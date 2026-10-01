@@ -1,3 +1,4 @@
+use super::super::PendingCheckpointObservation;
 use super::{
     canonical_completion_fingerprint, invalid_completion, StateTransferIdentity, StateTransferKind,
 };
@@ -21,6 +22,13 @@ pub(crate) struct CapturedCheckpoint<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> CapturedCheckpoint<R> {
+    pub(crate) fn capture_attempt(&self) -> CheckpointCaptureAttemptId {
+        self.backing.attempt_id()
+    }
+    pub(crate) fn slot_id(&self) -> CompletionSlotId {
+        self.slot_id
+    }
+
     pub(crate) fn identity(&self) -> &Arc<StateTransferIdentity> {
         &self.identity
     }
@@ -84,9 +92,17 @@ pub(crate) struct PendingRestoreCommit<R: DeviceRuntime> {
     target: Option<PreparedSequenceStateTransfer<R>>,
     checkpoint: Arc<CapturedCheckpoint<R>>,
     layout: SequenceCheckpointLayout,
+    observation: Option<PendingCheckpointObservation>,
 }
 
 impl<R: DeviceRuntime> PendingRestoreCommit<R> {
+    pub(in crate::vnext::completion) fn attach_observation(
+        &mut self,
+        observation: PendingCheckpointObservation,
+    ) {
+        self.observation = Some(observation);
+    }
+
     pub(crate) fn identity(&self) -> &Arc<StateTransferIdentity> {
         &self.identity
     }
@@ -227,10 +243,14 @@ impl<R: DeviceRuntime> RestoreFrontierPublication<R> {
             .as_ref()
             .expect("publication owns target gate");
         target.acknowledge_imported_frontier(&self.boundary)?;
+        let observation = pending.observation.take();
         // The exact gate was released under the same lock that validated its
         // installed boundary. Suppress PendingRestoreCommit's cancellation.
         drop(pending.target.take());
         drop(self.pending.take());
+        if let Some(observation) = observation {
+            observation.publish();
+        }
         Ok(Arc::clone(&self.boundary))
     }
 }
@@ -260,7 +280,10 @@ impl StateTransferFailure {
 /// work remains owned by the parent reaper's active/quarantined record.
 #[must_use = "a native terminal result carries ownership or a terminal failure"]
 pub(crate) enum StateTransferResult<R: DeviceRuntime> {
-    Captured(Arc<CapturedCheckpoint<R>>),
+    Captured(
+        Arc<CapturedCheckpoint<R>>,
+        Option<PendingCheckpointObservation>,
+    ),
     RestoreReady(PendingRestoreCommit<R>),
     Failed(StateTransferFailure),
 }
@@ -268,7 +291,7 @@ pub(crate) enum StateTransferResult<R: DeviceRuntime> {
 impl<R: DeviceRuntime> StateTransferResult<R> {
     pub(crate) fn slot_id(&self) -> CompletionSlotId {
         match self {
-            Self::Captured(checkpoint) => checkpoint.slot_id,
+            Self::Captured(checkpoint, _) => checkpoint.slot_id,
             Self::RestoreReady(restore) => restore.slot_id,
             Self::Failed(failure) => failure.slot_id,
         }
@@ -276,7 +299,7 @@ impl<R: DeviceRuntime> StateTransferResult<R> {
 
     pub(crate) fn identity(&self) -> &Arc<StateTransferIdentity> {
         match self {
-            Self::Captured(checkpoint) => checkpoint.identity(),
+            Self::Captured(checkpoint, _) => checkpoint.identity(),
             Self::RestoreReady(restore) => restore.identity(),
             Self::Failed(failure) => &failure.identity,
         }
@@ -315,13 +338,16 @@ impl<R: DeviceRuntime> StateTransferResult<R> {
                 "completed capture owners do not match its identity",
             ));
         }
-        Ok(Self::Captured(Arc::new(CapturedCheckpoint {
-            slot_id,
-            identity,
-            backing,
-            boundary,
-            byte_plan,
-        })))
+        Ok(Self::Captured(
+            Arc::new(CapturedCheckpoint {
+                slot_id,
+                identity,
+                backing,
+                boundary,
+                byte_plan,
+            }),
+            None,
+        ))
     }
 
     /// Even a constructor mismatch cancels before dropping an already-written
@@ -339,6 +365,7 @@ impl<R: DeviceRuntime> StateTransferResult<R> {
             target: Some(target),
             checkpoint,
             layout,
+            observation: None,
         };
         if pending.identity.kind() != StateTransferKind::Restore
             || !pending

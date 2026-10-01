@@ -295,6 +295,9 @@ pub struct SequenceState {
     pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
     pub(super) request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
+    /// Original trusted transport ingress, also retained when SLO is Off.
+    /// Private/calibration constructors without that context leave it unknown.
+    pub(super) admission_observation_ingress: Option<Instant>,
     /// Constant-size SLO controller state anchored at trusted product ingress.
     /// Separate from the legacy opt-in detailed timing evidence below.
     pub(super) slo: Option<ferrum_interfaces::RequestSloState>,
@@ -922,6 +925,7 @@ impl SequenceState {
             response_sender: None,
             request_slot: None,
             start_time,
+            admission_observation_ingress: None,
             slo: None,
             time_admission: None,
             token_timing,
@@ -1848,14 +1852,11 @@ impl SequenceState {
         }
         if !self.stop_text_seqs.is_empty() {
             if let Some(tok) = tokenizer {
-                if let Ok(text) = self.decode_owned_output(tok, &self.generated_tokens) {
-                    if self
-                        .stop_text_seqs
-                        .iter()
-                        .any(|stop| !stop.is_empty() && text.contains(stop))
-                    {
-                        return Some(FinishReason::Stop);
-                    }
+                if self
+                    .decoded_tokens_match_stop(tok, &self.generated_tokens)
+                    .unwrap_or(false)
+                {
+                    return Some(FinishReason::Stop);
                 }
             }
         }
@@ -1877,6 +1878,25 @@ impl SequenceState {
             return Some(FinishReason::Length);
         }
         None
+    }
+
+    /// The same owned decoder and stop predicate are used before a private
+    /// preparation commit and after an ordinary commit. Decode failure is
+    /// returned so preparation can fail closed without changing serving's
+    /// existing stop_reason behavior.
+    pub(in crate::continuous_engine) fn decoded_tokens_match_stop(
+        &self,
+        tokenizer: &dyn Tokenizer,
+        tokens: &[TokenId],
+    ) -> Result<bool> {
+        if self.stop_text_seqs.is_empty() {
+            return Ok(false);
+        }
+        let text = self.decode_owned_output(tokenizer, tokens)?;
+        Ok(self
+            .stop_text_seqs
+            .iter()
+            .any(|stop| !stop.is_empty() && text.contains(stop)))
     }
 
     /// Return whether the just-committed token belongs in the incremental

@@ -133,7 +133,7 @@ async fn future_metal_grouped_decode_long_context_and_rollout_match_actual() {
                 .plan_runtime_batch_decode_with_capacity_observed(&decodes, &mut probe.context())
                 .await,
         ));
-        assert_canonical(&probe, expected);
+        assert_canonical(&mut probe, expected);
         assert_eq!(outputs.len(), decodes.len());
         for (input, output) in decodes.iter_mut().zip(&outputs) {
             assert_eq!(input.kv_cache.cache_id(), output.kv_cache.cache_id());

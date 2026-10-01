@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_interfaces::vnext::DeviceRuntime;
 use ferrum_interfaces::vnext::{BufferRequest, BufferUsage, OperationCostCommand, ResourceId};
 use half::f16;
 
@@ -44,6 +45,46 @@ fn numeric_grid_preserves_actual_padding_and_checked_boundaries() {
 fn actual_pipeline_catalog_separates_b4_split_m8_m32_and_staged_work() {
     let device = Device::system_default().expect("selected algorithm evidence requires Metal");
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    for rows in [1, 4, 5, 8, 16, 32, 255, 256] {
+        let launch = launch(rows, 1024, 1024);
+        let expected = dense(&pipelines, &[launch], rows).unwrap();
+        let template = dense_observation(&pipelines, &[launch], rows).unwrap();
+        assert!(
+            template.retained_payload_bytes().unwrap()
+                <= observation_payload_upper(launch.dispatch_count()).unwrap()
+        );
+        let actual = template
+            .project(&ferrum_interfaces::vnext::FrozenObservationInput::command(
+                rows,
+            ))
+            .unwrap();
+        assert_eq!(actual, vec![Some(expected)]);
+        assert!(template
+            .project(&ferrum_interfaces::vnext::FrozenObservationInput::command(
+                rows + 1
+            ))
+            .is_err());
+        let mut frozen = observation::FrozenLinear::empty();
+        frozen
+            .projection(
+                &pipelines,
+                launch,
+                Some(staged_prefill::StagingPolicy::SwiGlu),
+            )
+            .unwrap();
+        let mut old = SelectedCommandCostBuilderV1::new(rows);
+        projection(
+            &mut old,
+            &pipelines,
+            launch,
+            Some(staged_prefill::StagingPolicy::SwiGlu),
+            2 << 20,
+        )
+        .unwrap();
+        let mut new = SelectedCommandCostBuilderV1::new(rows);
+        frozen.append(&mut new, 2 << 20).unwrap();
+        assert_eq!(new.finish().unwrap(), old.finish().unwrap());
+    }
     let m8_split = launch(8, 1024, 1024);
     let m8 = launch(8, 512, 1024);
     let m16 = launch(16, 512, 1024);
@@ -160,6 +201,7 @@ pub(crate) fn runtime_fixture(
     let projected = cost_route::dense_command_selected(&pipelines, 8, 8, &[selected]).unwrap();
     let statistics = dense(&pipelines, &[selected], 8).unwrap();
     assert_eq!(projected.statistical_evidence(), Some(&statistics));
+    let observation = dense_observation(&pipelines, &[selected], 8);
     let retained = regions.clone();
     let command =
         MetalDeviceCommand::operation("vnext_dense_linear", regions, move |encoder, regions| {
@@ -170,6 +212,10 @@ pub(crate) fn runtime_fixture(
         .unwrap()
         .with_work_shape(DeviceBatchingForm::Packed, 8, 8)
         .unwrap()
-        .with_statistical_evidence(Some(statistics));
+        .with_observation((observation).and_then(|template| {
+            (runtime.observation_template_budget().as_ref())?
+                .retain(template)
+                .ok()
+        }));
     (command, projected, retained)
 }

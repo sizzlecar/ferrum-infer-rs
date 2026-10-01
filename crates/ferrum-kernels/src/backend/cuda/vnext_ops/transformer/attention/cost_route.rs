@@ -2,8 +2,64 @@
 use super::*;
 use ferrum_interfaces::vnext::{
     DeviceCommandPhase, OperationCostCommand, OperationCostRoute, OperationCostRouteRequest,
-    ProgramBindingCostWrite,
+    OperationCostSelection, OperationCostTopologyRequirement, OperationId, ProgramBindingCostWrite,
 };
+
+/// Per-node model geometry and weight metadata. No current token extent,
+/// address, library-handle observation or selected dynamic work is retained.
+pub(super) struct PreparedCostData {
+    template: selected::PreparedCostTemplate,
+    matrices: Option<(Vec<weights::MatrixPart>, Vec<weights::MatrixPart>)>,
+}
+
+impl PreparedCostData {
+    pub(super) fn new(
+        operation_id: &OperationId,
+        bindings: &[ResolvedValueBinding],
+        attributes: &BTreeMap<AttributeId, SemanticValue>,
+        precision: AttentionPrecision,
+        #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
+    ) -> Result<Option<Self>, String> {
+        super::super::gguf_f16_projection::validate_values(operation_id, bindings)?;
+        let shape = AttentionShape::from_attributes(attributes)?;
+        validate_signature_values(bindings, shape, precision)?;
+        let projection = AttentionProjection::from_values(
+            bindings,
+            precision,
+            #[cfg(feature = "vllm-marlin")]
+            projection_runtime,
+        )?;
+        let is_library = matches!(precision, AttentionPrecision::F32MasterGgufF16Projections);
+        if is_library {
+            if !matches!(projection, AttentionProjection::F16) {
+                return Ok(None);
+            }
+        } else if !matches!(
+            projection,
+            AttentionProjection::Native { .. } | AttentionProjection::NativeQ8 { .. }
+        ) {
+            return Ok(None);
+        }
+        let parts = |ordinal| -> Result<_, String> {
+            let value = binding(bindings, ResolvedValueRole::Input, ordinal)?;
+            weights::matrix_parts(
+                value
+                    .weight()
+                    .ok_or("CUDA recurrent projection metadata absent")?,
+                value.tensor().dimensions(),
+            )
+        };
+        let matrices = if is_library {
+            None
+        } else {
+            Some((parts(2)?, parts(7)?))
+        };
+        Ok(Some(Self {
+            template: selected::PreparedCostTemplate::new(shape, precision, projection)?,
+            matrices,
+        }))
+    }
+}
 
 pub(super) fn native_projection_dispatches(
     parts: &[weights::MatrixPart],
@@ -25,7 +81,32 @@ pub(super) fn route(
     library_identity: Option<super::super::cublas_api::CublasHandleApiIdentity>,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
-    let checked = || -> Result<Option<OperationCostRoute>, String> {
+    selection(
+        request,
+        OperationCostTopologyRequirement::NotRequested,
+        &mut || Ok(()),
+        precision,
+        capabilities,
+        capture,
+        library_identity,
+        #[cfg(feature = "vllm-marlin")]
+        projection_runtime,
+    )
+    .map(|value| value.map(OperationCostSelection::into_route))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn selection(
+    request: OperationCostRouteRequest<'_>,
+    topology: OperationCostTopologyRequirement,
+    poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    precision: AttentionPrecision,
+    capabilities: GatedDeltaExecutionCapabilities,
+    capture: ferrum_types::SloStructuredCostCapture,
+    library_identity: Option<super::super::cublas_api::CublasHandleApiIdentity>,
+    #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
+) -> Result<Option<OperationCostSelection>, VNextError> {
+    let mut checked = || -> Result<Option<OperationCostSelection>, String> {
         if request.operation_id().as_str() != precision.operation() {
             return Err("CUDA recurrent cost operation mismatch".into());
         }
@@ -36,47 +117,28 @@ pub(super) fn route(
         {
             return Ok(None);
         }
-        super::super::gguf_f16_projection::validate_values(
-            request.operation_id(),
-            request.bindings(),
-        )?;
-        let shape = AttentionShape::from_attributes(request.attributes())?;
-        validate_signature_values(request.bindings(), shape, precision)?;
-        let projection = AttentionProjection::from_values(
-            request.bindings(),
-            precision,
-            #[cfg(feature = "vllm-marlin")]
-            projection_runtime,
-        )?;
-        if is_library {
-            if !matches!(projection, AttentionProjection::F16) {
-                return Ok(None);
+        let fallback;
+        let prepared = match request.prepared_cost_data::<PreparedCostData>() {
+            Some(prepared) => prepared,
+            None => {
+                let Some(value) = PreparedCostData::new(
+                    request.operation_id(),
+                    request.bindings(),
+                    request.attributes(),
+                    precision,
+                    #[cfg(feature = "vllm-marlin")]
+                    projection_runtime,
+                )?
+                else {
+                    return Ok(None);
+                };
+                fallback = value;
+                &fallback
             }
-        } else if !matches!(
-            projection,
-            AttentionProjection::Native { .. } | AttentionProjection::NativeQ8 { .. }
-        ) {
-            return Ok(None);
-        }
+        };
         let tokens = request.immediate_tokens();
-        shape.validate_launch_extents(tokens)?;
-        ScratchLayout::new(shape, tokens, request.rows().len(), projection)?;
-        let binding_layout = StateBindingLayout::new(request.rows().len())?;
-        let parts = |ordinal| -> Result<_, String> {
-            let value = binding(request.bindings(), ResolvedValueRole::Input, ordinal)?;
-            weights::matrix_parts(
-                value
-                    .weight()
-                    .ok_or("CUDA recurrent projection metadata absent")?,
-                value.tensor().dimensions(),
-            )
-        };
-        let matrices = if is_library {
-            None
-        } else {
-            Some((parts(2)?, parts(7)?))
-        };
-        let evidence = match &matrices {
+        let matrices = &prepared.matrices;
+        let evidence = match matrices {
             Some((input, output)) => selected::ProjectionEvidence::Native { input, output },
             None => selected::ProjectionEvidence::Library(
                 library_identity.ok_or("RN-F16 cuBLAS handle identity is unavailable")?,
@@ -89,58 +151,20 @@ pub(super) fn route(
             && request
                 .binding_uses_packed_batch_coordinates(ResolvedValueRole::Output, 0)
                 .map_err(|error| error.to_string())?;
-        let mut packed_form = None;
-        for row in request.rows() {
-            shape.validate_launch_extents(row.count.get())?;
-            let form = capabilities
-                .select(
-                    row.count.get(),
-                    GatedDeltaExecutionPreference::RecurrentScan,
-                )
-                .map_err(|error| error.to_string())?;
-            if matches!(form, GatedDeltaExecutionForm::ChunkedScan(_)) {
-                return Ok(None);
-            }
-            if packed
-                && packed_form
-                    .replace(form)
-                    .is_some_and(|previous| previous != form)
-            {
-                return Ok(None);
-            }
-        }
-        let native_count = |parts: &[weights::MatrixPart], count| {
-            native_projection_dispatches(parts, count, precision.quantizes_projections())
+        let Some(query) = prepared.template.query(
+            request.rows(),
+            tokens,
+            packed,
+            capabilities,
+            Some(evidence),
+            topology == OperationCostTopologyRequirement::Required,
+        )?
+        else {
+            return Ok(None);
         };
-        let launch_count = if packed {
-            1
-        } else {
-            request.rows().len() as u64
-        };
-        let launch_work = |count| {
-            match &matrices {
-                Some((input, output)) => combine_attention_dispatches(
-                    native_count(input, count)?,
-                    native_count(output, count)?,
-                ),
-                // Logical API calls, not an asserted vendor kernel launch count.
-                None => combine_attention_dispatches(1, 1),
-            }
-        };
-        let dispatches = if packed {
-            launch_work(tokens)?
-        } else {
-            request.rows().iter().try_fold(0_u64, |total, row| {
-                total
-                    .checked_add(launch_work(row.count.get())?)
-                    .ok_or_else(|| "CUDA recurrent cost dispatch count overflows".to_owned())
-            })?
-        };
-        let transfers = launch_count
-            .checked_mul(combine_attention_transfers(0, 0)?)
-            .ok_or("CUDA recurrent cost transfers overflow")?;
-        let participants = u32::try_from(request.rows().len())
-            .map_err(|_| "CUDA recurrent cost participants exceed u32")?;
+        let participants = query.participants();
+        let dispatches = query.dispatches();
+        let transfers = query.transfers();
         let binding_command = OperationCostCommand::new(
             "vnext_gated_delta_recurrent_attention_bindings",
             DeviceCommandPhase::DynamicBinding,
@@ -171,26 +195,7 @@ pub(super) fn route(
             binding_command,
             selected::bindings(request.rows().len(), tokens, capture),
         );
-        let leaves = std::iter::once((tokens, participants, true))
-            .take(usize::from(packed))
-            .chain(
-                request
-                    .rows()
-                    .iter()
-                    .filter(move |_| !packed)
-                    .map(|row| (row.count.get(), 1, false)),
-            );
-        let selected = selected::compute(
-            shape,
-            precision,
-            projection,
-            evidence,
-            leaves,
-            tokens,
-            participants as usize,
-            true,
-            capture,
-        );
+        let selected = query.compute(capture);
         // A library route is complete or Unknown. Never emit a partial native
         // prefix while the required library selection/parameters are missing.
         if is_library && selected.is_none() {
@@ -200,17 +205,28 @@ pub(super) fn route(
         let writes = (0..request.rows().len())
             .map(|index| {
                 ProgramBindingCostWrite::new(
-                    binding_layout.offset(index).map_err(invalid_plan)?,
+                    query.binding_offset(index).map_err(invalid_plan)?,
                     STATE_BINDING_SLOT_BYTES,
                 )
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        OperationCostRoute::new(vec![binding_command, compute])
+        let route = OperationCostRoute::new(vec![binding_command, compute])
             .and_then(|route| route.with_relocatable_binding(0))
             .and_then(|route| route.with_program_binding_writes(writes))
-            .map(Some)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let topology = match topology {
+            OperationCostTopologyRequirement::NotRequested => None,
+            OperationCostTopologyRequirement::Required => {
+                poll().map_err(|error| error.to_string())?;
+                Some(
+                    query
+                        .topology(&request)
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+        };
+        Ok(Some(OperationCostSelection::new(route, topology)))
     };
     checked().map_err(invalid_plan)
 }

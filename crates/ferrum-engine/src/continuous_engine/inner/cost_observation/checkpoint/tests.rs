@@ -260,7 +260,8 @@ async fn cost_checkpoint_waits_for_popped_sample_to_finish_and_excludes_concurre
     });
     runtime.sink.offer(sample(10, 12)).unwrap();
     waiting.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert_eq!(runtime.sink.stats().drained, 1); // popped, not yet trained
+    assert_eq!(runtime.sink.stats().entries_drained, 1); // original FIFO popped
+    assert_eq!(runtime.sink.stats().drained, 0); // classification hook is paused
     let waiter = runtime.request_checkpoint().unwrap().wait();
     tokio::pin!(waiter);
     assert!(futures::poll!(waiter.as_mut()).is_pending());
@@ -300,7 +301,15 @@ async fn cost_checkpoint_worker_unwind_notifies_waiter_while_runtime_state_is_re
     let config = config();
     let seed = profile::load_seed(&identity(), &config, None, None).unwrap();
     let state = Arc::new(
-        CostTrainingState::new(&config, seed, None, Arc::new(Clock(AtomicU64::new(20)))).unwrap(),
+        CostTrainingState::new(
+            &config,
+            seed,
+            None,
+            Arc::new(Clock(AtomicU64::new(20))),
+            None,
+            None,
+        )
+        .unwrap(),
     );
     let owner = TrainingWorkerOwner(state.clone());
     let worker = CostTrainingWorker::spawn(move || {
@@ -324,4 +333,33 @@ async fn cost_checkpoint_worker_unwind_notifies_waiter_while_runtime_state_is_re
         state.sink.request_checkpoint(),
         Err(CheckpointRequestError::Closing)
     ));
+}
+
+#[tokio::test]
+async fn cost_checkpoint_excludes_channel_send_before_committed_acceptance() {
+    let runtime = runtime(false);
+    let (sent, waiting) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    runtime.sink.on_next_send(move || {
+        sent.send(()).unwrap();
+        resume.recv_timeout(Duration::from_secs(3)).unwrap();
+    });
+    let sink = Arc::clone(&runtime.sink);
+    let producer = std::thread::spawn(move || sink.offer(sample(10, 12)));
+    waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+    let waiter = runtime.request_checkpoint().unwrap();
+    // The channel contains one entry, but its ticket and accepted watermark
+    // are uncommitted. The cut excludes it without waiting for the producer.
+    runtime.consume_samples();
+    let frozen = tokio::time::timeout(Duration::from_secs(3), waiter.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frozen.accepted_ordinal, 0);
+    assert_eq!(frozen.training.consumed, 0);
+    release.send(()).unwrap();
+    producer.join().unwrap().unwrap();
+    runtime.consume_samples();
+    assert_eq!(runtime.trained_samples(), 1);
+    runtime.shutdown().await.unwrap();
 }

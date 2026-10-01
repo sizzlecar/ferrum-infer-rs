@@ -6,6 +6,8 @@ use ferrum_interfaces::vnext::{
 };
 use std::num::{NonZeroU32, NonZeroU64};
 
+mod checked;
+
 fn id<T>(text: &str) -> T
 where
     T: TryFrom<String>,

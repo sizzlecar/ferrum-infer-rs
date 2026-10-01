@@ -35,6 +35,7 @@ parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+flate2 = { version = "=1.1.5", default-features = false, features = ["rust_backend"] }
 
 # Error handling
 anyhow = { workspace = true }
@@ -111,6 +112,10 @@ triton-kernels = ["cuda", "ferrum-kernels/triton-kernels"]
 metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:metal", "dep:mpsgraph", "dep:objc2", "dep:objc2-foundation", "dep:bytemuck", "dep:ndarray", "ferrum-models/metal", "ferrum-kernels/metal"]
 
 # Metal dependencies for Apple GPU support (only on macOS/iOS)
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Same-boot cost clock only; request/SLO Instant is unchanged.
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.27.0", optional = true }
 mpsgraph = { version = "0.2.0", optional = true }

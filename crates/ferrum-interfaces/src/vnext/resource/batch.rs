@@ -7,11 +7,12 @@ use super::{
     LaneStableArenaSlotIdentity, LaneStableArenaSlotLease, LogicalBackingSliceAuthority,
     LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase, ParticipantNodeKey,
     PlanBackingDeferral, PlanCapacityWaitRegistration, PlanHash, ProgramBindingExecutionBinding,
-    ProgramBindingLayout, ProgramBindingNodeBinding, RequestAuthorityId, SequenceAuthorityId,
-    SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
-    SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
-    StepCompletedBoundaryProof, StepCompletedBoundarySlot, StepParticipantFrameAssignment,
-    TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
+    ProgramBindingLayout, ProgramBindingNodeBinding, RequestAuthorityId, ResourceId,
+    SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch,
+    SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
+    SequenceSessionSlotState, Serialize, Sha256, StepCompletedBoundaryProof,
+    StepCompletedBoundarySlot, StepParticipantFrameAssignment, TokenSpanWork,
+    TrustedPlanRuntimeEvidence, VNextError,
 };
 use crate::vnext::DeviceReusableExecutionProgramId;
 use crate::vnext::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
@@ -1685,6 +1686,21 @@ fn logical_capacity_matches(
     }
 }
 
+// Both callers own claims created through BackingClaimCertificate::bind.
+// from_slices proves strict resource-id ordering and uniqueness; bind preserves
+// that exact allocation order, including retained lane projections. This only
+// locates the current authority. Pool, lease, generation and runtime descriptor
+// validation remain in view_many/validate_view_many on every access.
+fn certified_backing_slice<'a>(
+    slices: &'a [LogicalBackingSliceAuthority],
+    resource_id: &ResourceId,
+) -> Option<&'a LogicalBackingSliceAuthority> {
+    slices
+        .binary_search_by(|authority| authority.resource_id().cmp(resource_id))
+        .ok()
+        .map(|index| &slices[index])
+}
+
 impl ClaimedBackingTransaction {
     pub(super) fn new(
         work_shape: Arc<BatchWorkShape>,
@@ -1792,6 +1808,13 @@ impl ClaimedBackingTransaction {
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
         &self.backing_slices
+    }
+
+    pub(super) fn backing_slice(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<&LogicalBackingSliceAuthority> {
+        certified_backing_slice(&self.backing_slices, resource_id)
     }
 
     pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {
@@ -1944,6 +1967,13 @@ impl ClaimedSubmissionWaveBacking {
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
         &self.backing_slices
+    }
+
+    pub(super) fn backing_slice(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<&LogicalBackingSliceAuthority> {
+        certified_backing_slice(&self.backing_slices, resource_id)
     }
 
     pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {

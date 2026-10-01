@@ -80,6 +80,47 @@ fn assert_declared_eager_boundary(fixture: &Fixture, node: &str) {
     }
 }
 
+fn changed_input_tokens(rows: usize) -> [Arc<[u32]>; 2] {
+    assert!(rows > 0);
+    [3, 11].map(|base| {
+        (0..4)
+            .flat_map(|wave| (0..rows).map(move |row| base + ((row + wave) % 8) as u32))
+            .collect()
+    })
+}
+
+#[test]
+fn replay_token_fixture_varies_windows_and_conv_tails_between_owners() {
+    // Four windows must fit the real fixture context. Validate data properties,
+    // not a second copy of the token-generation formula. In particular, M7
+    // previously repeated every window and made a correct conv state look stale.
+    for rows in 1..=MAX_TOKENS as usize / 4 {
+        let owners = changed_input_tokens(rows);
+        for (owner, tokens) in owners.iter().enumerate() {
+            assert_eq!(tokens.len(), 4 * rows);
+            let allowed = if owner == 0 { 3..11 } else { 11..19 };
+            assert!(tokens.iter().all(|token| allowed.contains(token)));
+            for first in 0..4 {
+                for second in first + 1..4 {
+                    assert_ne!(
+                        &tokens[first * rows..(first + 1) * rows],
+                        &tokens[second * rows..(second + 1) * rows],
+                        "owner={owner} M={rows}: repeated wave input"
+                    );
+                    let first_end = (first + 1) * rows;
+                    let second_end = (second + 1) * rows;
+                    assert_ne!(
+                        &tokens[first_end.saturating_sub(3)..first_end],
+                        &tokens[second_end.saturating_sub(3)..second_end],
+                        "owner={owner} M={rows}: repeated rolling convolution tail"
+                    );
+                }
+            }
+        }
+        assert!(owners[0].iter().all(|token| !owners[1].contains(token)));
+    }
+}
+
 pub(super) fn compare_changed_inputs(
     eager: &Fixture,
     replay: &Fixture,
@@ -91,12 +132,10 @@ pub(super) fn compare_changed_inputs(
 
     // Same width/math for each oracle, distinct actual tokens in every window
     // and between owners. No cross-width equality or strict-vs-rounded claim.
-    let tokens_a: Arc<[u32]> = (0..4 * rows)
-        .map(|i| 3 + ((i + i / rows) % 8) as u32)
-        .collect();
-    let tokens_b: Arc<[u32]> = (0..4 * rows)
-        .map(|i| 11 + ((i + i / rows) % 8) as u32)
-        .collect();
+    // Advance the pattern by wave independently of its physical row count.
+    // Using global_index + wave cancels that advance whenever rows+1 is a
+    // multiple of the pattern period, such as the required M7 boundary.
+    let [tokens_a, tokens_b] = changed_input_tokens(rows);
     let window = |index| index * rows..(index + 1) * rows;
     let baseline = |name, tokens: &Arc<[u32]>| {
         let owner = eager.admit(name, Arc::clone(tokens));

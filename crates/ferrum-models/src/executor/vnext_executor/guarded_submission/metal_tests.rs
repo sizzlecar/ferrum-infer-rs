@@ -289,7 +289,7 @@ async fn guarded_metal_product_cold_capacity_cannot_invent_witness_and_cancel_is
         matches!(
             &cold,
             Err(ExecutionCostRouteUnknown::Resource(
-                ResourcePlanningUnknown::LogicalCapacity
+                ResourcePlanningUnknown::UnmaterializedCapacity
             ))
         ),
         "cold route: {cold:?}; cold domain/step/invocation/resident (first 8 of {}): {:?}",

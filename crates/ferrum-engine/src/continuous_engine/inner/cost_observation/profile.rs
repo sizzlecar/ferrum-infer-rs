@@ -6,6 +6,7 @@ use ferrum_scheduler::implementations::continuous::{
     cost_model as model, cost_profile as file,
     slo_planner::{
         PlanningCost, PlanningCostEvidence, PlanningCostEvidenceRequirement, PlanningCostModel,
+        PlanningObservedCost, PlanningQueryOutcome,
     },
 };
 use ferrum_types::{
@@ -16,6 +17,7 @@ use std::path::Path;
 mod selected;
 mod structured;
 mod structured_v2;
+pub(super) use structured_v2::VerifiedRestartCatalog;
 
 pub(super) fn model_settings(config: &SloCostModelConfig) -> model::CostModelSettings {
     model::CostModelSettings {
@@ -41,7 +43,7 @@ pub(super) fn model_settings(config: &SloCostModelConfig) -> model::CostModelSet
     }
 }
 
-fn load_limits(config: &SloCostProfileImportConfig) -> file::CostProfileLoadLimits {
+pub(super) fn load_limits(config: &SloCostProfileImportConfig) -> file::CostProfileLoadLimits {
     file::CostProfileLoadLimits {
         max_file_bytes: config.max_file_bytes,
         max_samples: config.max_samples,
@@ -89,6 +91,29 @@ pub(super) struct TrainingSeed {
 }
 
 pub(super) fn load_seed(
+    identity: &ExecutorCostIdentityAvailability,
+    config: &SloCostObservationConfig,
+    path: Option<&Path>,
+    clock: Option<file::ProfileLoadClock>,
+) -> Result<TrainingSeed, FerrumError> {
+    load_seed_with_domain(identity, config, path, clock, None)
+}
+
+pub(super) fn load_seed_with_domain(
+    identity: &ExecutorCostIdentityAvailability,
+    config: &SloCostObservationConfig,
+    path: Option<&Path>,
+    clock: Option<file::ProfileLoadClock>,
+    workload_domain: Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1>,
+) -> Result<TrainingSeed, FerrumError> {
+    let seed = load_seed_unchecked(identity, config, path, clock)?;
+    if let Some(snapshot) = &seed.snapshot {
+        snapshot.validate_workload_domain(workload_domain)?;
+    }
+    Ok(seed)
+}
+
+fn load_seed_unchecked(
     identity: &ExecutorCostIdentityAvailability,
     config: &SloCostObservationConfig,
     path: Option<&Path>,
@@ -203,20 +228,23 @@ fn import_receipt(
         })
         .collect();
     Ok(SloCostProfileReceipt {
+        storage: ferrum_types::SloCostProfileStorage::File,
+        clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
         selected_whole_wave: None,
         structured_whole_wave: None,
         structured_whole_wave_v2: None,
         schema_version: p.schema_version,
-        path: p
-            .loaded_from
-            .clone()
-            .ok_or_else(|| FerrumError::internal("file import has no source path"))?,
+        path: Some(
+            p.loaded_from
+                .clone()
+                .ok_or_else(|| FerrumError::internal("file import has no source path"))?,
+        ),
         file_sha256: p.file_sha256.clone(),
         file_bytes: p.file_bytes,
         generated_unix_ns: p.generated_unix_ns,
         loaded_unix_ns: p.loaded_unix_ns,
         conservative_clock_error_ns: p.conservative_clock_error_ns,
-        declared_local_clock_max_error_ns,
+        declared_local_clock_max_error_ns: Some(declared_local_clock_max_error_ns),
         oldest_imported_age_ns: p.oldest_imported_age_ns,
         newest_imported_age_ns: p.newest_imported_age_ns,
         offered_samples: p.counts.offered_samples,
@@ -288,7 +316,38 @@ pub(in crate::continuous_engine) struct EngineCostSnapshot {
     fingerprint: model::ExecutionFingerprint,
 }
 
+/// Fixed-size original identity and live invalidation gates. It contains no
+/// numerical model, catalog, imported source bytes, or feedback margin table.
+pub(super) struct ProspectiveIdentity {
+    fingerprint: model::ExecutionFingerprint,
+    model_version: u64,
+    epoch: super::structured_epoch::View,
+    feedback: Option<super::selected_feedback::Validity>,
+}
+impl ProspectiveIdentity {
+    pub fn current(&self) -> bool {
+        self.epoch.current() && self.feedback.as_ref().is_none_or(|v| v.current())
+    }
+    pub fn model_version(&self) -> u64 {
+        self.model_version
+    }
+    pub fn fingerprint(&self) -> &model::ExecutionFingerprint {
+        &self.fingerprint
+    }
+}
+
 impl EngineCostSnapshot {
+    pub(super) fn prospective_identity(&self) -> Option<ProspectiveIdentity> {
+        let Snapshot::StructuredV2(snapshot) = &self.inner else {
+            return None;
+        };
+        Some(ProspectiveIdentity {
+            fingerprint: self.fingerprint.clone(),
+            model_version: self.model_version(),
+            epoch: snapshot.epoch.clone(),
+            feedback: snapshot.feedback.as_ref().map(|view| view.validity()),
+        })
+    }
     pub(super) fn prospective_source(
         &self,
         query: &model::structured_v2::StructuredQueryV2,
@@ -318,6 +377,42 @@ impl EngineCostSnapshot {
                 self.model_version(),
             ),
             _ => Err(model::structured_v2::StructuredUnknownV2::UnsupportedScope),
+        }
+    }
+    /// Feedback receives a typed query failure from its original cause. A
+    /// bounded prediction range miss is distinct from damaged input evidence.
+    pub(in crate::continuous_engine::inner::cost_observation) fn audit_structured_query_v2_detailed(
+        &self,
+        query: &model::structured_v2::StructuredQueryV2,
+        local_now: u64,
+    ) -> Result<PlanningCost, model::structured_v2::StructuredQueryFailureV2> {
+        match &self.inner {
+            Snapshot::StructuredV2(snapshot) => structured_v2::predict_query_detailed(
+                snapshot,
+                &self.fingerprint,
+                query,
+                local_now,
+                self.model_version(),
+            ),
+            _ => Err(model::structured_v2::StructuredQueryFailureV2::Invalid(
+                model::structured_v2::StructuredUnknownV2::UnsupportedScope,
+            )),
+        }
+    }
+
+    pub(in crate::continuous_engine::inner::cost_observation) fn expired_structured_feedback_domain(
+        &self,
+        query: &model::structured_v2::StructuredQueryV2,
+        local_now: u64,
+    ) -> Result<[u8; 32], model::structured_v2::StructuredQueryFailureV2> {
+        match &self.inner {
+            Snapshot::StructuredV2(snapshot) => structured_v2::expired_feedback_domain(
+                snapshot,
+                &self.fingerprint,
+                query,
+                local_now,
+            ),
+            _ => Err(model::structured_v2::StructuredUnknownV2::UnsupportedScope.into()),
         }
     }
     pub(super) fn feedback_enabled(&self) -> bool {
@@ -357,6 +452,7 @@ impl EngineCostSnapshot {
             }),
             Snapshot::StructuredV2(s) => {
                 let mut next = s.clone();
+                next.epoch.epoch = feedback.epoch;
                 next.feedback = Some(feedback);
                 Snapshot::StructuredV2(next)
             }
@@ -388,7 +484,9 @@ impl EngineCostSnapshot {
     pub(super) fn current(&self) -> bool {
         match &self.inner {
             Snapshot::Selected(s) => s.feedback.as_ref().is_none_or(|v| v.current()),
-            Snapshot::StructuredV2(s) => s.feedback.as_ref().is_none_or(|v| v.current()),
+            Snapshot::StructuredV2(s) => {
+                s.epoch.current() && s.feedback.as_ref().is_none_or(|v| v.current())
+            }
             _ => true,
         }
     }
@@ -460,7 +558,7 @@ impl EngineCostSnapshot {
         match &self.inner {
             Snapshot::Selected(snapshot) => snapshot.feedback.as_ref().map_or(1, |v| v.epoch),
             Snapshot::Structured(_) => 1,
-            Snapshot::StructuredV2(s) => s.feedback.as_ref().map_or(1, |v| v.epoch),
+            Snapshot::StructuredV2(s) => s.epoch.epoch,
             Snapshot::Live(snapshot) => snapshot.model_version(),
             Snapshot::Imported(snapshot) => snapshot.model_version(),
         }
@@ -503,6 +601,37 @@ impl EngineCostSnapshot {
 }
 
 impl PlanningCostModel for EngineCostSnapshot {
+    fn predict_observed(
+        &self,
+        fingerprint: &model::ExecutionFingerprint,
+        shape: &model::WaveExecutionShape,
+        evidence: Option<&PlanningCostEvidence>,
+        now_ns: u64,
+    ) -> PlanningObservedCost {
+        let outcome = match &self.inner {
+            Snapshot::StructuredV2(snapshot) => match structured_v2::predict_observed(
+                snapshot,
+                fingerprint,
+                shape,
+                evidence,
+                now_ns,
+                self.model_version(),
+            ) {
+                Ok(cost) => PlanningQueryOutcome::Known(cost),
+                Err(reason) => PlanningQueryOutcome::StructuredUnknown(reason),
+            },
+            _ => self
+                .predict_with_evidence(fingerprint, shape, evidence, now_ns)
+                .map_or(
+                    PlanningQueryOutcome::ModelUnavailable,
+                    PlanningQueryOutcome::Known,
+                ),
+        };
+        PlanningObservedCost {
+            outcome,
+            cost_now_ns: Some(now_ns),
+        }
+    }
     fn evidence_requirement(&self) -> PlanningCostEvidenceRequirement {
         match &self.inner {
             Snapshot::Selected(_) => PlanningCostEvidenceRequirement::Selected,

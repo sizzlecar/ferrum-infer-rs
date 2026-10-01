@@ -1,6 +1,9 @@
 //! The production CUDA launch geometry, also consumed by selected evidence.
 //! No allocation, device pointer, or command is constructed here.
 use super::*;
+use crate::backend::causal_attention_selector::{
+    VARLEN_DYNAMIC_SHARED_BUDGET_BYTES, VARLEN_TILED_QUERY_TOKENS,
+};
 
 fn config(grid: [u64; 3], block: u32, shared: u64) -> Result<LaunchConfig, CudaDeviceRuntimeError> {
     if grid.contains(&0) || block == 0 {

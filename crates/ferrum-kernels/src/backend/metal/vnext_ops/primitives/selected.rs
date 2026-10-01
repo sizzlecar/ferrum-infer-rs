@@ -7,11 +7,30 @@ use ferrum_interfaces::execution_cost::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
+pub(super) mod observation;
+pub(super) use observation::{
+    argmax as argmax_observation, embedding as embedding_observation,
+    residual as residual_observation, rms as rms_observation,
+};
+
+#[derive(Clone, Copy)]
+struct SelectionStamp {
+    entry: &'static str,
+    specialization: u64,
+}
 
 pub(super) struct Selection<'a> {
     pub pipeline: &'a ComputePipelineState,
     entry: &'static str,
     specialization: u64,
+}
+impl Selection<'_> {
+    fn stamp(&self) -> SelectionStamp {
+        SelectionStamp {
+            entry: self.entry,
+            specialization: self.specialization,
+        }
+    }
 }
 fn pick<'a>(
     pipeline: &'a ComputePipelineState,
@@ -129,12 +148,38 @@ fn push(
     scratch: u64,
     extra: u64,
 ) -> Option<()> {
+    push_stamp(
+        builder,
+        selected.stamp(),
+        logical,
+        padded,
+        inner,
+        grid,
+        threads,
+        scratch,
+        extra,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_stamp(
+    builder: &mut SelectedCommandCostBuilderV1,
+    selected: SelectionStamp,
+    logical: u64,
+    padded: u64,
+    inner: u64,
+    grid: [u64; 3],
+    threads: u64,
+    scratch: u64,
+    extra: u64,
+) -> Option<()> {
     static NUMERIC: OnceLock<[u8; 32]> = OnceLock::new();
     let numeric = *NUMERIC.get_or_init(|| {
         let mut h = Sha256::new();
         h.update(b"metal.primitives.compile-options-default.v1");
         h.update(SHADER_SOURCE.as_bytes());
         h.update(include_str!("selected.rs").as_bytes());
+        h.update(include_str!("selected/observation.rs").as_bytes());
         h.finalize().into()
     });
     let mut layout = Sha256::new();
@@ -169,19 +214,7 @@ pub(super) fn push_embedding(
     out: ElementType,
     params: EmbeddingParams,
 ) -> Option<()> {
-    let x = u64::from(params.hidden_size).div_ceil(THREADS_PER_GROUP);
-    let rows = u64::from(params.token_count);
-    push(
-        builder,
-        embedding(p, format, out)?,
-        rows.checked_mul(u64::from(params.hidden_size))?,
-        rows.checked_mul(x)?.checked_mul(THREADS_PER_GROUP)?,
-        1,
-        [x, rows, 1],
-        THREADS_PER_GROUP,
-        0,
-        0,
-    )
+    observation::append_embedding(builder, embedding(p, format, out)?.stamp(), params)
 }
 pub(super) fn embedding_evidence(
     p: &MetalPrimitivePipelines,
@@ -220,18 +253,7 @@ pub(super) fn push_rms(
     out: ElementType,
     scratch: u64,
 ) -> Option<()> {
-    let rows = u64::from(params.rows);
-    push(
-        builder,
-        rms(p, input, out)?,
-        rows,
-        rows,
-        u64::from(params.hidden_size),
-        [rows, 1, 1],
-        THREADS_PER_GROUP,
-        scratch,
-        u64::from(params.epsilon.to_bits()),
-    )
+    observation::append_rms(builder, rms(p, input, out)?.stamp(), params, scratch)
 }
 pub(super) fn residual_evidence(
     p: &MetalPrimitivePipelines,
@@ -255,18 +277,11 @@ pub(super) fn push_residual(
     out: ElementType,
     scratch: u64,
 ) -> Option<()> {
-    let n = u64::from(params.elements);
-    let groups = n.div_ceil(THREADS_PER_GROUP);
-    push(
+    observation::append_residual(
         builder,
-        residual(p, left, right, out)?,
-        n,
-        groups.checked_mul(THREADS_PER_GROUP)?,
-        1,
-        [groups, 1, 1],
-        THREADS_PER_GROUP,
+        residual(p, left, right, out)?.stamp(),
+        params,
         scratch,
-        0,
     )
 }
 pub(super) fn push_argmax(
@@ -276,39 +291,7 @@ pub(super) fn push_argmax(
     logits: ElementType,
     scratch: u64,
 ) -> Option<()> {
-    let parallel = masked_argmax_dispatch_count(params.vocabulary_size) == 2;
-    let groups = if parallel {
-        MASKED_ARGMAX_PARTITIONS
-    } else {
-        1
-    };
-    let n = u64::from(params.vocabulary_size);
-    let width = groups.checked_mul(THREADS_PER_GROUP)?;
-    push(
-        b,
-        argmax(p, logits, parallel)?,
-        n,
-        n.div_ceil(width).checked_mul(width)?,
-        1,
-        [groups, 1, 1],
-        THREADS_PER_GROUP,
-        scratch,
-        u64::from(params.repetition_capacity),
-    )?;
-    if parallel {
-        push(
-            b,
-            pick(&p.masked_argmax_finalize, "vnext_masked_argmax_finalize", 0),
-            MASKED_ARGMAX_PARTITIONS,
-            32,
-            1,
-            [1, 1, 1],
-            32,
-            scratch,
-            0,
-        )?;
-    }
-    Some(())
+    observation::Argmax::freeze(p, params, logits)?.append(b, scratch)
 }
 pub(super) fn argmax_evidence(
     p: &MetalPrimitivePipelines,
@@ -328,3 +311,5 @@ pub(super) fn argmax_evidence(
 
 #[cfg(test)]
 pub(super) mod tests;
+
+pub(super) use observation::payload_upper as observation_payload_upper;

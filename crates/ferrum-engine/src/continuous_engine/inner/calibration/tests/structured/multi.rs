@@ -12,7 +12,8 @@ fn group_options(paths: &[SourcePath; 2]) -> StructuredCalibrationGroupOptionsV2
             provider_template:StructuredTemplateV2::Ordered([1;32]), algorithm_domain:[i as u8+1;32], installed_policy:[3;32]};
         StructuredCalibrationOptionsV2 {
             observations_path:path.0.clone(), protocol_sha256:[4;32],
-            scope:StructuredScopeV2 {owner:owner.clone(), coverage:StructuredCoverageV2 {
+            scope:StructuredScopeV2 {numerical_family: None,
+owner:owner.clone(), coverage:StructuredCoverageV2 {
                 pending_eligible_positions:vec![], authorized_pending_constraints:vec![HostPendingConstraintV2::AnySubset],
                 pending_counts:vec![0], length_counts:vec![0], pending_positions:vec![], length_positions:vec![], joint_counts:vec![(0,0)],
             }},

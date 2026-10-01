@@ -23,6 +23,77 @@ pub trait PlanningExecutionContext {
 }
 
 pub trait PlanningExecutionState<'epoch> {
+    fn bind_prefix_cache_capture(
+        &self,
+        _input: &super::PlanningPrefixCacheCaptureBindingInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>, PlanningUnknownReason>
+    {
+        poll()?;
+        Err(PlanningUnknownReason::UnknownResourceEvidence)
+    }
+
+    fn project_prefix_cache_capture(
+        &self,
+        _input: &super::PlanningPrefixCacheCaptureInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<super::ProjectedPrefixTransition<'epoch>>, PlanningUnknownReason> {
+        poll()?;
+        Err(PlanningUnknownReason::UnknownResourceEvidence)
+    }
+
+    fn bind_ready_prefix(
+        &self,
+        _input: &super::PlanningReadyPrefixInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>, PlanningUnknownReason>
+    {
+        poll()?;
+        Err(PlanningUnknownReason::UnknownResourceEvidence)
+    }
+
+    fn project_ready_prefix_restore(
+        &self,
+        _input: &super::PlanningReadyPrefixRestoreInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<super::ProjectedPrefixTransition<'epoch>>, PlanningUnknownReason> {
+        poll()?;
+        Err(PlanningUnknownReason::UnknownResourceEvidence)
+    }
+
+    /// Bind the current phase to this fresh captured physical state. This may
+    /// attach a private numeric token for an already retained checkpoint; it
+    /// must neither allocate nor charge its existing retention a second time.
+    /// A raw phase/offset is not completed-boundary or restore evidence.
+    fn bind_prefix_continuation(
+        &self,
+        _input: &super::PlanningPrefixContinuationInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>, PlanningUnknownReason>
+    {
+        poll()?;
+        Err(PlanningUnknownReason::UnknownResourceEvidence)
+    }
+
+    /// Optional complete checkpoint transition on this private physical branch.
+    /// Unsupported executors cannot acquire prefix readiness by changing a flag.
+    fn project_prefix_transition(
+        &self,
+        _input: &super::PlanningPrefixTransitionInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<super::ProjectedPrefixTransition<'epoch>>, PlanningUnknownReason> {
+        poll()?;
+        Err(PlanningUnknownReason::UnknownResourceEvidence)
+    }
+
+    /// Runtime-owned finite input scope for this captured execution epoch.
+    /// This does not replace the original route/resource/recipe validation.
+    fn cost_workload_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1> {
+        None
+    }
+
     fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
         Ok(PlanningGraphDomain::SnapshotExact)
     }
@@ -146,6 +217,147 @@ fn spend(remaining: &Cell<usize>) -> Result<(), PlanningUnknownReason> {
 }
 
 impl<'epoch> PlanningExecutionState<'epoch> for BoundedState<'epoch> {
+    fn bind_prefix_cache_capture(
+        &self,
+        input: &super::PlanningPrefixCacheCaptureBindingInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>, PlanningUnknownReason>
+    {
+        spend(self.remaining)?;
+        let Some(state) = checked(poll, |poll| {
+            self.state.bind_prefix_cache_capture(input, poll)
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            state,
+            remaining: self.remaining,
+            max_alternatives: self.max_alternatives,
+        })))
+    }
+
+    fn project_prefix_cache_capture(
+        &self,
+        input: &super::PlanningPrefixCacheCaptureInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<super::ProjectedPrefixTransition<'epoch>>, PlanningUnknownReason> {
+        spend(self.remaining)?;
+        let Some(projected) = checked(poll, |poll| {
+            self.state.project_prefix_cache_capture(input, poll)
+        })?
+        else {
+            return Ok(None);
+        };
+        if projected.cost_domain.shapes().len() > self.max_alternatives {
+            return Err(PlanningUnknownReason::ShapeCapacity);
+        }
+        Ok(Some(super::ProjectedPrefixTransition {
+            cost_domain: projected.cost_domain,
+            restored_frontier: projected.restored_frontier,
+            successor: Arc::new(Self {
+                state: projected.successor,
+                remaining: self.remaining,
+                max_alternatives: self.max_alternatives,
+            }),
+        }))
+    }
+
+    fn bind_ready_prefix(
+        &self,
+        input: &super::PlanningReadyPrefixInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>, PlanningUnknownReason>
+    {
+        spend(self.remaining)?;
+        let Some(state) = checked(poll, |poll| self.state.bind_ready_prefix(input, poll))? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            state,
+            remaining: self.remaining,
+            max_alternatives: self.max_alternatives,
+        })))
+    }
+
+    fn project_ready_prefix_restore(
+        &self,
+        input: &super::PlanningReadyPrefixRestoreInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<super::ProjectedPrefixTransition<'epoch>>, PlanningUnknownReason> {
+        spend(self.remaining)?;
+        let Some(projected) = checked(poll, |poll| {
+            self.state.project_ready_prefix_restore(input, poll)
+        })?
+        else {
+            return Ok(None);
+        };
+        if projected.cost_domain.shapes().len() > self.max_alternatives {
+            return Err(PlanningUnknownReason::ShapeCapacity);
+        }
+        Ok(Some(super::ProjectedPrefixTransition {
+            cost_domain: projected.cost_domain,
+            restored_frontier: projected.restored_frontier,
+            successor: Arc::new(Self {
+                state: projected.successor,
+                remaining: self.remaining,
+                max_alternatives: self.max_alternatives,
+            }),
+        }))
+    }
+
+    fn bind_prefix_continuation(
+        &self,
+        input: &super::PlanningPrefixContinuationInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>, PlanningUnknownReason>
+    {
+        spend(self.remaining)?;
+        let Some(state) = checked(poll, |poll| {
+            self.state.bind_prefix_continuation(input, poll)
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            state,
+            remaining: self.remaining,
+            max_alternatives: self.max_alternatives,
+        })))
+    }
+
+    fn project_prefix_transition(
+        &self,
+        input: &super::PlanningPrefixTransitionInput<'_>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<super::ProjectedPrefixTransition<'epoch>>, PlanningUnknownReason> {
+        spend(self.remaining)?;
+        let Some(projected) = checked(poll, |poll| {
+            self.state.project_prefix_transition(input, poll)
+        })?
+        else {
+            return Ok(None);
+        };
+        if projected.cost_domain.shapes().len() > self.max_alternatives {
+            return Err(PlanningUnknownReason::ShapeCapacity);
+        }
+        Ok(Some(super::ProjectedPrefixTransition {
+            cost_domain: projected.cost_domain,
+            restored_frontier: projected.restored_frontier,
+            successor: Arc::new(Self {
+                state: projected.successor,
+                remaining: self.remaining,
+                max_alternatives: self.max_alternatives,
+            }),
+        }))
+    }
+
+    fn cost_workload_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1> {
+        self.state.cost_workload_domain()
+    }
+
     fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
         self.state.graph_domain()
     }
@@ -185,6 +397,28 @@ pub(super) fn project<'epoch>(
     evidence_requirement: PlanningCostEvidenceRequirement,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<VerifiedExecution<'epoch>>, PlanningUnknownReason> {
+    project_observed(
+        snapshot,
+        requests,
+        work,
+        state,
+        retain_first_canonical,
+        evidence_requirement,
+        poll,
+        None,
+    )
+}
+
+pub(super) fn project_observed<'epoch>(
+    snapshot: &SchedulerSnapshot,
+    requests: &[RequestSchedulingView],
+    work: &[CandidateWork],
+    state: &dyn PlanningExecutionState<'epoch>,
+    retain_first_canonical: bool,
+    evidence_requirement: PlanningCostEvidenceRequirement,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    observation: Option<&super::observation::AttemptObservation<'_>>,
+) -> Result<Option<VerifiedExecution<'epoch>>, PlanningUnknownReason> {
     let prepared = shape::validate_work(snapshot, requests, work, poll)?;
     let Some((kind, rows, recurrent_state_bytes)) = prepared else {
         return Ok(None);
@@ -223,13 +457,32 @@ pub(super) fn project<'epoch>(
         poll,
     )?;
     let cost_evidence = if evidence_requirement != PlanningCostEvidenceRequirement::None {
-        bind_statistics_with_forecasts(
+        let domain = state.cost_workload_domain();
+        if evidence_requirement == PlanningCostEvidenceRequirement::StructuredV2 {
+            if let Some(domain) = domain {
+                let fingerprint = &snapshot.fingerprint;
+                let identity = ferrum_interfaces::execution_cost::ExecutorCostIdentity {
+                    schema_version:
+                        ferrum_interfaces::execution_cost::EXECUTOR_COST_IDENTITY_SCHEMA,
+                    model_weights: fingerprint.model_weights,
+                    numerical_policy: fingerprint.numerical_policy,
+                    device_runtime: fingerprint.device_runtime,
+                    execution_config: fingerprint.execution_config,
+                };
+                if !domain.matches_execution_identity(&identity) {
+                    return Err(PlanningUnknownReason::InvalidShapeEvidence);
+                }
+            }
+        }
+        bind_statistics_observed(
             &projected.canonical_domain,
             &execution_shape,
             projected.statistical_evidence.as_ref(),
             projected.host_content_forecasts.as_ref(),
+            domain,
             evidence_requirement,
             poll,
+            observation,
         )?
     } else {
         None
@@ -305,6 +558,12 @@ impl PlanningExecutionContext for ReplayContext<'_> {
 }
 
 impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
+    fn cost_workload_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1> {
+        self.context.resolver.cost_workload_domain()
+    }
+
     fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
         self.context.resolver.graph_domain()
     }
@@ -425,6 +684,32 @@ pub(super) fn bind_statistics_with_forecasts(
     requirement: PlanningCostEvidenceRequirement,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<PlanningShapeDomain<PlanningCostEvidence>>, PlanningUnknownReason> {
+    bind_statistics_observed(
+        canonical,
+        shapes,
+        statistics,
+        forecasts,
+        None,
+        requirement,
+        poll,
+        None,
+    )
+}
+
+pub(super) fn bind_statistics_observed(
+    canonical: &PlanningShapeDomain<CanonicalWaveCostShape>,
+    shapes: &PlanningShapeDomain<super::super::cost_model::WaveExecutionShape>,
+    statistics: Option<
+        &PlanningShapeDomain<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
+    >,
+    forecasts: Option<
+        &PlanningShapeDomain<ferrum_interfaces::execution_cost::HostContentForecastV2>,
+    >,
+    domain: Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1>,
+    requirement: PlanningCostEvidenceRequirement,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    observation: Option<&super::observation::AttemptObservation<'_>>,
+) -> Result<Option<PlanningShapeDomain<PlanningCostEvidence>>, PlanningUnknownReason> {
     let Some(statistics) = statistics else {
         return Ok(None);
     };
@@ -488,15 +773,19 @@ pub(super) fn bind_statistics_with_forecasts(
         .enumerate()
     {
         poll()?;
-        let Some(bound) = PlanningCostEvidence::bind_with_forecast(
+        let Some(bound) = PlanningCostEvidence::bind_with_forecast_and_domain(
             exact,
             shape,
             selected,
             requirement,
             forecasts.and_then(|domain| domain.shapes().get(index)),
+            domain,
         ) else {
             return Ok(None);
         };
+        if let Some(observation) = observation {
+            observation.constructed(index, bound.structured_query_v2_for(shape));
+        }
         evidence.push(bound);
     }
     poll()?;

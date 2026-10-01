@@ -251,6 +251,13 @@ pub enum SubmissionWaveDispatchStage {
     NodeInvocationConstruct,
     ProviderDynamicBindingEncode,
     BindingValidateAndCoalesce,
+    SelectedReplayCost,
+    ReplayCostIdentityAndResources,
+    ReplayCostMaterializeCached,
+    ReplayCostMaterializeUnmaterializedAttempt,
+    ReplayCostNumericResources,
+    ReplayCostFullExecutableResources,
+    ReplayCostProviderProjection,
     LaneReserve,
     DeviceRuntimeSubmit,
     CompletionArm,
@@ -305,6 +312,22 @@ where
             started: S::ENABLED.then(Instant::now),
         }
     }
+
+    /// The diagnostic probe runs only on the enabled timing path. It reports
+    /// the slot state before the attempt, not whether construction succeeds;
+    /// another shared owner may also publish that slot before the call.
+    #[inline(always)]
+    pub(super) fn start_replay_cost_materialize(
+        sink: &'sink S,
+        is_materialized: impl FnOnce() -> bool,
+    ) -> Self {
+        let stage = if S::ENABLED && is_materialized() {
+            SubmissionWaveDispatchStage::ReplayCostMaterializeCached
+        } else {
+            SubmissionWaveDispatchStage::ReplayCostMaterializeUnmaterializedAttempt
+        };
+        Self::start(sink, stage)
+    }
 }
 
 impl<S> Drop for SubmissionWaveDispatchStageTimer<'_, S>
@@ -353,6 +376,13 @@ mod submission_wave_dispatch_timing_tests {
             SubmissionWaveDispatchStage::NodeInvocationConstruct,
             SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+            SubmissionWaveDispatchStage::SelectedReplayCost,
+            SubmissionWaveDispatchStage::ReplayCostIdentityAndResources,
+            SubmissionWaveDispatchStage::ReplayCostMaterializeCached,
+            SubmissionWaveDispatchStage::ReplayCostMaterializeUnmaterializedAttempt,
+            SubmissionWaveDispatchStage::ReplayCostNumericResources,
+            SubmissionWaveDispatchStage::ReplayCostFullExecutableResources,
+            SubmissionWaveDispatchStage::ReplayCostProviderProjection,
         ] {
             let timer = SubmissionWaveDispatchStageTimer::start(&DisabledPanicSink, stage);
             assert!(timer.started.is_none());
@@ -360,6 +390,93 @@ mod submission_wave_dispatch_timing_tests {
         }
 
         assert!(!DisabledPanicSink::ENABLED);
+        let timer = SubmissionWaveDispatchStageTimer::start_replay_cost_materialize(
+            &DisabledPanicSink,
+            || panic!("disabled timing must not probe the identity cache"),
+        );
+        assert!(timer.started.is_none());
+        drop(timer);
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(std::sync::Mutex<Vec<SubmissionWaveDispatchStage>>);
+
+    impl RecordingSink {
+        fn take(&self) -> Vec<SubmissionWaveDispatchStage> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    impl DeviceSubmissionTimingSink for RecordingSink {
+        const ENABLED: bool = true;
+
+        fn record_device_submission(&self, _stage: DeviceSubmissionStage, _elapsed: Duration) {}
+    }
+
+    impl SubmissionWaveDispatchTimingSink for RecordingSink {
+        fn record(&self, stage: SubmissionWaveDispatchStage, _elapsed: Duration) {
+            self.0.lock().unwrap().push(stage);
+        }
+    }
+
+    #[test]
+    fn replay_cost_materialization_timing_preserves_early_return_attempts() {
+        use SubmissionWaveDispatchStage as Stage;
+
+        fn attempt(
+            sink: &RecordingSink,
+            cached: bool,
+            materialized: Option<()>,
+            resource_stage: Stage,
+            resources: Option<()>,
+        ) -> Option<()> {
+            let _parent = SubmissionWaveDispatchStageTimer::start(
+                sink,
+                Stage::ReplayCostIdentityAndResources,
+            );
+            let materialize =
+                SubmissionWaveDispatchStageTimer::start_replay_cost_materialize(sink, || cached);
+            materialized?;
+            drop(materialize);
+            let _resources = SubmissionWaveDispatchStageTimer::start(sink, resource_stage);
+            resources?;
+            Some(())
+        }
+
+        let sink = RecordingSink::default();
+        assert_eq!(
+            attempt(
+                &sink,
+                false,
+                None,
+                Stage::ReplayCostNumericResources,
+                Some(())
+            ),
+            None
+        );
+        assert_eq!(
+            sink.take(),
+            [
+                Stage::ReplayCostMaterializeUnmaterializedAttempt,
+                Stage::ReplayCostIdentityAndResources
+            ]
+        );
+        for stage in [
+            Stage::ReplayCostNumericResources,
+            Stage::ReplayCostFullExecutableResources,
+        ] {
+            for resources in [None, Some(())] {
+                assert_eq!(attempt(&sink, true, Some(()), stage, resources), resources);
+                assert_eq!(
+                    sink.take(),
+                    [
+                        Stage::ReplayCostMaterializeCached,
+                        stage,
+                        Stage::ReplayCostIdentityAndResources
+                    ]
+                );
+            }
+        }
     }
 }
 

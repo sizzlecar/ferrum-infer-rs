@@ -67,7 +67,12 @@ impl CublasHandleApiIdentity {
 
     #[cfg(test)]
     pub(super) fn fixture_identity() -> Self {
-        Self::checked(120900, 0, 0, 0, 0).unwrap()
+        Self::fixture_identity_for_version(120900)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture_identity_for_version(version: i32) -> Self {
+        Self::checked(version, 0, 0, 0, 0).unwrap()
     }
 
     fn signature(self) -> [u8; 32] {
@@ -172,6 +177,105 @@ pub(super) struct GemmF16ApiPlan {
     columns: i32,
     reduction: i32,
 }
+
+/// Immutable matrix/ABI portion compiled with a provider's plan-node binding.
+/// The runtime handle identity and M remain query inputs.
+pub(super) struct PreparedGemmF16Cost {
+    columns: i32,
+    reduction: i32,
+    parameters: [u64; 16],
+    layout: [u8; 32],
+}
+
+/// One synchronous query's observed identity, hashed once for all its matrices.
+#[derive(Clone, Copy)]
+pub(super) struct GemmCostQueryIdentity {
+    observed: CublasHandleApiIdentity,
+    signature: [u8; 32],
+}
+impl GemmCostQueryIdentity {
+    pub(super) fn new(observed: CublasHandleApiIdentity) -> Self {
+        Self {
+            observed,
+            signature: observed.signature(),
+        }
+    }
+}
+
+pub(super) struct BoundGemmF16Cost<'a> {
+    prepared: &'a PreparedGemmF16Cost,
+    observed: CublasHandleApiIdentity,
+    algorithm: SelectedAlgorithmClassV1,
+}
+
+impl PreparedGemmF16Cost {
+    pub(super) fn new(columns: i32, reduction: i32) -> Result<Self, CudaDeviceRuntimeError> {
+        let parameters = GemmF16ApiPlan::new(1, columns, reduction)?.parameters();
+        let mut layout = Sha256::new();
+        layout.update(b"ferrum.cuda.cublas.GemmEx.dense-f16-f32-fast.v1\0");
+        for (index, parameter) in parameters.iter().enumerate() {
+            if index != 3 {
+                layout.update(parameter.to_le_bytes());
+            }
+        }
+        Ok(Self {
+            columns,
+            reduction,
+            parameters,
+            layout: layout.finalize().into(),
+        })
+    }
+
+    pub(super) fn bind(
+        &self,
+        identity: GemmCostQueryIdentity,
+    ) -> Result<BoundGemmF16Cost<'_>, StatisticalEvidenceUnknown> {
+        Ok(BoundGemmF16Cost {
+            prepared: self,
+            observed: identity.observed,
+            algorithm: SelectedAlgorithmClassV1::library_api(
+                "cuda.cublasGemmEx",
+                1,
+                identity.signature,
+                self.layout,
+            )?,
+        })
+    }
+}
+
+impl BoundGemmF16Cost<'_> {
+    pub(super) fn append_selected(
+        &self,
+        builder: &mut SelectedCommandCostBuilderV1,
+        rows: i32,
+        columns: i32,
+        reduction: i32,
+        current: CublasHandleApiIdentity,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        if rows <= 0
+            || columns != self.prepared.columns
+            || reduction != self.prepared.reduction
+            || current != self.observed
+        {
+            return Err(StatisticalEvidenceUnknown::InvalidAlgorithm);
+        }
+        let mut parameters = self.prepared.parameters;
+        parameters[3] = rows as u64;
+        builder.library_call_with_replay_parameters(
+            self.algorithm,
+            LibraryApiNumericWorkV1 {
+                output_elements: (rows as u64)
+                    .checked_mul(columns as u64)
+                    .ok_or(StatisticalEvidenceUnknown::Overflow)?,
+                reduction_units_per_output: reduction as u64,
+            },
+            LibraryReplayParametersV1 {
+                fixed_parameters: &parameters,
+            },
+        )
+    }
+}
+
 impl GemmF16ApiPlan {
     pub(super) fn new(
         rows: i32,
@@ -387,6 +491,53 @@ mod tests {
             .unwrap()
             .validate_binding(&value)
             .unwrap();
+    }
+
+    #[test]
+    fn prepared_gemm_cost_keeps_exact_replay_and_rejects_identity_or_matrix_drift() {
+        let matrix = PreparedGemmF16Cost::new(64, 32).unwrap();
+        let observed = GemmCostQueryIdentity::new(identity());
+        let bound = matrix.bind(observed).unwrap();
+        for rows in [1, 4, 8, 1536] {
+            let mut original = SelectedCommandCostBuilderV1::new_with_algorithm_work(rows as u64);
+            GemmF16ApiPlan::new(rows, 64, 32)
+                .unwrap()
+                .append_selected(&mut original, identity())
+                .unwrap();
+            let mut prepared = SelectedCommandCostBuilderV1::new_with_algorithm_work(rows as u64);
+            bound
+                .append_selected(&mut prepared, rows, 64, 32, identity())
+                .unwrap();
+            assert_eq!(prepared.finish().unwrap(), original.finish().unwrap());
+        }
+        for (rows, n, k, current) in [
+            (0, 64, 32, identity()),
+            (4, 128, 32, identity()),
+            (4, 64, 64, identity()),
+            (
+                4,
+                64,
+                32,
+                CublasHandleApiIdentity::fixture_identity_for_version(130000),
+            ),
+        ] {
+            let mut builder = SelectedCommandCostBuilderV1::new_with_algorithm_work(4);
+            assert!(bound
+                .append_selected(&mut builder, rows, n, k, current)
+                .is_err());
+        }
+        let next = CublasHandleApiIdentity::fixture_identity_for_version(130000);
+        let rebound = matrix.bind(GemmCostQueryIdentity::new(next)).unwrap();
+        let mut prepared = SelectedCommandCostBuilderV1::new_with_algorithm_work(4);
+        rebound
+            .append_selected(&mut prepared, 4, 64, 32, next)
+            .unwrap();
+        let mut original = SelectedCommandCostBuilderV1::new_with_algorithm_work(4);
+        GemmF16ApiPlan::new(4, 64, 32)
+            .unwrap()
+            .append_selected(&mut original, next)
+            .unwrap();
+        assert_eq!(prepared.finish().unwrap(), original.finish().unwrap());
     }
 
     #[test]

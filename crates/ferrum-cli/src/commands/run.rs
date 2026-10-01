@@ -37,6 +37,7 @@ use ferrum_types::{has_unclosed_thinking_block, THINK_END_TAG};
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
 
+mod automatic_cost_probe;
 mod credited;
 pub(super) mod model_startup;
 
@@ -964,7 +965,7 @@ pub struct RunCommand {
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
-    /// Product observability detail level. Basic without artifact paths collects timing metrics only.
+    /// Product observability detail level. Basic without paths collects timing metrics; host collects only aggregate host timing and accepts no artifact paths.
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
@@ -1087,6 +1088,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     );
     if credited_output {
         credited::validate_observability(&product_observability)?;
+    }
+    if cmd.profile_detail == crate::observability_product::ProfileDetailArg::Host {
+        product_observability
+            .core
+            .validate()
+            .map_err(FerrumError::config)?;
     }
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
@@ -1352,12 +1359,33 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let numerical_execution = engine_config.numerical_execution.clone();
+    let probe_templates = automatic_cost_probe::templates(
+        &engine_config,
+        &cmd,
+        model_chat_template.as_ref(),
+        &chat_template_options,
+    );
     let engine_result = match (defined_model, model_sources.clone()) {
         (Some(prepared), _) => {
-            ferrum_engine::create_defined_product_engine(engine_config, prepared).await
+            ferrum_engine::create_defined_product_engine_with_automatic_cost_probes(
+                engine_config,
+                prepared,
+                probe_templates,
+            )
+            .await
         }
-        (None, Some(sources)) => ferrum_engine::create_product_engine(engine_config, sources).await,
-        (None, None) => ferrum_engine::create_default_engine(engine_config).await,
+        (None, Some(sources)) => {
+            ferrum_engine::create_product_engine_with_automatic_cost_probes(
+                engine_config,
+                sources,
+                probe_templates,
+            )
+            .await
+        }
+        (None, None) => {
+            ferrum_engine::create_engine_with_automatic_cost_probes(engine_config, probe_templates)
+                .await
+        }
     };
     let engine = match engine_result {
         Ok(engine) => engine,
@@ -3405,6 +3433,36 @@ mod tests {
             assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
             assert!(!engine.runtime.prefix_cache_enabled);
         }
+    }
+
+    #[test]
+    fn run_host_profile_detail_reaches_typed_engine_config_without_capture_paths() {
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Host;
+        let observability = crate::observability_product::ProductObservabilityConfig::new(
+            ferrum_types::ProfileEntrypoint::Run,
+            "model",
+            None,
+            cmd.profile_detail,
+            None,
+            None,
+            None,
+            cmd.profile_sample_rate,
+        );
+        credited::validate_observability(&observability).unwrap();
+        let effective = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::from_entries(Vec::new()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&effective).unwrap();
+        assert_eq!(
+            engine.runtime.profile_detail,
+            ferrum_types::ObservabilityProfileDetail::Host
+        );
+        assert!(engine.runtime.profile_jsonl.is_none());
+        assert!(engine.runtime.scheduler_trace_jsonl.is_none());
+        assert!(engine.runtime.validate_profile_observation().is_ok());
     }
 
     #[test]

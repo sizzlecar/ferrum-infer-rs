@@ -34,6 +34,9 @@ pub mod statistical;
 pub mod structured;
 pub mod structured_v2;
 
+mod maintenance_memory;
+pub use maintenance_memory::ExactMaintenanceMemoryRequirements;
+
 #[cfg(test)]
 #[path = "cost_model/expiry_tests.rs"]
 mod expiry_tests;

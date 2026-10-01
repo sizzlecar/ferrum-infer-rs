@@ -6,17 +6,19 @@ use super::super::{
     BatchWorkShape, ClaimedSubmissionWaveBacking, ContractVersion, DeviceDescriptor,
     DeviceReusableAddressScope, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
     EncodedDeviceOperation, EncodedReusableExecutionBindings, ExecutablePlanView,
-    LogicalBackingSliceAuthority, MemoryPlan, NodeId, OperationId, PlanHash, PlanId, ProviderId,
-    ProviderWorkspaceRequirement, SemanticValue, VNextError,
+    LogicalBackingSliceAuthority, MemoryPlan, NodeId, OperationId, PlanHash, PlanId, PlanNode,
+    ProviderId, ProviderWorkspaceRequirement, SemanticValue, VNextError,
 };
 use super::foundation::{canonical_sha256, invalid_operation};
 use super::invocation::PreparedOperationDispatchBinding;
 use super::resolved_value::resource_uses_packed_batch_coordinates;
 use super::{
-    AttributeId, BatchedOperationInvocation, CapabilityCatalog, EngineProviderDescriptor,
-    OperationContract, OperationCostRoute, OperationCostRouteRequest, OperationCostWorkRow,
-    OperationDescriptor, OperationFailure, OperationProviderDescriptor, ResolvedValueBinding,
-    ResolvedValueRole,
+    AttributeId, BatchedOperationInvocation, BoundDecodeContextCoverage, CapabilityCatalog,
+    DecodeContextCoverage, EngineProviderDescriptor, ExecutorDecodeContextCoverage,
+    OperationContract, OperationCostPreparationRequest, OperationCostRoute,
+    OperationCostRouteRequest, OperationCostSelection, OperationCostTopologyRequirement,
+    OperationCostWorkRow, OperationDescriptor, OperationFailure, OperationProviderDescriptor,
+    PreparedOperationCostData, ResolvedValueBinding, ResolvedValueRole,
 };
 
 /// Exact semantic input presented to a selected provider's resource estimator.
@@ -591,6 +593,27 @@ pub enum ReusableBindingResources {
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
+    /// Cold decode-context declarations for this exact selected plan node.
+    /// Unknown is distinct from a proven empty set of boundaries. This must
+    /// use the dispatch selector's immutable semantics and must not allocate
+    /// device resources, observe residency, or submit work.
+    fn decode_context_coverage(
+        &self,
+        _request: OperationCostPreparationRequest<'_>,
+    ) -> DecodeContextCoverage {
+        DecodeContextCoverage::default()
+    }
+
+    /// Compile immutable numerical inputs once for this exact selected node.
+    /// None keeps the original checked query path. This optional preparation
+    /// must not acquire execution resources or retain current request state.
+    fn prepare_cost_data(
+        &self,
+        _request: OperationCostPreparationRequest<'_>,
+    ) -> Option<PreparedOperationCostData> {
+        None
+    }
+
     /// Declares one eager route from immutable plan semantics and numerical
     /// work only. Unknown is the default; historical observations are not a
     /// future route proof. The caller still has to establish that eager is the
@@ -610,6 +633,32 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
         _request: OperationCostRouteRequest<'_>,
     ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
         Ok(None)
+    }
+
+    /// Select cost and, when required, graph topology for this one exact query.
+    /// Implementations may share their per-query numerical selection. They must
+    /// still read current library identity and prove all queried address scopes;
+    /// plan preparation and a previous query cannot stand in for either.
+    /// The caller polls around this callback. The default also polls between
+    /// the existing independent callbacks; eager-only work adds no extra poll.
+    fn future_cost_selection(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+        topology: OperationCostTopologyRequirement,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<Option<OperationCostSelection>, VNextError> {
+        let route = self.eager_cost_route(request)?;
+        let Some(route) = route else {
+            return Ok(None);
+        };
+        let topology = match topology {
+            OperationCostTopologyRequirement::NotRequested => None,
+            OperationCostTopologyRequirement::Required => {
+                poll()?;
+                self.reusable_execution_cost_topology(request)?
+            }
+        };
+        Ok(Some(OperationCostSelection::new(route, topology)))
     }
 
     /// Passive selected compute work for this real, core-created invocation
@@ -802,12 +851,24 @@ where
             node_id,
             provider.reusable_binding_resources(),
         )?;
+        let cost_data = provider.prepare_cost_data(OperationCostPreparationRequest::new(
+            dispatch.node(resolved, node_id)?,
+        ));
+        let decode_context_coverage = BoundDecodeContextCoverage {
+            node_id: node_id.clone(),
+            provider_id: provider.descriptor().provider_id().clone(),
+            coverage: provider.decode_context_coverage(OperationCostPreparationRequest::new(
+                dispatch.node(resolved, node_id)?,
+            )),
+        };
         Ok(BoundOperationProvider {
             provider: BoundOperationProviderSource::Borrowed(provider.as_ref()),
             plan_id: plan.payload().plan_id().clone(),
             plan_hash: plan.plan_hash().clone(),
             node_id: node_id.clone(),
             dispatch,
+            cost_data,
+            decode_context_coverage,
         })
     }
 
@@ -834,12 +895,22 @@ where
                     node.id(),
                     provider.reusable_binding_resources(),
                 )?;
+                let cost_data =
+                    provider.prepare_cost_data(OperationCostPreparationRequest::new(node));
+                let decode_context_coverage = BoundDecodeContextCoverage {
+                    node_id: node.id().clone(),
+                    provider_id: provider.descriptor().provider_id().clone(),
+                    coverage: provider
+                        .decode_context_coverage(OperationCostPreparationRequest::new(node)),
+                };
                 Ok(BoundOperationProvider {
                     provider: BoundOperationProviderSource::Owned(Arc::clone(provider)),
                     plan_id: plan.payload().plan_id().clone(),
                     plan_hash: plan.plan_hash().clone(),
                     node_id: node.id().clone(),
                     dispatch,
+                    cost_data,
+                    decode_context_coverage,
                 })
             })
             .collect::<Result<Vec<BoundOperationProvider<'static, R>>, _>>()?;
@@ -848,7 +919,50 @@ where
                 "executable plan cannot bind an empty provider set",
             ));
         }
-        Ok(BoundOperationProviderSet { providers })
+        // Keep dispatch order intact. Core uploads/readbacks refer to node IDs;
+        // this immutable index selects the already prepared node binding without
+        // scanning the entire executable again for every participant.
+        let mut nodes_by_id: Vec<_> = (0..providers.len()).collect();
+        nodes_by_id.sort_unstable_by(|&left, &right| {
+            providers[left].node_id.cmp(&providers[right].node_id)
+        });
+        let program_binding_count = resolved
+            .execution_plan()
+            .payload()
+            .nodes()
+            .iter()
+            .filter(|node| node.binding_resource().is_some())
+            .count();
+        let plan = resolved.execution_plan();
+        let topology_nodes = providers
+            .iter()
+            .zip(plan.payload().nodes())
+            .enumerate()
+            .map(|(index, (provider, node))| {
+                super::topology_digest::PreparedTopologyNode::new(
+                    index,
+                    index,
+                    node.id(),
+                    provider.descriptor().provider_id(),
+                    node.provider_execution_semantics().replay_equivalence(),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(BoundOperationProviderSet {
+            providers,
+            nodes_by_id,
+            program_binding_count,
+            cost_plan: PreparedCostPlanBinding {
+                plan_id: plan.payload().plan_id().clone(),
+                plan_hash: plan.plan_hash().clone(),
+                authority: plan.operation_registry_authority().clone(),
+                runtime_fingerprint: plan
+                    .payload()
+                    .device_runtime_implementation_fingerprint()
+                    .to_owned(),
+            },
+            topology_nodes,
+        })
     }
 
     fn selected_provider(
@@ -947,6 +1061,8 @@ where
     plan_hash: PlanHash,
     node_id: NodeId,
     dispatch: PreparedOperationDispatchBinding,
+    cost_data: Option<PreparedOperationCostData>,
+    decode_context_coverage: BoundDecodeContextCoverage,
 }
 
 impl<R> BoundOperationProvider<'_, R>
@@ -988,8 +1104,16 @@ where
         &self.dispatch
     }
 
+    pub(super) fn cost_data(&self) -> Option<&PreparedOperationCostData> {
+        self.cost_data.as_ref()
+    }
+
     pub fn descriptor(&self) -> &OperationProviderDescriptor {
         self.provider().descriptor()
+    }
+
+    pub fn decode_context_coverage(&self) -> &BoundDecodeContextCoverage {
+        &self.decode_context_coverage
     }
 
     /// Query the exact provider already bound to this plan, without creating
@@ -1007,6 +1131,8 @@ where
             node,
             resolved.execution_plan().payload().memory(),
             &rows,
+            &self.dispatch,
+            self.cost_data(),
         );
         self.query_eager_cost_route(request)
     }
@@ -1023,12 +1149,14 @@ where
             node,
             resolved.execution_plan().payload().memory(),
             rows,
+            &self.dispatch,
+            self.cost_data(),
         )
         .with_physical_ranges(physical_ranges);
         self.query_eager_cost_route(request)
     }
 
-    fn query_eager_cost_route(
+    pub(super) fn query_eager_cost_route(
         &self,
         request: OperationCostRouteRequest<'_>,
     ) -> Result<Option<OperationCostRoute>, VNextError> {
@@ -1041,6 +1169,16 @@ where
     }
 }
 
+/// Proof of complete immutable plan binding established by bind_plan. The
+/// private provider order and immutable ExecutionPlan payload cannot change
+/// while this proof is retained. This is not a request/resource/cost result.
+struct PreparedCostPlanBinding {
+    plan_id: PlanId,
+    plan_hash: PlanHash,
+    authority: OperationRegistryAuthority,
+    runtime_fingerprint: String,
+}
+
 /// Immutable provider selection for every node in one executable plan.
 ///
 /// Construction is restricted to [`OperationRuntimeRegistry::bind_plan`],
@@ -1051,14 +1189,86 @@ where
     R: DeviceRuntime,
 {
     providers: Vec<BoundOperationProvider<'static, R>>,
+    nodes_by_id: Vec<usize>,
+    program_binding_count: usize,
+    cost_plan: PreparedCostPlanBinding,
+    topology_nodes: Vec<super::topology_digest::PreparedTopologyNode>,
 }
 
 impl<R> BoundOperationProviderSet<R>
 where
     R: DeviceRuntime,
 {
+    /// Borrow the statically checked node order without repeating a complete
+    /// per-node binding walk. Exact plan/registry/runtime identity and total
+    /// node capacity remain mandatory on every independent projection.
+    /// Dynamic rows, resources, topology, and statistical work are not cached.
+    pub(super) fn prepared_cost_nodes<'plan>(
+        &self,
+        resolved: &'plan dyn ExecutablePlanView,
+    ) -> Result<&'plan [PlanNode], VNextError> {
+        let plan = resolved.execution_plan();
+        let nodes = plan.payload().nodes();
+        if nodes.is_empty()
+            || nodes.len() != self.providers.len()
+            || nodes.len() > crate::execution_cost::MAX_COST_COMMANDS
+            || plan.payload().plan_id() != &self.cost_plan.plan_id
+            || plan.plan_hash() != &self.cost_plan.plan_hash
+            || plan.operation_registry_authority() != &self.cost_plan.authority
+            || resolved.device().runtime_implementation_fingerprint
+                != self.cost_plan.runtime_fingerprint
+        {
+            return Err(invalid_operation(
+                "prepared cost plan identity or capacity differs",
+            ));
+        }
+        Ok(nodes)
+    }
+
+    pub(super) fn prepared_topology_node(
+        &self,
+        index: usize,
+    ) -> &super::topology_digest::PreparedTopologyNode {
+        &self.topology_nodes[index]
+    }
+
+    /// Static cardinality from the exact plan bound above. Live invocation
+    /// handles and physical layout availability are checked separately.
+    pub(super) fn program_binding_count(&self) -> usize {
+        self.program_binding_count
+    }
+
+    /// Locate plan metadata through the same sealed binding used by dispatch.
+    /// The index grants no resource, graph, or submission authority. Each use
+    /// still checks the original plan/hash/node binding against the caller.
+    pub(super) fn prepared_node<'plan>(
+        &self,
+        resolved: &'plan dyn ExecutablePlanView,
+        node_id: &NodeId,
+    ) -> Result<Option<&'plan PlanNode>, VNextError> {
+        let Ok(position) = self
+            .nodes_by_id
+            .binary_search_by(|&index| self.providers[index].node_id.cmp(node_id))
+        else {
+            return Ok(None);
+        };
+        let provider = &self.providers[self.nodes_by_id[position]];
+        provider.validate_binding(resolved, node_id)?;
+        provider.dispatch.node(resolved, node_id).map(Some)
+    }
+
     pub fn providers(&self) -> &[BoundOperationProvider<'static, R>] {
         &self.providers
+    }
+
+    pub fn decode_context_coverage(&self) -> ExecutorDecodeContextCoverage {
+        ExecutorDecodeContextCoverage {
+            nodes: self
+                .providers
+                .iter()
+                .map(|provider| provider.decode_context_coverage().clone())
+                .collect(),
+        }
     }
 
     pub fn len(&self) -> usize {

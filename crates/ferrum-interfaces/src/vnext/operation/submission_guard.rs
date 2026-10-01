@@ -38,11 +38,59 @@ pub trait PreparedWaveSubmissionGuard: Send + Sync {
 pub struct PendingGuardedWaveRejection {
     reason: GuardedNotSubmittedReason,
     step_id: BatchStepId,
+    invocation_id: crate::vnext::BatchInvocationId,
+    lane_id: crate::vnext::ExecutionLaneId,
 }
 
 impl PendingGuardedWaveRejection {
-    pub(super) fn new(reason: GuardedNotSubmittedReason, step_id: BatchStepId) -> Self {
-        Self { reason, step_id }
+    pub(super) fn new(
+        reason: GuardedNotSubmittedReason,
+        identity: &super::BatchOperationIdentity,
+    ) -> Self {
+        Self {
+            reason,
+            step_id: identity.batch_step_id(),
+            invocation_id: identity.batch_invocation_id(),
+            lane_id: identity.lane_id(),
+        }
+    }
+
+    /// The host names/frontiers must describe this exact real Step. Only the
+    /// successful rollback below can turn that checked binding into a receipt.
+    pub fn reconcile_step_with_observation<R: DeviceRuntime>(
+        self,
+        step: Arc<StepResourceLease<R>>,
+        expected: &crate::execution_cost::ExpectedWaveWork,
+    ) -> Result<GuardedNotSubmitted, (VNextError, Arc<StepResourceLease<R>>)> {
+        let rows = expected.participants();
+        let signature = crate::execution_cost::guarded_participant_signature(rows.len(), |i| {
+            let row = rows[i].selection();
+            (
+                &row.request_id,
+                row.owner_incarnation.get(),
+                row.work_generation.get(),
+            )
+        });
+        if expected.lane_id() != self.lane_id
+            || step.execution_lane().id() != self.lane_id
+            || expected.plan_hash() != step.plan_evidence().plan_hash()
+            || !step.matches_planning_participants(rows.iter().map(|row| row.resource()))
+            || signature.is_none()
+        {
+            // Missing observation correlation must not alter the executor's
+            // rollback or request-preservation semantics. It cannot mint the
+            // optional observation proof; the original rollback still applies.
+            return self.reconcile_step(step);
+        }
+        let binding = crate::execution_cost::GuardRollbackObservationBinding {
+            batch_step: self.step_id.get(),
+            batch_invocation: self.invocation_id.get(),
+            lane_id: self.lane_id.get(),
+            participant_count: rows.len(),
+            participant_signature: signature.expect("checked above"),
+        };
+        self.reconcile_step(step)
+            .map(|receipt| receipt.with_observation(binding))
     }
 
     pub fn reconcile_step<R: DeviceRuntime>(

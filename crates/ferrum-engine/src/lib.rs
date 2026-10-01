@@ -90,10 +90,10 @@ pub use continuous_engine::{
     CalibrationFrontier, CalibrationLimits, CalibrationObservation, CalibrationProfileArtifact,
     CalibrationProfilePaths, CalibrationQueueDisposition, CalibrationReferenceArtifact,
     CalibrationReferenceCollector, CalibrationReferenceCurve, CalibrationReferenceDiscoverySample,
-    CalibrationReferencePlan, CalibrationReferenceTrial, CalibrationRequestEvidence,
-    CalibrationSession, CalibrationSubmissionState, CalibrationTurn, CalibrationWaveReport,
-    CalibrationWork, ContinuousBatchEngine, FrozenCalibrationModel, ImportedCalibrationModel,
-    SequenceState,
+    CalibrationReferencePlan, CalibrationReferenceSourceV1, CalibrationReferenceTrial,
+    CalibrationRequestEvidence, CalibrationSession, CalibrationSubmissionState, CalibrationTurn,
+    CalibrationWaveReport, CalibrationWork, ContinuousBatchEngine, FrozenCalibrationModel,
+    ImportedCalibrationModel, SequenceState,
 };
 pub use continuous_engine::{
     CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleaseProgressV5,
@@ -109,9 +109,18 @@ pub use recurrent_state::{
     InMemoryRecurrentStateConfig, InMemoryRecurrentStateHandle, InMemoryRecurrentStateManager,
 };
 
+mod automatic_cost_probe;
+pub use automatic_cost_probe::{
+    AutomaticCostProbeOutput, AutomaticCostProbePromptBudget, AutomaticCostProbePromptLimits,
+    AutomaticCostProbePromptRenderer, AutomaticCostProbePromptUsage,
+    AutomaticCostProbePromptVariant, AutomaticCostProbeTemplate,
+};
+
 // Re-exports of builder
 pub use builder::{
-    create_defined_product_engine, create_engine, create_product_engine, EngineBuilder,
+    create_defined_product_engine, create_defined_product_engine_with_automatic_cost_probes,
+    create_engine, create_engine_with_automatic_cost_probes, create_product_engine,
+    create_product_engine_with_automatic_cost_probes, EngineBuilder,
 };
 
 // Re-exports of registry

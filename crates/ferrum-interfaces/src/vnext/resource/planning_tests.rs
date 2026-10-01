@@ -1,6 +1,9 @@
 //! Uses the real resource allocator/admission fixtures, without a GPU.
 use super::*;
 
+#[path = "planning_pool_cow_tests.rs"]
+mod pool_cow;
+
 fn known<T: std::fmt::Debug>(value: ResourcePlanningAvailability<T>) -> T {
     match value {
         ResourcePlanningAvailability::Known(value) => value,
@@ -547,3 +550,231 @@ fn planning_reversed_product_order_matches_real_canonical_extensions() {
 
 #[path = "planning_workspace_tests.rs"]
 mod workspace;
+
+#[test]
+fn planning_unmaterialized_capacity_stays_unknown_until_real_growth() {
+    // Incremental growth creates two distinct 64-byte backing chunks. Paged
+    // storage can use both; a contiguous 128-byte request must remain blocked
+    // and is covered by planning_contiguous_fragmentation_is_not_total_free_capacity.
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Step,
+        '8',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(Arc::clone(&runtime), catalog, 128, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 64)
+        .unwrap();
+    let sequence = admitted_sequence_with_ceiling(&harness.root, "materialize", 4);
+    let session = sequence.open_session().unwrap();
+    let before = view(&harness.root, &[&session]);
+    let allocated = runtime.allocate_calls();
+    assert!(matches!(
+        harness.root.project_resource_wave(
+            &before,
+            &before.initial_state(),
+            &[row(0, 0, 2)],
+            &mut || true
+        ),
+        ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::UnmaterializedCapacity)
+    ));
+    assert_eq!(
+        runtime.allocate_calls(),
+        allocated,
+        "projection must not materialize capacity"
+    );
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 64)
+        .unwrap();
+    let after = view(&harness.root, &[&session]);
+    assert!(!before.same_live_evidence(&after));
+    // Growth does not update an earlier immutable capture.
+    assert!(matches!(
+        harness.root.project_resource_wave(
+            &before,
+            &before.initial_state(),
+            &[row(0, 0, 2)],
+            &mut || true
+        ),
+        ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::UnmaterializedCapacity)
+    ));
+    known(harness.root.project_resource_wave(
+        &after,
+        &after.initial_state(),
+        &[row(0, 0, 2)],
+        &mut || true,
+    ));
+    session.try_abort_if_quiescent().unwrap();
+    drop(session);
+    drop(sequence);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn planning_later_row_hard_ceiling_is_not_hidden_by_first_growable_claim() {
+    for maximum in [320, 384] {
+        let catalog = pool_catalog(
+            paged_profile(),
+            AllocationLifetime::Sequence,
+            '9',
+            1,
+            maximum,
+            TestDemand::Tokens,
+        );
+        let runtime = new_runtime(&catalog, maximum);
+        let harness = harness(Arc::clone(&runtime), catalog, maximum, false);
+        harness
+            .root
+            .maintenance_controller
+            .grow_pool(&harness.pool_ids[0], 192)
+            .unwrap();
+        let first = admitted_sequence_with_ceiling(&harness.root, "first-unmaterialized", 4);
+        let second = admitted_sequence_with_ceiling(&harness.root, "second-unmaterialized", 4);
+        let a = first.open_session().unwrap();
+        let b = second.open_session().unwrap();
+        let snapshot = view(&harness.root, &[&a, &b]);
+        let allocated = runtime.allocate_calls();
+        // The two live one-token rows own 128 bytes. Each future row requires
+        // another 128. Current availability is 64; both original ceilings fit
+        // one future row, but only the 384-byte ceiling fits them together.
+        assert!(matches!(
+            harness.root.project_resource_wave(
+                &snapshot,
+                &snapshot.initial_state(),
+                &[row(0, 1, 2)],
+                &mut || true
+            ),
+            ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::UnmaterializedCapacity)
+        ));
+        let expected = if maximum == 320 {
+            ResourcePlanningUnknown::LogicalCapacity
+        } else {
+            ResourcePlanningUnknown::UnmaterializedCapacity
+        };
+        for rows in [[row(0, 1, 2), row(1, 1, 2)], [row(1, 1, 2), row(0, 1, 2)]] {
+            assert!(
+                matches!(harness.root.project_resource_wave(&snapshot, &snapshot.initial_state(), &rows, &mut || true),
+                ResourcePlanningAvailability::Unknown(reason) if reason == expected)
+            );
+        }
+        assert_eq!(runtime.allocate_calls(), allocated);
+        harness
+            .root
+            .maintenance_controller
+            .grow_pool(&harness.pool_ids[0], maximum - 192)
+            .unwrap();
+        let materialized = view(&harness.root, &[&a, &b]);
+        let projected = harness.root.project_resource_wave(
+            &materialized,
+            &materialized.initial_state(),
+            &[row(0, 1, 2), row(1, 1, 2)],
+            &mut || true,
+        );
+        if maximum == 384 {
+            let projected = known(projected);
+            assert_eq!(projected.state.covered_tokens(0), Some(3));
+            assert_eq!(projected.state.covered_tokens(1), Some(3));
+        } else {
+            assert!(matches!(
+                projected,
+                ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::LogicalCapacity)
+            ));
+        }
+        a.try_abort_if_quiescent().unwrap();
+        b.try_abort_if_quiescent().unwrap();
+        drop(a);
+        drop(b);
+        drop(first);
+        drop(second);
+        close_dynamic_test_root(harness.root);
+    }
+}
+
+#[test]
+fn planning_step_and_invocation_share_one_current_and_maximum_wave_ledger() {
+    for maximum in [192, 256] {
+        let mut catalog = pool_catalog(
+            linear_profile(),
+            AllocationLifetime::Step,
+            '6',
+            2,
+            maximum,
+            TestDemand::Tokens,
+        );
+        let node_id = NodeId::try_from("node.shared-step-invocation-capacity".to_owned()).unwrap();
+        let step_id = catalog.descriptors[0].base_resource_id().clone();
+        let invocation_id = catalog.descriptors[1].base_resource_id().clone();
+        let mut descriptor = serde_json::to_value(&catalog.descriptors[1]).unwrap();
+        descriptor["lifetime"] = json!("invocation");
+        catalog.descriptors[1] = serde_json::from_value(descriptor).unwrap();
+        let mut pool = serde_json::to_value(&catalog.pools[0]).unwrap();
+        pool["minimum_step_bytes"] = json!(64);
+        pool["minimum_invocation_peak_bytes"] = json!(64);
+        pool["step_resource_slots"] = json!([{"kind": "dedicated", "resource_ids": [step_id]}]);
+        pool["invocation_liveness_mode"] = json!("total_order_reuse");
+        pool["invocation_liveness"] =
+            json!([{"node_id": node_id, "resource_ids": [invocation_id]}]);
+        catalog.pools[0] = serde_json::from_value(pool).unwrap();
+        let runtime = new_runtime(&catalog, maximum);
+        let harness = harness_with_nodes(
+            Arc::clone(&runtime),
+            catalog,
+            maximum,
+            false,
+            Arc::from(vec![PlanNode::resource_test_node(node_id)]),
+        );
+        harness
+            .root
+            .maintenance_controller
+            .grow_pool(&harness.pool_ids[0], 128)
+            .unwrap();
+        let sequence = admitted_sequence_with_ceiling(&harness.root, "overlapping-lifetimes", 4);
+        let session = sequence.open_session().unwrap();
+        let snapshot = view(&harness.root, &[&session]);
+        let allocated = runtime.allocate_calls();
+        let expected = if maximum == 192 {
+            ResourcePlanningUnknown::LogicalCapacity
+        } else {
+            ResourcePlanningUnknown::UnmaterializedCapacity
+        };
+        assert!(
+            matches!(harness.root.project_resource_wave(&snapshot, &snapshot.initial_state(), &[row(0, 0, 2)], &mut || true),
+            ResourcePlanningAvailability::Unknown(reason) if reason == expected)
+        );
+        assert_eq!(runtime.allocate_calls(), allocated);
+        if maximum == 256 {
+            harness
+                .root
+                .maintenance_controller
+                .grow_pool(&harness.pool_ids[0], 128)
+                .unwrap();
+            let materialized = view(&harness.root, &[&session]);
+            let projected = known(harness.root.project_resource_wave(
+                &materialized,
+                &materialized.initial_state(),
+                &[row(0, 0, 2)],
+                &mut || true,
+            ));
+            assert_eq!(projected.domains.len(), 1);
+            assert_eq!(projected.domains[0].transient_peak_bytes, 256);
+            assert_eq!(
+                projected
+                    .state
+                    .available_in_domain(projected.domains[0].domain),
+                Some(256)
+            );
+        }
+        session.try_abort_if_quiescent().unwrap();
+        drop(session);
+        drop(sequence);
+        close_dynamic_test_root(harness.root);
+    }
+}

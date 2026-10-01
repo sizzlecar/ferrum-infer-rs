@@ -5,6 +5,88 @@ fn size(n: u64) -> Result<usize, FerrumError> {
 fn hex(hash: &[u8; 32]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+fn catalog_inventory_sha256(children: &[ferrum_types::SloStructuredChildReceiptV2]) -> [u8; 32] {
+    let mut inventory = Sha256::new();
+    inventory.update(b"ferrum.structured-v2-catalog-content-inventory.v1\0");
+    inventory.update((children.len() as u64).to_le_bytes());
+    for child in children {
+        inventory.update(child.domain_signature);
+        inventory.update(child.owner_sha256);
+        inventory.update(child.scope_sha256);
+        inventory.update(child.profile_sha256);
+        inventory.update(child.source_sha256);
+        inventory.update(child.parameters_sha256);
+        inventory.update(child.profile_bytes.to_le_bytes());
+        inventory.update(child.source_bytes.to_le_bytes());
+    }
+    inventory.finalize().into()
+}
+
+/// Select the installed subset of an already verified complete source8 import.
+/// Source bytes, all offered work, original clocks and child provenance stay
+/// intact. Only the selected child inventory is narrowed, before publication.
+pub(super) fn retain_startup_catalog_children(
+    receipt: &mut SloCostProfileReceipt,
+    original: &[ImportedStructuredModelV2],
+    keep: &[bool],
+) -> Result<(), FerrumError> {
+    let declared = receipt
+        .structured_whole_wave_v2
+        .as_mut()
+        .ok_or_else(|| FerrumError::config("startup subset lacks structured receipt"))?;
+    if receipt.schema_version != 15
+        || declared.artifact_kind
+            != ferrum_types::SloStructuredArtifactKindV2::PreparedOwnerBlockCatalogV15
+        || original.is_empty()
+        || original.len() != keep.len()
+        || declared.child_count != original.len()
+        || declared.children.len() != original.len()
+        || declared
+            .children
+            .windows(2)
+            .any(|pair| pair[0].domain_signature >= pair[1].domain_signature)
+        || declared.source_inventory_sha256 != Some(catalog_inventory_sha256(&declared.children))
+    {
+        return Err(FerrumError::config(
+            "startup subset original inventory differs",
+        ));
+    }
+    // Validate even the children that structural selection will omit. A bad
+    // original receipt must never become acceptable by filtering that record.
+    for record in &declared.children {
+        let model = original
+            .iter()
+            .find(|child| child.domain_signature() == &record.domain_signature)
+            .ok_or_else(|| FerrumError::config("startup subset original owner missing"))?;
+        if record != &child(model)? {
+            return Err(FerrumError::config(
+                "startup subset original source binding differs",
+            ));
+        }
+    }
+    if !keep.iter().any(|keep| *keep) {
+        return Err(FerrumError::config(
+            "startup source has no effective catalog extension; original structural coverage retained",
+        ));
+    }
+    declared.children.retain(|record| {
+        original
+            .iter()
+            .zip(keep)
+            .any(|(model, keep)| *keep && model.domain_signature() == &record.domain_signature)
+    });
+    declared.child_count = declared.children.len();
+    declared.source_inventory_sha256 = Some(catalog_inventory_sha256(&declared.children));
+    receipt.bucket_count = declared.child_count;
+    // Physical source totals above intentionally remain totals of the complete
+    // original capture. Reserved members describe the selected model inventory.
+    receipt.recorded_samples = size(declared.children.iter().try_fold(0u64, |sum, child| {
+        sum.checked_add(child.reserved_members)
+            .ok_or_else(|| FerrumError::config("startup subset member count overflow"))
+    })?)?;
+    Ok(())
+}
 pub(super) fn child(
     imported: &ImportedStructuredModelV2,
 ) -> Result<ferrum_types::SloStructuredChildReceiptV2, FerrumError> {
@@ -31,6 +113,8 @@ pub(super) fn child(
             parameters_sha256: v.parameters_sha256,
         });
     Ok(ferrum_types::SloStructuredChildReceiptV2 {
+        storage: p.storage,
+        clock_basis: p.clock_basis,
         profile_path: p.loaded_from.clone(),
         profile_sha256: p.file_sha256,
         profile_bytes: p.file_bytes,
@@ -64,7 +148,11 @@ pub(super) fn single(
     declared: u64,
 ) -> Result<SloCostProfileReceipt, FerrumError> {
     let p = imported.provenance();
+    let producer: serde_json::Value =
+        serde_json::from_str(p.producer.get()).map_err(profile_error)?;
     Ok(SloCostProfileReceipt {
+        storage: ferrum_types::SloCostProfileStorage::File,
+        clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
         selected_whole_wave: None,
         structured_whole_wave: None,
         structured_whole_wave_v2: Some(ferrum_types::SloStructuredWholeWaveReceiptV2 {
@@ -86,7 +174,7 @@ pub(super) fn single(
         generated_unix_ns: p.generated_unix_ns,
         loaded_unix_ns: p.loaded_unix_ns,
         conservative_clock_error_ns: p.conservative_clock_error_ns,
-        declared_local_clock_max_error_ns: declared,
+        declared_local_clock_max_error_ns: Some(declared),
         oldest_imported_age_ns: Some(p.oldest_imported_age_ns),
         newest_imported_age_ns: Some(p.newest_imported_age_ns),
         offered_samples: size(p.offered_attempts)?,
@@ -95,17 +183,17 @@ pub(super) fn single(
         skipped_samples: Default::default(),
         model_version: 1,
         bucket_count: 1,
-        source_generator: p.producer["executable_path"]
+        source_generator: producer["executable_path"]
             .as_str()
             .ok_or_else(|| FerrumError::config("source3 validated producer missing"))?
             .into(),
-        source_generator_revision: p.producer["source_revision"]
+        source_generator_revision: producer["source_revision"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| {
                 format!(
                     "package:{}",
-                    p.producer["package_version"]
+                    producer["package_version"]
                         .as_str()
                         .unwrap_or("unspecified")
                 )
@@ -118,7 +206,7 @@ pub(super) fn single(
 /// Outer source hash identifies the sorted child-content inventory. It is not
 /// a fabricated raw observation source; every original source is in children.
 pub(super) fn catalog(
-    path: &Path,
+    path: Option<&Path>,
     digest: [u8; 32],
     metadata_bytes: usize,
     snapshot: &StructuredSnapshot,
@@ -141,22 +229,11 @@ pub(super) fn catalog(
         a.checked_add(b)
             .ok_or_else(|| FerrumError::config("catalog receipt total overflow"))
     };
-    let mut inventory = Sha256::new();
-    inventory.update(b"ferrum.structured-v2-catalog-content-inventory.v1\0");
-    inventory.update((snapshot.len() as u64).to_le_bytes());
     // BTreeMap canonical domain order; paths locate artifacts but are not an
     // alternative model identity. Profile bytes already bind original source path.
-    for (domain, model) in snapshot.children.iter() {
+    for model in snapshot.children.values() {
         let p = model.provenance();
         let r = child(model)?;
-        inventory.update(domain);
-        inventory.update(r.owner_sha256);
-        inventory.update(r.scope_sha256);
-        inventory.update(p.file_sha256);
-        inventory.update(p.source_sha256);
-        inventory.update(p.parameters_sha256);
-        inventory.update(p.file_bytes.to_le_bytes());
-        inventory.update(p.source_bytes.to_le_bytes());
         total_bytes = add(add(total_bytes, p.file_bytes)?, p.source_bytes)?;
         total_rows = add(total_rows, p.total_shape_rows)?;
         offered = add(offered, p.offered_attempts)?;
@@ -173,8 +250,14 @@ pub(super) fn catalog(
         loaded = Some(p.loaded_unix_ns);
         children.push(r);
     }
-    let source_inventory: [u8; 32] = inventory.finalize().into();
+    let source_inventory = catalog_inventory_sha256(&children);
     Ok(SloCostProfileReceipt {
+        storage: if path.is_some() {
+            ferrum_types::SloCostProfileStorage::File
+        } else {
+            ferrum_types::SloCostProfileStorage::Memory
+        },
+        clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
         selected_whole_wave: None,
         structured_whole_wave: None,
         structured_whole_wave_v2: Some(ferrum_types::SloStructuredWholeWaveReceiptV2 {
@@ -187,14 +270,14 @@ pub(super) fn catalog(
             children,
         }),
         schema_version: 1,
-        path: path.into(),
+        path: path.map(Path::to_path_buf),
         file_sha256: format!("sha256:{}", hex(&digest)),
         file_bytes: metadata_bytes,
         // Catalog has no new measurement clock; report latest original close.
         generated_unix_ns: generated,
         loaded_unix_ns: loaded.unwrap(),
         conservative_clock_error_ns: error,
-        declared_local_clock_max_error_ns: declared,
+        declared_local_clock_max_error_ns: Some(declared),
         oldest_imported_age_ns: Some(oldest),
         newest_imported_age_ns: Some(newest),
         offered_samples: size(offered)?,
@@ -221,7 +304,7 @@ pub(super) fn shared(
     declared: u64,
 ) -> Result<SloCostProfileReceipt, FerrumError> {
     let mut receipt = catalog(
-        path,
+        Some(path),
         imported.file_sha256,
         size(imported.file_bytes)?,
         snapshot,
@@ -254,7 +337,7 @@ pub(super) fn prefix(
     declared: u64,
 ) -> Result<SloCostProfileReceipt, FerrumError> {
     let mut receipt = catalog(
-        path,
+        Some(path),
         imported.file_sha256,
         size(imported.file_bytes)?,
         snapshot,
@@ -275,6 +358,145 @@ pub(super) fn prefix(
     receipt.source_generator_revision = "12".into();
     receipt.source_measurement_protocol =
         format!("source5:sha256:{}", hex(&imported.capture_protocol));
+    receipt.source_observation_artifact_sha256 = imported.source_sha256;
+    Ok(receipt)
+}
+
+pub(super) fn service(
+    path: Option<&Path>,
+    imported: &file::ImportedStructuredCatalogV13,
+    snapshot: &StructuredSnapshot,
+    declared: Option<u64>,
+) -> Result<SloCostProfileReceipt, FerrumError> {
+    let mut receipt = catalog(
+        path,
+        imported.file_sha256,
+        size(imported.file_bytes)?,
+        snapshot,
+        declared.unwrap_or(0),
+    )?;
+    receipt.declared_local_clock_max_error_ns = declared;
+    receipt.clock_basis = imported.children[0].provenance().clock_basis;
+    if imported.children.iter().any(|c| {
+        c.provenance().clock_basis != receipt.clock_basis
+            || c.provenance().storage != receipt.storage
+            || c.provenance().loaded_from.as_deref() != path
+    }) {
+        return Err(FerrumError::config(
+            "service catalog mixes clock bases or storage locations",
+        ));
+    }
+    let v2 = receipt.structured_whole_wave_v2.as_mut().unwrap();
+    v2.artifact_kind = ferrum_types::SloStructuredArtifactKindV2::ServiceWindowCatalogV13;
+    v2.total_imported_bytes = imported
+        .file_bytes
+        .checked_add(imported.source_bytes)
+        .ok_or_else(|| FerrumError::config("service imported byte count overflow"))?;
+    v2.total_shape_rows = imported.total_shape_rows;
+    receipt.schema_version = 13;
+    receipt.offered_samples = size(imported.offered_attempts)?;
+    receipt.source_generator = "ferrum.structured-service-window-catalog".into();
+    receipt.source_generator_revision = "13".into();
+    receipt.source_measurement_protocol =
+        format!("source6:sha256:{}", hex(&imported.capture_protocol));
+    receipt.source_observation_artifact_sha256 = imported.source_sha256;
+    Ok(receipt)
+}
+
+// Source7 preserves its original global block prefix and per-owner phases.
+pub(super) fn owner_blocks(
+    path: Option<&Path>,
+    imported: &file::ImportedStructuredCatalogV14,
+    snapshot: &StructuredSnapshot,
+    declared: Option<u64>,
+) -> Result<SloCostProfileReceipt, FerrumError> {
+    if imported.journal_bytes < imported.source_bytes
+        || (path.is_none() && imported.journal_bytes != imported.source_bytes)
+    {
+        return Err(FerrumError::config(
+            "owner block catalog journal and checkpoint byte accounting differ",
+        ));
+    }
+    let mut receipt = catalog(
+        path,
+        imported.file_sha256,
+        size(imported.file_bytes)?,
+        snapshot,
+        declared.unwrap_or(0),
+    )?;
+    receipt.declared_local_clock_max_error_ns = declared;
+    receipt.clock_basis = imported.children[0].provenance().clock_basis;
+    if imported.children.iter().any(|c| {
+        c.provenance().clock_basis != receipt.clock_basis
+            || c.provenance().storage != receipt.storage
+            || c.provenance().loaded_from.as_deref() != path
+    }) {
+        return Err(FerrumError::config(
+            "owner block catalog mixes clock bases or storage locations",
+        ));
+    }
+    let v2 = receipt.structured_whole_wave_v2.as_mut().unwrap();
+    v2.artifact_kind = ferrum_types::SloStructuredArtifactKindV2::OwnerBlockCatalogV14;
+    v2.total_imported_bytes = imported
+        .file_bytes
+        .checked_add(imported.journal_bytes)
+        .ok_or_else(|| FerrumError::config("owner block imported byte count overflow"))?;
+    v2.total_shape_rows = imported.total_shape_rows;
+    receipt.schema_version = 14;
+    receipt.offered_samples = size(imported.offered_attempts)?;
+    receipt.source_generator = "ferrum.structured-owner-block-catalog".into();
+    receipt.source_generator_revision = "14".into();
+    receipt.source_measurement_protocol =
+        format!("source7:sha256:{}", hex(&imported.capture_protocol));
+    receipt.source_observation_artifact_sha256 = imported.source_sha256;
+    Ok(receipt)
+}
+
+// Source8 binds preparation and ordinary suffixes to the same original journal.
+pub(super) fn prepared_owner_blocks(
+    path: Option<&Path>,
+    imported: &file::ImportedPreparedOwnerBlockCatalogV15,
+    snapshot: &StructuredSnapshot,
+    declared: Option<u64>,
+) -> Result<SloCostProfileReceipt, FerrumError> {
+    if imported.journal_bytes < imported.source_bytes
+        || (path.is_none() && imported.journal_bytes != imported.source_bytes)
+    {
+        return Err(FerrumError::config(
+            "prepared owner block catalog journal and checkpoint byte accounting differ",
+        ));
+    }
+    let mut receipt = catalog(
+        path,
+        imported.file_sha256,
+        size(imported.file_bytes)?,
+        snapshot,
+        declared.unwrap_or(0),
+    )?;
+    receipt.declared_local_clock_max_error_ns = declared;
+    receipt.clock_basis = imported.children[0].provenance().clock_basis;
+    if imported.children.iter().any(|c| {
+        c.provenance().clock_basis != receipt.clock_basis
+            || c.provenance().storage != receipt.storage
+            || c.provenance().loaded_from.as_deref() != path
+    }) {
+        return Err(FerrumError::config(
+            "prepared owner block catalog mixes clock bases or storage locations",
+        ));
+    }
+    let v2 = receipt.structured_whole_wave_v2.as_mut().unwrap();
+    v2.artifact_kind = ferrum_types::SloStructuredArtifactKindV2::PreparedOwnerBlockCatalogV15;
+    v2.total_imported_bytes = imported
+        .file_bytes
+        .checked_add(imported.journal_bytes)
+        .ok_or_else(|| FerrumError::config("prepared owner block imported byte count overflow"))?;
+    v2.total_shape_rows = imported.total_shape_rows;
+    receipt.schema_version = 15;
+    receipt.offered_samples = size(imported.offered_attempts)?;
+    receipt.source_generator = "ferrum.structured-prepared-owner-block-catalog".into();
+    receipt.source_generator_revision = "15".into();
+    receipt.source_measurement_protocol =
+        format!("source8:sha256:{}", hex(&imported.capture_protocol));
     receipt.source_observation_artifact_sha256 = imported.source_sha256;
     Ok(receipt)
 }

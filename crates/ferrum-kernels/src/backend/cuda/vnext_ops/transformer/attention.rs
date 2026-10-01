@@ -68,7 +68,7 @@ mod launch_geometry;
 mod native_projection;
 mod precision;
 mod prepared;
-mod selected;
+pub(super) mod selected;
 use crate::backend::cuda::vnext_ops::native_blocks::q8_f32scale::Q8F32ScaleKernels;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
 use precision::AttentionPrecision;
@@ -168,6 +168,8 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("attention/prepared.rs"),
             include_bytes!("attention/launch_geometry.rs"),
             include_bytes!("attention/selected.rs"),
+            include_bytes!("attention/selected/classes.rs"),
+            include_bytes!("attention/selected/query.rs"),
             precision.operation().as_bytes(),
             include_bytes!("attention/precision.rs"),
             include_bytes!("gguf_f16_projection.rs"),
@@ -211,6 +213,8 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("attention/prepared.rs"),
             include_bytes!("attention/launch_geometry.rs"),
             include_bytes!("attention/selected.rs"),
+            include_bytes!("attention/selected/classes.rs"),
+            include_bytes!("attention/selected/query.rs"),
             include_bytes!("attention/precision.rs"),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("cublas_api.rs"),
@@ -529,6 +533,26 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         ))
     }
 
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        if request.operation_id().as_str() != self.precision.operation() {
+            return None;
+        }
+        cost_route::PreparedCostData::new(
+            request.operation_id(),
+            request.bindings(),
+            request.attributes(),
+            self.precision,
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
+        .ok()
+        .flatten()
+        .map(ferrum_interfaces::vnext::PreparedOperationCostData::new)
+    }
+
     fn eager_cost_route(
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
@@ -546,6 +570,25 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
 
     fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
         ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+    }
+
+    fn future_cost_selection(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+        topology: ferrum_interfaces::vnext::OperationCostTopologyRequirement,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostSelection>, VNextError> {
+        cost_route::selection(
+            request,
+            topology,
+            poll,
+            self.precision,
+            self.execution_capabilities,
+            self.structured_capture,
+            self.cublas_cost_identity.frozen(),
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
     }
 
     fn reusable_execution_topology(
@@ -635,45 +678,70 @@ fn reusable_attention_topology_for_tokens<I>(
 where
     I: IntoIterator<Item = u64>,
 {
-    if participant_count == 0 {
-        return Err("CUDA recurrent topology has no participants".to_owned());
-    }
-
-    const DOMAIN: &[u8] = b"ferrum.cuda.gated-delta.reusable-topology.v1\0";
-    let mut digest = Sha256::new();
-    digest.update(DOMAIN);
-    digest.update((participant_count as u64).to_le_bytes());
-    let mut observed_participants = 0_usize;
-    let mut total_tokens = 0_u64;
+    let mut digest = GdnTopologyDigest::new(participant_count)?;
     for tokens in token_counts {
-        observed_participants = observed_participants
-            .checked_add(1)
-            .ok_or_else(|| "CUDA recurrent topology participant count overflows".to_owned())?;
         shape.validate_launch_extents(tokens)?;
-        total_tokens = total_tokens
-            .checked_add(tokens)
-            .ok_or_else(|| "CUDA recurrent topology token count overflows".to_owned())?;
-        let execution_form = execution_capabilities
+        let form = execution_capabilities
             .select(tokens, GatedDeltaExecutionPreference::RecurrentScan)
             .map_err(|error| error.to_string())?;
-        if let GatedDeltaExecutionForm::ChunkedScan(plan) = execution_form {
+        digest.push(tokens, form)?;
+    }
+    digest.finish()
+}
+
+/// Shared numerical digest emitter; no path selection or resource authority.
+struct GdnTopologyDigest {
+    digest: Sha256,
+    expected: usize,
+    observed: usize,
+    tokens: u64,
+}
+impl GdnTopologyDigest {
+    fn new(participants: usize) -> Result<Self, String> {
+        if participants == 0 {
+            return Err("CUDA recurrent topology has no participants".into());
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"ferrum.cuda.gated-delta.reusable-topology.v1\0");
+        digest.update((participants as u64).to_le_bytes());
+        Ok(Self {
+            digest,
+            expected: participants,
+            observed: 0,
+            tokens: 0,
+        })
+    }
+    fn push(&mut self, tokens: u64, form: GatedDeltaExecutionForm) -> Result<(), String> {
+        if let GatedDeltaExecutionForm::ChunkedScan(plan) = form {
             return Err(format!(
                 "CUDA gated-delta provider selected an uninstalled {} form for {} tokens",
-                execution_form.as_str(),
+                form.as_str(),
                 plan.token_count()
             ));
         }
-        digest.update(tokens.to_le_bytes());
-        digest.update((execution_form.as_str().len() as u64).to_le_bytes());
-        digest.update(execution_form.as_str().as_bytes());
+        self.observed = self
+            .observed
+            .checked_add(1)
+            .ok_or("CUDA recurrent topology participant count overflows")?;
+        self.tokens = self
+            .tokens
+            .checked_add(tokens)
+            .ok_or("CUDA recurrent topology token count overflows")?;
+        self.digest.update(tokens.to_le_bytes());
+        self.digest
+            .update((form.as_str().len() as u64).to_le_bytes());
+        self.digest.update(form.as_str().as_bytes());
+        Ok(())
     }
-    if observed_participants != participant_count {
-        return Err("CUDA recurrent topology participant count changed while hashing".to_owned());
+    fn finish(mut self) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
+        if self.observed != self.expected {
+            return Err("CUDA recurrent topology participant count changed while hashing".into());
+        }
+        self.digest.update(self.tokens.to_le_bytes());
+        Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
+            self.digest.finalize().into(),
+        ))
     }
-    digest.update(total_tokens.to_le_bytes());
-    Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
-        digest.finalize().into(),
-    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1516,12 +1584,31 @@ fn encode_attention(
         #[cfg(feature = "vllm-marlin")]
         projection_runtime,
     )?;
-    let selected = selected::from_prepared(
-        &prepared,
-        precision,
-        functions.native.q8_pair_enabled(),
+    let observation_recipe = if structured_capture.is_disabled() {
+        None
+    } else {
+        invocation
+            .observation_template_budget()
+            .and_then(|budget| {
+                selected::Recipe::from_prepared(
+                    &prepared,
+                    precision,
+                    functions.native.q8_pair_enabled(),
+                    cublas_identity,
+                    budget,
+                )
+            })
+            .and_then(|recipe| {
+                super::replay_cost::CudaReplayCostRecipe::attention(
+                    &invocation,
+                    recipe,
+                    structured_capture,
+                )
+            })
+    };
+    let binding_observation = super::replay_cost::CudaReplayCostRecipe::attention_bindings(
+        &invocation,
         structured_capture,
-        cublas_identity,
     );
     let prepared::PreparedAttention {
         shape,
@@ -1678,13 +1765,7 @@ fn encode_attention(
                 u64::from(participant_count),
             )
         })
-        .map(|command| {
-            command.with_statistical_evidence(selected::bindings(
-                participant_count as usize,
-                total_tokens,
-                structured_capture,
-            ))
-        })
+        .map(|command| command.with_replay_cost_recipe(binding_observation))
         .map_err(|error| error.to_string())?;
 
     let compute_command =
@@ -1727,7 +1808,7 @@ fn encode_attention(
             )
         })
         .map(|command| {
-            let command = command.with_statistical_evidence(selected);
+            let command = command.with_replay_cost_recipe(observation_recipe);
             if matches!(precision, AttentionPrecision::F32MasterGgufF16Projections) {
                 // Missing selected work is Required(None), never NotRequired.
                 // The runtime checks the executing/captured handle for CostWitness.
@@ -3934,30 +4015,38 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         &self,
         request: &impl ReusableExecutionTopologyView,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        let mut values = (0..8)
-            .map(|ordinal| {
-                ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
-            })
-            .collect::<Vec<_>>();
-        values.extend([
-            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 8),
-            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 9),
-            ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
-        ]);
-        if request
-            .reusable_address_scope(
-                &values,
-                &[
-                    ReusableExecutionWorkspaceAddress::Scratch,
-                    ReusableExecutionWorkspaceAddress::Binding,
-                ],
-            )?
-            .is_none()
-        {
+        if !reusable_attention_address_scope(request)? {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
         reusable_attention_topology(request, self.execution_capabilities, self.precision)
             .map(ReusableExecutionTopology::Dynamic)
             .map_err(invalid_plan)
     }
+}
+
+fn reusable_attention_address_scope(
+    request: &impl ReusableExecutionTopologyView,
+) -> Result<bool, VNextError> {
+    let values = [
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 0),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 1),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 2),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 3),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 4),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 5),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 6),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 7),
+        ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 8),
+        ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 9),
+        ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
+    ];
+    request
+        .reusable_address_scope(
+            &values,
+            &[
+                ReusableExecutionWorkspaceAddress::Scratch,
+                ReusableExecutionWorkspaceAddress::Binding,
+            ],
+        )
+        .map(|scope| scope.is_some())
 }

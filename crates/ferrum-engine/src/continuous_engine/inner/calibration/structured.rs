@@ -19,7 +19,7 @@ impl CalibrationSession {
             .map(|collector| collector.progress())
     }
     fn structured_phase_boundary(&self) -> Result<()> {
-        if self.prefix_preparation.is_some() || self.prefix_source5 {
+        if self.prefix_preparation.is_some() || self.prefix_source5 || self.prefix_source8 {
             return Err(FerrumError::invalid_request(
                 "prefix preparation needs its independent source5 protocol; old collectors cannot omit its request frontier",
             ));
@@ -99,6 +99,11 @@ impl CalibrationSession {
     }
 
     pub(super) fn record_structured_unsubmitted(&mut self, reason: &str) {
+        if let Some(collector) = &mut self.prepared_owner_capture {
+            collector.invalidate(format!(
+                "original source8 offer did not reach a recorded call: {reason}"
+            ));
+        }
         if let Some(group) = &mut self.structured_group_v2 {
             if group.collecting() {
                 if let Err(error) = group.complete_unsubmitted(reason) {

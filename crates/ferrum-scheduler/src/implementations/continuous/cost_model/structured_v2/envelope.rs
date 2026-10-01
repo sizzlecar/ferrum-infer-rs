@@ -6,6 +6,8 @@ use super::*;
 pub(super) struct PendingGenerators {
     values: Vec<f64>,
     identified: Vec<bool>,
+    completion: Option<super::completion::CompletionGenerators>,
+    repetition: Option<super::repetition::RepetitionGenerator>,
 }
 pub(super) struct EnvelopeBounds {
     pub lower_ns: u64,
@@ -14,6 +16,21 @@ pub(super) struct EnvelopeBounds {
     pub support_upper: Vec<u64>,
 }
 impl PendingGenerators {
+    pub(super) fn retained_heap_bytes(&self) -> Option<usize> {
+        self.values
+            .capacity()
+            .checked_mul(std::mem::size_of::<f64>())?
+            .checked_add(
+                self.identified
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<bool>())?,
+            )?
+            .checked_add(
+                self.completion
+                    .as_ref()
+                    .map_or(Some(0), |c| c.retained_heap_bytes())?,
+            )
+    }
     pub fn new(fit: &RowSpaceFit, exemplar: &StructuredInputV2) -> Result<Self> {
         let mut values = Vec::with_capacity(exemplar.owner.rows as usize);
         let mut identified = Vec::with_capacity(exemplar.owner.rows as usize);
@@ -28,7 +45,12 @@ impl PendingGenerators {
                 Err(error) => return Err(error),
             });
         }
-        Ok(Self { values, identified })
+        Ok(Self {
+            values,
+            identified,
+            completion: super::completion::CompletionGenerators::new(fit, exemplar)?,
+            repetition: super::repetition::RepetitionGenerator::new(fit, exemplar)?,
+        })
     }
     pub fn bounds(
         &self,
@@ -36,8 +58,53 @@ impl PendingGenerators {
         input: &StructuredInputV2,
         pending: Option<&PendingQuery>,
     ) -> Result<EnvelopeBounds> {
+        self.bounds_detailed(fit, input, pending)
+            .map_err(StructuredQueryFailureV2::reason)
+    }
+    pub fn bounds_detailed(
+        &self,
+        fit: &RowSpaceFit,
+        input: &StructuredInputV2,
+        pending: Option<&PendingQuery>,
+    ) -> QueryResult<EnvelopeBounds> {
+        let bounds = self.pending_bounds(fit, input, pending)?;
+        match &self.completion {
+            Some(completion) => completion.extend(input, bounds),
+            None if input.completion.is_none() => Ok(bounds),
+            None => Err(StructuredUnknown::WrongDomain.into()),
+        }
+    }
+    pub fn extend_repetition(
+        &self,
+        input: &StructuredInputV2,
+        upper: Option<u64>,
+        bounds: EnvelopeBounds,
+    ) -> Result<EnvelopeBounds> {
+        self.extend_repetition_detailed(input, upper, bounds)
+            .map_err(StructuredQueryFailureV2::reason)
+    }
+    pub fn extend_repetition_detailed(
+        &self,
+        input: &StructuredInputV2,
+        upper: Option<u64>,
+        bounds: EnvelopeBounds,
+    ) -> QueryResult<EnvelopeBounds> {
+        match (upper, self.repetition.as_ref()) {
+            (None, _) => Ok(bounds),
+            (Some(upper), Some(generator)) => generator.extend(input, upper, bounds),
+            (Some(_), None) => Err(StructuredQueryFailureV2::OutsideSupport(
+                StructuredUnknown::UnsupportedScope,
+            )),
+        }
+    }
+    fn pending_bounds(
+        &self,
+        fit: &RowSpaceFit,
+        input: &StructuredInputV2,
+        pending: Option<&PendingQuery>,
+    ) -> QueryResult<EnvelopeBounds> {
         let Some(pending) = pending else {
-            let value = fit.predict(&input.basis)?;
+            let value = fit.predict_detailed(&input.basis)?;
             return Ok(EnvelopeBounds {
                 lower_ns: value,
                 upper_ns: value,
@@ -52,7 +119,7 @@ impl PendingGenerators {
             || (eligible.is_empty()
                 && pending.constraint == HostPendingConstraintV2::NonEmptySubset)
         {
-            return Err(StructuredUnknown::InvalidInput);
+            return Err(StructuredUnknown::InvalidInput.into());
         }
         let fixed = input
             .pending_positions
@@ -72,25 +139,27 @@ impl PendingGenerators {
                 *out += n as f64;
             }
         }
-        fit.identify(&anchor)?;
+        fit.identify_detailed(&anchor)?;
         // With >=2 nonempty eligible choices, their union and singleton
         // differences span every generator. A singleton has no free direction.
         if (pending.constraint == HostPendingConstraintV2::AnySubset || eligible.len() > 1)
             && eligible.iter().any(|p| !self.identified[*p as usize])
         {
-            return Err(StructuredUnknown::UnidentifiedDirection);
+            return Err(StructuredQueryFailureV2::OutsideSupport(
+                StructuredUnknown::UnidentifiedDirection,
+            ));
         }
         let values = eligible.iter().map(|p| self.values[*p as usize]);
         let (lo_delta, hi_delta) = linear_subset_extrema(values, pending.constraint)?;
         let lower = base + lo_delta;
         let upper = base + hi_delta;
-        if !lower.is_finite()
-            || !upper.is_finite()
-            || lower <= 0.
-            || upper < lower
-            || upper > (1u64 << 53) as f64
-        {
-            return Err(StructuredUnknown::Numerical);
+        if !lower.is_finite() || !upper.is_finite() || upper < lower {
+            return Err(StructuredUnknown::Numerical.into());
+        }
+        if lower <= 0. || upper > (1u64 << 53) as f64 {
+            return Err(StructuredQueryFailureV2::OutsidePredictionRange(
+                StructuredUnknown::Numerical,
+            ));
         }
         let mut support_lower = input.support.clone();
         let mut support_upper = input.support.clone();

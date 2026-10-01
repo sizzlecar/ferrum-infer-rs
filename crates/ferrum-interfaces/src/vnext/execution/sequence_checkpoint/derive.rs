@@ -175,14 +175,28 @@ pub(crate) fn derive_sequence_checkpoint(
                     continue;
                 };
                 let bytes = binding.tensor().minimum_storage_bytes()?;
-                let valid_mapping = match (semantics.contents(), port.layout()) {
+                let resolved_layout = match port
+                    .layout()
+                    .resolve_prefix_mapping(binding.tensor(), descriptor.storage().profile())
+                {
+                    Ok(layout) => layout,
+                    Err(error) => {
+                        reasons.push(Reason::StateLayout {
+                            state_id: state.id.clone(),
+                            reason: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let valid_mapping = match (semantics.contents(), resolved_layout) {
                     (
                         StateCheckpointContents::BoundaryValue,
                         ProviderCheckpointStateLayout::ContiguousBoundaryValue,
                     ) => true,
                     (
                         StateCheckpointContents::PrefixPositions,
-                        ProviderCheckpointStateLayout::TokenMajorPrefix,
+                        ProviderCheckpointStateLayout::TokenMajorPrefix
+                        | ProviderCheckpointStateLayout::PagedKeyValueBlockPrefix { .. },
                     ) => {
                         // The capability establishes token-major semantics.
                         // Capacity is checked for consistency only after that
@@ -225,7 +239,7 @@ pub(crate) fn derive_sequence_checkpoint(
                     tensor: binding.tensor().clone(),
                     resource_id: component.resource_id().clone(),
                     offset_bytes: component.offset_bytes(),
-                    layout: port.layout(),
+                    layout: resolved_layout,
                     storage: descriptor.storage().clone(),
                     initialization: descriptor.initialization(),
                     descriptor: descriptor.clone(),

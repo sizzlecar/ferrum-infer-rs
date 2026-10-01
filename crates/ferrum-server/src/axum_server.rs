@@ -963,6 +963,10 @@ fn admission_health_json(
         } else {
             "unavailable"
         },
+        "queue_observation": runtime_snapshot.and_then(|s| s.queue_observation()).and_then(|v| v.as_ref().ok()),
+        "queue_observation_error": runtime_snapshot.and_then(|s| s.queue_observation()).and_then(|v| v.as_ref().err()),
+        "queue_clock_basis": "engine-instance monotonic nanoseconds; ages since original trusted ingress; no client/server clock synchronization",
+        "queue_membership_scope": "single scheduler request-index read; waiting/prefill/decode/preempted; excludes pre-publication parsing/tokenization and completed transport drains",
     })
 }
 
@@ -3674,6 +3678,9 @@ pub fn prepare_model_chat_request(
         }
         ServerError::InternalError(message) => ferrum_types::FerrumError::internal(message),
         ServerError::ServiceUnavailable(message) => ferrum_types::FerrumError::backend(message),
+        ServerError::SloTimeAdmissionRejected { reason, .. } => {
+            ferrum_types::FerrumError::SloTimeAdmissionRejected { reason }
+        }
     })?;
     let mut prepared = convert_chat_request_with_template_model_and_default(
         request,
@@ -5083,6 +5090,7 @@ fn stream_validation_error_message(error: ServerError) -> String {
         ServerError::InternalError(message)
         | ServerError::NotImplemented(message)
         | ServerError::ServiceUnavailable(message)
+        | ServerError::SloTimeAdmissionRejected { message, .. }
         | ServerError::ContextLengthExceeded(message)
         | ServerError::InvalidRequest { message, .. }
         | ServerError::UnsupportedFeature { message, .. } => message,
@@ -5097,6 +5105,15 @@ fn server_error_from_ferrum_error(error: Error) -> ServerError {
             ServerError::ContextLengthExceeded(error.to_string())
         }
         Error::ResourceExhausted { message } => ServerError::ServiceUnavailable(message),
+        error @ Error::SloTimeAdmissionRejected { .. } => {
+            let Error::SloTimeAdmissionRejected { reason } = &error else {
+                unreachable!()
+            };
+            ServerError::SloTimeAdmissionRejected {
+                message: error.to_string(),
+                reason: *reason,
+            }
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -5124,6 +5141,31 @@ fn openai_error_sse_event(
     Event::default()
         .json_data(&stream_error_payload(message, error_type, param))
         .unwrap_or_else(|_| Event::default().data("error"))
+}
+
+/// Prepare the actual Completions product contract without admission or IO.
+/// Endpoint defaults remain independent of Chat's repetition policy.
+pub fn prepare_model_completion_request(
+    request: &CompletionsRequest,
+    engine_model_id: &str,
+) -> ferrum_types::Result<InferenceRequest> {
+    validate_completion_request(request).map_err(|error| match error {
+        ServerError::InvalidRequest { message, .. }
+        | ServerError::ContextLengthExceeded(message) => {
+            ferrum_types::FerrumError::invalid_request(message)
+        }
+        ServerError::UnsupportedFeature { message, .. } | ServerError::NotImplemented(message) => {
+            ferrum_types::FerrumError::unsupported(message)
+        }
+        ServerError::InternalError(message) => ferrum_types::FerrumError::internal(message),
+        ServerError::ServiceUnavailable(message) => ferrum_types::FerrumError::backend(message),
+        ServerError::SloTimeAdmissionRejected { reason, .. } => {
+            ferrum_types::FerrumError::SloTimeAdmissionRejected { reason }
+        }
+    })?;
+    let mut prepared = convert_completion_request(request);
+    apply_served_model_resolution(&mut prepared, ModelId(engine_model_id.to_owned()), None);
+    Ok(prepared)
 }
 
 fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest {
@@ -5986,6 +6028,10 @@ enum ServerError {
     ContextLengthExceeded(String),
     NotImplemented(String),
     ServiceUnavailable(String),
+    SloTimeAdmissionRejected {
+        message: String,
+        reason: ferrum_types::SloTimeAdmissionRejection,
+    },
 }
 
 impl ServerError {
@@ -6006,8 +6052,19 @@ impl ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        let code = matches!(&self, ServerError::ContextLengthExceeded(_))
-            .then(|| "context_length_exceeded".to_owned());
+        let code = match &self {
+            ServerError::ContextLengthExceeded(_) => Some("context_length_exceeded"),
+            ServerError::SloTimeAdmissionRejected { reason, .. } => Some(match reason {
+                ferrum_types::SloTimeAdmissionRejection::TargetTimeImpossible => {
+                    "slo_target_time_impossible"
+                }
+                ferrum_types::SloTimeAdmissionRejection::WaitExpired => {
+                    "slo_admission_wait_expired"
+                }
+            }),
+            _ => None,
+        }
+        .map(str::to_owned);
         let (status, message, error_type, param) = match self {
             ServerError::ContextLengthExceeded(message) => (
                 AxumStatusCode::BAD_REQUEST,
@@ -6043,6 +6100,12 @@ impl IntoResponse for ServerError {
                 AxumStatusCode::SERVICE_UNAVAILABLE,
                 msg,
                 "service_unavailable_error",
+                None,
+            ),
+            ServerError::SloTimeAdmissionRejected { message, .. } => (
+                AxumStatusCode::SERVICE_UNAVAILABLE,
+                message,
+                "slo_time_admission_error",
                 None,
             ),
         };
@@ -8670,6 +8733,44 @@ mod tests {
         assert!(admission["current_batch_size"].is_null());
         assert_eq!(admission["queue_depth"], 2);
         assert_eq!(admission["capacity_blocked_requests"], 3);
+        assert!(admission["queue_observation"].is_null());
+        let queue = ferrum_types::ExecutorQueueObservation {
+            schema_version: 1,
+            engine_instance: "server-instance".into(),
+            observed_at_ns: 123,
+            waiting_requests: 2,
+            active_prefill_sequences: 7,
+            active_decode_sequences: 23,
+            preempted_requests: 1,
+            oldest_waiting_ingress_age_ns: Some(91),
+            oldest_unfinished_ingress_age_ns: Some(100),
+        };
+        let observed = runtime.clone().with_queue_observation(Ok(queue.clone()));
+        let actual = admission_health_json(
+            &engine_status,
+            &EngineMetrics::default(),
+            &json!({}),
+            Some(&observed),
+            None,
+        );
+        assert_eq!(
+            actual["queue_observation"],
+            serde_json::to_value(queue).unwrap()
+        );
+        let busy = runtime.with_queue_observation(Err("sequence observation busy".into()));
+        let actual = admission_health_json(
+            &engine_status,
+            &EngineMetrics::default(),
+            &json!({}),
+            Some(&busy),
+            None,
+        );
+        assert!(actual["queue_observation"].is_null());
+        assert_eq!(
+            actual["queue_observation_error"],
+            "sequence observation busy"
+        );
+        assert_eq!(actual["queue_depth"], 2);
     }
 
     #[test]

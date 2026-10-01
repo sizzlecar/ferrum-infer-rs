@@ -2,6 +2,15 @@
 //! This is not evidence of CUDA replay or provider matching.
 use super::*;
 use crate::vnext::*;
+#[path = "graph_catalog/completion_capture.rs"]
+mod completion_capture;
+
+fn legacy_catalog(snapshot: &DeviceCostGraphCatalogSnapshot) -> &Arc<DeviceCostGraphCatalog> {
+    match snapshot {
+        DeviceCostGraphCatalogSnapshot::Legacy(catalog) => catalog,
+        DeviceCostGraphCatalogSnapshot::Prepared(_) => panic!("legacy runtime changed protocol"),
+    }
+}
 
 fn catalog(lane: ExecutionLaneId, tokens: u64) -> DeviceCostGraphCatalog {
     let bucket = ReusableExecutionBucketSpec::new(
@@ -189,6 +198,139 @@ fn planning_graph_catalog_rejects_state_lane_and_budget_mismatch() {
     session.try_abort_if_quiescent().unwrap();
     drop(session);
     drop(sequence);
+    drop(lane);
+    close_dynamic_test_root(h.root);
+}
+
+#[test]
+fn planning_shared_graph_catalog_keeps_arc_and_fresh_capture_identity() {
+    let (h, _, lane) = setup(256);
+    let sequence = admitted_sequence_with_ceiling(&h.root, "shared-catalog", 4);
+    let session = sequence.open_session().unwrap();
+    let original = Arc::new(catalog(lane.id(), 1));
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() = Some(Arc::clone(&original));
+    let allocations = h.runtime.allocate_calls();
+    let first = route(&h.root, &session, &lane);
+    let second = route(&h.root, &session, &lane);
+    assert!(Arc::ptr_eq(
+        legacy_catalog(first.graph_catalog.as_ref().unwrap()),
+        &original
+    ));
+    assert!(Arc::ptr_eq(
+        legacy_catalog(second.graph_catalog.as_ref().unwrap()),
+        &original
+    ));
+    assert!(first.same_live_evidence(&second));
+    assert_eq!(allocations, h.runtime.allocate_calls());
+
+    let changed = Arc::new(catalog(lane.id(), 2));
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() = Some(Arc::clone(&changed));
+    let next = route(&h.root, &session, &lane);
+    assert!(Arc::ptr_eq(
+        legacy_catalog(next.graph_catalog.as_ref().unwrap()),
+        &changed
+    ));
+    assert!(!first.same_live_evidence(&next));
+    assert_eq!(first.graph_catalog().unwrap(), original.as_ref());
+
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() = None;
+    session.try_abort_if_quiescent().unwrap();
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    close_dynamic_test_root(h.root);
+    assert_eq!(first.graph_catalog().unwrap().programs().len(), 1);
+}
+
+#[test]
+fn planning_shared_graph_catalog_does_not_cache_state_lane_or_budget_permission() {
+    let (h, _, lane) = setup(256);
+    let valid = Arc::new(catalog(lane.id(), 1));
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() = Some(Arc::clone(&valid));
+    let capture = |budget: &mut dyn ResourcePlanningBudget| {
+        lane.try_with_cost_planning_lane(
+            ResourcePlanningLimits::default(),
+            budget,
+            |_, _, catalog, _| Ok(catalog),
+        )
+    };
+    assert!(Arc::ptr_eq(
+        legacy_catalog(&capture(&mut || true).unwrap().unwrap()),
+        &valid
+    ));
+    *h.runtime.cost_graph_state_override.lock().unwrap() = Some(
+        DeviceCostGraphStreamState::new(DeviceCostGraphConfiguration::OnDemand, 2, 1, 0).unwrap(),
+    );
+    assert!(matches!(
+        capture(&mut || true),
+        Err(ResourcePlanningUnknown::StaleIdentity)
+    ));
+    *h.runtime.cost_graph_state_override.lock().unwrap() = None;
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() =
+        Some(Arc::new(catalog(ExecutionLaneId::mint().unwrap(), 1)));
+    assert!(matches!(
+        capture(&mut || true),
+        Err(ResourcePlanningUnknown::StaleIdentity)
+    ));
+    // A cached catalog was built under larger limits; a later capture must
+    // apply its own smaller bound even when the backend returns the same Arc.
+    let original_program = &valid.programs()[0];
+    let declaration = DeviceReusableExecutionCapture::new(
+        original_program.program().program_id().clone(),
+        2,
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let larger_program = DeviceReusableExecutionProgram::new(
+        &declaration,
+        original_program.program().segments().to_vec(),
+        vec![],
+        vec![DeviceReusableExecutionProgramGap::new(
+            1,
+            DeviceReusableExecutionProgramGapReason::MissingComputeCommand,
+        )],
+    )
+    .unwrap();
+    let mut builder = DeviceCostGraphCatalogBuilder::new(
+        valid.stream_state(),
+        DeviceCostGraphCatalogLimits::new(1, 2, 1).unwrap(),
+    )
+    .unwrap();
+    builder
+        .push_program(&larger_program, &mut || Ok(()))
+        .unwrap();
+    let segment = &original_program.uploaded_segments()[0];
+    builder
+        .push_uploaded_segment(
+            segment.segment(),
+            segment.reusable_executable_fingerprint(),
+            segment.logical_commands(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() =
+        Some(Arc::new(builder.finish(&mut || Ok(())).unwrap()));
+    let smaller = ResourcePlanningLimits {
+        maximum_free_extents: 1,
+        ..ResourcePlanningLimits::default()
+    };
+    assert!(matches!(
+        lane.try_with_cost_planning_lane(smaller, &mut || true, |_, _, _, _| Ok(())),
+        Err(ResourcePlanningUnknown::LimitExceeded)
+    ));
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() = Some(valid);
+
+    let mut polls = 0;
+    assert!(matches!(
+        capture(&mut || {
+            polls += 1;
+            polls < 2
+        }),
+        Err(ResourcePlanningUnknown::BudgetExhausted)
+    ));
+    assert_eq!(polls, 2);
+    *h.runtime.cost_graph_shared_catalog.lock().unwrap() = None;
     drop(lane);
     close_dynamic_test_root(h.root);
 }

@@ -44,35 +44,24 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
 }
 
 impl<R: DeviceRuntime> ExecutionLane<R> {
-    /// Extends the same quiescent bracket to the actual stream catalog. Its
-    /// epoch is supplied by core, never manufactured by a backend producer.
-    pub(crate) fn try_with_cost_planning_lane<T>(
+    /// One nonblocking lane bracket. The caller captures completion resources
+    /// before requesting optional catalog work through the bounded callback.
+    pub(crate) fn try_with_completion_planning_lane<T>(
         &self,
-        limits: crate::vnext::ResourcePlanningLimits,
-        budget: &mut dyn crate::vnext::ResourcePlanningBudget,
         capture: impl FnOnce(
             u64,
             Option<DeviceCostGraphStreamState>,
-            Option<crate::vnext::DeviceCostGraphCatalog>,
-            &mut dyn crate::vnext::ResourcePlanningBudget,
+            Option<u64>,
+            &mut dyn FnMut(
+                crate::vnext::ResourcePlanningLimits,
+                &mut dyn crate::vnext::ResourcePlanningBudget,
+            ) -> Result<
+                Option<crate::vnext::DeviceCostGraphCatalogSnapshot>,
+                ResourcePlanningUnknown,
+            >,
         ) -> Result<T, ResourcePlanningUnknown>,
     ) -> Result<T, ResourcePlanningUnknown> {
-        use crate::vnext::DeviceCostGraphCatalogLimits;
         use ResourcePlanningUnknown as U;
-        if !budget.has_budget() {
-            return Err(U::BudgetExhausted);
-        }
-        if !limits.is_valid() {
-            return Err(U::InvalidInput);
-        }
-        // Reuse existing capture bounds: descriptors cap program rows; extents
-        // cap total topology nodes and total logical command rows separately.
-        let graph_limits = DeviceCostGraphCatalogLimits::new(
-            limits.maximum_descriptors,
-            limits.maximum_free_extents,
-            limits.maximum_free_extents,
-        )
-        .map_err(|_| U::InvalidInput)?;
         let state = self.state.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => {
                 U::ReadUnavailable(ResourcePlanningReadStage::ExecutionLane)
@@ -88,23 +77,128 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             return Err(U::BusyOrUnavailable);
         }
         let graph = self.runtime.cost_graph_stream_state(&state.stream);
+        capture(
+            self.reusable_execution_epoch(),
+            graph,
+            self.readback_staging.available_for_cost_planning(),
+            &mut |limits, budget| self.capture_planning_catalog(&state, graph, limits, budget),
+        )
+    }
+
+    pub(crate) fn try_with_cost_planning_lane<T>(
+        &self,
+        limits: crate::vnext::ResourcePlanningLimits,
+        budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+        capture: impl FnOnce(
+            u64,
+            Option<DeviceCostGraphStreamState>,
+            Option<crate::vnext::DeviceCostGraphCatalogSnapshot>,
+            &mut dyn crate::vnext::ResourcePlanningBudget,
+        ) -> Result<T, ResourcePlanningUnknown>,
+    ) -> Result<T, ResourcePlanningUnknown> {
+        if !budget.has_budget() {
+            return Err(ResourcePlanningUnknown::BudgetExhausted);
+        }
+        if !limits.is_valid() {
+            return Err(ResourcePlanningUnknown::InvalidInput);
+        }
+        self.try_with_completion_planning_lane(|epoch, graph, _, catalog| {
+            let catalog = catalog(limits, budget)?;
+            capture(epoch, graph, catalog, budget)
+        })
+    }
+
+    fn capture_planning_catalog(
+        &self,
+        state: &ExecutionLaneState<R::Stream>,
+        graph: Option<DeviceCostGraphStreamState>,
+        limits: crate::vnext::ResourcePlanningLimits,
+        budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> Result<Option<crate::vnext::DeviceCostGraphCatalogSnapshot>, ResourcePlanningUnknown> {
+        use ResourcePlanningUnknown as U;
+        if !budget.has_budget() {
+            return Err(U::BudgetExhausted);
+        }
+        if !limits.is_valid() {
+            return Err(U::InvalidInput);
+        }
         let mut exhausted = false;
-        let inventory =
+        let prepared =
             self.runtime
-                .cost_reusable_graph_catalog(&state.stream, graph_limits, &mut || {
-                    if !budget.has_budget() {
+                .cost_prepared_reusable_graph_catalog(&state.stream, &mut || {
+                    if budget.has_budget() {
+                        Ok(())
+                    } else {
                         exhausted = true;
                         Err(VNextError::InvalidExecutionPlan {
-                            reason: "graph catalog capture budget exhausted".to_owned(),
+                            reason: "prepared graph catalog capture budget exhausted".to_owned(),
                         })
-                    } else {
-                        Ok(())
                     }
                 });
         if exhausted || !budget.has_budget() {
             return Err(U::BudgetExhausted);
         }
-        let catalog = inventory.transpose().map_err(|_| U::ReusableExecution)?;
+        match prepared.map_err(|_| U::ReusableExecution)? {
+            crate::vnext::DevicePreparedCostGraphCatalogAvailability::Ready(root) => {
+                if graph != Some(root.catalog().stream_state())
+                    || !root.matches_runtime_lane(
+                        &self.descriptor.runtime_implementation_fingerprint,
+                        self.id(),
+                    )
+                {
+                    return Err(U::StaleIdentity);
+                }
+                if !budget.has_budget() {
+                    return Err(U::BudgetExhausted);
+                }
+                return Ok(Some(
+                    crate::vnext::DeviceCostGraphCatalogSnapshot::Prepared(root),
+                ));
+            }
+            crate::vnext::DevicePreparedCostGraphCatalogAvailability::Unprepared => {
+                return Ok(None)
+            }
+            crate::vnext::DevicePreparedCostGraphCatalogAvailability::Unsupported => {}
+        }
+        let graph_limits = crate::vnext::DeviceCostGraphCatalogLimits::new(
+            limits.maximum_descriptors,
+            limits.maximum_free_extents,
+            limits.maximum_free_extents,
+        )
+        .map_err(|_| U::InvalidInput)?;
+        let mut exhausted = false;
+        let inventory = self.runtime.cost_reusable_graph_catalog_shared(
+            &state.stream,
+            graph_limits,
+            &mut || {
+                if !budget.has_budget() {
+                    exhausted = true;
+                    Err(VNextError::InvalidExecutionPlan {
+                        reason: "graph catalog capture budget exhausted".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        if exhausted || !budget.has_budget() {
+            return Err(U::BudgetExhausted);
+        }
+        let catalog = inventory.transpose().map_err(|error| {
+            // Keep the backend's failure reason and inventory measurements.
+            // Budget cancellation is classified above and is not logged here.
+            tracing::debug!(
+                target: "ferrum::cost_catalog_diagnostics",
+                error = %error,
+                lane_id = ?self.id(),
+                graph = ?graph,
+                maximum_programs = graph_limits.maximum_programs(),
+                maximum_nodes = graph_limits.maximum_nodes(),
+                maximum_logical_commands = graph_limits.maximum_logical_commands(),
+                "reusable graph catalog capture failed"
+            );
+            U::ReusableExecution
+        })?;
         if let Some(catalog) = &catalog {
             if !catalog.fits(graph_limits) {
                 return Err(U::LimitExceeded);
@@ -121,6 +215,6 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 }
             }
         }
-        capture(self.reusable_execution_epoch(), graph, catalog, budget)
+        Ok(catalog.map(crate::vnext::DeviceCostGraphCatalogSnapshot::Legacy))
     }
 }

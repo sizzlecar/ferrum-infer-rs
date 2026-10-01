@@ -252,7 +252,8 @@ impl CudaRmsNormProvider {
                 crate::ptx::RMS_NORM.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
-        )?;
+        )?
+        .with_checkpoint_capability(super::stateless_token_prefix_checkpoint());
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::RMS_NORM.to_owned()))
@@ -287,6 +288,13 @@ impl OperationResourceEstimator for CudaRmsNormProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        cost_route::prepare_rms_norm(request, self.precision)
+    }
+
     fn uses_captured_replay_cost_recipe(&self) -> bool {
         true
     }
@@ -773,6 +781,8 @@ impl CudaDenseSwiGluProvider {
                 marlin_swiglu_provider_descriptor(runtime, &contract, provider_fingerprint)?;
             descriptor
         };
+        let descriptor =
+            descriptor.with_checkpoint_capability(super::stateless_token_prefix_checkpoint());
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
@@ -1416,7 +1426,8 @@ impl CudaResidualAddProvider {
                 crate::ptx::RESIDUAL_ADD.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
-        )?;
+        )?
+        .with_checkpoint_capability(super::stateless_token_prefix_checkpoint());
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::RESIDUAL_ADD.to_owned()))
@@ -1451,6 +1462,13 @@ impl OperationResourceEstimator for CudaResidualAddProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        cost_route::prepare_residual(request, self.precision)
+    }
+
     fn uses_captured_replay_cost_recipe(&self) -> bool {
         true
     }
@@ -1932,7 +1950,7 @@ fn encode_rms_norm(
             participant_count,
             u64::from(rows),
             hidden_size as u64,
-            structured_capture,
+            ferrum_types::SloStructuredCostCapture::Disabled,
         )
     })
     .map(|command| command.with_replay_cost_recipe(recipe))
@@ -4284,7 +4302,7 @@ fn encode_residual_add(
             participant_count,
             token_count,
             hidden_size,
-            structured_capture,
+            ferrum_types::SloStructuredCostCapture::Disabled,
         )
     })
     .map(|command| command.with_replay_cost_recipe(recipe))

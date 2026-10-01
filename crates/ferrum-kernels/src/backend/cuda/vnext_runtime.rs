@@ -42,8 +42,8 @@ use ferrum_interfaces::vnext::{
     DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery,
     GuardedDeviceSubmissionError, GuardedSubmissionMode, HostTransferLayout,
     PreparedDeviceSubmissionReadback, ProgramBindingNodeBinding, RetainedHostMemoryRegion,
-    StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, VNextError,
-    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, StridedCopyRegion,
+    VNextError, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::AttentionExecutionPolicy;
@@ -55,6 +55,7 @@ mod core_cost_route;
 mod cost_identity;
 mod device_memory;
 mod nvml;
+mod observation;
 pub(crate) mod selected_cost;
 mod submission;
 #[cfg(test)]
@@ -491,6 +492,8 @@ pub struct CudaDeviceCommand {
     completion_checks: Vec<Arc<CudaCompletionReadback>>,
     statistical_evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
     replay_cost_recipe: Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>,
+    observation: Option<ferrum_interfaces::vnext::DeviceObservationPacket>,
+    core_strided_transfer: Option<(StridedCopyRegion, ferrum_types::SloStructuredCostCapture)>,
     core_transfer: Option<(
         ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
         u64,
@@ -840,8 +843,10 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         })
     }
 
@@ -887,8 +892,10 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         })
     }
 
@@ -923,8 +930,10 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         }
     }
 
@@ -992,8 +1001,10 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         })
     }
 
@@ -1003,13 +1014,15 @@ impl CudaDeviceCommand {
         mut self,
         identity: Option<super::vnext_ops::CublasHandleApiIdentity>,
     ) -> Self {
-        self.library_cost_requirement = super::vnext_ops::CublasCostRequirement::Required(
-            identity.filter(|_| {
-                self.statistical_evidence.as_ref()
-                    .and_then(|evidence| evidence.algorithm_work().and_then(Result::ok))
-                    .is_some_and(|work| work.entries().iter().any(|entry| entry.kind() == ferrum_interfaces::execution_cost::AlgorithmWorkKindV1::LibraryCall))
-            }),
-        );
+        // The actual provider branch declares this API requirement. Its
+        // executing handle is checked by submission; passive projection is
+        // resolved later and cannot manufacture a missing handle identity.
+        self.library_cost_requirement =
+            super::vnext_ops::CublasCostRequirement::Required(identity.filter(|identity| {
+                self.replay_cost_recipe
+                    .as_ref()
+                    .is_some_and(|recipe| recipe.library_identity() == Some(*identity))
+            }));
         self
     }
 
@@ -1023,23 +1036,33 @@ impl CudaDeviceCommand {
         mut self,
         recipe: Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>,
     ) -> Self {
-        self.replay_cost_recipe = recipe.filter(|recipe| {
-        self.statistical_evidence.as_ref().is_some_and(|actual| {
-            recipe.captured_evidence().is_some_and(|projected| {
-                    projected == *actual
-                        && projected.algorithm_work() == actual.algorithm_work()
-                        && projected.independent_attention_family_v2() == actual.independent_attention_family_v2()
-                        && ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1::from_selected(
-                            &projected, self.token_count, self.compute_dispatch_count, self.transfer_command_count,
-                        ).ok().is_some_and(|template| template.validate_binding(actual).is_ok())
-                })
-        })
-    });
+        self.observation = recipe.as_ref().and_then(|recipe| {
+            observation::compute(Arc::clone(recipe), self.observation_occurrences()?)
+        });
+        self.replay_cost_recipe = self.observation.as_ref().and(recipe);
+        self.statistical_evidence = None;
         self
     }
 
     pub(crate) fn replay_cost_recipe(&self) -> Option<Arc<super::vnext_ops::CudaReplayCostRecipe>> {
         self.replay_cost_recipe.clone()
+    }
+    pub(crate) fn observation_packet(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceObservationPacket> {
+        self.observation.clone()
+    }
+    pub(crate) fn with_observation(
+        mut self,
+        packet: ferrum_interfaces::vnext::DeviceObservationPacket,
+    ) -> Self {
+        self.statistical_evidence = None;
+        self.observation = Some(packet);
+        self
+    }
+    pub(crate) fn observation_occurrences(&self) -> Option<u64> {
+        self.compute_dispatch_count
+            .checked_add(self.transfer_command_count)
     }
 
     /// Passive evidence never changes submission permission or inference output.
@@ -1069,7 +1092,21 @@ impl CudaDeviceCommand {
             return self;
         }
         self.core_transfer = Some((kind, bytes, capture));
-        self.statistical_evidence = selected_cost::transfer(kind, bytes, self.token_count, capture);
+        self.statistical_evidence = None;
+        self.observation = None;
+        self
+    }
+
+    fn with_core_strided_transfer(
+        mut self,
+        region: StridedCopyRegion,
+        capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Self {
+        if !capture.is_disabled() {
+            self.core_strided_transfer = Some((region, capture));
+            self.statistical_evidence = None;
+            self.observation = None;
+        }
         self
     }
 
@@ -1123,11 +1160,24 @@ impl CudaDeviceCommand {
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
-        if let Some((kind, bytes, capture)) = self.core_transfer {
-            self.statistical_evidence =
-                selected_cost::transfer(kind, bytes, self.token_count, capture);
-        }
+
         Ok(self)
+    }
+
+    fn prepare_core_observation(
+        &mut self,
+        budget: &Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) {
+        if let Some((region, capture)) = self.core_strided_transfer {
+            if !capture.is_disabled() {
+                self.observation = observation::strided_transfer(region, self.token_count, budget);
+            }
+        }
+        if let Some((kind, bytes, capture)) = self.core_transfer {
+            if !capture.is_disabled() {
+                self.observation = observation::transfer(kind, bytes, self.token_count, budget);
+            }
+        }
     }
 
     fn reusable_execution(
@@ -1164,14 +1214,17 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         }
     }
 
     fn coalesced_program_bindings(
         mut commands: Vec<Self>,
         structured_capture: ferrum_types::SloStructuredCostCapture,
+        budget: Option<Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>>,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         if commands.is_empty() {
             return Ok(commands);
@@ -1385,13 +1438,17 @@ impl CudaDeviceCommand {
             ));
             host_storage.push(transfer.payload);
         }
-        let statistical_evidence = selected_cost::program_binding(
-            transfer_shapes
-                .iter()
-                .map(|&(stride, bytes, rows)| (stride as u64, bytes as u64, rows as u64)),
-            token_count,
-            structured_capture,
-        );
+        let observation = (!structured_capture.is_disabled())
+            .then(|| {
+                observation::program_binding(
+                    transfer_shapes
+                        .iter()
+                        .map(|&(stride, bytes, rows)| (stride as u64, bytes as u64, rows as u64)),
+                    token_count,
+                    budget.as_ref()?,
+                )
+            })
+            .flatten();
         let executable = Arc::new(CudaCommandExecutable {
             regions,
             host_storage,
@@ -1416,10 +1473,12 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks,
-            statistical_evidence,
+            statistical_evidence: None,
             replay_cost_recipe: None,
+            observation,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         }])
     }
 
@@ -1484,8 +1543,10 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         }])
     }
 
@@ -1529,8 +1590,17 @@ impl CudaDeviceCommand {
     pub(crate) fn selected_replay_template(
         &self,
     ) -> Option<ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1> {
+        // Cold registration is the only synchronous projection: it seals the
+        // actual selected launch geometry once beside successful graph capture.
+        let projected = self.observation.as_ref().and_then(|packet| {
+            let mut commands = packet.template().project(packet.input()).ok()?;
+            (commands.len() == 1)
+                .then(|| commands.pop().flatten())
+                .flatten()
+        });
+        let selected = projected.as_ref().or(self.statistical_evidence.as_ref())?;
         ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1::from_selected(
-            self.statistical_evidence.as_ref()?,
+            selected,
             self.token_count,
             self.compute_dispatch_count,
             self.transfer_command_count,
@@ -1713,17 +1783,22 @@ fn cuda_submission_attribution(
                     "CUDA command attribution has invalid native work metadata",
                 )
             })?;
-            // A graph launch cannot borrow eager evidence: its sealed logical
-            // population needs the separate replay adapter.
-            Ok::<_, CudaDeviceRuntimeError>(
-                command
+            // An actual eager command receives its owned CPU snapshot only;
+            // native graph launches use their separate sealed logical ledger.
+            let row = match &command.observation {
+                Some(observation) => row
+                    .clone()
+                    .with_observation(observation.clone())
+                    .unwrap_or(row),
+                None => command
                     .statistical_evidence
                     .as_ref()
                     .and_then(|evidence| {
                         row.clone().with_statistical_evidence(evidence.clone()).ok()
                     })
                     .unwrap_or(row),
-            )
+            };
+            Ok::<_, CudaDeviceRuntimeError>(row)
         })
         .collect::<Result<Vec<_>, _>>()?;
     DeviceSubmissionAttribution::with_replayed_segments(rows, replayed_segments).ok_or_else(|| {
@@ -2155,6 +2230,8 @@ pub struct CudaDeviceRuntime {
     attention_execution_policy: AttentionExecutionPolicy,
     structured_capture: ferrum_types::SloStructuredCostCapture,
     runtime_instance: u64,
+    observation_template_budget:
+        OnceLock<Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>>,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
     #[cfg(feature = "vllm-marlin")]
@@ -2266,6 +2343,7 @@ impl CudaDeviceRuntime {
             attention_execution_policy: config.attention_execution_policy,
             structured_capture,
             runtime_instance,
+            observation_template_budget: OnceLock::new(),
             context,
             allocation_stream,
             #[cfg(feature = "vllm-marlin")]
@@ -2314,6 +2392,23 @@ impl CudaDeviceRuntime {
             ));
         }
         Ok(())
+    }
+
+    fn publish_prepared_cost_catalog(&self, stream: &mut CudaDeviceStream) {
+        if self.structured_capture.is_disabled() {
+            return;
+        }
+        let Some(budget) = self.observation_template_budget() else {
+            stream.executable_cache.invalidate_prepared_cost_catalog();
+            return;
+        };
+        stream.executable_cache.publish_prepared_cost_catalog(
+            self.runtime_instance,
+            stream.id,
+            &self.descriptor.runtime_implementation_fingerprint,
+            &budget,
+            &mut || Ok(()),
+        );
     }
 
     fn validate_stream(&self, stream: &CudaDeviceStream) -> Result<(), CudaDeviceRuntimeError> {
@@ -3333,6 +3428,35 @@ impl DeviceRuntime for CudaDeviceRuntime {
         self.structured_capture
     }
 
+    fn install_observation_template_budget(
+        &self,
+        budget: Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Result<(), ferrum_interfaces::vnext::VNextError> {
+        if let Err(candidate) = self.observation_template_budget.set(budget) {
+            if !Arc::ptr_eq(
+                self.observation_template_budget.get().expect("initialized"),
+                &candidate,
+            ) {
+                return Err(ferrum_interfaces::vnext::VNextError::InvalidExecutionPlan {
+                    reason: "CUDA observation template budget is already installed".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+    fn observation_template_budget(
+        &self,
+    ) -> Option<Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>> {
+        Some(Arc::clone(self.observation_template_budget.get_or_init(
+            || {
+                ferrum_interfaces::vnext::DeviceObservationTemplateBudget::new(
+                    ferrum_interfaces::vnext::DEFAULT_OBSERVATION_TEMPLATE_BYTES,
+                )
+                .expect("valid standalone observation template budget")
+            },
+        )))
+    }
+
     fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
     }
@@ -3381,6 +3505,47 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 .executable_cache
                 .cost_reusable_graph_catalog(limits, poll)
         })())
+    }
+
+    fn cost_reusable_graph_catalog_shared(
+        &self,
+        stream: &Self::Stream,
+        limits: ferrum_interfaces::vnext::DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<Arc<ferrum_interfaces::vnext::DeviceCostGraphCatalog>, Self::Error>> {
+        Some((|| {
+            self.validate_stream(stream)?;
+            if !stream.state.is_quiescent() {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA numerical graph catalog requires its quiescent owning stream",
+                ));
+            }
+            stream
+                .executable_cache
+                .cost_reusable_graph_catalog_shared(limits, poll)
+        })())
+    }
+
+    fn cost_prepared_reusable_graph_catalog(
+        &self,
+        stream: &Self::Stream,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<ferrum_interfaces::vnext::DevicePreparedCostGraphCatalogAvailability, Self::Error>
+    {
+        self.validate_stream(stream)?;
+        if !stream.state.is_quiescent() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA prepared cost catalog requires its quiescent owning stream",
+            ));
+        }
+        stream
+            .executable_cache
+            .cost_prepared_reusable_graph_catalog(
+                self.runtime_instance,
+                stream.id,
+                &self.descriptor.runtime_implementation_fingerprint,
+                poll,
+            )
     }
 
     fn cost_direct_graph_replay_operation(&self) -> Option<&'static str> {
@@ -3494,6 +3659,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
         buffer.descriptor.clone()
     }
 
+    fn borrowed_buffer_descriptor<'buffer>(
+        &self,
+        buffer: &'buffer Self::Buffer,
+    ) -> Option<&'buffer BufferDescriptor> {
+        Some(&buffer.descriptor)
+    }
+
     fn supports_cost_buffer_ranges(&self) -> bool {
         true
     }
@@ -3561,6 +3733,34 @@ impl DeviceRuntime for CudaDeviceRuntime {
         })
     }
 
+    fn bind_cost_graph_catalog_lane(
+        &self,
+        stream: &mut Self::Stream,
+        lane: ferrum_interfaces::vnext::ExecutionLaneId,
+    ) -> Result<(), Self::Error> {
+        if let Err(error) = self.validate_stream(stream) {
+            stream.executable_cache.invalidate_prepared_cost_catalog();
+            return Err(error);
+        }
+        if !stream.state.is_quiescent() {
+            stream.executable_cache.invalidate_prepared_cost_catalog();
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA cost catalog binding requires its quiescent owning stream",
+            ));
+        }
+        if self.structured_capture.is_disabled() {
+            return Ok(());
+        }
+        stream.executable_cache.bind_cost_catalog_lane(
+            self.runtime_instance,
+            stream.id,
+            &self.descriptor.runtime_implementation_fingerprint,
+            lane,
+        )?;
+        self.publish_prepared_cost_catalog(stream);
+        Ok(())
+    }
+
     fn stream_state(&self, stream: &Self::Stream) -> StreamState {
         if stream.runtime_instance != self.runtime_instance {
             return StreamState::Failed;
@@ -3573,32 +3773,38 @@ impl DeviceRuntime for CudaDeviceRuntime {
         stream: &mut Self::Stream,
         plan: DeviceReusableExecutionPlan,
     ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        stream.executable_cache.invalidate_prepared_cost_catalog();
         self.validate_stream(stream)?;
         if !stream.state.is_quiescent() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA reusable executable preparation requires its quiescent owning stream",
             ));
         }
-        stream
+        let preparation = stream
             .executable_cache
             .configure(plan)
-            .map_err(CudaDeviceRuntimeError::contract)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        self.publish_prepared_cost_catalog(stream);
+        Ok(preparation)
     }
 
     fn seal_reusable_executables(
         &self,
         stream: &mut Self::Stream,
     ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        stream.executable_cache.invalidate_prepared_cost_catalog();
         self.validate_stream(stream)?;
         if !stream.state.is_quiescent() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA reusable executable sealing requires its quiescent owning stream",
             ));
         }
-        stream
+        let preparation = stream
             .executable_cache
             .seal()
-            .map_err(CudaDeviceRuntimeError::contract)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        self.publish_prepared_cost_catalog(stream);
+        Ok(preparation)
     }
 
     fn reusable_executable_preparation(
@@ -3654,12 +3860,14 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         stream: &mut Self::Stream,
     ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        stream.executable_cache.invalidate_prepared_cost_catalog();
         if stream.runtime_instance != self.runtime_instance || !stream.state.is_quiescent() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA reusable executable trim requires its quiescent owning stream",
             ));
         }
         let (released_executables, released_rejections) = stream.executable_cache.trim_quiescent();
+        self.publish_prepared_cost_catalog(stream);
         Ok(DeviceReusableExecutionTrim::new(
             released_executables,
             released_rejections,
@@ -3713,6 +3921,90 @@ impl DeviceRuntime for CudaDeviceRuntime {
             region.length_bytes(),
             self.structured_capture,
         ))
+    }
+
+    fn encode_strided_copy(
+        &self,
+        source: &Self::Buffer,
+        destination: &Self::Buffer,
+        region: StridedCopyRegion,
+    ) -> Option<Result<Self::Command, Self::Error>> {
+        Some((|| {
+            self.validate_buffer(source)?;
+            self.validate_buffer(destination)?;
+            region
+                .validate_bounds(&source.descriptor, &destination.descriptor)
+                .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+            if source.descriptor.element_type != destination.descriptor.element_type {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA strided copy requires matching element types",
+                ));
+            }
+            let source_end = region
+                .source_end_bytes()
+                .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+            let destination_end = region
+                .destination_end_bytes()
+                .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+            let regions = vec![
+                source.region(region.source_offset_bytes()..source_end)?,
+                destination.region(region.destination_offset_bytes()..destination_end)?,
+            ];
+            let width = checked_usize(region.width_bytes(), "CUDA strided copy width")?;
+            let height = checked_usize(region.height(), "CUDA strided copy height")?;
+            let source_pitch = checked_usize(
+                region.source_pitch_bytes(),
+                "CUDA strided copy source pitch",
+            )?;
+            let destination_pitch = checked_usize(
+                region.destination_pitch_bytes(),
+                "CUDA strided copy destination pitch",
+            )?;
+            Ok(CudaDeviceCommand::transfer(
+                self.runtime_instance,
+                DEVICE_COPY_NATIVE_OPERATION_ID.as_str(),
+                regions,
+                Vec::new(),
+                Box::new(move |stream, _blas, regions, _host_storage| {
+                    // A depth-one 3D copy preserves this rectangle and accepts
+                    // ordinary allocations with compact, unaligned row pitches.
+                    // 2DAsync has an additional cuMemAllocPitch restriction.
+                    let copy = cudarc::driver::sys::CUDA_MEMCPY3D {
+                        srcXInBytes: 0,
+                        srcY: 0,
+                        srcZ: 0,
+                        srcLOD: 0,
+                        srcMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                        srcHost: std::ptr::null(),
+                        srcDevice: regions[0].device_ptr,
+                        srcArray: std::ptr::null_mut(),
+                        reserved0: std::ptr::null_mut(),
+                        srcPitch: source_pitch,
+                        srcHeight: height,
+                        dstXInBytes: 0,
+                        dstY: 0,
+                        dstZ: 0,
+                        dstLOD: 0,
+                        dstMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                        dstHost: std::ptr::null_mut(),
+                        dstDevice: regions[1].device_ptr,
+                        dstArray: std::ptr::null_mut(),
+                        reserved1: std::ptr::null_mut(),
+                        dstPitch: destination_pitch,
+                        dstHeight: height,
+                        WidthInBytes: width,
+                        Height: height,
+                        Depth: 1,
+                    };
+                    unsafe { cudarc::driver::sys::cuMemcpy3DAsync_v2(&copy, stream.cu_stream()) }
+                        .result()
+                        .map_err(|error| {
+                            CudaDeviceRuntimeError::driver("strided device copy", error)
+                        })
+                }),
+            )
+            .with_core_strided_transfer(region, self.structured_capture))
+        })())
     }
 
     fn encode_upload(
@@ -3807,7 +4099,25 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         commands: Vec<Self::Command>,
     ) -> Result<Vec<Self::Command>, Self::Error> {
-        CudaDeviceCommand::coalesced_program_bindings(commands, self.structured_capture)
+        CudaDeviceCommand::coalesced_program_bindings(
+            commands,
+            self.structured_capture,
+            self.observation_template_budget(),
+        )
+    }
+    fn coalesce_program_bindings_with_cost_observation(
+        &self,
+        commands: Vec<Self::Command>,
+        demand: ferrum_interfaces::vnext::DeviceCostObservationDemand,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
+        CudaDeviceCommand::coalesced_program_bindings(
+            commands,
+            self.structured_capture,
+            demand
+                .is_required()
+                .then(|| self.observation_template_budget())
+                .flatten(),
+        )
     }
 
     fn submit(
@@ -3840,6 +4150,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn supports_guarded_submission(&self) -> bool {
         true
+    }
+
+    fn supports_guarded_submission_with_timing(&self, mode: DeviceTimingMode) -> bool {
+        mode.guarded_completion_compatible()
     }
 
     fn guarded_adaptive_submission_capability(&self) -> DeviceGuardedAdaptiveCapability {
@@ -4603,9 +4917,11 @@ mod tests {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation: None,
             library_cost_requirement:
                 crate::backend::cuda::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
+            core_strided_transfer: None,
         }
     }
 
@@ -4704,7 +5020,7 @@ mod tests {
         use ferrum_types::SloStructuredCostCapture;
         let logical = DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 2, 7).unwrap();
         let make = |mode| {
-            CudaDeviceCommand::transfer(
+            let mut command = CudaDeviceCommand::transfer(
                 1,
                 DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
                 Vec::new(),
@@ -4713,14 +5029,24 @@ mod tests {
             )
             .with_core_transfer(StatisticalTransferKindV1::Fill, 257, mode)
             .bind_core_logical_work(logical)
-            .unwrap()
+            .unwrap();
+            command.prepare_core_observation(
+                &ferrum_interfaces::vnext::DeviceObservationTemplateBudget::new(4096).unwrap(),
+            );
+            command
         };
         let command = make(SloStructuredCostCapture::HostSettledV1);
-        let evidence = command.statistical_evidence.as_ref().unwrap();
-        evidence.validate_command(7, 0, 1).unwrap();
-        assert_eq!(evidence.work().fill_bytes, 257);
+        assert!(command.statistical_evidence.is_none());
+        assert!(command.observation.is_some());
+        let evidence = selected_cost::transfer(
+            StatisticalTransferKindV1::Fill,
+            257,
+            7,
+            SloStructuredCostCapture::HostSettledV1,
+        )
+        .unwrap();
         assert!(make(SloStructuredCostCapture::Disabled)
-            .statistical_evidence
+            .observation
             .is_none());
         for path in [DeviceExecutionPath::Eager, DeviceExecutionPath::Replayed] {
             let attribution = cuda_submission_attribution(
@@ -4736,6 +5062,12 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
+            assert!(attribution.commands()[0].statistical_evidence().is_none());
+            assert_eq!(
+                attribution.has_unresolved_observation(),
+                path == DeviceExecutionPath::Eager
+            );
+            let attribution = attribution.resolve_observation().unwrap();
             let actual = &attribution.commands()[0];
             assert_eq!(
                 actual.statistical_evidence().is_some(),

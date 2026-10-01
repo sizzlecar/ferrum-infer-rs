@@ -277,3 +277,6 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
 
 #[path = "on_demand_tests/fence_lifetime.rs"]
 mod fence_lifetime;
+
+#[path = "on_demand_tests/cost_catalog.rs"]
+mod cost_catalog;

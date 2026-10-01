@@ -14,6 +14,13 @@ const VALUE_FEATURES: usize = VALUE_HEADS * HEAD_DIM;
 const QKV_FEATURES: usize = 2 * KEY_HEADS * HEAD_DIM + VALUE_FEATURES;
 
 #[derive(Clone, Copy)]
+pub(super) enum LayerKind {
+    Linear,
+    Full,
+}
+pub(super) const TWO_LAYERS: [LayerKind; 2] = [LayerKind::Linear, LayerKind::Full];
+
+#[derive(Clone, Copy)]
 pub(super) struct CausalGeometry {
     pub heads: usize,
     pub kv_heads: usize,
@@ -38,6 +45,18 @@ impl CausalGeometry {
     };
 }
 pub(super) fn write_config(dir: &Path, causal: CausalGeometry) {
+    write_config_for_layers(dir, causal, &TWO_LAYERS);
+}
+
+pub(super) fn write_config_for_layers(dir: &Path, causal: CausalGeometry, layers: &[LayerKind]) {
+    assert!(!layers.is_empty());
+    let layer_types: Vec<_> = layers
+        .iter()
+        .map(|kind| match kind {
+            LayerKind::Linear => "linear_attention",
+            LayerKind::Full => "full_attention",
+        })
+        .collect();
     let config = serde_json::json!({
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "model_type": "qwen3_5",
@@ -50,8 +69,8 @@ pub(super) fn write_config(dir: &Path, causal: CausalGeometry) {
             "model_type": "qwen3_5_text",
             "hidden_size": HIDDEN,
             "intermediate_size": INTERMEDIATE,
-            "num_hidden_layers": 2,
-            "layer_types": ["linear_attention", "full_attention"],
+            "num_hidden_layers": layers.len(),
+            "layer_types": layer_types,
             "linear_num_key_heads": KEY_HEADS,
             "linear_num_value_heads": VALUE_HEADS,
             "linear_key_head_dim": HEAD_DIM,
@@ -75,6 +94,10 @@ pub(super) fn write_config(dir: &Path, causal: CausalGeometry) {
 }
 
 pub(super) fn write_weights(dir: &Path, causal: CausalGeometry) {
+    write_weights_for_layers(dir, causal, &TWO_LAYERS);
+}
+
+pub(super) fn write_weights_for_layers(dir: &Path, causal: CausalGeometry, layers: &[LayerKind]) {
     let tensors: Vec<(String, Vec<f32>)> = vec![
         (
             "model.embed_tokens.weight".to_string(),
@@ -180,7 +203,25 @@ pub(super) fn write_weights(dir: &Path, causal: CausalGeometry) {
             vec![0.5, 0.25, -0.2, 0.75],
         ),
     ];
-    let views = tensors
+    // Reuse the original two deterministic layer recipes at a declared depth.
+    // Tensor widths stay small; only real compiled graph/state size grows.
+    let mut expanded = tensors
+        .iter()
+        .filter(|(name, _)| !name.starts_with("model.layers."))
+        .cloned()
+        .collect::<Vec<_>>();
+    for (index, kind) in layers.iter().enumerate() {
+        let source = match kind {
+            LayerKind::Linear => "model.layers.0.",
+            LayerKind::Full => "model.layers.1.",
+        };
+        for (name, values) in &tensors {
+            if let Some(suffix) = name.strip_prefix(source) {
+                expanded.push((format!("model.layers.{index}.{suffix}"), values.clone()));
+            }
+        }
+    }
+    let views = expanded
         .into_iter()
         .map(|(name, values)| {
             let dimensions = if name.ends_with("embed_tokens.weight")

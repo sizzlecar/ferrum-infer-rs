@@ -60,10 +60,31 @@ impl DynamicPoolMaintenanceStatus {
     }
 }
 
+/// Evidence of a successful lane-slot reclamation by the owning plan.
+/// This grants only a bounded admission re-probe, never backing authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicLaneSlotReclamation {
+    pub(super) epochs: CapacityEpochs,
+}
+
+impl DynamicLaneSlotReclamation {
+    pub const fn epochs(&self) -> CapacityEpochs {
+        self.epochs
+    }
+
+    /// Expired-lane cleanup may release several slots together. Count that
+    /// operation conservatively as one continuation, never several retries.
+    pub const fn continuation_count(&self) -> u32 {
+        1
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum DynamicDeferredMaintenanceOutcome {
     RetryAdmission {
         current_epochs: CapacityEpochs,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lane_reclamation: Option<DynamicLaneSlotReclamation>,
     },
     WaitForRelease {
         current_epochs: CapacityEpochs,
@@ -516,7 +537,10 @@ where
                         "dynamic backing maintenance made no progress on an unchanged deferral",
                     ));
                 }
-                Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs })
+                Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission {
+                    current_epochs,
+                    lane_reclamation: None,
+                })
             }
             Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
             Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
@@ -658,6 +682,7 @@ where
         if requested_by_pool.is_empty() {
             return Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission {
                 current_epochs: self.pools.logical_admission.epochs()?,
+                lane_reclamation: None,
             });
         }
         let requests = requested_by_pool

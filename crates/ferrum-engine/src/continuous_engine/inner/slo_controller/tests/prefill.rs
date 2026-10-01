@@ -240,6 +240,11 @@ pub(in crate::continuous_engine::inner::slo_controller) async fn selected_after_
             SloIterationPlan::Legacy => {
                 panic!("completion retry unexpectedly selected the legacy driver")
             }
+            SloIterationPlan::Progressed
+            | SloIterationPlan::PrefixMaintenance(_)
+            | SloIterationPlan::PrefixSampling(_) => {
+                panic!("fixture without checkpoint support selected prefix maintenance")
+            }
         }
     }
 }

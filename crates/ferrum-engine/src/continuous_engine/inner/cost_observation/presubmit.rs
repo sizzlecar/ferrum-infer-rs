@@ -21,6 +21,10 @@ pub struct PresubmitPredictionReceiptV1 {
 }
 
 impl PendingPrediction {
+    pub(super) fn retained_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(super::sealed::canonical_retained_bytes(&self.exact)?)
+    }
     pub(super) fn receipt(&self, actual: &ActualWaveShape) -> PresubmitPredictionReceiptV1 {
         let a = &self.exact;
         PresubmitPredictionReceiptV1 {

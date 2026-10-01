@@ -20,6 +20,8 @@ struct LeafExecutor {
     base: MockModelExecutor,
     physical_calls: AtomicU64,
     observed_calls: AtomicU64,
+    actual_sample_demands: Mutex<Vec<bool>>,
+    numeric_sample_demands: Mutex<Vec<bool>>,
     fail: AtomicBool,
     cancel: Mutex<Option<Weak<EngineInner>>>,
     shapes: Mutex<Vec<ActualWaveShape>>,
@@ -113,6 +115,12 @@ impl ModelExecutor for LeafExecutor {
         context: &mut PlanRuntimeCostObservationContext<'_>,
     ) -> ObservedDispatch<PlanRuntimePrefillOutcome> {
         self.observed_calls.fetch_add(1, Ordering::Relaxed);
+        self.actual_sample_demands
+            .lock()
+            .push(context.structured_capture_enabled());
+        self.numeric_sample_demands
+            .lock()
+            .push(context.cost_observation_demand().is_required());
         let row = context.participant(&input.request_id).unwrap();
         let shape = ActualWaveShape {
             statistical_evidence: None,
@@ -161,6 +169,12 @@ impl ModelExecutor for LeafExecutor {
     }
 }
 async fn fixture(observe: bool) -> (ContinuousBatchEngine, Arc<LeafExecutor>) {
+    fixture_with_config(observe, |_| {}).await
+}
+async fn fixture_with_config(
+    observe: bool,
+    configure: impl FnOnce(&mut EngineConfig),
+) -> (ContinuousBatchEngine, Arc<LeafExecutor>) {
     let vocab: tokenizers::models::bpe::Vocab = ["a", "b", "c", "d", "e", "f", "g", "h"]
         .into_iter()
         .enumerate()
@@ -178,6 +192,8 @@ async fn fixture(observe: bool) -> (ContinuousBatchEngine, Arc<LeafExecutor>) {
         base: MockModelExecutor::instant(8),
         physical_calls: AtomicU64::new(0),
         observed_calls: AtomicU64::new(0),
+        actual_sample_demands: Mutex::new(Vec::new()),
+        numeric_sample_demands: Mutex::new(Vec::new()),
         fail: AtomicBool::new(false),
         cancel: Mutex::new(None),
         shapes: Mutex::new(Vec::new()),
@@ -201,6 +217,7 @@ async fn fixture(observe: bool) -> (ContinuousBatchEngine, Arc<LeafExecutor>) {
                 attainment: Default::default(),
             });
     }
+    configure(&mut config);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
@@ -330,6 +347,11 @@ async fn off_and_observe_execute_the_same_actual_frontier() {
             executor.observed_calls.load(Ordering::Relaxed),
             u64::from(observe)
         );
+        assert_eq!(
+            *executor.numeric_sample_demands.lock(),
+            if observe { vec![true] } else { vec![] },
+            "legacy observed context keeps its numeric consumer"
+        );
         let sequences = engine.inner.sequences.read();
         assert_eq!(sequences[&id].prefill_tokens_processed, 2);
         assert!(sequences[&id].generated_tokens.is_empty());
@@ -367,7 +389,9 @@ async fn actual_inference_progresses_while_the_cost_trainer_is_blocked() {
     );
     assert_eq!(executor.physical_calls.load(Ordering::Relaxed), 1);
     assert_eq!(runtime.trained_samples(), 0);
-    assert_eq!(runtime.sink.stats().published, 1);
+    assert_eq!(runtime.sink.stats().raw_accepted, 1);
+    assert_eq!(runtime.sink.stats().raw_pending, 1);
+    assert_eq!(runtime.sink.stats().published, 0);
     release.send(()).unwrap();
     holder.join().unwrap();
     engine.inner.scheduler.cancel(id.clone()).await.unwrap();
@@ -391,6 +415,17 @@ async fn submitted_failure_and_cancelled_host_never_train_or_replay() {
         assert_eq!(executor.physical_calls.load(Ordering::Relaxed), 1);
         assert_eq!(executor.observed_calls.load(Ordering::Relaxed), 1);
         let runtime = engine.inner.cost_runtime.as_ref().unwrap();
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            runtime.request_checkpoint().unwrap().wait(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cut.accepted_ordinal, 1);
+        assert_eq!(runtime.sink.stats().raw_accepted, 1);
+        assert_eq!(runtime.sink.stats().raw_resolved, 1);
+        assert_eq!(runtime.sink.stats().raw_pending, 0);
         assert_eq!(runtime.trained_samples(), 0);
         assert_eq!(runtime.sink.stats().published, 0);
         assert!(runtime.snapshot().is_none());
@@ -453,4 +488,70 @@ async fn same_kv_budget_keeps_actual_host_history_lengths_separate() {
         None,
         "history cannot manufacture an unknown policy"
     );
+}
+
+#[tokio::test]
+async fn consumer_driven_nonmanual_v2_keeps_logical_host_fifo_without_actual_sample() {
+    for policy in [
+        ferrum_types::SloStructuredActualCapturePolicy::LegacyEveryWave,
+        ferrum_types::SloStructuredActualCapturePolicy::ConsumerDrivenV1,
+    ] {
+        let (engine, executor) = fixture_with_config(true, |config| {
+            config.scheduler.slo.cost_observation =
+                ferrum_types::SloCostObservationConfig::structured_whole_wave_v2();
+            config
+                .scheduler
+                .slo
+                .cost_observation
+                .structured_actual_capture = policy;
+        })
+        .await;
+        assert!(!engine.inner.manual_calibration_driver);
+        let runtime = engine.inner.cost_runtime.as_ref().unwrap();
+        let (batch, id, _receiver) = install(&engine).await;
+        engine.inner.process_batch(&batch).await.unwrap();
+        assert_eq!(executor.physical_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(executor.observed_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *executor.actual_sample_demands.lock(),
+            vec![policy.is_legacy()]
+        );
+        assert_eq!(
+            *executor.numeric_sample_demands.lock(),
+            vec![policy.is_legacy()]
+        );
+        assert_eq!(
+            runtime.sink.stats().raw_accepted,
+            1,
+            "real host settlement still enters the original raw FIFO"
+        );
+        assert_eq!(
+            engine.inner.sequences.read()[&id].prefill_tokens_processed,
+            2
+        );
+        assert_eq!(
+            engine.inner.sequences.read()[&id]
+                .cost_frontier
+                .unwrap()
+                .work_generation
+                .get(),
+            2
+        );
+        assert!(executor
+            .shapes
+            .lock()
+            .iter()
+            .all(|shape| shape.statistical_evidence.is_none()));
+        engine.inner.scheduler.cancel(id.clone()).await.unwrap();
+        engine.inner.sequences.write().remove(&id);
+        engine.shutdown().await.unwrap();
+        assert_eq!(runtime.sink.stats().raw_resolved, 1);
+        assert_eq!(runtime.sink.stats().raw_pending, 0);
+        assert_eq!(runtime.sink.stats().published, 1);
+        assert_eq!(
+            runtime.trained_samples(),
+            0,
+            "receipt is not a fabricated V2 numerical qualification"
+        );
+    }
 }

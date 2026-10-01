@@ -457,6 +457,16 @@ impl PlanningCostEvidence {
         requirement: PlanningCostEvidenceRequirement,
         forecast: Option<&ferrum_interfaces::execution_cost::HostContentForecastV2>,
     ) -> Option<Self> {
+        Self::bind_with_forecast_and_domain(exact, expected, selected, requirement, forecast, None)
+    }
+    pub(super) fn bind_with_forecast_and_domain(
+        exact: &CanonicalWaveCostShape,
+        expected: &WaveExecutionShape,
+        selected: &ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+        requirement: PlanningCostEvidenceRequirement,
+        forecast: Option<&ferrum_interfaces::execution_cost::HostContentForecastV2>,
+        domain: Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1>,
+    ) -> Option<Self> {
         if super::cost_shape::canonical_cost_shape(exact).ok().as_ref() != Some(expected) {
             return None;
         }
@@ -491,9 +501,16 @@ impl PlanningCostEvidence {
                             .structured_capture()
                             .ok_or(structured_v2::StructuredUnknownV2::MissingEvidence)?
                             .map_err(|_| structured_v2::StructuredUnknownV2::MissingEvidence)?;
-                        structured_v2::StructuredQueryV2::from_future(
-                            exact, selected, recipe, forecast,
-                        )
+                        match domain {
+                            Some(domain) => {
+                                structured_v2::StructuredQueryV2::from_future_with_domain(
+                                    exact, selected, recipe, forecast, domain,
+                                )
+                            }
+                            None => structured_v2::StructuredQueryV2::from_future(
+                                exact, selected, recipe, forecast,
+                            ),
+                        }
                     });
                 BoundCostInput::StructuredV2(input)
             }
@@ -614,6 +631,14 @@ impl PlanningGraphDomain {
 }
 
 pub trait PlanningShapeResolver {
+    /// Immutable physical workload descriptor installed by this execution
+    /// runtime. A model/profile declaration is not a source for this value.
+    fn cost_workload_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1> {
+        None
+    }
+
     fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
         Ok(PlanningGraphDomain::SnapshotExact)
     }
@@ -709,6 +734,28 @@ pub enum PlanningCostEvidenceRequirement {
 }
 
 pub trait PlanningCostModel {
+    fn query_observer(&self) -> Option<&dyn super::PlanningQueryObserver> {
+        None
+    }
+    /// Same single lookup as predict_with_evidence, with its original typed
+    /// outcome preserved. Only the enabled observer path calls this method.
+    fn predict_observed(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        shape: &WaveExecutionShape,
+        evidence: Option<&PlanningCostEvidence>,
+        now_ns: u64,
+    ) -> super::PlanningObservedCost {
+        super::PlanningObservedCost {
+            outcome: self
+                .predict_with_evidence(fingerprint, shape, evidence, now_ns)
+                .map_or(
+                    super::PlanningQueryOutcome::ModelUnavailable,
+                    super::PlanningQueryOutcome::Known,
+                ),
+            cost_now_ns: Some(now_ns),
+        }
+    }
     /// New predictors explicitly require producer-bound selected statistics.
     /// The legacy callback remains unchanged for all existing implementations.
     fn requires_statistical_evidence(&self) -> bool {

@@ -32,6 +32,10 @@ use super::{
 use crate::vnext::ReusableExecutionBucketSpec;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "invocation_lookup_tests.rs"]
+mod certified_lookup_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepResourceAdmissionProfilePhase {
     AuthorityAndPolicyValidate,
@@ -308,6 +312,22 @@ where
             .expect("step participant count was validated before admission")
     }
 
+    /// Correlates a guarded observation to the original admitted sessions,
+    /// including their epochs/fingerprints. This grants no resource authority.
+    pub(crate) fn matches_planning_participants<'a>(
+        &self,
+        participants: impl ExactSizeIterator<Item = &'a super::ResourcePlanningParticipant>,
+    ) -> bool {
+        participants.len() == self.participants.len()
+            && participants.into_iter().all(|expected| {
+                self.participants
+                    .iter()
+                    .filter(|actual| expected.matches_session_identity(&actual.session))
+                    .count()
+                    == 1
+            })
+    }
+
     pub fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
         self.participants[0].session.resources().coordinator_id()
     }
@@ -520,12 +540,7 @@ where
         &self,
         resource_id: &ResourceId,
     ) -> Result<(&DynamicPoolSet<R>, &[LogicalBackingSliceAuthority]), VNextError> {
-        if let Some(authority) = self
-            .claimed_backing
-            .backing_slices()
-            .iter()
-            .find(|authority| authority.resource_id() == resource_id)
-        {
+        if let Some(authority) = self.claimed_backing.backing_slice(resource_id) {
             return Ok((
                 self.participants[0]
                     .session
@@ -1937,12 +1952,7 @@ where
             .nodes
             .get(node_index)
             .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?;
-        if let Some(authority) = self
-            .claimed_backing
-            .backing_slices()
-            .iter()
-            .find(|authority| authority.resource_id() == resource_id)
-        {
+        if let Some(authority) = self.claimed_backing.backing_slice(resource_id) {
             return Ok((
                 node.participant_authority.participants[0]
                     .request
@@ -2486,12 +2496,7 @@ where
         &self,
         resource_id: &ResourceId,
     ) -> Result<(&DynamicPoolSet<R>, &[LogicalBackingSliceAuthority]), VNextError> {
-        if let Some(authority) = self
-            .claimed_backing
-            .backing_slices()
-            .iter()
-            .find(|authority| authority.resource_id() == resource_id)
-        {
+        if let Some(authority) = self.claimed_backing.backing_slice(resource_id) {
             return Ok((
                 self.step.participants[0]
                     .session

@@ -67,6 +67,7 @@ impl SelectedCalibrationCapture {
             return Err(ModelUnknown::InvalidSample);
         };
         let stages = capture.host_stages();
+        let original_stages = stages.clone();
         let entry = match result.as_ref() {
             CostCalibrationResult::Observed {
                 sample,
@@ -85,7 +86,16 @@ impl SelectedCalibrationCapture {
             },
             _ => return Err(ModelUnknown::InvalidSample),
         };
-        super::super::trainer::whole_wave_observation(&entry, ordinal, identity)
+        if let Some(stages) = original_stages.as_ref() {
+            let actual = super::super::trainer::host_content::statistical::capture_actual(
+                capture, stages, &entry,
+            )?;
+            super::super::trainer::host_content::statistical::whole_wave_observation_from_actual(
+                &actual, ordinal, identity,
+            )
+        } else {
+            super::super::trainer::whole_wave_observation(&entry, ordinal, identity)
+        }
     }
 
     pub fn new(

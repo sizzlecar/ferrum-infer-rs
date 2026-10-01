@@ -10,12 +10,17 @@ use ferrum_interfaces::{
         FutureWaveCostRow,
     },
 };
+use ferrum_scheduler::implementations::continuous::slo_planner::PlanningProjectionDiagnostic;
 
 mod domain;
 mod execution;
+pub(super) use execution::{
+    CacheCaptureExecutorShape, PrefixExecutorShape, ReadyPrefixExecutorShape,
+};
 mod frontier;
 mod planning_audit;
-use domain::{FutureHostMode, RouteDomain};
+use domain::RouteDomain;
+pub(in crate::continuous_engine::inner) use domain::{projected_row_host, FutureHostMode};
 use frontier::{PreparedRow, ProjectedFrontiers, ProjectedRequest};
 #[cfg(test)]
 mod tests;
@@ -155,20 +160,40 @@ impl ExecutorShape<'_> {
                 return Ok(None);
             };
             let output = match selected.work {
-                ActualRowWork::Decode { .. } => FutureCostOutput::Decode {
-                    policy: if request.host_content_changed {
-                        match mode {
-                            FutureHostMode::Exact => return Ok(None),
-                            FutureHostMode::Greedy => match fence.future_greedy_policy.as_ref() {
-                                Some(policy) => policy,
-                                None => return Ok(None),
-                            },
-                            FutureHostMode::FullLogits => &full_logits,
+                ActualRowWork::Decode { .. } => {
+                    if !request.host_content_changed {
+                        FutureCostOutput::Decode {
+                            policy: &fence.logits_policy,
                         }
                     } else {
-                        &fence.logits_policy
-                    },
-                },
+                        match mode {
+                            FutureHostMode::Exact => return Ok(None),
+                            FutureHostMode::FullLogits => FutureCostOutput::Decode {
+                                policy: &full_logits,
+                            },
+                            FutureHostMode::Greedy => {
+                                let Some(policy) = fence.future_greedy_policy.as_ref() else {
+                                    return Ok(None);
+                                };
+                                if let Some((known, penalty, vocabulary)) = fence.future_repetition
+                                {
+                                    let ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax { token_mask, .. } = policy
+                                        else { return Ok(None); };
+                                    let repetition = ferrum_interfaces::vnext::FutureRepetitionRangeV3::from_observed_history(
+                                        known, fence.generated as u64, u64::from(request.generated), vocabulary)
+                                        .map_err(|_| PlanningUnknownReason::InvalidSnapshot)?;
+                                    FutureCostOutput::ProjectedGreedy {
+                                        token_mask: token_mask.as_ref(),
+                                        repetition,
+                                        repetition_penalty: penalty,
+                                    }
+                                } else {
+                                    FutureCostOutput::Decode { policy }
+                                }
+                            }
+                        }
+                    }
+                }
                 ActualRowWork::Prefill {
                     offset,
                     count,
@@ -183,9 +208,14 @@ impl ExecutorShape<'_> {
                         total as usize,
                     )
                     .map_err(|_| PlanningUnknownReason::InvalidSnapshot)?;
-                    // A prefix capture boundary could narrow the selected span
-                    // or add a checkpoint wave. Neither belongs to this route.
+                    // Providers without the explicit guarded maintenance
+                    // contract may narrow this span or append an implicit copy.
+                    // That behavior cannot share the exact selected-wave proof.
                     if request.generated == 0
+                        && !self
+                            .engine
+                            .model_executor
+                            .supports_guarded_prefix_maintenance()
                         && self
                             .engine
                             .model_executor
@@ -246,6 +276,7 @@ impl ExecutorShape<'_> {
                         else {
                             return Ok(None);
                         };
+                        fixed_full |= clean_policy.requires_full_logits();
                         eligible.push(FutureHostPendingRowV2 {
                             physical_position: u32::try_from(position)
                                 .map_err(|_| PlanningUnknownReason::ShapeCapacity)?,
@@ -284,7 +315,7 @@ impl ExecutorShape<'_> {
                         state,
                         &query,
                         &host,
-                        &mut budget,
+                        &mut self.captured.budget.observed_resource_budget(&mut budget),
                     ) {
                     ExecutionCostRouteAvailability::Known(value) => {
                         ExecutionCostRouteAvailability::Known((
@@ -301,7 +332,7 @@ impl ExecutorShape<'_> {
                     &self.captured.route,
                     state,
                     &query,
-                    &mut budget,
+                    &mut self.captured.budget.observed_resource_budget(&mut budget),
                 ) {
                     ExecutionCostRouteAvailability::Known(value) => {
                         ExecutionCostRouteAvailability::Known((
@@ -316,6 +347,16 @@ impl ExecutorShape<'_> {
             }
         };
         let after = poll();
+        // Preserve the original poll and returned-error precedence. The route
+        // may already be unknown even when the outer budget wins this return.
+        if let ExecutionCostRouteAvailability::Unknown(reason) = &projection {
+            PlanningProjectionDiagnostic::ExecutionRoute(*reason).trace(
+                &self.captured.snapshot,
+                None,
+                kind,
+                rows.len(),
+            );
+        }
         if let Some(reason) = failure {
             return Err(reason);
         }
@@ -341,6 +382,12 @@ impl ExecutorShape<'_> {
 }
 
 impl PlanningShapeResolver for ExecutorShape<'_> {
+    fn cost_workload_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1> {
+        self.engine.cost_runtime.as_ref()?.workload_domain()
+    }
+
     fn order_work(
         &self,
         _: &SchedulerSnapshot,

@@ -6,7 +6,9 @@
 //! names or memory bounds cannot identify an arbitrary trait implementation.
 
 use crate::continuous_engine::SequenceState;
-use ferrum_interfaces::execution_cost::{HostContentDomainV1, HostCostPolicyV2};
+use ferrum_interfaces::execution_cost::{
+    HostContentDomainV1, HostCostPolicyV2, PlainTextPolicyCapabilityV2, PlainTextSamplingRouteV2,
+};
 use ferrum_interfaces::{sampler::SamplingConfig, Tokenizer};
 use ferrum_types::ApiRequest;
 use serde::Serialize;
@@ -36,7 +38,8 @@ pub(in crate::continuous_engine) fn host_numeric_policy(
     // Legacy decoders do not promise bounded scratch/allocation behavior.
     let (decoder, raw_bound, _, _) = sequence.credited_output.as_ref()?.decoder.cost_policy()?;
     Some(HostCostPolicyV2 {
-        empirical_content_domain: empirical_content_domain(sequence),
+        empirical_content_domain: empirical_content_domain(sequence)
+            .or_else(|| installed_plain_text_domain(sequence)),
         categorical_signature: policy_signature(sequence, tokenizer, true)?,
         decoder_text_bytes_per_token: u64::try_from(decoder.requirements(1).ok()?.text_bytes)
             .ok()?,
@@ -44,6 +47,21 @@ pub(in crate::continuous_engine) fn host_numeric_policy(
             .ok()?,
         raw_token_bytes_bound: u64::try_from(raw_bound).ok()?,
     })
+}
+
+impl SequenceState {
+    /// Cold preparation-only validation of the actual installed strategy.
+    /// Cached cost identity is insufficient when a private test or a future
+    /// installer changes real sampler, mask, stop or output owner state.
+    pub(in crate::continuous_engine) fn current_host_cost_policy(
+        &self,
+        tokenizer: &dyn Tokenizer,
+    ) -> Option<([u8; 32], HostCostPolicyV2)> {
+        Some((
+            host_policy_signature(self, tokenizer)?,
+            host_numeric_policy(self, tokenizer)?,
+        ))
+    }
 }
 
 /// Narrow, installed plain-text algorithm domain. It deliberately permits
@@ -95,6 +113,82 @@ fn empirical_content_domain(sequence: &SequenceState) -> Option<HostContentDomai
     .then_some(HostContentDomainV1::PlainTextGreedyV1)
 }
 
+/// Ordinary text keeps its actual installed stopping and sampling algorithms.
+/// The new capability is separate from the old length-only greedy forecast.
+fn installed_plain_text_domain(sequence: &SequenceState) -> Option<HostContentDomainV1> {
+    use crate::continuous_engine::{ResponseCompletionState, SequenceSamplingHistoryScope};
+    use ferrum_types::{
+        ModelOutputProtocol, ResponseCompletionBoundary, ResponseFormat, StructuredOutputStart,
+    };
+    let p = &sequence.sampling_params;
+    if sequence.calibration_prefix.is_some()
+        || p.tfs.is_some()
+        || p.typical_p.is_some()
+        || p.mirostat.is_some()
+        || !matches!(p.response_format, ResponseFormat::Text)
+        || p.model_output_protocol != ModelOutputProtocol::Text
+        || !matches!(p.structured_output_start, StructuredOutputStart::Immediate)
+        || !matches!(
+            p.response_completion_boundary,
+            ResponseCompletionBoundary::Immediate
+        )
+        || !matches!(
+            sequence.response_completion_state,
+            ResponseCompletionState::Satisfied
+        )
+        || !matches!(
+            sequence.sampling_history.scope(),
+            SequenceSamplingHistoryScope::FullGeneration
+        )
+        || sequence.structured_output_processor.is_some()
+    {
+        return None;
+    }
+    // Check both resolved representations. An inconsistent EOS/matcher state
+    // cannot gain authority by selecting the broader capability.
+    if sequence.stop_token_ids.iter().any(|id| {
+        !sequence.model_eos_token_ids.contains(id) && !sequence.user_stop_token_ids.contains(id)
+    }) || sequence
+        .model_eos_token_ids
+        .iter()
+        .any(|id| !sequence.stop_token_ids.contains(id))
+        || sequence
+            .user_stop_token_ids
+            .iter()
+            .any(|id| !sequence.stop_token_ids.contains(id))
+        || !sequence.stop_text_seqs.iter().map(String::as_str).eq(p
+            .stop_sequences
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(String::as_str))
+    {
+        return None;
+    }
+    // This mirrors the installed model-side argmax eligibility without the
+    // current UTF-8 bit. That bit determines the actual per-wave route later.
+    let sampling = if p.temperature == 0.0
+        && p.top_p == 1.0
+        && p.top_k.is_none()
+        && p.presence_penalty == 0.0
+        && p.frequency_penalty == 0.0
+        && p.min_p.is_none()
+    {
+        PlainTextSamplingRouteV2::Greedy {
+            repetition_penalty: p.repetition_penalty != 1.0,
+        }
+    } else {
+        PlainTextSamplingRouteV2::FullLogits
+    };
+    Some(HostContentDomainV1::PlainTextInstalledV2(
+        PlainTextPolicyCapabilityV2 {
+            sampling,
+            model_eos: !sequence.model_eos_token_ids.is_empty(),
+            user_stop: !sequence.stop_text_seqs.is_empty()
+                || !sequence.user_stop_token_ids.is_empty(),
+        },
+    ))
+}
+
 fn policy_signature(
     sequence: &SequenceState,
     tokenizer: &dyn Tokenizer,
@@ -126,9 +220,11 @@ fn policy_signature_with_algorithm(
     // from that contract rather than hash stale requested sampling settings.
     let expected = SamplingConfig::from_params(params);
     let actual = &sequence.sampling_plan;
+    let actual_sampling = actual.cost_identity()?;
     if actual.sampler.name() != expected.sampler.name()
         || actual.sampler.is_deterministic() != expected.sampler.is_deterministic()
         || actual.processor_chain.processor_names() != expected.processor_chain.processor_names()
+        || actual_sampling != expected.cost_identity()?
     {
         return None;
     }
@@ -147,11 +243,19 @@ fn policy_signature_with_algorithm(
     if let Some(revision) = algorithm_revision {
         digest.field(&revision)?;
     }
+    if empirical_content_domain(sequence).is_none() {
+        if let Some(domain) = installed_plain_text_domain(sequence) {
+            // Old plain greedy identities retain their original meaning.
+            // New capabilities never borrow an old profile's authority.
+            digest.field(&domain)?;
+            digest.field(&actual_sampling)?;
+        }
+    }
     digest.0.update(tokenizer_identity);
-    if sequence.calibration_prefix.is_some() {
+    if let Some(prefix) = &sequence.calibration_prefix {
         // Preserve real physical/categorical attribution, but do not identify
         // intervention as the ordinary sampler algorithm or empirical domain.
-        digest.field(&"calibration-prefix-preparation.v1")?;
+        digest.field(&prefix.policy_marker())?;
     }
     // Keep every numerical/structured sampling field, while explicitly
     // excluding the stochastic realization from the host execution contract.

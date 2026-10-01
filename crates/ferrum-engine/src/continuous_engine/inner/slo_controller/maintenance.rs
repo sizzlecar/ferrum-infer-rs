@@ -276,10 +276,22 @@ impl EngineInner {
             .iter()
             .map(|row| row.selection().request_id.clone())
             .collect();
+        self.defer_wave_capacity_for_requests(&ids, deferral).await
+    }
+
+    /// Shared physical pressure handling for a proven zero-submit cohort.
+    /// It does not select another model wave or confer a time promise.
+    pub(in crate::continuous_engine::inner) async fn defer_wave_capacity_for_requests(
+        &self,
+        ids: &[RequestId],
+        deferral: &ExecutorExecutionCapacityDeferral,
+    ) -> Result<()> {
         if let Some(retry) = deferral.validated_maintenance_retry_scope(&ids)? {
             self.scheduler
                 .defer_retry_after_execution_maintenance(retry)?;
-            self.slo_controller.lock().pending_maintenance_fairness = true;
+            if self.completion_allowed() {
+                self.slo_controller.lock().pending_maintenance_fairness = true;
+            }
             return Ok(());
         }
         let observed = deferral.observed();

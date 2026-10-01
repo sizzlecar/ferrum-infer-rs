@@ -21,6 +21,114 @@ fn observe_config() -> EngineConfig {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stage_ablation_deadline_timer_keeps_pre_deadline_stages_inside_wait() {
+    use ferrum_interfaces::SloTimingBoundary;
+    use ferrum_types::SloExperimentStageV1 as Stage;
+
+    for stage in [
+        Some(Stage::ControlledAdaptiveBaseline),
+        Some(Stage::SingleWave),
+        Some(Stage::OutputIsolation),
+        Some(Stage::DeadlineOnly),
+        Some(Stage::CostCandidates),
+        Some(Stage::Complete),
+        None,
+    ] {
+        for decoding in [false, true] {
+            let mut engine = test_continuous_engine_with_config(observe_config());
+            // Exercise the timer's typed policy using a real trusted timing
+            // owner. Product startup and transport are covered by the shared
+            // stage tests; this fixture does not claim legacy Enforce startup.
+            let slo = &mut Arc::get_mut(&mut engine.inner)
+                .unwrap()
+                .config
+                .scheduler
+                .slo;
+            slo.mode = SloMode::Enforce;
+            slo.experiment_stage = stage;
+            if let Some(stage) = stage {
+                slo.output.transport = stage.output_transport();
+            }
+            let ingress = tokio::time::Instant::now().into_std();
+            let mut sequence = SequenceState::new(policy_request(), vec![TokenId::new(1)]);
+            sequence.sampling_params.max_tokens = 8;
+            sequence.slo = InferenceRequestContext::from_ingress(ingress)
+                .resolve_slo(&engine.inner.config.scheduler.slo)
+                .unwrap();
+            if decoding {
+                sequence.generated_tokens.push(TokenId::new(2));
+                sequence
+                    .slo
+                    .as_mut()
+                    .unwrap()
+                    .record_commit(ingress)
+                    .unwrap();
+            }
+            let id = sequence.request_id.clone();
+            let generated = sequence.generated_tokens.clone();
+            let frontier = sequence.cost_frontier;
+            engine.inner.sequences.write().insert(id.clone(), sequence);
+            let iterations = engine.inner.iteration_count.load(Ordering::Relaxed);
+            let mut wait = Box::pin(engine.inner.wait_for_slo_deadline());
+            assert!(futures::poll!(&mut wait).is_pending());
+            tokio::time::advance(Duration::from_millis(if decoding { 52 } else { 502 })).await;
+
+            let deadline_enabled = !matches!(
+                stage,
+                Some(
+                    Stage::ControlledAdaptiveBaseline | Stage::SingleWave | Stage::OutputIsolation
+                )
+            );
+            let result = futures::poll!(&mut wait);
+            if deadline_enabled {
+                assert_eq!(
+                    result,
+                    std::task::Poll::Ready(if decoding {
+                        SloTimingBoundary::TokenPrefix
+                    } else {
+                        SloTimingBoundary::FirstToken
+                    }),
+                    "{stage:?} must preserve the deadline scheduling wake"
+                );
+            } else {
+                assert!(result.is_pending(), "{stage:?} must not wake the driver");
+                if decoding {
+                    tokio::time::advance(Duration::from_millis(50)).await;
+                    assert!(futures::poll!(&mut wait).is_pending());
+                }
+                assert!(engine.inner.next_slo_violation_wake().is_none());
+            }
+            {
+                let sequences = engine.inner.sequences.read();
+                let sequence = &sequences[&id];
+                let timing = sequence.slo.as_ref().unwrap();
+                assert_eq!(timing.ingress(), ingress);
+                assert_eq!(timing.committed_tokens(), u64::from(decoding));
+                assert_eq!(sequence.generated_tokens, generated);
+                assert_eq!(sequence.cost_frontier, frontier);
+                if decoding {
+                    assert!(timing.violations().tpot);
+                    if !deadline_enabled {
+                        assert!(timing.violations().itl);
+                    }
+                } else {
+                    assert!(timing.violations().ttft);
+                }
+            }
+            assert_eq!(
+                engine.inner.iteration_count.load(Ordering::Relaxed),
+                iterations
+            );
+            assert_eq!(engine.inner.scheduler.active_count(), 0);
+            assert_eq!(engine.inner.scheduler.waiting_count(), 0);
+            drop(wait);
+            engine.inner.sequences.write().remove(&id);
+            engine.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn slo_wait_timer_records_blocked_ttft_without_scheduler_activity() {
     let engine = test_continuous_engine_with_config(observe_config());
     let ingress = tokio::time::Instant::now().into_std();
@@ -275,6 +383,10 @@ async fn slo_runtime_stream_retains_ingress_from_before_engine_submission() {
     {
         let sequences = engine.inner.sequences.read();
         let timing = sequences.get(&request_id).unwrap().slo.as_ref().unwrap();
+        assert_eq!(
+            sequences[&request_id].admission_observation_ingress,
+            Some(ingress)
+        );
         assert_eq!(timing.ingress(), ingress);
         assert_eq!(
             timing.first_deadline(),
@@ -285,6 +397,51 @@ async fn slo_runtime_stream_retains_ingress_from_before_engine_submission() {
         chunk.unwrap();
     }
     engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_observation_off_stream_uses_real_scheduler_and_original_ingress() {
+    let engine = test_continuous_engine();
+    let ingress = Instant::now() - Duration::from_secs(1);
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 2;
+    let request_id = request.id.clone();
+    let mut stream = engine
+        .infer_stream_with_context(request, InferenceRequestContext::from_ingress(ingress))
+        .await
+        .unwrap();
+    {
+        let sequences = engine.inner.sequences.read();
+        assert!(sequences[&request_id].slo.is_none());
+        assert_eq!(
+            sequences[&request_id].admission_observation_ingress,
+            Some(ingress)
+        );
+    }
+    let snapshot = engine.admission_snapshot().unwrap().unwrap();
+    let queue = snapshot.queue_observation().unwrap().as_ref().unwrap();
+    assert_eq!(queue.waiting_requests, 1);
+    assert!(queue.oldest_waiting_ingress_age_ns.unwrap() >= 1_000_000_000);
+    {
+        let _busy = engine.inner.sequences.write();
+        let unavailable = engine.admission_snapshot().unwrap().unwrap();
+        assert!(unavailable.queue_observation().unwrap().is_err());
+        assert_eq!(unavailable.waiting_requests(), 1);
+    }
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        chunk.unwrap();
+    }
+    engine.shutdown().await.unwrap();
+    let empty = engine.admission_snapshot().unwrap().unwrap();
+    assert_eq!(
+        empty
+            .queue_observation()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .oldest_unfinished_ingress_age_ns,
+        None
+    );
 }
 
 #[tokio::test]
@@ -347,5 +504,49 @@ async fn slo_runtime_terminal_observation_keeps_commit_text_and_terminal_boundar
         event.attributes["text_boundary"],
         "engine_text_prepared_before_channel_send_not_http_or_client_visible"
     );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn required_query_observation_shared_engine_startup_health_and_shutdown() {
+    // Startup/shutdown plumbing only: an unsupported mock executor does not
+    // acquire a model, query coverage or an execution witness from this record.
+    let path = std::env::temp_dir().join(format!(
+        "ferrum-required-query-engine-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let mut config = observe_config();
+    config.scheduler.slo.cost_observation =
+        ferrum_types::SloCostObservationConfig::structured_whole_wave_v2();
+    config.scheduler.slo.required_query_observation =
+        ferrum_types::SloRequiredQueryObservationConfig::StructuredRequiredV1 {
+            path: path.clone(),
+            limits: Default::default(),
+        };
+    let engine = test_continuous_engine_with_config(config);
+    let health = engine.cache_metrics_snapshot().unwrap();
+    assert_eq!(health["required_query_observation"]["enabled"], true);
+    assert_eq!(
+        health["required_query_observation"]["recording_complete"],
+        false
+    );
+    engine.shutdown().await.unwrap();
+    let health = engine.cache_metrics_snapshot().unwrap();
+    assert_eq!(
+        health["required_query_observation"]["recording_complete"],
+        true
+    );
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let identity = records
+        .iter()
+        .find(|row| row["event"] == "run_identity")
+        .unwrap();
+    assert!(identity["data"]["cost_profile_receipt"].is_null());
+    assert_eq!(records.last().unwrap()["event"], "run_footer");
+    assert_eq!(records.last().unwrap()["recording_complete"], true);
     std::fs::remove_file(path).unwrap();
 }

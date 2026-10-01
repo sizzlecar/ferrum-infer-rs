@@ -7,6 +7,9 @@ use ferrum_interfaces::execution_cost::{
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
+mod observation;
+pub(super) use observation::freeze as observation;
+
 fn blit(builder: &mut SelectedCommandCostBuilderV1, bytes: u64, gather: bool) -> Option<()> {
     static SOURCE: OnceLock<[u8; 32]> = OnceLock::new();
     let signature = *SOURCE.get_or_init(|| Sha256::digest(FINGERPRINT_SOURCE.as_bytes()).into());
@@ -131,6 +134,26 @@ mod tests {
                     Some((layout, count as u32, false)),
                 )
                 .unwrap();
+                for (shared_input, expected) in [(true, &shared), (false, &gathered)] {
+                    let template = observation(
+                        projection,
+                        &[launch],
+                        tokens,
+                        Some((layout, count as u32, shared_input)),
+                    )
+                    .unwrap();
+                    let resolved = template
+                        .project(&ferrum_interfaces::vnext::FrozenObservationInput::command(
+                            tokens,
+                        ))
+                        .unwrap();
+                    assert_eq!(resolved[0].as_ref(), Some(expected));
+                    assert!(template
+                        .project(&ferrum_interfaces::vnext::FrozenObservationInput::command(
+                            tokens + 1
+                        ))
+                        .is_err());
+                }
                 shared
                     .validate_command(tokens, projection.dispatch_count(launch), count)
                     .unwrap();
@@ -231,3 +254,5 @@ mod tests {
         );
     }
 }
+
+pub(super) use observation::payload_upper as observation_payload_upper;

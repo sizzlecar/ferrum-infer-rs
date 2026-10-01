@@ -79,16 +79,12 @@ fn capture_registry_view<R: DeviceRuntime>(
     )
 }
 
-pub(super) fn with_registry_sequences<R: DeviceRuntime, T>(
+pub(super) fn with_registry_sequences<R: DeviceRuntime, T, B: ResourcePlanningBudget + ?Sized>(
     sequences: &Mutex<VNextSequenceRegistry<R>>,
     requests: &[ExecutorResourcePlanningRequest<'_>],
     limits: ResourcePlanningLimits,
-    budget: &mut dyn ResourcePlanningBudget,
-    capture: impl FnOnce(
-        &[Arc<VNextSequence<R>>],
-        &[&SequenceSession<R>],
-        &mut dyn ResourcePlanningBudget,
-    ) -> T,
+    budget: &mut B,
+    capture: impl FnOnce(&[Arc<VNextSequence<R>>], &[&SequenceSession<R>], &mut B) -> T,
 ) -> std::result::Result<T, ResourcePlanningUnknown> {
     use ResourcePlanningReadStage as Stage;
     use ResourcePlanningUnknown as U;

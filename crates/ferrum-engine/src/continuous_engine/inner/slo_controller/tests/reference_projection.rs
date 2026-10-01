@@ -213,7 +213,7 @@ fn publish_another_online_sample(runtime: &EngineCostRuntime) {
         committed_at_ns: Some(9),
     });
     clock.0.store(10, Ordering::Relaxed);
-    assert_eq!(call.finish(), CostCallDisposition::Published);
+    assert_eq!(call.finish(), CostCallDisposition::Queued);
     runtime.consume_samples();
 }
 

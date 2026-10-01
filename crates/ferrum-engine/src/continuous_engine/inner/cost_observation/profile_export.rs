@@ -27,7 +27,7 @@ mod session;
 pub(in crate::continuous_engine::inner) mod structured;
 pub(in crate::continuous_engine::inner) mod structured_v2;
 pub(in crate::continuous_engine) use cut::{CostProfileCutPaths, CostProfileCutReceipt};
-use files::{ProducerIdentity, PublishedFile, StagedFile};
+pub(super) use files::{ProducerIdentity, PublishedFile, StagedFile};
 pub(super) use session::ExportSession;
 
 #[derive(Debug, thiserror::Error)]
@@ -578,6 +578,13 @@ impl ProfileExporter {
                 .filter_map(|row| row.sample.as_ref())
                 .any(|sample| sample.measured_unix_ns() > closing.wall_unix_ns)
         {
+            #[cfg(test)]
+            eprintln!(
+                "export clock rejection: opening={:?} closing={closing:?} declared_error_ns={error} max_sample_wall_ns={:?} max_host_sample_wall_ns={:?}",
+                self.plan.opening,
+                self.samples.iter().filter_map(|entry| entry.observation.as_ref()).map(|sample| sample.sample.measured_unix_ns).max(),
+                self.samples.iter().filter_map(|entry| entry.host_content.as_ref()).filter_map(|row| row.sample.as_ref()).map(|sample| sample.measured_unix_ns()).max(),
+            );
             return Err(ExportError::Clock(
                 "wall/monotonic endpoints contradict declared clock accuracy",
             ));

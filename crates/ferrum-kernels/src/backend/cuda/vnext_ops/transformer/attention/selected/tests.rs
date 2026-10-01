@@ -3,6 +3,8 @@ use crate::gguf_blocks::GgufBlockFormat;
 use ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1;
 use ferrum_interfaces::vnext::WeightId;
 
+mod prepared;
+
 fn shape() -> AttentionShape {
     AttentionShape {
         hidden_size: 4096,
@@ -96,6 +98,31 @@ fn cuda_selected_gdn_matches_shared_dispatch_selectors_for_packed_and_leaf_comma
                 SloStructuredCostCapture::HostSettledV1,
             )
             .unwrap();
+            let classes = PreparedKernelClasses::new(shape(), precision).unwrap();
+            let prepared = compute_with_classes(
+                shape(),
+                precision,
+                projection(&qkv, quantized),
+                ProjectionEvidence::Native {
+                    input: &qkv,
+                    output: &output,
+                },
+                counts
+                    .iter()
+                    .map(|&n| (n, if packed { 8 } else { 1 }, packed)),
+                8,
+                participants,
+                true,
+                SloStructuredCostCapture::HostSettledV1,
+                Some(&classes),
+            )
+            .unwrap();
+            assert_eq!(prepared, observed);
+            assert_eq!(prepared.algorithm_work(), observed.algorithm_work());
+            let wrong_block = (THREADS_PER_BLOCK + 1, 1, 1);
+            assert!(classes
+                .get(CONV_STATE_COMMIT_FUNCTION, wrong_block)
+                .is_none());
             let expected = counts
                 .iter()
                 .map(|&n| {
@@ -259,6 +286,22 @@ fn cublas_gdn_complete_sequence_matches_two_library_calls_and_all_native_work() 
         (8, 2, vec![(3, 1, false), (5, 1, false)]),
     ] {
         let leaf_count = leaves.len() as u64;
+        let classes =
+            PreparedKernelClasses::new(shape(), AttentionPrecision::F32MasterGgufF16Projections)
+                .unwrap();
+        let prepared = compute_with_classes(
+            shape(),
+            AttentionPrecision::F32MasterGgufF16Projections,
+            AttentionProjection::F16,
+            ProjectionEvidence::Library(identity),
+            leaves.iter().copied(),
+            tokens,
+            participants,
+            true,
+            SloStructuredCostCapture::HostSettledV1,
+            Some(&classes),
+        )
+        .unwrap();
         let selected = compute(
             shape(),
             AttentionPrecision::F32MasterGgufF16Projections,
@@ -271,6 +314,16 @@ fn cublas_gdn_complete_sequence_matches_two_library_calls_and_all_native_work() 
             SloStructuredCostCapture::HostSettledV1,
         )
         .unwrap();
+        assert_eq!(prepared, selected);
+        assert_eq!(prepared.algorithm_work(), selected.algorithm_work());
+        let captured = SelectedReplayAlgorithmTemplateV1::from_selected(
+            &selected,
+            tokens,
+            leaf_count * 10,
+            leaf_count * 2,
+        )
+        .unwrap();
+        captured.validate_binding(&prepared).unwrap();
         selected
             .validate_command(tokens, leaf_count * 10, leaf_count * 2)
             .unwrap();

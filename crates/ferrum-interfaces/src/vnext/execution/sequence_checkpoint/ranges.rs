@@ -2,7 +2,12 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use super::*;
-use crate::vnext::{CheckpointBackingRequest, CheckpointBackingRequests};
+use crate::vnext::{CheckpointBackingRequest, CheckpointBackingRequests, StridedCopyRegion};
+
+mod key_value_block;
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SequenceCheckpointCopyRange {
@@ -27,6 +32,10 @@ pub struct SequenceCheckpointResourceRanges {
     resource_id: ResourceId,
     logical_bytes: u64,
     ranges: Vec<SequenceCheckpointCopyRange>,
+    #[serde(skip_serializing_if = "is_false")]
+    physical_prefix_coordinates: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    strided_ranges: Vec<StridedCopyRegion>,
 }
 
 impl SequenceCheckpointResourceRanges {
@@ -38,6 +47,33 @@ impl SequenceCheckpointResourceRanges {
     }
     pub fn ranges(&self) -> &[SequenceCheckpointCopyRange] {
         &self.ranges
+    }
+
+    pub fn strided_ranges(&self) -> &[StridedCopyRegion] {
+        &self.strided_ranges
+    }
+
+    pub(crate) fn sequence_copy_bound(&self, logical_bytes: u64, capacity_bytes: u64) -> u64 {
+        if self.physical_prefix_coordinates {
+            capacity_bytes
+        } else {
+            logical_bytes
+        }
+    }
+
+    pub(crate) fn physical_copy_extent(&self) -> Option<u64> {
+        self.physical_prefix_coordinates.then(|| {
+            self.ranges
+                .iter()
+                .map(|range| range.source.end)
+                .chain(
+                    self.strided_ranges
+                        .iter()
+                        .map(|range| range.source_end_bytes().expect("checked copy extent")),
+                )
+                .max()
+                .unwrap_or(0)
+        })
     }
 }
 
@@ -87,6 +123,33 @@ impl SequenceCheckpointBytePlan {
 }
 
 impl SequenceCheckpointState {
+    fn source_copy_plan(
+        &self,
+        boundary: u64,
+    ) -> Result<(Vec<Range<u64>>, Vec<StridedCopyRegion>), VNextError> {
+        if let ProviderCheckpointStateLayout::PagedKeyValueBlockPrefix {
+            tokens_per_block,
+            key_pack_elements,
+        } = self.layout
+        {
+            let shape = self.descriptor.demand().theoretical_maximum_shape();
+            let logical_capacity = self
+                .descriptor
+                .evaluate_logical_request_bytes_for_shape(shape)?;
+            let physical_capacity = self.descriptor.evaluate_request_bytes_for_shape(shape)?;
+            return key_value_block::source_copy_plan(
+                &self.tensor,
+                tokens_per_block.get(),
+                key_pack_elements.get(),
+                self.offset_bytes,
+                boundary,
+                logical_capacity,
+                physical_capacity,
+            );
+        }
+        Ok((vec![self.source_range(boundary)?], Vec::new()))
+    }
+
     fn source_range(&self, boundary: u64) -> Result<Range<u64>, VNextError> {
         let length = match self.layout {
             ProviderCheckpointStateLayout::ContiguousBoundaryValue => {
@@ -97,6 +160,11 @@ impl SequenceCheckpointState {
                 .minimum_storage_bytes()?
                 .checked_mul(boundary)
                 .ok_or_else(|| invalid_plan("checkpoint prefix byte length overflows u64"))?,
+            ProviderCheckpointStateLayout::PagedKeyValueBlockPrefix { .. } => {
+                return Err(invalid_plan(
+                    "blocked key/value prefix requires its exact copy ranges",
+                ));
+            }
         };
         let end = self
             .offset_bytes
@@ -116,11 +184,24 @@ impl SequenceCheckpointState {
     fn maximum_source_range(&self) -> Result<Range<u64>, VNextError> {
         match self.layout {
             ProviderCheckpointStateLayout::ContiguousBoundaryValue => self.source_range(1),
-            ProviderCheckpointStateLayout::TokenMajorPrefix => {
+            ProviderCheckpointStateLayout::TokenMajorPrefix
+            | ProviderCheckpointStateLayout::PagedKeyValueBlockPrefix { .. } => {
                 let capacity = self.descriptor.evaluate_logical_request_bytes_for_shape(
                     self.descriptor.demand().theoretical_maximum_shape(),
                 )?;
-                self.source_range(capacity / self.tensor.minimum_storage_bytes()?)
+                let (ranges, strided) =
+                    self.source_copy_plan(capacity / self.tensor.minimum_storage_bytes()?)?;
+                let end = ranges
+                    .iter()
+                    .map(|range| range.end)
+                    .chain(
+                        strided
+                            .iter()
+                            .map(|range| range.source_end_bytes().expect("checked copy extent")),
+                    )
+                    .max()
+                    .ok_or_else(|| invalid_plan("checkpoint maximum prefix is empty"))?;
+                Ok(self.offset_bytes..end)
             }
         }
     }
@@ -170,16 +251,26 @@ impl SequenceCheckpointLayout {
                 "checkpoint requires a positive completed boundary",
             ));
         }
-        let mut groups = BTreeMap::<ResourceId, Vec<Range<u64>>>::new();
+        let mut groups =
+            BTreeMap::<ResourceId, (Vec<Range<u64>>, Vec<StridedCopyRegion>, bool)>::new();
         for state in &self.data.states {
-            groups
-                .entry(state.resource_id.clone())
-                .or_default()
-                .push(state.source_range(boundary)?);
+            let (ranges, rectangles, physical_coordinates) =
+                groups.entry(state.resource_id.clone()).or_default();
+            let (contiguous, strided) = state.source_copy_plan(boundary)?;
+            ranges.extend(contiguous);
+            for rectangle in strided {
+                if !rectangles.contains(&rectangle) {
+                    rectangles.push(rectangle);
+                }
+            }
+            *physical_coordinates |= matches!(
+                state.layout,
+                ProviderCheckpointStateLayout::PagedKeyValueBlockPrefix { .. }
+            );
         }
         let mut total = 0_u64;
         let mut resources = Vec::new();
-        for (resource_id, mut ranges) in groups {
+        for (resource_id, (mut ranges, mut strided, physical_prefix_coordinates)) in groups {
             ranges.sort_by_key(|range| (range.start, range.end));
             let mut merged: Vec<Range<u64>> = Vec::new();
             for range in ranges {
@@ -208,6 +299,21 @@ impl SequenceCheckpointLayout {
                     })
                 })
                 .collect::<Result<Vec<_>, VNextError>>()?;
+            strided.sort_by_key(|range| range.source_offset_bytes());
+            let mut strided_ranges = Vec::with_capacity(strided.len());
+            for range in strided {
+                strided_ranges.push(StridedCopyRegion::new(
+                    range.source_offset_bytes(),
+                    logical_bytes,
+                    range.width_bytes(),
+                    range.height(),
+                    range.source_pitch_bytes(),
+                    range.width_bytes(),
+                )?);
+                logical_bytes = logical_bytes
+                    .checked_add(range.length_bytes()?)
+                    .ok_or_else(|| invalid_plan("compact strided checkpoint bytes overflow u64"))?;
+            }
             total = total
                 .checked_add(logical_bytes)
                 .ok_or_else(|| invalid_plan("checkpoint total bytes overflow u64"))?;
@@ -215,6 +321,8 @@ impl SequenceCheckpointLayout {
                 resource_id,
                 logical_bytes,
                 ranges,
+                physical_prefix_coordinates,
+                strided_ranges,
             });
         }
         Ok(SequenceCheckpointBytePlan {

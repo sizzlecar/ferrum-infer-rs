@@ -4,7 +4,7 @@
 
 use super::*;
 use ferrum_interfaces::{SloTimingBoundary, SloViolationWake};
-use ferrum_types::SloMode;
+use ferrum_types::{SloControllerPolicy, SloMode};
 
 /// Shared by SLO wait observation, token commit and terminal observation. Tokio
 /// delegates to the platform monotonic clock outside a paused test runtime.
@@ -77,14 +77,20 @@ impl EngineInner {
             // Tokio's clock is the same monotonic clock in production, and
             // allows this waiting path to be exercised with virtual time.
             let newly_due = self.observe_slo_waits(slo_clock_now);
-            if self.config.scheduler.slo.mode == SloMode::Enforce {
+            if self.config.scheduler.slo.mode == SloMode::Enforce
+                && self.config.scheduler.slo.execution_policy().controller
+                    != SloControllerPolicy::Legacy
+            {
                 if let Some(boundary) = newly_due {
                     return boundary;
                 }
             }
-            // Observe does not invoke the scheduler or alter its fairness/
-            // retry counters. A different, unrecorded boundary may still be
-            // due later; recorded violations cannot cause a timer spin.
+            // Observe and stages without deadline scheduling stay inside this
+            // wait. Returning would wake the background driver and introduce
+            // an extra scheduling/admission opportunity. Keep the real sticky
+            // measurements, but do not change fairness or retry counters.
+            // Another boundary may be due later; recorded violations cannot
+            // cause a timer spin.
         }
     }
 }

@@ -40,7 +40,22 @@ fn decode() -> Row {
     }
 }
 
-fn evidence(attempt: &Attempt) -> (Vec<ReportedRow>, HostStageEvidenceV1) {
+struct HostWorkFixture {
+    rows: Vec<HostRowStageV1>,
+    finalized_at_ns: Option<u64>,
+    completeness: HostStageCompleteness,
+}
+impl HostWorkFixture {
+    fn view(&self) -> HostWorkView<'_> {
+        HostWorkView {
+            rows: &self.rows,
+            finalized_at_ns: self.finalized_at_ns,
+            completeness: self.completeness,
+        }
+    }
+}
+
+fn evidence(attempt: &Attempt) -> (Vec<ReportedRow>, HostWorkFixture) {
     let rows = attempt
         .rows
         .iter()
@@ -49,17 +64,7 @@ fn evidence(attempt: &Attempt) -> (Vec<ReportedRow>, HostStageEvidenceV1) {
             full_logits: true,
         })
         .collect();
-    let host = HostStageEvidenceV1 {
-        schema_version: 1,
-        call_id: 1,
-        presubmit_prediction: None,
-        prospective_capture: None,
-        fingerprint: None,
-        actual_shape: None,
-        statistical_evidence: None,
-        structured_evidence: None,
-        prepare_started_at_ns: Some(1),
-        executor_returned_at_ns: Some(2),
+    let host = HostWorkFixture {
         rows: attempt
             .rows
             .iter()
@@ -92,7 +97,6 @@ fn evidence(attempt: &Attempt) -> (Vec<ReportedRow>, HostStageEvidenceV1) {
             })
             .collect(),
         finalized_at_ns: Some(7),
-        full_wall_ns: None,
         completeness: HostStageCompleteness::CompleteSingleWave,
     };
     // No synthetic timing bound, canonical shape, cost sample or queue receipt
@@ -109,7 +113,7 @@ fn complete(cursor: &mut Cursor<'_>, rows: Vec<Row>) -> Attempt {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .unwrap());
     attempt
@@ -189,7 +193,7 @@ fn wave_plan_blocked_withdrawn_failed_and_indeterminate_do_not_advance() {
             CalibrationSubmissionState::HostReconciled,
             true,
             &rows,
-            Some(&host)
+            Some(host.view())
         )
         .is_err());
     assert_eq!(cursor.choice(), before);
@@ -199,7 +203,7 @@ fn wave_plan_blocked_withdrawn_failed_and_indeterminate_do_not_advance() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &rows,
-            Some(&host)
+            Some(host.view())
         )
         .unwrap());
     assert!(cursor
@@ -208,7 +212,7 @@ fn wave_plan_blocked_withdrawn_failed_and_indeterminate_do_not_advance() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &rows,
-            Some(&host)
+            Some(host.view())
         )
         .is_err());
 }
@@ -228,7 +232,7 @@ fn wave_plan_requires_actual_owner_frontier_work_and_forced_full_policy() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .is_err());
     actual[0].full_logits = true;
@@ -239,7 +243,7 @@ fn wave_plan_requires_actual_owner_frontier_work_and_forced_full_policy() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .is_err());
     actual[0].row.work_generation -= 1;
@@ -254,7 +258,7 @@ fn wave_plan_requires_actual_owner_frontier_work_and_forced_full_policy() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .is_err());
     assert_eq!(cursor.choice(), before);
@@ -267,7 +271,7 @@ fn wave_plan_requires_actual_owner_frontier_work_and_forced_full_policy() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .unwrap());
 }
@@ -303,7 +307,7 @@ fn wave_plan_requires_successful_terminal_handoff_but_not_cost_eligibility() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .is_err());
     assert_eq!(cursor.choice().decode_completed, 0);
@@ -320,7 +324,7 @@ fn wave_plan_requires_successful_terminal_handoff_but_not_cost_eligibility() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .unwrap());
 }
@@ -353,7 +357,7 @@ fn wave_plan_missing_failed_or_mismatched_host_evidence_never_counts_as_progress
                 CalibrationSubmissionState::HostReconciled,
                 false,
                 &actual,
-                Some(&host)
+                Some(host.view())
             )
             .is_err());
         assert_eq!(cursor.choice().decode_completed, 0);
@@ -389,7 +393,7 @@ fn wave_plan_reset_static_axis_and_checked_mixed_ordinal_are_explicit() {
             CalibrationSubmissionState::HostReconciled,
             false,
             &actual,
-            Some(&host)
+            Some(host.view())
         )
         .is_err());
     assert_eq!(cursor.choice(), before);

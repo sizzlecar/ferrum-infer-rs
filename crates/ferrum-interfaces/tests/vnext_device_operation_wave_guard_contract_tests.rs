@@ -94,6 +94,48 @@ fn dispatch_with_timing<S: SubmissionWaveDispatchTimingSink>(
     guard: &Guard,
     timing: &S,
 ) -> GuardedWaveSubmissionOutcome<TestRuntime> {
+    dispatch_with_timing_and_demand(
+        fixture,
+        session,
+        step,
+        reaper,
+        guard,
+        timing,
+        ferrum_interfaces::execution_cost::StructuredCostSampleDemand::RuntimePolicy,
+    )
+}
+
+fn dispatch_with_timing_and_demand<S: SubmissionWaveDispatchTimingSink>(
+    fixture: &Fixture,
+    session: &Arc<SequenceSession<TestRuntime>>,
+    step: &Arc<StepResourceLease<TestRuntime>>,
+    reaper: &Arc<CompletionReaper<TestRuntime>>,
+    guard: &Guard,
+    timing: &S,
+    demand: ferrum_interfaces::execution_cost::StructuredCostSampleDemand,
+) -> GuardedWaveSubmissionOutcome<TestRuntime> {
+    dispatch_with_device_timing_and_demand(
+        fixture,
+        session,
+        step,
+        reaper,
+        guard,
+        timing,
+        demand,
+        DeviceTimingMode::Off,
+    )
+}
+
+fn dispatch_with_device_timing_and_demand<S: SubmissionWaveDispatchTimingSink>(
+    fixture: &Fixture,
+    session: &Arc<SequenceSession<TestRuntime>>,
+    step: &Arc<StepResourceLease<TestRuntime>>,
+    reaper: &Arc<CompletionReaper<TestRuntime>>,
+    guard: &Guard,
+    timing: &S,
+    demand: ferrum_interfaces::execution_cost::StructuredCostSampleDemand,
+    device_timing: DeviceTimingMode,
+) -> GuardedWaveSubmissionOutcome<TestRuntime> {
     let lane = step.execution_lane();
     let mut wave = prepare_wave(&fixture.plan_resources, &fixture.plan, step);
     if guard.staging {
@@ -126,13 +168,17 @@ fn dispatch_with_timing<S: SubmissionWaveDispatchTimingSink>(
         lane,
     )
     .unwrap();
-    OperationDispatch::encode_and_submit_guarded_wave_with_timing(
+    OperationDispatch::encode_and_submit_guarded_wave_with_device_timing_and_cost_evidence_demand(
         &providers,
         &fixture.resolved,
         &identity,
         active.iter(),
+        device_timing,
         &[],
+        None,
         guard,
+        ferrum_interfaces::vnext::DeviceCostObservationDemand::Required,
+        demand,
         timing,
         wave,
         lane,
@@ -163,6 +209,18 @@ fn rejected_then_retry_with_timing<S: SubmissionWaveDispatchTimingSink>(
     missing_attribution: bool,
     timing: &S,
 ) {
+    rejected_then_retry_with_timing_and_demand(
+        missing_attribution,
+        timing,
+        ferrum_interfaces::execution_cost::StructuredCostSampleDemand::RuntimePolicy,
+    )
+}
+
+fn rejected_then_retry_with_timing_and_demand<S: SubmissionWaveDispatchTimingSink>(
+    missing_attribution: bool,
+    timing: &S,
+    demand: ferrum_interfaces::execution_cost::StructuredCostSampleDemand,
+) {
     let (fixture, sequence, session, batch, step) = setup();
     let lane = Arc::clone(step.execution_lane());
     lane.configure_submission_readback_staging(8).unwrap();
@@ -179,7 +237,9 @@ fn rejected_then_retry_with_timing<S: SubmissionWaveDispatchTimingSink>(
         trace: Arc::clone(&fixture.runtime_trace),
     };
     let reaper = CompletionReaper::new();
-    let pending = match dispatch_with_timing(&fixture, &session, &step, &reaper, &guard, timing) {
+    let pending = match dispatch_with_timing_and_demand(
+        &fixture, &session, &step, &reaper, &guard, timing, demand,
+    ) {
         GuardedWaveSubmissionOutcome::NotSubmitted(pending) => pending,
         _ => panic!("prepared guard must reject without submitting"),
     };
@@ -256,6 +316,156 @@ fn guarded_core_rejection_releases_staging_and_retries_same_live_request() {
 #[test]
 fn guarded_core_missing_attribution_rejects_before_host_gate_and_submit() {
     rejected_then_retry(true);
+}
+
+#[test]
+fn guarded_cpu_row_primitives_match_actual_dispatches_and_output() {
+    struct PrimitiveGuard<'a> {
+        fill: &'a ControlledCpuFill,
+        dispatches: u64,
+    }
+    impl PreparedWaveSubmissionGuard for PrimitiveGuard<'_> {
+        fn check(
+            &self,
+            actual: &DeviceSubmissionAttribution,
+            readback: CoreReadbackRoute,
+        ) -> Result<(), GuardedNotSubmittedReason> {
+            assert_eq!(self.fill.executed.load(Ordering::Acquire), 0);
+            assert_eq!(self.fill.executed_dispatches.load(Ordering::Acquire), 0);
+            assert_eq!(readback, CoreReadbackRoute::HostSynchronized);
+            assert_eq!(actual.commands().len(), 2);
+            for command in actual.commands() {
+                assert_eq!(command.participant_count(), 2);
+                assert_eq!(command.token_count(), 2);
+                assert_eq!(command.compute_dispatch_count(), self.dispatches);
+                assert_eq!(command.transfer_command_count(), 0);
+                assert_eq!(
+                    command.native_op_id(),
+                    self.fill.layout.native_op_id(self.fill.full_logits)
+                );
+            }
+            Ok(())
+        }
+    }
+
+    // The expected dispatch count is independent of the fixture's helper.
+    // A-only and B-only each invoke one primitive; mixed rows invoke both.
+    for (contexts, expected_dispatches) in [([1, 1], 1), ([2, 2], 1), ([1, 2], 2)] {
+        for full_logits in [false, true] {
+            let fixture = fixture();
+            let sequences = (0..2)
+                .map(|index| {
+                    logical_resources(
+                        &fixture.plan_resources,
+                        &format!("run.cpu-primitives.{index}"),
+                        &format!("request.cpu-primitives.{index}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let sessions = sequences
+                .iter()
+                .map(|sequence| sequence.open_session().unwrap())
+                .collect::<Vec<_>>();
+            let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+            let lane = fixture.plan_resources.create_execution_lane().unwrap();
+            let work = contexts
+                .map(|context| {
+                    TokenSpanWork::from_token_ids(&vec![5; context + 1], context..context + 1)
+                        .unwrap()
+                })
+                .to_vec();
+            let request = StepResourceAdmissionRequest::new(
+                batch.bind_work_shape(work).unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap();
+            let mut admitted = None;
+            for _ in 0..4 {
+                match batch.try_begin_step(request.clone(), &lane).unwrap() {
+                    StepResourceAdmissionDecision::Admitted(step) => {
+                        admitted = Some(step);
+                        break;
+                    }
+                    StepResourceAdmissionDecision::BackingDeferred(deferred) => {
+                        deferred.maintain().unwrap();
+                    }
+                    _ => panic!("original CPU primitive step unavailable"),
+                }
+            }
+            let step = admitted.expect("bounded CPU primitive admission");
+            let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+            let active = sessions
+                .iter()
+                .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
+                .collect::<Vec<_>>();
+            let identity = OperationDispatch::bind_submission_wave_identity(
+                &fixture.resolved,
+                active.iter(),
+                &wave,
+                &lane,
+            )
+            .unwrap();
+            let fill = ControlledCpuFill::with_layout(
+                2,
+                64,
+                full_logits,
+                ControlledCpuFillLayout::per_row(contexts),
+            );
+            fixture.provider_trace.lock().unwrap().controlled_cpu_fill = Some(fill.clone());
+            {
+                let mut trace = fixture.runtime_trace.lock().unwrap();
+                trace.controlled_cpu_fill = Some(fill.clone());
+                trace.structured_cost_capture_enabled = true;
+                trace.cost_route_projection_enabled = true;
+            }
+            let providers = fixture.registry.bind_plan(&fixture.resolved).unwrap();
+            let reaper = CompletionReaper::new();
+            let handle = accepted(OperationDispatch::encode_and_submit_guarded_wave(
+                providers.providers(),
+                &fixture.resolved,
+                &identity,
+                active.iter(),
+                &[],
+                &PrimitiveGuard {
+                    fill: &fill,
+                    dispatches: expected_dispatches,
+                },
+                wave,
+                &lane,
+                &reaper,
+            ));
+            assert!(matches!(
+                handle.wait().unwrap(),
+                CompletionObservation::Terminal(_)
+            ));
+            assert_eq!(fill.executed.load(Ordering::Acquire), 2);
+            assert_eq!(
+                fill.executed_dispatches.load(Ordering::Acquire),
+                2 * expected_dispatches as usize
+            );
+            let output = fill.take_output();
+            assert_eq!(output.len(), 2);
+            for row in output {
+                if full_logits {
+                    assert_eq!(row.len(), 64);
+                    assert_eq!(row[6], 1.0);
+                    assert!(row.iter().enumerate().all(|(i, v)| i == 6 || *v == 0.0));
+                } else {
+                    assert_eq!(row, vec![6.0]);
+                }
+            }
+            drop(handle);
+            drop(identity);
+            drop(active);
+            drop(providers);
+            step.try_retire_normal().unwrap();
+            drop(batch);
+            for session in sessions {
+                session.try_complete().unwrap();
+            }
+        }
+    }
 }
 
 #[test]
@@ -410,4 +620,112 @@ fn guarded_core_rejection_receipt_cannot_reconcile_a_different_step() {
     drop(reaper);
     drop(lane);
     teardown(fixture, sequence, session, batch, next);
+}
+
+#[test]
+fn omitted_actual_sample_preserves_fresh_guard_rejection_and_logical_attribution() {
+    use ferrum_interfaces::execution_cost::StructuredCostSampleDemand;
+    rejected_then_retry_with_timing_and_demand(
+        false,
+        &NoHostTiming,
+        StructuredCostSampleDemand::NotRequested,
+    );
+    rejected_then_retry_with_timing_and_demand(
+        true,
+        &NoHostTiming,
+        StructuredCostSampleDemand::NotRequested,
+    );
+}
+
+#[test]
+fn guarded_completion_timing_rejects_without_submit_then_retries_once() {
+    use ferrum_interfaces::execution_cost::StructuredCostSampleDemand;
+    for staging in [false, true] {
+        let (fixture, sequence, session, batch, step) = setup();
+        let lane = Arc::clone(step.execution_lane());
+        if staging {
+            lane.configure_submission_readback_staging(8).unwrap();
+            fixture
+                .runtime_trace
+                .lock()
+                .unwrap()
+                .submission_readback_enabled = true;
+        }
+        let timing = HostTiming::default();
+        let reaper = CompletionReaper::new();
+        let guard = Guard {
+            rejection: Some(GuardedNotSubmittedReason::HostRejected(
+                HostSubmissionRejection::WitnessExpired,
+            )),
+            calls: AtomicU64::new(0),
+            staging,
+            trace: fixture.runtime_trace.clone(),
+        };
+        let rejected = dispatch_with_device_timing_and_demand(
+            &fixture,
+            &session,
+            &step,
+            &reaper,
+            &guard,
+            &timing,
+            StructuredCostSampleDemand::RuntimePolicy,
+            DeviceTimingMode::Completion,
+        );
+        let GuardedWaveSubmissionOutcome::NotSubmitted(pending) = rejected else {
+            panic!("guard must reject");
+        };
+        {
+            let trace = fixture.runtime_trace.lock().unwrap();
+            assert_eq!(trace.submit_calls, 0);
+            assert!(trace.submitted_timing_modes.is_empty());
+            assert_eq!(trace.submission_readback_live, 0);
+        }
+        assert_eq!(timing.completion_arms.load(Ordering::Relaxed), 0);
+        assert_eq!(reaper.retained_count(), 0);
+        pending
+            .reconcile_step(step)
+            .unwrap_or_else(|(e, _)| panic!("rollback: {e}"));
+        let next = begin_single_participant_step_on_lane_with_bucket(
+            &batch,
+            &lane,
+            fixture.reusable_execution_bucket.as_ref(),
+        );
+        fixture.runtime_trace.lock().unwrap().guarded_submit_calls = 0;
+        let accept = Guard {
+            rejection: None,
+            calls: AtomicU64::new(0),
+            staging,
+            trace: fixture.runtime_trace.clone(),
+        };
+        let handle = accepted(dispatch_with_device_timing_and_demand(
+            &fixture,
+            &session,
+            &next,
+            &reaper,
+            &accept,
+            &timing,
+            StructuredCostSampleDemand::RuntimePolicy,
+            DeviceTimingMode::Completion,
+        ));
+        let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+            panic!("terminal required");
+        };
+        assert!(matches!(
+            receipt.fence_timing().device_execution(),
+            DeviceTimingMeasurement::Measured(_)
+        ));
+        assert!(matches!(
+            receipt.submission_timing(),
+            DeviceTimingMeasurement::NotRequested
+        ));
+        assert_eq!(
+            fixture.runtime_trace.lock().unwrap().submitted_timing_modes,
+            [DeviceTimingMode::Completion]
+        );
+        assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 1);
+        assert_eq!(timing.completion_arms.load(Ordering::Relaxed), 1);
+        assert_eq!(accept.calls.load(Ordering::Relaxed), 1);
+        drop((handle, reaper, lane));
+        teardown(fixture, sequence, session, batch, next);
+    }
 }

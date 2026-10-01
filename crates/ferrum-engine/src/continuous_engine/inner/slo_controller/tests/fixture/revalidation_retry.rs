@@ -3,11 +3,8 @@ use super::*;
 use crate::continuous_engine::inner::slo_controller::tests::prefill;
 
 fn resource_view(evidence: &CoreEvidence) -> ResourcePlanningView {
-    let sessions = evidence
-        .sessions
-        .iter()
-        .map(Arc::as_ref)
-        .collect::<Vec<_>>();
+    let owned = evidence.sessions.snapshot();
+    let sessions = owned.iter().map(Arc::as_ref).collect::<Vec<_>>();
     match evidence
         .fixture
         .as_ref()

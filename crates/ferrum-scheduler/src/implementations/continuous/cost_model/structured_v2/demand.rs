@@ -13,9 +13,55 @@ pub struct StructuredQueryDemandV2 {
     pub pending_constraint: Option<HostPendingConstraintV2>,
     pub length_positions: Vec<u32>,
     pub reachable_joint_counts: Vec<(u32, u32)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repetition_upper_sum: Option<u64>,
 }
 
 impl StructuredQueryV2 {
+    /// Complete payload retained by a passive observation, using the same
+    /// owned-allocation accounting as numerical evidence. Shared immutable
+    /// algorithm universes are charged conservatively per queued query.
+    pub fn observation_retained_bytes(&self) -> Option<usize> {
+        self.retained_payload_bytes()
+    }
+    /// Maximum backing bytes of the worker's temporary demand arrays, separate
+    /// from the queued immutable query. This does not allocate or run a model.
+    pub fn observation_demand_scratch_bytes(&self) -> Option<usize> {
+        let (minimum, maximum) = self.pending_count_range().ok()?;
+        // filter().collect() may grow geometrically for this one non-exact
+        // iterator; include that backing capacity rather than just its length.
+        let fixed_capacity = if self.input.pending_positions.is_empty() {
+            0
+        } else {
+            self.input
+                .pending_positions
+                .len()
+                .checked_next_power_of_two()?
+                .max(4)
+        };
+        let mut bytes = std::mem::size_of::<StructuredQueryDemandV2>();
+        for (length, element) in [
+            (self.input.basis.len(), std::mem::size_of::<f64>()),
+            (self.input.support.len(), std::mem::size_of::<u64>()),
+            (fixed_capacity, std::mem::size_of::<u32>()),
+            (
+                self.pending.as_ref().map_or(0, |p| p.eligible.len()),
+                std::mem::size_of::<u32>(),
+            ),
+            (
+                self.input.length_positions.len(),
+                std::mem::size_of::<u32>(),
+            ),
+            (
+                maximum.checked_sub(minimum)?.checked_add(1)?,
+                std::mem::size_of::<(u32, u32)>(),
+            ),
+        ] {
+            bytes = bytes.checked_add(length.checked_mul(element)?)?;
+        }
+        Some(bytes)
+    }
+
     /// Numerical requirements only. In particular, support coordinates retain
     /// their joint identity: coordinate extrema are not an authorized envelope.
     pub fn required_coverage(&self) -> Result<StructuredQueryDemandV2> {
@@ -43,6 +89,7 @@ impl StructuredQueryV2 {
             pending_constraint: self.pending.as_ref().map(|p| p.constraint),
             length_positions: self.input.length_positions.clone(),
             reachable_joint_counts: (minimum..=maximum).map(|n| (n as u32, length)).collect(),
+            repetition_upper_sum: self.repetition_upper_sum,
         })
     }
 

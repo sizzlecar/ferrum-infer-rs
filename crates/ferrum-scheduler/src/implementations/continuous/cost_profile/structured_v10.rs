@@ -12,7 +12,9 @@ mod lifecycle;
 mod observation;
 mod prepared;
 mod replay;
+mod service;
 mod shared;
+pub use service::*;
 pub use shared::{
     export_structured_profile_v11, export_structured_profile_v12, load_structured_profile_v11,
     load_structured_profile_v12, structured_prefix_source_header_v5,
@@ -28,9 +30,19 @@ pub const COST_PROFILE_SCHEMA_VERSION_V10: u32 = 10;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StructuredImportProvenanceV10 {
+    #[serde(skip_serializing_if = "ferrum_types::SloCostProfileStorage::is_file")]
+    pub storage: ferrum_types::SloCostProfileStorage,
+    #[serde(
+        skip_serializing_if = "ferrum_types::SloCostProfileClockBasis::is_imported_wall_clock"
+    )]
+    pub clock_basis: ferrum_types::SloCostProfileClockBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monotonic_domain: Option<ferrum_interfaces::execution_cost::CostMonotonicDomainV1>,
     pub schema_version: u32,
-    pub loaded_from: PathBuf,
-    pub source_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded_from: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
     pub file_sha256: [u8; 32],
     pub source_sha256: [u8; 32],
     pub parameters_sha256: [u8; 32],
@@ -50,7 +62,9 @@ pub struct StructuredImportProvenanceV10 {
     pub loaded_unix_ns: u64,
     pub generated_unix_ns: u64,
     pub clock: ProfileObservationClock,
-    pub producer: serde_json::Value,
+    /// Original JSON retained as one immutable, measurable box. The transient
+    /// deserialized producer tree is not retained by imported models.
+    pub producer: Box<serde_json::value::RawValue>,
     pub phases: [StructuredPhaseProvenanceV10; 3],
 }
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +96,118 @@ impl std::fmt::Debug for ImportedStructuredModelV2 {
     }
 }
 impl ImportedStructuredModelV2 {
+    /// Explicitly opted-in input dispatch; legacy children return None.
+    /// This does not convert a clock, predict a cost, or grant execution rights.
+    pub fn catalog_input_membership(
+        &self,
+        query: &StructuredQueryV2,
+    ) -> Result<Option<bool>, StructuredUnknownV2> {
+        self.model.catalog_input_membership(query)
+    }
+
+    pub fn phase_support_policy(
+        &self,
+    ) -> Option<
+        crate::implementations::continuous::cost_model::structured_v2::OwnerPhaseSupportPolicyV1,
+    > {
+        self.model
+            .owner_block_contract()
+            .and_then(|contract| contract.schedule.phase_support)
+    }
+
+    /// Identity copied from the original producer header, never inferred at load.
+    pub fn monotonic_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostMonotonicDomainV1> {
+        self.provenance.monotonic_domain.as_ref()
+    }
+
+    /// Frozen numerical projection only; original execution owners stay exact.
+    pub fn algorithm_universe(
+        &self,
+    ) -> Option<
+        &crate::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1,
+    > {
+        self.model.algorithm_universe()
+    }
+
+    /// Checked numerical identity reconstructed from the original populations.
+    /// This is not a live execution capability or an unchecked profile field.
+    pub fn numerical_family_key(
+        &self,
+    ) -> Option<&crate::implementations::continuous::cost_model::structured_v2::NumericalFamilyKeyV1>
+    {
+        self.model.numerical_family_key()
+    }
+
+    /// A catalog has one child per declared statistical population. Exact
+    /// owner and homogeneous-family policies remain distinct interpretations.
+    pub fn same_population(&self, other: &Self) -> bool {
+        match (self.numerical_family_key(), other.numerical_family_key()) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.owner() == other.owner(),
+            _ => false,
+        }
+    }
+
+    /// Input-only proof used before replacing a live child during startup.
+    /// Prediction values, independent source clocks and expiry are unchanged.
+    pub fn preserves_physical_input_coverage(&self, previous: &Self) -> bool {
+        self.same_population(previous)
+            && self
+                .model
+                .preserves_physical_input_coverage(&previous.model)
+    }
+
+    /// Frozen numerical workload limits. This is not an execution capability;
+    /// activation must compare the entire descriptor with the real runtime.
+    pub fn workload_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1> {
+        self.model
+            .service_window_contract()
+            .and_then(|contract| contract.nonnegative_envelope.as_ref())
+            .or_else(|| {
+                self.model
+                    .owner_block_contract()
+                    .and_then(|contract| contract.nonnegative_envelope.as_ref())
+            })
+            .map(|contract| &contract.workload_domain)
+    }
+
+    /// Payload retained by this child, including the full shared numerical model,
+    /// its own scope, paths and producer JSON box. Summing children conservatively
+    /// charges shared model payload again if a caller duplicates an Arc. Allocator
+    /// bookkeeping, Arc counters, catalog containers and process RSS are excluded.
+    pub fn retained_payload_bytes(&self) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(self.model.retained_payload_bytes()?)?
+            .checked_add(self.scope.retained_heap_bytes()?)?
+            .checked_add(self.provenance.producer.get().len())?;
+        for path in [&self.provenance.loaded_from, &self.provenance.source_path]
+            .into_iter()
+            .flatten()
+        {
+            bytes = bytes.checked_add(path.capacity())?;
+        }
+        Some(bytes)
+    }
+    /// Publication freshness uses the unchanged import mapping and source expiry.
+    pub fn is_current_local(&self, local_now_ns: u64) -> Result<(), StructuredUnknownV2> {
+        self.model
+            .validate_runtime_at(self.model_now_ns(local_now_ns)?)
+    }
+
+    /// Input integrity only. No prediction or clock/TTL authority is returned.
+    pub fn validate_retrospective_query_input(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        query: &StructuredQueryV2,
+    ) -> Result<(), StructuredQueryFailureV2> {
+        self.model
+            .validate_retrospective_query_input(fingerprint, query)
+    }
+
     pub fn runtime_limits(&self) -> (u64, u64) {
         self.model.runtime_limits()
     }
@@ -102,8 +228,21 @@ impl ImportedStructuredModelV2 {
         input: &StructuredQueryV2,
         local_now_ns: u64,
     ) -> Result<(StructuredPredictionV2, u64), StructuredUnknownV2> {
+        self.predict_query_local_with_clock_detailed(fingerprint, input, local_now_ns)
+            .map_err(StructuredQueryFailureV2::reason)
+    }
+    /// Preserve the single clock conversion and the original qualified model's
+    /// distinction between unavailable input coverage and invalid evidence.
+    pub fn predict_query_local_with_clock_detailed(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        input: &StructuredQueryV2,
+        local_now_ns: u64,
+    ) -> Result<(StructuredPredictionV2, u64), StructuredQueryFailureV2> {
         let model_now_ns = self.model_now_ns(local_now_ns)?;
-        let value = self.model.predict_query(fingerprint, input, model_now_ns)?;
+        let value = self
+            .model
+            .predict_query_detailed(fingerprint, input, model_now_ns)?;
         Ok((value, model_now_ns))
     }
     pub fn model_now_ns(&self, local_now_ns: u64) -> Result<u64, StructuredUnknownV2> {
@@ -118,8 +257,8 @@ impl ImportedStructuredModelV2 {
     pub fn owner(&self) -> &StructuredOwnerKeyV2 {
         &self.scope.owner
     }
-    pub fn source_path(&self) -> &PathBuf {
-        &self.provenance.source_path
+    pub fn source_path(&self) -> Option<&Path> {
+        self.provenance.source_path.as_deref()
     }
     pub fn domain_signature(&self) -> &[u8; 32] {
         &self.domain
@@ -327,9 +466,12 @@ pub fn load_structured_profile_v10(
         scope: replayed.header.scope.clone(),
         domain,
         provenance: StructuredImportProvenanceV10 {
+            monotonic_domain: None,
+            storage: ferrum_types::SloCostProfileStorage::File,
+            clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
             schema_version: 10,
-            loaded_from: path.into(),
-            source_path,
+            loaded_from: Some(path.into()),
+            source_path: Some(source_path),
             file_sha256: Sha256::digest(&bytes).into(),
             source_sha256: declared.source_sha256,
             parameters_sha256: declared.parameters_sha256,
@@ -348,7 +490,7 @@ pub fn load_structured_profile_v10(
             loaded_unix_ns: mapped.wall,
             generated_unix_ns: replayed.closing.wall_unix_ns,
             clock: mapped.clock,
-            producer: replayed.header.producer,
+            producer: serde_json::value::to_raw_value(&replayed.header.producer)?,
             phases: declared.phases,
         },
     };

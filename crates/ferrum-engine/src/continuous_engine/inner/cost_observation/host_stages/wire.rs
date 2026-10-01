@@ -4,6 +4,46 @@ use super::*;
 use ferrum_scheduler::implementations::continuous::{cost_model::PrefillShape, cost_profile::*};
 use serde::ser::{SerializeSeq, SerializeStruct};
 
+/// Explicit original source schema. Borrowing avoids cloning rows or receipts,
+/// and prevents a new diagnostic field from silently changing source bytes.
+#[derive(Serialize)]
+pub(super) struct SourceEvidence<'a> {
+    schema_version: u32,
+    call_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presubmit_prediction: &'a Option<super::super::presubmit::PresubmitPredictionReceiptV1>,
+    #[serde(serialize_with = "serialize_fingerprint")]
+    fingerprint: &'a Option<ExecutionFingerprint>,
+    #[serde(serialize_with = "serialize_shape")]
+    actual_shape: &'a Option<WaveExecutionShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statistical_evidence: &'a Option<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
+    prepare_started_at_ns: Option<u64>,
+    executor_returned_at_ns: Option<u64>,
+    rows: &'a [HostRowStageV1],
+    finalized_at_ns: Option<u64>,
+    full_wall_ns: Option<u64>,
+    completeness: HostStageCompleteness,
+}
+impl<'a> SourceEvidence<'a> {
+    pub(super) fn new(stages: &'a HostStageEvidenceV1) -> Self {
+        Self {
+            schema_version: stages.schema_version,
+            call_id: stages.call_id,
+            presubmit_prediction: &stages.presubmit_prediction,
+            fingerprint: &stages.fingerprint,
+            actual_shape: &stages.actual_shape,
+            statistical_evidence: &stages.statistical_evidence,
+            prepare_started_at_ns: stages.prepare_started_at_ns,
+            executor_returned_at_ns: stages.executor_returned_at_ns,
+            rows: &stages.rows,
+            finalized_at_ns: stages.finalized_at_ns,
+            full_wall_ns: stages.full_wall_ns,
+            completeness: stages.completeness,
+        }
+    }
+}
+
 struct Prefills<'a>(&'a [PrefillShape]);
 impl Serialize for Prefills<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

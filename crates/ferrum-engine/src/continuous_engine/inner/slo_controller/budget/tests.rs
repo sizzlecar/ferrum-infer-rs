@@ -152,24 +152,43 @@ async fn controller_window_keeps_capture_elapsed_and_full_publication_deadline()
 
 #[tokio::test(start_paused = true)]
 async fn completion_reserve_stops_optional_capture_without_spending_hard_publication_time() {
-    let started = slo_clock_now();
-    let budget = ControllerBudget::new(started, Duration::from_micros(2_000)).unwrap();
-    tokio::time::advance(Duration::from_micros(500)).await;
-    let phase = budget.completion_optional_phase(Duration::from_micros(500), 20);
-    let origin = PlanningTimeOrigin::from_origin(started, slo_clock_now()).unwrap();
-    let window = phase.planning_window(&origin).unwrap();
-    assert_eq!(window.window.started_at_ns, 0);
-    assert_eq!(window.window.deadline_ns, 2_000_000);
-    assert_eq!(window.planner_deadline_ns, Some(1_100_000));
-    assert!(phase.poll());
-    tokio::time::advance(Duration::from_micros(600)).await;
-    assert!(!phase.poll());
-    assert!(budget.poll());
-    tokio::time::advance(Duration::from_micros(899)).await;
-    assert!(budget.finish_planning());
-    let audit = budget.take_audit("selected").unwrap();
-    assert!(audit.planner_budget_exhausted);
-    assert!(!audit.budget_exhausted);
+    for (preparation_us, percent, optional_end_us) in [
+        (100, 20, 1_600),
+        (400, 20, 1_600),
+        (500, 20, 1_500),
+        (500, 10, 1_500),
+        (500, 40, 1_200),
+    ] {
+        let started = slo_clock_now();
+        let budget = ControllerBudget::new(started, Duration::from_micros(2_000)).unwrap();
+        // Preparation is real elapsed transaction time. Its measurement and
+        // the configured floor describe the same future publication stage.
+        let preparation = Duration::from_micros(preparation_us);
+        tokio::time::advance(preparation).await;
+        let phase = budget.completion_optional_phase(preparation, percent);
+        let origin = PlanningTimeOrigin::from_origin(started, slo_clock_now()).unwrap();
+        let window = phase.planning_window(&origin).unwrap();
+        assert_eq!(window.window.started_at_ns, 0);
+        assert_eq!(window.window.deadline_ns, 2_000_000);
+        assert_eq!(window.planner_deadline_ns, Some(optional_end_us * 1_000));
+        assert!(phase.poll());
+        tokio::time::advance(Duration::from_nanos(
+            (optional_end_us - preparation_us) * 1_000 - 1,
+        ))
+        .await;
+        assert!(phase.poll());
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(!phase.poll());
+        assert!(budget.poll());
+        assert!(!budget.exhausted.load(Ordering::Acquire));
+        tokio::time::advance(Duration::from_nanos((2_000 - optional_end_us) * 1_000 - 1)).await;
+        assert!(budget.poll());
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(!budget.finish_planning());
+        let audit = budget.take_audit("idle").unwrap();
+        assert!(audit.planner_budget_exhausted && audit.budget_exhausted);
+        assert_eq!(audit.planning_wall_ns, 2_000_000);
+    }
 }
 
 #[tokio::test(start_paused = true)]

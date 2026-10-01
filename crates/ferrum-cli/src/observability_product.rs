@@ -22,6 +22,7 @@ pub enum ProfileDetailArg {
     #[default]
     Off,
     Basic,
+    Host,
     Resource,
     Latency,
     Kernel,
@@ -36,6 +37,7 @@ impl ProfileDetailArg {
         match self {
             Self::Off => "off",
             Self::Basic => "basic",
+            Self::Host => "host",
             Self::Resource => "resource",
             Self::Latency => "latency",
             Self::Kernel => "kernel",
@@ -52,6 +54,7 @@ impl From<ProfileDetailArg> for ObservabilityProfileDetail {
         match value {
             ProfileDetailArg::Off => Self::Off,
             ProfileDetailArg::Basic => Self::Basic,
+            ProfileDetailArg::Host => Self::Host,
             ProfileDetailArg::Resource => Self::Resource,
             ProfileDetailArg::Latency => Self::Latency,
             ProfileDetailArg::Kernel => Self::Kernel,
@@ -1952,50 +1955,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_metrics_only_product_writers_skip_artifacts_and_keep_validation() {
+    fn host_and_basic_metrics_only_product_writers_skip_artifacts_and_keep_validation() {
         for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
-            let mut config = ProductObservabilityConfig::new(
-                entrypoint,
-                "model",
-                None,
-                ProfileDetailArg::Basic,
-                None,
-                None,
-                None,
-                default_profile_sample_rate(),
-            );
-            assert!(
-                write_actual_serve_startup_observability(&config, 1, None, Vec::new())
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(append_actual_serve_memory_stage_observability(
-                &config,
-                ActualMemoryStageObservation::new("shutdown", "shutdown", None, None),
-            )
-            .unwrap()
-            .is_empty());
-            let failure = ActualRunFailureObservation {
-                request_id: "failed-request".to_owned(),
-                duration_us: 1,
-                sampling_params: SamplingParams::greedy(),
-                prompt_token_ids: None,
-                prompt_token_count: None,
-                prompt_chars: 0,
-                failure_kind: "test".to_owned(),
-                error_kind: "test".to_owned(),
-                error_message: "test".to_owned(),
-                memory: None,
-                memory_stages: Vec::new(),
-            };
-            assert!(write_actual_run_failure_observability(&config, &failure)
+            for detail in [ProfileDetailArg::Basic, ProfileDetailArg::Host] {
+                let mut config = ProductObservabilityConfig::new(
+                    entrypoint,
+                    "model",
+                    None,
+                    detail,
+                    None,
+                    None,
+                    None,
+                    default_profile_sample_rate(),
+                );
+                assert!(
+                    write_actual_serve_startup_observability(&config, 1, None, Vec::new())
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(append_actual_serve_memory_stage_observability(
+                    &config,
+                    ActualMemoryStageObservation::new("shutdown", "shutdown", None, None),
+                )
                 .unwrap()
                 .is_empty());
-            config.core.profile_sample_rate = f64::NAN;
-            assert!(write_actual_run_failure_observability(&config, &failure).is_err());
-            assert!(
-                write_actual_serve_startup_observability(&config, 1, None, Vec::new()).is_err()
-            );
+                let failure = ActualRunFailureObservation {
+                    request_id: "failed-request".to_owned(),
+                    duration_us: 1,
+                    sampling_params: SamplingParams::greedy(),
+                    prompt_token_ids: None,
+                    prompt_token_count: None,
+                    prompt_chars: 0,
+                    failure_kind: "test".to_owned(),
+                    error_kind: "test".to_owned(),
+                    error_message: "test".to_owned(),
+                    memory: None,
+                    memory_stages: Vec::new(),
+                };
+                assert!(write_actual_run_failure_observability(&config, &failure)
+                    .unwrap()
+                    .is_empty());
+                config.core.profile_sample_rate = f64::NAN;
+                assert!(write_actual_run_failure_observability(&config, &failure).is_err());
+                assert!(
+                    write_actual_serve_startup_observability(&config, 1, None, Vec::new()).is_err()
+                );
+            }
         }
     }
 

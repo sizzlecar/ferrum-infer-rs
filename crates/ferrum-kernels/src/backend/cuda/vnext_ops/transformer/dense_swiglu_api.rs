@@ -239,7 +239,6 @@ pub(super) fn encode(
         participants,
         regions,
     } = prepare(operation, &invocation)?;
-    let selected = rounded.then(|| shape.selected(capture, identity)).flatten();
     let recipe = if rounded && !capture.is_disabled() {
         identity.and_then(|identity| {
             replay_cost::CudaReplayCostRecipe::dense(&invocation, shape, identity)
@@ -305,9 +304,8 @@ pub(super) fn encode(
     .map_err(|e| e.to_string())?;
     Ok(if rounded {
         command
-            .with_statistical_evidence(selected)
-            .with_cublas_cost_requirement(identity)
             .with_replay_cost_recipe(recipe)
+            .with_cublas_cost_requirement(identity)
     } else {
         command
     })

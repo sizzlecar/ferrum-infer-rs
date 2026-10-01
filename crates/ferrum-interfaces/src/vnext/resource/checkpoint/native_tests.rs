@@ -219,7 +219,7 @@ fn complete_capture(
             .unwrap(),
     );
     assert_eq!(handle.poll().unwrap(), StateTransferObservation::Ready);
-    let Some(StateTransferResult::Captured(checkpoint)) = handle.take().unwrap() else {
+    let Some(StateTransferResult::Captured(checkpoint, _)) = handle.take().unwrap() else {
         panic!("successful native fence must publish one captured owner")
     };
     assert!(handle.take().is_err());
@@ -309,7 +309,7 @@ fn verify_native_capture_restore_gates(harness: RestoreHarness) {
         .runtime
         .set_fence_behavior(TestFenceBehavior::Succeeded);
     assert_eq!(handle.poll().unwrap(), StateTransferObservation::Ready);
-    let Some(StateTransferResult::Captured(checkpoint)) = handle.take().unwrap() else {
+    let Some(StateTransferResult::Captured(checkpoint, _)) = handle.take().unwrap() else {
         panic!("native capture must publish its owner")
     };
     assert_eq!(Arc::strong_count(&harness.session), source_refs);

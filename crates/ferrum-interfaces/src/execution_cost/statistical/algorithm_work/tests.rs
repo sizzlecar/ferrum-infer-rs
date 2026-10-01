@@ -221,3 +221,71 @@ fn algorithm_work_covers_the_real_selected_command_capacity_boundary() {
     );
     assert_eq!(builder.finish(), Err(StatisticalEvidenceUnknown::Capacity));
 }
+
+#[test]
+fn algorithm_work_construction_binding_keeps_public_validation_and_rejects_bad_entries() {
+    let command = command(true, 8, 4, 12);
+    let table = command.algorithm_work().unwrap().unwrap();
+    let binding = command.algorithm_work_binding().unwrap();
+    table.validate_command(&command).unwrap();
+    table
+        .validate_command_with_binding(&command, || Ok(binding))
+        .unwrap();
+
+    let check = |table: &SelectedAlgorithmWorkEvidenceV1, expected| {
+        assert_eq!(table.validate_command(&command), Err(expected));
+        assert_eq!(
+            table.validate_command_with_binding(&command, || Ok(binding)),
+            Err(expected)
+        );
+    };
+    let mut wrong_binding = table.clone();
+    wrong_binding.command_binding[0] ^= 1;
+    check(&wrong_binding, StatisticalEvidenceUnknown::CommandMismatch);
+
+    let mut no_commands = table.clone();
+    no_commands.entries[0].commands = 0;
+    check(&no_commands, StatisticalEvidenceUnknown::InvalidWork);
+    // Exercise the actual private constructor as well as its validation helper.
+    let mut accumulator = AlgorithmWorkAccumulator::new();
+    accumulator.entries = no_commands.entries;
+    assert_eq!(
+        accumulator.finish(&command),
+        Err(StatisticalEvidenceUnknown::InvalidWork)
+    );
+
+    let mut wrong_order = table.clone();
+    wrong_order.entries.swap(0, 1);
+    check(&wrong_order, StatisticalEvidenceUnknown::InvalidWork);
+    let mut wrong_kind = table.clone();
+    wrong_kind.entries[0].kind = AlgorithmWorkKindV1::HostToDevice;
+    check(&wrong_kind, StatisticalEvidenceUnknown::InvalidWork);
+    let mut wrong_count = table.clone();
+    wrong_count.entries[0].commands += 1;
+    check(&wrong_count, StatisticalEvidenceUnknown::CommandMismatch);
+    let mut wrong_total = table.clone();
+    wrong_total.entries[0].work.inner_work_units += 1;
+    check(&wrong_total, StatisticalEvidenceUnknown::CommandMismatch);
+}
+
+#[test]
+fn algorithm_work_construction_binding_preserves_structural_before_missing_binding_errors() {
+    let captured = command(true, 8, 4, 12);
+    let missing = command(false, 8, 4, 12);
+    let mut table = captured.algorithm_work().unwrap().unwrap().clone();
+    assert_eq!(
+        table.validate_command(&missing),
+        Err(StatisticalEvidenceUnknown::MissingProducer)
+    );
+    table.protocol = "invalid";
+    assert_eq!(
+        table.validate_command(&missing),
+        Err(StatisticalEvidenceUnknown::CommandMismatch)
+    );
+    table.protocol = "ferrum.selected-algorithm-work.v1";
+    table.entries.clear();
+    assert_eq!(
+        table.validate_command(&missing),
+        Err(StatisticalEvidenceUnknown::CommandMismatch)
+    );
+}

@@ -3,7 +3,7 @@
 use super::super::audit::{HostContentEvaluation, HostContentRejection};
 use super::*;
 use ferrum_scheduler::implementations::continuous::cost_model as model;
-pub(super) mod statistical;
+pub(in crate::continuous_engine::inner::cost_observation) mod statistical;
 
 pub(super) struct EvaluatedHostContent {
     pub evaluation: HostContentEvaluation,

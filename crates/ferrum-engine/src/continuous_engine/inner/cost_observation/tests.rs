@@ -1,6 +1,8 @@
 use super::*;
+mod async_observation;
 mod calibration_capture;
 mod host_stages;
+mod queue_handoff;
 pub(in crate::continuous_engine::inner) mod statistical_model;
 mod structured_settlement;
 use ferrum_scheduler::implementations::continuous::cost_model as model;
@@ -168,6 +170,18 @@ fn completed(shape: &ActualWaveShape, sink: &Arc<BoundedCostSampleSink>) -> Engi
     call
 }
 
+/// Exercise the real sole consumer before asserting its final rejection.
+fn assert_finished_rejection(
+    call: EngineCostCall,
+    sink: &Arc<BoundedCostSampleSink>,
+    reason: CostCallRejection,
+) {
+    let before = sink.stats().rejected(reason);
+    assert_eq!(call.finish(), CostCallDisposition::Queued);
+    while sink.pop_resolved_bound().is_some() {}
+    assert_eq!(sink.stats().rejected(reason), before + 1);
+}
+
 #[test]
 fn exact_narrowed_prefill_wall_trains_a_real_scheduler_prediction() {
     // The requested chunk could have been eight tokens. Only these actual four
@@ -180,7 +194,7 @@ fn exact_narrowed_prefill_wall_trains_a_real_scheduler_prediction() {
     let sink = sink(4, 16);
     assert_eq!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     let observation = sink.pop().unwrap();
     assert_eq!(observation.timing.wall_total_ns, 8);
@@ -255,7 +269,7 @@ fn all_actual_rows_must_commit_once_despite_engine_ok_result() {
             _ => unreachable!(),
         }
         clock.set(10);
-        assert_eq!(call.finish(), CostCallDisposition::Rejected(reason));
+        assert_finished_rejection(call, &sink, reason);
         assert!(sink.pop().is_none());
         assert_eq!(sink.stats().rejected(reason), 1);
     }
@@ -320,10 +334,7 @@ fn planned_instead_of_actual_prefill_or_wrong_token_progress_cannot_train() {
         evidence.outcome = HostCommitOutcome::Committed(wrong);
         call.record_host_result(evidence);
         clock.set(10);
-        assert_eq!(
-            call.finish(),
-            CostCallDisposition::Rejected(CostCallRejection::WorkMismatch)
-        );
+        assert_finished_rejection(call, &sink, CostCallRejection::WorkMismatch);
     }
 }
 
@@ -339,8 +350,8 @@ fn cancellation_retains_no_fabricated_terminal_and_is_counted() {
     assert!(call.observations()[0].outcome.is_none());
     assert!(call.observations()[0].host_committed_at_ns.is_none());
     drop(call);
-    assert_eq!(sink.stats().rejected(CostCallRejection::Abandoned), 1);
     assert!(sink.pop().is_none());
+    assert_eq!(sink.stats().rejected(CostCallRejection::Abandoned), 1);
 }
 
 #[test]
@@ -370,22 +381,20 @@ fn composite_executor_only_and_unknown_shape_never_train() {
         }
         call.record_host_result(committed(&shape.rows[0], 9));
         clock.set(10);
-        assert_eq!(
-            call.finish(),
-            CostCallDisposition::Rejected(if composite {
+        assert_finished_rejection(
+            call,
+            &sink,
+            if composite {
                 CostCallRejection::Composite
             } else {
                 CostCallRejection::ActualEvidenceUnknown
-            })
+            },
         );
     }
     let sink = sink(4, 16);
     let mut call = completed(&shape, &sink);
     call.boundary = WaveObservationBoundary::ExecutorOnly;
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::Composite);
 }
 
 #[test]
@@ -396,25 +405,19 @@ fn host_clock_reversal_and_missing_identity_are_explicit() {
     execute(&mut call, &clock, shape.clone());
     call.record_host_result(committed(&shape.rows[0], 5));
     clock.set(10);
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Clock)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::Clock);
     let mut call = completed(&shape, &sink);
     call.identity = ExecutorCostIdentityAvailability::default();
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::IdentityUnknown)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::IdentityUnknown);
 }
 
 #[test]
 fn bounded_sink_drops_without_refreshing_or_overwriting_retained_sample() {
     let shape = shape(&[ActualRowWork::Decode { kv_tokens: 12 }]);
-    let sink = sink(1, 1);
+    let sink = sink(1, 16);
     assert_eq!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     assert_eq!(
         completed(&shape, &sink).finish(),
@@ -425,7 +428,7 @@ fn bounded_sink_drops_without_refreshing_or_overwriting_retained_sample() {
     assert!(sink.pop().is_none());
     assert_eq!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
 }
 
@@ -504,11 +507,11 @@ fn canonical_shape_key_is_preserved_by_scheduler_adapter() {
     let sink = sink(4, 16);
     assert_eq!(
         completed(&first, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     assert_eq!(
         completed(&second, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     let first_sample = sink.pop().unwrap().actual_shape;
     let second_sample = sink.pop().unwrap().actual_shape;
@@ -548,13 +551,14 @@ fn failed_or_unsubmitted_dispatch_cannot_be_relabelled_by_host_success() {
         }
         call.record_host_result(committed(&shape.rows[0], 9));
         clock.set(10);
-        assert_eq!(
-            call.finish(),
-            CostCallDisposition::Rejected(if submitted {
+        assert_finished_rejection(
+            call,
+            &sink,
+            if submitted {
                 CostCallRejection::ExecutorFailed
             } else {
                 CostCallRejection::NoPhysicalWave
-            })
+            },
         );
         assert!(sink.pop().is_none());
     }
@@ -570,7 +574,7 @@ fn final_prefill_commits_exactly_one_token_and_foreign_incarnation_is_rejected()
     let sink = sink(4, 16);
     assert_eq!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     let (mut call, clock) = begin(&shape, &sink);
     execute(&mut call, &clock, shape.clone());
@@ -578,19 +582,17 @@ fn final_prefill_commits_exactly_one_token_and_foreign_incarnation_is_rejected()
     evidence.owner_incarnation += 1;
     call.record_host_result(evidence);
     clock.set(10);
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::FrontierMismatch)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::FrontierMismatch);
 }
 
 #[test]
-fn shape_memory_and_contended_consumer_are_bounded_explicit_loss() {
+fn shape_memory_and_contended_producer_are_bounded_explicit_loss() {
     let shape = shape(&[ActualRowWork::Decode { kv_tokens: 12 }]);
-    let sink = sink(4, 1);
+    // The raw envelope retains one participant, commit slot and stage slot.
+    let sink = sink(4, 3);
     assert_eq!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     assert_eq!(
         completed(&shape, &sink).finish(),
@@ -598,14 +600,15 @@ fn shape_memory_and_contended_consumer_are_bounded_explicit_loss() {
     );
     sink.pop().unwrap();
     let call = completed(&shape, &sink);
-    let disposition = sink.with_locked_queue(|| call.finish());
+    let disposition = sink.with_locked_producer(|| call.finish());
     assert_eq!(
         disposition,
         CostCallDisposition::Dropped(CostSampleDrop::Contended)
     );
     let stats = sink.stats();
-    assert_eq!(stats.dropped_capacity, 1);
-    assert_eq!(stats.dropped_contention, 1);
+    assert_eq!(stats.entries_dropped_capacity, 1);
+    assert_eq!(stats.entries_dropped_contention, 1);
+    assert_eq!(stats.raw_lost, 2);
     assert!(stats.has_lost_samples());
     assert!(sink.pop().is_none());
 }
@@ -616,16 +619,10 @@ fn absent_host_output_policy_and_reused_context_do_not_train() {
     let sink = sink(4, 16);
     let mut call = completed(&shape, &sink);
     call.participants[0].output_policy_signature = None;
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::OutputPolicyUnknown)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::OutputPolicyUnknown);
     let mut call = completed(&shape, &sink);
     assert!(matches!(call.context(), Err(CostCallRejection::Composite)));
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::Composite);
 }
 
 #[test]
@@ -642,7 +639,7 @@ fn runtime_consumes_real_samples_and_publishes_a_usable_snapshot() {
             call.finished = true;
             runtime.sink.offer(query.as_ref().unwrap().clone()).unwrap();
         } else {
-            assert_eq!(call.finish(), CostCallDisposition::Published);
+            assert_eq!(call.finish(), CostCallDisposition::Queued);
         }
     }
     runtime.consume_samples();
@@ -665,7 +662,7 @@ fn queued_training_sample(sink: &Arc<BoundedCostSampleSink>) -> model::WaveCostO
     let sample = call.make_sample().unwrap();
     call.finished = true;
     // This helper bypasses finish/offer to exercise delayed worker receipts.
-    call.sink.call_finished();
+    call.sink.as_ref().unwrap().call_finished();
     sample
 }
 
@@ -675,32 +672,28 @@ fn observation_call_funnel_separates_completed_rejected_and_abandoned_calls() {
     let shape = shape(&[ActualRowWork::Decode { kv_tokens: 12 }]);
     assert_eq!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     assert_eq!(
         completed(&shape, &sink).finish(),
         CostCallDisposition::Dropped(CostSampleDrop::Capacity)
     );
+    sink.pop().expect("first original sample resolves");
     let (mut failed, _) = begin(&shape, &sink);
     failed.reject(CostCallRejection::HostFailed);
-    assert_eq!(
-        failed.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::HostFailed)
-    );
+    assert_finished_rejection(failed, &sink, CostCallRejection::HostFailed);
     drop(begin(&shape, &sink).0);
+    assert!(sink.pop().is_none());
     sink.reject_initialization(CostCallRejection::IdExhausted);
     sink.reject_preparation(CostCallRejection::NoPhysicalWave);
     let stats = sink.stats();
     assert_eq!((stats.calls_started, stats.calls_finished), (4, 4));
-    assert_eq!(
-        (stats.offered, stats.published, stats.dropped_capacity),
-        (2, 1, 1)
-    );
+    assert_eq!((stats.offered, stats.published, stats.raw_lost), (1, 1, 1));
     assert_eq!(stats.rejected(CostCallRejection::HostFailed), 1);
     assert_eq!(stats.rejected(CostCallRejection::Abandoned), 1);
     assert_eq!(
         stats.calls_finished,
-        stats.offered + stats.rejected.iter().sum::<u64>()
+        stats.offered + stats.rejected.iter().sum::<u64>() + stats.raw_lost
     );
     assert_eq!(
         stats.initialization_rejected[CostCallRejection::IdExhausted.index()],

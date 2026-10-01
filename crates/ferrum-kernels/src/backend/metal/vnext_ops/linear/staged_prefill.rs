@@ -359,6 +359,23 @@ impl Sequence {
         )
     }
 
+    pub(super) fn observation(
+        &self,
+        pipelines: &MetalLinearPipelines,
+        tokens: u64,
+        scratch_bytes: u64,
+    ) -> Option<std::sync::Arc<dyn ferrum_interfaces::vnext::DeviceObservationTemplate>> {
+        selected::swiglu_observation(
+            pipelines,
+            &self.gate_up,
+            self.down,
+            self.activation,
+            self.workspace.map(|workspace| workspace.policy),
+            tokens,
+            scratch_bytes,
+        )
+    }
+
     pub(super) fn dispatch_count(&self, regions: &[MetalBufferRegion]) -> u64 {
         projection_steps(&self.gate_up, regions)
             .map(|step| step.dispatch_count(self.workspace))

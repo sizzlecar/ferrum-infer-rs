@@ -235,13 +235,22 @@ fn rejected_then_retry(f: Fixture) {
 }
 
 fn rejected_then_retry_with_timing<S: SubmissionWaveDispatchTimingSink>(f: Fixture, timing: &S) {
+    rejected_then_retry_with_device_timing(f, timing, DeviceTimingMode::Off);
+}
+
+fn rejected_then_retry_with_device_timing<S: SubmissionWaveDispatchTimingSink>(
+    f: Fixture,
+    timing: &S,
+    mode: DeviceTimingMode,
+) {
     let lane_id = f.lane.id();
     let (step, wave) = f.prepare();
     let guard = Guard::new(&f, true);
-    let pending = match f.dispatch_with_timing(wave, &guard, timing) {
-        GuardedWaveSubmissionOutcome::NotSubmitted(value) => value,
-        _ => panic!("expected actual backend rejection"),
-    };
+    let pending =
+        match f.dispatch_program_with_device_timing(wave, Some(&guard), None, timing, mode) {
+            GuardedWaveSubmissionOutcome::NotSubmitted(value) => value,
+            _ => panic!("expected actual backend rejection"),
+        };
     assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
     assert_eq!(f.encoded.load(Ordering::Relaxed), 1);
     assert_eq!(f.enqueues.load(Ordering::Relaxed), 0);
@@ -257,7 +266,8 @@ fn rejected_then_retry_with_timing<S: SubmissionWaveDispatchTimingSink>(f: Fixtu
     );
     let (step, wave) = f.prepare();
     let guard = Guard::new(&f, false);
-    let handle = accepted(f.dispatch_with_timing(wave, &guard, timing));
+    let handle =
+        accepted(f.dispatch_program_with_device_timing(wave, Some(&guard), None, timing, mode));
     assert_eq!(f.lane.id(), lane_id);
     assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
     assert_eq!(f.enqueues.load(Ordering::Relaxed), 1);
@@ -269,7 +279,22 @@ fn rejected_then_retry_with_timing<S: SubmissionWaveDispatchTimingSink>(f: Fixtu
         receipt.completion().submission_timing(),
         DeviceTimingMeasurement::NotRequested
     ));
-    assert!(receipt.readback_timings().is_none());
+    match mode {
+        DeviceTimingMode::Off => {
+            assert!(receipt.readback_timings().is_none());
+            assert!(matches!(
+                receipt.completion().fence_timing().device_execution(),
+                DeviceTimingMeasurement::NotRequested
+            ));
+        }
+        DeviceTimingMode::Completion => {
+            assert!(matches!(
+                receipt.completion().fence_timing().device_execution(),
+                DeviceTimingMeasurement::Measured(_)
+            ));
+        }
+        _ => unreachable!(),
+    }
     let CompletionReadbackDisposition::Succeeded(output) = &receipt.dispositions()[0] else {
         panic!("scale output failed")
     };
@@ -335,4 +360,19 @@ fn guarded_cuda_core_dropped_handle_keeps_flight_until_terminal_reaped() {
     assert_eq!(f.lane.in_flight_count(), 0);
     step.try_retire_normal().unwrap();
     f.close(true);
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device and installed native operator artifacts"]
+fn guarded_cuda_completion_timing_rejects_then_measures_same_lane_retry() {
+    for program_binding in [false, true] {
+        let fixture = if program_binding {
+            Fixture::new_program_binding()
+        } else {
+            Fixture::new()
+        };
+        let timing = HostTiming::default();
+        rejected_then_retry_with_device_timing(fixture, &timing, DeviceTimingMode::Completion);
+        assert_eq!(timing.completion_arms.load(Ordering::Relaxed), 1);
+    }
 }

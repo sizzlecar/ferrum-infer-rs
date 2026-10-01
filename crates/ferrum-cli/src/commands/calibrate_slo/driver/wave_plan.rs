@@ -10,6 +10,23 @@ use ferrum_types::RequestId;
 use serde::Serialize;
 use std::num::NonZeroU32;
 
+/// Read-only work correlation used by the cursor. It carries no private
+/// calibration receipt, route classification or numerical membership.
+struct HostWorkView<'a> {
+    rows: &'a [HostRowStageV1],
+    finalized_at_ns: Option<u64>,
+    completeness: HostStageCompleteness,
+}
+impl<'a> From<&'a HostStageEvidenceV1> for HostWorkView<'a> {
+    fn from(stages: &'a HostStageEvidenceV1) -> Self {
+        Self {
+            rows: &stages.rows,
+            finalized_at_ns: stages.finalized_at_ns,
+            completeness: stages.completeness,
+        }
+    }
+}
+
 pub(super) struct Cursor<'a> {
     case: &'a manifest::Cohort,
     prefill_completed: u64,
@@ -195,7 +212,7 @@ impl<'a> Cursor<'a> {
             report.submission,
             report.error.is_some(),
             &rows,
-            report.host_stages.as_deref(),
+            report.host_stages.as_deref().map(HostWorkView::from),
         )
     }
 
@@ -205,7 +222,7 @@ impl<'a> Cursor<'a> {
         submission: CalibrationSubmissionState,
         failed: bool,
         reported: &[ReportedRow],
-        host: Option<&HostStageEvidenceV1>,
+        host: Option<HostWorkView<'_>>,
     ) -> Result<bool> {
         if attempt.choice != self.choice() {
             return Err(invalid(

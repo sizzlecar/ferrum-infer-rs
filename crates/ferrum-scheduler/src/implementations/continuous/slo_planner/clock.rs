@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod prefix;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PlanningTimeError {
     #[error("request count exceeds the configured planning snapshot bound")]
@@ -624,6 +626,26 @@ impl<'a> AnchoredPlanningCostModel<'a> {
 }
 
 impl PlanningCostModel for AnchoredPlanningCostModel<'_> {
+    fn query_observer(&self) -> Option<&dyn super::PlanningQueryObserver> {
+        self.model.query_observer()
+    }
+    fn predict_observed(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        shape: &WaveExecutionShape,
+        evidence: Option<&PlanningCostEvidence>,
+        now_ns: u64,
+    ) -> super::PlanningObservedCost {
+        match self.anchor.cost_time_ns(now_ns) {
+            Ok(cost_now) => self
+                .model
+                .predict_observed(fingerprint, shape, evidence, cost_now),
+            Err(_) => super::PlanningObservedCost {
+                outcome: super::PlanningQueryOutcome::ClockMappingFailed,
+                cost_now_ns: None,
+            },
+        }
+    }
     fn evidence_requirement(&self) -> PlanningCostEvidenceRequirement {
         self.model.evidence_requirement()
     }

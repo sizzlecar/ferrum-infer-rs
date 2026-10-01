@@ -6,6 +6,8 @@ use ferrum_interfaces::execution_cost::{
     ActualRowWork, ActualWaveKind, CompletionOnlyReason, ExpectedExecutionWave, ExpectedWaveInput,
     ExpectedWaveWork, ExpectedWorkSelection,
 };
+mod capture;
+use capture::{CaptureObserver, DraftCapture};
 
 struct CompletionSelection {
     proof: ControllerSafetyProof,
@@ -21,6 +23,13 @@ struct CompletionSelection {
 pub(super) struct CompletionDraft {
     selection: CompletionSelection,
     pub(super) preparation_wall: std::time::Duration,
+    pub(super) optional_phase: Option<ControllerOptionalPhase>,
+    forecast_limits: ResourcePlanningLimits,
+    forecast: Option<
+        ferrum_interfaces::vnext::ExecutionCostRouteAvailability<
+            ferrum_interfaces::vnext::ExecutionCostRouteView,
+        >,
+    >,
 }
 
 /// A captured runnable wave that cannot be published needs a future snapshot,
@@ -46,23 +55,50 @@ impl EngineInner {
     ) -> ControllerResult<CompletionDraft> {
         let started = slo_clock_now();
         let _stage = budget.stage(ControllerStage::Capture);
-        let selection = self.capture_completion_selection(
+        let mut shared = DraftCapture {
+            started,
+            reserve_percent: self
+                .config
+                .scheduler
+                .slo
+                .planner
+                .publication_reserve_percent,
+            forecast_limits: self.controller_projection_limits(),
+            forecast_enabled: self
+                .cost_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.try_snapshot().is_some_and(|model| model.is_some())),
+            preparation_wall: None,
+            optional_started: None,
+            optional_elapsed: None,
+            clock_invalid: false,
+            phase: None,
+            forecast: None,
+        };
+        let selection = self.capture_completion_selection_with_forecast(
             hint,
             Arc::clone(budget),
             None,
             NonZeroUsize::new(4096).unwrap(),
+            Some(&mut shared),
         )?;
         let preparation_wall =
-            slo_clock_now()
-                .checked_duration_since(started)
+            shared
+                .completed_preparation_wall(slo_clock_now())
                 .ok_or(Unavailable {
                     reason: "clock_moved_backwards",
                     obligations: selection.proof.queue.requests().len(),
                     retry: Some(retry::ControllerRetryReason::ComputeBudget),
                 })?;
+        if let Some(phase) = shared.phase.as_mut() {
+            phase.tighten_for_completion_preparation(preparation_wall, shared.reserve_percent);
+        }
         Ok(CompletionDraft {
             selection,
             preparation_wall,
+            optional_phase: shared.phase,
+            forecast_limits: shared.forecast_limits,
+            forecast: shared.forecast,
         })
     }
 
@@ -92,8 +128,8 @@ impl EngineInner {
 
     pub(super) fn completion_allowed(&self) -> bool {
         self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce
-            && self.config.scheduler.slo.admission.time_policy
-                == ferrum_types::SloTimeAdmissionPolicy::CompleteRequests
+            && self.config.scheduler.slo.execution_policy().controller
+                != ferrum_types::SloControllerPolicy::Legacy
     }
 
     /// Remember exhaustion/expiry until a fresh bounded iteration. Otherwise a
@@ -152,7 +188,11 @@ impl EngineInner {
         maximum_requests: NonZeroUsize,
     ) -> Result<SloIterationPlan> {
         if !self.manual_calibration_driver
-            || self.config.scheduler.slo.mode != ferrum_types::SloMode::Observe
+            || (self.config.scheduler.slo.mode != ferrum_types::SloMode::Observe
+                && !(self.automatic_reference_bootstrap
+                    && crate::continuous_engine::slo_startup::automatic_reference_enabled(
+                        &self.config,
+                    )))
         {
             return Err(FerrumError::invalid_request(
                 "exact calibration requires its exclusive manual driver",
@@ -182,6 +222,17 @@ impl EngineInner {
         } {
             Ok(selected) => selected,
             Err(error) => {
+                // A strict pending owner has no completion obligation. When
+                // accepted work cannot run, the next real wake must be able to
+                // reassess time admission against new evidence.
+                if self.requires_strict_acceptance()
+                    && matches!(
+                        error.reason,
+                        "output_or_resource_blocked" | "no_accepted_work"
+                    )
+                {
+                    self.slo_controller.lock().completion_next = None;
+                }
                 if let Some(reason) = error.retry {
                     self.arm_controller_retry(reason);
                 }
@@ -319,6 +370,7 @@ impl EngineInner {
                 "complete_requests"
             },
             reason: match reason {
+                CompletionOnlyReason::DeadlinePolicy => "deadline_policy",
                 CompletionOnlyReason::CostUnavailable => "cost_unavailable",
                 CompletionOnlyReason::WitnessExpired => "witness_expired",
                 CompletionOnlyReason::SearchInconclusive => "search_inconclusive",
@@ -406,6 +458,17 @@ impl EngineInner {
         exact: Option<&[super::super::calibration::CalibrationWork]>,
         maximum_requests: NonZeroUsize,
     ) -> ControllerResult<CompletionSelection> {
+        self.capture_completion_selection_with_forecast(hint, budget, exact, maximum_requests, None)
+    }
+
+    fn capture_completion_selection_with_forecast(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        budget: Arc<ControllerBudget>,
+        exact: Option<&[super::super::calibration::CalibrationWork]>,
+        maximum_requests: NonZeroUsize,
+        shared: Option<&mut DraftCapture>,
+    ) -> ControllerResult<CompletionSelection> {
         let obligations = self.scheduler.active_count() + self.scheduler.waiting_count();
         let unavailable = |reason| Unavailable {
             reason,
@@ -474,10 +537,21 @@ impl EngineInner {
                 return Err(unavailable("compute_budget_exhausted")
                     .retry(retry::ControllerRetryReason::ComputeBudget));
             }
-            let frontier = sequences[&row.key.request_id]
+            let sequence = &sequences[&row.key.request_id];
+            if sequence
+                .time_admission
+                .as_ref()
+                .is_some_and(SequenceTimeAdmission::before_acceptance)
+            {
+                continue;
+            }
+            let frontier = sequence
                 .cost_frontier
                 .ok_or_else(|| unavailable("engine_frontier_unknown"))?;
             live.push((row.key.request_id.clone(), frontier.owner_incarnation.get()));
+        }
+        if live.is_empty() && exact.is_none() {
+            return Err(unavailable("no_accepted_work"));
         }
         let recovery_scope = self
             .slo_controller
@@ -513,6 +587,13 @@ impl EngineInner {
                 let sequence = sequences
                     .get(&observed.request_id)
                     .ok_or_else(|| unavailable("calibration_owner_changed"))?;
+                if sequence
+                    .time_admission
+                    .as_ref()
+                    .is_some_and(SequenceTimeAdmission::before_acceptance)
+                {
+                    return Err(unavailable("calibration_owner_not_accepted"));
+                }
                 let current = sequence
                     .cost_frontier
                     .ok_or_else(|| unavailable("engine_frontier_unknown"))?;
@@ -549,6 +630,26 @@ impl EngineInner {
             for key in live {
                 if included.insert(key.clone()) {
                     order.push_back(key);
+                }
+            }
+            if self.config.scheduler.slo.execution_policy().controller
+                == ferrum_types::SloControllerPolicy::DeadlineOnly
+            {
+                // Stable sorting keeps the existing fair rotation for equal
+                // deadlines. If any trusted deadline is unavailable, retain
+                // fair completion for this turn; never invent a deadline or
+                // stall accepted work for missing timing evidence.
+                let deadlines: Option<std::collections::HashMap<_, _>> = order
+                    .iter()
+                    .map(|(id, _)| {
+                        Some((
+                            id.clone(),
+                            sequences[id].slo.as_ref()?.next_deadline().ok()?,
+                        ))
+                    })
+                    .collect();
+                if let Some(deadlines) = deadlines {
+                    order.make_contiguous().sort_by_key(|(id, _)| deadlines[id]);
                 }
             }
             normalized_order = Some(order.clone());
@@ -779,6 +880,7 @@ impl EngineInner {
                 prefill_total: total,
                 logits_policy: policy,
                 future_greedy_policy: None,
+                future_repetition: None,
                 host_features: None,
             });
             remaining -= tokens;
@@ -796,15 +898,72 @@ impl EngineInner {
                 cache_id: fence.resource_cache_id(),
             })
             .collect();
-        let resources = match self.model_executor.execution_resource_planning_view(
-            &requests,
-            ResourcePlanningLimits {
-                maximum_participants: 256,
-                maximum_projected_waves: 1,
-                ..Default::default()
-            },
-            &mut || budget.poll(),
-        ) {
+        let kind = match (prefill_count != 0, decode_count != 0) {
+            (true, true) => ActualWaveKind::Mixed,
+            (true, false) => ActualWaveKind::Prefill,
+            (false, true) => ActualWaveKind::Decode,
+            _ => unreachable!(),
+        };
+        let limits = ResourcePlanningLimits {
+            maximum_participants: 256,
+            maximum_projected_waves: 1,
+            ..Default::default()
+        };
+        let mut expected_rows = Some(expected_rows);
+        let mut captured_work = None;
+        let resource_capture = if let Some(shared) = shared {
+            use ferrum_interfaces::model_executor::ExecutorPlanningCapture;
+            let forecast_limits = shared.forecast_limits;
+            let enabled = shared.forecast_enabled;
+            let mut observer = CaptureObserver {
+                state: shared,
+                budget: Arc::clone(&budget),
+                rows: expected_rows.take(),
+                kind,
+                work: None,
+            };
+            let captured = if enabled {
+                self.model_executor.execution_completion_planning_capture(
+                    &requests,
+                    limits,
+                    forecast_limits,
+                    &mut observer,
+                )
+            } else {
+                match self.model_executor.execution_resource_planning_view(
+                    &requests,
+                    limits,
+                    observer.resource_budget(),
+                ) {
+                    ResourcePlanningAvailability::Known(resources) => {
+                        observer.completion_ready(&resources);
+                        ResourcePlanningAvailability::Known(
+                            ferrum_interfaces::model_executor::ExecutorCompletionPlanningCapture {
+                                resources,
+                                forecast: None,
+                            },
+                        )
+                    }
+                    ResourcePlanningAvailability::Unknown(reason) => {
+                        ResourcePlanningAvailability::Unknown(reason)
+                    }
+                }
+            };
+            captured_work = observer.work.take();
+            match captured {
+                ResourcePlanningAvailability::Known(capture) => {
+                    observer.state.forecast = capture.forecast;
+                    ResourcePlanningAvailability::Known(capture.resources)
+                }
+                ResourcePlanningAvailability::Unknown(reason) => {
+                    ResourcePlanningAvailability::Unknown(reason)
+                }
+            }
+        } else {
+            self.model_executor
+                .execution_resource_planning_view(&requests, limits, &mut || budget.poll())
+        };
+        let resources = match resource_capture {
             ResourcePlanningAvailability::Known(view) => view,
             ResourcePlanningAvailability::Unknown(reason) => {
                 if exact.is_some() {
@@ -825,24 +984,25 @@ impl EngineInner {
         };
         drop(requests);
         drop(sequences);
-        // The native wave owns canonical authority order, independent of fair
-        // selection order or the prefill/decode input vectors.
-        expected_rows
-            .sort_by_key(|row| resources.participants()[row.participant_index].authority());
-        let kind = match (prefill_count != 0, decode_count != 0) {
-            (true, true) => ActualWaveKind::Mixed,
-            (true, false) => ActualWaveKind::Prefill,
-            (false, true) => ActualWaveKind::Decode,
-            _ => unreachable!(),
-        };
-        let work = ExpectedWaveWork::new(&resources, kind, expected_rows)
-            .map_err(|_| unavailable("invalid_exact_work"))?;
+        let work = match captured_work {
+            Some(work) => work,
+            None => {
+                let mut rows =
+                    expected_rows.ok_or_else(|| unavailable("completion_callback_missing"))?;
+                rows.sort_by_key(|row| resources.participants()[row.participant_index].authority());
+                ExpectedWaveWork::new(&resources, kind, rows)
+            }
+        }
+        .map_err(|_| unavailable("invalid_exact_work"))?;
         if !budget.poll() {
             return Err(unavailable("compute_budget_exhausted")
                 .retry(retry::ControllerRetryReason::ComputeBudget));
         }
         Ok(CompletionSelection {
             proof: ControllerSafetyProof {
+                prefix_maintenance: None,
+                _prefix_checkpoint: None,
+                waiting_fences: Vec::new(),
                 recovery_peers,
                 protection: None,
                 budget,

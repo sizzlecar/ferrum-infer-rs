@@ -291,7 +291,7 @@ impl Artifacts {
         };
         let host_prediction = if let Some(model) = host_model {
             host_content_prediction(
-                report.host_stages.as_deref(),
+                report.host_stages.as_deref().map(HostContentView::from),
                 model.kind(),
                 totals,
                 |shape| model.predict(shape),
@@ -406,8 +406,29 @@ fn selected_prediction(
     serde_json::json!({"kind":"unknown", "reason":reason, "actual_ns":actual_ns, "query_identity":query_identity})
 }
 
+/// Retrospective reporting inputs only. Converting this borrowed view never
+/// recreates the engine's private settlement or route-population authority.
+struct HostContentView<'a> {
+    schema_version: u32,
+    completeness: HostStageCompleteness,
+    has_rows: bool,
+    full_wall_ns: Option<u64>,
+    actual_shape: Option<&'a WaveExecutionShape>,
+}
+impl<'a> From<&'a HostStageEvidenceV1> for HostContentView<'a> {
+    fn from(stages: &'a HostStageEvidenceV1) -> Self {
+        Self {
+            schema_version: stages.schema_version,
+            completeness: stages.completeness,
+            has_rows: !stages.rows.is_empty(),
+            full_wall_ns: stages.full_wall_ns,
+            actual_shape: stages.actual_shape.as_ref(),
+        }
+    }
+}
+
 fn host_content_prediction(
-    stages: Option<&HostStageEvidenceV1>,
+    stages: Option<HostContentView<'_>>,
     model_source: &str,
     totals: &mut Summary,
     predict: impl FnOnce(&WaveExecutionShape) -> Result<Option<CostPrediction>>,
@@ -416,7 +437,7 @@ fn host_content_prediction(
     let eligible = stages.filter(|stages| {
         stages.schema_version == 1
             && stages.completeness == HostStageCompleteness::CompleteSingleWave
-            && !stages.rows.is_empty()
+            && stages.has_rows
             && stages.full_wall_ns.is_some_and(|wall| wall > 0)
             && stages.actual_shape.as_ref().is_some_and(|shape| {
                 shape

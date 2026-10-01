@@ -39,7 +39,8 @@ impl CalibrationSession {
         prefix: Option<ferrum_scheduler::implementations::continuous::cost_model::structured_v2::prefixes::StructuredPrefixPlanV5>,
     ) -> Result<()> {
         self.selected_phase_boundary()?;
-        if self.structured_group_v2.is_some()
+        if self.prefix_source8
+            || self.structured_group_v2.is_some()
             || self.structured_capture_v2.is_some()
             || self.structured_capture.is_some()
             || self.selected_capture_identity.is_some()

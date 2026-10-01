@@ -3,6 +3,38 @@
 
 use super::*;
 
+/// Demand for a dynamic actual sample from this submission only. It does not
+/// enable backend capability, change logical attribution, or authorize work.
+/// Public dispatch wrappers keep RuntimePolicy for compatibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StructuredCostSampleDemand {
+    #[default]
+    RuntimePolicy,
+    Requested,
+    NotRequested,
+}
+
+impl StructuredCostSampleDemand {
+    pub fn for_call(
+        policy: ferrum_types::SloStructuredActualCapturePolicy,
+        observed_call: bool,
+        artifact_consumer: bool,
+    ) -> Self {
+        if policy.is_legacy() {
+            Self::RuntimePolicy
+        } else if observed_call || artifact_consumer {
+            Self::Requested
+        } else {
+            Self::NotRequested
+        }
+    }
+
+    pub fn enabled(self, capability: ferrum_types::SloStructuredCostCapture) -> bool {
+        capability == ferrum_types::SloStructuredCostCapture::HostSettledV1
+            && self != Self::NotRequested
+    }
+}
+
 /// Unavailable proves the observed entrypoint did no work. The nested executor
 /// result is intentionally distinct: an Err there may follow device submission.
 pub enum ObservedDispatch<T> {
@@ -14,6 +46,13 @@ pub enum ObservedDispatch<T> {
 /// an async call. None means clock conversion/overflow failed, never timestamp 0.
 pub trait CostObservationClock: Send + Sync {
     fn now_ns(&self) -> Option<u64>;
+
+    /// Cold identity for clocks whose nanosecond origin survives a process
+    /// restart within the same boot and namespace. None preserves process-local
+    /// calibration but cannot authorize persisted age/TTL comparisons.
+    fn monotonic_domain(&self) -> Option<&CostMonotonicDomainV1> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +99,7 @@ pub struct PlanRuntimeCostObservationContext<'a> {
     recorder: &'a mut BoundedWaveRecorder,
     clock: &'a dyn CostObservationClock,
     participants: &'a [CostObservationParticipant],
+    participant_index: std::collections::HashMap<&'a RequestId, Option<usize>>,
     prepare_started_at_ns: Option<u64>,
     boundary: WaveObservationBoundary,
     handle: Option<WaveObservationHandle>,
@@ -68,6 +108,7 @@ pub struct PlanRuntimeCostObservationContext<'a> {
     unknown: Option<ActualWaveEvidenceUnknown>,
     terminal_recorded: bool,
     structured_capture: bool,
+    numeric_observation: crate::vnext::DeviceCostObservationDemand,
 }
 
 impl<'a> PlanRuntimeCostObservationContext<'a> {
@@ -78,10 +119,20 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
         prepare_started_at_ns: Option<u64>,
         boundary: WaveObservationBoundary,
     ) -> Self {
+        let mut participant_index = std::collections::HashMap::new();
+        if participants.len() <= 1024 {
+            for (index, participant) in participants.iter().enumerate() {
+                participant_index
+                    .entry(&participant.request_id)
+                    .and_modify(|prior| *prior = None)
+                    .or_insert(Some(index));
+            }
+        }
         Self {
             recorder,
             clock,
             participants,
+            participant_index,
             prepare_started_at_ns,
             boundary,
             handle: None,
@@ -90,6 +141,7 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
             unknown: None,
             terminal_recorded: false,
             structured_capture: false,
+            numeric_observation: crate::vnext::DeviceCostObservationDemand::Required,
         }
     }
 
@@ -102,6 +154,23 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
         self.structured_capture
     }
 
+    /// Declared by the actual consumer before execution. Exact lifecycle and
+    /// physical receipts remain required regardless of statistical demand.
+    pub fn with_cost_observation_demand(
+        mut self,
+        demand: crate::vnext::DeviceCostObservationDemand,
+    ) -> Self {
+        self.numeric_observation = demand;
+        self
+    }
+    pub fn cost_observation_demand(&self) -> crate::vnext::DeviceCostObservationDemand {
+        if self.structured_capture {
+            crate::vnext::DeviceCostObservationDemand::Required
+        } else {
+            self.numeric_observation
+        }
+    }
+
     pub fn now_ns(&self) -> Option<u64> {
         self.clock.now_ns()
     }
@@ -110,12 +179,74 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
         if self.participants.len() > 1024 {
             return None;
         }
-        let mut found = self
-            .participants
-            .iter()
-            .filter(|participant| &participant.request_id == request_id);
-        let participant = found.next()?;
-        found.next().is_none().then_some(participant)
+        self.participant_index
+            .get(request_id)
+            .and_then(|index| *index)
+            .and_then(|index| self.participants.get(index))
+    }
+
+    /// Called before encode/submit, with the receipt from the same actual
+    /// program selector. No outcome or duration can influence membership.
+    pub fn prepared_route(
+        &mut self,
+        route: PreparedCostRouteV1,
+        rows: Result<Vec<ActualWaveRow>, ActualWaveEvidenceUnknown>,
+    ) {
+        self.recorder.diagnose_route_selection(&route);
+        let proof = (|| {
+            if self.waves != 0 || self.outcome.is_some() {
+                return Err("selection_after_wave_or_outcome");
+            }
+            let selected_at_ns = self.now_ns().ok_or("selection_clock_missing")?;
+            self.recorder.diagnose_route_clock(selected_at_ns);
+            if self
+                .prepare_started_at_ns
+                .is_none_or(|started| selected_at_ns < started)
+            {
+                return Err("selection_before_preparation_or_missing_clock");
+            }
+            let rows = rows.map_err(|_| "selected_rows_unknown")?;
+            if route.class().is_outside() {
+                if rows.is_empty()
+                    || rows.len() != self.participants.len()
+                    || rows.len() > 1024
+                    || rows.iter().enumerate().any(|(index, row)| {
+                        rows[..index].iter().any(|prior| {
+                            prior.request_id == row.request_id
+                                || prior.input_index == row.input_index
+                        }) || self.participant(&row.request_id).is_none_or(|host| {
+                            host.owner_incarnation != row.owner_incarnation
+                                || host.work_generation != row.work_generation
+                                || host.input_index != row.input_index
+                        })
+                    })
+                {
+                    return Err("outside_selected_rows_invalid");
+                }
+            } else if !rows.is_empty() {
+                return Err("eligible_selection_has_outside_rows");
+            }
+            Ok(PreparedCallRouteV1 {
+                route,
+                selected_at_ns,
+                rows,
+                submitted: None,
+            })
+        })();
+        if let Err(gate) = proof.as_ref() {
+            self.recorder.diagnose_route_rejection(gate);
+        }
+        self.recorder.record_prepared_route(proof.ok());
+    }
+
+    /// Binds the selected Outside proof to the original successful submit's
+    /// private batch identity and native graph evidence. Device completion and
+    /// host settlement are still required separately before retirement.
+    pub fn route_submission(
+        &mut self,
+        attribution: Option<&crate::vnext::BoundDeviceSubmissionAttribution>,
+    ) {
+        self.recorder.record_route_submission(attribution);
     }
 
     pub fn unknown_reason(&self) -> Option<ActualWaveEvidenceUnknown> {
@@ -147,6 +278,28 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
         shape: Result<ActualWaveShape, ActualWaveEvidenceUnknown>,
         submission_started_at_ns: Option<u64>,
     ) {
+        self.record_physical_wave(
+            shape.map(PhysicalWaveInput::Ready),
+            submission_started_at_ns,
+        );
+    }
+
+    pub fn physical_wave_pending(
+        &mut self,
+        shape: Result<PendingActualWave, ActualWaveEvidenceUnknown>,
+        submission_started_at_ns: Option<u64>,
+    ) {
+        self.record_physical_wave(
+            shape.map(PhysicalWaveInput::Pending),
+            submission_started_at_ns,
+        );
+    }
+
+    fn record_physical_wave(
+        &mut self,
+        shape: Result<PhysicalWaveInput, ActualWaveEvidenceUnknown>,
+        submission_started_at_ns: Option<u64>,
+    ) {
         self.waves = self.waves.saturating_add(1);
         self.terminal_recorded = false;
         if self.waves > 1 {
@@ -165,7 +318,7 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
         };
         let result = match shape {
             Ok(shape) => {
-                if shape.rows.iter().any(|row| {
+                if shape.rows().iter().any(|row| {
                     self.participant(&row.request_id).is_none_or(|expected| {
                         expected.owner_incarnation != row.owner_incarnation
                             || expected.work_generation != row.work_generation
@@ -179,7 +332,14 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
                         ActualWaveEvidenceUnknown::ParticipantCorrelation,
                     )
                 } else {
-                    self.recorder.begin(shape, self.boundary, prepare)
+                    match shape {
+                        PhysicalWaveInput::Ready(shape) => {
+                            self.recorder.begin(shape, self.boundary, prepare)
+                        }
+                        PhysicalWaveInput::Pending(shape) => {
+                            self.recorder.begin_pending(shape, self.boundary, prepare)
+                        }
+                    }
                 }
             }
             Err(reason) => {
@@ -237,4 +397,135 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
             self.mark_unknown(ActualWaveEvidenceUnknown::InvalidLifecycle);
         }
     }
+
+    /// Finish an actual typed capacity decision whose executor contract rules
+    /// out provider encode and inference submission. Generic Deferred is not
+    /// sufficient. Partial physical work, unknown/lost evidence, a previously
+    /// selected route, or a failed rollback cannot produce this receipt.
+    pub fn finish_capacity_deferred(
+        &mut self,
+        deferral: &crate::model_executor::ExecutorExecutionDeferral,
+    ) {
+        self.finish_capacity_no_submission(deferral, ObservedCallOutcome::Deferred);
+    }
+
+    /// Batch prefill and mixed execution retain their original NotSubmitted
+    /// control outcome while producing the same private capacity proof.
+    pub fn finish_capacity_not_submitted(
+        &mut self,
+        deferral: &crate::model_executor::ExecutorExecutionDeferral,
+    ) {
+        self.finish_capacity_no_submission(deferral, ObservedCallOutcome::NotSubmitted);
+    }
+
+    /// Finish only the original core guard rejection after successful Step
+    /// rollback. A selected route is allowed here solely through its exact
+    /// Step/Invocation/lane and checked participant binding; it remains forbidden
+    /// for the earlier capacity-deferral proof.
+    pub fn finish_guard_rollback(&mut self, receipt: &GuardedNotSubmitted) {
+        let proof = (|| {
+            if self.waves != 0
+                || self.handle.is_some()
+                || self.outcome.is_some()
+                || self.unknown.is_some()
+                || self.terminal_recorded
+            {
+                return Err(ActualWaveEvidenceUnknown::InvalidLifecycle);
+            }
+            let binding = receipt
+                .observation
+                .as_ref()
+                .ok_or(ActualWaveEvidenceUnknown::ParticipantCorrelation)?;
+            let signature = super::guarded_participant_signature(self.participants.len(), |i| {
+                let row = &self.participants[i];
+                (&row.request_id, row.owner_incarnation, row.work_generation)
+            })
+            .ok_or(ActualWaveEvidenceUnknown::ParticipantCorrelation)?;
+            if binding.participant_count != self.participants.len()
+                || binding.participant_signature != signature
+            {
+                return Err(ActualWaveEvidenceUnknown::ParticipantCorrelation);
+            }
+            let prepare = self
+                .prepare_started_at_ns
+                .ok_or(ActualWaveEvidenceUnknown::Clock)?;
+            let returned = self
+                .now_ns()
+                .filter(|now| *now >= prepare)
+                .ok_or(ActualWaveEvidenceUnknown::Clock)?;
+            let signature = super::no_submission::participant_signature(self.participants)
+                .ok_or(ActualWaveEvidenceUnknown::ParticipantCorrelation)?;
+            self.recorder
+                .record_guard_rollback(
+                    receipt,
+                    prepare,
+                    returned,
+                    self.participants.len(),
+                    signature,
+                )
+                .map_err(|_| ActualWaveEvidenceUnknown::InvalidLifecycle)
+        })();
+        if let Err(reason) = proof {
+            self.mark_unknown(reason);
+        }
+        self.finish_call(ObservedCallOutcome::NotSubmitted);
+    }
+
+    fn finish_capacity_no_submission(
+        &mut self,
+        deferral: &crate::model_executor::ExecutorExecutionDeferral,
+        outcome: ObservedCallOutcome,
+    ) {
+        let proof = (|| {
+            if self.waves != 0
+                || self.handle.is_some()
+                || self.outcome.is_some()
+                || self.unknown.is_some()
+                || self.terminal_recorded
+            {
+                return Err(ActualWaveEvidenceUnknown::InvalidLifecycle);
+            }
+            let prepare = self
+                .prepare_started_at_ns
+                .ok_or(ActualWaveEvidenceUnknown::Clock)?;
+            let returned = self
+                .now_ns()
+                .filter(|at| *at >= prepare)
+                .ok_or(ActualWaveEvidenceUnknown::Clock)?;
+            let signature = super::no_submission::participant_signature(self.participants)
+                .ok_or(ActualWaveEvidenceUnknown::ParticipantCorrelation)?;
+            let reason = CallNoSubmissionReasonV1::from_deferral(deferral)
+                .ok_or(ActualWaveEvidenceUnknown::InvalidLifecycle)?;
+            self.recorder
+                .record_no_submission(
+                    prepare,
+                    returned,
+                    self.participants.len(),
+                    signature,
+                    reason,
+                )
+                .map_err(|_| ActualWaveEvidenceUnknown::InvalidLifecycle)
+        })();
+        if let Err(reason) = proof {
+            self.mark_unknown(reason);
+        }
+        self.finish_call(outcome);
+    }
 }
+
+enum PhysicalWaveInput {
+    Ready(ActualWaveShape),
+    Pending(PendingActualWave),
+}
+impl PhysicalWaveInput {
+    fn rows(&self) -> &[ActualWaveRow] {
+        match self {
+            Self::Ready(shape) => &shape.rows,
+            Self::Pending(shape) => shape.rows(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "context/structured_demand_tests.rs"]
+mod structured_demand_tests;

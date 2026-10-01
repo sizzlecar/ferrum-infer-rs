@@ -22,6 +22,8 @@ pub struct CalibrationActualEvidenceDiagnostic {
     /// No observation is fabricated to fill a lost recorder slot.
     pub waves: Vec<CalibrationActualWaveUnknown>,
     pub retained_wave_details_complete: bool,
+    #[serde(skip)]
+    pub(super) observation_memory: Option<Arc<super::super::memory::ObservationBytePermit>>,
 }
 
 fn serialize_reason<S: Serializer>(
@@ -82,6 +84,7 @@ impl EngineCostCall {
             dispatch_unknown: self.dispatch.unknown,
             waves,
             retained_wave_details_complete,
+            observation_memory: self.observation_memory.clone(),
         };
         if capture
             .actual_evidence_diagnostic
@@ -90,5 +93,19 @@ impl EngineCostCall {
         {
             capture.mark_conflict();
         }
+    }
+}
+
+impl CalibrationActualEvidenceDiagnostic {
+    pub(in crate::continuous_engine::inner::cost_observation) fn retained_payload_bytes(
+        &self,
+    ) -> Option<usize> {
+        std::mem::size_of_val(self)
+            .checked_add(
+                self.waves
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CalibrationActualWaveUnknown>())?,
+            )?
+            .checked_add(2 * std::mem::size_of::<usize>())
     }
 }

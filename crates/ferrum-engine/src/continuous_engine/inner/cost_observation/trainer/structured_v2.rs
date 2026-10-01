@@ -10,10 +10,10 @@ use ferrum_types::FinishReason;
 
 pub(in crate::continuous_engine::inner::cost_observation) struct ValidatedStructuredWaveV2 {
     pub stages: Arc<HostStageEvidenceV1>,
-    pub actual: host_content::statistical::CompleteSelectedObservation,
+    pub actual: Arc<host_content::statistical::CompleteSelectedObservation>,
+    input: StructuredInputV2,
     sessions: Box<[Arc<StructuredCaptureSessionBinding>]>,
     ordinal: u64,
-    recipe: Arc<UnsettledStructuredWaveEvidenceV1>,
 }
 impl ValidatedStructuredWaveV2 {
     pub fn into_member(
@@ -37,11 +37,7 @@ impl ValidatedStructuredWaveV2 {
         {
             return Err(StructuredUnknownV2::WrongSource);
         }
-        let input = StructuredInputV2::from_actual(
-            &self.actual.exact,
-            &self.actual.selected,
-            &self.recipe,
-        )?;
+        let input = self.input.clone();
         Ok(StructuredNumericObservationV2 {
             source: session.identity(),
             protocol: session.protocol(),
@@ -115,11 +111,22 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
         .ok_or(U::MissingEvidence)?
         .as_ref()
         .map_err(|_| U::MissingEvidence)?;
-    qualified
-        .validate_host_stages(&stages)
+    let shared = capture
+        .structured_projection(&stages)
+        .transpose()
         .map_err(|_| U::InvalidSample)?;
-    let actual = host_content::statistical::complete_structured_observation_v2(&entry)
-        .map_err(|_| U::InvalidSample)?;
+    let actual = if let Some(shared) = &shared {
+        shared.actual.clone()
+    } else {
+        // Imported/copied/mutated diagnostics never receive a cached proof.
+        qualified
+            .validate_host_stages(&stages)
+            .map_err(|_| U::InvalidSample)?;
+        Arc::new(
+            host_content::statistical::complete_structured_observation_v2(&entry)
+                .map_err(|_| U::InvalidSample)?,
+        )
+    };
     if sessions
         .iter()
         .any(|session| &actual.fingerprint != session.fingerprint())
@@ -165,12 +172,16 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
             _ => return Err(U::UnsupportedScope),
         }
     }
+    let input = match shared {
+        Some(shared) => shared.base_input.clone(),
+        None => StructuredInputV2::from_actual(&actual.exact, &actual.selected, &recipe)?,
+    };
     Ok(ValidatedStructuredWaveV2 {
         stages,
         actual,
+        input,
         sessions: sessions.to_vec().into_boxed_slice(),
         ordinal,
-        recipe,
     })
 }
 
@@ -180,6 +191,20 @@ pub(in crate::continuous_engine) fn structured_discovery_input_v2(
     stages: &Arc<HostStageEvidenceV1>,
 ) -> Result<StructuredInputV2, StructuredUnknownV2> {
     structured_serving_observation_v2(stages).map(|(input, _)| input)
+}
+
+pub(in crate::continuous_engine) fn structured_capture_input_v2(
+    capture: &CostCalibrationCapture,
+    stages: &Arc<HostStageEvidenceV1>,
+) -> Result<StructuredInputV2, StructuredUnknownV2> {
+    match capture.structured_projection(stages) {
+        Some(Ok(shared)) => {
+            shared.feedback_scope?;
+            Ok(shared.query.input().clone())
+        }
+        Some(Err(_)) => Err(StructuredUnknownV2::InvalidSample),
+        None => structured_discovery_input_v2(stages),
+    }
 }
 
 /// Common live settlement validation for discovery and runtime feedback. This
@@ -209,6 +234,39 @@ pub(in crate::continuous_engine::inner::cost_observation) fn structured_serving_
     };
     let actual = host_content::statistical::complete_structured_observation_v2(&entry)
         .map_err(|_| U::InvalidSample)?;
+    feedback_scope_for_actual(stages, &actual)?;
+    let recipe = actual
+        .selected
+        .structured_capture()
+        .ok_or(U::MissingEvidence)?
+        .map_err(|_| U::MissingEvidence)?;
+    let terminal_positions = stages
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(p, row)| row.terminal.as_ref().map(|_| p as u32))
+        .collect::<Vec<_>>();
+    let input = StructuredInputV2::from_actual(&actual.exact, &actual.selected, recipe)?
+        .with_settled_completion(&terminal_positions)?;
+    if input.regression_axes().len() > 4096 || input.joint_support_coordinates().len() > 4096 {
+        return Err(U::Capacity);
+    }
+    Ok((input, actual))
+}
+
+/// Additional consumer scope, using the already validated original settlement.
+/// It does not re-project or re-hash the numerical actual wave.
+pub(in crate::continuous_engine::inner::cost_observation) fn feedback_scope_for_actual(
+    stages: &HostStageEvidenceV1,
+    actual: &host_content::statistical::CompleteSelectedObservation,
+) -> Result<(), StructuredUnknownV2> {
+    use StructuredUnknownV2 as U;
+    let qualified = stages
+        .structured_evidence
+        .as_ref()
+        .ok_or(U::MissingEvidence)?
+        .as_ref()
+        .map_err(|_| U::MissingEvidence)?;
     let recipe = actual
         .selected
         .structured_capture()
@@ -221,17 +279,30 @@ pub(in crate::continuous_engine::inner::cost_observation) fn structured_serving_
         return Err(U::InvalidSample);
     }
     for (declared, row) in recipe.physical_host_rows().iter().zip(&stages.rows) {
+        // Only this separately bound installed domain admits natural completion.
+        // The original private receipt above has already proved generated-count,
+        // host ordering and complete no-additional-work settlement.
+        let natural = |reason| {
+            matches!(
+                declared.installed_policy.empirical_content_domain,
+                Some(ferrum_interfaces::execution_cost::HostContentDomainV1::PlainTextInstalledV2(policy))
+                    if match reason {
+                        FinishReason::EOS => policy.model_eos,
+                        FinishReason::Stop => policy.user_stop,
+                        _ => false,
+                    }
+            )
+        };
         match (declared.terminal_expectation, row.terminal.as_ref()) {
             (HostTerminalExpectationV1::NoTokenProduced, None)
             | (HostTerminalExpectationV1::TokenMayTerminate, None) => {}
             (HostTerminalExpectationV1::LengthBoundary, Some(terminal))
-                if terminal.finish_reason == FinishReason::Length => {}
+                if terminal.finish_reason == FinishReason::Length
+                    || natural(terminal.finish_reason) => {}
+            (HostTerminalExpectationV1::TokenMayTerminate, Some(terminal))
+                if natural(terminal.finish_reason) => {}
             _ => return Err(U::UnsupportedScope),
         }
     }
-    let input = StructuredInputV2::from_actual(&actual.exact, &actual.selected, recipe)?;
-    if input.regression_axes().len() > 4096 || input.joint_support_coordinates().len() > 4096 {
-        return Err(U::Capacity);
-    }
-    Ok((input, actual))
+    Ok(())
 }

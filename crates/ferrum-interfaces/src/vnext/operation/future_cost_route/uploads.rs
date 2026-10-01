@@ -25,7 +25,8 @@ pub struct EagerCoreReadback<'a> {
     pub layout: HostTransferLayout,
 }
 
-pub(super) fn input_transfer_bytes(
+pub(super) fn input_transfer_bytes<R: DeviceRuntime>(
+    providers: &BoundOperationProviderSet<R>,
     resolved: &dyn ExecutablePlanView,
     rows: &ValidatedCostRows<'_>,
     uploads: &[EagerCoreInputUpload<'_>],
@@ -47,12 +48,9 @@ pub(super) fn input_transfer_bytes(
             super::core::poll(budget)?;
             end += 1;
         }
-        let node = resolved
-            .execution_plan()
-            .payload()
-            .nodes()
-            .iter()
-            .find(|node| node.id() == first.node_id)
+        let node = providers
+            .prepared_node(resolved, first.node_id)
+            .map_err(|_| U::StaleView)?
             .ok_or(U::InvalidInput)?;
         let value = node
             .values()
@@ -114,7 +112,8 @@ pub(super) fn input_transfer_bytes(
     Ok(commands)
 }
 
-pub(super) fn readback_bytes(
+pub(super) fn readback_bytes<R: DeviceRuntime>(
+    providers: &BoundOperationProviderSet<R>,
     resolved: &dyn ExecutablePlanView,
     rows: &ValidatedCostRows<'_>,
     readbacks: &[EagerCoreReadback<'_>],
@@ -123,12 +122,9 @@ pub(super) fn readback_bytes(
     let mut total = 0_u64;
     for readback in readbacks {
         super::core::poll(budget)?;
-        let node = resolved
-            .execution_plan()
-            .payload()
-            .nodes()
-            .iter()
-            .find(|node| node.id() == readback.node_id)
+        let node = providers
+            .prepared_node(resolved, readback.node_id)
+            .map_err(|_| U::StaleView)?
             .ok_or(U::InvalidInput)?;
         if !node.values().iter().any(|value| {
             value.role() == ResolvedValueRole::Output
@@ -254,3 +250,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "uploads/prepared_tests.rs"]
+mod prepared_tests;

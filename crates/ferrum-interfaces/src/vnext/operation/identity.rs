@@ -634,6 +634,21 @@ impl BatchOperationIdentity {
             .node_index(node_id)
     }
 
+    /// Diagnostic observation of one slot; never materializes or validates it.
+    /// A false result includes an absent index and is not a promise that a
+    /// later materialization will create a node successfully. Callers must
+    /// retain the original materialize_node result and error handling.
+    pub(super) fn node_is_materialized(&self, node_index: usize) -> bool {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes.get(node_index).is_some();
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.node_identities.get(node_index))
+            .is_some_and(|slot| slot.get().is_some())
+    }
+
     pub(crate) fn materialize_node(
         &self,
         node_index: usize,

@@ -13,6 +13,32 @@ pub(super) fn evaluate(
     previous: Option<&EngineCostSnapshot>,
     clock: &dyn CostObservationClock,
 ) -> SelectedServingEvaluation {
+    evaluate_actual(entry, accepted_ordinal, previous, clock, || {
+        host_content::statistical::complete_observation(entry).map(Arc::new)
+    })
+}
+
+pub(super) fn evaluate_resolved(
+    resolved: &super::super::resolved::ResolvedCostEntry,
+    accepted_ordinal: u64,
+    previous: Option<&EngineCostSnapshot>,
+    clock: &dyn CostObservationClock,
+) -> SelectedServingEvaluation {
+    evaluate_actual(resolved.entry(), accepted_ordinal, previous, clock, || {
+        resolved.selected_actual()
+    })
+}
+
+fn evaluate_actual(
+    entry: &CostEvidenceEntry,
+    accepted_ordinal: u64,
+    previous: Option<&EngineCostSnapshot>,
+    clock: &dyn CostObservationClock,
+    actual: impl FnOnce() -> Result<
+        Arc<host_content::statistical::CompleteSelectedObservation>,
+        ModelUnknown,
+    >,
+) -> SelectedServingEvaluation {
     use SelectedServingEvaluation as E;
     if let CostEvidenceEntry::Training { sample, .. } = entry {
         use model::WaveObservationOutcome as O;
@@ -28,7 +54,7 @@ pub(super) fn evaluate(
         }
     }
     // No invented calibration source digest/partition for ordinary serving.
-    let actual = match host_content::statistical::complete_observation(entry) {
+    let actual = match actual() {
         Ok(value) => value,
         Err(reason) => return E::InvalidActual(reason),
     };

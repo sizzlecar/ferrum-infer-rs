@@ -1,5 +1,10 @@
 //! Dynamic pool-set orchestration over backing owned by `dynamic_pool`.
 
+mod step_layout;
+use step_layout::{compile_step_layouts, StepSlotLayout};
+mod lane_layout;
+use lane_layout::CompiledLaneStableLayouts;
+
 use super::{
     align_up_resource, backing_segment_range, backing_segment_range_matches,
     bind_lane_stable_slot_projections, compile_program_binding_layouts,
@@ -80,6 +85,8 @@ where
         BTreeMap<DynamicBackingPoolId, Arc<DynamicBackingPool<R>>>,
     pub(in crate::vnext::resource) domains: Vec<DynamicPoolDomainSpec>,
     pub(in crate::vnext::resource) nodes: Arc<[PlanNode]>,
+    pub(in crate::vnext::resource) step_layouts: Vec<Vec<StepSlotLayout>>,
+    pub(in crate::vnext::resource) lane_stable_layouts: CompiledLaneStableLayouts,
     pub(in crate::vnext::resource) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
     pub(in crate::vnext::resource) submission_wave_reusable_capacity_layouts:
         BTreeMap<ReusableExecutionBucketId, Vec<Option<SubmissionWaveDomainCapacityLayout>>>,
@@ -120,6 +127,7 @@ where
         reusable_execution: Option<ReusableExecutionMemoryPlan>,
     ) -> Result<Self, VNextError> {
         let request_state_hazards = RequestStateHazardCoordinator::compile(&nodes)?;
+        let step_layouts = compile_step_layouts(&domains, reusable_execution.as_ref())?;
         let submission_wave_layouts = domains
             .iter()
             .map(|domain| compile_submission_wave_domain_layout(domain, &nodes))
@@ -130,6 +138,13 @@ where
                 &submission_wave_layouts,
                 reusable_execution.as_ref(),
             )?;
+        let lane_stable_layouts = CompiledLaneStableLayouts::compile(
+            &domains,
+            &step_layouts,
+            &submission_wave_layouts,
+            &submission_wave_reusable_capacity_layouts,
+            reusable_execution.as_ref(),
+        )?;
         let program_binding_layouts = compile_program_binding_layouts(
             &domains,
             &nodes,
@@ -178,6 +193,8 @@ where
             domains,
             pools,
             nodes,
+            step_layouts,
+            lane_stable_layouts,
             submission_wave_layouts,
             submission_wave_reusable_capacity_layouts,
             program_binding_layouts,
@@ -1263,7 +1280,11 @@ where
         let mut canonical_requests = requests.iter().collect::<Vec<_>>();
         canonical_requests
             .sort_unstable_by(|left, right| left.claim_identity.cmp(&right.claim_identity));
-        let key = lane_stable_layout_key(lane.id(), lifetime, &canonical_requests)?;
+        let compiled = requests.first().and_then(|request| {
+            self.lane_stable_layouts
+                .get(request.reusable_execution_bucket_id.as_ref(), lifetime)
+        });
+        let key = lane_stable_layout_key(lane.id(), lifetime, &canonical_requests, compiled)?;
         let lane_owner: Arc<dyn LaneStableArenaLane> =
             Arc::clone(lane) as Arc<dyn LaneStableArenaLane>;
 
@@ -1380,15 +1401,14 @@ where
                         .slots
                         .insert(
                             slot_id,
-                            LaneStableArenaSlot {
+                            LaneStableArenaSlot::new(
                                 slot_id,
                                 authorities,
-                                certificate: Arc::clone(&certificate),
+                                Arc::clone(&certificate),
                                 projection_bindings,
-                                availability_domains: availability_domains.clone(),
-                                in_use: true,
-                                last_used: now,
-                            },
+                                availability_domains.clone(),
+                                now,
+                            ),
                         )
                         .is_some()
                     {
@@ -1457,6 +1477,23 @@ where
         }
     }
 
+    pub(in crate::vnext::resource) fn lane_stable_slot_count(&self) -> Result<usize, VNextError> {
+        let arenas = self
+            .lane_stable_arenas
+            .lock()
+            .map_err(|_| invalid_resource("lane-stable arena registry is poisoned"))?;
+        if arenas.poisoned {
+            return Err(invalid_resource(
+                "lane-stable arena registry is fail-closed",
+            ));
+        }
+        arenas.entries.values().try_fold(0usize, |count, entry| {
+            count
+                .checked_add(entry.slots.len())
+                .ok_or_else(|| invalid_resource("lane-stable slot count overflow"))
+        })
+    }
+
     pub(in crate::vnext::resource) fn try_reclaim_expired_lane_slots(
         &self,
     ) -> Result<bool, VNextError> {
@@ -1520,7 +1557,7 @@ where
                         .filter(|slot| {
                             !slot.in_use
                                 && required_pool.is_none_or(|pool_id| {
-                                    slot.authorities
+                                    slot.authorities()
                                         .iter()
                                         .any(|authority| authority.evidence.pool_id() == pool_id)
                                 })
@@ -2502,7 +2539,11 @@ where
             authorities,
             |_| (),
             |(), _, _, chunk| {
-                if self.runtime.buffer_descriptor(&chunk.buffer) != chunk.descriptor {
+                let actual = crate::vnext::device::read_buffer_descriptor(
+                    self.runtime.as_ref(),
+                    &chunk.buffer,
+                );
+                if actual.as_ref() != &chunk.descriptor {
                     return Err(invalid_resource(
                         "runtime descriptor differs from a committed backing chunk",
                     ));

@@ -136,9 +136,23 @@ pub(super) struct Released {
     pub through_fifo_ordinal: u64,
     pub actor_applied_output_ordinal: u64,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum PreparationRecord {
+    NativePrefixRestored {
+        phase: StructuredProfilePhaseV10,
+        cohort: usize,
+        slot: usize,
+        before: Frontier,
+        after: Frontier,
+        input_tokens_sha256: [u8; 32],
+        capture: NativeTransfer,
+        restore: NativeTransfer,
+        captured_at_ns: u64,
+        acknowledged_at_ns: u64,
+        expires_at_ns: u64,
+        acknowledged: bool,
+    },
     PreparationOffered {
         offered: u64,
         phase: StructuredProfilePhaseV10,
@@ -163,4 +177,29 @@ pub(super) enum PreparationRecord {
         slot: usize,
         receipt: Released,
     },
+}
+
+/// Untrusted transfer metadata; no public value can issue native execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NativeTransfer {
+    pub slot: u64,
+    pub checkpoint_coordinator: u64,
+    pub checkpoint_serial: u64,
+    pub sequence_sparse: u32,
+    pub sequence_generation: u64,
+    pub request_sparse: u32,
+    pub request_generation: u64,
+    pub boundary_tokens: u64,
+    pub kind: NativeTransferKind,
+    pub plan_hash: String,
+    pub layout_fingerprint: String,
+    pub runtime_implementation_fingerprint: String,
+    pub device_id: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum NativeTransferKind {
+    Capture,
+    Restore,
 }

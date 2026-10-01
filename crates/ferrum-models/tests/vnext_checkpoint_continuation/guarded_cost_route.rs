@@ -3,6 +3,7 @@
 use super::*;
 use ferrum_interfaces::execution_cost::{
     CoreReadbackRoute, GuardedNotSubmittedReason, HostSubmissionRejection,
+    StructuredCostSampleDemand,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,15 +41,60 @@ fn reject_encoded(
     session: &Arc<SequenceSession<Runtime>>,
     tokens: Arc<[u32]>,
 ) -> (PendingGuardedWaveRejection, Arc<StepResourceLease<Runtime>>) {
+    reject_encoded_with_sample_demand(
+        fixture,
+        session,
+        0..tokens.len(),
+        tokens,
+        StructuredCostSampleDemand::RuntimePolicy,
+    )
+}
+
+pub(super) fn reject_encoded_with_sample_demand(
+    fixture: &Fixture,
+    session: &Arc<SequenceSession<Runtime>>,
+    range: Range<usize>,
+    tokens: Arc<[u32]>,
+    demand: StructuredCostSampleDemand,
+) -> (PendingGuardedWaveRejection, Arc<StepResourceLease<Runtime>>) {
+    reject_encoded_output_with_sample_demand(
+        fixture,
+        session,
+        range,
+        tokens,
+        demand,
+        "node.attention",
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reject_encoded_output_with_sample_demand(
+    fixture: &Fixture,
+    session: &Arc<SequenceSession<Runtime>>,
+    range: Range<usize>,
+    tokens: Arc<[u32]>,
+    demand: StructuredCostSampleDemand,
+    output_node_id: &str,
+    resident: bool,
+) -> (PendingGuardedWaveRejection, Arc<StepResourceLease<Runtime>>) {
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(session)]).unwrap();
-    let request = StepResourceAdmissionRequest::new(
+    let mut request = StepResourceAdmissionRequest::new(
         batch
-            .bind_work_shape(vec![token_span(Arc::clone(&tokens), 0..tokens.len())])
+            .bind_work_shape(vec![token_span(Arc::clone(&tokens), range.clone())])
             .unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
+    if resident {
+        request = request.with_reusable_execution_bucket(
+            fixture
+                .reusable_bucket
+                .clone()
+                .expect("resident guard requires declared slots"),
+        );
+    }
     let step = loop {
         match batch
             .try_begin_step(request.clone(), &fixture.lane)
@@ -95,7 +141,7 @@ fn reject_encoded(
         .payload()
         .nodes()
         .iter()
-        .find(|node| node.id().as_str() == "node.attention")
+        .find(|node| node.id().as_str() == output_node_id)
         .unwrap();
     let output = output_node
         .values()
@@ -108,7 +154,7 @@ fn reject_encoded(
         0,
         component.resource_id().clone(),
         component.offset_bytes(),
-        HostTransferLayout::new(fixture.output_type, tokens.len() as u64 * HIDDEN).unwrap(),
+        HostTransferLayout::new(fixture.output_type, range.len() as u64 * HIDDEN).unwrap(),
     )
     .unwrap()])
     .unwrap();
@@ -125,32 +171,66 @@ fn reject_encoded(
         id("node.embedding"),
         0,
         0,
-        0,
-        HostTransferLayout::new(ElementType::U32, tokens.len() as u64).unwrap(),
-        tokens
+        range.start as u64 * ElementType::U32.size_bytes(),
+        HostTransferLayout::new(ElementType::U32, range.len() as u64).unwrap(),
+        tokens[range]
             .iter()
             .flat_map(|token| token.to_le_bytes())
             .collect(),
     )
     .unwrap();
+    // Resolve the current wave against the real warmed catalog. An exact
+    // guard cannot authorize cold on-demand graph capture; it must not mutate
+    // cache state before returning a definite NotSubmitted receipt.
+    let catalog = resident.then(|| fixture.lane.reusable_execution_catalog().unwrap());
+    let program = catalog.as_ref().map(|catalog| {
+        let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+            fixture.providers.providers(),
+            executable,
+            &wave,
+            &fixture.lane,
+        )
+        .unwrap()
+        .expect("resident guard requires a current reusable topology");
+        let program = catalog
+            .programs()
+            .iter()
+            .find(|program| program.program_id() == &program_id)
+            .expect("resident guard must match the current wave, without eager fallback");
+        assert!(program.is_determinism_ready());
+        program
+    });
     let guard = ExpiredAfterEncoding {
         calls: AtomicU64::new(0),
     };
-    let result = OperationDispatch::encode_and_submit_guarded_wave(
+    let result = OperationDispatch::encode_and_submit_guarded_wave_with_cost_evidence_demand(
         fixture.providers.providers(),
         executable,
         &identity,
         std::iter::once(&active),
         &[upload],
+        program,
         &guard,
+        ferrum_interfaces::vnext::DeviceCostObservationDemand::Required,
+        demand,
+        &ActualSampleGateNoTiming,
         wave,
         &fixture.lane,
         &fixture.reaper,
     );
+    let rejection = match result {
+        GuardedWaveSubmissionOutcome::NotSubmitted(rejection) => rejection,
+        GuardedWaveSubmissionOutcome::Dispatch(Err(error)) => {
+            panic!("encoded guard was not reached: {error}")
+        }
+        GuardedWaveSubmissionOutcome::Dispatch(Ok(_)) => {
+            panic!("expired guard unexpectedly submitted the wave")
+        }
+    };
     assert_eq!(
         guard.calls.load(Ordering::Relaxed),
         1,
-        "guarded wave cannot retry through ordinary dispatch"
+        "guarded wave cannot retry or reject before the requested host check: {rejection:?}"
     );
     assert_eq!(
         fixture.reaper.retained_count(),
@@ -162,16 +242,7 @@ fn reject_encoded(
         Some(1 << 20),
         "failed wave must release staged readback bytes"
     );
-    match result {
-        GuardedWaveSubmissionOutcome::NotSubmitted(rejection) => (rejection, step),
-        GuardedWaveSubmissionOutcome::Dispatch(result) => panic!(
-            "actual encoded gate did not reject: {}",
-            result
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_default()
-        ),
-    }
+    (rejection, step)
 }
 
 #[test]

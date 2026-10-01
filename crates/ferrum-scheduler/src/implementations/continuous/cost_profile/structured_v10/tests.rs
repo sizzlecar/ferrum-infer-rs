@@ -1,6 +1,7 @@
 use super::*;
 mod fit_floor;
 pub(super) mod fixture;
+mod learned_span;
 use fixture::*;
 
 #[test]

@@ -29,7 +29,7 @@ pub(super) fn validate_requested(
     scheduler_trace_jsonl: Option<&Path>,
     environment: &RuntimeConfigSnapshot,
 ) -> Result<()> {
-    if limit.is_none() {
+    if limit.is_none() && detail != ObservabilityProfileDetail::Host {
         return Ok(());
     }
     // Only the existing sink path aliases may come from the captured user
@@ -44,9 +44,10 @@ pub(super) fn validate_requested(
         profile_max_frames_per_request: limit,
         profile_jsonl: path(profile_jsonl, "FERRUM_PROFILE_JSONL"),
         scheduler_trace_jsonl: path(scheduler_trace_jsonl, "FERRUM_SCHEDULER_TRACE_JSONL"),
+        legacy_scheduler_trace_jsonl: path(None, "FERRUM_LEGACY_SCHEDULER_TRACE_JSONL"),
         ..Default::default()
     }
-    .validate_profile_frame_limit()
+    .validate_profile_observation()
     .map_err(FerrumError::config)
 }
 

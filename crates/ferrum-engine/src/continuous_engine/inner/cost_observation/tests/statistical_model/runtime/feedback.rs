@@ -434,8 +434,9 @@ async fn selected_feedback_real_worker_unwind_closes_epoch_and_leaves_restart_di
         Some(Fixture::load_clock()),
     )
     .unwrap();
-    let training =
-        Arc::new(CostTrainingState::new(&f.fixture.config, seed, None, f.clock.clone()).unwrap());
+    let training = Arc::new(
+        CostTrainingState::new(&f.fixture.config, seed, None, f.clock.clone(), None, None).unwrap(),
+    );
     let old = training.snapshot().unwrap();
     let owner = TrainingWorkerOwner(training.clone());
     let worker = CostTrainingWorker::spawn(move || {

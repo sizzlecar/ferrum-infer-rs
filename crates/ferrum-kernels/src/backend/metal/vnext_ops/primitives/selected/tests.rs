@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_interfaces::vnext::DeviceRuntime;
 use ferrum_interfaces::vnext::{
     BufferRequest, BufferUsage, DeviceBatchingForm, OperationCostCommand, ResourceId,
 };
@@ -186,7 +187,27 @@ pub(crate) fn runtime_fixtures(runtime: &MetalDeviceRuntime) -> Vec<NativeCase> 
         .unwrap()
         .with_work_shape(route.batching(), 1, 2)
         .unwrap()
-        .with_statistical_evidence(Some(evidence));
+        .with_observation(
+            (embedding_observation(
+                &p,
+                &[EmbeddingLaunch {
+                    table_region: 0,
+                    tokens_region: 1,
+                    output_region: 2,
+                    transform: None,
+                    scratch_offset_bytes: 0,
+                    format: EmbeddingPhysicalFormat::DenseF16,
+                    params,
+                }],
+                ElementType::F16,
+                2,
+            ))
+            .and_then(|template| {
+                (runtime.observation_template_budget().as_ref())?
+                    .retain(template)
+                    .ok()
+            }),
+        );
         cases.push(NativeCase {
             command,
             projected: route,
@@ -236,7 +257,15 @@ pub(crate) fn runtime_fixtures(runtime: &MetalDeviceRuntime) -> Vec<NativeCase> 
         .unwrap()
         .with_work_shape(route.batching(), 2, 2)
         .unwrap()
-        .with_statistical_evidence(Some(evidence));
+        .with_observation(
+            (rms_observation(&p, params, ElementType::F32, ElementType::F16)).and_then(
+                |template| {
+                    (runtime.observation_template_budget().as_ref())?
+                        .retain(template)
+                        .ok()
+                },
+            ),
+        );
         cases.push(NativeCase {
             command,
             projected: route,
@@ -295,7 +324,21 @@ pub(crate) fn runtime_fixtures(runtime: &MetalDeviceRuntime) -> Vec<NativeCase> 
         .unwrap()
         .with_work_shape(route.batching(), 1, 1)
         .unwrap()
-        .with_statistical_evidence(Some(evidence));
+        .with_observation(
+            (residual_observation(
+                &p,
+                params,
+                ElementType::F32,
+                ElementType::F16,
+                ElementType::F32,
+                1,
+            ))
+            .and_then(|template| {
+                (runtime.observation_template_budget().as_ref())?
+                    .retain(template)
+                    .ok()
+            }),
+        );
         cases.push(NativeCase {
             command,
             projected: route,
@@ -380,7 +423,23 @@ pub(crate) fn runtime_fixtures(runtime: &MetalDeviceRuntime) -> Vec<NativeCase> 
             .unwrap()
             .with_work_shape(DeviceBatchingForm::Scalar, 1, 1)
             .unwrap()
-            .with_statistical_evidence(Some(evidence));
+            .with_observation(
+                (argmax_observation(
+                    &p,
+                    &[LastTokenMaskedArgmaxLaunch {
+                        first_region: 0,
+                        scratch_offset_bytes: 0,
+                        params,
+                    }],
+                    ElementType::F32,
+                    scratch_bytes,
+                ))
+                .and_then(|template| {
+                    (runtime.observation_template_budget().as_ref())?
+                        .retain(template)
+                        .ok()
+                }),
+            );
         cases.push(NativeCase {
             command,
             projected: route,

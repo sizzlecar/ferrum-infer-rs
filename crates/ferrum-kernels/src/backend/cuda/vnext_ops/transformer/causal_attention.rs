@@ -26,6 +26,10 @@ use ferrum_types::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::backend::causal_attention_selector::{
+    self as selector, CausalAttentionSelectorShape, NativeDecodeKernel, SelectedCausalAttentionPath,
+};
+
 use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
 #[cfg(feature = "vllm-marlin")]
 use super::{
@@ -80,7 +84,7 @@ mod launch_geometry;
 mod numerical_tests;
 mod precision;
 mod prepared;
-mod selected;
+pub(super) mod selected;
 use super::native_matrix;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
 use ferrum_interfaces::vnext::{
@@ -123,14 +127,9 @@ const GROUPED_FALLBACK_GEMMA_LOCAL_KV_TILE_TOKENS: u64 = 32;
 const MAXIMUM_GROUPED_QUERY_HEADS_PER_KV: u32 = 16;
 const MAXIMUM_HEAD_DIM: u64 = 512;
 const MAXIMUM_STANDARD_HEAD_DIM: u64 = 256;
-const MAXIMUM_VARLEN_HEAD_DIM: u64 = 256;
 const VLLM_BLOCK_TOKENS: u64 = 16;
+const VLLM_KEY_PACK_ELEMENTS: u64 = 8;
 const VLLM_PARTITION_TOKENS: u64 = CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS;
-const VARLEN_DEFAULT_SHARED_LIMIT_BYTES: u64 = 48 * 1024;
-const VARLEN_STATIC_SHARED_RESERVE_BYTES: u64 = 1024;
-const VARLEN_DYNAMIC_SHARED_BUDGET_BYTES: u64 =
-    VARLEN_DEFAULT_SHARED_LIMIT_BYTES - VARLEN_STATIC_SHARED_RESERVE_BYTES;
-const VARLEN_TILED_QUERY_TOKENS: u64 = 4;
 
 pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider {
     descriptor: OperationProviderDescriptor,
@@ -360,6 +359,7 @@ impl CudaCausalPagedAttentionProvider {
             include_bytes!("cublas_api.rs"),
             include_bytes!("causal_attention/prepared.rs"),
             include_bytes!("causal_attention/selected.rs"),
+            include_bytes!("causal_attention/selected/template.rs"),
             include_bytes!("causal_attention/launch_geometry.rs"),
             include_bytes!("../native_blocks/linear_launch.rs"),
             include_bytes!("../native_blocks/selected.rs"),
@@ -536,7 +536,10 @@ impl CudaCausalPagedAttentionProvider {
             estimator_fingerprint,
         )
         .map_err(contract_error)?;
-        if semantics.int8_kv() {
+        if matches!(
+            semantics,
+            CausalAttentionSemantics::Standard | CausalAttentionSemantics::StandardInt8
+        ) {
             let storage = DynamicStorageProfile::new(
                 DynamicStorageAllocator::FixedBlockArena {
                     block_bytes: VNEXT_KV_PAGE_BYTES,
@@ -553,13 +556,24 @@ impl CudaCausalPagedAttentionProvider {
             )
             .with_completed_input_capture(CheckpointCompletedInputCapture::Supported)
             .with_state_ports(
-                (8..=9)
+                (8..=if semantics.int8_kv() { 9 } else { 8 })
                     .map(|ordinal| {
                         ProviderCheckpointStatePort::new(
                             ResolvedValueRole::Input,
                             ordinal,
                             storage,
-                            ProviderCheckpointStateLayout::TokenMajorPrefix,
+                            if semantics.int8_kv() {
+                                ProviderCheckpointStateLayout::TokenMajorPrefix
+                            } else {
+                                ProviderCheckpointStateLayout::PagedKeyValueBlockPrefix {
+                                    tokens_per_block: std::num::NonZeroU64::new(VLLM_BLOCK_TOKENS)
+                                        .unwrap(),
+                                    key_pack_elements: std::num::NonZeroU64::new(
+                                        VLLM_KEY_PACK_ELEMENTS,
+                                    )
+                                    .unwrap(),
+                                }
+                            },
                         )
                     })
                     .collect(),
@@ -778,6 +792,57 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        if request.operation_id() != self.descriptor.operation_id() {
+            return None;
+        }
+        cost_route::PreparedCostData::new(
+            request.operation_id(),
+            request.bindings(),
+            request.attributes(),
+            self.semantics,
+            self.precision,
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
+        .ok()
+        .flatten()
+        .map(ferrum_interfaces::vnext::PreparedOperationCostData::new)
+    }
+
+    fn decode_context_coverage(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> ferrum_interfaces::vnext::DecodeContextCoverage {
+        let Some((shape, maximum)) =
+            CausalAttentionShape::from_attributes_for(request.attributes(), self.semantics)
+                .ok()
+                .and_then(|shape| {
+                    Some((
+                        shape,
+                        std::num::NonZeroU64::new(shape.maximum_context_tokens)?,
+                    ))
+                })
+        else {
+            return Default::default();
+        };
+        match shape.selector_shape() {
+            Ok(shape) => selector::decode_context_coverage(
+                self.attention_policy,
+                shape,
+                cfg!(feature = "vllm-paged-attn-v2"),
+                maximum,
+            ),
+            Err(_) => ferrum_interfaces::vnext::DecodeContextCoverage::Unknown {
+                maximum_sequence_tokens: Some(maximum),
+                known_boundaries: Vec::new(),
+            },
+        }
+    }
+
     fn eager_cost_route(
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
@@ -797,6 +862,27 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
 
     fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
         ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+    }
+
+    fn future_cost_selection(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+        topology: ferrum_interfaces::vnext::OperationCostTopologyRequirement,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostSelection>, VNextError> {
+        cost_route::selection(
+            request,
+            topology,
+            poll,
+            self.attention_policy,
+            self.semantics,
+            self.precision,
+            self.structured_capture,
+            self.descriptor.operation_id().as_str(),
+            self.cublas_cost_identity.frozen(),
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
     }
 
     fn reusable_execution_topology(
@@ -900,6 +986,16 @@ fn topology(
     attention_policy: AttentionExecutionPolicy,
     semantics: CausalAttentionSemantics,
 ) -> Result<ReusableExecutionTopology, VNextError> {
+    if !reusable_attention_address_scope(request, semantics)? {
+        return Ok(ReusableExecutionTopology::EagerBoundary);
+    }
+    reusable_attention_topology(request, attention_policy, semantics).map_err(invalid_plan)
+}
+
+fn reusable_attention_address_scope(
+    request: &impl ReusableExecutionTopologyView,
+    semantics: CausalAttentionSemantics,
+) -> Result<bool, VNextError> {
     let mut values = (0..semantics.input_count())
         .filter(|ordinal| !semantics.is_state(*ordinal))
         .map(|ordinal| ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal))
@@ -914,7 +1010,7 @@ fn topology(
             9,
         ));
     }
-    if request
+    Ok(request
         .reusable_address_scope(
             &values,
             &[
@@ -922,11 +1018,7 @@ fn topology(
                 ReusableExecutionWorkspaceAddress::Binding,
             ],
         )?
-        .is_none()
-    {
-        return Ok(ReusableExecutionTopology::EagerBoundary);
-    }
-    reusable_attention_topology(request, attention_policy, semantics).map_err(invalid_plan)
+        .is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -980,66 +1072,26 @@ impl CausalAttentionKernelPath {
         active_tokens: u64,
         sequence_tokens: u64,
     ) -> Result<Self, String> {
-        if shape.int8_kv && attention_policy != AttentionExecutionPolicy::Portable {
-            return Err("INT8 causal attention requires resolved portable execution".to_owned());
-        }
-        if matches!(shape.kv_layout()?, CausalKvLayout::TokenMajorPages) {
-            return Ok(Self::TokenMajorFallback);
-        }
-        if active_tokens == 1 && shape.tiled_vllm_supported()? {
-            return match attention_policy {
-                AttentionExecutionPolicy::Portable => Ok(Self::VllmAddressedFallback),
-                AttentionExecutionPolicy::NativeAdaptive => {
-                    #[cfg(feature = "vllm-paged-attn-v2")]
-                    {
-                        Ok(
-                            match VnextAddressedPagedAttentionKernel::for_sequence_length(
-                                sequence_tokens,
-                            ) {
-                                VnextAddressedPagedAttentionKernel::V1 => {
-                                    Self::VllmAddressedDecodeV1
-                                }
-                                VnextAddressedPagedAttentionKernel::V2 => {
-                                    Self::VllmAddressedDecodeV2
-                                }
-                            },
-                        )
-                    }
-                    #[cfg(not(feature = "vllm-paged-attn-v2"))]
-                    {
-                        Err(
-                            "native-adaptive causal attention requires the compiled vLLM paged-attention provider"
-                                .to_owned(),
-                        )
-                    }
+        // Dispatch, future cost projection, and cold coverage share this pure
+        // selector. This wrapper only maps the selected path to CUDA encoding.
+        Ok(
+            match selector::select_causal_attention_path(
+                attention_policy,
+                shape.selector_shape()?,
+                cfg!(feature = "vllm-paged-attn-v2"),
+                active_tokens,
+                sequence_tokens,
+            )? {
+                SelectedCausalAttentionPath::TokenMajorFallback => Self::TokenMajorFallback,
+                SelectedCausalAttentionPath::VllmAddressedFallback => Self::VllmAddressedFallback,
+                SelectedCausalAttentionPath::VllmAddressedVarlen => Self::VllmAddressedVarlen,
+                SelectedCausalAttentionPath::VllmAddressedVarlenTiled => {
+                    Self::VllmAddressedVarlenTiled
                 }
-                AttentionExecutionPolicy::Auto => {
-                    Err("causal attention received an unresolved auto policy".to_owned())
-                }
-            };
-        }
-        // The addressed varlen kernels currently support arbitrary scale but
-        // only head dimensions through 256 and full-prefix attention. Gemma 4
-        // local layers and 512-wide full layers therefore stay on the generic
-        // addressed fallback; this also keeps them away from the vLLM decode
-        // kernels whose scale and head-size ABI are fixed.
-        if !shape.addressed_varlen_supported() {
-            return Ok(Self::VllmAddressedFallback);
-        }
-        let score_bytes = sequence_tokens
-            .checked_mul(std::mem::size_of::<f32>() as u64)
-            .ok_or_else(|| "causal attention varlen score bytes overflow".to_owned())?;
-        if active_tokens >= VARLEN_TILED_QUERY_TOKENS
-            && score_bytes
-                .checked_mul(VARLEN_TILED_QUERY_TOKENS)
-                .is_some_and(|bytes| bytes <= VARLEN_DYNAMIC_SHARED_BUDGET_BYTES)
-        {
-            Ok(Self::VllmAddressedVarlenTiled)
-        } else if score_bytes <= VARLEN_DYNAMIC_SHARED_BUDGET_BYTES {
-            Ok(Self::VllmAddressedVarlen)
-        } else {
-            Ok(Self::VllmAddressedFallback)
-        }
+                SelectedCausalAttentionPath::VllmAddressedDecodeV1 => Self::VllmAddressedDecodeV1,
+                SelectedCausalAttentionPath::VllmAddressedDecodeV2 => Self::VllmAddressedDecodeV2,
+            },
+        )
     }
 
     fn operation(self) -> &'static str {
@@ -1105,13 +1157,19 @@ impl CausalAttentionReplayEnvelope {
     ) -> Result<Self, String> {
         let sequence_capacity_tokens = match path {
             CausalAttentionKernelPath::VllmAddressedDecodeV1 => {
-                VLLM_PARTITION_TOKENS.min(shape.maximum_context_tokens)
+                selector::native_decode_replay_capacity(
+                    NativeDecodeKernel::V1,
+                    sequence_tokens,
+                    shape.maximum_context_tokens,
+                )?
             }
-            CausalAttentionKernelPath::VllmAddressedDecodeV2 => sequence_tokens
-                .div_ceil(VLLM_PARTITION_TOKENS)
-                .checked_mul(VLLM_PARTITION_TOKENS)
-                .map(|capacity| capacity.min(shape.maximum_context_tokens))
-                .ok_or_else(|| "causal attention replay sequence capacity overflows".to_owned())?,
+            CausalAttentionKernelPath::VllmAddressedDecodeV2 => {
+                selector::native_decode_replay_capacity(
+                    NativeDecodeKernel::V2,
+                    sequence_tokens,
+                    shape.maximum_context_tokens,
+                )?
+            }
             CausalAttentionKernelPath::TokenMajorFallback
             | CausalAttentionKernelPath::VllmAddressedFallback => shape.maximum_context_tokens,
             CausalAttentionKernelPath::VllmAddressedVarlen
@@ -1146,7 +1204,14 @@ impl CausalAttentionReplayTopology {
         sequence_tokens: u64,
     ) -> Result<Self, String> {
         let envelope = CausalAttentionReplayEnvelope::new(shape, path, sequence_tokens)?;
-        Ok(match path {
+        Ok(Self::from_envelope(path, envelope))
+    }
+
+    fn from_envelope(
+        path: CausalAttentionKernelPath,
+        envelope: CausalAttentionReplayEnvelope,
+    ) -> Self {
+        match path {
             CausalAttentionKernelPath::TokenMajorFallback
             | CausalAttentionKernelPath::VllmAddressedFallback
             | CausalAttentionKernelPath::VllmAddressedDecodeV1
@@ -1155,7 +1220,7 @@ impl CausalAttentionReplayTopology {
             | CausalAttentionKernelPath::VllmAddressedVarlenTiled => {
                 Self::ExactShapeEager(envelope)
             }
-        })
+        }
     }
 
     const fn envelope(self) -> CausalAttentionReplayEnvelope {
@@ -1218,6 +1283,58 @@ fn reusable_attention_topology_from_rows<I>(
 where
     I: IntoIterator<Item = Result<CausalAttentionTopologyRow, String>>,
 {
+    reusable_attention_topology_from_selected(
+        shape,
+        row_count,
+        rows.into_iter().map(|row| {
+            let row = row?;
+            let path = CausalAttentionKernelPath::select(
+                attention_policy,
+                shape,
+                row.active_tokens,
+                row.sequence_tokens,
+            )?;
+            Ok((row, path))
+        }),
+    )
+}
+
+fn reusable_attention_topology_from_selected<I>(
+    shape: CausalAttentionShape,
+    row_count: usize,
+    rows: I,
+) -> Result<ReusableExecutionTopology, String>
+where
+    I: IntoIterator<Item = Result<(CausalAttentionTopologyRow, CausalAttentionKernelPath), String>>,
+{
+    reusable_attention_topology_from_envelopes(
+        shape,
+        row_count,
+        rows.into_iter().map(|row| {
+            let (row, path) = row?;
+            let envelope = CausalAttentionReplayEnvelope::new(shape, path, row.sequence_tokens)?;
+            Ok((row, path, envelope))
+        }),
+    )
+}
+
+fn reusable_attention_topology_from_envelopes<I>(
+    shape: CausalAttentionShape,
+    row_count: usize,
+    rows: I,
+) -> Result<ReusableExecutionTopology, String>
+where
+    I: IntoIterator<
+        Item = Result<
+            (
+                CausalAttentionTopologyRow,
+                CausalAttentionKernelPath,
+                CausalAttentionReplayEnvelope,
+            ),
+            String,
+        >,
+    >,
+{
     if row_count == 0 {
         return Err("CUDA causal topology has no participants".to_owned());
     }
@@ -1231,20 +1348,14 @@ where
     let mut total_tokens = 0_u64;
     let mut partition_stable = true;
     for row in rows {
-        let row = row?;
+        let (row, path, envelope) = row?;
         observed_rows = observed_rows
             .checked_add(1)
             .ok_or_else(|| "CUDA causal topology participant count overflows".to_owned())?;
         total_tokens = total_tokens
             .checked_add(row.active_tokens)
             .ok_or_else(|| "CUDA causal topology token count overflows".to_owned())?;
-        let path = CausalAttentionKernelPath::select(
-            attention_policy,
-            shape,
-            row.active_tokens,
-            row.sequence_tokens,
-        )?;
-        let topology = CausalAttentionReplayTopology::new(shape, path, row.sequence_tokens)?;
+        let topology = CausalAttentionReplayTopology::from_envelope(path, envelope);
         partition_stable &= topology.is_partition_stable();
         let envelope = topology.envelope();
         digest.update(row.active_tokens.to_le_bytes());
@@ -1405,7 +1516,7 @@ impl CausalAttentionShape {
             .state_bytes_per_token()?
             .checked_mul(VLLM_BLOCK_TOKENS)
             .ok_or_else(|| "causal attention vLLM block size overflows".to_owned())?;
-        if self.head_dim % 8 != 0
+        if self.head_dim % VLLM_KEY_PACK_ELEMENTS != 0
             || combined_block_bytes > VNEXT_KV_PAGE_BYTES
             || VNEXT_KV_PAGE_BYTES % combined_block_bytes != 0
         {
@@ -1557,16 +1668,22 @@ impl CausalAttentionShape {
     }
 
     fn tiled_vllm_supported(self) -> Result<bool, String> {
-        Ok(cfg!(feature = "vllm-paged-attn-v2")
-            && matches!(self.kv_layout()?, CausalKvLayout::VllmBlocks16 { .. })
-            && matches!(self.head_dim, 128 | 256)
-            && self.sliding_window_tokens == 0
-            && self.attention_scale.to_bits()
-                == (1.0_f32 / (self.head_dim as f32).sqrt()).to_bits())
+        if !cfg!(feature = "vllm-paged-attn-v2") {
+            return Ok(false);
+        }
+        Ok(self
+            .selector_shape()?
+            .tiled_vllm_supported(cfg!(feature = "vllm-paged-attn-v2")))
     }
 
-    fn addressed_varlen_supported(self) -> bool {
-        self.head_dim <= MAXIMUM_VARLEN_HEAD_DIM && self.sliding_window_tokens == 0
+    fn selector_shape(self) -> Result<CausalAttentionSelectorShape, String> {
+        Ok(CausalAttentionSelectorShape {
+            int8_kv: self.int8_kv,
+            uses_vllm_blocks: matches!(self.kv_layout()?, CausalKvLayout::VllmBlocks16 { .. }),
+            head_dim: self.head_dim,
+            sliding_window_tokens: self.sliding_window_tokens,
+            attention_scale: self.attention_scale,
+        })
     }
 
     fn cuda_shape(self) -> Result<CudaCausalAttentionShape, String> {
@@ -2151,16 +2268,31 @@ fn encode_attention(
     )?;
     let rounded = super::gguf_f16_projection::is_operation(&invocation.operation().id);
     let library_identity = rounded.then_some(library_identity).flatten();
-    let selected_compute = selected::actual(
-        &prepared,
-        attention_policy,
-        precision,
-        structured_capture,
-        library_identity,
-    );
-    let selected_binding = selected::binding_evidence(
+    let observation_recipe = if structured_capture.is_disabled() {
+        None
+    } else {
+        invocation
+            .observation_template_budget()
+            .and_then(|budget| {
+                selected::Recipe::from_prepared(
+                    &prepared,
+                    attention_policy,
+                    precision,
+                    library_identity,
+                    budget,
+                )
+            })
+            .and_then(|recipe| {
+                super::replay_cost::CudaReplayCostRecipe::causal(
+                    &invocation,
+                    recipe,
+                    structured_capture,
+                )
+            })
+    };
+    let binding_observation = super::replay_cost::CudaReplayCostRecipe::causal_bindings(
+        &invocation,
         prepared.host_storage.iter().map(|bytes| bytes.len() as u64),
-        prepared.total_tokens,
         structured_capture,
     );
     let prepared::Prepared {
@@ -2250,7 +2382,7 @@ fn encode_attention(
                 u64::from(participant_count),
             )
         })
-        .map(|command| command.with_statistical_evidence(selected_binding))
+        .map(|command| command.with_replay_cost_recipe(binding_observation))
         .map_err(|error| error.to_string())?;
 
     let compute_operation = launches
@@ -2447,7 +2579,7 @@ fn encode_attention(
         )
     })
     .map(|command| {
-        let command = command.with_statistical_evidence(selected_compute);
+        let command = command.with_replay_cost_recipe(observation_recipe);
         if rounded {
             // Missing/incomplete API evidence stays Required(None), never an
             // implicit permission to submit under the legacy cost contract.

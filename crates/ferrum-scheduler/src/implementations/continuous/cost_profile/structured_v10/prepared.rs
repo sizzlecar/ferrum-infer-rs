@@ -20,6 +20,29 @@ pub(super) fn project(
     p: &Prepared,
     offered: &[OfferedRow],
 ) -> Result<StructuredInputV2, CostProfileError> {
+    project_parts(p, offered, true, None)
+}
+// Source6 has actual post-execution facts, never a Prepared forecast. Reuse
+// numerical validation only; it cannot mint a live receipt/planning authority.
+pub(super) fn project_service_actual(
+    p: &Prepared,
+    offered: &[OfferedRow],
+) -> Result<StructuredInputV2, CostProfileError> {
+    project_parts(p, offered, false, None)
+}
+pub(super) fn project_service_actual_with_domain(
+    p: &Prepared,
+    offered: &[OfferedRow],
+    domain: &CostWorkloadDomainV1,
+) -> Result<StructuredInputV2, CostProfileError> {
+    project_parts(p, offered, false, Some(domain))
+}
+fn project_parts(
+    p: &Prepared,
+    offered: &[OfferedRow],
+    compare_prepared_facts: bool,
+    domain: Option<&CostWorkloadDomainV1>,
+) -> Result<StructuredInputV2, CostProfileError> {
     let fail = || invalid("invalid original Prepared facts or membership projection");
     let n = p.rows.len();
     if n == 0 || n > 128 || offered.len() != n || p.recipe.physical_host_rows.len() != n {
@@ -221,12 +244,18 @@ pub(super) fn project(
                 r.native_graph_nodes,
             ]
         }),
+        p.recipe.device.retries,
     )
     .map_err(numeric_error)?;
-    if serde_json::to_value(facts)? != p.owner_facts {
+    if compare_prepared_facts && serde_json::to_value(facts)? != p.owner_facts {
         return Err(invalid("Prepared owner facts differ from original recipe"));
     }
-    Ok(input)
+    match domain {
+        Some(domain) => input
+            .bind_validated_physical_domain(&canonical, domain)
+            .map_err(numeric_error),
+        None => Ok(input),
+    }
 }
 fn validate_recipe(
     r: &Recipe,

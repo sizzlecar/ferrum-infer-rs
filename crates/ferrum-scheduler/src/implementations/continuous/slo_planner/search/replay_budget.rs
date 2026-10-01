@@ -3,10 +3,10 @@
 use super::PlanningUnknownReason;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct MeasuredReplayWork(u64);
+pub(in super::super) struct MeasuredReplayWork(u64);
 
 impl MeasuredReplayWork {
-    pub(super) fn with_span(
+    pub(in super::super) fn with_span(
         self,
         start_ns: u64,
         end_ns: u64,
@@ -20,7 +20,7 @@ impl MeasuredReplayWork {
             .ok_or(PlanningUnknownReason::ArithmeticOverflow)
     }
 
-    pub(super) fn ns(self) -> u64 {
+    pub(in super::super) fn ns(self) -> u64 {
         self.0
     }
 }
@@ -28,7 +28,7 @@ impl MeasuredReplayWork {
 /// The original phase endpoints are ceilings. A complete common plan can move
 /// only the optional endpoint earlier; it never changes the transaction origin,
 /// planner/publication endpoint, physical authority, or any request obligation.
-pub(super) struct ReplayReserve {
+pub(in super::super) struct ReplayReserve {
     origin_ns: u64,
     configured_search_end_ns: u64,
     planner_end_ns: u64,
@@ -39,7 +39,7 @@ pub(super) struct ReplayReserve {
 }
 
 impl ReplayReserve {
-    pub(super) fn new(origin_ns: u64, search_end_ns: u64, planner_end_ns: u64) -> Self {
+    pub(in super::super) fn new(origin_ns: u64, search_end_ns: u64, planner_end_ns: u64) -> Self {
         // PlanningPhaseBudget checked the order. With an early outer cap the
         // optional endpoint can equal the origin, while construct still runs.
         Self {
@@ -53,7 +53,7 @@ impl ReplayReserve {
         }
     }
 
-    pub(super) fn observe_complete(
+    pub(in super::super) fn observe_complete(
         &mut self,
         work: MeasuredReplayWork,
     ) -> Result<(), PlanningUnknownReason> {
@@ -77,19 +77,19 @@ impl ReplayReserve {
         Ok(())
     }
 
-    pub(super) fn deadline_ns(&self) -> u64 {
+    pub(in super::super) fn deadline_ns(&self) -> u64 {
         self.search_end_ns
     }
 
-    pub(super) fn is_early_stop(&self, now_ns: u64) -> bool {
+    pub(in super::super) fn is_early_stop(&self, now_ns: u64) -> bool {
         now_ns >= self.search_end_ns && now_ns < self.configured_search_end_ns
     }
 
-    pub(super) fn measured_ns(&self) -> u64 {
+    pub(in super::super) fn measured_ns(&self) -> u64 {
         self.measured.ns()
     }
 
-    pub(super) fn reserved_ns(&self) -> u64 {
+    pub(in super::super) fn reserved_ns(&self) -> u64 {
         self.reserved_ns
     }
 }

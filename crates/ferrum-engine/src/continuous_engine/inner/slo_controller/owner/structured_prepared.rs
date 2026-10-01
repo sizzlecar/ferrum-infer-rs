@@ -161,7 +161,7 @@ impl PreparedControllerWave {
                 ));
             }
             let host = participant_host_features(sequence)
-                .filter(|host| host.supports_empirical_plain_text_content())
+                .filter(|host| host.supports_installed_plain_text_content())
                 .ok_or_else(|| {
                     FerrumError::unsupported("structured Prepared host domain is unavailable")
                 })?;

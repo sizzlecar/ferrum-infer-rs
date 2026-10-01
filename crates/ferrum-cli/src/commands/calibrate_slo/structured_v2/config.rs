@@ -2,7 +2,7 @@ use super::*;
 use ferrum_engine::continuous_engine::{CalibrationSession, StructuredCalibrationOptionsV2};
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
     windows::{CohortPlanV2, CohortRequestV2, CohortV2, MembershipRuleV2},
-    StructuredScopeV2,
+    StructuredScopeV2, StructuredSettingsV2,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,7 +18,7 @@ pub(crate) struct CaptureConfigV2 {
     pub source: PathBuf,
     pub scope: StructuredScopeV2,
     pub membership_rule: MembershipRuleV2,
-    pub settings: structured::Settings,
+    pub settings: StructuredSettingsV2,
     pub phase_members: [usize; 3],
     pub maximum_offered_waves: NonZeroUsize,
     pub maximum_file_bytes: NonZeroU64,
@@ -27,7 +27,7 @@ pub(crate) struct CaptureConfigV2 {
 impl CaptureConfigV2 {
     pub(crate) fn validate(&self, manifest: &manifest::Manifest) -> Result<()> {
         let bad = |reason| FerrumError::config(format!("structured V2 declaration: {reason:?}"));
-        self.settings.core().validate().map_err(bad)?;
+        self.settings.validate().map_err(bad)?;
         self.scope.validate().map_err(bad)?;
         self.membership_rule.validate().map_err(bad)?;
         if self.scope.owner != self.membership_rule.owner
@@ -87,7 +87,7 @@ impl CaptureConfigV2 {
             membership_rule: self.membership_rule.clone(),
             cohort_plan: plan,
             cohort_manifest_payload: payload,
-            settings: self.settings.core(),
+            settings: self.settings.clone(),
             phase_members: self.phase_members,
             maximum_offered_waves: self.maximum_offered_waves,
             maximum_file_bytes: self.maximum_file_bytes,

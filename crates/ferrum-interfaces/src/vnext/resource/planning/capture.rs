@@ -1,5 +1,8 @@
 use super::*;
-use crate::vnext::resource::sequence::{SequenceSessionPhase, SequenceSessionSlotState};
+use crate::vnext::resource::sequence::{
+    CompletedSequenceProvenance, SequenceCompletedFrontier, SequenceSessionPhase,
+    SequenceSessionSlotState,
+};
 
 impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     /// Samples existing admitted sessions without pinning their backing. Every
@@ -48,20 +51,22 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         (
             ResourcePlanningView,
             Option<crate::vnext::DeviceCostGraphStreamState>,
-            Option<crate::vnext::DeviceCostGraphCatalog>,
+            Option<crate::vnext::DeviceCostGraphCatalogSnapshot>,
         ),
         ResourcePlanningUnknown,
     > {
         if !Arc::ptr_eq(&self.runtime, lane.runtime_arc()) {
             return Err(ResourcePlanningUnknown::StaleIdentity);
         }
+        budget.diagnostic_checkpoint("resource_capture_lane_begin");
         lane.try_with_cost_planning_lane(limits, budget, |epoch, graph, catalog, budget| {
+            budget.diagnostic_checkpoint("resource_capture_lane_ready");
             self.capture_resource_planning_view(sessions, Some((lane.id(), epoch)), limits, budget)
                 .map(|view| (view, graph, catalog))
         })
     }
 
-    fn capture_resource_planning_view(
+    pub(super) fn capture_resource_planning_view(
         &self,
         sessions: &[&SequenceSession<R>],
         lane: Option<(ExecutionLaneId, u64)>,
@@ -70,6 +75,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     ) -> Result<ResourcePlanningView, ResourcePlanningUnknown> {
         use ResourcePlanningReadStage as Stage;
         use ResourcePlanningUnknown as U;
+        poll_budget.diagnostic_checkpoint("resource_capture_validation_begin");
         poll(poll_budget)?;
         if !limits.is_valid() || sessions.is_empty() {
             return Err(U::InvalidInput);
@@ -102,7 +108,9 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             return Err(U::ReusableExecution);
         }
         let _lifecycle = self.try_read_planning_lifecycle()?;
+        poll_budget.diagnostic_checkpoint("resource_capture_static_ranges_begin");
         let mut physical_ranges = physical_ranges::capture_static(self, limits, poll_budget)?;
+        poll_budget.diagnostic_checkpoint("resource_capture_sessions_begin");
         let mut slots = Vec::with_capacity(sessions.len());
         let mut backings = Vec::with_capacity(sessions.len());
         let mut participants = Vec::with_capacity(sessions.len());
@@ -144,6 +152,31 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     .ok_or(U::ReadUnavailable(Stage::SequenceBacking))?,
             );
             let backing = &backings.last().unwrap().current;
+            let completed_checkpoint_boundary = match &active.completed_boundary {
+                SequenceCompletedFrontier::Proven(boundary)
+                    if boundary.epoch() == session.epoch()
+                        && boundary.session_fingerprint() == session.fingerprint()
+                        && boundary.backing_generation() == backing.generation()
+                        && boundary.plan_hash() == self.planning_plan_hash() =>
+                {
+                    Some(ResourcePlanningCompletedBoundary {
+                        span_start: u64::try_from(boundary.capture_span_start())
+                            .map_err(|_| U::InvalidDemand)?,
+                        completed_tokens: u64::try_from(boundary.completed_tokens())
+                            .map_err(|_| U::InvalidDemand)?,
+                        prompt_tokens: u64::try_from(boundary.full_input().len())
+                            .map_err(|_| U::InvalidDemand)?,
+                        restored_from: match boundary.provenance() {
+                            CompletedSequenceProvenance::FullPlan { .. } => None,
+                            CompletedSequenceProvenance::ImportedCheckpoint {
+                                capture_attempt,
+                                ..
+                            } => Some(*capture_attempt),
+                        },
+                    })
+                }
+                _ => None,
+            };
             // Token-span execution has no independently supplied page work.
             // Page-evidence protocols need an explicit adapter, not page guesses.
             if backing.committed_pages() != 0 {
@@ -159,6 +192,17 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             } else {
                 Arc::new(BTreeMap::new())
             });
+            let mut restore_zero_initializations_pending = true;
+            let pending_zero_initializations = pending_zero_initializations(
+                BatchParticipantAuthority::new(
+                    session.sequence_authority(),
+                    session.request_authority(),
+                ),
+                backing.backing_slices(),
+                limits.maximum_free_extents,
+                poll_budget,
+                &mut restore_zero_initializations_pending,
+            )?;
             participants.push(ResourcePlanningParticipant {
                 authority: session.sequence_authority(),
                 epoch: session.epoch(),
@@ -171,15 +215,13 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     .work_shape()
                     .fit_tokens(),
                 retired_frames: active.retired_frames,
-                pending_zero_initializations: pending_zero_initializations(
-                    BatchParticipantAuthority::new(
-                        session.sequence_authority(),
-                        session.request_authority(),
-                    ),
-                    backing.backing_slices(),
-                    limits.maximum_free_extents,
-                    poll_budget,
-                )?,
+                pending_zero_initializations,
+                restore_zero_initializations_pending,
+                restore_frontier_fresh: matches!(
+                    active.completed_boundary,
+                    SequenceCompletedFrontier::Fresh
+                ),
+                completed_checkpoint_boundary,
             });
         }
         // Hold the arena read across logical and physical snapshots. A retained
@@ -192,18 +234,39 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     .map_err(|error| read_lock_error(error, Stage::LaneWorkspace))
             })
             .transpose()?;
+        poll_budget.diagnostic_checkpoint("resource_capture_workspace_begin");
         let workspace = match (lane, arena_guard.as_deref()) {
-            (Some((id, epoch)), Some(arena)) => {
-                Some(workspace::capture(arena, id, epoch, limits, poll_budget)?)
-            }
+            (Some((id, epoch)), Some(arena)) => Some(Arc::new(workspace::capture(
+                arena,
+                id,
+                epoch,
+                limits,
+                poll_budget,
+            )?)),
             (None, None) => None,
             _ => return Err(U::InvalidDemand),
         };
         // Some release paths acquire these locks in a different order. This
         // chain only uses try_lock and never waits while retaining a guard.
+        poll_budget.diagnostic_checkpoint("resource_capture_capacity_begin");
         pools
             .logical_admission
             .with_planning_snapshot(limits.maximum_pools, |logical| {
+                // Checkpoint copies need allocator-owned fragment geometry,
+                // not backend absolute addresses. Keep the actual lease proof
+                // even on a runtime without provider cost-buffer ranges.
+                // Ordinary address proofs remain absent on that runtime.
+                if physical_ranges.is_none() && logical.checkpoint_retention().is_some() {
+                    for (range, backing) in sequence_ranges.iter_mut().zip(&backings) {
+                        poll(poll_budget)?;
+                        *range = sequence_ranges::capture(
+                            backing.current.backing_slices(),
+                            limits.maximum_free_extents,
+                            &mut sequence_segments,
+                            poll_budget,
+                        )?;
+                    }
+                }
                 let budget = &pools.budget;
                 let account = budget
                     .account
@@ -240,6 +303,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     return Err(U::MaintenanceRequired);
                 }
                 let mut guards = Vec::with_capacity(pools.pools.len());
+                poll_budget.diagnostic_checkpoint("resource_capture_physical_pools_begin");
                 for pool in pools.pools.values() {
                     poll(poll_budget)?;
                     guards.push(
@@ -300,10 +364,14 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                         instance: pool.instance_id,
                         next_extent_generation: pool.next_extent_generation.load(Ordering::Acquire),
                         resident_bytes: state.resident_bytes,
-                        allocator: state.allocator.clone(),
+                        // Capture real mutable state once under this same
+                        // nonblocking bracket. Only subsequent private numeric
+                        // successors may share this immutable copy.
+                        allocator: Arc::new(state.allocator.clone()),
                     });
                 }
                 poll(poll_budget)?;
+                poll_budget.diagnostic_checkpoint("resource_capture_complete");
                 Ok(ResourcePlanningView {
                     fence: Arc::new(()),
                     plan_hash: self.planning_plan_hash().clone(),
@@ -329,6 +397,7 @@ fn pending_zero_initializations(
     slices: &[LogicalBackingSliceAuthority],
     maximum_segments: usize,
     budget: &mut dyn ResourcePlanningBudget,
+    restore_pending: &mut bool,
 ) -> Result<Option<Arc<[PendingZeroInitialization]>>, ResourcePlanningUnknown> {
     use super::super::backing_initialization::order::{InitializationOrder, InitializationRanges};
     let mut ordering = InitializationOrder::new();
@@ -342,7 +411,10 @@ fn pending_zero_initializations(
             return Ok(None);
         };
         match cell.status() {
-            Ok(BackingInitializationStatus::Initialized) => continue,
+            Ok(BackingInitializationStatus::Initialized) => {
+                *restore_pending = false;
+                continue;
+            }
             Ok(BackingInitializationStatus::Pending) => {}
             _ => return Ok(None),
         }
@@ -364,6 +436,7 @@ fn pending_zero_initializations(
         poll(budget)?;
         let mut seen = InitializationRanges::new();
         let mut bytes = Vec::new();
+        let mut resources = Vec::new();
         for slice in ordered_slices {
             for segment in slice.evidence().segments() {
                 poll(budget)?;
@@ -372,6 +445,7 @@ fn pending_zero_initializations(
                         .try_reserve(1)
                         .map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
                     bytes.push(segment.length_bytes());
+                    resources.push(slice.resource_id().clone());
                 }
             }
         }
@@ -381,6 +455,7 @@ fn pending_zero_initializations(
         claims.push(PendingZeroInitialization {
             target_fingerprint: Arc::from(cell.target_fingerprint()),
             transfer_bytes: bytes.into(),
+            transfer_resources: resources.into(),
         });
     }
     Ok(Some(claims.into()))

@@ -1,6 +1,19 @@
 use super::*;
 use std::ops::Range;
 
+struct ActualSampleGateNoTiming;
+impl DeviceSubmissionTimingSink for ActualSampleGateNoTiming {
+    const ENABLED: bool = false;
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {
+        panic!("actual-sample qualification must not enable device timing")
+    }
+}
+impl SubmissionWaveDispatchTimingSink for ActualSampleGateNoTiming {
+    fn record(&self, _: SubmissionWaveDispatchStage, _: std::time::Duration) {
+        panic!("actual-sample qualification must not enable host timing")
+    }
+}
+
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 #[path = "guarded_cost_route.rs"]
 mod guarded_cost_route;
@@ -610,6 +623,31 @@ impl Fixture {
         selected_replay: bool,
         output_node: &str,
     ) -> Option<Observation> {
+        self.execute_checked_output_node_with_sample_demand(
+            session,
+            tokens,
+            range,
+            replay,
+            expect_failure,
+            selected_replay,
+            output_node,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_checked_output_node_with_sample_demand(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+        replay: bool,
+        expect_failure: bool,
+        selected_replay: bool,
+        output_node: &str,
+        structured_sample: Option<ferrum_interfaces::execution_cost::StructuredCostSampleDemand>,
+    ) -> Option<Observation> {
+        assert!(structured_sample.is_none() || selected_replay);
         let catalog = replay.then(|| self.lane.reusable_execution_catalog().unwrap());
         let span = token_span(Arc::clone(&tokens), range.clone());
         let batch = ExecutionBatchParticipants::new(vec![Arc::clone(session)]).unwrap();
@@ -849,7 +887,7 @@ impl Fixture {
             );
             #[cfg(feature = "cuda")]
             if selected_replay && output_node.id().as_str() == "node.ffn" {
-                gdn_selected_replay::submit_for_nodes(
+                gdn_selected_replay::submit_for_nodes_with_demand(
                     self,
                     executable,
                     &identity,
@@ -859,9 +897,10 @@ impl Fixture {
                     wave,
                     range.clone(),
                     &["node.ffn"],
+                    structured_sample.unwrap_or_default(),
                 )
             } else if selected_replay {
-                gdn_selected_replay::submit(
+                gdn_selected_replay::submit_for_nodes_with_demand(
                     self,
                     executable,
                     &identity,
@@ -870,6 +909,8 @@ impl Fixture {
                     program,
                     wave,
                     range.clone(),
+                    &["node.embedding", "node.attention"],
+                    structured_sample.unwrap_or_default(),
                 )
             } else {
                 OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
@@ -904,6 +945,45 @@ impl Fixture {
                 )
                 .unwrap()
             }
+        } else if let Some(demand) = structured_sample {
+            #[cfg(all(feature = "metal", target_os = "macos", not(feature = "cuda")))]
+            let predicted = gated_delta_cost_route::predict_sample_demand(self, &range);
+            let (handle, attribution) =
+                OperationDispatch::encode_and_submit_wave_with_cost_evidence_demand(
+                    self.providers.providers(),
+                    executable,
+                    &identity,
+                    std::iter::once(&active),
+                    DeviceTimingMode::Off,
+                    &[input],
+                    SubmissionExecutionPolicy::default(),
+                    None,
+                    true,
+                    ferrum_interfaces::vnext::DeviceCostObservationDemand::Required,
+                    demand,
+                    &ActualSampleGateNoTiming,
+                    wave,
+                    &self.lane,
+                    &self.reaper,
+                )
+                .unwrap()
+                .into_parts();
+            #[cfg(all(feature = "metal", target_os = "macos", not(feature = "cuda")))]
+            {
+                assert!(matches!(
+                    handle.wait().unwrap(),
+                    CompletionObservation::Terminal(_)
+                ));
+                gated_delta_cost_route::assert_sample_demand_actual(
+                    predicted,
+                    attribution
+                        .as_ref()
+                        .expect("Metal eager logical attribution"),
+                );
+            }
+            #[cfg(not(all(feature = "metal", target_os = "macos", not(feature = "cuda"))))]
+            let _ = attribution;
+            handle
         } else {
             OperationDispatch::encode_and_submit_wave_with_inputs(
                 self.providers.providers(),
@@ -1045,6 +1125,7 @@ impl Fixture {
                 format!("CapacityMaintenance({reason:?})")
             }
             NativeCheckpointStart::NotSubmitted(error) => format!("NotSubmitted({error})"),
+            NativeCheckpointStart::GuardRejected(reason) => format!("GuardRejected({reason:?})"),
             NativeCheckpointStart::Submitted(_) => "Submitted".to_owned(),
             NativeCheckpointStart::Indeterminate(_) => "Indeterminate".to_owned(),
             NativeCheckpointStart::ContractAfterSubmission { error, .. } => {

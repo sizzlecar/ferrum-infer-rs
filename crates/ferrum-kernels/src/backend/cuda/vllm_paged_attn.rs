@@ -185,10 +185,10 @@ pub(crate) enum VnextAddressedPagedAttentionKernel {
 
 impl VnextAddressedPagedAttentionKernel {
     pub(crate) fn for_sequence_length(sequence_tokens: u64) -> Self {
-        if sequence_tokens <= VNEXT_VLLM_PARTITION_TOKENS {
-            Self::V1
-        } else {
-            Self::V2
+        use crate::backend::causal_attention_selector::{native_decode_kernel, NativeDecodeKernel};
+        match native_decode_kernel(sequence_tokens) {
+            NativeDecodeKernel::V1 => Self::V1,
+            NativeDecodeKernel::V2 => Self::V2,
         }
     }
 

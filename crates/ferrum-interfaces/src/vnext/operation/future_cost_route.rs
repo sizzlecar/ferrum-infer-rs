@@ -3,13 +3,17 @@
 use crate::execution_cost::{
     ActualRowWork, ActualWaveKind, CanonicalWaveCostShape, HostCostFeaturesV1,
 };
-use crate::model_executor::LogitsReturnPolicy;
+use crate::model_executor::{LogitsReturnPolicy, TokenSelectionMask};
 use crate::vnext::{ResourcePlanningState, ResourcePlanningUnknown, ResourcePlanningView};
 use std::sync::Arc;
 
+mod checkpoint;
 mod core;
+pub use checkpoint::*;
 mod host_content;
 mod masks;
+mod repetition;
+pub use repetition::FutureRepetitionRangeV3;
 mod state_equivalence;
 mod uploads;
 pub use core::{append_complete_eager_cost_route, EagerCoreWaveCostQuery};
@@ -50,6 +54,9 @@ pub enum ExecutionCostRouteUnknown {
     StaleView,
     Resource(ResourcePlanningUnknown),
     ExecutionPolicy,
+    /// An explicitly on-demand graph stream lacks the required resident
+    /// program. Only a fresh capture after real preparation can establish it.
+    OnDemandResidentProgram,
     ProviderRoute,
     CoreLayout,
     InitializationState,
@@ -65,8 +72,19 @@ pub enum ExecutionCostRouteAvailability<T> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum FutureCostOutput<'a> {
-    Prefill { final_logits: bool },
-    Decode { policy: &'a LogitsReturnPolicy },
+    Prefill {
+        final_logits: bool,
+    },
+    Decode {
+        policy: &'a LogitsReturnPolicy,
+    },
+    /// A hypothetical future workload, never an executable sampling policy.
+    /// The actual first-wave guard only accepts Decode with real token IDs.
+    ProjectedGreedy {
+        token_mask: Option<&'a TokenSelectionMask>,
+        repetition: FutureRepetitionRangeV3,
+        repetition_penalty: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,13 +115,15 @@ pub struct ExecutionCostRouteView {
     pub(crate) lane_id: crate::vnext::ExecutionLaneId,
     pub(crate) token_masks: Option<ProductTokenMaskResidencySnapshot>,
     pub(crate) graph_stream_state: Option<crate::vnext::DeviceCostGraphStreamState>,
-    pub(crate) graph_catalog: Option<Arc<crate::vnext::DeviceCostGraphCatalog>>,
+    pub(crate) graph_catalog: Option<crate::vnext::DeviceCostGraphCatalogSnapshot>,
 }
 
 impl ExecutionCostRouteView {
     /// Bounded numeric inventory under the same live lane/resource fence.
     pub fn graph_catalog(&self) -> Option<&crate::vnext::DeviceCostGraphCatalog> {
-        self.graph_catalog.as_deref()
+        self.graph_catalog
+            .as_ref()
+            .map(|snapshot| snapshot.catalog())
     }
 
     /// Passive capture mode shares the same numeric epoch and resource authority.

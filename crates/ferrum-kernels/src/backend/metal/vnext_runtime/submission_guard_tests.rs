@@ -27,6 +27,15 @@ impl DeviceSubmissionGuard for Guard {
 
 #[test]
 fn guarded_native_encode_rejection_keeps_zero_commits_and_lane_reusable() {
+    guarded_native_encode_rejection_and_retry(DeviceTimingMode::Off);
+}
+
+#[test]
+fn guarded_native_completion_timing_keeps_zero_rejected_commits_and_measures_retry() {
+    guarded_native_encode_rejection_and_retry(DeviceTimingMode::Completion);
+}
+
+fn guarded_native_encode_rejection_and_retry(timing_mode: DeviceTimingMode) {
     let runtime = tests::runtime();
     let buffer = runtime
         .allocate_request(&tests::buffer_request("guarded.destination"))
@@ -55,8 +64,9 @@ fn guarded_native_encode_rejection_keeps_zero_commits_and_lane_reusable() {
     let result = runtime.submit_commands_inner(
         &mut stream,
         vec![(DeviceCommandPhase::Initialization, None, command)],
-        DeviceTimingMode::Off,
+        timing_mode,
         true,
+        DeviceCostObservationDemand::Required,
         &DisabledDeviceSubmissionTimingSink,
         Some(&rejected),
     );
@@ -92,18 +102,31 @@ fn guarded_native_encode_rejection_keeps_zero_commits_and_lane_reusable() {
         .submit_commands_inner(
             &mut stream,
             vec![(DeviceCommandPhase::Initialization, None, command)],
-            DeviceTimingMode::Off,
+            timing_mode,
             true,
+            DeviceCostObservationDemand::Required,
             &DisabledDeviceSubmissionTimingSink,
             Some(&accepted),
         )
         .unwrap();
     assert_eq!(accepted.calls.load(Ordering::Relaxed), 1);
-    assert!(runtime
-        .wait_fence(&fence)
-        .unwrap()
-        .terminal()
-        .is_succeeded());
+    let terminal = runtime.wait_fence(&fence).unwrap();
+    assert!(terminal.terminal().is_succeeded());
+    match timing_mode {
+        DeviceTimingMode::Completion => assert!(matches!(
+            terminal.execution_timing(),
+            DeviceTimingMeasurement::Measured(_)
+        )),
+        DeviceTimingMode::Off => assert!(matches!(
+            terminal.execution_timing(),
+            DeviceTimingMeasurement::NotRequested
+        )),
+        _ => unreachable!(),
+    }
+    assert!(matches!(
+        terminal.submission_timing(),
+        DeviceTimingMeasurement::NotRequested
+    ));
     assert_eq!(
         runtime
             .readback(

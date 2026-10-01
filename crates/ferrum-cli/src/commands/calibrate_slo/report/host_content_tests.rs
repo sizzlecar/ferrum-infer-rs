@@ -11,7 +11,28 @@ use ferrum_scheduler::implementations::continuous::cost_model::*;
 use ferrum_types::{FinishReason, RequestId};
 use std::num::{NonZeroU32, NonZeroUsize};
 
-fn terminal() -> HostStageEvidenceV1 {
+struct HostContentFixture {
+    schema_version: u32,
+    fingerprint: Option<ExecutionFingerprint>,
+    actual_shape: Option<WaveExecutionShape>,
+    rows: Vec<HostRowStageV1>,
+    finalized_at_ns: Option<u64>,
+    full_wall_ns: Option<u64>,
+    completeness: HostStageCompleteness,
+}
+impl HostContentFixture {
+    fn view(&self) -> HostContentView<'_> {
+        HostContentView {
+            schema_version: self.schema_version,
+            completeness: self.completeness,
+            has_rows: !self.rows.is_empty(),
+            full_wall_ns: self.full_wall_ns,
+            actual_shape: self.actual_shape.as_ref(),
+        }
+    }
+}
+
+fn terminal() -> HostContentFixture {
     let shape = WaveExecutionShape {
         kind: WaveKind::Decode,
         path: WaveExecutionPath::PlanRuntime,
@@ -44,13 +65,8 @@ fn terminal() -> HostStageEvidenceV1 {
             }],
         }),
     };
-    HostStageEvidenceV1 {
-        presubmit_prediction: None,
-        prospective_capture: None,
-        statistical_evidence: None,
-        structured_evidence: None,
+    HostContentFixture {
         schema_version: 1,
-        call_id: 1,
         fingerprint: Some(ExecutionFingerprint {
             model_weights: [1; 32],
             numerical_policy: [2; 32],
@@ -58,8 +74,6 @@ fn terminal() -> HostStageEvidenceV1 {
             execution_config: [4; 32],
         }),
         actual_shape: Some(shape),
-        prepare_started_at_ns: Some(100),
-        executor_returned_at_ns: Some(110),
         rows: vec![HostRowStageV1 {
             request_id: RequestId::new(),
             owner_incarnation: 1,
@@ -138,25 +152,26 @@ fn v2_terminal_predictions_require_real_v2_rows_without_filling_legacy_evidence(
         .unwrap();
     let model = trainer.publish(201).unwrap();
     let mut totals = Summary::default();
-    let result = host_content_prediction(Some(&stages), "test_snapshot", &mut totals, |query| {
-        assert!(
-            query.host_content_features.is_none(),
-            "CLI invented old host identity"
-        );
-        Ok(Some(model.predict(
-            &fingerprint,
-            query,
-            model.planning_boundary(),
-            201,
-        )))
-    })
-    .unwrap();
+    let result =
+        host_content_prediction(Some(stages.view()), "test_snapshot", &mut totals, |query| {
+            assert!(
+                query.host_content_features.is_none(),
+                "CLI invented old host identity"
+            );
+            Ok(Some(model.predict(
+                &fingerprint,
+                query,
+                model.planning_boundary(),
+                201,
+            )))
+        })
+        .unwrap();
     assert_eq!(result["kind"], "known");
     assert_eq!(result["observed_row_multiset_schema"], 2);
     // An old complete terminal has legitimate V1 evidence, but the V2 model
     // must return Unknown rather than deriving absent row classes from its SHA.
     let old = terminal();
-    let result = host_content_prediction(Some(&old), "test_snapshot", &mut totals, |query| {
+    let result = host_content_prediction(Some(old.view()), "test_snapshot", &mut totals, |query| {
         Ok(Some(model.predict(
             &fingerprint,
             query,
@@ -214,16 +229,17 @@ fn terminal_validation_uses_real_model_boundary_and_separate_complete_wall_denom
     stages.finalized_at_ns = Some(351);
     stages.full_wall_ns = Some(250);
     let mut totals = Summary::default();
-    let result = host_content_prediction(Some(&stages), "live_frozen", &mut totals, |query| {
-        assert_eq!(query, &shape);
-        Ok(Some(model.predict(
-            &fingerprint,
-            query,
-            model.planning_boundary(),
-            351,
-        )))
-    })
-    .unwrap();
+    let result =
+        host_content_prediction(Some(stages.view()), "live_frozen", &mut totals, |query| {
+            assert_eq!(query, &shape);
+            Ok(Some(model.predict(
+                &fingerprint,
+                query,
+                model.planning_boundary(),
+                351,
+            )))
+        })
+        .unwrap();
     assert_eq!(result["kind"], "known");
     assert_eq!(result["actual_wall_ns"], 250);
     assert_eq!(result["underestimate_ns"], 150);
@@ -233,7 +249,7 @@ fn terminal_validation_uses_real_model_boundary_and_separate_complete_wall_denom
     assert_eq!(totals.validation_unknown, 0);
 
     stages.completeness = HostStageCompleteness::Failed;
-    host_content_prediction(Some(&stages), "live_frozen", &mut totals, |_| {
+    host_content_prediction(Some(stages.view()), "live_frozen", &mut totals, |_| {
         panic!("failed terminal cannot query a successful cost")
     })
     .unwrap();

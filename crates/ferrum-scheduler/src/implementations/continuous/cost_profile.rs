@@ -831,11 +831,57 @@ mod tests;
 
 mod structured_v10;
 pub use structured_v10::{
-    export_structured_profile_v10, export_structured_profile_v11, export_structured_profile_v12,
+    diagnose_structured_service_owners_v6, export_structured_profile_v10,
+    export_structured_profile_v11, export_structured_profile_v12, export_structured_profile_v13,
     load_structured_profile_v10, load_structured_profile_v11, load_structured_profile_v12,
-    structured_prefix_source_header_v5, structured_shared_source_header_v4,
-    ImportedStructuredCatalogV11, ImportedStructuredCatalogV12, ImportedStructuredModelV2,
-    StructuredImportProvenanceV10, StructuredPhaseProvenanceV10, StructuredProfileExportReceiptV10,
-    StructuredProfileExportReceiptV11, StructuredProfileExportReceiptV12,
-    StructuredProfilePhaseV10, COST_PROFILE_SCHEMA_VERSION_V10,
+    load_structured_profile_v13, structured_prefix_source_header_v5,
+    structured_shared_source_header_v4, ImportedStructuredCatalogV11, ImportedStructuredCatalogV12,
+    ImportedStructuredCatalogV13, ImportedStructuredModelV2, StructuredImportProvenanceV10,
+    StructuredOutsideOwnerDiagnosticV1, StructuredOwnerDifferenceV1,
+    StructuredOwnerReplayFailureV1, StructuredPhaseProvenanceV10,
+    StructuredProfileExportReceiptV10, StructuredProfileExportReceiptV11,
+    StructuredProfileExportReceiptV12, StructuredProfileExportReceiptV13,
+    StructuredProfilePhaseV10, StructuredServiceChildFreezeV6, StructuredServiceClockV6,
+    StructuredServiceCollectorV6, StructuredServiceDeclarationV6, StructuredServiceHeaderV6,
+    StructuredServiceNoSubmissionV6, StructuredServiceOutsideRouteV6,
+    StructuredServiceOwnerDiagnosticV1, StructuredServiceRecordV6, StructuredServiceRouteCountsV1,
+    StructuredServiceWaveV6, COST_PROFILE_SCHEMA_VERSION_V10, SERVICE_SOURCE_PROTOCOL_V6,
 };
+
+// Owner-block populations have independent source/profile schemas.
+pub use structured_v10::{
+    export_structured_profile_v14, export_structured_profile_v14_same_boot,
+    export_structured_profile_v14_same_boot_selected,
+    export_structured_profile_v14_same_boot_selected_from_original_bytes,
+    load_structured_profile_v14, load_structured_profile_v14_same_boot,
+    load_structured_profile_v14_same_boot_selected,
+    load_structured_profile_v14_same_boot_selected_from_original_bytes,
+    replay_structured_source_v7, ImportedStructuredCatalogV14, StructuredOwnerAssignmentV7,
+    StructuredOwnerAuditV7, StructuredOwnerDiscoveryV7, StructuredOwnerFreezeV7,
+    StructuredProfileExportReceiptV14, StructuredServiceAuditV7, StructuredServiceCheckpointV7,
+    StructuredServiceClockV7, StructuredServiceCollectorV7, StructuredServiceDeclarationV7,
+    StructuredServiceHeaderV7, StructuredServiceNoSubmissionV7, StructuredServiceOutsideRouteV7,
+    StructuredServiceRecordV7, StructuredServiceWaveV7, SERVICE_SOURCE_PROTOCOL_V7,
+};
+
+pub use structured_v10::{canonical_value_v7, record_bytes_v7, StructuredSourceRecordSinkV1};
+
+pub use structured_v10::{
+    export_structured_profile_v15, export_structured_profile_v15_same_boot,
+    export_structured_profile_v15_same_boot_selected,
+    export_structured_profile_v15_same_boot_selected_from_original_bytes,
+    load_structured_profile_v15, load_structured_profile_v15_same_boot,
+    load_structured_profile_v15_same_boot_selected,
+    load_structured_profile_v15_same_boot_selected_from_original_bytes,
+    replay_structured_source_v8, ImportedPreparedOwnerBlockCatalogV15, StructuredCohortEventV8,
+    StructuredNativePrefixAcquisitionCohortV1, StructuredNativePrefixAcquisitionPlanV1,
+    StructuredNativePrefixScopeV1, StructuredPreparationEventV8,
+    StructuredPreparedCohortPhasePolicyV8, StructuredPreparedOwnerBlockAuditV8,
+    StructuredPreparedOwnerBlockCheckpointV8, StructuredPreparedOwnerBlockCollectorV8,
+    StructuredPreparedOwnerBlockDeclarationV8, StructuredPreparedOwnerBlockHeaderV8,
+    StructuredPreparedOwnerBlockRecordV8, StructuredProfileExportReceiptV15,
+    PREPARED_OWNER_BLOCK_SOURCE_PROTOCOL_V8,
+};
+
+/// Original profile14/profile15 encoder bound, independent of journal bytes.
+pub use structured_v10::structured_owner_block_metadata_maximum_bytes;

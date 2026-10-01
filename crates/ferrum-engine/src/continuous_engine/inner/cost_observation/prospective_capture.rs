@@ -1,18 +1,23 @@
 //! Prospective, witness-only capture. Frozen before input preparation and
 //! reconciled with the original private host settlement. No source3 session,
 //! cohort/phase assignment, fit input, TTL refresh or execution authority.
-use super::profile::EngineCostSnapshot;
 use super::*;
 use ferrum_interfaces::execution_cost::{ExpectedExecutionWave, HostTerminalExpectationV1};
-use ferrum_scheduler::implementations::continuous::{
-    cost_model::structured_v2::StructuredQueryV2,
-    slo_planner::{SchedulerSnapshot, SelectedWave},
-};
+#[cfg(test)]
+use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredQueryV2;
+use ferrum_scheduler::implementations::continuous::slo_planner::{SchedulerSnapshot, SelectedWave};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     OnceLock,
 };
 use std::time::Instant;
+mod issued;
+pub(super) use issued::{IssuedPredictionAudit, IssuedPredictionAuditSnapshot};
+
+struct IssuedPrediction {
+    planning_ns: u64,
+    audit: Arc<IssuedPredictionAudit>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +77,10 @@ pub struct ProspectiveCaptureReceiptV1 {
     declared_at_ns: u64,
     call_id: u64,
     outcome: ProspectiveCaptureOutcomeV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issued_planning_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_full_wall_ns: Option<u64>,
     #[serde(skip)]
     settlement_binding: Option<[u8; 32]>,
 }
@@ -142,12 +151,14 @@ pub(in crate::continuous_engine::inner) struct ProspectiveCapture {
     exact: Arc<CanonicalWaveCostShape>,
     selected: Arc<StatisticalWaveEvidenceV1>,
     participants: Vec<CostObservationParticipant>,
-    baseline: Arc<EngineCostSnapshot>,
+    baseline: super::profile::ProspectiveIdentity,
     source: SourceIdentity,
     epoch: u64,
     declared_at_ns: u64,
     valid_until: Instant,
     audit: Arc<CaptureAudit>,
+    issued_prediction: Option<IssuedPrediction>,
+    issued_recorded: AtomicBool,
     claimed: AtomicBool,
     outcome: AtomicU8,
     receipt: OnceLock<ProspectiveCaptureReceiptV1>,
@@ -156,6 +167,32 @@ pub(in crate::continuous_engine::inner) struct ProspectiveCapture {
     before_finish: parking_lot::Mutex<Option<Box<dyn FnOnce(ProspectiveCaptureOutcomeV1) + Send>>>,
 }
 impl ProspectiveCapture {
+    pub(super) fn retained_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<CaptureAudit>())?
+            .checked_add(if self.issued_prediction.is_some() {
+                // Include both audit Arcs conservatively even when their population is shared.
+                std::mem::size_of::<IssuedPredictionAudit>()
+                    + std::mem::size_of::<CaptureAudit>()
+                    + 4 * std::mem::size_of::<usize>()
+            } else {
+                0
+            })?
+            .checked_add(super::sealed::canonical_retained_bytes(&self.exact)?)?
+            .checked_add(std::mem::size_of::<StatisticalWaveEvidenceV1>())?
+            .checked_add(
+                self.participants
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<CostObservationParticipant>())?,
+            )?
+            .checked_add(
+                match self.selected.structured_capture().and_then(Result::ok) {
+                    Some(recipe) => recipe.retained_bytes().ok()?,
+                    None => 0,
+                },
+            )?
+            .checked_add(8 * std::mem::size_of::<usize>() + 4 * std::mem::size_of::<AtomicU64>())
+    }
     #[cfg(test)]
     pub(super) fn before_receipt_finish_for_test(
         &self,
@@ -179,18 +216,31 @@ impl ProspectiveCapture {
         baseline
             .audit_structured_query_v2(query, runtime.clock.now_ns().unwrap())
             .unwrap();
-        let audit = runtime.prospective_capture.as_ref().unwrap().clone();
+        let audit = runtime
+            .prospective_capture
+            .clone()
+            .or_else(|| {
+                runtime
+                    .issued_structured_prediction
+                    .as_ref()
+                    .map(|a| a.population.clone())
+            })
+            .unwrap();
         audit.add(&audit.declared);
         Arc::new(Self {
             source: baseline.prospective_source(query).unwrap(),
             epoch: baseline.model_version(),
-            baseline,
+            baseline: baseline
+                .prospective_identity()
+                .expect("validated structured snapshot"),
             exact: Arc::new(exact),
             selected: Arc::new(selected),
             participants,
             declared_at_ns: runtime.clock.now_ns().unwrap(),
             valid_until,
             audit,
+            issued_prediction: None,
+            issued_recorded: AtomicBool::new(false),
             claimed: AtomicBool::new(false),
             outcome: AtomicU8::new(0),
             receipt: OnceLock::new(),
@@ -198,6 +248,49 @@ impl ProspectiveCapture {
             #[cfg(test)]
             before_finish: parking_lot::Mutex::new(None),
         })
+    }
+    #[cfg(test)]
+    pub(super) fn with_issued_bound_for_test(
+        mut self: Arc<Self>,
+        runtime: &EngineCostRuntime,
+        planning_ns: u64,
+    ) -> Arc<Self> {
+        let this = Arc::get_mut(&mut self).expect("unshared fixture declaration");
+        let audit = runtime
+            .issued_structured_prediction
+            .as_ref()
+            .unwrap()
+            .clone();
+        if !Arc::ptr_eq(&this.audit, &audit.population) {
+            audit.population.add(&audit.population.declared);
+        }
+        this.issued_prediction = Some(IssuedPrediction { planning_ns, audit });
+        self
+    }
+    fn each_audit(&self, visit: impl Fn(&CaptureAudit)) {
+        visit(&self.audit);
+        if let Some(issued) = &self.issued_prediction {
+            if !Arc::ptr_eq(&self.audit, &issued.audit.population) {
+                visit(&issued.audit.population);
+            }
+        }
+    }
+    /// Sole original resolver calls this only after its final retention check.
+    /// Do not re-query the current model: an update cannot replace the issued bound.
+    pub(super) fn record_issued_settlement(&self, ordinal: u64) {
+        let Some(issued) = &self.issued_prediction else {
+            return;
+        };
+        let Some(receipt) = self
+            .receipt
+            .get()
+            .filter(|r| r.outcome == ProspectiveCaptureOutcomeV1::Matched)
+        else {
+            return;
+        };
+        if !self.issued_recorded.swap(true, Ordering::AcqRel) {
+            issued.audit.record(ordinal, receipt);
+        }
     }
     pub(in crate::continuous_engine::inner) fn not_submitted(&self, now: Instant) {
         self.finish(if now > self.valid_until {
@@ -214,7 +307,7 @@ impl ProspectiveCapture {
             .compare_exchange(0, outcome as u8, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
-                self.audit.outcome(outcome);
+                self.each_audit(|audit| audit.outcome(outcome));
                 outcome
             }
             // The declaration has one winning terminal result, even when a
@@ -254,8 +347,9 @@ impl ProspectiveCapture {
     pub(super) fn receipt(
         &self,
         actual: &ActualWaveShape,
-        stages: &HostStageEvidenceV1,
+        original: host_stages::OriginalHostStages<'_>,
     ) -> ProspectiveCaptureReceiptV1 {
+        let stages = original.get();
         self.receipt
             .get_or_init(|| {
                 let proposed = self.reconcile(actual, stages);
@@ -272,6 +366,11 @@ impl ProspectiveCapture {
                     declared_at_ns: self.declared_at_ns,
                     call_id: stages.call_id,
                     outcome,
+                    issued_planning_ns: self
+                        .issued_prediction
+                        .as_ref()
+                        .map(|issued| issued.planning_ns),
+                    actual_full_wall_ns: self.issued_prediction.as_ref().and(stages.full_wall_ns),
                     settlement_binding: stages
                         .structured_evidence
                         .as_ref()
@@ -293,7 +392,10 @@ impl ProspectiveCapture {
         let Some(Ok(settled)) = &stages.structured_evidence else {
             return O::SettlementRejected;
         };
-        if settled.validate_host_stages(stages).is_err()
+        // receipt only accepts the original producer's private borrow, immediately
+        // after qualification. Do not serialize/hash the same host stages again.
+        if stages.completeness != HostStageCompleteness::CompleteSingleWave
+            || stages.full_wall_ns != Some(settled.full_wall_ns())
             || stages.fingerprint.as_ref() != Some(self.baseline.fingerprint())
         {
             return O::SettlementRejected;
@@ -339,12 +441,19 @@ impl ProspectiveCapture {
         }
         O::Matched
     }
+    pub(super) fn abandon_unresolved(&self) {
+        self.finish(ProspectiveCaptureOutcomeV1::Abandoned);
+    }
     pub(super) fn queue_result(&self, result: &Result<u64, CostSampleDrop>) {
-        if self.receipt.get().is_some() && !self.queue_recorded.swap(true, Ordering::AcqRel) {
-            self.audit.add(if result.is_ok() {
-                &self.audit.queued
-            } else {
-                &self.audit.queue_dropped
+        // FIFO acceptance/loss is independent of later actual matching. A raw
+        // drop cannot project a receipt or be silently omitted from this count.
+        if !self.queue_recorded.swap(true, Ordering::AcqRel) {
+            self.each_audit(|audit| {
+                audit.add(if result.is_ok() {
+                    &audit.queued
+                } else {
+                    &audit.queue_dropped
+                })
             });
         }
     }
@@ -352,6 +461,13 @@ impl ProspectiveCapture {
 impl Drop for ProspectiveCapture {
     fn drop(&mut self) {
         self.finish(ProspectiveCaptureOutcomeV1::Abandoned);
+        if self.outcome.load(Ordering::Acquire) == ProspectiveCaptureOutcomeV1::Matched as u8
+            && !self.issued_recorded.load(Ordering::Acquire)
+        {
+            if let Some(issued) = &self.issued_prediction {
+                issued.audit.not_retained();
+            }
+        }
     }
 }
 
@@ -365,8 +481,16 @@ impl EngineCostRuntime {
         expected: &ExpectedExecutionWave,
         valid_until: Instant,
     ) -> Option<Arc<ProspectiveCapture>> {
-        let audit = self.prospective_capture.as_ref()?;
+        let audit = self.prospective_capture.clone().or_else(|| {
+            self.issued_structured_prediction
+                .as_ref()
+                .map(|a| a.population.clone())
+        })?;
         audit.add(&audit.declared);
+        let issued_audit = self.issued_structured_prediction.as_ref();
+        if let Some(issued) = issued_audit.filter(|a| !Arc::ptr_eq(&audit, &a.population)) {
+            issued.population.add(&issued.population.declared);
+        }
         let attempt = (|| {
             let (exact, statistics, query) =
                 selected
@@ -402,11 +526,18 @@ impl EngineCostRuntime {
                 selected: statistics.clone(),
                 participants,
                 epoch: selected.cost_model_version,
-                baseline,
+                baseline: baseline
+                    .prospective_identity()
+                    .expect("validated structured snapshot"),
                 source,
                 declared_at_ns,
                 valid_until,
                 audit: audit.clone(),
+                issued_prediction: issued_audit.map(|audit| IssuedPrediction {
+                    planning_ns: selected.predicted_wall_ns,
+                    audit: audit.clone(),
+                }),
+                issued_recorded: AtomicBool::new(false),
                 claimed: AtomicBool::new(false),
                 outcome: AtomicU8::new(0),
                 receipt: OnceLock::new(),
@@ -419,6 +550,9 @@ impl EngineCostRuntime {
             Ok(value) => Some(value),
             Err(reason) => {
                 audit.outcome(reason);
+                if let Some(issued) = issued_audit.filter(|a| !Arc::ptr_eq(&audit, &a.population)) {
+                    issued.population.outcome(reason);
+                }
                 None
             }
         }

@@ -2,6 +2,8 @@
 
 use clap::ValueEnum;
 
+mod automatic_cost_probe;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PrefillDecodeExecutionArg {
     Split,
@@ -93,9 +95,9 @@ mod tests {
     }
 
     #[test]
-    fn basic_metrics_only_cli_configuration_matches_run_and_serve() {
+    fn host_and_basic_metrics_only_cli_configuration_matches_run_and_serve() {
         for command in ["run", "serve"] {
-            for detail in ["off", "basic", "latency", "full"] {
+            for detail in ["off", "basic", "host", "latency", "full"] {
                 let parsed = TestCli::try_parse_from([
                     "ferrum",
                     command,
@@ -130,10 +132,11 @@ mod tests {
                         )
                     }
                 };
-                assert_eq!(config.metrics_only(), detail == "basic");
+                assert_eq!(config.profile_detail.as_str(), detail);
+                assert_eq!(config.metrics_only(), matches!(detail, "basic" | "host"));
                 assert_eq!(
                     config.core.validate().is_ok(),
-                    matches!(detail, "off" | "basic")
+                    matches!(detail, "off" | "basic" | "host")
                 );
             }
         }

@@ -12,9 +12,41 @@ fn flat(elements: u64, label: &'static str) -> Result<LaunchConfig, CudaDeviceRu
 pub(super) fn rms(tokens: u64, hidden: i32) -> Result<LaunchConfig, CudaDeviceRuntimeError> {
     Ok(LaunchConfig {
         grid_dim: (checked_u32(tokens, "attention RMSNorm rows")?, 1, 1),
-        block_dim: (super::super::rms_norm_threads(hidden), 1, 1),
+        block_dim: rms_block(hidden),
         shared_mem_bytes: 0,
     })
+}
+
+pub(super) fn rms_block(hidden: i32) -> (u32, u32, u32) {
+    (super::super::rms_norm_threads(hidden), 1, 1)
+}
+
+pub(super) fn qk_block(shape: CudaAttentionShape) -> (u32, u32, u32) {
+    (
+        (shape.key_head_dim as u32).next_power_of_two().min(256),
+        1,
+        1,
+    )
+}
+
+pub(super) fn delta_block(shape: CudaAttentionShape) -> (u32, u32, u32) {
+    (
+        if shape.tiled_delta {
+            256
+        } else {
+            shape.value_head_dim.min(256) as u32
+        },
+        1,
+        1,
+    )
+}
+
+pub(super) fn gated_block(shape: CudaAttentionShape) -> (u32, u32, u32) {
+    (
+        (shape.value_head_dim as u32).next_power_of_two().min(256),
+        1,
+        1,
+    )
 }
 
 pub(super) fn prepare(
@@ -64,11 +96,7 @@ pub(super) fn qk(
         .ok_or_else(|| CudaDeviceRuntimeError::contract("attention QK rows overflow"))?;
     Ok(LaunchConfig {
         grid_dim: (checked_u32(rows, "attention QK rows")?, 1, 1),
-        block_dim: (
-            (shape.key_head_dim as u32).next_power_of_two().min(256),
-            1,
-            1,
-        ),
+        block_dim: qk_block(shape),
         shared_mem_bytes: 0,
     })
 }
@@ -103,15 +131,7 @@ pub(super) fn delta(
         } else {
             (shape.value_heads as u32, batch as u32, 1)
         },
-        block_dim: (
-            if shape.tiled_delta {
-                256
-            } else {
-                shape.value_head_dim.min(256) as u32
-            },
-            1,
-            1,
-        ),
+        block_dim: delta_block(shape),
         shared_mem_bytes: 0,
     })
 }
@@ -125,11 +145,7 @@ pub(super) fn gated(
         .ok_or_else(|| CudaDeviceRuntimeError::contract("attention gated rows overflow"))?;
     Ok(LaunchConfig {
         grid_dim: (checked_u32(rows, "attention gated rows")?, 1, 1),
-        block_dim: (
-            (shape.value_head_dim as u32).next_power_of_two().min(256),
-            1,
-            1,
-        ),
+        block_dim: gated_block(shape),
         shared_mem_bytes: 0,
     })
 }

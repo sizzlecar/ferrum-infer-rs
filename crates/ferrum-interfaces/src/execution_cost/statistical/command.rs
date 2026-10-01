@@ -40,6 +40,47 @@ impl PartialEq for SelectedCommandCostEvidenceV1 {
 }
 impl Eq for SelectedCommandCostEvidenceV1 {}
 impl SelectedCommandCostEvidenceV1 {
+    /// Capacity bound for the sparse table built by at most this many actual
+    /// kernel/API/transfer occurrences. The worker checks actual allocation
+    /// capacity against the reservation before retaining the result.
+    pub fn maximum_payload_bytes(command_occurrences: u64) -> Option<usize> {
+        let entries = usize::try_from(command_occurrences)
+            .ok()?
+            .min(MAX_COST_COMMANDS)
+            .checked_add(7)?
+            / 8
+            * 8;
+        std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<SelectedAlgorithmWorkEvidenceV1>())?
+            .checked_add(2 * std::mem::size_of::<usize>())?
+            .checked_add(
+                entries
+                    .min(MAX_COST_COMMANDS)
+                    .checked_mul(std::mem::size_of::<AlgorithmNumericWorkV1>())?,
+            )
+    }
+    /// CPU working payload for the common builder and its output. Includes
+    /// simultaneous old/new sparse table storage during growth and the row
+    /// digest array. Provider-specific temporary arrays must be added by the
+    /// template; this is not an allocator/RSS bound.
+    pub fn maximum_working_payload_bytes(command_occurrences: u64) -> Option<usize> {
+        let output = Self::maximum_payload_bytes(command_occurrences)?;
+        let independent_rows = usize::try_from(command_occurrences / 2)
+            .ok()?
+            .min(MAX_COST_ROWS);
+        output
+            .checked_mul(2)?
+            .checked_add(std::mem::size_of::<SelectedCommandCostBuilderV1>())?
+            .checked_add(independent_rows.checked_mul(std::mem::size_of::<[u8; 32]>())?)
+    }
+    /// CPU payload retained by this immutable evidence. This is not RSS or an
+    /// allocator-overhead estimate; shared tables are conservatively charged.
+    pub fn retained_payload_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>().checked_add(match &self.algorithm_work {
+            Some(Ok(work)) => work.retained_bytes().ok()?,
+            _ => 0,
+        })
+    }
     pub(super) fn replay_fixed_launch_signature(
         &self,
     ) -> Result<[u8; 32], StatisticalEvidenceUnknown> {
@@ -457,3 +498,7 @@ mod transfer_geometry_tests;
 #[cfg(test)]
 #[path = "command/binding_reuse_tests.rs"]
 mod binding_reuse_tests;
+
+#[cfg(test)]
+#[path = "command/working_payload_tests.rs"]
+mod working_payload_tests;

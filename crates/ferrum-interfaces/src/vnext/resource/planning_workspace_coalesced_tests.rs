@@ -91,6 +91,16 @@ fn planning_coalesced_invocation_workspace_keeps_distinct_projection_ranges() {
             AdmissionPressureAction::WaitForRelease,
         )
         .unwrap();
+    super::shared_capture::assert_compiled_layout_identity(
+        &requests,
+        AllocationLifetime::Invocation,
+        harness
+            .root
+            .dynamic_pools
+            .lane_stable_layouts
+            .get(Some(bucket.bucket_id()), AllocationLifetime::Invocation)
+            .unwrap(),
+    );
     let claim = || match harness
         .root
         .dynamic_pools

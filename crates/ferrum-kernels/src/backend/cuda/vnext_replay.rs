@@ -18,12 +18,14 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_interfaces::execution_cost::{SelectedReplayAlgorithmTemplateV1, MAX_COST_COMMANDS};
 use ferrum_interfaces::vnext::{
-    DeviceCommandPhase, DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
-    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
-    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
-    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
-    DeviceReusableExecutionSegment, DeviceTimingMode, ElementType,
+    DeviceCommandPhase, DeviceObservationPacket, DeviceObservationTemplate,
+    DeviceReplayedCommandCatalogue, DeviceReplayedLogicalCommandAttribution,
+    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionPreparationState, DeviceReusableExecutionProgram,
+    DeviceReusableExecutionProgramGap, DeviceReusableExecutionProgramGapReason,
+    DeviceReusableExecutionProgramId, DeviceReusableExecutionSegment, DeviceTimingMode,
+    ElementType,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,6 +36,10 @@ use crate::backend::reusable_execution::{
 
 use super::vnext_runtime::{CudaCommandExecutable, CudaDeviceCommand, CudaDeviceRuntimeError};
 use super::vnext_tool_correlation::correlate_replay_launch;
+
+mod cost_catalog_diagnostics;
+mod observation;
+mod prepared_catalog;
 
 const COMMAND_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.command-replay.v1\0";
 const SEGMENT_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.executable-segment.v1\0";
@@ -289,7 +295,7 @@ struct CudaExecutableSegment {
     command_graph_node_counts: Option<Arc<[u32]>>,
     // Sealed at actual successful capture, not reconstructed during register.
     selected_replay_templates: Option<Box<[Option<SelectedReplayAlgorithmTemplateV1>]>>,
-    selected_replay_recipes: Option<Box<[Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>]>>,
+    observation_template: Option<ferrum_interfaces::vnext::RetainedDeviceObservationTemplate>,
     uploaded: bool,
     last_used: u64,
     profile_identity: OnceLock<CudaExecutableProfileIdentity>,
@@ -767,57 +773,28 @@ impl CudaExecutableSegment {
             _blas: Arc::clone(blas),
             _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
             command_graph_node_counts,
-            selected_replay_recipes: (commands.len() <= MAX_COST_COMMANDS
-                && commands
-                    .iter()
-                    .any(|command| command.replay_cost_recipe().is_some()))
-            .then(|| {
-                commands
-                    .iter()
-                    .map(|command| {
-                        command
-                            .cublas_cost_requirement()
-                            .matches_observed(blas_cost_identity)
-                            .then(|| command.replay_cost_recipe())
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice()
-            }),
-            selected_replay_templates: (commands.len() <= MAX_COST_COMMANDS
-                && commands
-                    .iter()
-                    .any(|command| command.selected_replay_template().is_some()))
-            .then(|| {
-                commands
-                    .iter()
-                    .map(|command| {
-                        command
-                            .cublas_cost_requirement()
-                            .matches_observed(blas_cost_identity)
-                            .then(|| command.selected_replay_template())
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice()
-            }),
+            observation_template: observation::SegmentObservation::new(
+                commands,
+                blas_cost_identity,
+            ),
+            selected_replay_templates: (commands.len() <= MAX_COST_COMMANDS)
+                .then(|| {
+                    commands
+                        .iter()
+                        .map(|command| {
+                            command
+                                .cublas_cost_requirement()
+                                .matches_observed(blas_cost_identity)
+                                .then(|| command.selected_replay_template())
+                                .flatten()
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                })
+                .filter(|templates| templates.iter().any(Option::is_some)),
             uploaded: false,
             last_used,
             profile_identity: OnceLock::new(),
-        })
-    }
-
-    fn bind_replay_cost(
-        &self,
-        invocation: &DeviceReusableExecutionInvocation,
-        sealed: &[ferrum_interfaces::vnext::DeviceReplayedLogicalCommandAttribution],
-    ) -> Option<Vec<ferrum_interfaces::vnext::DeviceReplayedLogicalCommandAttribution>> {
-        invocation.bind_replayed_cost_evidence_with(sealed, |ordinal, current| {
-            self.selected_replay_recipes
-                .as_deref()?
-                .get(ordinal as usize)?
-                .as_ref()?
-                .project(current)
         })
     }
 
@@ -908,6 +885,9 @@ pub(crate) struct CudaExecutableCache {
     preparation: ReusableExecutionPreparationTracker,
     warmup: DemandWarmup<CudaExecutableSegmentKey>,
     clock: u64,
+    // One numeric snapshot only. It holds no graph handles, buffers or leases.
+    cost_catalog: OnceLock<Arc<ferrum_interfaces::vnext::DeviceCostGraphCatalog>>,
+    prepared_catalog: prepared_catalog::PreparedCatalog,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -915,7 +895,7 @@ struct CudaExecutableProgramSegment {
     descriptor: DeviceReusableExecutionSegment,
     key: CudaExecutableSegmentKey,
     reusable_executable_fingerprint: Arc<str>,
-    logical_commands: Option<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
+    logical_commands: Option<Arc<DeviceReplayedCommandCatalogue>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -925,6 +905,27 @@ struct CudaExecutableProgram {
 }
 
 impl CudaExecutableProgram {
+    // Execution Eq deliberately omits passive cost sidecars. Reusing a numeric
+    // catalog requires the full metadata of every row, not execution Eq alone.
+    fn same_cost_catalog_metadata(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor
+            && self.segments.len() == other.segments.len()
+            && self.segments.iter().zip(&other.segments).all(|(a, b)| {
+                a.descriptor == b.descriptor
+                    && a.key == b.key
+                    && a.reusable_executable_fingerprint == b.reusable_executable_fingerprint
+                    && match (&a.logical_commands, &b.logical_commands) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => {
+                            a.len() == b.len()
+                                && a.iter()
+                                    .zip(b.iter())
+                                    .all(|(a, b)| a.same_cost_catalog_metadata(b))
+                        }
+                        _ => false,
+                    }
+            })
+    }
     fn validate_monotonic_update(&self, next: &Self) -> Result<(), CudaReplayError> {
         if self.descriptor.program_id() != next.descriptor.program_id()
             || self.descriptor.node_count() != next.descriptor.node_count()
@@ -1087,10 +1088,15 @@ impl CudaExecutableProgram {
 pub(crate) struct CudaExecutableLaunch {
     reusable_executable_fingerprint: Option<Arc<str>>,
     reusable_graph_node_counts: Option<Arc<[u32]>>,
-    replayed_logical_commands: Option<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
+    replayed_logical_commands: Option<Arc<DeviceReplayedCommandCatalogue>>,
+    observation: Option<DeviceObservationPacket>,
 }
 
 impl CudaExecutableLaunch {
+    pub(crate) fn observation(&self) -> Option<DeviceObservationPacket> {
+        self.observation.clone()
+    }
+
     pub(crate) fn reusable_executable_fingerprint(&self) -> Option<Arc<str>> {
         self.reusable_executable_fingerprint
             .as_ref()
@@ -1101,9 +1107,7 @@ impl CudaExecutableLaunch {
         self.reusable_graph_node_counts.as_ref().map(Arc::clone)
     }
 
-    pub(crate) fn replayed_logical_commands(
-        &self,
-    ) -> Option<Arc<[DeviceReplayedLogicalCommandAttribution]>> {
+    pub(crate) fn replayed_logical_commands(&self) -> Option<Arc<DeviceReplayedCommandCatalogue>> {
         self.replayed_logical_commands.as_ref().map(Arc::clone)
     }
 }
@@ -1230,6 +1234,83 @@ impl CudaExecutableCache {
         builder.finish(poll).map_err(contract)
     }
 
+    /// Invalidation requires the owning stream's exclusive mutation access.
+    /// Old snapshots retain numeric values only; live execution checks are separate.
+    fn invalidate_cost_catalog(&mut self) {
+        self.cost_catalog.take();
+        self.prepared_catalog.invalidate();
+    }
+
+    pub(crate) fn cost_reusable_graph_catalog_shared(
+        &self,
+        limits: ferrum_interfaces::vnext::DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), ferrum_interfaces::vnext::VNextError>,
+    ) -> Result<Arc<ferrum_interfaces::vnext::DeviceCostGraphCatalog>, CudaDeviceRuntimeError> {
+        // Preserve cancellation cost: inventory totals are diagnostic evidence
+        // for a structural backend failure, never extra work after a poll fails.
+        let mut cancelled = false;
+        let result = self.capture_cost_catalog_shared(limits, &mut || {
+            let result = poll();
+            cancelled |= result.is_err();
+            result
+        });
+        result.map_err(|error| {
+            if cancelled
+                || !tracing::enabled!(
+                    target: "ferrum::cost_catalog_diagnostics",
+                    tracing::Level::DEBUG
+                )
+            {
+                error
+            } else {
+                // Record the original structural failure before optional
+                // inventory traversal. The caller's final budget check can
+                // still classify the request as exhausted after this point.
+                tracing::debug!(
+                    target: "ferrum::cost_catalog_diagnostics",
+                    backend = "cuda",
+                    error = %error,
+                    maximum_programs = limits.maximum_programs(),
+                    maximum_nodes = limits.maximum_nodes(),
+                    maximum_logical_commands = limits.maximum_logical_commands(),
+                    "reusable graph catalog failed before inventory diagnostics"
+                );
+                self.cost_catalog_diagnostic_error(error, limits)
+            }
+        })
+    }
+
+    fn capture_cost_catalog_shared(
+        &self,
+        limits: ferrum_interfaces::vnext::DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), ferrum_interfaces::vnext::VNextError>,
+    ) -> Result<Arc<ferrum_interfaces::vnext::DeviceCostGraphCatalog>, CudaDeviceRuntimeError> {
+        poll().map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        if let Some(catalog) = self.cost_catalog.get() {
+            if self.cost_graph_stream_state() != Some(catalog.stream_state()) {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA cached graph catalog state differs",
+                ));
+            }
+            if !catalog.fits(limits) {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA cached graph catalog exceeds capture limits",
+                ));
+            }
+            return Ok(Arc::clone(catalog));
+        }
+        // Misses use the original complete, bounded, cancellable producer. Never
+        // retain an error, a partial inventory or a result built under no budget.
+        let catalog = Arc::new(self.cost_reusable_graph_catalog(limits, poll)?);
+        poll().map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        self.cost_catalog.set(Arc::clone(&catalog)).map_err(|_| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA graph catalog changed during its exclusive capture",
+            )
+        })?;
+        Ok(catalog)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -1238,6 +1319,8 @@ impl CudaExecutableCache {
             preparation: ReusableExecutionPreparationTracker::default(),
             warmup: DemandWarmup::default(),
             clock: 0,
+            cost_catalog: OnceLock::new(),
+            prepared_catalog: prepared_catalog::PreparedCatalog::default(),
         }
     }
 
@@ -1245,11 +1328,13 @@ impl CudaExecutableCache {
         &mut self,
         plan: DeviceReusableExecutionPlan,
     ) -> Result<DeviceReusableExecutionPreparation, String> {
+        self.invalidate_cost_catalog();
         self.preparation
             .configure(plan, self.entries.len(), self.rejected.len())
     }
 
     pub(crate) fn seal(&mut self) -> Result<DeviceReusableExecutionPreparation, String> {
+        self.invalidate_cost_catalog();
         self.preparation
             .seal(self.entries.len(), self.rejected.len())
     }
@@ -1271,6 +1356,8 @@ impl CudaExecutableCache {
         if !self.entries.contains_key(&key) {
             return Ok(false);
         }
+        // Retire the prepared proof before any fallible metadata work.
+        self.invalidate_cost_catalog();
         let mut updates = Vec::new();
         for (program_id, program) in &self.programs {
             if let Some(program) = program.with_evicted_segment(key)? {
@@ -1305,6 +1392,31 @@ impl CudaExecutableCache {
     }
 
     pub(crate) fn prepare_all_with_library_identity(
+        &mut self,
+        context: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        blas: &Arc<CudaBlas>,
+        blas_cost_identity: Option<super::vnext_ops::CublasHandleApiIdentity>,
+        commands: &[CudaDeviceCommand],
+        candidates: &[CudaExecutableCandidate],
+        capture_allowed: bool,
+    ) -> Result<CudaExecutablePreparation, CudaReplayError> {
+        let result = self.prepare_all_with_library_identity_inner(
+            context,
+            stream,
+            blas,
+            blas_cost_identity,
+            commands,
+            candidates,
+            capture_allowed,
+        );
+        if result.is_err() {
+            self.invalidate_prepared_cost_catalog();
+        }
+        result
+    }
+
+    fn prepare_all_with_library_identity_inner(
         &mut self,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
@@ -1476,10 +1588,12 @@ impl CudaExecutableCache {
         let upload_keys = captured.iter().map(|(key, _)| *key).collect::<Vec<_>>();
         report.captured_segments = captured.len();
         for (key, entry) in captured {
+            self.invalidate_cost_catalog();
             let previous = self.entries.insert(key, entry);
             debug_assert!(previous.is_none());
         }
         for key in upload_keys {
+            self.invalidate_cost_catalog();
             self.entries
                 .get_mut(&key)
                 .expect("captured CUDA executable was committed before upload")
@@ -1518,6 +1632,7 @@ impl CudaExecutableCache {
     }
 
     fn remember_rejected(&mut self, key: CudaExecutableSegmentKey, now: u64) {
+        self.invalidate_cost_catalog();
         let maximum_entries = self
             .preparation
             .maximum_executables()
@@ -1536,6 +1651,29 @@ impl CudaExecutableCache {
     }
 
     pub(crate) fn register_program(
+        &mut self,
+        capture: &DeviceReusableExecutionCapture,
+        candidates: &[CudaExecutableCandidate],
+        command_phases: &[DeviceCommandPhase],
+        command_node_indices: &[Option<u32>],
+        commands: &[CudaDeviceCommand],
+        preparation: &CudaExecutablePreparation,
+    ) -> Result<(), CudaReplayError> {
+        let result = self.register_program_inner(
+            capture,
+            candidates,
+            command_phases,
+            command_node_indices,
+            commands,
+            preparation,
+        );
+        if result.is_err() {
+            self.invalidate_prepared_cost_catalog();
+        }
+        result
+    }
+
+    fn register_program_inner(
         &mut self,
         capture: &DeviceReusableExecutionCapture,
         candidates: &[CudaExecutableCandidate],
@@ -1669,7 +1807,10 @@ impl CudaExecutableCache {
                         })
                         .collect::<Option<Vec<_>>>()
                 })
-                .map(Arc::<[DeviceReplayedLogicalCommandAttribution]>::from);
+                .and_then(|rows| {
+                    DeviceReplayedCommandCatalogue::new(descriptor.clone(), rows.into())
+                })
+                .map(Arc::new);
             segments.push(CudaExecutableProgramSegment {
                 descriptor,
                 key: candidate.key,
@@ -1758,16 +1899,34 @@ impl CudaExecutableCache {
             descriptor,
             segments,
         };
-        if let Some(current) = self.programs.get(capture.program_id()) {
-            current.validate_monotonic_update(&program)?;
+        self.commit_registered_program(capture.program_id(), program)
+    }
+
+    fn commit_registered_program(
+        &mut self,
+        program_id: &DeviceReusableExecutionProgramId,
+        program: CudaExecutableProgram,
+    ) -> Result<(), CudaReplayError> {
+        if let Some(current) = self.programs.get(program_id) {
+            if let Err(error) = current.validate_monotonic_update(&program) {
+                self.invalidate_prepared_cost_catalog();
+                return Err(error);
+            }
+            // Compare passive rows only when a numeric catalog can be retained.
+            if (self.cost_catalog.get().is_some() || self.prepared_catalog.is_bound())
+                && current.same_cost_catalog_metadata(&program)
+            {
+                return Ok(());
+            }
         }
+        self.invalidate_cost_catalog();
         // Preserve resident identities across updates. With on-demand work,
         // do not retain an unbounded history of empty program tombstones.
         if self.preparation.is_on_demand() && program.segments.is_empty() {
-            self.programs.remove(capture.program_id());
+            self.programs.remove(program_id);
             return Ok(());
         }
-        self.programs.insert(capture.program_id().clone(), program);
+        self.programs.insert(program_id.clone(), program);
         if self.preparation.is_on_demand() {
             let capacity = self
                 .preparation
@@ -1777,7 +1936,7 @@ impl CudaExecutableCache {
                 let victim = self
                     .programs
                     .iter()
-                    .filter(|(id, _)| *id != capture.program_id())
+                    .filter(|(id, _)| *id != program_id)
                     .min_by_key(|(id, program)| {
                         (
                             program
@@ -1868,21 +2027,13 @@ impl CudaExecutableCache {
         if !executable.uploaded {
             return None;
         }
-        ferrum_interfaces::vnext::DeviceReplayedSegmentAttribution::new(
+        let catalogue = segment.logical_commands.as_ref()?;
+        ferrum_interfaces::vnext::DeviceReplayedSegmentAttribution::from_catalogue(
             physical_command_index,
             invocation.program_id().clone(),
             segment.descriptor.clone(),
             segment.reusable_executable_fingerprint.to_string(),
-            executable
-                .bind_replay_cost(invocation, segment.logical_commands.as_ref()?.as_ref())
-                .unwrap_or_else(|| {
-                    segment
-                        .logical_commands
-                        .as_ref()
-                        .expect("checked above")
-                        .as_ref()
-                        .to_vec()
-                }),
+            catalogue,
         )
     }
 
@@ -1915,13 +2066,7 @@ impl CudaExecutableCache {
                 segment
                     .logical_commands
                     .as_ref()
-                    .map(|sealed| {
-                        self.entries
-                            .get(&key)
-                            .and_then(|entry| entry.bind_replay_cost(invocation, sealed.as_ref()))
-                            .map(Arc::from)
-                            .unwrap_or_else(|| Arc::clone(sealed))
-                    })
+                    .map(Arc::clone)
                     .ok_or_else(|| CudaReplayError {
                         stage: "launch reusable execution program",
                         detail: "sealed program segment lacks logical graph-node attribution"
@@ -1942,10 +2087,21 @@ impl CudaExecutableCache {
         };
         let (profile_fingerprint, reusable_graph_node_counts) =
             entry.launch(stream, now, timing_mode)?;
+        // Only the real successful launch can attach a pending observation.
+        // The queue later joins this ledger to terminal completion; preview
+        // never publishes a statistical packet.
+        let observation = invocation.observation_input().and_then(|input| {
+            entry
+                .observation_template
+                .as_ref()?
+                .packet(input.clone())
+                .ok()
+        });
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint: profile_fingerprint.or(sealed_fingerprint),
             reusable_graph_node_counts,
             replayed_logical_commands,
+            observation,
         }))
     }
 
@@ -2010,6 +2166,7 @@ impl CudaExecutableCache {
             reusable_executable_fingerprint,
             reusable_graph_node_counts,
             replayed_logical_commands: None,
+            observation: None,
         }))
     }
 
@@ -2018,6 +2175,7 @@ impl CudaExecutableCache {
     }
 
     pub(crate) fn trim_quiescent(&mut self) -> (usize, usize) {
+        self.invalidate_cost_catalog();
         let released_executables = self.entries.len();
         let released_rejections = self.rejected.len();
         self.entries.clear();
@@ -2027,9 +2185,14 @@ impl CudaExecutableCache {
     }
 
     pub(crate) fn leak_if_in_flight(&mut self) {
+        self.invalidate_cost_catalog();
         self.programs.clear();
         for (_, entry) in self.entries.drain() {
             std::mem::forget(entry);
         }
     }
 }
+
+#[cfg(test)]
+#[path = "vnext_replay/cost_catalog_tests.rs"]
+mod cost_catalog_tests;

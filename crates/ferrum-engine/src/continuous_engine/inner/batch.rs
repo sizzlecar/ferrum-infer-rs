@@ -23,7 +23,7 @@ impl EngineInner {
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> Result<()> {
-        if self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce
+        if self.config.scheduler.slo.execution_policy().single_wave
             && self.model_executor.execution_resource_authority()
                 != ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
         {
@@ -134,7 +134,7 @@ impl EngineInner {
     /// the preceding step. Resource pressure therefore has one authority and
     /// is surfaced to the scheduler before another request is dispatched.
     async fn process_batch_plan_runtime(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
-        if self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce {
+        if self.config.scheduler.slo.execution_policy().single_wave {
             return self.process_one_plan_runtime_wave(batch).await;
         }
         let (mut prefill_ids, mut decode_ids) = self.classify_published_batch_sequences(batch)?;

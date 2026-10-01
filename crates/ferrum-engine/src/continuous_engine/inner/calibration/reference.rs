@@ -22,11 +22,15 @@ mod assemble;
 mod evidence;
 mod plan;
 mod source;
+mod source_v1;
 mod trials;
 pub use assemble::CalibrationReferenceArtifact;
+pub(super) use assemble::MemoryReferenceArtifact;
+pub(super) use evidence::unavailable_summary;
 pub use evidence::CalibrationReferenceDiscoverySample;
 use evidence::Witness;
 pub use plan::{CalibrationReferenceCurve, CalibrationReferencePlan};
+pub use source_v1::CalibrationReferenceSourceV1;
 pub use trials::CalibrationReferenceTrial;
 
 pub struct CalibrationReferenceCollector {

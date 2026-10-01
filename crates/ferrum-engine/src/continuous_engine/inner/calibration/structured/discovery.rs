@@ -1,7 +1,7 @@
 //! Read-only discovery from original live settlement evidence. This creates no
 //! collector membership, source identity, observation ordinal or training data.
 use super::*;
-use crate::continuous_engine::inner::cost_observation::structured_discovery_input;
+use crate::continuous_engine::inner::cost_observation::structured_capture_input;
 use ferrum_scheduler::implementations::continuous::cost_model::structured::{
     StructuredInputV1, StructuredUnknown,
 };
@@ -17,7 +17,8 @@ impl CalibrationWaveReport {
         if self.submission != CalibrationSubmissionState::HostReconciled || self.error.is_some() {
             return Err(StructuredUnknown::InvalidSample);
         }
-        structured_discovery_input(
+        structured_capture_input(
+            &self.observation_capture,
             self.host_stages
                 .as_ref()
                 .ok_or(StructuredUnknown::MissingEvidence)?,

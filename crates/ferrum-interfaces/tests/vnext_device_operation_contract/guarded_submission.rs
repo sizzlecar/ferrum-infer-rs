@@ -16,6 +16,12 @@ impl TestRuntime {
     ) -> Result<TestFence, DefinitelyNotSubmitted<TestRuntimeError>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
+        if guard.is_some() && !timing_mode.guarded_completion_compatible() {
+            return Err(DefinitelyNotSubmitted::new(TestRuntimeError(
+                "unsupported guarded timing",
+            )));
+        }
+        let observation_demand = commands.cost_observation_demand();
         let compute_path_requirement = commands.compute_path_requirement();
         let declared_eager_compute_node_count =
             commands.declared_eager_compute_node_indices().len();
@@ -133,6 +139,8 @@ impl TestRuntime {
         let (drift, behavior, fence) = {
             let mut trace = self.trace.lock().unwrap();
             trace.submit_calls += 1;
+            trace.submitted_timing_modes.push(timing_mode);
+            trace.submitted_observation_demands.push(observation_demand);
             trace.submitted_command_counts.push(command_count);
             trace.submitted_command_phases.push(command_phases);
             trace
@@ -173,6 +181,29 @@ impl TestRuntime {
         }
         if let Some(memory) = self.trace.lock().unwrap().memory.clone() {
             memory_fixture::execute(&memory, &memory_commands);
+        }
+        for command in &memory_commands {
+            if let TestCommand::ControlledCpuFill {
+                id,
+                full_logits,
+                layout,
+                participants,
+                ..
+            } = command
+            {
+                let fill = self
+                    .trace
+                    .lock()
+                    .unwrap()
+                    .controlled_cpu_fill
+                    .clone()
+                    .expect("actual CPU fill command has its original owned work");
+                assert_eq!(fill.id, *id);
+                assert_eq!(fill.full_logits, *full_logits);
+                assert_eq!(fill.layout, *layout);
+                assert_eq!(fill.rows, *participants as usize);
+                fill.execute();
+            }
         }
         if drift {
             self.use_alternate_descriptor.store(true, Ordering::Release);

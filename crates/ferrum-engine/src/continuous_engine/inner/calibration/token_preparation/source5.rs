@@ -37,8 +37,14 @@ impl CalibrationSession {
             release_generated: usize::try_from(release)
                 .map_err(|_| invalid("source5 release bound overflow"))?,
         };
-        self.install_prefix_request(request, context, contract, declaration, true)
-            .await
+        self.install_prefix_request(
+            request,
+            context,
+            contract,
+            declaration,
+            PrefixSource::Source5,
+        )
+        .await
     }
 
     pub(in crate::continuous_engine::inner::calibration) fn offer_prefix_source_wave_v5(

@@ -63,9 +63,13 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear/small_batch.metal"),
     include_str!("linear/plain_prefill.rs"),
     include_str!("linear/cost_route.rs"),
+    include_str!("linear/cost_route/prepared.rs"),
     include_str!("linear/head_cost_route.rs"),
     include_str!("linear/head_selected.rs"),
+    include_str!("linear/head_selected/observation.rs"),
     include_str!("linear/selected.rs"),
+    include_str!("linear/selected/prepared.rs"),
+    include_str!("linear/selected/observation.rs"),
     include_str!("weights.rs"),
     include_str!("linear/staged_prefill.rs"),
     include_str!("linear/transformed_prefill.rs"),
@@ -658,6 +662,13 @@ impl OperationResourceEstimator for MetalDenseLinearProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalDenseLinearProvider {
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        cost_route::prepare_dense(request)
+    }
+
     fn eager_cost_route(
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
@@ -784,6 +795,13 @@ impl OperationResourceEstimator for MetalDenseSwiGluProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalDenseSwiGluProvider {
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        cost_route::prepare_swiglu(request)
+    }
+
     fn eager_cost_route(
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
@@ -1330,10 +1348,14 @@ fn encode_dense_linear(
         "Metal dense linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let route =
-        cost_route::dense_command_selected(&pipelines, participant_count, token_count, &launches)
-            .map_err(|error| error.to_string())?;
+    let route = cost_route::dense_command(participant_count, token_count, &launches)
+        .map_err(|error| error.to_string())?;
     let dispatch_count = route.compute_dispatch_count();
+    let observation = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(dispatch_count),
+        || selected::dense_observation(&pipelines, &launches, token_count),
+    );
     MetalDeviceCommand::operation(
         route.native_operation(),
         regions,
@@ -1347,7 +1369,7 @@ fn encode_dense_linear(
     )
     .map_err(|error| error.to_string())?
     .with_work_shape(route.batching(), participant_count, token_count)
-    .map(|command| command.with_statistical_evidence(route.statistical_evidence().cloned()))
+    .map(|command| command.with_observation(observation))
     .map_err(|error| error.to_string())
 }
 
@@ -1519,11 +1541,17 @@ fn encode_last_token_dense_linear(
                 scratch_layout.required_bytes,
                 "Metal packed last-token scratch",
             )?;
-            let statistical = head_selected::evidence(
-                &pipelines,
-                &[launch],
-                token_count,
-                Some((scratch_layout, participant_count_u32, shared_packed_input)),
+            let statistical = crate::backend::metal::vnext_runtime::prepare_observation_template(
+                invocation.observation_template_budget(),
+                head_selected::observation_payload_upper(pipelines.dispatch_count(launch), 1),
+                || {
+                    head_selected::observation(
+                        &pipelines,
+                        &[launch],
+                        token_count,
+                        Some((scratch_layout, participant_count_u32, shared_packed_input)),
+                    )
+                },
             );
             let operation_label = pipelines.operation_label(activation_type);
             return MetalDeviceCommand::operation(
@@ -1563,7 +1591,7 @@ fn encode_last_token_dense_linear(
                 },
             )
             .map_err(|error| error.to_string())?
-            .with_statistical_evidence(statistical)
+            .with_observation(statistical)
             .with_work_shape(
                 DeviceBatchingForm::Packed,
                 participant_count_u32,
@@ -1627,7 +1655,11 @@ fn encode_last_token_dense_linear(
         .iter()
         .map(|launch| pipelines.dispatch_count(*launch))
         .sum();
-    let statistical = head_selected::evidence(&pipelines, &launches, token_count, None);
+    let statistical = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        head_selected::observation_payload_upper(dispatch_count, launches.len()),
+        || head_selected::observation(&pipelines, &launches, token_count, None),
+    );
     let operation_label = pipelines.operation_label(activation_type);
     MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
         encoder.record_compute_dispatches(dispatch_count);
@@ -1637,7 +1669,7 @@ fn encode_last_token_dense_linear(
         Ok(())
     })
     .map_err(|error| error.to_string())?
-    .with_statistical_evidence(statistical)
+    .with_observation(statistical)
     .with_work_shape(
         if participant_count_u32 == 1 {
             DeviceBatchingForm::Scalar
@@ -1902,9 +1934,15 @@ fn encode_dense_swiglu(
         scratch_region,
         workspace: staging,
     };
-    let statistics = activation_scratch_bytes
-        .checked_add(staging_bytes)
-        .and_then(|scratch| sequence.statistical_evidence(&pipelines, tokens, scratch));
+    let statistics = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(sequence.dispatch_count(&regions)),
+        || {
+            activation_scratch_bytes
+                .checked_add(staging_bytes)
+                .and_then(|scratch| sequence.observation(&pipelines, tokens, scratch))
+        },
+    );
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
         encoder.record_compute_dispatches(sequence.dispatch_count(regions));
         sequence.encode(&pipelines, regions, |subwork, encode| {
@@ -1923,7 +1961,7 @@ fn encode_dense_swiglu(
         participant_count,
         tokens,
     )
-    .map(|command| command.with_statistical_evidence(statistics))
+    .map(|command| command.with_observation(statistics))
     .map_err(|error| error.to_string())
 }
 
@@ -3977,4 +4015,44 @@ pub(super) fn append_selected_projection(
     scratch: u64,
 ) -> Option<()> {
     selected::projection(builder, pipelines, launch, policy, scratch)
+}
+
+pub(super) use selected::prepared::PreparedLinearClasses;
+
+pub(super) fn append_selected_projection_with_classes(
+    builder: &mut ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1,
+    pipelines: &MetalLinearPipelines,
+    launch: LinearLaunch,
+    policy: Option<staged_prefill::StagingPolicy>,
+    scratch: u64,
+    classes: Option<&PreparedLinearClasses>,
+) -> Option<()> {
+    selected::projection_with_classes(builder, pipelines, launch, policy, scratch, classes)
+}
+
+pub(super) use selected::observation::FrozenLinear;
+
+#[cfg(test)]
+pub(super) fn selected_q4_observation_fixture(
+    tokens: u64,
+    input: u64,
+    output: u32,
+) -> LinearLaunch {
+    linear_launch(
+        PreparedLinearPart {
+            region: 0,
+            format: LinearPhysicalFormat::Q4K,
+            out_features: output,
+            output_offset: 0,
+            transform: None,
+        },
+        0,
+        0,
+        tokens,
+        input,
+        u64::from(output),
+        0,
+        0,
+    )
+    .unwrap()
 }

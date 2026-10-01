@@ -952,3 +952,119 @@ extern "C" __global__ void vnext_rn_fragment_mma(
     asm volatile("trap;");
 #endif
 }
+
+// Selected only for Q6 by the typed per-projection host plan. The generic
+// format arithmetic is retained to preserve the qualified instruction schedule.
+// PTX cp.async groups are per issuing thread. Every lane commits, including
+// inactive copy lanes; consumers wait and synchronize the warp before reading.
+__device__ __forceinline__ void rn_frag_prefetch_copy(
+    byte* destination, const byte* source, unsigned cell_bytes, unsigned lane) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (lane * 16 < cell_bytes) {
+        const unsigned shared = static_cast<unsigned>(__cvta_generic_to_shared(destination + lane * 16));
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+            :: "r"(shared), "l"(source + lane * 16) : "memory");
+    }
+    // Reconverge before the uniform commit; no lane exits the warp protocol.
+    __syncwarp();
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#else
+    asm volatile("trap;");
+#endif
+}
+extern "C" __global__ void vnext_rn_fragment_q6_prefetch_mma(
+    const half* x, const byte* packed, unsigned long long bytes, half* y,
+    unsigned rows, unsigned k, unsigned n, unsigned stride, unsigned offset,
+    unsigned format, unsigned abi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1
+        || !rows || offset > stride || n > stride - offset
+        || !rn_frag_valid(k, n, format, bytes, abi)) return;
+    __shared__ float partial[8][128]; // Original F32 final partials: 4096 B.
+    __shared__ __align__(16) byte staged[8][2][512]; // Two exact packet slots per warp.
+    const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const unsigned g = lane / 4, t = lane % 4;
+    const unsigned first_col = blockIdx.x * 16, first_row = blockIdx.y * 8;
+    if (blockIdx.x >= (static_cast<unsigned long long>(n) + 15) / 16
+        || blockIdx.y >= (static_cast<unsigned long long>(rows) + 7) / 8) return;
+    const unsigned step = rn_frag_step(format), cell_bytes = 128 + 2 * step;
+    float c[4] = {};
+    // The original U8 ABI permits unaligned physical views. They retain the
+    // original global reads below and issue no asynchronous copies.
+    const bool prefetch = (reinterpret_cast<size_t>(packed) & 15) == 0;
+    unsigned stage = 0;
+    if (prefetch) {
+        const byte* first = packed + (size_t(blockIdx.x) * (k / 32) + warp) * cell_bytes;
+        rn_frag_prefetch_copy(staged[warp][stage], first, cell_bytes, lane);
+    }
+    // K32 stripes are disjoint. No atomics/global scratch/fixup; the final
+    // eight-warp F32 sum changes reduction order relative to vendor GEMM.
+    for (unsigned group = warp; group < k / 32; group += 8) {
+        const byte* cell = packed + (size_t(blockIdx.x) * (k / 32) + group) * cell_bytes;
+        if (prefetch) {
+            // Each lane waits for its own copy, then the complete warp may read
+            // metadata/codes copied by other lanes. One group at most is pending.
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncwarp();
+            cell = staged[warp][stage];
+            if (group + 8 < k / 32) {
+                const byte* next = packed + (size_t(blockIdx.x) * (k / 32) + group + 8) * cell_bytes;
+                rn_frag_prefetch_copy(staged[warp][stage ^ 1], next, cell_bytes, lane);
+            }
+        }
+        #pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            const byte* codes = cell + 128 + h * step;
+            const unsigned low = rn_frag_word(codes + lane * 4);
+            const unsigned scale_offset = format == 14 ? h * 64 : 0;
+            const float al = __uint_as_float(rn_frag_word(cell + scale_offset + g * 4));
+            const float ah = __uint_as_float(rn_frag_word(cell + scale_offset + (g + 8) * 4));
+            const float zl = format == 14 ? 0.0f : __uint_as_float(rn_frag_word(cell + 64 + g * 4));
+            const float zh = format == 14 ? 0.0f : __uint_as_float(rn_frag_word(cell + 64 + (g + 8) * 4));
+            unsigned a[4];
+            #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const float scale = j % 2 ? ah : al, zero = j % 2 ? zh : zl;
+                const half lo = rn_frag_half(scale, zero, rn_frag_code(low, codes + 128, lane, 2 * j, format), format);
+                const half hi = rn_frag_half(scale, zero, rn_frag_code(low, codes + 128, lane, 2 * j + 1, format), format);
+                a[j] = rn_frag_pair(lo, hi);
+            }
+            unsigned b0 = 0, b1 = 0;
+            if (first_row + g < rows) {
+                const size_t base = size_t(first_row + g) * k + group * 32 + h * 16 + 2 * t;
+                b0 = rn_frag_pair(x[base], x[base + 1]);
+                b1 = rn_frag_pair(x[base + 8], x[base + 9]);
+            }
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+        }
+        if (prefetch) {
+            // No lane may overwrite this slot until every lane consumed it.
+            __syncwarp();
+            stage ^= 1;
+        }
+    }
+    if (prefetch) {
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncwarp();
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < 4; ++j) partial[warp][lane * 4 + j] = c[j];
+    __syncthreads();
+    if (warp == 0) {
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            float sum = partial[0][lane * 4 + j];
+            #pragma unroll
+            for (unsigned w = 1; w < 8; ++w) sum = __fadd_rn(sum, partial[w][lane * 4 + j]);
+            const unsigned row = first_row + 2 * t + j % 2;
+            const unsigned column = first_col + g + (j / 2) * 8;
+            if (row < rows && column < n) y[size_t(row) * stride + offset + column] = __float2half_rn(sum);
+        }
+    }
+// A stale/misbound module must never turn a successful launch into no output.
+#else
+    asm volatile("trap;");
+#endif
+}

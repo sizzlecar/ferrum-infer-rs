@@ -150,6 +150,7 @@ fn options(files: &Files) -> StructuredCalibrationGroupOptionsV2 {
                 observations_path: files.0.join(format!("child-{algorithm}.jsonl")),
                 protocol_sha256: [9; 32],
                 scope: StructuredScopeV2 {
+                    numerical_family: None,
                     owner: owner.clone(),
                     coverage: StructuredCoverageV2 {
                         pending_eligible_positions: vec![],
@@ -539,4 +540,51 @@ fn shared_source4_header_capacity_fails_during_group_construction_before_offers(
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         assert_eq!(std::fs::read_dir(&files.0).unwrap().count(), 1);
     }
+}
+
+#[test]
+fn structured_group_learned_span_writes_typed_policy_and_preserves_disabled_header() {
+    use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredLearnedDriftV2;
+    let files = Files::new();
+    let mut options = options(&files);
+    let original = &options.children[0];
+    let rule = original.membership_rule.signature().unwrap();
+    let cohorts = original
+        .cohort_plan
+        .signature(&original.cohort_manifest_payload)
+        .unwrap();
+    let disabled = original.protocol_signature(rule, cohorts).unwrap();
+    options.children[0].settings.learned_drift = StructuredLearnedDriftV2::ObservedResidualSpanV1 {
+        maximum_span_margin_ns: NonZeroU64::new(1_000_000).unwrap(),
+    };
+    let enabled = options.children[0]
+        .protocol_signature(rule, cohorts)
+        .unwrap();
+    assert_ne!(disabled, enabled);
+    let group = StructuredCalibrationGroupV2::new(
+        options,
+        fingerprint(),
+        Arc::new(Clock(AtomicU64::new(7))),
+        0,
+    )
+    .unwrap();
+    // This is the real producer header, without manufacturing a completed population.
+    let artifact = group.finish(0).unwrap();
+    assert!(artifact.failure.is_some());
+    assert!(artifact.children.iter().all(|child| child.model.is_none()));
+    let first = records(&artifact.children[0].source_path);
+    let header = &first[0]["record"];
+    assert_eq!(
+        header["settings"]["learned_drift"]["kind"],
+        "observed_residual_span_v1"
+    );
+    assert_eq!(
+        header["settings"]["learned_drift"]["maximum_span_margin_ns"],
+        1_000_000
+    );
+    assert_eq!(header["protocol"], serde_json::to_value(enabled).unwrap());
+    let second = records(&artifact.children[1].source_path);
+    assert!(second[0]["record"]["settings"]
+        .get("learned_drift")
+        .is_none());
 }

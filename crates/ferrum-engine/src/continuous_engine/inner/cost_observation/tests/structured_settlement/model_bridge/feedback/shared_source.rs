@@ -41,7 +41,8 @@ fn run_shared_case(fail_after_receipt: bool) {
         queries.push(StructuredQueryV2::exact(input));
         StructuredCalibrationOptionsV2 {
             observations_path: path.clone(), protocol_sha256: [81; 32],
-            scope: StructuredScopeV2 { owner: owner.clone(), coverage: StructuredCoverageV2 {
+            scope: StructuredScopeV2 { numerical_family: None,
+owner: owner.clone(), coverage: StructuredCoverageV2 {
                 pending_eligible_positions: vec![], authorized_pending_constraints: vec![HostPendingConstraintV2::AnySubset],
                 pending_counts: vec![0], length_counts: vec![1], pending_positions: vec![], length_positions: vec![0], joint_counts: vec![(0,1)],
             }},

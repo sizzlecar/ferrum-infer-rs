@@ -5,6 +5,16 @@ pub(super) struct JointSupport {
     points: Vec<Vec<u64>>,
 }
 impl JointSupport {
+    pub(super) fn retained_heap_bytes(&self) -> Option<usize> {
+        let mut bytes = self
+            .points
+            .capacity()
+            .checked_mul(std::mem::size_of::<Vec<u64>>())?;
+        for point in std::iter::once(&self.minimum).chain(self.points.iter()) {
+            bytes = bytes.checked_add(point.capacity().checked_mul(std::mem::size_of::<u64>())?)?;
+        }
+        Some(bytes)
+    }
     pub(super) fn bind_parameters(&self, digest: &mut sha2::Sha256) {
         use sha2::Digest;
         digest.update(b"joint-support-v1\0");
@@ -44,6 +54,47 @@ impl JointSupport {
     pub(super) fn contains(&self, query: &[u64]) -> bool {
         self.contains_envelope(query, query)
     }
+    /// Bounded debug witness for a validated point query. This is intentionally
+    /// separate from the production membership predicate and only run on demand.
+    pub(super) fn diagnose(&self, query: &[u64]) -> Option<StructuredFitSupportReasonV1> {
+        if query.len() != self.minimum.len() || self.contains(query) {
+            return None;
+        }
+        let maximum = |axis: usize| self.points.iter().map(|point| point[axis]).max().unwrap();
+        for (axis, (&value, &minimum)) in query.iter().zip(&self.minimum).enumerate() {
+            if value < minimum {
+                return Some(StructuredFitSupportReasonV1::BelowMinimum {
+                    support_axis: axis,
+                    query: value,
+                    minimum,
+                    maximum: maximum(axis),
+                });
+            }
+        }
+        for (axis, &value) in query.iter().enumerate() {
+            let high = maximum(axis);
+            if value > high {
+                return Some(StructuredFitSupportReasonV1::AboveAllFitMax {
+                    support_axis: axis,
+                    query: value,
+                    minimum: self.minimum[axis],
+                    maximum: high,
+                });
+            }
+        }
+        let first = self.points.first()?;
+        let axis = query
+            .iter()
+            .zip(first)
+            .position(|(value, high)| value > high)?;
+        Some(StructuredFitSupportReasonV1::NoJointDominator {
+            support_axis: axis,
+            query: query[axis],
+            minimum: self.minimum[axis],
+            maximum: maximum(axis),
+            first_fit_point_upper: first[axis],
+        })
+    }
     /// One original complete point must dominate the whole envelope; maxima
     /// from separate observations cannot be assembled into fictitious support.
     pub(super) fn contains_envelope(&self, lower: &[u64], upper: &[u64]) -> bool {
@@ -57,3 +108,6 @@ impl JointSupport {
                 .any(|point| upper.iter().zip(point).all(|(q, high)| q <= high))
     }
 }
+
+#[cfg(test)]
+mod diagnostic_tests;

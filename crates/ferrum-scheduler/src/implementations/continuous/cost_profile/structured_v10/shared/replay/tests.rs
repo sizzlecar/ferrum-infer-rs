@@ -31,6 +31,9 @@ fn resign_child(h: &mut Header) {
     ]) {
         sha.update(n.to_le_bytes());
     }
+    if !h.settings.learned_drift.is_disabled() {
+        sha.update(h.settings.learned_drift.signature());
+    }
     h.protocol = sha.finalize().into();
 }
 

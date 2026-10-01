@@ -196,6 +196,7 @@ async fn structured_v2_metal_complete_cohorts_source_export_load_and_query() {
         .unwrap()
         .accepted_ordinal();
     let scope = StructuredScopeV2 {
+        numerical_family: None,
         owner: owner.clone(),
         coverage: StructuredCoverageV2 {
             pending_eligible_positions: vec![],

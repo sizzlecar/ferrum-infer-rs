@@ -104,8 +104,17 @@ fn future_workspace_equality_keeps_slot_claim_and_projection_identity() {
             slot_id: 1,
             in_use: false,
             last_used: 1,
-            claims: fixture.claims,
-            projections: fixture.projections,
+            geometry: Arc::new(SlotGeometry {
+                bucket: bucket.bucket_id().clone(),
+                segment_count: fixture.claims.iter().map(|c| c.segments.len()).sum(),
+                identity_count: fixture
+                    .claims
+                    .iter()
+                    .map(|c| c.identity.resource_ids().len())
+                    .sum(),
+                claims: fixture.claims,
+                projections: fixture.projections,
+            }),
         }],
     };
     assert!(original
@@ -121,10 +130,10 @@ fn future_workspace_equality_keeps_slot_claim_and_projection_identity() {
     changed.slots[0].last_used += 1;
     assert!(!original.same_future_state(&changed, &mut || true).unwrap());
     let mut changed = original.clone();
-    changed.slots[0].claims[0].pool_instance += 1;
+    Arc::make_mut(&mut changed.slots[0].geometry).claims[0].pool_instance += 1;
     assert!(!original.same_future_state(&changed, &mut || true).unwrap());
     let mut changed = original.clone();
-    changed.slots[0].projections[0].physical_offset += 1;
+    Arc::make_mut(&mut changed.slots[0].geometry).projections[0].physical_offset += 1;
     assert!(!original.same_future_state(&changed, &mut || true).unwrap());
     let mut polls = 0;
     assert_eq!(
@@ -284,18 +293,13 @@ fn workspace_hot_claim_match_keeps_every_interleaved_projection_check() {
             .shares_resource_id_storage(&request.claim_identity));
     }
     requests.reverse(); // A slot-local claim index is not a canonical index.
-    let mut polls = 0;
     check_hot_claims(
         &fixture.claims,
         &fixture.projections,
         &requests,
-        &mut || {
-            polls += 1;
-            true
-        },
+        &mut || true,
     )
     .unwrap();
-    assert_eq!(polls, fixture.projections.len());
     for index in 2..fixture.projections.len() {
         // All these rows follow an already matched projection of this claim.
         for field in 0..4 {
@@ -368,7 +372,21 @@ fn workspace_hot_claim_match_preserves_logical_demand_and_per_row_cancellation()
         );
     }
     let requests = fixture.requests();
-    for stop in 1..=fixture.projections.len() {
+    // Discover this call's actual cancellation boundaries, without a fixed
+    // callback-count/performance assertion. Cancellation at every boundary must
+    // fail closed, including the per-claim order scan.
+    let mut boundaries = 0;
+    check_hot_claims(
+        &fixture.claims,
+        &fixture.projections,
+        &requests,
+        &mut || {
+            boundaries += 1;
+            true
+        },
+    )
+    .unwrap();
+    for stop in 1..=boundaries {
         let mut polls = 0;
         assert_eq!(
             check_hot_claims(
@@ -391,4 +409,159 @@ fn workspace_hot_claim_match_preserves_logical_demand_and_per_row_cancellation()
         &mut || true,
     )
     .unwrap();
+}
+
+#[test]
+fn workspace_projection_lookup_preserves_permutations_without_authority_cache() {
+    let fixture = HotClaimsFixture::new();
+    let mut requests = fixture.requests();
+    for request in &requests {
+        assert!(
+            projection_lookup_indices(&request.projections, &mut || true)
+                .unwrap()
+                .is_none()
+        );
+    }
+    requests.reverse();
+    for request in &mut requests {
+        request.projections.reverse();
+        assert!(
+            projection_lookup_indices(&request.projections, &mut || true)
+                .unwrap()
+                .is_some()
+        );
+    }
+    let mut projections = fixture.projections.clone();
+    projections.reverse();
+    check_hot_claims(&fixture.claims, &projections, &requests, &mut || true).unwrap();
+    // Every later call reads the current request. The previously successful
+    // numeric index cannot authorize a changed range, demand or claim.
+    for field in 0..4 {
+        let mut changed = requests.clone();
+        match field {
+            0 => changed[0].projections[0].physical_offset_bytes += 1,
+            1 => changed[0].projections[0].capacity_size_bytes += 1,
+            2 => changed[0].projections[0].logical_size_bytes = 0,
+            _ => {
+                let claim = &changed[0].claim_identity;
+                let mut ids = claim.resource_ids().to_vec();
+                *ids.last_mut().unwrap() = ResourceId::new("resource/unrelated-claim").unwrap();
+                changed[0].claim_identity =
+                    PhysicalBackingClaimIdentity::new(claim.pool_id().clone(), ids).unwrap();
+            }
+        }
+        assert_eq!(
+            check_hot_claims(&fixture.claims, &projections, &changed, &mut || true),
+            Err(ResourcePlanningUnknown::InvalidDemand)
+        );
+    }
+    check_hot_claims(&fixture.claims, &projections, &requests, &mut || true).unwrap();
+}
+
+#[test]
+fn workspace_projection_lookup_rejects_missing_and_duplicate_request_ids() {
+    let fixture = HotClaimsFixture::new();
+    for reverse in [false, true] {
+        let mut requests = fixture.requests();
+        requests[0].projections.pop();
+        if reverse {
+            requests[0].projections.reverse();
+        }
+        assert_eq!(
+            check_hot_claims(
+                &fixture.claims,
+                &fixture.projections,
+                &requests,
+                &mut || true
+            ),
+            Err(ResourcePlanningUnknown::InvalidDemand)
+        );
+        let mut requests = fixture.requests();
+        let duplicate = requests[0].projections[0].clone();
+        // Preserve the count while repeating one ID and omitting another.
+        requests[0].projections[3] = duplicate;
+        if reverse {
+            requests[0].projections.reverse();
+        }
+        assert_eq!(
+            check_hot_claims(
+                &fixture.claims,
+                &fixture.projections,
+                &requests,
+                &mut || true
+            ),
+            Err(ResourcePlanningUnknown::InvalidDemand)
+        );
+    }
+}
+
+#[test]
+fn workspace_projection_lookup_fallback_retains_cancellation_and_missing_resource_checks() {
+    let fixture = HotClaimsFixture::new();
+    let mut requests = fixture.requests();
+    requests[0].projections.reverse();
+    assert_eq!(
+        projection_lookup_indices(&requests[0].projections, &mut || false),
+        Err(ResourcePlanningUnknown::BudgetExhausted)
+    );
+    let mut cancelled = false;
+    assert_eq!(
+        check_hot_claims(
+            &fixture.claims,
+            &fixture.projections,
+            &requests,
+            &mut || {
+                if cancelled {
+                    false
+                } else {
+                    cancelled = true;
+                    true
+                }
+            }
+        ),
+        Err(ResourcePlanningUnknown::BudgetExhausted)
+    );
+    let mut projections = fixture.projections.clone();
+    projections.last_mut().unwrap().resource = ResourceId::new("resource/absent").unwrap();
+    assert_eq!(
+        check_hot_claims(&fixture.claims, &projections, &requests, &mut || true),
+        Err(ResourcePlanningUnknown::InvalidDemand)
+    );
+    check_hot_claims(
+        &fixture.claims,
+        &fixture.projections,
+        &requests,
+        &mut || true,
+    )
+    .unwrap();
+}
+
+#[test]
+fn workspace_projection_lookup_canonical_scan_checks_budget_including_empty() {
+    let fixture = HotClaimsFixture::new();
+    let requests = fixture.requests();
+    let ordered = &requests[0].projections;
+    for projections in [&ordered[..0], &ordered[..1], ordered.as_slice()] {
+        assert_eq!(
+            projection_lookup_indices(projections, &mut || false),
+            Err(ResourcePlanningUnknown::BudgetExhausted)
+        );
+        assert!(projection_lookup_indices(projections, &mut || true)
+            .unwrap()
+            .is_none());
+    }
+    // Entry is allowed; cancellation while checking the canonical order must
+    // be observed before any lookup can use that order.
+    let mut entered = false;
+    assert_eq!(
+        projection_lookup_indices(ordered, &mut || {
+            let was_entered = entered;
+            entered = true;
+            !was_entered
+        }),
+        Err(ResourcePlanningUnknown::BudgetExhausted)
+    );
+    assert!(projection_lookup_indices(ordered, &mut || true)
+        .unwrap()
+        .is_none());
 }

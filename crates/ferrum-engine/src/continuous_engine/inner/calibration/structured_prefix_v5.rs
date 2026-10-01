@@ -15,6 +15,19 @@ impl CalibrationSession {
             .first()
             .ok_or_else(|| FerrumError::config("source5 needs declared children"))?
             .cohort_plan;
+        self.validate_declared_prefix_plan(requests, &prefixes)?;
+        self.begin_structured_group_inner(options, Some(prefixes))
+            .await
+    }
+
+    /// Every prepared source must validate its immutable declaration against
+    /// the tokenizer and context of this engine before installing capabilities.
+    /// This checks declarations only; it grants no sample or request authority.
+    pub(super) fn validate_declared_prefix_plan(
+        &self,
+        requests: &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::windows::CohortPlanV2,
+        prefixes: &StructuredPrefixPlanV5,
+    ) -> Result<()> {
         prefixes
             .validate(requests)
             .map_err(|e| FerrumError::config(format!("source5 prefix plan: {e:?}")))?;
@@ -66,8 +79,7 @@ impl CalibrationSession {
                 }
             }
         }
-        self.begin_structured_group_inner(options, Some(prefixes))
-            .await
+        Ok(())
     }
     pub(super) fn group_phase_boundary(&self) -> Result<()> {
         if self.prefix_source5 {

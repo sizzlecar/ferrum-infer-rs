@@ -27,6 +27,7 @@ use tracing::{debug, info};
 
 /// Engine builder for creating inference engines with registry-based components
 pub struct EngineBuilder {
+    automatic_cost_probe_templates: Vec<crate::AutomaticCostProbeTemplate>,
     /// Component registry to use
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
@@ -71,6 +72,7 @@ impl EngineBuilder {
         Self {
             registry,
             config,
+            automatic_cost_probe_templates: Vec::new(),
             model_sources: None,
             defined_model: None,
             tokenizer_name: None,
@@ -85,6 +87,15 @@ impl EngineBuilder {
             custom_recurrent_state_manager: None,
             custom_executor: None,
         }
+    }
+
+    /// Product-resolved requests for private automatic cost calibration.
+    pub fn with_automatic_cost_probe_templates(
+        mut self,
+        templates: Vec<crate::AutomaticCostProbeTemplate>,
+    ) -> Self {
+        self.automatic_cost_probe_templates = templates;
+        self
     }
 
     pub fn with_model_sources(mut self, sources: Arc<ProductionModelSourceBundle>) -> Self {
@@ -282,11 +293,34 @@ impl EngineBuilder {
         let executor_name = self.resolve_executor_name();
         let explicit_kv_cache_override = self.kv_cache_name.is_some();
 
-        let component_config = ComponentConfig::from_engine_config_and_product_model(
+        let mut component_config = ComponentConfig::from_engine_config_and_product_model(
             &self.config,
             self.model_sources.clone(),
             self.defined_model.clone(),
         );
+        let template_maximum = self
+            .config
+            .scheduler
+            .slo
+            .cost_observation
+            .maximum_template_bytes
+            .get();
+        let template_budget =
+            match self
+                .custom_executor
+                .as_ref()
+                .and_then(|executor| executor.observation_template_budget())
+            {
+                Some(budget) if budget.maximum_bytes() == template_maximum => budget,
+                Some(_) => return Err(FerrumError::config(
+                    "custom executor observation template budget differs from typed configuration",
+                )),
+                None => {
+                    ferrum_interfaces::vnext::DeviceObservationTemplateBudget::new(template_maximum)
+                        .map_err(|error| FerrumError::config(error.to_string()))?
+                }
+            };
+        component_config.observation_template_budget = Some(template_budget);
         validate_layer_split_plan(&component_config)?;
         let typed_model_path = component_config.get_string_option("model_path");
         let has_model_path = typed_model_path.is_some() || self.config.runtime.model_path.is_some();
@@ -535,7 +569,9 @@ impl EngineBuilder {
             }
             return Err(startup_error);
         }
-        Ok(engine)
+        engine
+            .finish_automatic_startup_with_probes(self.automatic_cost_probe_templates)
+            .await
     }
 }
 
@@ -629,6 +665,41 @@ pub async fn create_defined_product_engine(
 ) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config)
         .with_defined_model(prepared)
+        .build()
+        .await
+}
+
+/// Product composition with original request/codec templates supplied before readiness.
+pub async fn create_engine_with_automatic_cost_probes(
+    config: EngineConfig,
+    templates: Vec<crate::AutomaticCostProbeTemplate>,
+) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+    EngineBuilder::new(config)
+        .with_automatic_cost_probe_templates(templates)
+        .build()
+        .await
+}
+
+pub async fn create_product_engine_with_automatic_cost_probes(
+    config: EngineConfig,
+    sources: Arc<ProductionModelSourceBundle>,
+    templates: Vec<crate::AutomaticCostProbeTemplate>,
+) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+    EngineBuilder::new(config)
+        .with_model_sources(sources)
+        .with_automatic_cost_probe_templates(templates)
+        .build()
+        .await
+}
+
+pub async fn create_defined_product_engine_with_automatic_cost_probes(
+    config: EngineConfig,
+    prepared: Arc<DefinedProductionModel>,
+    templates: Vec<crate::AutomaticCostProbeTemplate>,
+) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+    EngineBuilder::new(config)
+        .with_defined_model(prepared)
+        .with_automatic_cost_probe_templates(templates)
         .build()
         .await
 }

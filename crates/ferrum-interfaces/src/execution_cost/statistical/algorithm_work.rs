@@ -119,10 +119,18 @@ impl SelectedAlgorithmWorkEvidenceV1 {
         &self,
         command: &SelectedCommandCostEvidenceV1,
     ) -> Result<(), StatisticalEvidenceUnknown> {
+        self.validate_command_with_binding(command, || command.algorithm_work_binding())
+    }
+
+    fn validate_command_with_binding(
+        &self,
+        command: &SelectedCommandCostEvidenceV1,
+        binding: impl FnOnce() -> Result<[u8; 32], StatisticalEvidenceUnknown>,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
         if self.protocol != "ferrum.selected-algorithm-work.v1"
             || self.entries.is_empty()
             || self.entries.capacity() > MAX_COST_COMMANDS
-            || self.command_binding != command.algorithm_work_binding()?
+            || self.command_binding != binding()?
         {
             return Err(StatisticalEvidenceUnknown::CommandMismatch);
         }
@@ -267,12 +275,16 @@ impl AlgorithmWorkAccumulator {
         if let Some(error) = self.failure {
             return Err(error);
         }
+        let binding = command.algorithm_work_binding()?;
         let value = SelectedAlgorithmWorkEvidenceV1 {
             protocol: "ferrum.selected-algorithm-work.v1",
-            command_binding: command.algorithm_work_binding()?,
+            command_binding: binding,
             entries: self.entries,
         };
-        value.validate_command(command)?;
+        // The command is immutably borrowed throughout construction. Reuse
+        // this digest while retaining every table-content check; no value is
+        // retained for another command or a later validation call.
+        value.validate_command_with_binding(command, || Ok(binding))?;
         Ok(value)
     }
 }

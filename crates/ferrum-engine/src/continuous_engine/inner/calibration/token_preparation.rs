@@ -10,8 +10,15 @@ mod plan;
 mod sequence;
 mod session;
 mod source5;
+mod source8;
 pub use plan::CalibrationPrefixTokensV1;
+mod probe_tokens;
 use plan::ValidatedCalibrationPrefixTokensV1;
+pub(in crate::continuous_engine::inner::calibration) use probe_tokens::{
+    discover_aligned_prefix_tokens, discover_prefix_tokens, CalibrationPrefixTokenBudgetV1,
+    CalibrationPrefixTokenDiscoveryAuditV1, CalibrationPrefixTokenDiscoveryV1,
+    CalibrationPrefixTokenUnavailableReasonV1, DiscoveredCalibrationPrefixTokensV1,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,7 +55,9 @@ pub struct PrefixFrontierV1 {
     pub output_accepted_ordinal: u64,
 }
 impl PrefixFrontierV1 {
-    fn capture(sequence: &SequenceState) -> Result<Self> {
+    pub(in crate::continuous_engine::inner::calibration) fn capture(
+        sequence: &SequenceState,
+    ) -> Result<Self> {
         let cost = sequence
             .cost_frontier
             .ok_or_else(|| invalid("prefix owner unavailable"))?;
@@ -144,15 +153,38 @@ pub struct PrefixReleasedV1 {
     pub actor_applied_output_ordinal: u64,
 }
 
+/// Source8 installation is granted only by its frozen private collector.
+#[derive(Debug)]
+enum PrefixPreparationAuthority {
+    LengthV5,
+    InstalledPlainTextV8 {
+        // Captured after the intervention marker is installed. Recompute from
+        // the actual sampler/masks/output owner before each forced commit.
+        prepared_policy: Option<([u8; 32], HostCostPolicyV2)>,
+    },
+}
+
 /// Constructor and fields stay inside the calibration preparation module.
 /// SequenceState can consume it, but ordinary request metadata cannot make it.
 #[derive(Debug)]
 pub(in crate::continuous_engine) struct InstalledPrefix {
     plan: ValidatedCalibrationPrefixTokensV1,
+    authority: PrefixPreparationAuthority,
     owner: u64,
     original_policy: [u8; 32],
     original_numeric: HostCostPolicyV2,
     pending_commit: Option<PrefixTokenCommitV1>,
+}
+
+impl InstalledPrefix {
+    pub(in crate::continuous_engine) fn policy_marker(&self) -> &'static str {
+        match self.authority {
+            PrefixPreparationAuthority::LengthV5 => "calibration-prefix-preparation.v1",
+            PrefixPreparationAuthority::InstalledPlainTextV8 { .. } => {
+                "calibration-prefix-preparation.installed-v8"
+            }
+        }
+    }
 }
 
 struct RequestRecord {
@@ -161,8 +193,37 @@ struct RequestRecord {
     declaration: CalibrationPrefixTokensV1,
     released: Option<PrefixReleasedV1>,
     completed_length: bool,
+    // A source8 request retains the original terminal capability; no output
+    // policy is rewritten to force a convenient calibration completion.
+    installed_policy: Option<HostCostPolicyV2>,
     last_call: u64,
     last_fifo: u64,
+}
+impl RequestRecord {
+    fn accepts_terminal(&self, reason: ferrum_types::FinishReason, generated: u64) -> bool {
+        if generated == 0 || generated > self.maximum_output as u64 {
+            return false;
+        }
+        match reason {
+            ferrum_types::FinishReason::Length => generated == self.maximum_output as u64,
+            ferrum_types::FinishReason::EOS => {
+                matches!(self.installed_policy.and_then(|p| p.empirical_content_domain),
+                Some(ferrum_interfaces::execution_cost::HostContentDomainV1::PlainTextInstalledV2(cap)) if cap.model_eos)
+            }
+            ferrum_types::FinishReason::Stop => {
+                matches!(self.installed_policy.and_then(|p| p.empirical_content_domain),
+                Some(ferrum_interfaces::execution_cost::HostContentDomainV1::PlainTextInstalledV2(cap)) if cap.user_stop)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefixSource {
+    Standalone,
+    Source5,
+    Source8,
 }
 #[derive(Default)]
 pub(super) struct PrefixPreparationRun {

@@ -11,6 +11,11 @@ use ferrum_interfaces::execution_cost::*;
 use ferrum_types::RequestId;
 
 mod audit;
+mod automatic_reuse;
+mod automatic_settings;
+pub(in crate::continuous_engine::inner) use automatic_settings::{
+    automatic_numerical_settings, automatic_prediction_validity,
+};
 mod calibration_capture;
 pub(in crate::continuous_engine) use calibration_capture::*;
 pub use calibration_capture::{CalibrationActualEvidenceDiagnostic, CalibrationActualWaveUnknown};
@@ -20,12 +25,22 @@ mod clock;
 mod dispatch;
 mod engine;
 mod host_stages;
+mod live_calibration;
+pub(in crate::continuous_engine::inner) use live_calibration::StartupOwnerSeries;
+mod route_population;
+mod structured_epoch;
 pub use host_stages::{
     HostRowStageV1, HostStageCompleteness, HostStageEvidenceV1, HostStageQueueDisposition,
     HostStageQueueReceipt, HostStageWork, HostTerminalStageV1,
 };
 pub(in crate::continuous_engine) use host_stages::{HostSettledReceipt, PendingHostRow};
 mod policy;
+mod prepared_calibration;
+pub(in crate::continuous_engine::inner) use prepared_calibration::{
+    CompletedPreparedSourceJournal, PreparedOwnerCalibration, PreparedSourceCheckpointReceipt,
+    PreparedSourceJournal, PreparedSourceJournalFailure, PreparedSourceJournalLimits,
+    PreparedSourceJournalObserver, PreparedSourceJournalStage, PreparedSourceJournalStatus,
+};
 mod profile;
 mod profile_export;
 pub(in crate::continuous_engine::inner) use profile_export::selected::SelectedCalibrationCapture;
@@ -53,12 +68,19 @@ mod trainer;
 mod worker;
 pub(in crate::continuous_engine) use engine::*;
 pub(in crate::continuous_engine) use runtime::*;
-pub(in crate::continuous_engine) use trainer::structured::structured_discovery_input;
-pub(in crate::continuous_engine) use trainer::structured_v2::structured_discovery_input_v2;
+pub(in crate::continuous_engine) use trainer::structured::{
+    structured_capture_input, structured_discovery_input,
+};
+pub(in crate::continuous_engine) use trainer::structured_v2::structured_capture_input_v2;
 mod presubmit;
 mod prospective_capture;
 pub(in crate::continuous_engine::inner) use prospective_capture::ProspectiveCapture;
+mod memory;
+mod prefix;
+pub(in crate::continuous_engine) use prefix::{prefix_cost_shape, PrefixCostSnapshot};
+mod resolved;
 mod sample;
+mod sealed;
 mod selected_feedback;
 mod sink;
 mod structured_feedback;
@@ -148,6 +170,8 @@ impl CostCallRejection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::continuous_engine) enum CostCallDisposition {
+    /// Raw facts entered the bounded FIFO; numerical qualification is pending.
+    Queued,
     Published,
     Rejected(CostCallRejection),
     Dropped(CostSampleDrop),
@@ -174,7 +198,8 @@ struct DispatchSummary {
 pub(in crate::continuous_engine) struct EngineCostCall {
     call_id: NonZeroU64,
     clock: Arc<dyn CostObservationClock>,
-    sink: Arc<BoundedCostSampleSink>,
+    sink: Option<Arc<BoundedCostSampleSink>>,
+    sealed_at_ns: Option<Option<u64>>,
     identity: ExecutorCostIdentityAvailability,
     participants: Vec<CostObservationParticipant>,
     prepare_started_at_ns: Option<u64>,
@@ -183,6 +208,7 @@ pub(in crate::continuous_engine) struct EngineCostCall {
     dispatch: DispatchSummary,
     context_created: bool,
     structured_capture: bool,
+    numeric_observation: ferrum_interfaces::vnext::DeviceCostObservationDemand,
     host: Vec<Option<HostCommitEvidence>>,
     host_fence: Arc<()>,
     host_stages: Vec<host_stages::HostRowProgress>,
@@ -193,6 +219,10 @@ pub(in crate::continuous_engine) struct EngineCostCall {
     calibration_capture: Option<Arc<CostCalibrationCapture>>,
     presubmit_prediction: Option<presubmit::PendingPrediction>,
     prospective_capture: Option<Arc<ProspectiveCapture>>,
+    live_ticket: Option<live_calibration::Ticket>,
+    source_generation: u64,
+    feedback_population: Option<ferrum_types::SloCalibrationRoutePopulationV1>,
+    observation_memory: Option<Arc<memory::ObservationBytePermit>>,
 }
 
 /// Dropping this guard copies only already observed facts. In particular,
@@ -263,8 +293,12 @@ impl EngineCostCall {
         {
             return Err(CostCallRejection::InvalidParticipants);
         }
-        let recorder = BoundedWaveRecorder::new(call_id, spec.recorder_limits)
-            .map_err(|_| CostCallRejection::RecorderCapacity)?;
+        let recorder = BoundedWaveRecorder::new_with_byte_limits(
+            call_id,
+            spec.recorder_limits,
+            sink.byte_limits(),
+        )
+        .map_err(|_| CostCallRejection::RecorderCapacity)?;
         let mut host = Vec::new();
         host.try_reserve_exact(spec.participants.len())
             .map_err(|_| CostCallRejection::RecorderCapacity)?;
@@ -280,7 +314,11 @@ impl EngineCostCall {
         Ok(Self {
             call_id,
             clock,
-            sink,
+            source_generation: sink.source_generation(),
+            feedback_population: sink.feedback_population(),
+            sink: Some(sink),
+            sealed_at_ns: None,
+            observation_memory: None,
             identity: spec.identity,
             participants: spec.participants,
             prepare_started_at_ns: spec.prepare_started_at_ns,
@@ -289,6 +327,7 @@ impl EngineCostCall {
             dispatch: DispatchSummary::default(),
             context_created: false,
             structured_capture: false,
+            numeric_observation: ferrum_interfaces::vnext::DeviceCostObservationDemand::Required,
             host,
             host_fence: Arc::new(()),
             host_stages,
@@ -299,11 +338,39 @@ impl EngineCostCall {
             calibration_capture: None,
             presubmit_prediction: None,
             prospective_capture: None,
+            live_ticket: None,
         })
+    }
+
+    fn with_source_generation(mut self, generation: u64) -> Self {
+        self.source_generation = generation;
+        self
+    }
+
+    fn with_live_ticket(mut self, mut ticket: Option<live_calibration::Ticket>) -> Self {
+        if let Some(ticket) = &mut ticket {
+            ticket.bind_call(self.call_id.get());
+            if tracing::enabled!(
+                target: "ferrum_engine::continuous_engine::inner::cost_observation::runtime",
+                tracing::Level::DEBUG
+            ) {
+                self.recorder.enable_route_diagnostics();
+            }
+        }
+        self.live_ticket = ticket;
+        self
     }
 
     pub fn with_structured_capture(mut self, enabled: bool) -> Self {
         self.structured_capture = enabled;
+        self
+    }
+
+    fn with_cost_observation_demand(
+        mut self,
+        demand: ferrum_interfaces::vnext::DeviceCostObservationDemand,
+    ) -> Self {
+        self.numeric_observation = demand;
         self
     }
 
@@ -325,7 +392,8 @@ impl EngineCostCall {
                 self.prepare_started_at_ns,
                 self.boundary,
             )
-            .with_structured_capture(self.structured_capture),
+            .with_structured_capture(self.structured_capture)
+            .with_cost_observation_demand(self.numeric_observation),
             summary: &mut self.dispatch,
         })
     }
@@ -397,122 +465,17 @@ impl EngineCostCall {
     }
 
     pub fn finish(mut self) -> CostCallDisposition {
-        self.finished = true;
-        self.capture_actual_unknown_diagnostic();
-        let stages = self.make_host_stages();
-        if let (Some(capture), Some(stages)) = (&self.calibration_capture, &stages) {
-            capture.complete_host_stages(Arc::clone(stages));
-        }
-        match self.make_sample() {
-            Ok(sample) => {
-                // The normal observer remains the sole author of this sample.
-                // Only an explicitly attached calibration consumer copies the
-                // bounded facts; no before/after state is guessed here.
-                let captured = self.calibration_capture.as_ref().map(|_| {
-                    let rows = self.recorder.observations()[0]
-                        .shape
-                        .as_ref()
-                        .expect("validated sample shape")
-                        .rows
-                        .clone();
-                    let commits = rows
-                        .iter()
-                        .map(|row| {
-                            self.host
-                                .iter()
-                                .flatten()
-                                .find(|commit| {
-                                    commit.request_id == row.request_id
-                                        && commit.owner_incarnation == row.owner_incarnation
-                                        && commit.work_generation == row.work_generation
-                                        && commit.input_index == row.input_index
-                                })
-                                .expect("validated physical/host identity")
-                                .clone()
-                        })
-                        .collect();
-                    let host_features = rows
-                        .iter()
-                        .map(|row| {
-                            self.participants
-                                .iter()
-                                .find(|participant| {
-                                    participant.request_id == row.request_id
-                                        && participant.owner_incarnation == row.owner_incarnation
-                                        && participant.work_generation == row.work_generation
-                                        && participant.input_index == row.input_index
-                                })
-                                .expect("validated physical/participant identity")
-                                .host_features
-                        })
-                        .collect();
-                    (sample.clone(), rows, commits, host_features)
-                });
-                self.sink.call_finished();
-                let offered = self
-                    .sink
-                    .offer_evidence_numbered(CostEvidenceEntry::Training { sample, stages });
-                self.record_host_stage_queue(&offered);
-                let (disposition, accepted_ordinal) = match offered {
-                    Ok(ordinal) => (CostCallDisposition::Published, Some(ordinal)),
-                    Err(reason) => (CostCallDisposition::Dropped(reason), None),
-                };
-                if let (Some(capture), Some((sample, actual_rows, commits, host_features))) =
-                    (&self.calibration_capture, captured)
-                {
-                    capture.complete(CostCalibrationResult::Observed {
-                        sample: Box::new(sample),
-                        actual_rows,
-                        commits,
-                        host_features,
-                        accepted_ordinal,
-                        disposition,
-                    });
-                }
-                disposition
-            }
-            Err(reason) => {
-                self.sink.reject(reason);
-                if let Some(stages) = stages {
-                    let offered =
-                        self.sink
-                            .offer_evidence_numbered(CostEvidenceEntry::StagesOnly {
-                                stages,
-                                legacy_rejection: reason,
-                            });
-                    self.record_host_stage_queue(&offered);
-                }
-                if let Some(capture) = &self.calibration_capture {
-                    capture.complete(CostCalibrationResult::Rejected(reason));
-                }
-                CostCallDisposition::Rejected(reason)
-            }
-        }
+        self.enqueue_frozen()
     }
 }
 
 impl Drop for EngineCostCall {
     fn drop(&mut self) {
         if !self.finished {
-            self.capture_actual_unknown_diagnostic();
-            self.sink.reject(CostCallRejection::Abandoned);
-            if let Some(stages) = self.make_host_stages() {
-                if let Some(capture) = &self.calibration_capture {
-                    capture.complete_host_stages(Arc::clone(&stages));
-                }
-                let offered = self
-                    .sink
-                    .offer_evidence_numbered(CostEvidenceEntry::StagesOnly {
-                        stages,
-                        legacy_rejection: CostCallRejection::Abandoned,
-                    });
-                self.record_host_stage_queue(&offered);
-            }
-            if let Some(capture) = &self.calibration_capture {
-                capture.complete(CostCalibrationResult::Rejected(
-                    CostCallRejection::Abandoned,
-                ));
-            }
+            self.rejection.get_or_insert(CostCallRejection::Abandoned);
+            self.stage_rejection
+                .get_or_insert(CostCallRejection::Abandoned);
+            let _ = self.enqueue_frozen();
         }
     }
 }

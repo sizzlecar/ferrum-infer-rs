@@ -19,6 +19,7 @@ mod weights;
 pub(super) use plan::Shape;
 
 const ENTRY: &str = "vnext_rn_fragment_mma";
+const Q6_PREFETCH_ENTRY: &str = "vnext_rn_fragment_q6_prefetch_mma";
 const LABEL: &str = "vnext_rn_fragment_swiglu";
 
 /// Bind eligibility to the actual embedded module, including builds targeting
@@ -48,6 +49,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaRnFragmentSwiGluProvider {
     capture: SloStructuredCostCapture,
     cublas_identity: cublas_api::CublasCostIdentitySource,
     mma: CudaFunction,
+    mma_q6_prefetch: CudaFunction,
     silu: CudaFunction,
 }
 
@@ -109,12 +111,16 @@ impl CudaRnFragmentSwiGluProvider {
                 CheckpointPartitionNumerics::CapturedExecutionContinuation,
             ),
         ));
-        let mma = runtime
+        let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::VNEXT_GGUF))
-            .map_err(|e| CudaDeviceRuntimeError::driver("RN fragment module", e))?
+            .map_err(|e| CudaDeviceRuntimeError::driver("RN fragment module", e))?;
+        let mma = module
             .load_function(ENTRY)
             .map_err(|e| CudaDeviceRuntimeError::driver("RN fragment function", e))?;
+        let mma_q6_prefetch = module
+            .load_function(Q6_PREFETCH_ENTRY)
+            .map_err(|e| CudaDeviceRuntimeError::driver("RN Q6 fragment function", e))?;
         let silu = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL))
@@ -126,6 +132,7 @@ impl CudaRnFragmentSwiGluProvider {
             capture: runtime.structured_capture(),
             cublas_identity: runtime.cublas_cost_identity_source(),
             mma,
+            mma_q6_prefetch,
             silu,
         })
     }
@@ -164,6 +171,19 @@ impl OperationResourceEstimator for CudaRnFragmentSwiGluProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaRnFragmentSwiGluProvider {
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        if request.operation_id().as_str() != DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID
+        {
+            return None;
+        }
+        plan::PreparedShape::from_values(request.bindings(), request.attributes())
+            .ok()
+            .map(ferrum_interfaces::vnext::PreparedOperationCostData::new)
+    }
+
     fn uses_captured_replay_cost_recipe(&self) -> bool {
         true
     }
@@ -203,11 +223,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRnFragmentSwiGluProvider {
         {
             return Ok(None);
         }
-        let shape = Shape::from_values(
-            request.bindings(),
-            request.attributes(),
-            request.immediate_tokens(),
-        )
+        let shape = match request.prepared_cost_data::<plan::PreparedShape>() {
+            Some(prepared) => prepared.for_tokens(request.immediate_tokens()),
+            None => Shape::from_values(
+                request.bindings(),
+                request.attributes(),
+                request.immediate_tokens(),
+            ),
+        }
         .map_err(invalid_plan)?;
         if request.rows().len() > 1
             && (!request.binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)?
@@ -241,6 +264,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRnFragmentSwiGluProvider {
         execution::encode(
             self.descriptor.provider_implementation_fingerprint(),
             &self.mma,
+            &self.mma_q6_prefetch,
             &self.silu,
             self.capture,
             self.cublas_identity.frozen(),

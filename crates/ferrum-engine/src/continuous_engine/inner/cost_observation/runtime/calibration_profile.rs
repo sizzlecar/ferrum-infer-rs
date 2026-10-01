@@ -25,7 +25,13 @@ impl EngineCostRuntime {
         }
         config.validate().map_err(FerrumError::config)?;
         let clock = profile::read_load_clock(self.clock.as_ref(), &config.profile_import)?;
-        let seed = profile::load_seed(&self.identity, config, Some(path), Some(clock))?;
+        let seed = profile::load_seed_with_domain(
+            &self.identity,
+            config,
+            Some(path),
+            Some(clock),
+            self.workload_domain(),
+        )?;
         seed.receipt
             .filter(|r| r.structured_whole_wave_v2.is_some())
             .ok_or_else(|| {
@@ -41,7 +47,13 @@ impl EngineCostRuntime {
         cut: &CostProfileCutReceipt,
     ) -> Result<LoadedCalibrationProfile, FerrumError> {
         let clock = profile::read_load_clock(self.clock.as_ref(), &config.profile_import)?;
-        let seed = profile::load_seed(&self.identity, config, Some(&cut.profile), Some(clock))?;
+        let seed = profile::load_seed_with_domain(
+            &self.identity,
+            config,
+            Some(&cut.profile),
+            Some(clock),
+            self.workload_domain(),
+        )?;
         let receipt = seed.receipt.ok_or_else(|| {
             FerrumError::internal("calibration artifact import returned no provenance receipt")
         })?;

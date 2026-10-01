@@ -1,6 +1,16 @@
 //! CUDA native submission and the final optional cost guard.
 use super::*;
 
+/// Keep every stream effect after the final authorization. This boundary is
+/// shared by native event recording below and its hardware-independent test.
+fn after_submission_authorization<T, E>(
+    authorize: impl FnOnce() -> Result<(), E>,
+    begin: impl FnOnce() -> T,
+) -> Result<T, E> {
+    authorize()?;
+    Ok(begin())
+}
+
 impl CudaDeviceRuntime {
     pub(super) fn submit_with_timing_and_guard<S>(
         &self,
@@ -26,6 +36,7 @@ impl CudaDeviceRuntime {
                 )),
             ));
         }
+        let numeric_observation = commands.cost_observation_demand();
         let timing_mode = commands.timing_mode();
         let compute_path_requirement = commands.compute_path_requirement();
         let declared_eager_compute_node_indices = commands
@@ -41,7 +52,7 @@ impl CudaDeviceRuntime {
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let graph_before = stream.executable_cache.cost_graph_stream_state();
         if guard.is_some()
-            && (timing_mode != DeviceTimingMode::Off
+            && (!timing_mode.guarded_completion_compatible()
                 || !logical_attribution
                 || (reusable_execution_capture.is_some()
                     && guard.is_some_and(|gate| {
@@ -139,6 +150,7 @@ impl CudaDeviceRuntime {
             if !valid {
                 library_contract_valid = false;
                 command.statistical_evidence = None;
+                command.observation = None;
             }
         }
         if !library_contract_valid && guard.is_some_and(|gate| gate.relies_on_cost_witness()) {
@@ -478,6 +490,9 @@ impl CudaDeviceRuntime {
                 );
             }
         }
+        // Native preparation may already have executed capture/upload work.
+        // Optional numeric publication cannot reject or reinterpret that work.
+        self.publish_prepared_cost_catalog(stream);
         let graph_after_preparation = stream.executable_cache.cost_graph_stream_state();
         let graph_evidence = |replayed_segments| {
             DeviceSubmissionGraphEvidence::new(
@@ -529,25 +544,6 @@ impl CudaDeviceRuntime {
         };
         drop(validate_stage);
 
-        let begin_timing_stage =
-            CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
-        let timing = match timing_mode {
-            DeviceTimingMode::Off => CudaFenceTiming::NotRequested,
-            DeviceTimingMode::Completion
-            | DeviceTimingMode::Replay
-            | DeviceTimingMode::Kernel
-            | DeviceTimingMode::Verification => {
-                match stream
-                    .stream
-                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
-                {
-                    Ok(start) => CudaFenceTiming::Events { start },
-                    Err(_) => CudaFenceTiming::Unavailable,
-                }
-            }
-        };
-        drop(begin_timing_stage);
-
         let enqueue_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
         let mut command_spans =
@@ -556,39 +552,74 @@ impl CudaDeviceRuntime {
         let mut index = 0;
         let mut executable_candidate_index = 0;
         let mut actual_replayed_segments = 0_u64;
-        if let Some(guard) = guard.filter(|_| !adaptive_guarded) {
-            // All blocking context/preparation work and host attribution
-            // allocation is complete. Recheck the exact cache before enqueue.
-            let previews_match = guarded_replays.as_ref().is_some_and(|expected| {
-                let mut index = 0;
-                for (physical, command) in commands.iter().enumerate() {
-                    if let Some(invocation) = command.reusable_execution_invocation() {
-                        if stream
-                            .executable_cache
-                            .preview_program_segment(invocation, physical as u32)
-                            .as_ref()
-                            != expected.get(index)
-                        {
-                            return false;
+        // Allocate the event before final authorization; event creation does not
+        // enqueue work. Recording it is the first irreversible stream effect.
+        let prepared_start = timing_mode
+            .completion_enabled()
+            .then(|| {
+                self.context
+                    .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .ok()
+            })
+            .flatten();
+        let timing = after_submission_authorization(
+            || {
+                if let Some(guard) = guard.filter(|_| !adaptive_guarded) {
+                    // All blocking context/preparation work and host attribution
+                    // allocation is complete. Recheck the exact cache before enqueue.
+                    let previews_match = guarded_replays.as_ref().is_some_and(|expected| {
+                        let mut index = 0;
+                        for (physical, command) in commands.iter().enumerate() {
+                            if let Some(invocation) = command.reusable_execution_invocation() {
+                                if stream
+                                    .executable_cache
+                                    .preview_program_segment(invocation, physical as u32)
+                                    .as_ref()
+                                    != expected.get(index)
+                                {
+                                    return false;
+                                }
+                                index += 1;
+                            }
                         }
-                        index += 1;
+                        index == expected.len()
+                    });
+                    if !previews_match
+                        || stream.executable_cache.cost_graph_stream_state()
+                            != graph_after_preparation
+                    {
+                        return Err(ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable);
+                    }
+                    if let Err(reason) = guard.check(guarded_attribution.as_ref()) {
+                        return Err(reason);
                     }
                 }
-                index == expected.len()
-            });
-            if !previews_match
-                || stream.executable_cache.cost_graph_stream_state() != graph_after_preparation
-            {
-                stream.state.cancel_recording();
-                return Err(GuardedDeviceSubmissionError::Rejected(
-                    ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable,
-                ));
-            }
-            if let Err(reason) = guard.check(guarded_attribution.as_ref()) {
+                Ok(())
+            },
+            || {
+                let _stage = CudaSubmissionStageTimer::start(
+                    timing_sink,
+                    DeviceSubmissionStage::BeginTiming,
+                );
+                if !timing_mode.completion_enabled() {
+                    return CudaFenceTiming::NotRequested;
+                }
+                match prepared_start {
+                    Some(start) if start.record(&stream.stream).is_ok() => {
+                        CudaFenceTiming::Events { start }
+                    }
+                    _ => CudaFenceTiming::Unavailable,
+                }
+            },
+        );
+        let timing = match timing {
+            Ok(timing) => timing,
+            Err(reason) => {
                 stream.state.cancel_recording();
                 return Err(GuardedDeviceSubmissionError::Rejected(reason));
             }
-        }
+        };
+
         while index < commands.len() {
             if let Some(invocation) = commands[index].reusable_execution_invocation() {
                 let start = command_spans.as_ref().and_then(|_| {
@@ -623,22 +654,13 @@ impl CudaDeviceRuntime {
                                 .replayed_logical_commands()
                                 .expect("attributable CUDA replay retained its logical commands");
                             let reusable_graph_node_count =
-                                logical_commands.iter().try_fold(0_u64, |total, command| {
-                                    total.checked_add(command.reusable_graph_node_count())
-                                });
-                            let Some(reusable_graph_node_count) = reusable_graph_node_count else {
-                                stream.state.fail();
-                                self.quarantine(stream, commands);
-                                panic!(
-                                    "CUDA submission became indeterminate because replay graph attribution overflowed u64"
-                                );
-                            };
-                            let replayed = DeviceReplayedSegmentAttribution::new(
+                                logical_commands.logical_graph_node_count();
+                            let replayed = DeviceReplayedSegmentAttribution::from_catalogue(
                                 physical_command_index,
                                 invocation.program_id().clone(),
                                 invocation.segment().clone(),
                                 reusable_executable_fingerprint.to_string(),
-                                logical_commands.as_ref().to_vec(),
+                                &logical_commands,
                             );
                             let Some(replayed) = replayed else {
                                 stream.state.fail();
@@ -646,6 +668,13 @@ impl CudaDeviceRuntime {
                                 panic!(
                                     "CUDA submission became indeterminate because sealed replay attribution drifted"
                                 );
+                            };
+                            let replayed = match launch.observation() {
+                                Some(observation) => replayed
+                                    .clone()
+                                    .with_observation(observation)
+                                    .unwrap_or(replayed),
+                                None => replayed,
                             };
                             execution_paths
                                 .as_mut()
@@ -859,6 +888,23 @@ impl CudaDeviceRuntime {
         if S::ENABLED {
             timing_sink.record_reusable_execution(replay_observation);
         }
+        // Original encoding and launch have succeeded. Preserve exact rows
+        // regardless of demand; only now allocate scalar core-transfer packets.
+        if numeric_observation.is_required() {
+            if command_node_indices.is_some() {
+                if let Some(budget) = self.observation_template_budget() {
+                    for command in &mut commands {
+                        command.prepare_core_observation(&budget);
+                    }
+                }
+            }
+        } else {
+            for command in &mut commands {
+                command.observation = None;
+                command.statistical_evidence = None;
+                command.replay_cost_recipe = None;
+            }
+        }
         let attribution = match command_node_indices
             .as_ref()
             .zip(execution_paths.as_ref())
@@ -946,5 +992,35 @@ impl CudaDeviceRuntime {
         };
         drop(fence_stage);
         Ok(fence)
+    }
+}
+
+#[cfg(test)]
+mod completion_guard_order_tests {
+    use super::after_submission_authorization;
+    use std::cell::RefCell;
+
+    #[test]
+    fn guarded_completion_authorization_precedes_every_stream_effect() {
+        let events = RefCell::new(Vec::new());
+        let rejected: Result<(), &str> = after_submission_authorization(
+            || {
+                events.borrow_mut().push("guard");
+                Err("expired")
+            },
+            || events.borrow_mut().push("record_start_event"),
+        );
+        assert_eq!(rejected, Err("expired"));
+        assert_eq!(*events.borrow(), ["guard"]);
+        events.borrow_mut().clear();
+        let accepted: Result<(), &str> = after_submission_authorization(
+            || {
+                events.borrow_mut().push("guard");
+                Ok(())
+            },
+            || events.borrow_mut().push("record_start_event"),
+        );
+        accepted.unwrap();
+        assert_eq!(*events.borrow(), ["guard", "record_start_event"]);
     }
 }

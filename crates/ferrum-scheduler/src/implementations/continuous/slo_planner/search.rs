@@ -8,8 +8,8 @@ use super::{
 };
 use std::sync::Arc;
 
-mod replay_budget;
-use replay_budget::{MeasuredReplayWork, ReplayReserve};
+pub(super) mod replay_budget;
+pub(super) use replay_budget::{MeasuredReplayWork, ReplayReserve};
 
 /// Finite heuristic search. Neither candidate truncation, beam pruning, nor
 /// exhausted depth is ever an impossibility proof. All surviving branches are
@@ -52,7 +52,7 @@ impl<'epoch> Frame<'epoch> {
 /// improvement share the same transaction, action limits and final replay.
 struct CommonPlan<'epoch>(Node<'epoch>);
 
-struct ComputeBudget {
+pub(super) struct ComputeBudget {
     last_ns: u64,
     replay_reserve: ReplayReserve,
     planner_deadline_ns: u64,
@@ -62,7 +62,21 @@ struct ComputeBudget {
 }
 
 impl ComputeBudget {
-    fn new(
+    /// Prefix comparison independently replays both complete queue paths.
+    pub(super) fn reserve_prefix_pair(
+        &mut self,
+        left: MeasuredReplayWork,
+        right: MeasuredReplayWork,
+    ) -> Result<(u64, u64), PlanningUnknownReason> {
+        let pair = left.with_span(0, right.ns())?;
+        self.replay_reserve.observe_complete(pair)?;
+        Ok((
+            self.replay_reserve.measured_ns(),
+            self.replay_reserve.reserved_ns(),
+        ))
+    }
+
+    pub(super) fn new(
         phase: PlanningPhaseBudget,
         now_ns: u64,
         settings: &ferrum_types::SloPlannerConfig,
@@ -86,7 +100,10 @@ impl ComputeBudget {
         })
     }
 
-    fn read(&mut self, clock: &mut dyn PlanningClock) -> Result<u64, PlanningUnknownReason> {
+    pub(super) fn read(
+        &mut self,
+        clock: &mut dyn PlanningClock,
+    ) -> Result<u64, PlanningUnknownReason> {
         let now = clock.now_ns();
         if now < self.last_ns {
             return Err(PlanningUnknownReason::ClockMovedBackwards);
@@ -777,6 +794,10 @@ impl BoundedSloPlanner {
                     .min(state.minimum_cost_freshness_slack_ns - final_delay)
                     .min(snapshot.scope.horizon_end_ns - final_now - 1),
             };
+            if let (Some(observer), Some(replay)) = (model.query_observer(), state.observed_replay)
+            {
+                observer.selected_replay(replay);
+            }
             let witness = PlanningWitnessSummary {
                 waves: solution.waves.len(),
                 completion_at_ns,

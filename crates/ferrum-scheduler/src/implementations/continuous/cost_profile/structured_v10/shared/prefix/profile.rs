@@ -225,9 +225,12 @@ pub fn load_structured_profile_v12(
             scope: r.header.scope.clone(),
             domain,
             provenance: StructuredImportProvenanceV10 {
+                monotonic_domain: None,
+                storage: ferrum_types::SloCostProfileStorage::File,
+                clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
                 schema_version: 12,
-                loaded_from: path.into(),
-                source_path: source_path.clone(),
+                loaded_from: Some(path.into()),
+                source_path: Some(source_path.clone()),
                 file_sha256,
                 source_sha256: declared.source_sha256,
                 parameters_sha256: d.parameters_sha256,
@@ -246,7 +249,7 @@ pub fn load_structured_profile_v12(
                 loaded_unix_ns: mapped.wall,
                 generated_unix_ns: r.closing.wall_unix_ns,
                 clock: mapped.clock,
-                producer: r.header.common.producer.clone(),
+                producer: serde_json::value::to_raw_value(&r.header.common.producer)?,
                 phases: d.phases,
             },
         });

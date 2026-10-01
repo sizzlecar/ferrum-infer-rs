@@ -93,6 +93,35 @@ impl EngineInner {
             }
         };
         let outcome = self.execute_plan_runtime_wave(batch, &selection).await?;
+        // Experiments enter this compatibility boundary directly, without a
+        // controller publication. Preserve the normal physical/readiness
+        // wake owners, and return before another model submission.
+        if self.config.scheduler.slo.experiment_stage.is_some() {
+            match &outcome {
+                PlanRuntimeWaveOutcome::NotSubmitted(ExecutorExecutionDeferral::Capacity(
+                    deferral,
+                )) => {
+                    let (prefills, decodes) = selection.participants();
+                    let ids: Vec<_> = prefills.iter().chain(decodes).cloned().collect();
+                    self.defer_wave_capacity_for_requests(&ids, deferral)
+                        .await?;
+                }
+                PlanRuntimeWaveOutcome::Unsupported => {
+                    // Never spin forever or silently change this single-wave
+                    // stage into the legacy same-turn fallback algorithm.
+                    let (prefills, decodes) = selection.participants();
+                    for id in prefills.iter().chain(decodes) {
+                        self.complete_request_with_error(id, FerrumError::unsupported(
+                            "declared single-wave experiment is unsupported for this physical cohort",
+                        )).await?;
+                    }
+                    return Err(FerrumError::unsupported(
+                        "single-wave experiment cohort is unsupported",
+                    ));
+                }
+                _ => {}
+            }
+        }
         let observation = match outcome {
             PlanRuntimeWaveOutcome::Completed(receipt) => serde_json::json!({
                 "disposition": "completed",
@@ -118,11 +147,17 @@ impl EngineInner {
             }
             PlanRuntimeWaveOutcome::NotSubmitted(ExecutorExecutionDeferral::RequestState(
                 deferral,
-            )) => serde_json::json!({
+            )) => {
+                let observation = serde_json::json!({
                 "disposition": "not_submitted",
                 "reason": "request_state",
                 "request_ids": deferral.request_ids(),
-            }),
+                });
+                if self.config.scheduler.slo.experiment_stage.is_some() {
+                    self.defer_for_request_state_readiness(deferral).await?;
+                }
+                observation
+            }
             PlanRuntimeWaveOutcome::Unsupported => {
                 serde_json::json!({"disposition": "unsupported"})
             }

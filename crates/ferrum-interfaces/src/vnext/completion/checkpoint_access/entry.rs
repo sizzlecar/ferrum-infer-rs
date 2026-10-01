@@ -1,9 +1,10 @@
 use super::super::{CheckpointTimingPhase, StateTransferKind};
 use super::*;
 use crate::vnext::{
-    CheckpointBackingAllocationDecision, CheckpointPartitionNumerics, DeviceTimingMode,
-    ExecutionPlan, SequenceCheckpointCapability, SequenceCheckpointLayout,
-    SequenceStateTransferKind, SequenceStateTransferPreparation, TrustedPlanRuntimeBinding,
+    CheckpointBackingAllocationDecision, CheckpointPartitionNumerics,
+    CheckpointTransferObservationStart, DeviceTimingMode, ExecutionPlan,
+    SequenceCheckpointCapability, SequenceCheckpointLayout, SequenceStateTransferKind,
+    SequenceStateTransferPreparation, TrustedPlanRuntimeBinding,
 };
 
 fn access_layout(
@@ -32,6 +33,9 @@ fn wrap_submission<R: DeviceRuntime>(
     restore: Option<RestoreInput<R>>,
 ) -> NativeCheckpointStart<R> {
     match submission {
+        Ok(StateTransferSubmission::GuardRejected(reason)) => {
+            NativeCheckpointStart::GuardRejected(reason)
+        }
         Ok(StateTransferSubmission::Submitted(handle)) => {
             NativeCheckpointStart::Submitted(NativeCheckpointTransfer { handle, restore })
         }
@@ -78,6 +82,71 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         lane: Arc<ExecutionLane<R>>,
         timing_mode: DeviceTimingMode,
     ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_capture_sequence_checkpoint_with_observation(
+            plan,
+            binding,
+            source,
+            lane,
+            timing_mode,
+            CheckpointTransferObservationStart::now(),
+        )
+    }
+
+    /// Preserve a model entry timestamp while using the exact same native
+    /// transfer authority. Recording never changes submission or recovery.
+    pub fn try_capture_sequence_checkpoint_with_observation(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        binding: &TrustedPlanRuntimeBinding<R>,
+        source: Arc<SequenceSession<R>>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+        observation_start: CheckpointTransferObservationStart,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_capture_sequence_checkpoint_prepared(
+            plan,
+            binding,
+            source,
+            lane,
+            timing_mode,
+            observation_start,
+            None,
+        )
+    }
+
+    /// Preserve the native guard through the final backend commit. There is
+    /// no ordinary-submit fallback when guard support or validation is absent.
+    pub fn try_capture_sequence_checkpoint_guarded(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        binding: &TrustedPlanRuntimeBinding<R>,
+        source: Arc<SequenceSession<R>>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+        observation_start: CheckpointTransferObservationStart,
+        guard: &dyn crate::vnext::CheckpointTransferSubmissionGuard,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_capture_sequence_checkpoint_prepared(
+            plan,
+            binding,
+            source,
+            lane,
+            timing_mode,
+            observation_start,
+            Some(guard),
+        )
+    }
+
+    fn try_capture_sequence_checkpoint_prepared(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        binding: &TrustedPlanRuntimeBinding<R>,
+        source: Arc<SequenceSession<R>>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+        observation_start: CheckpointTransferObservationStart,
+        submission_guard: Option<&dyn crate::vnext::CheckpointTransferSubmissionGuard>,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
         let preparation = self.checkpoint_timings.start(
             StateTransferKind::Capture,
             CheckpointTimingPhase::PrepareClaim,
@@ -117,6 +186,12 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .map_err(|_| invalid_completion("checkpoint span start exceeds u64"))?;
         let input_length = u64::try_from(boundary.full_input().len())
             .map_err(|_| invalid_completion("checkpoint input length exceeds u64"))?;
+        let observation_start = observation_start.with_host_work(
+            crate::vnext::NativeCheckpointTransferHostWork::from_lengths(
+                boundary_tokens,
+                input_length,
+            )?,
+        );
         if !layout.permits_capture_from(source_start, boundary_tokens, input_length) {
             return Ok(NativeCheckpointStart::Skipped(
                 CheckpointAccessSkipReason::BoundaryNotPermitted,
@@ -158,7 +233,15 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         let permit = owner.try_reserve_capture()?;
         drop(preparation);
         Ok(wrap_submission(
-            self.submit_capture_with_timing(guard, permit, byte_plan, lane, timing_mode),
+            self.submit_capture_with_observation(
+                guard,
+                permit,
+                byte_plan,
+                lane,
+                timing_mode,
+                observation_start,
+                submission_guard,
+            ),
             None,
         ))
     }
@@ -194,6 +277,77 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         full_input: Arc<[u32]>,
         lane: Arc<ExecutionLane<R>>,
         timing_mode: DeviceTimingMode,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_restore_sequence_checkpoint_with_observation(
+            plan,
+            target,
+            checkpoint,
+            full_input,
+            lane,
+            timing_mode,
+            CheckpointTransferObservationStart::now(),
+        )
+    }
+
+    /// Success is observed only after the existing restore publication is
+    /// acknowledged. Dropping or rejecting it produces no successful sample.
+    pub fn try_restore_sequence_checkpoint_with_observation(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        target: Arc<SequenceSession<R>>,
+        checkpoint: &SequenceCheckpoint<R>,
+        full_input: Arc<[u32]>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+        observation_start: CheckpointTransferObservationStart,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_restore_sequence_checkpoint_prepared(
+            plan,
+            target,
+            checkpoint,
+            full_input,
+            lane,
+            timing_mode,
+            observation_start,
+            None,
+        )
+    }
+
+    /// Preserve the native guard through the final backend commit. There is
+    /// no ordinary-submit fallback when guard support or validation is absent.
+    pub fn try_restore_sequence_checkpoint_guarded(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        target: Arc<SequenceSession<R>>,
+        checkpoint: &SequenceCheckpoint<R>,
+        full_input: Arc<[u32]>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+        observation_start: CheckpointTransferObservationStart,
+        guard: &dyn crate::vnext::CheckpointTransferSubmissionGuard,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_restore_sequence_checkpoint_prepared(
+            plan,
+            target,
+            checkpoint,
+            full_input,
+            lane,
+            timing_mode,
+            observation_start,
+            Some(guard),
+        )
+    }
+
+    fn try_restore_sequence_checkpoint_prepared(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        target: Arc<SequenceSession<R>>,
+        checkpoint: &SequenceCheckpoint<R>,
+        full_input: Arc<[u32]>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+        observation_start: CheckpointTransferObservationStart,
+        submission_guard: Option<&dyn crate::vnext::CheckpointTransferSubmissionGuard>,
     ) -> Result<NativeCheckpointStart<R>, VNextError> {
         let preparation = self.checkpoint_timings.start(
             StateTransferKind::Restore,
@@ -231,13 +385,23 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
         };
         guard.validate_restore_input(Arc::clone(&full_input))?;
+        let observation_start = observation_start.with_host_work(
+            crate::vnext::NativeCheckpointTransferHostWork::from_lengths(
+                u64::try_from(checkpoint.completed_tokens())
+                    .map_err(|_| invalid_completion("checkpoint prefix length exceeds u64"))?,
+                u64::try_from(full_input.len())
+                    .map_err(|_| invalid_completion("checkpoint input length exceeds u64"))?,
+            )?,
+        );
         drop(preparation);
-        let submission = self.submit_restore_with_timing(
+        let submission = self.submit_restore_with_observation(
             guard,
             Arc::clone(&checkpoint.inner),
             layout,
             lane,
             timing_mode,
+            observation_start,
+            submission_guard,
         );
         Ok(wrap_submission(
             submission,

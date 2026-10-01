@@ -2,8 +2,15 @@
 //! owns logical progress; this adapter never advances a second copy of it.
 use super::*;
 use ferrum_scheduler::implementations::continuous::slo_planner::{
-    PlanningExecutionContext, PlanningExecutionInput, PlanningExecutionState, ProjectedExecution,
+    PlanningExecutionContext, PlanningExecutionInput, PlanningExecutionState, PlanningGraphDomain,
+    PlanningProjectionDiagnostic, PrefixRendezvousOffer, ProjectedExecution,
 };
+mod capture;
+mod prefix;
+pub(in crate::continuous_engine::inner::slo_controller) use capture::CacheCaptureExecutorShape;
+mod ready;
+pub(in crate::continuous_engine::inner::slo_controller) use prefix::PrefixExecutorShape;
+pub(in crate::continuous_engine::inner::slo_controller) use ready::ReadyPrefixExecutorShape;
 
 type ProjectionResult<T> = std::result::Result<T, PlanningUnknownReason>;
 
@@ -11,6 +18,11 @@ struct ExecutorState<'epoch> {
     source: ExecutorShape<'epoch>,
     domain: RouteDomain,
     depth: usize,
+    prefix: Option<PrefixRendezvousOffer>,
+    ready_prefix: Option<ReadyPrefixRestoreOffer>,
+    cache_capture: Option<capture::CacheCaptureBinding>,
+    prefix_lease: Option<&'epoch dyn ferrum_interfaces::model_executor::PrefixCaptureLease>,
+    prefix_restored: bool,
 }
 
 impl PlanningExecutionContext for ExecutorShape<'_> {
@@ -36,16 +48,111 @@ impl PlanningExecutionContext for ExecutorShape<'_> {
             },
             domain: RouteDomain::initial(self.captured.route.initial_state()),
             depth: 0,
+            prefix: None,
+            ready_prefix: None,
+            cache_capture: None,
+            prefix_lease: None,
+            prefix_restored: false,
         }))
     }
 }
 
 impl<'epoch> PlanningExecutionState<'epoch> for ExecutorState<'epoch> {
+    fn bind_prefix_cache_capture(
+        &self,
+        input: &PlanningPrefixCacheCaptureBindingInput<'_>,
+        poll: &mut dyn FnMut() -> ProjectionResult<()>,
+    ) -> ProjectionResult<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>> {
+        self.bind_cache_capture(input, poll)
+    }
+    fn project_prefix_cache_capture(
+        &self,
+        input: &PlanningPrefixCacheCaptureInput<'_>,
+        poll: &mut dyn FnMut() -> ProjectionResult<()>,
+    ) -> ProjectionResult<Option<ProjectedPrefixTransition<'epoch>>> {
+        self.project_cache_capture(input, poll)
+    }
+    fn bind_ready_prefix(
+        &self,
+        input: &PlanningReadyPrefixInput<'_>,
+        poll: &mut dyn FnMut() -> ProjectionResult<()>,
+    ) -> ProjectionResult<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>> {
+        self.bind_ready(input, poll)
+    }
+    fn project_ready_prefix_restore(
+        &self,
+        input: &PlanningReadyPrefixRestoreInput<'_>,
+        poll: &mut dyn FnMut() -> ProjectionResult<()>,
+    ) -> ProjectionResult<Option<ProjectedPrefixTransition<'epoch>>> {
+        self.project_ready(input, poll)
+    }
+    fn bind_prefix_continuation(
+        &self,
+        input: &ferrum_scheduler::implementations::continuous::slo_planner::PlanningPrefixContinuationInput<'_>,
+        poll: &mut dyn FnMut() -> ProjectionResult<()>,
+    ) -> ProjectionResult<Option<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>>> {
+        self.bind_prefix(input, poll)
+    }
+    fn project_prefix_transition(
+        &self,
+        input: &ferrum_scheduler::implementations::continuous::slo_planner::PlanningPrefixTransitionInput<'_>,
+        poll: &mut dyn FnMut() -> ProjectionResult<()>,
+    ) -> ProjectionResult<
+        Option<
+            ferrum_scheduler::implementations::continuous::slo_planner::ProjectedPrefixTransition<
+                'epoch,
+            >,
+        >,
+    > {
+        self.project_prefix(input, poll)
+    }
+    fn cost_workload_domain(
+        &self,
+    ) -> Option<&ferrum_interfaces::execution_cost::CostWorkloadDomainV1> {
+        self.source.engine.cost_runtime.as_ref()?.workload_domain()
+    }
+
+    fn graph_domain(&self) -> ProjectionResult<PlanningGraphDomain> {
+        use ferrum_interfaces::vnext::DeviceCostGraphConfiguration as Configuration;
+        let route = &self.source.captured.route;
+        let stream = route.graph_stream_state();
+        let catalog = route.graph_catalog();
+        // The quiescent lane capture already checks catalog/stream identity.
+        // Retain that check here: a catalog is not a substitute for its stream.
+        if catalog.is_some_and(|catalog| Some(catalog.stream_state()) != stream) {
+            return Err(PlanningUnknownReason::UnknownResourceEvidence);
+        }
+        match stream {
+            // Unsupported graph backends (including Metal) legitimately expose
+            // neither stream graph state nor catalog. Exact Disabled stays exact;
+            // this fallback cannot authorize any Warm/ConfiguredEager label.
+            None => Ok(PlanningGraphDomain::SnapshotExact),
+            Some(state) if state.is_unconfigured_empty() => Ok(PlanningGraphDomain::SnapshotExact),
+            Some(state) if state.is_ready() && catalog.is_some() => match state.configuration() {
+                Configuration::OnDemand => Ok(PlanningGraphDomain::ConfiguredPerWave),
+                Configuration::StartupReady => Ok(PlanningGraphDomain::ResidentReplayOnly),
+                _ => Err(PlanningUnknownReason::UnknownResourceEvidence),
+            },
+            _ => Err(PlanningUnknownReason::UnknownResourceEvidence),
+        }
+        // This only chooses the validation domain. Every projection still has
+        // to match its actual core route and uploaded programs in this capture.
+    }
+
     fn project(
         &self,
         input: &PlanningExecutionInput<'_>,
         poll: &mut dyn FnMut() -> ProjectionResult<()>,
     ) -> ProjectionResult<Option<ProjectedExecution<'epoch>>> {
+        let _diagnostic = self
+            .source
+            .captured
+            .budget
+            .diagnostic_scope("candidate_projection");
+        let diagnostic_span = tracing::trace_span!(target: "ferrum::slo_transaction",
+            "candidate_projection", generation=self.source.captured.snapshot.generation,
+            depth=self.depth, rows=input.rows.len(), kind=?input.kind);
+        let _entered = diagnostic_span.enter();
         poll()?;
         if self.depth
             >= self
@@ -61,7 +168,20 @@ impl<'epoch> PlanningExecutionState<'epoch> for ExecutorState<'epoch> {
             return Err(PlanningUnknownReason::ShapeCapacity);
         }
         let snapshot = &self.source.captured.snapshot;
-        let frontiers = input_frontiers(snapshot, input, self.depth, poll)?;
+        let invalid = |diagnostic: PlanningProjectionDiagnostic| {
+            diagnostic.trace(snapshot, Some(self.depth), input.kind, input.rows.len());
+            PlanningUnknownReason::InvalidShapeEvidence
+        };
+        let frontiers = input_frontiers_with_prefix(
+            snapshot,
+            input,
+            self.depth,
+            self.prefix.as_ref(),
+            self.ready_prefix.as_ref(),
+            self.cache_capture.as_ref(),
+            self.prefix_restored,
+            poll,
+        )?;
         let mut ordered_work = input.work.to_vec();
         // The existing authority-based ordering is reused, without invoking
         // the old stateless resolver or replaying a previous wave.
@@ -73,12 +193,12 @@ impl<'epoch> PlanningExecutionState<'epoch> for ExecutorState<'epoch> {
                 .requests
                 .iter()
                 .position(|r| r.key == work.key)
-                .ok_or(PlanningUnknownReason::InvalidShapeEvidence)?;
+                .ok_or_else(|| invalid(PlanningProjectionDiagnostic::WorkOwnerMissing))?;
             let row = input
                 .rows
                 .iter()
                 .find(|row| row.request.key == work.key)
-                .ok_or(PlanningUnknownReason::InvalidShapeEvidence)?;
+                .ok_or_else(|| invalid(PlanningProjectionDiagnostic::WorkRowMissing))?;
             rows.push(PreparedRow {
                 index,
                 work: row.work,
@@ -93,13 +213,15 @@ impl<'epoch> PlanningExecutionState<'epoch> for ExecutorState<'epoch> {
         else {
             return Ok(None);
         };
-        if (self.depth == 0 && canonical_domain.exact().is_none())
-            || canonical_domain
-                .shapes()
-                .iter()
-                .any(|shape| shape.kind != input.kind)
+        if self.depth == 0 && canonical_domain.exact().is_none() {
+            return Err(invalid(PlanningProjectionDiagnostic::RootNotExact));
+        }
+        if canonical_domain
+            .shapes()
+            .iter()
+            .any(|shape| shape.kind != input.kind)
         {
-            return Err(PlanningUnknownReason::InvalidShapeEvidence);
+            return Err(invalid(PlanningProjectionDiagnostic::ProjectionKind));
         }
         Ok(Some(ProjectedExecution {
             host_content_forecasts,
@@ -116,6 +238,11 @@ impl<'epoch> PlanningExecutionState<'epoch> for ExecutorState<'epoch> {
                     .depth
                     .checked_add(1)
                     .ok_or(PlanningUnknownReason::ArithmeticOverflow)?,
+                prefix: self.prefix.clone(),
+                ready_prefix: self.ready_prefix.clone(),
+                cache_capture: self.cache_capture.clone(),
+                prefix_lease: self.prefix_lease,
+                prefix_restored: self.prefix_restored,
             }),
         }))
     }
@@ -130,7 +257,24 @@ pub(super) fn input_frontiers(
     depth: usize,
     poll: &mut dyn FnMut() -> ProjectionResult<()>,
 ) -> ProjectionResult<Vec<ProjectedRequest>> {
+    input_frontiers_with_prefix(snapshot, input, depth, None, None, None, false, poll)
+}
+
+fn input_frontiers_with_prefix(
+    snapshot: &SchedulerSnapshot,
+    input: &PlanningExecutionInput<'_>,
+    depth: usize,
+    prefix: Option<&PrefixRendezvousOffer>,
+    ready: Option<&ReadyPrefixRestoreOffer>,
+    capture: Option<&capture::CacheCaptureBinding>,
+    prefix_restored: bool,
+    poll: &mut dyn FnMut() -> ProjectionResult<()>,
+) -> ProjectionResult<Vec<ProjectedRequest>> {
     poll()?;
+    let invalid = |diagnostic: PlanningProjectionDiagnostic| {
+        diagnostic.trace(snapshot, Some(depth), input.kind, input.rows.len());
+        PlanningUnknownReason::InvalidShapeEvidence
+    };
     if input.requests.len() != snapshot.requests.len()
         || input.requests.is_empty()
         || input.requests.len() > 256
@@ -139,11 +283,20 @@ pub(super) fn input_frontiers(
         || input.work.len() > snapshot.capabilities.max_wave_rows.get()
         || depth > 16
     {
-        return Err(PlanningUnknownReason::InvalidShapeEvidence);
+        return Err(invalid(PlanningProjectionDiagnostic::FrontierEnvelope));
     }
     let mut frontiers = Vec::with_capacity(input.requests.len());
     for (current, initial) in input.requests.iter().zip(&snapshot.requests) {
         poll()?;
+        let adjusted = prefix
+            .and_then(|offer| prefix::comparison_initial(offer, initial, current, prefix_restored))
+            .or_else(|| {
+                ready.and_then(|offer| ready::restored_initial(offer, initial, prefix_restored))
+            })
+            .or_else(|| {
+                capture.and_then(|binding| capture::comparison_initial(binding, initial, current))
+            });
+        let initial = adjusted.as_ref().unwrap_or(initial);
         if current.key != initial.key
             || current.timing.ingress_at_ns != initial.timing.ingress_at_ns
             || current.timing.budgets != initial.timing.budgets
@@ -160,7 +313,7 @@ pub(super) fn input_frontiers(
                 && current.timing.first_commit_at_ns != initial.timing.first_commit_at_ns)
             || (depth == 0 && !same_request(current, initial))
         {
-            return Err(PlanningUnknownReason::InvalidShapeEvidence);
+            return Err(invalid(PlanningProjectionDiagnostic::FrontierIdentity));
         }
         match (&initial.phase, &current.phase) {
             (RequestPhaseView::Decode, RequestPhaseView::Decode) => {}
@@ -178,13 +331,13 @@ pub(super) fn input_frontiers(
                     || now.logical_high_water > now.total_prompt_tokens.get()
                     || now.offset > now.executable_until
                 {
-                    return Err(PlanningUnknownReason::InvalidShapeEvidence);
+                    return Err(invalid(PlanningProjectionDiagnostic::FrontierPrefill));
                 }
             }
             (RequestPhaseView::Prefill(before), RequestPhaseView::Decode)
                 if current.context_tokens >= before.total_prompt_tokens.get()
                     && current.timing.committed_tokens > initial.timing.committed_tokens => {}
-            _ => return Err(PlanningUnknownReason::InvalidShapeEvidence),
+            _ => return Err(invalid(PlanningProjectionDiagnostic::FrontierPhase)),
         }
         frontiers.push(ProjectedRequest {
             key: current.key.clone(),
@@ -205,15 +358,15 @@ pub(super) fn input_frontiers(
             .iter()
             .any(|prior| prior.key == work.key)
         {
-            return Err(PlanningUnknownReason::InvalidShapeEvidence);
+            return Err(invalid(PlanningProjectionDiagnostic::WorkDuplicateOwner));
         }
         let current = input
             .requests
             .iter()
             .find(|r| r.key == work.key)
-            .ok_or(PlanningUnknownReason::InvalidShapeEvidence)?;
+            .ok_or_else(|| invalid(PlanningProjectionDiagnostic::WorkOwnerMissing))?;
         if !same_request(current, row.request) {
-            return Err(PlanningUnknownReason::InvalidShapeEvidence);
+            return Err(invalid(PlanningProjectionDiagnostic::WorkIdentity));
         }
         let expected = match (&work.action, &current.phase) {
             (WaveAction::Decode, RequestPhaseView::Decode) if current.context_tokens > 0 => {
@@ -227,7 +380,7 @@ pub(super) fn input_frontiers(
                     .checked_add(count.get())
                     .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
                 if *offset != progress.offset || end > progress.executable_until {
-                    return Err(PlanningUnknownReason::InvalidShapeEvidence);
+                    return Err(invalid(PlanningProjectionDiagnostic::WorkRange));
                 }
                 has_prefill = true;
                 ActualRowWork::Prefill {
@@ -236,10 +389,10 @@ pub(super) fn input_frontiers(
                     total_prompt_tokens: progress.total_prompt_tokens.get(),
                 }
             }
-            _ => return Err(PlanningUnknownReason::InvalidShapeEvidence),
+            _ => return Err(invalid(PlanningProjectionDiagnostic::WorkPhase)),
         };
         if expected != row.work || current.timing.completed() {
-            return Err(PlanningUnknownReason::InvalidShapeEvidence);
+            return Err(invalid(PlanningProjectionDiagnostic::WorkRowOrCompleted));
         }
         recurrent = recurrent
             .checked_add(current.recurrent_state_bytes)
@@ -249,10 +402,10 @@ pub(super) fn input_frontiers(
         (true, true) => ActualWaveKind::Mixed,
         (true, false) => ActualWaveKind::Prefill,
         (false, true) => ActualWaveKind::Decode,
-        _ => return Err(PlanningUnknownReason::InvalidShapeEvidence),
+        _ => return Err(invalid(PlanningProjectionDiagnostic::WorkPhase)),
     };
     if kind != input.kind || recurrent != input.recurrent_state_bytes {
-        return Err(PlanningUnknownReason::InvalidShapeEvidence);
+        return Err(invalid(PlanningProjectionDiagnostic::WorkKindOrRecurrent));
     }
     poll()?;
     Ok(frontiers)

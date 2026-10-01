@@ -56,6 +56,42 @@ pub(super) fn transfer(
     result.finish().ok()
 }
 
+/// The submitted depth-one 3D device copy, including both physical row pitches.
+/// It cannot borrow the statistical identity of a contiguous DtoD transfer.
+pub(super) fn strided_transfer(
+    region: ferrum_interfaces::vnext::StridedCopyRegion,
+    tokens: u64,
+    capture: SloStructuredCostCapture,
+) -> Option<SelectedCommandCostEvidenceV1> {
+    let mut result = builder(capture, tokens)?;
+    let mut layout = Sha256::new();
+    layout.update(b"cuda.initialized_device_rectangle.v1");
+    layout.update(region.width_bytes().to_le_bytes());
+    layout.update(region.height().to_le_bytes());
+    layout.update(region.source_pitch_bytes().to_le_bytes());
+    layout.update(region.destination_pitch_bytes().to_le_bytes());
+    let class = SelectedAlgorithmClassV1::new(
+        "cuda.cuMemcpy3DAsync.depth1.device",
+        1,
+        Sha256::digest(b"cuda.byte_exact_transfer.v1").into(),
+        layout.finalize().into(),
+    )
+    .ok()?;
+    result
+        .transfer_with_replay_geometry(
+            class,
+            StatisticalTransferKindV1::DeviceToDevice,
+            region.length_bytes().ok()?,
+            TransferReplayGeometryV1 {
+                row_bytes: region.width_bytes(),
+                rows: region.height(),
+                destination_stride_bytes: region.destination_pitch_bytes(),
+            },
+        )
+        .ok()?;
+    result.finish().ok()
+}
+
 /// Already coalesced physical binding transfers: destination pitch, row bytes,
 /// row count. Padding between destination rows is not transferred.
 pub(super) fn program_binding(
@@ -256,7 +292,10 @@ mod tests {
                 ),
             ];
             for (command, kind, bytes) in &commands {
-                let observed = command.statistical_evidence.as_ref().unwrap();
+                assert!(command.statistical_evidence.is_none());
+                let packet = command.observation_packet().unwrap();
+                let mut projected = packet.template().project(packet.input()).unwrap();
+                let observed = projected.pop().flatten().unwrap();
                 let future = runtime
                     .cost_core_transfer_evidence(*kind, *bytes, 0)
                     .unwrap();
@@ -280,5 +319,204 @@ mod tests {
         assert!(runtime
             .encode_copy(&source, &destination, CopyRegion::new(30, 0, 13).unwrap())
             .is_err());
+    }
+    #[test]
+    #[ignore = "requires an actual CUDA device"]
+    fn cuda_native_strided_checkpoint_round_trip_keeps_tail_slots_and_passive_identity() {
+        use super::super::*;
+        use ferrum_interfaces::vnext::{
+            BufferUsage, DeviceObservationTemplateBudget, ResourceId, StridedCopyRegion,
+        };
+        let runtime = CudaDeviceRuntime::new_with_structured_capture(
+            crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config(
+                0,
+                DeviceId::new("device.cuda.strided-state-copy").unwrap(),
+                AttentionExecutionPolicy::Portable,
+            )
+            .unwrap(),
+            SloStructuredCostCapture::HostSettledV1,
+        )
+        .unwrap();
+        let mut stream = runtime.create_stream().unwrap();
+
+        // Exercise every tail width for both the smallest packed key and the
+        // actual product KV geometry. These are ordinary device allocations:
+        // destination value pitches 2..30 must work without cuMemAllocPitch.
+        for (heads, dimension) in [(1_usize, 8_usize), (4, 256)] {
+            for tokens in 1_usize..16 {
+                let state_bytes = 2 * heads * dimension * 16 * 2;
+                let packed_bytes = 2 * heads * dimension * tokens * 2;
+                let state_size = state_bytes + 16;
+                let packed_size = packed_bytes + 16;
+                let make = |name: &str, size: usize| {
+                    let base = stream.stream.alloc_zeros::<u8>(size).unwrap();
+                    let pointer = base.device_ptr(&stream.stream).0;
+                    CudaDeviceBuffer {
+                        descriptor: BufferDescriptor {
+                            resource_id: ResourceId::new(name).unwrap(),
+                            size_bytes: size as u64,
+                            alignment_bytes: 1,
+                            usage: BufferUsage::Transfer,
+                            element_type: ElementType::U8,
+                        },
+                        runtime_instance: runtime.runtime_instance,
+                        allocation: Arc::new(CudaAllocation {
+                            _base: base,
+                            _memory_charge: None,
+                            aligned_ptr: pointer,
+                            requested_bytes: size as u64,
+                        }),
+                    }
+                };
+                let source = make("source-state", state_size);
+                let compact = make("packed-checkpoint", packed_size);
+                let restored = make("fresh-restored-state", state_size);
+                let mut original = vec![0xD3; state_size];
+                let mut expected = vec![0xA7; state_size];
+                let mut expected_packed = vec![0xEE; packed_size];
+                let key_bytes = heads * dimension * 16 * 2;
+                let packed_key_bytes = heads * dimension * tokens * 2;
+                // Write initialized K/V slots through the kernel's exact blocked ABI.
+                for head in 0..heads {
+                    for token in 0..tokens {
+                        for dim in 0..dimension {
+                            for byte in 0..2 {
+                                let key_row = head * (dimension / 8) + dim / 8;
+                                let k = 5 + key_row * 256 + token * 16 + (dim % 8) * 2 + byte;
+                                let v = 5
+                                    + key_bytes
+                                    + (head * dimension + dim) * 32
+                                    + token * 2
+                                    + byte;
+                                let packed_k =
+                                    7 + key_row * tokens * 16 + token * 16 + (dim % 8) * 2 + byte;
+                                let packed_v = 7
+                                    + packed_key_bytes
+                                    + (head * dimension + dim) * tokens * 2
+                                    + token * 2
+                                    + byte;
+                                let value = 1 + ((head * 17 + dim * 3 + token + byte) % 61) as u8;
+                                original[k] = value;
+                                expected[k] = value;
+                                expected_packed[packed_k] = value;
+                                original[v] = value + 71;
+                                expected[v] = value + 71;
+                                expected_packed[packed_v] = value + 71;
+                            }
+                        }
+                    }
+                }
+                for (buffer, bytes) in [
+                    (&source, original),
+                    (&compact, vec![0xEE; packed_size]),
+                    (&restored, vec![0xA7; state_size]),
+                ] {
+                    runtime
+                        .encode_upload(
+                            &bytes,
+                            HostTransferLayout::new(ElementType::U8, bytes.len() as u64).unwrap(),
+                            buffer,
+                            0,
+                        )
+                        .unwrap()
+                        .enqueue(&stream.stream, &stream.blas)
+                        .unwrap();
+                }
+                let geometry = [
+                    StridedCopyRegion::new(
+                        5,
+                        7,
+                        (tokens * 16) as u64,
+                        (heads * (dimension / 8)) as u64,
+                        256,
+                        (tokens * 16) as u64,
+                    )
+                    .unwrap(),
+                    StridedCopyRegion::new(
+                        (5 + key_bytes) as u64,
+                        (7 + packed_key_bytes) as u64,
+                        (tokens * 2) as u64,
+                        (heads * dimension) as u64,
+                        32,
+                        (tokens * 2) as u64,
+                    )
+                    .unwrap(),
+                ];
+                let budget = DeviceObservationTemplateBudget::new(1 << 20).unwrap();
+                for region in geometry {
+                    let mut command = runtime
+                        .encode_strided_copy(&source, &compact, region)
+                        .unwrap()
+                        .unwrap();
+                    command.prepare_core_observation(&budget);
+                    let packet = command.observation_packet().unwrap();
+                    let observed = packet
+                        .template()
+                        .project(packet.input())
+                        .unwrap()
+                        .pop()
+                        .flatten()
+                        .unwrap();
+                    let expected_cost =
+                        strided_transfer(region, 0, SloStructuredCostCapture::HostSettledV1)
+                            .unwrap();
+                    assert_eq!(
+                        observed.family_signature(),
+                        expected_cost.family_signature()
+                    );
+                    assert_eq!(observed.work(), expected_cost.work());
+                    assert_ne!(
+                        observed.family_signature(),
+                        transfer(
+                            StatisticalTransferKindV1::DeviceToDevice,
+                            region.length_bytes().unwrap(),
+                            0,
+                            SloStructuredCostCapture::HostSettledV1,
+                        )
+                        .unwrap()
+                        .family_signature(),
+                    );
+                    command.enqueue(&stream.stream, &stream.blas).unwrap();
+                    runtime
+                        .encode_strided_copy(&compact, &restored, region.reversed())
+                        .unwrap()
+                        .unwrap()
+                        .enqueue(&stream.stream, &stream.blas)
+                        .unwrap();
+                }
+                let actual = runtime
+                    .readback(
+                        &mut stream,
+                        &restored,
+                        CopyRegion::new(0, 0, state_size as u64).unwrap(),
+                        HostTransferLayout::new(ElementType::U8, state_size as u64).unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "restored H={heads}, D={dimension}, tail={tokens}"
+                );
+                let packed = runtime
+                    .readback(
+                        &mut stream,
+                        &compact,
+                        CopyRegion::new(0, 0, packed_size as u64).unwrap(),
+                        HostTransferLayout::new(ElementType::U8, packed_size as u64).unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    packed, expected_packed,
+                    "packed H={heads}, D={dimension}, tail={tokens}"
+                );
+                assert!(runtime
+                    .encode_strided_copy(
+                        &source,
+                        &compact,
+                        StridedCopyRegion::new((state_size - 1) as u64, 0, 4, 2, 32, 4).unwrap(),
+                    )
+                    .unwrap()
+                    .is_err());
+            }
+        }
     }
 }

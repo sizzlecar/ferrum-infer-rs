@@ -96,8 +96,10 @@ mod tests {
     #[test]
     fn structured_feedback_requires_v2_and_keeps_bounded_declared_policy() {
         let mut config = SloCostObservationConfig::structured_whole_wave_v2();
+        config.structured_actual_capture = SloStructuredActualCapturePolicy::ConsumerDrivenV1;
         config.structured_feedback = policy();
         config.validate().unwrap();
+        assert!(config.needs_structured_actual_sample(false));
         for predictor in [
             SloCostPredictor::LegacyFeatureModel,
             SloCostPredictor::SelectedWholeWaveV1,

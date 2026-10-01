@@ -46,13 +46,21 @@ pub struct SloSelectedFeedbackSettingsV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SloSelectedFeedbackStorageV1 {
-    CreateNew { path: PathBuf },
-    Resume { path: PathBuf },
+    /// Process-local corrections are discarded on restart with their base.
+    #[serde(deserialize_with = "deserialize_disabled")]
+    MemoryOnly,
+    CreateNew {
+        path: PathBuf,
+    },
+    Resume {
+        path: PathBuf,
+    },
 }
 impl SloSelectedFeedbackStorageV1 {
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> Option<&std::path::Path> {
         match self {
-            Self::CreateNew { path } | Self::Resume { path } => path,
+            Self::MemoryOnly => None,
+            Self::CreateNew { path } | Self::Resume { path } => Some(path),
         }
     }
 }
@@ -90,10 +98,9 @@ pub(super) fn validate_feedback_bounds(
     maximum_age_ns: u64,
     maximum_file_bytes: usize,
 ) -> Result<(), String> {
-    if storage.path().as_os_str().is_empty()
-        || !storage.path().is_absolute()
-        || storage.path().file_name().is_none()
-    {
+    if storage.path().is_some_and(|path| {
+        path.as_os_str().is_empty() || !path.is_absolute() || path.file_name().is_none()
+    }) {
         return Err("selected feedback requires an absolute versioned receipt path".into());
     }
     if p.minimum_consecutive_underestimates > p.minimum_underestimates

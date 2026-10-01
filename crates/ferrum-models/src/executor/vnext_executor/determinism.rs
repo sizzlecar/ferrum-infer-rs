@@ -323,7 +323,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .collect::<Result<Vec<_>>>()?;
         let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0_u32;
-        let mut maintenance_receipts = Vec::new();
+        let mut maintenance_receipts = backing_maintenance::BackingMaintenanceProgress::default();
         loop {
             match step
                 .try_prepare_determinism_submission_wave(requests.clone())
@@ -815,7 +815,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     };
                 let catalog_snapshot = self.reusable_execution_catalog.read().clone();
                 let catalog = match catalog_snapshot.as_deref() {
-                    Some(catalog) if catalog.lane_epoch == self.lane.reusable_execution_epoch() => {
+                    Some(catalog) if catalog.epoch() == self.lane.reusable_execution_epoch() => {
                         catalog
                     }
                     _ => {
@@ -828,7 +828,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ))
                     }
                 };
-                let reusable_program = match catalog.programs.get(&program_id) {
+                let reusable_program = match catalog.programs().get(&program_id) {
                     Some(program) => program,
                     None => {
                         return Err(self.abort_prepared_unsubmitted_step(

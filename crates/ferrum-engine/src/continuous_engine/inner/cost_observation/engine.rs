@@ -91,12 +91,64 @@ fn completion_state_signature(state: &ResponseCompletionState) -> Option<[u8; 32
     Some(digest.finalize().into())
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ActualCaptureDemand {
+    pub(super) source_generation: u64,
+    pub(super) structured_sample: bool,
+    pub(super) numeric_observation: ferrum_interfaces::vnext::DeviceCostObservationDemand,
+}
+
+impl EngineCostRuntime {
+    /// One acquire read binds the decision and the eventual call to the same
+    /// published source generation. Closing a prediction epoch or revoking a
+    /// monitor does not erase its source generation or its evidence demand.
+    pub(super) fn actual_capture_demand(
+        &self,
+        config: &ferrum_types::SloCostObservationConfig,
+        manual_calibration: bool,
+        live_ticket: bool,
+        diagnostic_trace: bool,
+    ) -> ActualCaptureDemand {
+        let source_generation = self.sink.source_generation();
+        let automatic_feedback = source_generation != 0
+            && matches!(
+                config.live_structured_calibration,
+                ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { .. }
+            );
+        let structured_sample = self.structured_capture
+            && (live_ticket
+                || config.needs_structured_actual_sample(manual_calibration)
+                || automatic_feedback
+                || diagnostic_trace);
+        // Structured V2 has no legacy trainer (including before publication).
+        // Its absent consumer needs only the original exact/lifecycle FIFO.
+        // Legacy aggregate/selected callers retain their original numeric demand.
+        let numeric_observation = if !config.structured_actual_capture.is_legacy()
+            && config.predictor == ferrum_types::SloCostPredictor::StructuredWholeWaveV2
+            && !structured_sample
+        {
+            ferrum_interfaces::vnext::DeviceCostObservationDemand::NotRequired
+        } else {
+            ferrum_interfaces::vnext::DeviceCostObservationDemand::Required
+        };
+        ActualCaptureDemand {
+            source_generation,
+            structured_sample,
+            numeric_observation,
+        }
+    }
+}
+
 pub(in crate::continuous_engine) struct EngineCostPreparation {
     runtime: Arc<EngineCostRuntime>,
     started_at: Option<u64>,
     participants: Vec<CostObservationParticipant>,
     rejection: Option<CostCallRejection>,
     preparation_intervention: bool,
+    structured_actual_sample: bool,
+    numeric_observation: ferrum_interfaces::vnext::DeviceCostObservationDemand,
+    live_ticket: Option<super::live_calibration::Ticket>,
+    source_generation: u64,
     finished: bool,
 }
 impl EngineCostPreparation {
@@ -152,7 +204,10 @@ impl EngineCostPreparation {
                 // and their original FIFO still exist for the next protocol.
                 call.rejection = Some(CostCallRejection::CalibrationPreparation);
             }
-            call.with_structured_capture(self.runtime.structured_capture)
+            call.with_structured_capture(self.structured_actual_sample)
+                .with_cost_observation_demand(self.numeric_observation)
+                .with_live_ticket(self.live_ticket.take())
+                .with_source_generation(self.source_generation)
         })
         .map(ObservedCostCall::new)
     }
@@ -184,6 +239,11 @@ mod audit_tests {
                 participants: Vec::new(),
                 rejection: None,
                 preparation_intervention: false,
+                structured_actual_sample: false,
+                numeric_observation:
+                    ferrum_interfaces::vnext::DeviceCostObservationDemand::Required,
+                live_ticket: None,
+                source_generation: 0,
                 finished: false,
             }
         };
@@ -231,9 +291,26 @@ impl EngineInner {
     pub(in crate::continuous_engine) fn prepare_cost_observation(
         &self,
     ) -> Option<EngineCostPreparation> {
+        if self.config.scheduler.slo.experiment_stage.is_some()
+            && !self
+                .config
+                .scheduler
+                .slo
+                .execution_policy()
+                .cost_observation
+        {
+            return None;
+        }
         let runtime = self.cost_runtime.as_ref()?;
         // Read the anchor before allocation and before preparing any real input.
         let started_at = runtime.clock.now_ns();
+        let live_ticket = runtime.reserve_live_ticket(started_at);
+        let capture = runtime.actual_capture_demand(
+            &self.config.scheduler.slo.cost_observation,
+            self.manual_calibration_driver,
+            live_ticket.is_some(),
+            self.profile_trace_jsonl.is_some() || self.scheduler_trace_jsonl.is_some(),
+        );
         runtime.sink.preparation_started();
         Some(EngineCostPreparation {
             runtime: Arc::clone(runtime),
@@ -241,6 +318,10 @@ impl EngineInner {
             participants: Vec::new(),
             rejection: None,
             preparation_intervention: false,
+            live_ticket,
+            source_generation: capture.source_generation,
+            structured_actual_sample: capture.structured_sample,
+            numeric_observation: capture.numeric_observation,
             finished: false,
         })
     }

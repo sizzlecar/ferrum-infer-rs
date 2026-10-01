@@ -1,5 +1,7 @@
 //! Legal logical work is resolved into a canonical physical route explicitly.
-use super::{super::cost_model::*, cost_shape::canonical_cost_shape, types::*};
+use super::{
+    super::cost_model::*, cost_shape::canonical_cost_shape, types::*, PlanningProjectionDiagnostic,
+};
 use ferrum_interfaces::execution_cost::{ActualRowWork, ActualWaveKind};
 #[cfg(test)]
 use std::cell::Cell;
@@ -228,27 +230,49 @@ pub(super) fn validate_domain(
         .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
     for canonical in domain.shapes() {
         poll_budget()?;
-        if canonical.rows.len() != rows.len()
-            || canonical.kind != kind
-            || canonical.recurrent_state_bytes != recurrent_state_bytes
-            || canonical
-                .rows
-                .iter()
-                .zip(rows)
-                .any(|(actual, expected)| *actual != expected.work)
+        let diagnostic = if canonical.rows.len() != rows.len() {
+            Some(PlanningProjectionDiagnostic::CanonicalRows)
+        } else if canonical.kind != kind {
+            Some(PlanningProjectionDiagnostic::CanonicalKind)
+        } else if canonical.recurrent_state_bytes != recurrent_state_bytes {
+            Some(PlanningProjectionDiagnostic::CanonicalRecurrent)
+        } else if canonical
+            .rows
+            .iter()
+            .zip(rows)
+            .any(|(actual, expected)| *actual != expected.work)
         {
+            Some(PlanningProjectionDiagnostic::CanonicalWork)
+        } else {
+            None
+        };
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.trace(snapshot, None, kind, rows.len());
             return Err(PlanningUnknownReason::InvalidShapeEvidence);
         }
         if matches!(domain, PlanningShapeDomain::HostContentAlternatives(_))
             && canonical.host_content_features.is_none()
         {
+            PlanningProjectionDiagnostic::CanonicalHostContent.trace(
+                snapshot,
+                None,
+                kind,
+                rows.len(),
+            );
             return Err(PlanningUnknownReason::InvalidShapeEvidence);
         }
         let shape = canonical_cost_shape(canonical)?;
-        if shape.path != snapshot.capabilities.path
-            || !graph_domain.accepts(snapshot.capabilities.graph_state, shape.graph_state)
-            || shape.order != snapshot.capabilities.order
-        {
+        let diagnostic = if shape.path != snapshot.capabilities.path {
+            Some(PlanningProjectionDiagnostic::ExecutionPath)
+        } else if !graph_domain.accepts(snapshot.capabilities.graph_state, shape.graph_state) {
+            Some(PlanningProjectionDiagnostic::GraphState)
+        } else if shape.order != snapshot.capabilities.order {
+            Some(PlanningProjectionDiagnostic::RowOrder)
+        } else {
+            None
+        };
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.trace(snapshot, None, kind, rows.len());
             return Err(PlanningUnknownReason::InvalidShapeEvidence);
         }
         shapes.push(shape);

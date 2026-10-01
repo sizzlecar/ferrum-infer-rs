@@ -1,6 +1,8 @@
 //! Opt-in assertion on a real resident graph launch in the existing fixture.
 use super::*;
-use ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1;
+use ferrum_interfaces::execution_cost::{
+    SelectedReplayAlgorithmTemplateV1, StructuredCostSampleDemand,
+};
 use std::num::NonZeroU64;
 
 struct NoTiming;
@@ -52,6 +54,33 @@ pub(super) fn submit_for_nodes(
     range: Range<usize>,
     node_ids: &[&str],
 ) -> CompletionHandle<Runtime> {
+    submit_for_nodes_with_demand(
+        fixture,
+        executable,
+        identity,
+        active,
+        input,
+        program,
+        wave,
+        range,
+        node_ids,
+        StructuredCostSampleDemand::RuntimePolicy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn submit_for_nodes_with_demand(
+    fixture: &Fixture,
+    executable: &dyn ExecutablePlanView,
+    identity: &BatchOperationIdentity,
+    active: &TrustedActiveSequenceBinding,
+    input: SubmissionWaveInputUpload,
+    program: &DeviceReusableExecutionProgram,
+    wave: PreparedStepSubmissionWave<Runtime>,
+    range: Range<usize>,
+    node_ids: &[&str],
+    demand: StructuredCostSampleDemand,
+) -> CompletionHandle<Runtime> {
     let rows = [OperationCostWorkRow {
         offset: range.start as u64,
         count: NonZeroU64::new(range.len() as u64).unwrap(),
@@ -86,26 +115,47 @@ pub(super) fn submit_for_nodes(
             (index, predicted)
         })
         .collect::<Vec<_>>();
-    let (handle, attribution) = OperationDispatch::encode_and_submit_wave_with_cost_observation(
-        fixture.providers.providers(),
-        executable,
-        identity,
-        std::iter::once(active),
-        DeviceTimingMode::Off,
-        &[input],
-        SubmissionExecutionPolicy::determinism_replayed(1),
-        Some(program),
-        &NoTiming,
-        wave,
-        &fixture.lane,
-        &fixture.reaper,
-    )
-    .unwrap()
-    .into_parts();
+    let (handle, attribution) =
+        OperationDispatch::encode_and_submit_wave_with_cost_evidence_demand(
+            fixture.providers.providers(),
+            executable,
+            identity,
+            std::iter::once(active),
+            DeviceTimingMode::Off,
+            &[input],
+            SubmissionExecutionPolicy::determinism_replayed(1),
+            Some(program),
+            true,
+            ferrum_interfaces::vnext::DeviceCostObservationDemand::Required,
+            demand,
+            &NoTiming,
+            wave,
+            &fixture.lane,
+            &fixture.reaper,
+        )
+        .unwrap()
+        .into_parts();
     let attribution = attribution.expect("real graph attribution");
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    // Test the same explicit completed-ledger boundary as the observation
+    // worker. All comparisons below share this one resolved result.
+    let resolved = attribution
+        .device()
+        .clone()
+        .resolve_observation()
+        .expect("actual completed graph numeric projection");
+    if demand == StructuredCostSampleDemand::NotRequested {
+        assert!(resolved
+            .replayed_segments()
+            .iter()
+            .flat_map(|segment| segment.logical_commands())
+            .all(|logical| logical.statistical_evidence().is_none()));
+    }
     for (index, predicted) in predictions {
-        let observed = attribution
-            .device()
+        let observed = resolved
             .replayed_segments()
             .iter()
             .flat_map(|segment| segment.logical_commands())
@@ -114,6 +164,16 @@ pub(super) fn submit_for_nodes(
         let [logical] = observed.as_slice() else {
             panic!("native node must actually replay, no eager fallback")
         };
+        // This checks the backend's original successful-capture template even
+        // when actual sampling is omitted. It does not attach this prediction
+        // to the command, manufacture an actual sample, or authorize execution.
+        assert!(logical
+            .bind_current_cost_evidence(Some(&predicted))
+            .is_some());
+        if demand == StructuredCostSampleDemand::NotRequested {
+            assert!(logical.statistical_evidence().is_none());
+            continue;
+        }
         let selected = logical
             .statistical_evidence()
             .expect("current native work bound to sealed capture");

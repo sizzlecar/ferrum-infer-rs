@@ -17,17 +17,24 @@ fn finish<T, R: DeviceRuntime>(
         executor.attach_guarded_maintenance(selected, outcome)
     };
     if let Some(observation) = observation {
-        observation.finish_call(match &outcome {
-            GuardedDispatchOutcome::Submitted(Ok(_)) => ObservedCallOutcome::Completed,
-            GuardedDispatchOutcome::Submitted(Err(_)) => ObservedCallOutcome::Failed,
-            GuardedDispatchOutcome::Deferred(_)
-            | GuardedDispatchOutcome::MaintenanceDeferred { .. } => ObservedCallOutcome::Deferred,
-            GuardedDispatchOutcome::Unsupported
-            | GuardedDispatchOutcome::ReplanBeforeEncode
-            | GuardedDispatchOutcome::NotSubmittedAfterPreparation(_) => {
-                ObservedCallOutcome::NotSubmitted
+        match &outcome {
+            GuardedDispatchOutcome::Submitted(Ok(_)) => {
+                observation.finish_call(ObservedCallOutcome::Completed)
             }
-        });
+            GuardedDispatchOutcome::Submitted(Err(_)) => {
+                observation.finish_call(ObservedCallOutcome::Failed)
+            }
+            GuardedDispatchOutcome::Deferred(deferral)
+            | GuardedDispatchOutcome::MaintenanceDeferred { deferral, .. } => {
+                observation.finish_capacity_deferred(deferral)
+            }
+            GuardedDispatchOutcome::NotSubmittedAfterPreparation(receipt) => {
+                observation.finish_guard_rollback(receipt)
+            }
+            GuardedDispatchOutcome::Unsupported | GuardedDispatchOutcome::ReplanBeforeEncode => {
+                observation.finish_call(ObservedCallOutcome::NotSubmitted)
+            }
+        }
     }
     outcome
 }
@@ -91,10 +98,10 @@ fn matches_inputs(
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn supports_guarded_prefill_wave(&self, expected: &ExpectedExecutionWave) -> bool {
         self.supports_guarded_work(expected)
-            // Boundary retention can submit an independent CheckpointTransfer.
-            // Until that maintenance has its own controller phase, reject this
-            // policy before changing any retained-prefill registry state.
-            && self.resolved_plan.execution_plan().payload().memory().checkpoint_capacity().is_none()
+            // Guarded waves suppress implicit retention. Checkpoint transfers
+            // are separate controller actions with their own final guard.
+            && (self.resolved_plan.execution_plan().payload().memory().checkpoint_capacity().is_none()
+                || self.supports_guarded_prefix_maintenance())
     }
 
     pub(in crate::executor::vnext_executor) fn restore_guarded_prefills(

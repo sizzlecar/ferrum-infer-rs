@@ -18,6 +18,9 @@ use crate::vnext::{
 use serde_json::{json, Value};
 use std::error::Error;
 
+#[path = "prepared_catalog_tests.rs"]
+mod prepared_catalog_tests;
+
 #[path = "checkpoint/maintenance_tests.rs"]
 mod checkpoint_maintenance_tests;
 
@@ -99,6 +102,9 @@ impl Drop for TestBuffer {
 
 struct TestStream {
     drops: Arc<AtomicU64>,
+    catalog_stream_id: u64,
+    catalog_source: Option<crate::vnext::DeviceCostGraphCatalogSource>,
+    prepared_catalog: Option<Arc<crate::vnext::DevicePreparedCostGraphCatalog>>,
 }
 
 impl Drop for TestStream {
@@ -128,14 +134,21 @@ struct TestRuntime {
     reusable_trim_fails: AtomicBool,
     fence_behavior: AtomicU8,
     submit_behavior: AtomicU8,
+    checkpoint_guard_enabled: AtomicBool,
+    checkpoint_guard_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     device_timing: Mutex<DeviceTimingMeasurement<DeviceExecutionTiming>>,
     timing_queries: AtomicU64,
     submitted_timing_modes: Mutex<Vec<DeviceTimingMode>>,
     encoded_copy_regions: Mutex<Vec<CopyRegion>>,
     encoded_zero_bytes: Mutex<Vec<u64>>,
     cost_graph_catalog: Mutex<Option<crate::vnext::DeviceCostGraphCatalog>>,
+    cost_graph_shared_catalog: Mutex<Option<Arc<crate::vnext::DeviceCostGraphCatalog>>>,
     cost_graph_state_override: Mutex<Option<crate::vnext::DeviceCostGraphStreamState>>,
     cost_graph_probe: Mutex<Option<Box<dyn Fn() + Send>>>,
+    prepared_catalog_enabled: AtomicBool,
+    prepared_catalog_bind_fails: AtomicBool,
+    created_catalog_streams: AtomicU64,
+    catalog_budget: Arc<crate::vnext::DeviceObservationTemplateBudget>,
 }
 
 struct TestFence {
@@ -198,14 +211,21 @@ impl TestRuntime {
             reusable_trim_fails: AtomicBool::new(false),
             fence_behavior: AtomicU8::new(TestFenceBehavior::Succeeded as u8),
             submit_behavior: AtomicU8::new(TestSubmitBehavior::Submitted as u8),
+            checkpoint_guard_enabled: AtomicBool::new(false),
+            checkpoint_guard_hook: Mutex::new(None),
             device_timing: Mutex::new(DeviceTimingMeasurement::NotRequested),
             timing_queries: AtomicU64::new(0),
             submitted_timing_modes: Mutex::new(Vec::new()),
             encoded_copy_regions: Mutex::new(Vec::new()),
             encoded_zero_bytes: Mutex::new(Vec::new()),
             cost_graph_catalog: Mutex::new(None),
+            cost_graph_shared_catalog: Mutex::new(None),
             cost_graph_state_override: Mutex::new(None),
             cost_graph_probe: Mutex::new(None),
+            prepared_catalog_enabled: AtomicBool::new(false),
+            prepared_catalog_bind_fails: AtomicBool::new(false),
+            created_catalog_streams: AtomicU64::new(0),
+            catalog_budget: crate::vnext::DeviceObservationTemplateBudget::new(1 << 20).unwrap(),
         }
     }
 
@@ -310,21 +330,109 @@ impl DeviceRuntime for TestRuntime {
     type Fence = TestFence;
     type Error = TestRuntimeError;
 
+    fn bind_cost_graph_catalog_lane(
+        &self,
+        stream: &mut Self::Stream,
+        lane: ExecutionLaneId,
+    ) -> Result<(), Self::Error> {
+        if !self.prepared_catalog_enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.prepared_catalog_bind_fails.load(Ordering::Acquire) {
+            return Err(TestRuntimeError);
+        }
+        if let Some(source) = &mut stream.catalog_source {
+            if source.matches_owner(
+                1,
+                stream.catalog_stream_id,
+                &self.descriptor.runtime_implementation_fingerprint,
+            ) && source.lane_id() == lane
+            {
+                return Ok(());
+            }
+            source.invalidate();
+            stream.prepared_catalog = None;
+            return Err(TestRuntimeError);
+        }
+        let source = crate::vnext::DeviceCostGraphCatalogSource::new(
+            1,
+            stream.catalog_stream_id,
+            &self.descriptor.runtime_implementation_fingerprint,
+            lane,
+        )
+        .map_err(|_| TestRuntimeError)?;
+        let state = crate::vnext::DeviceCostGraphStreamState::new(
+            crate::vnext::DeviceCostGraphConfiguration::OnDemand,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        stream.prepared_catalog = Some(
+            source
+                .begin(state, &self.catalog_budget, &mut || Ok(()))
+                .and_then(|builder| builder.finish(&mut || Ok(())))
+                .map_err(|_| TestRuntimeError)?,
+        );
+        stream.catalog_source = Some(source);
+        Ok(())
+    }
+
+    fn cost_prepared_reusable_graph_catalog(
+        &self,
+        stream: &Self::Stream,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<crate::vnext::DevicePreparedCostGraphCatalogAvailability, Self::Error> {
+        use crate::vnext::DevicePreparedCostGraphCatalogAvailability as A;
+        if !self.prepared_catalog_enabled.load(Ordering::Acquire) {
+            return Ok(A::Unsupported);
+        }
+        poll().map_err(|_| TestRuntimeError)?;
+        Ok(match (&stream.catalog_source, &stream.prepared_catalog) {
+            (Some(source), Some(root))
+                if source.matches_owner(
+                    1,
+                    stream.catalog_stream_id,
+                    &self.descriptor.runtime_implementation_fingerprint,
+                ) && root.is_current(source, root.catalog().stream_state()) =>
+            {
+                A::Ready(Arc::clone(root))
+            }
+            _ => A::Unprepared,
+        })
+    }
+
     fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
     }
 
     fn cost_graph_stream_state(
         &self,
-        _stream: &Self::Stream,
+        stream: &Self::Stream,
     ) -> Option<crate::vnext::DeviceCostGraphStreamState> {
-        self.cost_graph_state_override.lock().unwrap().or_else(|| {
-            self.cost_graph_catalog
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|c| c.stream_state())
-        })
+        self.cost_graph_state_override
+            .lock()
+            .unwrap()
+            .or_else(|| {
+                self.cost_graph_shared_catalog
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| c.stream_state())
+            })
+            .or_else(|| {
+                self.cost_graph_catalog
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| c.stream_state())
+            })
+            .or_else(|| {
+                stream
+                    .prepared_catalog
+                    .as_ref()
+                    .map(|root| root.catalog().stream_state())
+            })
     }
 
     fn cost_reusable_graph_catalog(
@@ -357,6 +465,24 @@ impl DeviceRuntime for TestRuntime {
             }
             out.finish(poll).map_err(|_| TestRuntimeError)
         })())
+    }
+
+    fn cost_reusable_graph_catalog_shared(
+        &self,
+        stream: &Self::Stream,
+        limits: crate::vnext::DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<Arc<crate::vnext::DeviceCostGraphCatalog>, Self::Error>> {
+        if let Some(catalog) = self.cost_graph_shared_catalog.lock().unwrap().as_ref() {
+            return Some(
+                poll()
+                    .map_err(|_| TestRuntimeError)
+                    .map(|_| Arc::clone(catalog)),
+            );
+        }
+        // Preserve the original owned producer fixture and its cancellation tests.
+        self.cost_reusable_graph_catalog(stream, limits, poll)
+            .map(|result| result.map(Arc::new))
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
@@ -415,6 +541,9 @@ impl DeviceRuntime for TestRuntime {
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
         Ok(TestStream {
             drops: Arc::clone(&self.stream_drops),
+            catalog_stream_id: self.created_catalog_streams.fetch_add(1, Ordering::AcqRel) + 1,
+            catalog_source: None,
+            prepared_catalog: None,
         })
     }
 
@@ -469,6 +598,38 @@ impl DeviceRuntime for TestRuntime {
             2 => panic!("injected native submit panic with unknown device visibility"),
             _ => unreachable!("test submit behavior is set through its typed setter"),
         }
+    }
+
+    fn supports_guarded_submission(&self) -> bool {
+        self.checkpoint_guard_enabled.load(Ordering::Acquire)
+    }
+
+    fn supports_guarded_submission_with_timing(&self, mode: DeviceTimingMode) -> bool {
+        self.supports_guarded_submission()
+            && matches!(mode, DeviceTimingMode::Off | DeviceTimingMode::Completion)
+    }
+
+    fn submit_guarded(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        guard: &dyn crate::vnext::DeviceSubmissionGuard,
+    ) -> Result<Self::Fence, crate::vnext::GuardedDeviceSubmissionError<Self::Error>> {
+        use crate::execution_cost::GuardedNotSubmittedReason;
+        use crate::vnext::GuardedDeviceSubmissionError as Error;
+        if !self.supports_guarded_submission_with_timing(commands.timing_mode()) {
+            return Err(Error::Rejected(
+                GuardedNotSubmittedReason::AttributionUnavailable,
+            ));
+        }
+        // Deterministically exercise a change after encode and immediately
+        // before the same final callback used by native backends.
+        let hook = self.checkpoint_guard_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        guard.check(None).map_err(Error::Rejected)?;
+        self.submit(stream, commands).map_err(Error::Device)
     }
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
@@ -6300,7 +6461,7 @@ fn controller_maintains_current_deferral_and_retries_stale_epoch_without_growth(
     };
     assert_eq!(receipt.growths().len(), 1);
     assert_eq!(runtime.allocate_calls(), 1);
-    let DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs } =
+    let DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs, .. } =
         deferred.maintain().unwrap()
     else {
         panic!("stale deferral must retry without another growth")
@@ -6745,4 +6906,143 @@ fn paged_internal_fault_restores_segments_selected_earlier_in_the_same_call() {
     assert_eq!(index.by_offset.len(), 2);
     assert_eq!(index.by_offset[&(1, 0)].length_bytes, 64);
     assert!(index.by_size.contains(&(64, 1, 1, 0)));
+}
+
+#[test]
+fn lane_reclamation_receipts_allow_three_real_evictions_before_retrying_the_claim() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'a',
+        1,
+        192,
+        TestDemand::Tokens,
+    );
+    // Tokens costs 64 bytes per token. Distinct classes keep three separate
+    // slot identities while every bucket declares the same legal 64-byte shape.
+    let buckets = ["first", "second", "third"].map(|class| {
+        ReusableExecutionBucketSpec::new(
+            ReusableExecutionClassId::new(format!("test.reclamation-progress.{class}")).unwrap(),
+            ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+        )
+        .unwrap()
+    });
+    let resolved = buckets
+        .iter()
+        .map(|bucket| {
+            ResolvedReusableExecutionBucket::new(
+                bucket.clone(),
+                vec![ReusablePoolWorkspaceBudget::new(catalog.pool_id.clone(), 64, 0).unwrap()],
+            )
+            .unwrap()
+        })
+        .collect();
+    let memory = ReusableExecutionMemoryPlan::new(1, 1, resolved).unwrap();
+    let runtime = new_runtime(&catalog, 192);
+    let h = harness_with_reusable(runtime, catalog, 192, memory);
+    let lane = h.root.create_execution_lane().unwrap();
+    h.root
+        .maintenance_controller
+        .grow_pool(&h.pool_ids[0], 192)
+        .unwrap();
+    let pool = &h.root.dynamic_pools.pools[&h.pool_ids[0]];
+    for bucket in &buckets {
+        let mut request = evaluated_request(pool, 64);
+        request.reusable_execution_bucket_id = Some(bucket.bucket_id().clone());
+        let LaneBackingPrepareDecision::Prepared(prepared) = h
+            .root
+            .dynamic_pools
+            .prepare_lane_stable_claim(&lane, &[request])
+            .unwrap()
+        else {
+            panic!("each real retained slot must fit its declared workspace");
+        };
+        drop(prepared.commit().into_parts());
+    }
+    let frozen_slots = h.root.lane_stable_slot_count().unwrap();
+    assert_eq!(frozen_slots, 3);
+    let before = h.root.dynamic_pool_status().unwrap();
+    assert_eq!(before.pools()[0].free_bytes(), 0);
+    let mut previous_epoch = before.epochs().capacity_epoch();
+    for reclaimed in 0..frozen_slots {
+        let BackingPrepareDecision::Deferred(evidence) = h
+            .root
+            .dynamic_pools
+            .prepare_claim(&[evaluated_request(pool, 192)])
+            .unwrap()
+        else {
+            panic!("remaining retained slots must still block the contiguous claim");
+        };
+        let deferred = PlanBackingDeferral::new(Arc::clone(&h.root), evidence).unwrap();
+        let DynamicDeferredMaintenanceOutcome::RetryAdmission {
+            current_epochs,
+            lane_reclamation: Some(receipt),
+        } = deferred.maintain().unwrap()
+        else {
+            panic!("real idle slot eviction must carry typed progress");
+        };
+        assert_eq!(receipt.epochs(), current_epochs);
+        assert_eq!(receipt.continuation_count(), 1);
+        assert!(current_epochs.capacity_epoch() > previous_epoch);
+        previous_epoch = current_epochs.capacity_epoch();
+        assert_eq!(
+            h.root.lane_stable_slot_count().unwrap(),
+            frozen_slots - reclaimed - 1
+        );
+        let status = h.root.dynamic_pool_status().unwrap();
+        assert_eq!(status.pools()[0].resident_bytes(), 192);
+        assert_eq!(status.pools()[0].free_bytes(), (reclaimed as u64 + 1) * 64);
+        assert_eq!(status.budget_claimed_bytes(), before.budget_claimed_bytes());
+    }
+    let BackingPrepareDecision::Prepared(prepared) = h
+        .root
+        .dynamic_pools
+        .prepare_claim(&[evaluated_request(pool, 192)])
+        .unwrap()
+    else {
+        panic!("the final retry must use real reclaimed contiguous backing");
+    };
+    drop(prepared);
+    assert_eq!(h.runtime.allocate_calls(), 1);
+    drop(lane);
+    close_dynamic_test_root(h.root);
+}
+
+#[test]
+fn lane_reclamation_receipt_is_absent_when_live_pin_prevents_eviction() {
+    let (h, lane, pin) = idle_reusable_step_slot_harness_with_pin();
+    let pool = &h.root.dynamic_pools.pools[&h.pool_ids[0]];
+    let BackingPrepareDecision::Deferred(evidence) = h
+        .root
+        .dynamic_pools
+        .prepare_claim(&[evaluated_request(pool, 64)])
+        .unwrap()
+    else {
+        panic!("the retained pinned slot occupies the pool");
+    };
+    let deferred = PlanBackingDeferral::new(Arc::clone(&h.root), evidence).unwrap();
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    assert_eq!(h.root.lane_stable_slot_count().unwrap(), 1);
+    drop(pin);
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission {
+            lane_reclamation: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(h.root.lane_stable_slot_count().unwrap(), 0);
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission {
+            lane_reclamation: None,
+            ..
+        }
+    ));
+    drop(deferred);
+    drop(lane);
+    close_dynamic_test_root(h.root);
 }

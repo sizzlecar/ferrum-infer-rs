@@ -3,33 +3,69 @@
 
 use super::super::*;
 use ferrum_interfaces::execution_cost::*;
+mod pending;
 mod route;
-pub(in crate::executor::vnext_executor) fn actual_shape<R: DeviceRuntime>(
-    executor: &VNextModelExecutor<R>,
-    context: &PlanRuntimeCostObservationContext<'_>,
+pub(in crate::executor::vnext_executor) use pending::{
+    pending_actual_shape, ProviderIdentityTable,
+};
+/// The original selected work, independent of whether its graph route can be
+/// modeled after execution. Only outside candidates need this extra retention.
+pub(in crate::executor::vnext_executor) fn prepared_route_rows<R: DeviceRuntime>(
     participants: &[VNextExecutionParticipant<'_, R>],
-    kind: VNextExecutionWaveKind,
-    output_mode: VNextProductOutputMode,
-    token_masks: &[VNextProductTokenMaskSubmissionPlan],
-    attribution: Option<&BoundDeviceSubmissionAttribution>,
-    retries: u32,
-    core_readback_route: CoreReadbackRoute,
-) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
-    actual_shape_from_device_with_capture(
-        executor,
-        participants,
-        kind,
-        output_mode,
-        token_masks,
-        attribution.map(BoundDeviceSubmissionAttribution::device),
-        retries,
-        core_readback_route,
-        context.structured_capture_enabled(),
-        |request_id| context.participant(request_id),
-    )
+    context: &PlanRuntimeCostObservationContext<'_>,
+) -> std::result::Result<Vec<ActualWaveRow>, ActualWaveEvidenceUnknown> {
+    if participants.is_empty() || participants.len() > 1024 {
+        return Err(ActualWaveEvidenceUnknown::ShapeOverflow);
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(participants.len())
+        .map_err(|_| ActualWaveEvidenceUnknown::Capacity)?;
+    for participant in participants {
+        let host = context
+            .participant(participant.sequence.request_id())
+            .ok_or(ActualWaveEvidenceUnknown::ParticipantCorrelation)?;
+        rows.push(ActualWaveRow {
+            request_id: host.request_id.clone(),
+            owner_incarnation: host.owner_incarnation,
+            work_generation: host.work_generation,
+            input_index: host.input_index,
+            work: prepared_participant_work(participant)?,
+        });
+    }
+    Ok(rows)
 }
 
-/// One projection for completed observation and the final pre-submit check.
+fn prepared_participant_work<R: DeviceRuntime>(
+    participant: &VNextExecutionParticipant<'_, R>,
+) -> std::result::Result<ActualRowWork, ActualWaveEvidenceUnknown> {
+    let range = participant.span.immediate_token_range();
+    let offset =
+        u32::try_from(range.start).map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?;
+    let count = u32::try_from(
+        range
+            .end
+            .checked_sub(range.start)
+            .ok_or(ActualWaveEvidenceUnknown::ShapeOverflow)?,
+    )
+    .map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?;
+    Ok(match participant.output_role {
+        VNextParticipantOutputRole::Decode(_) if count == 1 && offset > 0 => {
+            ActualRowWork::Decode { kv_tokens: offset }
+        }
+        VNextParticipantOutputRole::Decode(_) => {
+            return Err(ActualWaveEvidenceUnknown::ParticipantCorrelation)
+        }
+        _ if count > 0 => ActualRowWork::Prefill {
+            offset,
+            count,
+            total_prompt_tokens: u32::try_from(participant.span.full_input_tokens())
+                .map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?,
+        },
+        _ => return Err(ActualWaveEvidenceUnknown::ParticipantCorrelation),
+    })
+}
+
+/// Exact-only projection for the final pre-submit execution check.
 /// The device attribution is borrowed from actual encoding; work, output and
 /// mask roles come from actual prepared participants, never expected hashes.
 /// The callback supplies only correlated host inputs/lifecycle identity. Its
@@ -45,7 +81,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
     core_readback_route: CoreReadbackRoute,
     correlate: impl FnMut(&ferrum_types::RequestId) -> Option<&'h CostObservationParticipant>,
 ) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
-    actual_shape_from_device_with_capture(
+    actual_shape_from_device_with_options(
         executor,
         participants,
         kind,
@@ -55,10 +91,12 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
         retries,
         core_readback_route,
         false,
+        false,
         correlate,
     )
 }
 
+#[cfg(test)]
 pub(in crate::executor::vnext_executor) fn actual_shape_from_device_with_capture<
     'h,
     R: DeviceRuntime,
@@ -72,6 +110,34 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device_with_capture
     retries: u32,
     core_readback_route: CoreReadbackRoute,
     structured_capture: bool,
+    correlate: impl FnMut(&ferrum_types::RequestId) -> Option<&'h CostObservationParticipant>,
+) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
+    actual_shape_from_device_with_options(
+        executor,
+        participants,
+        kind,
+        output_mode,
+        token_masks,
+        attribution,
+        retries,
+        core_readback_route,
+        structured_capture,
+        true,
+        correlate,
+    )
+}
+
+fn actual_shape_from_device_with_options<'h, R: DeviceRuntime>(
+    executor: &VNextModelExecutor<R>,
+    participants: &[VNextExecutionParticipant<'_, R>],
+    kind: VNextExecutionWaveKind,
+    output_mode: VNextProductOutputMode,
+    token_masks: &[VNextProductTokenMaskSubmissionPlan],
+    attribution: Option<&DeviceSubmissionAttribution>,
+    retries: u32,
+    core_readback_route: CoreReadbackRoute,
+    structured_capture: bool,
+    statistics: bool,
     mut correlate: impl FnMut(&ferrum_types::RequestId) -> Option<&'h CostObservationParticipant>,
 ) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
     if participants.is_empty()
@@ -86,7 +152,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device_with_capture
     let route::ObservedRoute {
         mut canonical,
         graph,
-    } = route::actual_route_with_capture(
+    } = route::actual_route_projection(
         attribution,
         |index| {
             executor
@@ -110,6 +176,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device_with_capture
         },
         retries,
         structured_capture,
+        statistics,
     )?;
     canonical
         .core_readback_route(core_readback_route)
@@ -136,39 +203,19 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device_with_capture
         let host_policy_signature = correlation
             .output_policy_signature
             .ok_or(ActualWaveEvidenceUnknown::OutputPolicy)?;
-        let range = participant.span.immediate_token_range();
-        let offset =
-            u32::try_from(range.start).map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?;
-        let count = u32::try_from(
-            range
-                .end
-                .checked_sub(range.start)
-                .ok_or(ActualWaveEvidenceUnknown::ShapeOverflow)?,
-        )
-        .map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?;
-        let (work, output) = match participant.output_role {
+        let work = prepared_participant_work(participant)?;
+        let output = match participant.output_role {
             VNextParticipantOutputRole::Decode(policy) => {
                 let repetition = product_repetition_input(Some(policy), output_mode);
-                (
-                    ActualRowWork::Decode { kv_tokens: offset },
-                    CostRowOutput::Decode {
-                        requires_full_logits: policy.requires_full_logits(),
-                        repetition_tokens: repetition.token_ids.len() as u64,
-                        repetition_penalty_bits: repetition.penalty.to_bits(),
-                    },
-                )
+                CostRowOutput::Decode {
+                    requires_full_logits: policy.requires_full_logits(),
+                    repetition_tokens: repetition.token_ids.len() as u64,
+                    repetition_penalty_bits: repetition.penalty.to_bits(),
+                }
             }
-            role => (
-                ActualRowWork::Prefill {
-                    offset,
-                    count,
-                    total_prompt_tokens: u32::try_from(participant.span.full_input_tokens())
-                        .map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?,
-                },
-                CostRowOutput::Prefill {
-                    final_logits: matches!(role, VNextParticipantOutputRole::FinalPrefill),
-                },
-            ),
+            role => CostRowOutput::Prefill {
+                final_logits: matches!(role, VNextParticipantOutputRole::FinalPrefill),
+            },
         };
         canonical
             .row(CanonicalCostRow {
@@ -197,15 +244,30 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device_with_capture
     } else {
         ActualWavePath::PlanRuntime
     };
-    let canonical = canonical
-        .finish_with_captured_structure(
-            kind,
-            path,
-            graph,
-            ActualWaveRowOrder::Ordered,
-            recurrent_state_bytes,
-        )
-        .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?;
+    let canonical = if statistics {
+        canonical
+            .finish_with_captured_structure(
+                kind,
+                path,
+                graph,
+                ActualWaveRowOrder::Ordered,
+                recurrent_state_bytes,
+            )
+            .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?
+    } else {
+        CanonicalStatisticalWave {
+            exact: canonical
+                .finish(
+                    kind,
+                    path,
+                    graph,
+                    ActualWaveRowOrder::Ordered,
+                    recurrent_state_bytes,
+                )
+                .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?,
+            statistical: Err(StatisticalEvidenceUnknown::MissingProducer),
+        }
+    };
     let statistical_evidence = canonical.statistical.ok();
     let canonical = canonical.exact;
     let shape = ActualWaveShape {

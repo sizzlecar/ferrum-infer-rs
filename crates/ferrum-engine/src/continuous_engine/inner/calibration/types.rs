@@ -196,6 +196,7 @@ pub enum CalibrationSubmissionState {
 #[derive(Debug)]
 pub struct CalibrationWaveReport {
     pub(super) selected: Option<super::selected::SelectedCalibrationEvidence>,
+    pub(super) observation_capture: Arc<super::super::cost_observation::CostCalibrationCapture>,
     /// Mandatory work in the authority order checked at real submission.
     /// For NotSubmitted/Unknown this is selected intent, not executed evidence.
     pub ordered_work: ExpectedWaveWork,
@@ -214,6 +215,16 @@ pub struct CalibrationWaveReport {
         Option<Arc<super::super::cost_observation::CalibrationActualEvidenceDiagnostic>>,
 }
 
+impl CalibrationWaveReport {
+    /// Original worker-settled proof only. Public outcome/diagnostic fields do
+    /// not mint this evidence or assign a source population position.
+    pub(in crate::continuous_engine::inner) fn no_submission_proof(
+        &self,
+    ) -> Option<Arc<super::super::cost_observation::OriginalNoSubmissionReceipt>> {
+        self.observation_capture.no_submission_proof()
+    }
+}
+
 #[derive(Debug)]
 pub enum CalibrationTurn {
     AdmittedOrMaintained,
@@ -229,6 +240,7 @@ pub(in crate::continuous_engine::inner) struct CalibrationWaveReceipt {
     structured_prepared_projection: std::sync::OnceLock<StructuredPreparedProjectionReportV2>,
     state: std::sync::atomic::AtomicU8,
     capture: std::sync::OnceLock<Arc<super::super::cost_observation::CostCalibrationCapture>>,
+    execution_error: parking_lot::Mutex<Option<FerrumError>>,
 }
 impl CalibrationWaveReceipt {
     pub(in crate::continuous_engine::inner) fn new(ordered_work: ExpectedWaveWork) -> Self {
@@ -237,6 +249,7 @@ impl CalibrationWaveReceipt {
             structured_prepared_projection: std::sync::OnceLock::new(),
             state: std::sync::atomic::AtomicU8::new(0),
             capture: std::sync::OnceLock::new(),
+            execution_error: parking_lot::Mutex::new(None),
         }
     }
     pub(in crate::continuous_engine::inner) fn capture(
@@ -286,9 +299,22 @@ impl CalibrationWaveReceipt {
             _ => unreachable!("private calibration receipt state"),
         }
     }
+    pub(super) fn retain_execution_error(&self, error: Option<FerrumError>) {
+        let mut retained = self.execution_error.lock();
+        if retained.is_none() {
+            *retained = error;
+        }
+    }
+    pub(super) async fn wait_observation(&self) {
+        if let Some(capture) = self.capture.get() {
+            capture.wait_resolved().await;
+        }
+    }
     pub(super) fn report(&self, error: Option<FerrumError>) -> CalibrationWaveReport {
+        let error = self.execution_error.lock().take().or(error);
         CalibrationWaveReport {
             selected: None,
+            observation_capture: self.capture().clone(),
             structured_prepared_projection: self.structured_prepared_projection.get().cloned(),
             ordered_work: self.ordered_work.clone(),
             submission: self.state(),

@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 use crate::config::CliConfig;
 
+mod capacity;
 mod decode_isolation;
 mod sampling;
 mod sharegpt;
@@ -123,6 +124,9 @@ pub struct BenchServeCommand {
 
     #[command(flatten)]
     pub sampling: BenchSamplingArgs,
+
+    #[command(flatten)]
+    pub capacity: capacity::CapacityArgs,
 
     // ─── Workload selection (pick one mode) ────────────────────────
     /// Closed-loop concurrency (single cell). Default when no other mode is
@@ -1901,6 +1905,9 @@ fn benchmark_cell_id(index: usize, cell: Cell) -> String {
 
 pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
+    if cmd.capacity.capacity_contract.is_some() {
+        return capacity::execute(&cmd).await;
+    }
     let slo_config = slo_report::load(&cmd)?;
     let prepared_sharegpt = sharegpt::prepare(&cmd)?;
     let banner = if cmd.scenario == BenchServeWorkload::DecodeIsolation {
@@ -2988,6 +2995,7 @@ mod tests {
             scenario: BenchServeWorkload::Standard,
             decode_isolation: DecodeIsolationArgs::default(),
             sampling: BenchSamplingArgs::default(),
+            capacity: capacity::CapacityArgs::default(),
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -3221,6 +3229,7 @@ mod tests {
             scenario: BenchServeWorkload::Standard,
             decode_isolation: DecodeIsolationArgs::default(),
             sampling: BenchSamplingArgs::default(),
+            capacity: capacity::CapacityArgs::default(),
             concurrency: 2,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -3317,6 +3326,7 @@ mod tests {
             scenario: BenchServeWorkload::Standard,
             decode_isolation: DecodeIsolationArgs::default(),
             sampling: BenchSamplingArgs::default(),
+            capacity: capacity::CapacityArgs::default(),
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,

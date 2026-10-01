@@ -70,6 +70,9 @@ pub(super) fn project_capture(capture: &CostCalibrationCapture) -> CalibrationOb
         CostCalibrationStatus::Pending => CalibrationObservation::PendingOrUnavailable,
         CostCalibrationStatus::ConflictingCalls => CalibrationObservation::ConflictingCalls,
         CostCalibrationStatus::Complete(value) => match value.as_ref() {
+            CostCalibrationResult::UnresolvedDropped(reason) => CalibrationObservation::Rejected {
+                reason: format!("raw observation dropped before resolution: {reason:?}"),
+            },
             CostCalibrationResult::Rejected(reason) => CalibrationObservation::Rejected {
                 reason: format!("{reason:?}"),
             },
@@ -80,6 +83,7 @@ pub(super) fn project_capture(capture: &CostCalibrationCapture) -> CalibrationOb
                 host_features,
                 accepted_ordinal,
                 disposition,
+                ..
             } => {
                 if actual_rows.len() != commits.len()
                     || actual_rows.len() != host_features.len()
@@ -144,7 +148,7 @@ pub(super) fn project_capture(capture: &CostCalibrationCapture) -> CalibrationOb
                     CostCallDisposition::Dropped(reason) => CalibrationQueueDisposition::Dropped {
                         reason: format!("{reason:?}"),
                     },
-                    CostCallDisposition::Rejected(_) => {
+                    CostCallDisposition::Rejected(_) | CostCallDisposition::Queued => {
                         return CalibrationObservation::InvalidIdentityJoin
                     }
                 };

@@ -1,6 +1,7 @@
 //! Native Metal provider for the standard fixed-page causal attention operation.
 
 mod cost_route;
+mod decode_context;
 mod selected;
 
 use std::collections::BTreeMap;
@@ -607,6 +608,7 @@ impl MetalCausalPagedAttentionProvider {
                 include_str!("causal_attention.rs").as_bytes(),
                 include_str!("causal_attention/cost_route.rs").as_bytes(),
                 include_str!("causal_attention/selected.rs").as_bytes(),
+                include_str!("causal_attention/selected/observation.rs").as_bytes(),
                 include_str!("causal_attention/head_dim_specialization.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 INT8_SHADER_SOURCE.as_bytes(),
@@ -614,6 +616,7 @@ impl MetalCausalPagedAttentionProvider {
                 super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/selected.rs").as_bytes(),
+                include_str!("primitives/selected/observation.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
                 provider_id.as_bytes(),
             ]),
@@ -730,6 +733,22 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider {
+    fn decode_context_coverage(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> ferrum_interfaces::vnext::DecodeContextCoverage {
+        if request.operation_id().as_str() != self.operation_id {
+            return Default::default();
+        }
+        let Ok(shape) = CausalAttentionShape::from_attributes(request.attributes()) else {
+            return Default::default();
+        };
+        decode_context::coverage(
+            shape,
+            cost_route::Capabilities::from(self.attention.as_ref()),
+        )
+    }
+
     fn eager_cost_route(
         &self,
         request: OperationCostRouteRequest<'_>,
@@ -1748,49 +1767,55 @@ fn encode_attention(
         batched_grouped,
         extra_projection_dispatches,
     )?;
-    let statistical_evidence = (|| {
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(launches.len()).ok()?;
-        rows.extend(launches.iter().map(|v| selected::Row {
-            params: v.params,
-            projection: selected::Projection {
-                tokens: v.params.tokens,
-                hidden: v.hidden_size,
-                epsilon: v.params.epsilon,
-                launches: [
-                    v.query_projection,
-                    v.key_projection,
-                    v.value_projection,
-                    v.output_projection,
-                ],
-            },
-        }));
-        let packed = packed.as_ref().map(|v| selected::Projection {
-            tokens: v.tokens,
-            hidden: v.hidden_size,
-            epsilon: v.epsilon,
-            launches: [
-                v.query_projection,
-                v.key_projection,
-                v.value_projection,
-                v.output_projection,
-            ],
-        });
-        selected::evidence(
-            &attention,
-            &linear,
-            &primitives,
-            hidden_type,
-            total_tokens,
-            layout
-                .required_bytes
-                .checked_add(binding_layout.required_bytes)?,
-            packed,
-            batched_grouped,
-            independent_rows,
-            &rows,
-        )
-    })();
+    let statistical_evidence = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(compute_route.compute_dispatch_count(), launches.len()),
+        || {
+            (|| {
+                let mut rows = Vec::new();
+                rows.try_reserve_exact(launches.len()).ok()?;
+                rows.extend(launches.iter().map(|v| selected::Row {
+                    params: v.params,
+                    projection: selected::Projection {
+                        tokens: v.params.tokens,
+                        hidden: v.hidden_size,
+                        epsilon: v.params.epsilon,
+                        launches: [
+                            v.query_projection,
+                            v.key_projection,
+                            v.value_projection,
+                            v.output_projection,
+                        ],
+                    },
+                }));
+                let packed = packed.as_ref().map(|v| selected::Projection {
+                    tokens: v.tokens,
+                    hidden: v.hidden_size,
+                    epsilon: v.epsilon,
+                    launches: [
+                        v.query_projection,
+                        v.key_projection,
+                        v.value_projection,
+                        v.output_projection,
+                    ],
+                });
+                selected::observation(
+                    &attention,
+                    &linear,
+                    &primitives,
+                    hidden_type,
+                    total_tokens,
+                    layout
+                        .required_bytes
+                        .checked_add(binding_layout.required_bytes)?,
+                    packed,
+                    batched_grouped,
+                    independent_rows,
+                    &rows,
+                )
+            })()
+        },
+    );
     let dispatch_count = compute_route.compute_dispatch_count();
     let binding_pipelines = Arc::clone(&attention);
     let binding_command = MetalDeviceCommand::operation(
@@ -1881,7 +1906,7 @@ fn encode_attention(
         compute_route.token_count(),
     )
     .map_err(|error| error.to_string())?;
-    compute_command = compute_command.with_statistical_evidence(statistical_evidence);
+    compute_command = compute_command.with_observation(statistical_evidence);
     for offset in completion_offsets {
         compute_command = compute_command
             .with_completed_u32_zero_check(

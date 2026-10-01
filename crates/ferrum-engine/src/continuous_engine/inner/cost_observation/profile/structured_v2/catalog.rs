@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer};
 use std::{fs::File, io::Read, num::NonZeroUsize, path::PathBuf};
 const ARTIFACT_TYPE: &str = "ferrum.structured-v2-catalog";
 const MAX_CHILDREN: usize = 128;
-const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -217,6 +217,8 @@ pub(super) fn load(
         let snapshot = StructuredSnapshot {
             children: Arc::new(children),
             feedback: None,
+            epoch:
+                crate::continuous_engine::inner::cost_observation::structured_epoch::View::initial(),
         };
         let receipt = receipt::shared(path, &imported, &snapshot, declared)?;
         return Ok((snapshot, receipt));
@@ -242,13 +244,75 @@ pub(super) fn load(
         let snapshot = StructuredSnapshot {
             children: Arc::new(children),
             feedback: None,
+            epoch:
+                crate::continuous_engine::inner::cost_observation::structured_epoch::View::initial(),
         };
         let receipt = receipt::prefix(path, &imported, &snapshot, declared)?;
         return Ok((snapshot, receipt));
     }
+    if kind.schema_version == 13
+        && kind.artifact_type.as_deref() == Some("ferrum.structured-service-window-catalog")
+    {
+        drop(bytes);
+        let imported =
+            file::load_structured_profile_v13(path, fp, limits, clock).map_err(profile_error)?;
+        if imported.file_sha256 != digest {
+            return Err(FerrumError::config(
+                "service catalog changed during startup",
+            ));
+        }
+        domain::validate_service_catalog(&imported)?;
+        let mut children = BTreeMap::new();
+        for child in &imported.children {
+            if children
+                .insert(*child.domain_signature(), child.clone())
+                .is_some()
+            {
+                return Err(FerrumError::config("duplicate service replayed domain"));
+            }
+        }
+        let snapshot = StructuredSnapshot {
+            children: Arc::new(children),
+            feedback: None,
+            epoch: super::super::super::structured_epoch::View::initial(),
+        };
+        let receipt = receipt::service(Some(path), &imported, &snapshot, Some(declared))?;
+        return Ok((snapshot, receipt));
+    }
+    if kind.schema_version == 14
+        && kind.artifact_type.as_deref() == Some("ferrum.structured-owner-block-catalog")
+    {
+        drop(bytes);
+        let imported =
+            file::load_structured_profile_v14(path, fp, limits, clock).map_err(profile_error)?;
+        if imported.file_sha256 != digest {
+            return Err(FerrumError::config(
+                "owner block catalog changed during startup",
+            ));
+        }
+        let snapshot = publication::owner_block_snapshot(&imported)?;
+        let receipt = receipt::owner_blocks(Some(path), &imported, &snapshot, Some(declared))?;
+        return Ok((snapshot, receipt));
+    }
+    if kind.schema_version == 15
+        && kind.artifact_type.as_deref() == Some("ferrum.structured-prepared-owner-block-catalog")
+    {
+        drop(bytes);
+        let imported =
+            file::load_structured_profile_v15(path, fp, limits, clock).map_err(profile_error)?;
+        if imported.file_sha256 != digest {
+            return Err(FerrumError::config(
+                "prepared owner block catalog changed during startup",
+            ));
+        }
+        let snapshot = publication::prepared_owner_block_snapshot(&imported)?;
+        let receipt =
+            receipt::prepared_owner_blocks(Some(path), &imported, &snapshot, Some(declared))?;
+        return Ok((snapshot, receipt));
+    }
     if kind.schema_version != 1 || kind.artifact_type.as_deref() != Some(ARTIFACT_TYPE) {
         return Err(FerrumError::config(
-            "expected schema10 child, explicit V2 catalog, shared schema11, or prefix schema12",
+            "expected schema10 child, explicit V2 catalog, shared schema11, prefix schema12, service schema13, owner block schema14, or prepared owner block schema15",
         ));
     }
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(profile_error)?;
@@ -289,8 +353,9 @@ pub(super) fn load(
     let snapshot = StructuredSnapshot {
         children: Arc::new(children),
         feedback: None,
+        epoch: crate::continuous_engine::inner::cost_observation::structured_epoch::View::initial(),
     };
-    let receipt = receipt::catalog(path, digest, metadata_bytes, &snapshot, declared)?;
+    let receipt = receipt::catalog(Some(path), digest, metadata_bytes, &snapshot, declared)?;
     Ok((snapshot, receipt))
 }
 #[cfg(test)]

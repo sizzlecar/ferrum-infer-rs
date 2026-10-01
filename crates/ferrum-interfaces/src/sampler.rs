@@ -10,6 +10,10 @@ use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+mod cost_identity;
+pub use cost_identity::{
+    BuiltinLogitsProcessorCostV1, BuiltinSamplerCostV1, SamplingCostIdentityV1,
+};
 
 /// Stable request-local RNG used by every product sampling path.
 ///
@@ -133,6 +137,11 @@ impl<'a> SamplingContext<'a> {
 
 /// Logits processor trait for modifying raw model outputs
 pub trait LogitsProcessor: Send + Sync {
+    /// Explicit identity of the installed algorithm and its stored parameters.
+    /// External processors are unknown unless they provide this capability.
+    fn cost_identity(&self) -> Option<BuiltinLogitsProcessorCostV1> {
+        None
+    }
     /// Process logits in-place
     fn process(&self, ctx: &mut SamplingContext) -> Result<()>;
 
@@ -158,6 +167,11 @@ pub enum ProcessorPriority {
 
 /// Token sampler trait for selecting next token from processed logits
 pub trait Sampler: Send + Sync {
+    /// Debug names are not cost identities. Unknown implementations cannot
+    /// inherit built-in calibration by returning a matching display name.
+    fn cost_identity(&self) -> Option<BuiltinSamplerCostV1> {
+        None
+    }
     /// Sample next token from logits
     fn sample(&self, logits: &[f32], rng: &mut dyn RngCore) -> Result<TokenId>;
 
@@ -260,6 +274,11 @@ impl TemperatureProcessor {
 }
 
 impl LogitsProcessor for TemperatureProcessor {
+    fn cost_identity(&self) -> Option<BuiltinLogitsProcessorCostV1> {
+        Some(BuiltinLogitsProcessorCostV1::Temperature {
+            bits: self.temperature.to_bits(),
+        })
+    }
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.temperature > 0.0 && self.temperature != 1.0 {
             for logit in ctx.logits.iter_mut() {
@@ -292,6 +311,9 @@ impl TopKProcessor {
 }
 
 impl LogitsProcessor for TopKProcessor {
+    fn cost_identity(&self) -> Option<BuiltinLogitsProcessorCostV1> {
+        Some(BuiltinLogitsProcessorCostV1::TopK { k: self.k })
+    }
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.k > 0 && self.k < ctx.logits.len() {
             let threshold = if ctx.logits.iter().any(|logit| logit.is_nan()) {
@@ -346,6 +368,11 @@ impl TopPProcessor {
 }
 
 impl LogitsProcessor for TopPProcessor {
+    fn cost_identity(&self) -> Option<BuiltinLogitsProcessorCostV1> {
+        Some(BuiltinLogitsProcessorCostV1::TopP {
+            bits: self.p.to_bits(),
+        })
+    }
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.p < 1.0 && self.p > 0.0 {
             // A preceding top-k/min-p processor may already have reduced a
@@ -413,6 +440,11 @@ impl MinPProcessor {
 }
 
 impl LogitsProcessor for MinPProcessor {
+    fn cost_identity(&self) -> Option<BuiltinLogitsProcessorCostV1> {
+        Some(BuiltinLogitsProcessorCostV1::MinP {
+            bits: self.min_p.to_bits(),
+        })
+    }
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.min_p > 0.0 && self.min_p <= 1.0 {
             let max_logit = ctx.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -447,6 +479,11 @@ impl RepetitionPenaltyProcessor {
 }
 
 impl LogitsProcessor for RepetitionPenaltyProcessor {
+    fn cost_identity(&self) -> Option<BuiltinLogitsProcessorCostV1> {
+        Some(BuiltinLogitsProcessorCostV1::RepetitionPenalty {
+            bits: self.penalty.to_bits(),
+        })
+    }
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.penalty != 1.0 {
             for &token_id in ctx.token_frequencies.keys() {
@@ -494,6 +531,12 @@ impl PresenceFrequencyPenaltyProcessor {
 }
 
 impl LogitsProcessor for PresenceFrequencyPenaltyProcessor {
+    fn cost_identity(&self) -> Option<BuiltinLogitsProcessorCostV1> {
+        Some(BuiltinLogitsProcessorCostV1::PresenceFrequencyPenalty {
+            presence_bits: self.presence_penalty.to_bits(),
+            frequency_bits: self.frequency_penalty.to_bits(),
+        })
+    }
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.presence_penalty == 0.0 && self.frequency_penalty == 0.0 {
             return Ok(());
@@ -523,6 +566,9 @@ impl LogitsProcessor for PresenceFrequencyPenaltyProcessor {
 pub struct GreedySampler;
 
 impl Sampler for GreedySampler {
+    fn cost_identity(&self) -> Option<BuiltinSamplerCostV1> {
+        Some(BuiltinSamplerCostV1::GreedyV1)
+    }
     fn sample(&self, logits: &[f32], _rng: &mut dyn RngCore) -> Result<TokenId> {
         let max_idx = logits
             .iter()
@@ -580,6 +626,9 @@ mod greedy_sampler_tests {
 pub struct MultinomialSampler;
 
 impl Sampler for MultinomialSampler {
+    fn cost_identity(&self) -> Option<BuiltinSamplerCostV1> {
+        Some(BuiltinSamplerCostV1::MultinomialV1)
+    }
     fn sample(&self, logits: &[f32], rng: &mut dyn RngCore) -> Result<TokenId> {
         // Convert logits to probabilities
         let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));

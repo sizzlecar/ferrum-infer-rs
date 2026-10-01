@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{invalid_resource, DynamicBackingPoolId, VNextError};
 
+mod indexed_segments;
+pub(super) use indexed_segments::IndexedBackingSegments;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct BackingChunkIdentity {
     pool_id: DynamicBackingPoolId,

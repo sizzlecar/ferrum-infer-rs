@@ -19,17 +19,44 @@ pub(in crate::backend::cuda::vnext_ops::transformer) struct Recipe {
     q8_bytes: u64,
     q8: Option<Q8SumPolicy>,
     mmq: selected::MmqLayouts,
+    _construction: ferrum_interfaces::vnext::DeviceObservationTemplateReservation,
 }
 
 impl Recipe {
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn retained_payload_bytes(
+        &self,
+    ) -> Option<usize> {
+        let leaves = match &self.leaves {
+            Leaves::Packed(_) => 0,
+            Leaves::Participants(rows) => {
+                rows.len().checked_mul(std::mem::size_of::<(u32, u64)>())?
+            }
+        };
+        std::mem::size_of::<Self>()
+            .checked_add(weights::retained_payload_bytes(&self.gate)?)?
+            .checked_add(weights::retained_payload_bytes(&self.down)?)?
+            .checked_add(leaves)
+    }
     pub(super) fn from_prepared(
         prepared: &prepared::Prepared,
         q8: Option<Q8SumPolicy>,
         mmq: Option<&StreamMmq>,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
     ) -> Option<Self> {
-        // A missing actual table cannot become Known through a recipe. Check
-        // this before cloning even the purely numeric matrix descriptors.
-        prepared.selection.command.statistical_evidence()?;
+        let copied = weights::retained_payload_bytes(&prepared.gate_up)?
+            .checked_add(weights::retained_payload_bytes(&prepared.down)?)?
+            .checked_add(
+                prepared
+                    .launches
+                    .len()
+                    .checked_mul(std::mem::size_of::<(u32, u64)>())?,
+            )?;
+        let construction = budget
+            .reserve(std::mem::size_of::<Self>().checked_add(copied.checked_mul(2)?)?)
+            .ok()?;
+        // Actual prepare has already selected and validated these numerical
+        // launch facts. Evidence is built only by the observation worker (or
+        // once by cold capture to seal the resident fixed geometry).
         let leaves = if let Some(rows) = prepared.selection.packed_rows {
             if prepared.launches.len() != 1
                 || prepared.launches[0].2 != rows
@@ -42,6 +69,7 @@ impl Recipe {
             Leaves::Participants(prepared.launches.iter().map(|row| (row.2, row.3)).collect())
         };
         Some(Self {
+            _construction: construction,
             gate: prepared.gate_up.clone().into_boxed_slice(),
             down: prepared.down.clone().into_boxed_slice(),
             leaves,

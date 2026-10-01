@@ -83,6 +83,8 @@ fn import_receipt(
             .map_err(|_| FerrumError::config("structured profile receipt size overflow"))
     };
     Ok(SloCostProfileReceipt {
+        storage: ferrum_types::SloCostProfileStorage::File,
+        clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
         selected_whole_wave: None,
         structured_whole_wave_v2: None,
         structured_whole_wave: Some(ferrum_types::SloStructuredWholeWaveReceiptV1 {
@@ -97,7 +99,7 @@ fn import_receipt(
             phases,
         }),
         schema_version: p.schema_version,
-        path: p.loaded_from.clone(),
+        path: Some(p.loaded_from.clone()),
         file_sha256: format!(
             "sha256:{}",
             p.file_sha256
@@ -109,7 +111,7 @@ fn import_receipt(
         generated_unix_ns: p.generated_unix_ns,
         loaded_unix_ns: p.loaded_unix_ns,
         conservative_clock_error_ns: p.conservative_clock_error_ns,
-        declared_local_clock_max_error_ns: declared,
+        declared_local_clock_max_error_ns: Some(declared),
         oldest_imported_age_ns: Some(p.oldest_imported_age_ns),
         newest_imported_age_ns: Some(p.newest_imported_age_ns),
         offered_samples: size(p.offered_attempts)?,

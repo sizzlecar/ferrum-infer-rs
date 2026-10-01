@@ -36,6 +36,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 StructuredCostProductV1::GreedyToken => VNextProductOutputMode::GreedyToken,
             };
             let mut positions = Vec::new();
+            let installed = recipe.physical_host_rows().iter().any(|row| {
+                matches!(
+                    row.installed_policy.empirical_content_domain,
+                    Some(HostContentDomainV1::PlainTextInstalledV2(_))
+                )
+            });
             positions
                 .try_reserve_exact(host.eligible_rows.len())
                 .map_err(|_| U::Capacity)?;
@@ -55,11 +61,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 let FutureCostOutput::Decode { policy: actual } = row.output else {
                     return Err(U::OutputBranch);
                 };
-                require_same_pending_product_inputs(
+                require_same_pending_product_inputs_bound(
                     actual,
                     eligible.clean_policy,
                     mode,
                     self.io.output_elements,
+                    installed,
                 )?;
                 positions.push(position);
             }
@@ -72,9 +79,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             // otherwise FullLogits requires a nonempty subset. A Greedy branch
             // admits only the conditional empty subset. This is the same OR
             // rule used by product_output_mode_for_roles above this core route.
-            let pending =
+            let mut repetition_upper = None;
+            if mode == VNextProductOutputMode::GreedyToken {
+                let numeric = projection
+                    .shape
+                    .numeric_features
+                    .as_ref()
+                    .ok_or(U::OutputBranch)?;
+                let mut sum = 0u64;
+                let mut projected = false;
+                for (row, numeric) in query.rows.iter().zip(&numeric.rows) {
+                    let count = match row.output {
+                        FutureCostOutput::ProjectedGreedy { repetition, .. } => {
+                            projected = true;
+                            repetition.maximum()
+                        }
+                        _ => numeric.repetition_tokens,
+                    };
+                    sum = sum.checked_add(count).ok_or(U::Capacity)?;
+                }
+                if projected {
+                    repetition_upper = Some(sum);
+                }
+            }
+            let pending = if installed {
+                HostPendingSetV2::new_installed(
+                    &projection.shape,
+                    recipe,
+                    &positions,
+                    host.constraint,
+                    repetition_upper,
+                )
+            } else {
+                if repetition_upper.is_some() {
+                    return Err(U::OutputBranch);
+                }
                 HostPendingSetV2::new(&projection.shape, recipe, &positions, host.constraint)
-                    .map_err(|_| U::OutputBranch)?;
+            }
+            .map_err(|_| U::OutputBranch)?;
             if !budget.has_budget() {
                 return Err(U::BudgetExhausted);
             }
@@ -96,14 +138,24 @@ fn require_same_pending_product_inputs(
     mode: VNextProductOutputMode,
     vocabulary_size: usize,
 ) -> std::result::Result<(), U> {
+    require_same_pending_product_inputs_bound(actual, clean, mode, vocabulary_size, false)
+}
+fn require_same_pending_product_inputs_bound(
+    actual: &LogitsReturnPolicy,
+    clean: &LogitsReturnPolicy,
+    mode: VNextProductOutputMode,
+    vocabulary_size: usize,
+    installed: bool,
+) -> std::result::Result<(), U> {
     if mode != VNextProductOutputMode::FullLogits
-        || !matches!(
-            clean,
-            LogitsReturnPolicy::GreedyArgmax {
-                repetition_penalty: None,
-                ..
-            }
-        )
+        || (!installed
+            && !matches!(
+                clean,
+                LogitsReturnPolicy::GreedyArgmax {
+                    repetition_penalty: None,
+                    ..
+                }
+            ))
     {
         return Err(U::OutputBranch);
     }

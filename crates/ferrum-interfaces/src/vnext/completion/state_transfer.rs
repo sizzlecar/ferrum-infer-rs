@@ -2,7 +2,10 @@
 //! registry owns submission, fences and recovery; this module never submits or
 //! decides that a device operation has completed.
 
-use super::{canonical_completion_fingerprint, invalid_completion, ExecutionLane};
+use super::{
+    canonical_completion_fingerprint, checkpoint_byte_plan_fingerprint, invalid_completion,
+    ExecutionLane,
+};
 use crate::vnext::{
     CheckpointAuthorityId, CheckpointBackingOwner, DeviceId, DeviceRuntime, ExecutionFrameId,
     ExecutionLaneId, PlanHash, PreparedSequenceStateTransfer, RequestAuthorityId,
@@ -131,7 +134,7 @@ impl StateTransferIdentity {
             kind: guard.kind().into(),
             plan_hash: byte_plan.plan_hash().clone(),
             layout_fingerprint: byte_plan.layout_fingerprint().to_owned(),
-            byte_plan_fingerprint: canonical_completion_fingerprint(byte_plan),
+            byte_plan_fingerprint: checkpoint_byte_plan_fingerprint(byte_plan),
             checkpoint: checkpoint.authority(),
             capture_attempt,
             boundary_tokens: byte_plan.boundary(),
@@ -163,6 +166,12 @@ impl StateTransferIdentity {
     pub(crate) fn checkpoint_authority(&self) -> CheckpointAuthorityId {
         self.checkpoint
     }
+    pub(crate) fn sequence_authority(&self) -> SequenceAuthorityId {
+        self.sequence
+    }
+    pub(crate) fn request_authority(&self) -> RequestAuthorityId {
+        self.request
+    }
 
     pub(crate) fn boundary_tokens(&self) -> u64 {
         self.boundary_tokens
@@ -174,6 +183,18 @@ impl StateTransferIdentity {
 
     pub(crate) fn layout_fingerprint(&self) -> &str {
         &self.layout_fingerprint
+    }
+
+    pub(crate) fn byte_plan_fingerprint(&self) -> &str {
+        &self.byte_plan_fingerprint
+    }
+
+    pub(crate) fn runtime_implementation_fingerprint(&self) -> &str {
+        &self.runtime_implementation_fingerprint
+    }
+
+    pub(crate) fn device_id(&self) -> &DeviceId {
+        &self.device_id
     }
 
     pub(crate) fn fingerprint(&self) -> String {
@@ -207,7 +228,7 @@ impl StateTransferIdentity {
         self.checkpoint == checkpoint.authority()
             && self.plan_hash == *byte_plan.plan_hash()
             && self.layout_fingerprint == byte_plan.layout_fingerprint()
-            && self.byte_plan_fingerprint == canonical_completion_fingerprint(byte_plan)
+            && self.byte_plan_fingerprint == checkpoint_byte_plan_fingerprint(byte_plan)
             && self.boundary_tokens == byte_plan.boundary()
     }
 }

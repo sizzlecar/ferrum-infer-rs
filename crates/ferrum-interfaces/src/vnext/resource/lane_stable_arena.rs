@@ -12,6 +12,9 @@ use super::{
 };
 use crate::vnext::ReusableExecutionBucketId;
 
+mod layout;
+pub(in crate::vnext::resource) use layout::CompiledLaneStableLayout;
+
 pub(super) struct CommittedLaneBackingClaim {
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     certificate: Arc<BackingClaimCertificate>,
@@ -105,15 +108,47 @@ pub(super) struct LaneStableProjectionBinding {
 
 pub(super) struct LaneStableArenaSlot {
     pub(super) slot_id: u64,
-    pub(super) authorities: Vec<LogicalBackingSliceAuthority>,
+    authorities: Vec<LogicalBackingSliceAuthority>,
     pub(super) certificate: Arc<BackingClaimCertificate>,
-    pub(super) projection_bindings: Vec<LaneStableProjectionBinding>,
+    projection_bindings: Vec<LaneStableProjectionBinding>,
+    planning_geometry: std::sync::OnceLock<Arc<super::planning::SlotGeometry>>,
     pub(super) availability_domains: Vec<CapacityDomainId>,
     pub(super) in_use: bool,
     pub(super) last_used: u64,
 }
 
 impl LaneStableArenaSlot {
+    pub(super) fn new(
+        slot_id: u64,
+        authorities: Vec<LogicalBackingSliceAuthority>,
+        certificate: Arc<BackingClaimCertificate>,
+        projection_bindings: Vec<LaneStableProjectionBinding>,
+        availability_domains: Vec<CapacityDomainId>,
+        last_used: u64,
+    ) -> Self {
+        Self {
+            slot_id,
+            authorities,
+            certificate,
+            projection_bindings,
+            availability_domains,
+            in_use: true,
+            last_used,
+            planning_geometry: std::sync::OnceLock::new(),
+        }
+    }
+    pub(super) fn authorities(&self) -> &[LogicalBackingSliceAuthority] {
+        &self.authorities
+    }
+    pub(super) fn projection_bindings(&self) -> &[LaneStableProjectionBinding] {
+        &self.projection_bindings
+    }
+    pub(super) fn planning_geometry(
+        &self,
+    ) -> &std::sync::OnceLock<Arc<super::planning::SlotGeometry>> {
+        &self.planning_geometry
+    }
+
     pub(super) fn has_external_address_pins(&self) -> bool {
         self.authorities
             .iter()
@@ -472,6 +507,7 @@ pub(super) fn lane_stable_layout_key(
     lane_id: ExecutionLaneId,
     lifetime: AllocationLifetime,
     requests: &[&EvaluatedBackingRequest<'_>],
+    compiled: Option<&CompiledLaneStableLayout>,
 ) -> Result<LaneStableArenaKey, VNextError> {
     if requests.is_empty()
         || requests
@@ -509,6 +545,11 @@ pub(super) fn lane_stable_layout_key(
         lane_id,
         lifetime,
         reusable_execution_bucket_id: bucket_id.clone(),
-        layout_fingerprint: lane_stable_layout_fingerprint(lifetime, bucket_id, requests)?,
+        layout_fingerprint: match compiled
+            .and_then(|layout| layout.matching_fingerprint(lifetime, bucket_id, requests))
+        {
+            Some(fingerprint) => fingerprint.to_owned(),
+            None => lane_stable_layout_fingerprint(lifetime, bucket_id, requests)?,
+        },
     })
 }

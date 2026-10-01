@@ -901,7 +901,7 @@ fn imported_state_can_be_captured_again_without_inventing_a_model_frame() {
             .unwrap(),
     );
     assert_eq!(handle.poll().unwrap(), StateTransferObservation::Ready);
-    let Some(StateTransferResult::Captured(recaptured)) = handle.take().unwrap() else {
+    let Some(StateTransferResult::Captured(recaptured, _)) = handle.take().unwrap() else {
         panic!("imported state with current evidence must be capturable")
     };
     assert_eq!(recaptured.boundary().frame_id(), None);

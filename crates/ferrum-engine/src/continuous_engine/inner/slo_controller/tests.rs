@@ -3,6 +3,8 @@
 //! this fixture never manufactures their private rollback receipt.
 use super::*;
 
+mod captured_graph_domain;
+mod uncalibrated_observation;
 mod unified_execution;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 mod unified_execution_metal;
@@ -25,6 +27,7 @@ mod recovery;
 mod recurrent_state;
 mod reference_projection;
 mod selected_feedback;
+mod stage_ablation;
 mod timing_metrics;
 use fixture::*;
 

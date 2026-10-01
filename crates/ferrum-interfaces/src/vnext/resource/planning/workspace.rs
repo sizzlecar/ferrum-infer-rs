@@ -1,10 +1,10 @@
 //! Numeric copies of actual lane-stable slots. No authority or buffer is held.
 use super::*;
-use crate::vnext::resource::backing_extent::backing_segment_range_matches_with_poll;
 use crate::vnext::resource::lane_stable_arena::{
     lane_stable_layout_key, LaneStableArenaKey, LaneStableArenaState,
 };
 
+mod slot_geometry;
 mod state_equivalence;
 #[cfg(test)]
 mod tests;
@@ -32,8 +32,23 @@ struct SlotReadView {
     slot_id: u64,
     in_use: bool,
     last_used: u64,
+    geometry: Arc<SlotGeometry>,
+}
+impl std::ops::Deref for SlotReadView {
+    type Target = SlotGeometry;
+    fn deref(&self) -> &Self::Target {
+        &self.geometry
+    }
+}
+
+/// Numeric-only immutable slot shape. No leases, buffers, sessions or permits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::vnext::resource) struct SlotGeometry {
+    bucket: ReusableExecutionBucketId,
     claims: Vec<ClaimReadView>,
     projections: Vec<ProjectionReadView>,
+    segment_count: usize,
+    identity_count: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WorkspaceReadView {
@@ -79,121 +94,28 @@ pub(super) fn capture(
         }
         for slot in entry.slots.values() {
             poll(budget)?;
-            if slot.authorities.len() != slot.projection_bindings.len() {
-                return Err(U::InvalidDemand);
-            }
+            let geometry = slot_geometry::capture(key, slot, limits, budget)?;
             projections = projections
-                .checked_add(slot.authorities.len())
+                .checked_add(geometry.projections.len())
                 .ok_or(U::LimitExceeded)?;
-            if projections > limits.maximum_descriptors {
+            segments = segments
+                .checked_add(geometry.segment_count)
+                .ok_or(U::LimitExceeded)?;
+            claims = claims
+                .checked_add(geometry.identity_count)
+                .ok_or(U::LimitExceeded)?;
+            if projections > limits.maximum_descriptors
+                || claims > limits.maximum_descriptors
+                || segments > limits.maximum_free_extents
+            {
                 return Err(U::LimitExceeded);
-            }
-            let mut values = Vec::with_capacity(slot.authorities.len());
-            let mut physical: Vec<ClaimReadView> = Vec::new();
-            // Borrow only while the arena is locked. No lease reference or Arc
-            // escapes into the numeric result.
-            let mut claim_indices = BTreeMap::new();
-            for (authority, binding) in slot.authorities.iter().zip(&slot.projection_bindings) {
-                poll(budget)?;
-                let evidence = authority.evidence();
-                // Evidence segments describe this logical projection, not the
-                // shared physical allocation. Borrow the real lease while the
-                // arena is locked; retain only its numeric fields in the view.
-                let backing = &authority.segment_lease;
-                if evidence.initialization() != StateInitialization::None
-                    || evidence.reusable_execution_bucket_id()
-                        != Some(&key.reusable_execution_bucket_id)
-                    || backing.released
-                    || backing.owner_instance_id != evidence.pool_instance_id()
-                    || backing.owner.instance_id() != backing.owner_instance_id
-                    || backing.claim_identity.pool_id()
-                        != evidence.physical_claim_identity().pool_id()
-                    || backing.segment_generation != evidence.segment_generation()
-                    || backing.size_bytes != evidence.physical_size_bytes()
-                    || evidence
-                        .physical_offset_bytes()
-                        .checked_add(evidence.capacity_size_bytes())
-                        .is_none_or(|end| end > backing.size_bytes)
-                {
-                    return Err(U::InvalidDemand);
-                }
-                check_same_resource_ids(
-                    &backing.claim_identity,
-                    evidence.physical_claim_identity(),
-                    budget,
-                )?;
-                match backing_segment_range_matches_with_poll(
-                    &backing.segments,
-                    evidence.physical_offset_bytes(),
-                    evidence.capacity_size_bytes(),
-                    evidence.segments(),
-                    || budget.has_budget(),
-                )
-                .map_err(|_| U::InvalidDemand)?
-                {
-                    Some(true) => {}
-                    Some(false) => return Err(U::InvalidDemand),
-                    None => return Err(U::BudgetExhausted),
-                }
-                let claim = if let Some(&(index, prior_backing)) =
-                    claim_indices.get(&binding.request_index)
-                {
-                    let prior: &ClaimReadView = &physical[index];
-                    if prior.identity.pool_id() != evidence.physical_claim_identity().pool_id()
-                        || prior.physical_size != evidence.physical_size_bytes()
-                        || prior.pool_instance != evidence.pool_instance_id()
-                        || prior.segment_generation != Some(evidence.segment_generation())
-                    {
-                        return Err(U::InvalidDemand);
-                    }
-                    // A request index alone is not evidence. Shared immutable
-                    // identity and the exact lease permit constant-time checks;
-                    // independently supplied evidence is still checked in full.
-                    check_same_resource_ids(
-                        &prior.identity,
-                        evidence.physical_claim_identity(),
-                        budget,
-                    )?;
-                    if !Arc::ptr_eq(prior_backing, backing) {
-                        check_same_items(&prior.segments, &backing.segments, budget)?;
-                    }
-                    index
-                } else {
-                    segments = segments
-                        .checked_add(backing.segments.len())
-                        .ok_or(U::LimitExceeded)?;
-                    claims = claims
-                        .checked_add(evidence.physical_claim_identity().resource_ids().len())
-                        .ok_or(U::LimitExceeded)?;
-                    if segments > limits.maximum_free_extents || claims > limits.maximum_descriptors
-                    {
-                        return Err(U::LimitExceeded);
-                    }
-                    let index = physical.len();
-                    physical.push(ClaimReadView {
-                        identity: evidence.physical_claim_identity().clone(),
-                        physical_size: evidence.physical_size_bytes(),
-                        pool_instance: evidence.pool_instance_id(),
-                        segment_generation: Some(evidence.segment_generation()),
-                        segments: backing.segments.clone(),
-                    });
-                    claim_indices.insert(binding.request_index, (index, backing));
-                    index
-                };
-                values.push(ProjectionReadView {
-                    claim,
-                    resource: evidence.resource_id().clone(),
-                    capacity: evidence.capacity_size_bytes(),
-                    physical_offset: evidence.physical_offset_bytes(),
-                });
             }
             slots.push(SlotReadView {
                 key: key.clone(),
                 slot_id: slot.slot_id,
                 in_use: slot.in_use,
                 last_used: slot.last_used,
-                claims: physical,
-                projections: values,
+                geometry,
             });
         }
     }
@@ -251,22 +173,36 @@ fn validate_idle_projections(
     for projection in projections {
         poll(budget)?;
         let claim = claims.get(projection.claim).ok_or(U::InvalidDemand)?;
-        let index = match request_indices[projection.claim] {
-            Some(index) => index,
-            None => {
-                let index = canonical
-                    .binary_search_by(|request| request.claim_identity.cmp(&claim.identity))
-                    .map_err(|_| U::InvalidDemand)?;
-                request_indices[projection.claim] = Some(index);
-                index
-            }
-        };
-        let request = canonical[index];
-        let matched = request
-            .projections
-            .iter()
-            .find(|candidate| candidate.descriptor.base_resource_id() == &projection.resource)
+        if request_indices[projection.claim].is_none() {
+            let index = canonical
+                .binary_search_by(|request| request.claim_identity.cmp(&claim.identity))
+                .map_err(|_| U::InvalidDemand)?;
+            let projection_indices =
+                projection_lookup_indices(&canonical[index].projections, budget)?;
+            request_indices[projection.claim] = Some((index, projection_indices));
+        }
+        let (index, projection_indices) = request_indices[projection.claim]
+            .as_ref()
             .ok_or(U::InvalidDemand)?;
+        let request = canonical[*index];
+        let matched_index = match projection_indices {
+            None => request.projections.binary_search_by(|candidate| {
+                candidate
+                    .descriptor
+                    .base_resource_id()
+                    .cmp(&projection.resource)
+            }),
+            Some(indices) => indices
+                .binary_search_by(|&index| {
+                    request.projections[index]
+                        .descriptor
+                        .base_resource_id()
+                        .cmp(&projection.resource)
+                })
+                .map(|index| indices[index]),
+        }
+        .map_err(|_| U::InvalidDemand)?;
+        let matched = &request.projections[matched_index];
         if request.capacity_size_bytes != claim.physical_size
             || matched.physical_offset_bytes != projection.physical_offset
             || matched.capacity_size_bytes != projection.capacity
@@ -279,12 +215,48 @@ fn validate_idle_projections(
     Ok(())
 }
 
+// Production Step/Invocation projections preserve the immutable plan's strict
+// ResourceId order. Verify it once per matched claim, then borrow that order.
+// Other private callers may provide an equivalent permutation: build only a
+// call-local numeric index for that case. No ID, descriptor or authority is
+// copied, and the per-projection range/capacity checks remain above.
+fn projection_lookup_indices(
+    projections: &[crate::vnext::resource::dynamic_pool::EvaluatedBackingProjection<'_>],
+    budget: &mut dyn ResourcePlanningBudget,
+) -> Result<Option<Vec<usize>>, ResourcePlanningUnknown> {
+    // Even empty or singleton inputs cannot bypass an expired budget.
+    poll(budget)?;
+    let mut ordered = true;
+    for pair in projections.windows(2) {
+        poll(budget)?;
+        if pair[0].descriptor.base_resource_id() >= pair[1].descriptor.base_resource_id() {
+            ordered = false;
+            break;
+        }
+    }
+    if ordered {
+        return Ok(None);
+    }
+    let mut by_resource = BTreeMap::new();
+    for (index, projection) in projections.iter().enumerate() {
+        poll(budget)?;
+        if by_resource
+            .insert(projection.descriptor.base_resource_id(), index)
+            .is_some()
+        {
+            return Err(ResourcePlanningUnknown::InvalidDemand);
+        }
+    }
+    Ok(Some(by_resource.into_values().collect()))
+}
+
 /// Match the same first idle slot as LaneStableArenaEntry::claim_idle_slot.
 /// A new slot uses real resident free extents and is retained after this wave.
 pub(super) fn reserve(
     state: &mut ResourcePlanningState,
     requests: &[EvaluatedBackingRequest<'_>],
     lifetime: AllocationLifetime,
+    compiled: Option<&crate::vnext::resource::lane_stable_arena::CompiledLaneStableLayout>,
     limits: ResourcePlanningLimits,
     budget: &mut dyn ResourcePlanningBudget,
 ) -> Result<Option<LaneStableArenaSlotIdentity>, ResourcePlanningUnknown> {
@@ -323,7 +295,7 @@ pub(super) fn reserve(
     canonical.sort_unstable_by(|a, b| a.claim_identity.cmp(&b.claim_identity));
     let workspace = state.workspace.as_ref().ok_or(U::ReusableExecution)?;
     poll(budget)?;
-    let key = lane_stable_layout_key(workspace.lane_id, lifetime, &canonical)
+    let key = lane_stable_layout_key(workspace.lane_id, lifetime, &canonical, compiled)
         .map_err(|_| U::InvalidDemand)?;
     poll(budget)?;
     let mut idle: Option<&SlotReadView> = None;
@@ -418,7 +390,7 @@ pub(super) fn reserve(
             });
         }
     }
-    let workspace = state.workspace.as_mut().ok_or(U::ReusableExecution)?;
+    let workspace = Arc::make_mut(state.workspace.as_mut().ok_or(U::ReusableExecution)?);
     let slot_id = workspace.next_slot_id;
     workspace.next_slot_id = slot_id.checked_add(1).ok_or(U::LimitExceeded)?;
     let identity = slot_identity(&key, slot_id);
@@ -427,8 +399,13 @@ pub(super) fn reserve(
         slot_id,
         in_use: false,
         last_used: workspace.arena_clock,
-        claims,
-        projections,
+        geometry: Arc::new(SlotGeometry {
+            bucket: identity.reusable_execution_bucket_id().clone(),
+            segment_count: claims.iter().map(|c| c.segments.len()).sum(),
+            identity_count: claims.iter().map(|c| c.identity.resource_ids().len()).sum(),
+            claims,
+            projections,
+        }),
     });
     Ok(Some(identity))
 }

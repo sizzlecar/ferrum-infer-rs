@@ -166,6 +166,18 @@ pub enum ExecutionEventSinkEnablement {
 }
 
 pub trait ExecutionEventSink: Send + Sync {
+    /// Unknown artifact consumers conservatively retain statistical evidence.
+    /// Exact command identities, counts and timing are independent of this demand.
+    fn cost_observation_demand(&self) -> super::super::DeviceCostObservationDemand {
+        super::super::DeviceCostObservationDemand::Required
+    }
+
+    /// Existing artifact sinks conservatively retain dynamic actual evidence.
+    /// A metrics-only sink may opt out without changing device/logical receipts.
+    fn needs_structured_cost_sample(&self) -> bool {
+        true
+    }
+
     /// Resolves stable event enablement once when an emitter is constructed.
     ///
     /// Dynamically filtered sinks keep the conservative `PerKind` default.
@@ -603,6 +615,13 @@ where
 pub struct DisabledExecutionEventSink;
 
 impl ExecutionEventSink for DisabledExecutionEventSink {
+    fn cost_observation_demand(&self) -> super::super::DeviceCostObservationDemand {
+        super::super::DeviceCostObservationDemand::NotRequired
+    }
+    fn needs_structured_cost_sample(&self) -> bool {
+        false
+    }
+
     fn enablement(&self) -> ExecutionEventSinkEnablement {
         ExecutionEventSinkEnablement::None
     }
@@ -613,5 +632,28 @@ impl ExecutionEventSink for DisabledExecutionEventSink {
 
     fn record(&self, _permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cost_observation_demand_tests {
+    use super::*;
+    struct LegacyArtifact;
+    impl ExecutionEventSink for LegacyArtifact {
+        fn is_enabled(&self, _: ExecutionEventKind) -> bool {
+            true
+        }
+        fn record(&self, _: EventEmissionPermit) -> Result<(), ExecutionEventSinkError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn unknown_artifact_keeps_numeric_evidence_while_disabled_sink_does_not() {
+        assert!(LegacyArtifact.cost_observation_demand().is_required());
+        assert!(LegacyArtifact.needs_structured_cost_sample());
+        assert!(!DisabledExecutionEventSink
+            .cost_observation_demand()
+            .is_required());
+        assert!(!DisabledExecutionEventSink.needs_structured_cost_sample());
     }
 }

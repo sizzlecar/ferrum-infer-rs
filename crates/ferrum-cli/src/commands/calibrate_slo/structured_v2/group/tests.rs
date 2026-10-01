@@ -53,6 +53,7 @@ fn manifest() -> manifest::Manifest {
                 source: format!("child{index}.jsonl").into(),
                 scope: StructuredScopeV2 {
                     owner: owner.clone(),
+                    numerical_family: None,
                     coverage: StructuredCoverageV2 {
                         pending_eligible_positions: vec![],
                         authorized_pending_constraints: vec![HostPendingConstraintV2::AnySubset],
@@ -82,7 +83,7 @@ fn manifest() -> manifest::Manifest {
                         ],
                     }],
                 },
-                settings: structured::Settings::default(),
+                settings: Default::default(),
                 phase_members: [8; 3],
                 maximum_offered_waves: NonZeroUsize::new(512).unwrap(),
                 maximum_file_bytes: NonZeroU64::new(8 * 1024 * 1024).unwrap(),

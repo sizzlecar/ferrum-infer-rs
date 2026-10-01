@@ -178,6 +178,8 @@ pub enum ObservabilityProfileDetail {
     #[default]
     Off,
     Basic,
+    /// Aggregate host dispatch counters without device timing or artifact capture.
+    Host,
     Resource,
     Latency,
     Kernel,
@@ -192,6 +194,7 @@ impl ObservabilityProfileDetail {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
             "basic" => Some(Self::Basic),
+            "host" => Some(Self::Host),
             "resource" => Some(Self::Resource),
             "latency" => Some(Self::Latency),
             "kernel" => Some(Self::Kernel),
@@ -207,6 +210,7 @@ impl ObservabilityProfileDetail {
         match self {
             Self::Off => "off",
             Self::Basic => "basic",
+            Self::Host => "host",
             Self::Resource => "resource",
             Self::Latency => "latency",
             Self::Kernel => "kernel",
@@ -284,10 +288,12 @@ impl FerrumObservabilityConfig {
         self.enabled() && self.model == "synthetic/no-weight"
     }
 
-    /// Basic timing counters can be collected without constructing artifact events.
+    /// Basic and host timing counters can be collected without artifact events.
     pub fn metrics_only(&self) -> bool {
-        self.profile_detail == ObservabilityProfileDetail::Basic
-            && self.profile_jsonl.is_none()
+        matches!(
+            self.profile_detail,
+            ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Host
+        ) && self.profile_jsonl.is_none()
             && self.memory_profile_jsonl.is_none()
             && self.scheduler_trace_jsonl.is_none()
             && self.request_dump_dir.is_none()
@@ -308,6 +314,11 @@ impl FerrumObservabilityConfig {
         {
             return Err("profile_sample_rate must be between 0.0 and 1.0".to_string());
         }
+        if self.profile_detail == ObservabilityProfileDetail::Host && !self.metrics_only() {
+            return Err(
+                "host profile detail collects aggregate host metrics only and cannot be combined with artifact paths".to_string(),
+            );
+        }
         if self.enabled()
             && !self.metrics_only()
             && self.profile_jsonl.is_none()
@@ -316,7 +327,7 @@ impl FerrumObservabilityConfig {
             && self.request_dump_dir.is_none()
         {
             return Err(
-                "observability profile detail other than basic requires at least one artifact path"
+                "observability profile detail other than basic or host requires at least one artifact path"
                     .to_string(),
             );
         }
@@ -667,6 +678,45 @@ mod tests {
         );
         assert_eq!(ObservabilityProfileDetail::Verify.as_str(), "verify");
         assert!(ObservabilityProfileDetail::Verify.diagnostic_only());
+    }
+
+    #[test]
+    fn host_profile_is_typed_aggregate_only_without_artifact_capture() {
+        let host = ObservabilityProfileDetail::Host;
+        assert_eq!(ObservabilityProfileDetail::parse(" HOST "), Some(host));
+        assert_eq!(host.as_str(), "host");
+        assert_eq!(serde_json::to_string(&host).unwrap(), "\"host\"");
+        assert_eq!(
+            serde_json::from_str::<ObservabilityProfileDetail>("\"host\"").unwrap(),
+            host
+        );
+        assert!(!host.diagnostic_only());
+        assert!(!host.captures_engine_token_timing());
+        let config = FerrumObservabilityConfig::new(
+            ProfileEntrypoint::Run,
+            "model",
+            None,
+            host,
+            None,
+            None,
+            None,
+            DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE,
+        );
+        assert!(config.enabled());
+        assert!(config.metrics_only());
+        assert!(config.validate().is_ok());
+        for artifact in 0..4 {
+            let mut configured = config.clone();
+            let path = Some(PathBuf::from("artifact"));
+            match artifact {
+                0 => configured.profile_jsonl = path,
+                1 => configured.memory_profile_jsonl = path,
+                2 => configured.scheduler_trace_jsonl = path,
+                _ => configured.request_dump_dir = path,
+            }
+            assert!(!configured.metrics_only());
+            assert!(configured.validate().is_err());
+        }
     }
 
     #[test]

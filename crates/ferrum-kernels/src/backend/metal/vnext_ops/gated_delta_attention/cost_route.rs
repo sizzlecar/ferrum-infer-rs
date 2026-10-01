@@ -11,6 +11,9 @@ use ferrum_interfaces::vnext::{
 // describe a larger composite. Unsupported projection coverage remains None.
 const MAX_PLAIN_PARTS: usize = 16;
 
+mod checked;
+use checked::CheckedOperationInstance;
+
 #[derive(Clone, Copy)]
 pub(super) struct ProjectionDispatches {
     pub input: u64,
@@ -21,6 +24,121 @@ pub(super) struct RowDispatches {
     pub projections: ProjectionDispatches,
     pub delta: u64,
     pub chunked: bool,
+}
+
+/// Model geometry and weight partitions are fixed by the bound plan. Token
+/// extents, launch selection and resident ranges are still projected below.
+pub(super) struct PreparedCostData {
+    shape: AttentionShape,
+    classes: selected::PreparedKernelClasses,
+    input: Vec<PreparedLinearPart>,
+    output: PreparedLinearPart,
+    staging_bytes: u64,
+    linear_classes: Option<PreparedLinearProjectionClasses>,
+}
+
+pub(super) struct PreparedLinearProjectionClasses {
+    pub(super) input: Vec<super::super::linear::PreparedLinearClasses>,
+    pub(super) output: super::super::linear::PreparedLinearClasses,
+}
+
+impl PreparedLinearProjectionClasses {
+    pub(super) fn new(
+        shape: AttentionShape,
+        input: &[PreparedLinearPart],
+        output: PreparedLinearPart,
+    ) -> Option<Self> {
+        use super::super::linear::PreparedLinearClasses;
+        let mut classes = Vec::new();
+        classes.try_reserve_exact(input.len()).ok()?;
+        for &part in input {
+            let launch = linear_launch(
+                part,
+                0,
+                0,
+                1,
+                shape.hidden_size,
+                shape.qkvzba_features,
+                0,
+                0,
+            )
+            .ok()?;
+            classes.push(PreparedLinearClasses::new(launch)?);
+        }
+        let output = linear_launch(
+            output,
+            0,
+            0,
+            1,
+            shape.value_features,
+            shape.hidden_size,
+            0,
+            0,
+        )
+        .ok()?;
+        Some(Self {
+            input: classes,
+            output: PreparedLinearClasses::new(output)?,
+        })
+    }
+}
+
+impl PreparedCostData {
+    pub(super) fn new(
+        attributes: &BTreeMap<AttributeId, SemanticValue>,
+        bindings: &[ResolvedValueBinding],
+        hidden_type: ElementType,
+    ) -> Result<Option<Self>, String> {
+        let Some(mut data) = Self::unprepared(attributes, bindings, hidden_type)? else {
+            return Ok(None);
+        };
+        data.linear_classes =
+            PreparedLinearProjectionClasses::new(data.shape, &data.input, data.output);
+        Ok(Some(data))
+    }
+
+    // The compatibility query path retains the original renderer; only plan
+    // preparation compiles the complete immutable class set.
+    fn unprepared(
+        attributes: &BTreeMap<AttributeId, SemanticValue>,
+        bindings: &[ResolvedValueBinding],
+        hidden_type: ElementType,
+    ) -> Result<Option<Self>, String> {
+        let shape = AttentionShape::from_attributes(attributes)?;
+        validate_bindings(bindings, shape, hidden_type)?;
+        let input_binding = binding(bindings, ResolvedValueRole::Input, 2)?;
+        let output_binding = binding(bindings, ResolvedValueRole::Input, 7)?;
+        let Some(input) = projection(
+            input_binding,
+            shape.qkvzba_features,
+            shape.hidden_size,
+            true,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(output) = projection(
+            output_binding,
+            shape.hidden_size,
+            shape.value_features,
+            false,
+        )?
+        else {
+            return Ok(None);
+        };
+        let [output] = output.as_slice() else {
+            return Err("Metal GDN output projection is not one matrix".into());
+        };
+        Ok(Some(Self {
+            shape,
+            classes: selected::PreparedKernelClasses::new(&shape.params(1)?)
+                .ok_or("Metal GDN kernel identity preparation failed")?,
+            input,
+            output: *output,
+            staging_bytes: input_projection_workspace(bindings, shape)?,
+            linear_classes: None,
+        }))
+    }
 }
 
 /// Both the actual encoder and future query use this command accounting.
@@ -102,32 +220,26 @@ pub(super) fn eager_route(
         return Ok(None);
     }
     let calculate = || -> Result<Option<OperationCostCommand>, String> {
-        let shape = AttentionShape::from_attributes(request.attributes())?;
-        validate_bindings(request.bindings(), shape, hidden_type)?;
-        let input_binding = binding(request.bindings(), ResolvedValueRole::Input, 2)?;
-        let output_binding = binding(request.bindings(), ResolvedValueRole::Input, 7)?;
-        let Some(input) = projection(
-            input_binding,
-            shape.qkvzba_features,
-            shape.hidden_size,
-            true,
-        )?
-        else {
-            return Ok(None);
+        let fallback;
+        let prepared = match request.prepared_cost_data::<PreparedCostData>() {
+            Some(prepared) => prepared,
+            None => {
+                let Some(value) = PreparedCostData::unprepared(
+                    request.attributes(),
+                    request.bindings(),
+                    hidden_type,
+                )?
+                else {
+                    return Ok(None);
+                };
+                fallback = value;
+                &fallback
+            }
         };
-        let Some(output) = projection(
-            output_binding,
-            shape.hidden_size,
-            shape.value_features,
-            false,
-        )?
-        else {
-            return Ok(None);
-        };
-        let [output] = output.as_slice() else {
-            return Err("Metal GDN output projection is not one matrix".into());
-        };
-        let staging_bytes = input_projection_workspace(request.bindings(), shape)?;
+        let shape = prepared.shape;
+        let input = &prepared.input;
+        let output = &prepared.output;
+        let staging_bytes = prepared.staging_bytes;
         let layout = ScratchLayout::new(shape, request.immediate_tokens())?
             .with_projection_workspace(staging_bytes)?;
         let packed = request.rows().len() > 1
@@ -137,34 +249,26 @@ pub(super) fn eager_route(
             && request
                 .binding_uses_packed_batch_coordinates(ResolvedValueRole::Output, 0)
                 .map_err(|e| e.to_string())?;
-        let route = project(
+        let instance = CheckedOperationInstance::new(
             shape,
             hidden_type,
             request.rows(),
             request.immediate_tokens(),
             packed,
-            &input,
+            input,
             *output,
             layout,
             staging_bytes,
             capabilities,
             cost_model,
         )?;
-        let statistics = project_statistics(
-            shape,
-            hidden_type,
-            request.rows(),
-            request.immediate_tokens(),
-            packed,
-            &input,
-            *output,
-            layout,
-            staging_bytes,
-            capabilities,
-            cost_model,
+        let route = instance.command()?;
+        let statistics = instance.statistics(
             attention,
             linear,
             primitives,
+            &prepared.classes,
+            prepared.linear_classes.as_ref(),
         );
         Ok(Some(match statistics {
             Some(evidence) => route
@@ -264,6 +368,7 @@ fn plain_projection(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn project(
     shape: AttentionShape,
     hidden_type: ElementType,
@@ -323,6 +428,7 @@ fn project(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn project_dispatches(
     shape: AttentionShape,
     input: &[PreparedLinearPart],
@@ -421,6 +527,7 @@ fn project_launches(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn project_statistics(
     shape: AttentionShape,
     hidden: ElementType,
@@ -436,6 +543,7 @@ fn project_statistics(
     attention: &MetalGatedDeltaPipelines,
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
+    classes: &selected::PreparedKernelClasses,
 ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
     let mut projections = Vec::new();
     projections.try_reserve_exact(rows.len()).ok()?;
@@ -462,7 +570,7 @@ fn project_statistics(
     } else {
         None
     };
-    selected::evidence(
+    selected::evidence_with_classes(
         attention,
         linear,
         primitives,
@@ -481,6 +589,7 @@ fn project_statistics(
                 },
                 form: *form,
             }),
+        Some(classes),
     )
 }
 

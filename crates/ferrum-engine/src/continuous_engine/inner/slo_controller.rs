@@ -11,6 +11,7 @@ use ferrum_scheduler::implementations::continuous::{planning_state::*, slo_plann
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 pub(in crate::continuous_engine) mod admission;
+use admission::SequenceTimeAdmission;
 mod budget;
 use budget::{ControllerAudit, ControllerBudget, ControllerOptionalPhase, ControllerStage};
 mod commit;
@@ -20,10 +21,12 @@ mod completion;
 mod dispatch;
 mod maintenance;
 mod owner;
+mod prefix;
 mod recovery;
 mod resources;
 mod retry;
-mod shape;
+pub(super) mod sampling;
+pub(super) mod shape;
 mod snapshot;
 mod submit;
 #[cfg(test)]
@@ -34,6 +37,9 @@ pub(in crate::continuous_engine) enum SloIterationPlan {
     Legacy,
     Idle,
     Selected(submit::PreparedControllerWave),
+    PrefixMaintenance(prefix::PreparedPrefixMaintenance),
+    PrefixSampling(prefix::PreparedPrefixSampling),
+    Progressed,
 }
 
 /// Only one iteration publishes a wave at a time. A typed no-submission
@@ -61,6 +67,13 @@ pub(in crate::continuous_engine) struct SloControllerState {
     completion_next: Option<ferrum_interfaces::execution_cost::CompletionOnlyReason>,
     retry: Option<retry::ControllerRetryWake>,
     time_activation: admission::TimeActivationState,
+    prefix: Option<prefix::SloPrefixCohort>,
+    ready_prefix: Option<prefix::ReadyPrefixCohort>,
+    // One numeric attempt marker per live owner; no cache or owner lease.
+    prefix_cache_captures: Vec<(RequestId, u64, u32)>,
+    prefix_cache_preparing: Option<prefix::producer::CacheCaptureContinuation>,
+    prefix_samples: Vec<(RequestId, u64, u64, usize)>,
+    prefix_sample: Option<Arc<prefix::PrefixSample>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +123,8 @@ struct EngineFence {
     /// only for the installed empirical plain-text capability; not a prediction
     /// of token content or permission to replace the first wave's exact policy.
     future_greedy_policy: Option<ferrum_interfaces::model_executor::LogitsReturnPolicy>,
+    /// Actual unique-history count and installed penalty; no future IDs.
+    future_repetition: Option<(u64, f32, u64)>,
     host_features: Option<ferrum_interfaces::execution_cost::HostCostFeaturesV1>,
 }
 
@@ -138,6 +153,8 @@ impl EngineFence {
 }
 
 struct ControllerSnapshot {
+    prefix_maintenance: Option<Arc<super::cost_observation::PrefixCostSnapshot>>,
+    prefix_checkpoint: Option<Arc<dyn ferrum_interfaces::model_executor::PrefixCaptureLease>>,
     budget: Arc<ControllerBudget>,
     optional_phase: Option<ControllerOptionalPhase>,
     queue: PlanningQueueSnapshot,
@@ -147,6 +164,10 @@ struct ControllerSnapshot {
     resources: ResourcePlanningView,
     route: ferrum_interfaces::vnext::ExecutionCostRouteView,
     fences: Vec<EngineFence>,
+    /// Other strict waiters remain in the full queue seal and owner fence,
+    /// but carry no accepted time obligation in this candidate's forecast.
+    waiting_fences: Vec<EngineFence>,
+    before_acceptance_candidate: Option<RequestId>,
     model: Arc<dyn PlanningCostModel + Send + Sync>,
     protection: Arc<PlanningObligationSet>,
     recovery_peers: Vec<recovery::RecoveryPeer>,
@@ -168,21 +189,27 @@ impl ControllerSnapshot {
 }
 
 struct ControllerSafetyProof {
+    prefix_maintenance: Option<Arc<super::cost_observation::PrefixCostSnapshot>>,
+    _prefix_checkpoint: Option<Arc<dyn ferrum_interfaces::model_executor::PrefixCaptureLease>>,
     recovery_peers: Vec<recovery::RecoveryPeer>,
     protection: Option<Arc<PlanningObligationSet>>,
     budget: Arc<ControllerBudget>,
     queue: PlanningQueueSnapshot,
     fences: Vec<EngineFence>,
+    waiting_fences: Vec<EngineFence>,
 }
 
 impl ControllerSnapshot {
     fn into_safety(self) -> ControllerSafetyProof {
         ControllerSafetyProof {
+            prefix_maintenance: self.prefix_maintenance,
+            _prefix_checkpoint: self.prefix_checkpoint,
             protection: self.protection.needs_recovery().then_some(self.protection),
             recovery_peers: self.recovery_peers,
             budget: self.budget,
             queue: self.queue,
             fences: self.fences,
+            waiting_fences: self.waiting_fences,
         }
     }
 }
@@ -194,8 +221,9 @@ impl EngineInner {
         &self,
         hint: &ferrum_interfaces::BatchHint,
     ) -> Result<SloIterationPlan> {
-        let mode = self.config.scheduler.slo.mode;
-        if mode == ferrum_types::SloMode::Off {
+        if self.config.scheduler.slo.execution_policy().controller
+            == ferrum_types::SloControllerPolicy::Legacy
+        {
             return Ok(SloIterationPlan::Legacy);
         }
         // Publication rollback and durable task completion must still notify
@@ -207,6 +235,13 @@ impl EngineInner {
             slo_clock_now(),
             self.config.scheduler.slo.planner.planning_budget(),
         )?;
+        if let Some(writer) = &self.required_query_observation {
+            let _ = budget.observation.set(writer.begin());
+        }
+        let diagnostic_span = tracing::trace_span!(target: "ferrum::slo_transaction",
+            "slo_transaction", transaction=budget.observation.get().map(|o| o.id()));
+        let _diagnostic = diagnostic_span.enter();
+        budget.diagnostic_checkpoint("preparation_begin");
         let result = self.prepare_slo_controller_budgeted(hint, &budget);
         self.finish_slo_controller_preparation(&budget, result)
     }
@@ -219,6 +254,7 @@ impl EngineInner {
         result: Result<SloIterationPlan>,
     ) -> Result<SloIterationPlan> {
         let within_budget = budget.finish_planning();
+        budget.diagnostic_checkpoint("preparation_end");
         if !within_budget {
             self.arm_controller_retry(retry::ControllerRetryReason::ComputeBudget);
             if result.is_ok() {
@@ -238,6 +274,17 @@ impl EngineInner {
                 return Ok(SloIterationPlan::Idle);
             }
             return Ok(SloIterationPlan::Selected(prepared));
+        }
+        if matches!(
+            &result,
+            Ok(SloIterationPlan::PrefixMaintenance(_) | SloIterationPlan::PrefixSampling(_))
+        ) {
+            if within_budget {
+                return result;
+            }
+            drop(result);
+            self.finish_controller_audit(budget, "prefix_preparation_expired");
+            return Ok(SloIterationPlan::Idle);
         }
         self.finish_controller_audit(
             budget,
@@ -290,33 +337,67 @@ impl EngineInner {
                 SloIterationPlan::Legacy
             });
         }
+        if self.config.scheduler.slo.execution_policy().controller
+            == ferrum_types::SloControllerPolicy::DeadlineOnly
+        {
+            return self.prepare_completion_controller(
+                hint,
+                budget,
+                ferrum_interfaces::execution_cost::CompletionOnlyReason::DeadlinePolicy,
+            );
+        }
+        // Lock contention is not missing cost. A published inference model
+        // always reaches cost-aware planning before new cold work is selected.
+        if self.prefix_inference_cost_absent() {
+            if let Some(sampling) = self.prepare_prefix_sampling(budget, None) {
+                return Ok(SloIterationPlan::PrefixSampling(sampling));
+            }
+        }
         let completion = self.slo_controller.lock().completion_next;
-        if let Some(reason) = completion.filter(|_| self.completion_allowed()) {
+        if let Some(reason) = completion.filter(|_| {
+            let state = self.slo_controller.lock();
+            self.completion_allowed()
+                && state.prefix.is_none()
+                && state.ready_prefix.is_none()
+                && state.prefix_sample.is_none()
+                && !self.config.runtime.prefix_state_cache_enabled
+        }) {
             return self.prepare_completion_controller(hint, budget, reason);
         }
         // CompleteRequests permits safe physical progress without a time
         // witness. Prepare that evidence before optional cost work can spend
         // the transaction. A draft holds no publication or output permission.
         // If it is unavailable, retain the ordinary complete-obligation search.
-        let draft = self
+        budget.diagnostic_checkpoint("completion_draft_begin");
+        let mut draft = self
             .completion_allowed()
             .then(|| self.capture_completion_draft(hint, budget).ok())
             .flatten();
+        budget.diagnostic_checkpoint(if draft.is_some() {
+            "completion_draft_ready"
+        } else {
+            "completion_draft_unavailable"
+        });
         let optional_phase = draft.as_ref().map(|draft| {
-            budget.completion_optional_phase(
-                draft.preparation_wall,
-                self.config
-                    .scheduler
-                    .slo
-                    .planner
-                    .publication_reserve_percent,
-            )
+            draft.optional_phase.clone().unwrap_or_else(|| {
+                budget.completion_optional_phase(
+                    draft.preparation_wall,
+                    self.config
+                        .scheduler
+                        .slo
+                        .planner
+                        .publication_reserve_percent,
+                )
+            })
         });
         if optional_phase.as_ref().is_some_and(|phase| !phase.poll()) {
             budget.record_search(&PlanningDecision::Unknown {
                 reason: PlanningUnknownReason::ComputeBudgetExhausted,
                 search: Default::default(),
             });
+            if self.drop_slo_prefix_trajectory() {
+                return Ok(SloIterationPlan::Progressed);
+            }
             return self.prepare_completion_with_draft(
                 hint,
                 budget,
@@ -324,13 +405,14 @@ impl EngineInner {
                 ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive,
             );
         }
-        let captured = match {
+        let mut captured = match {
             let _stage = budget.stage(ControllerStage::Capture);
-            self.capture_slo_controller_snapshot_in_phase(
+            self.capture_slo_controller_snapshot_with_completion(
                 hint,
                 Arc::clone(budget),
                 optional_phase,
                 &mut None,
+                draft.as_mut(),
             )
         } {
             Ok(value) => value,
@@ -341,6 +423,9 @@ impl EngineInner {
                     disposition: "unknown",
                     reason: error.reason,
                 });
+                if self.drop_slo_prefix_trajectory() {
+                    return Ok(SloIterationPlan::Progressed);
+                }
                 return if self.completion_allowed() {
                     self.prepare_completion_with_draft(
                             hint,
@@ -361,6 +446,114 @@ impl EngineInner {
                 };
             }
         };
+        match self.plan_slo_prefix(&captured)? {
+            prefix::PrefixPlan::CachePreparation {
+                selected,
+                maintenance,
+            } => {
+                captured.prefix_maintenance = Some(maintenance);
+                drop(draft);
+                return self
+                    .prepare_slo_controller_wave_with_admission(captured, selected, hint, None);
+            }
+            prefix::PrefixPlan::CacheCapture(capture) => {
+                drop(draft);
+                let model_version = captured.snapshot.cost_model_version;
+                return Ok(SloIterationPlan::PrefixMaintenance(
+                    prefix::PreparedPrefixMaintenance::CacheCapture(
+                        capture.prepare(captured.into_safety(), model_version),
+                    ),
+                ));
+            }
+            prefix::PrefixPlan::ReadyMaintenance(ready) => {
+                drop(draft);
+                let model_version = captured.snapshot.cost_model_version;
+                return Ok(SloIterationPlan::PrefixMaintenance(
+                    prefix::PreparedPrefixMaintenance::Ready(
+                        ready.prepare(captured.into_safety(), model_version),
+                    ),
+                ));
+            }
+            prefix::PrefixPlan::None => {
+                // No complete comparison was available. A new cold Capture
+                // still requires a current physical projection whose exact
+                // domain is missing cost; Restore is checked at native submit.
+                if captured.poll_planning() {
+                    if let Some(sampling) = self.prepare_prefix_sampling(budget, Some(&captured)) {
+                        if captured.poll_planning() {
+                            return Ok(SloIterationPlan::PrefixSampling(sampling));
+                        }
+                    }
+                }
+            }
+            prefix::PrefixPlan::CostUnavailable => {
+                if captured.poll_planning() {
+                    if let Some(sampling) = self.prepare_prefix_sampling(budget, Some(&captured)) {
+                        if captured.poll_planning() {
+                            return Ok(SloIterationPlan::PrefixSampling(sampling));
+                        }
+                    }
+                }
+            }
+            prefix::PrefixPlan::IncompleteCostLookup => {
+                if captured.poll_planning() {
+                    if let Some(sampling) = self.prepare_prefix_sampling(budget, Some(&captured)) {
+                        if captured.poll_planning() {
+                            return Ok(SloIterationPlan::PrefixSampling(sampling));
+                        }
+                    }
+                }
+                return self.prepare_completion_with_draft(
+                    hint,
+                    budget,
+                    draft,
+                    ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive,
+                );
+            }
+            prefix::PrefixPlan::Changed => return Ok(SloIterationPlan::Progressed),
+            prefix::PrefixPlan::Inconclusive => {
+                return self.prepare_completion_with_draft(
+                    hint,
+                    budget,
+                    draft,
+                    ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive,
+                );
+            }
+            prefix::PrefixPlan::Wave {
+                selected,
+                maintenance,
+                checkpoint,
+            } => {
+                captured.prefix_maintenance = Some(maintenance);
+                captured.prefix_checkpoint = Some(checkpoint);
+                drop(draft);
+                return self
+                    .prepare_slo_controller_wave_with_admission(captured, selected, hint, None);
+            }
+            prefix::PrefixPlan::Maintenance {
+                cohort,
+                evidence,
+                maintenance,
+                valid_until,
+                predicted_wall_ns,
+            } => {
+                drop(draft);
+                let model_version = captured.snapshot.cost_model_version;
+                return Ok(SloIterationPlan::PrefixMaintenance(
+                    prefix::PreparedPrefixMaintenance::Rendezvous(
+                        prefix::PreparedRendezvousMaintenance {
+                            cohort,
+                            evidence,
+                            maintenance,
+                            valid_until,
+                            model_version,
+                            predicted_wall_ns,
+                            proof: captured.into_safety(),
+                        },
+                    ),
+                ));
+            }
+        }
         self.slo_controller.lock().last_recovery_scope = captured
             .protection
             .needs_recovery()
@@ -369,13 +562,36 @@ impl EngineInner {
             tracing::trace!(scope = ?scope.rows(), required_first_service = ?scope.required_first_service(),
                 promises_closed = scope.new_time_promises_closed(), "immutable forward recovery obligations");
         }
-        let (decision, admission, deferred) = {
+        let (decision, admission, deferred, rejected_before_acceptance) = {
             let _stage = budget.stage(ControllerStage::SearchReplay);
             match self.propose_slo_time_admission(&captured) {
-                Some(proposal) => (proposal.decision, proposal.pending, proposal.deferred),
-                None => (Some(self.propose_slo_controller(&captured)), None, None),
+                Some(proposal) => (
+                    proposal.decision,
+                    proposal.pending,
+                    proposal.deferred,
+                    proposal.rejected_before_acceptance,
+                ),
+                None => (
+                    Some(self.propose_slo_controller(&captured)),
+                    None,
+                    None,
+                    false,
+                ),
             }
         };
+        if rejected_before_acceptance {
+            self.record_controller(ControllerObservation {
+                obligations: captured.snapshot.requests.len(),
+                disposition: "rejected_before_acceptance",
+                reason: "strict_time_admission",
+            });
+            return self.prepare_completion_with_draft(
+                hint,
+                budget,
+                draft,
+                ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive,
+            );
+        }
         if let Some(reason) = deferred {
             self.record_controller(ControllerObservation {
                 obligations: captured.snapshot.requests.len(),

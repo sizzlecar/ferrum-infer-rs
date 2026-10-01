@@ -3,6 +3,26 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// A strict time promise was refused before transport acceptance.
+/// Expiry does not assert that the request was mathematically infeasible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloTimeAdmissionRejection {
+    TargetTimeImpossible,
+    WaitExpired,
+}
+
+impl std::fmt::Display for SloTimeAdmissionRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TargetTimeImpossible => {
+                "target time obligation is impossible under the imported model"
+            }
+            Self::WaitExpired => "original strict admission wait expired without a time promise",
+        })
+    }
+}
+
 /// Main error type for Ferrum operations
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum FerrumError {
@@ -46,6 +66,10 @@ pub enum FerrumError {
     /// Resource exhaustion errors
     #[error("Resource exhausted: {message}")]
     ResourceExhausted { message: String },
+
+    /// Strict SLO refusal; never used to terminate an already accepted owner.
+    #[error("SLO time admission rejected: {reason}")]
+    SloTimeAdmissionRejected { reason: SloTimeAdmissionRejection },
 
     /// Timeout errors
     #[error("Operation timed out: {message}")]
@@ -325,6 +349,7 @@ impl FerrumError {
     /// failures and generic panic/error failures.
     pub fn observability_failure_kind(&self) -> &'static str {
         match self {
+            Self::SloTimeAdmissionRejected { .. } => "time_admission",
             Self::ResourceExhausted { .. } => "oom_admission",
             Self::Device { message } if looks_like_oom(message) => "oom",
             Self::Scheduler { message } if looks_like_admission(message) => "admission",
@@ -345,6 +370,7 @@ impl FerrumError {
             Self::RequestValidation { .. } => "request_validation",
             Self::ContextLengthExceeded { .. } => "context_length_exceeded",
             Self::ResourceExhausted { .. } => "resource_exhausted",
+            Self::SloTimeAdmissionRejected { .. } => "slo_time_admission_rejected",
             Self::Timeout { .. } => "timeout",
             Self::Auth { .. } => "auth",
             Self::RateLimit { .. } => "rate_limit",

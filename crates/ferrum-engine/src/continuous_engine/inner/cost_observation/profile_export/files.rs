@@ -6,8 +6,60 @@ use std::io::{Read, Write};
 
 const MAX_PRODUCER_BINARY_BYTES: u64 = 1 << 30;
 
+#[cfg(test)]
+mod producer_identity_tests;
+
+/// One immutable origin per running executable. An exec starts a new process
+/// and an empty store; explicit read(path) deliberately does not use this store.
+static PROCESS_PRODUCER: ProducerIdentityStore = ProducerIdentityStore::new();
+
+struct ProducerIdentityStore {
+    result: std::sync::OnceLock<Result<ProducerIdentity, ProducerReadError>>,
+}
+impl ProducerIdentityStore {
+    const fn new() -> Self {
+        Self {
+            result: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn current(
+        &self,
+        read: impl FnOnce() -> Result<ProducerIdentity, ProducerReadError>,
+    ) -> Result<ProducerIdentity, ExportError> {
+        self.result
+            .get_or_init(read)
+            .as_ref()
+            .cloned()
+            .map_err(ProducerReadError::export)
+    }
+}
+
+/// Preserve the existing source/IO failure category on every read of a failed
+/// immutable process origin, without trying the executable again.
+enum ProducerReadError {
+    Io(std::io::Error),
+    Source(&'static str),
+}
+impl From<std::io::Error> for ProducerReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl ProducerReadError {
+    fn export(&self) -> ExportError {
+        match self {
+            Self::Io(error) => ExportError::Io(match error.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(error.kind(), error.to_string()),
+            }),
+            Self::Source(reason) => ExportError::Source(reason),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct ProducerIdentity {
+pub(in crate::continuous_engine::inner::cost_observation) struct ProducerIdentity {
     pub executable_path: PathBuf,
     pub executable_sha256: String,
     pub executable_bytes: u64,
@@ -18,15 +70,19 @@ pub(super) struct ProducerIdentity {
 
 impl ProducerIdentity {
     pub fn current() -> Result<Self, ExportError> {
-        Self::read(&std::env::current_exe()?)
+        PROCESS_PRODUCER.current(|| Self::read_uncached(&std::env::current_exe()?))
     }
 
     pub(super) fn read(path: &Path) -> Result<Self, ExportError> {
+        Self::read_uncached(path).map_err(|error| error.export())
+    }
+
+    fn read_uncached(path: &Path) -> Result<Self, ProducerReadError> {
         let path = path.canonicalize()?;
         let mut file = File::open(&path)?;
         let before = file.metadata()?;
         if !before.is_file() || before.len() > MAX_PRODUCER_BINARY_BYTES {
-            return Err(ExportError::Source(
+            return Err(ProducerReadError::Source(
                 "producer executable exceeds the regular-file bound",
             ));
         }
@@ -41,7 +97,7 @@ impl ProducerIdentity {
             bytes = bytes
                 .checked_add(n as u64)
                 .filter(|bytes| *bytes <= MAX_PRODUCER_BINARY_BYTES)
-                .ok_or(ExportError::Source(
+                .ok_or(ProducerReadError::Source(
                     "producer executable grew beyond the byte bound",
                 ))?;
             hash.update(&buffer[..n]);
@@ -51,7 +107,7 @@ impl ProducerIdentity {
             || after.len() != before.len()
             || after.modified()? != before.modified()?
         {
-            return Err(ExportError::Source(
+            return Err(ProducerReadError::Source(
                 "producer executable changed while hashing",
             ));
         }
@@ -91,13 +147,14 @@ pub(in crate::continuous_engine::inner::cost_observation) struct PublishedFile {
     pub digest: [u8; 32],
 }
 
-pub(super) struct StagedFile {
+pub(in crate::continuous_engine::inner::cost_observation) struct StagedFile {
     file: File,
     temp: PathBuf,
     destination: PathBuf,
     limit: u64,
     bytes: u64,
     hash: Sha256,
+    preserve_unpublished: bool,
 }
 
 impl StagedFile {
@@ -118,7 +175,38 @@ impl StagedFile {
             limit,
             bytes: 0,
             hash: Sha256::new(),
+            preserve_unpublished: false,
         })
+    }
+
+    /// Live service-window evidence must survive a failed writer or incomplete
+    /// shutdown. Other exporters retain their ordinary temporary-file cleanup.
+    pub fn preserve_unpublished(&mut self) {
+        self.preserve_unpublished = true;
+    }
+    pub fn destination_path(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Inline rolling receipt for an original-record sink: no path/String clone.
+    pub fn source_receipt(&self) -> (u64, [u8; 32]) {
+        (self.bytes, self.hash.clone().finalize().into())
+    }
+
+    pub fn retained_path_bytes(&self) -> Option<usize> {
+        self.temp
+            .capacity()
+            .checked_add(self.destination.capacity())
+    }
+
+    pub fn unpublished_receipt(&self) -> PublishedFile {
+        let digest = self.hash.clone().finalize();
+        PublishedFile {
+            path: self.temp.clone(),
+            bytes: self.bytes,
+            sha256: format!("{digest:x}"),
+            digest: digest.into(),
+        }
     }
 
     pub fn json<T: Serialize>(&mut self, value: &T) -> Result<(), ExportError> {
@@ -138,6 +226,7 @@ impl StagedFile {
         // Same-directory hard-link creation is atomic and fails if a competing
         // writer created the destination after preflight. No rename overwrite.
         std::fs::hard_link(&self.temp, &self.destination)?;
+        self.preserve_unpublished = false;
         let digest = self.hash.clone().finalize();
         Ok(PublishedFile {
             path: self.destination.clone(),
@@ -166,6 +255,8 @@ impl Write for StagedFile {
 }
 impl Drop for StagedFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.temp);
+        if !self.preserve_unpublished {
+            let _ = std::fs::remove_file(&self.temp);
+        }
     }
 }

@@ -94,10 +94,7 @@ fn host_settled_wall_preserves_actual_mixed_host_order_and_old_composite_rejecti
     }
     call.reject(CostCallRejection::Composite);
     clock.set(30);
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::Composite);
     let stages = capture.host_stages().unwrap();
     assert_eq!(
         stages.actual_shape.as_ref().unwrap().row_multiset_features,
@@ -234,7 +231,7 @@ fn auxiliary_drop_has_no_accepted_ordinal_and_missing_physical_row_cannot_be_com
     let sink = sink(1, 32);
     assert_eq!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     let capture = Arc::new(CostCalibrationCapture::default());
     let (mut call, clock) = begin(&shape, &sink);
@@ -252,13 +249,17 @@ fn auxiliary_drop_has_no_accepted_ordinal_and_missing_physical_row_cannot_be_com
     call.reject(CostCallRejection::Composite);
     assert_eq!(
         call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
+        CostCallDisposition::Dropped(CostSampleDrop::Capacity)
     );
-    assert_eq!(
-        capture.host_stage_queue(),
-        Some(HostStageQueueReceipt {
-            accepted_ordinal: None,
-            disposition: HostStageQueueDisposition::DroppedCapacity,
-        })
+    assert!(
+        capture.host_stage_queue().is_none(),
+        "raw queue loss cannot mint resolved host evidence"
     );
+    let CostCalibrationStatus::Complete(result) = capture.status() else {
+        panic!("drop completes waiter");
+    };
+    assert!(matches!(
+        result.as_ref(),
+        CostCalibrationResult::UnresolvedDropped(CostSampleDrop::Capacity)
+    ));
 }

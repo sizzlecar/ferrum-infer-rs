@@ -172,15 +172,15 @@ impl<R: DeviceRuntime> CheckpointBackingOwner<R> {
     }
 }
 
-struct EvaluatedCheckpointBacking<'a> {
-    slices: Vec<EvaluatedBackingRequest<'a>>,
-    demand: AdmissionDemand,
-    logical_bytes: u64,
-    extent_bytes: u64,
+pub(in crate::vnext::resource) struct EvaluatedCheckpointBacking<'a> {
+    pub(in crate::vnext::resource) slices: Vec<EvaluatedBackingRequest<'a>>,
+    pub(in crate::vnext::resource) demand: AdmissionDemand,
+    pub(in crate::vnext::resource) logical_bytes: u64,
+    pub(in crate::vnext::resource) extent_bytes: u64,
 }
 
 impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
-    fn evaluate_checkpoint_backing(
+    pub(in crate::vnext::resource) fn evaluate_checkpoint_backing(
         &self,
         request: &CheckpointBackingRequests,
     ) -> Result<EvaluatedCheckpointBacking<'_>, VNextError> {

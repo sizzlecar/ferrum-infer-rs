@@ -1,5 +1,32 @@
 use super::*;
 
+#[test]
+fn pool_cow_failed_allocation_preserves_original_search_counter_and_layout() {
+    let original = state();
+    let mut branch = original.clone();
+    let before = original.pools[0].allocator.search_probes;
+    let mut independent = (*original.pools[0].allocator).clone();
+    let id = branch.pools[0].id.clone();
+    let expected = independent.allocate_contiguous(&id, 256).unwrap();
+    let actual = Arc::make_mut(&mut branch.pools[0].allocator)
+        .allocate_contiguous(&id, 256)
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert!(actual.is_none());
+    assert_eq!(original.pools[0].allocator.search_probes, before);
+    assert_eq!(
+        branch.pools[0].allocator.search_probes,
+        independent.search_probes
+    );
+    assert_eq!(branch.pools[0].allocator.search_probes, before + 1);
+    assert_eq!(branch.pools[0].allocator.by_offset, independent.by_offset);
+    assert_eq!(branch.pools[0].allocator.by_size, independent.by_size);
+    assert!(!Arc::ptr_eq(
+        &original.pools[0].allocator,
+        &branch.pools[0].allocator
+    ));
+}
+
 fn state() -> ResourcePlanningState {
     let id = serde_json::from_value(serde_json::json!(format!(
         "dynamic-pool/sha256/{}",
@@ -16,12 +43,14 @@ fn state() -> ResourcePlanningState {
             instance: 1,
             next_extent_generation: 2,
             resident_bytes: 256,
-            allocator,
+            allocator: Arc::new(allocator),
         }],
         workspace: None,
         logical_available: BTreeMap::from([(CapacityDomainId::new(1).unwrap(), 128)]),
         covered: vec![DynamicResourceShape::from_validated(1, 1, 0)],
         sequence_ranges: vec![Arc::new(BTreeMap::new())],
+        checkpoint_retained_bytes: None,
+        checkpoint_tokens: Vec::new(),
         waves: 1,
     }
 }
@@ -36,7 +65,7 @@ fn successor_equality_keeps_allocator_layout_and_capture_authority() {
     let mut allocator = FreeExtentIndex::default();
     allocator.insert_extent(1, 1, 64, 64).unwrap();
     allocator.insert_extent(1, 1, 192, 64).unwrap();
-    rearranged.pools[0].allocator = allocator;
+    rearranged.pools[0].allocator = Arc::new(allocator);
     assert_eq!(
         original.pools[0].allocator.free_bytes,
         rearranged.pools[0].allocator.free_bytes

@@ -84,6 +84,9 @@ impl StructuredCalibrationOptionsV2 {
         ]) {
             digest.update(value.to_le_bytes());
         }
+        if !self.settings.learned_drift.is_disabled() {
+            digest.update(self.settings.learned_drift.signature());
+        }
         Ok(digest.finalize().into())
     }
 }

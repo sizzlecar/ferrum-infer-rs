@@ -57,12 +57,25 @@ impl<R: DeviceRuntime> CheckpointBackingOwner<R> {
                 .plan
                 .dynamic_pools
                 .view_many(guard.backing().backing_slices_for(resource.resource_id()))?;
+            for region in resource.strided_ranges() {
+                if region.source_end_bytes()?
+                    > resource
+                        .sequence_copy_bound(sequence.size_bytes(), sequence.capacity_size_bytes())
+                    || region.destination_end_bytes()? > checkpoint.size_bytes()
+                {
+                    return Err(invalid_resource(
+                        "strided state copy exceeds concrete backing",
+                    ));
+                }
+            }
             for range in resource.ranges() {
                 let compact_end = range
                     .checkpoint_offset()
                     .checked_add(range.length_bytes())
                     .ok_or_else(|| invalid_resource("checkpoint copy range overflows"))?;
-                if range.source().end > sequence.size_bytes()
+                if range.source().end
+                    > resource
+                        .sequence_copy_bound(sequence.size_bytes(), sequence.capacity_size_bytes())
                     || compact_end > checkpoint.size_bytes()
                 {
                     return Err(invalid_resource(

@@ -94,6 +94,12 @@ fn planning_workspace_cold_retention_and_hot_reuse_match_actual_slots() {
     let session = sequence.open_session().unwrap();
     let before = harness.runtime.allocate_calls();
     let cold = lane_view(&harness.root, &session, &lane);
+    let cold_initial = cold.initial_state();
+    let cold_clone = cold_initial.clone();
+    assert!(harness
+        .pool_ids
+        .iter()
+        .all(|id| cold_initial.shares_pool_allocator(&cold_clone, id)));
     assert_eq!(cold.plan_hash(), harness.root.planning_plan_hash());
     assert_eq!(
         cold.coordinator_id(),
@@ -116,6 +122,40 @@ fn planning_workspace_cold_retention_and_hot_reuse_match_actual_slots() {
         first.state.available_in_domain(first.domains[0].domain),
         Some(256)
     );
+    // A candidate's newly retained slot must not consume its sibling's
+    // resident capacity or appear in the original captured inventory.
+    let sibling = known(harness.root.project_resource_wave_with_bucket(
+        &cold,
+        &cold.initial_state(),
+        &[row(0, 0, 1)],
+        Some(bucket.bucket_id()),
+        &mut || true,
+    ));
+    assert!(first
+        .state
+        .same_future_state(&sibling.state, &mut || true)
+        .unwrap());
+    assert!(
+        harness
+            .pool_ids
+            .iter()
+            .any(|id| !cold_initial.shares_pool_allocator(&first.state, id)),
+        "creating a cold workspace detaches its allocator"
+    );
+    assert!(
+        harness
+            .pool_ids
+            .iter()
+            .all(|id| cold_initial.shares_pool_allocator(&cold.initial_state(), id)),
+        "the captured root remains the original immutable allocator"
+    );
+    known(harness.root.project_resource_wave_with_bucket(
+        &cold,
+        &cold.initial_state(),
+        &[row(0, 0, 1)],
+        None,
+        &mut || true,
+    ));
     let second = known(harness.root.project_resource_wave_with_bucket(
         &cold,
         &first.state,
@@ -124,6 +164,13 @@ fn planning_workspace_cold_retention_and_hot_reuse_match_actual_slots() {
         &mut || true,
     ));
     assert_eq!(second.domains[0].transient_peak_bytes, 128);
+    assert!(
+        harness
+            .pool_ids
+            .iter()
+            .all(|id| first.state.shares_pool_allocator(&second.state, id)),
+        "retained workspace reuse makes no allocator copy"
+    );
     assert!(
         matches!(
             harness.root.project_resource_wave_with_bucket(
@@ -158,13 +205,19 @@ fn planning_workspace_cold_retention_and_hot_reuse_match_actual_slots() {
     actual.try_retire_normal().unwrap();
     let hot = lane_view(&harness.root, &session, &lane);
     assert!(!cold.same_live_evidence(&hot));
-    known(harness.root.project_resource_wave_with_bucket(
+    let hot_projected = known(harness.root.project_resource_wave_with_bucket(
         &hot,
         &hot.initial_state(),
         &[row(0, 1, 2)],
         Some(bucket.bucket_id()),
         &mut || true,
     ));
+    assert!(
+        harness.pool_ids.iter().all(|id| hot
+            .initial_state()
+            .shares_pool_allocator(&hot_projected.state, id)),
+        "real retained idle slots also reuse immutable allocator evidence"
+    );
     let actual = step(&batch, &lane, 2, Some(&bucket));
     assert_eq!(actual.backing_slices()[0].size_bytes(), 128);
     assert_eq!(actual.backing_slices()[0].evidence().segments(), physical);
@@ -389,8 +442,21 @@ fn planning_workspace_busy_slot_is_not_assumed_released() {
     let a = first.open_session().unwrap();
     let b = second.open_session().unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&a)]).unwrap();
+    step(&batch, &lane, 1, Some(&bucket))
+        .try_retire_normal()
+        .unwrap();
+    let previously_idle = lane_view(&harness.root, &b, &lane);
+    known(harness.root.project_resource_wave_with_bucket(
+        &previously_idle,
+        &previously_idle.initial_state(),
+        &[row(0, 0, 1)],
+        Some(bucket.bucket_id()),
+        &mut || true,
+    ));
+    // Retaining verified immutable geometry must not retain availability.
     let held = step(&batch, &lane, 1, Some(&bucket));
     let busy = lane_view(&harness.root, &b, &lane);
+    assert!(!previously_idle.same_live_evidence(&busy));
     assert!(busy.participants()[0].matches_session_identity(&b));
     assert!(!busy.participants()[0].matches_session_identity(&a));
     assert!(matches!(
@@ -485,17 +551,21 @@ fn planning_workspace_bucket_shape_lane_identity_and_budget_are_checked() {
         .lane_stable_arenas
         .lock()
         .unwrap();
-    assert!(matches!(
-        harness.root.resource_planning_view_on_lane(
-            &[&session],
-            &lane,
-            ResourcePlanningLimits::default(),
-            &mut || true
+    let held_arena_capture = harness.root.resource_planning_view_on_lane(
+        &[&session],
+        &lane,
+        ResourcePlanningLimits::default(),
+        &mut || true,
+    );
+    assert!(
+        matches!(
+            held_arena_capture,
+            ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::ReadUnavailable(
+                ResourcePlanningReadStage::LaneWorkspace
+            ))
         ),
-        ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::ReadUnavailable(
-            ResourcePlanningReadStage::LaneWorkspace
-        ))
-    ));
+        "held lane arena capture returned {held_arena_capture:?}"
+    );
     drop(held);
     session.try_abort_if_quiescent().unwrap();
     drop(session);

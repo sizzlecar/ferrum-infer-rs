@@ -1,6 +1,8 @@
 //! Exercise the real one-owner admission protocol before a joint prefix wave.
 //! No prepared receipt, failure flag or successful sampler result is injected.
 use super::*;
+mod driver_tests;
+mod probe_primitives;
 
 fn joint_declaration(
     session: &CalibrationSession,
@@ -43,25 +45,41 @@ async fn joint_session() -> (
     Vec<RequestId>,
     Vec<CreditedOutputSession>,
 ) {
-    let (mut session, executor) = prepared_session_with_width(2).await;
-    let source = Source::new();
-    let (options, prefixes) = joint_declaration(&session, &source);
-    session
-        .begin_structured_prefix_cost_group_v5(options, prefixes)
-        .await
-        .unwrap();
-    session.begin_structured_cost_group_cohort_v2(0).unwrap();
+    joint_session_with_output(
+        3,
+        [
+            OutputProjectionContract::cli_text(),
+            OutputProjectionContract::cli_text(),
+        ],
+    )
+    .await
+}
+
+// Shared CPU fixture for the actual cohort driver. Only test inputs are
+// parameterized; admission, prefix installation, release and receipts remain
+// the production CalibrationSession mechanisms.
+async fn joint_session_with_output(
+    maximum_output: usize,
+    contracts: [OutputProjectionContract; 2],
+) -> (
+    CalibrationSession,
+    Arc<ControlledExecutor>,
+    Source,
+    Vec<RequestId>,
+    Vec<CreditedOutputSession>,
+) {
+    let (mut session, executor, source) = joint_unstarted_cohort(maximum_output).await;
     let mut ids = Vec::new();
     let mut outputs = Vec::new();
-    for _ in 0..2 {
-        let request = request(&session, 3);
+    for contract in contracts {
+        let request = request(&session, maximum_output);
         ids.push(request.id.clone());
         outputs.push(
             session
                 .add_request(
                     request,
                     InferenceRequestContext::from_ingress(slo_clock_now()),
-                    Arc::new(OutputProjectionContract::cli_text()),
+                    Arc::new(contract),
                 )
                 .await
                 .unwrap(),
@@ -71,6 +89,48 @@ async fn joint_session() -> (
         ready(&session, id, false).await;
     }
     (session, executor, source, ids, outputs)
+}
+
+// The production cohort executor can use this hook before it registers the
+// original requests itself: source5 declaration/phase/cohort are already bound,
+// with no active request, output lease, prefix state or physical execution.
+async fn joint_unstarted_cohort(
+    maximum_output: usize,
+) -> (CalibrationSession, Arc<ControlledExecutor>, Source) {
+    assert!(
+        maximum_output > 2,
+        "the original G2 prefix must leave a suffix"
+    );
+    let (mut session, executor) = prepared_session_with_width(2).await;
+    // The common controller fixture deliberately reserves only two events for
+    // CLI backpressure tests. SSE includes terminal/usage/DONE escrow; use the
+    // typed product event bound before any original output plan is installed.
+    Arc::get_mut(&mut session.engine.inner)
+        .unwrap()
+        .config
+        .scheduler
+        .slo
+        .output
+        .max_queued_events_per_request =
+        ferrum_types::SloOutputConfig::default().max_queued_events_per_request;
+    let source = Source::new();
+    let (mut options, prefixes) = joint_declaration(&session, &source);
+    for child in &mut options.children {
+        for phase in &mut child.cohort_plan.phases {
+            for cohort in phase {
+                for request in &mut cohort.requests {
+                    request.maximum_output = maximum_output as u64;
+                }
+            }
+        }
+        child.cohort_manifest_payload["full_output"] = maximum_output.into();
+    }
+    session
+        .begin_structured_prefix_cost_group_v5(options, prefixes)
+        .await
+        .unwrap();
+    session.begin_structured_cost_group_cohort_v2(0).unwrap();
+    (session, executor, source)
 }
 
 fn joint_prefill(session: &CalibrationSession, ids: &[RequestId]) -> Vec<CalibrationWork> {

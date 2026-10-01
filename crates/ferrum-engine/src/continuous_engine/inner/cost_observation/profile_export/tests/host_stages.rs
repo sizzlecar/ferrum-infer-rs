@@ -2,10 +2,12 @@ use super::*;
 
 fn stages(capacity: usize) -> Arc<HostStageEvidenceV1> {
     Arc::new(HostStageEvidenceV1 {
+        observation_memory: None,
         presubmit_prediction: None,
         prospective_capture: None,
         statistical_evidence: None,
         structured_evidence: None,
+        route_evidence: None,
         schema_version: 1,
         call_id: 7,
         fingerprint: Some(fingerprint()),
@@ -42,7 +44,7 @@ fn auxiliary_fifo_charges_spare_capacity_and_keeps_sample_denominator_separate()
     assert_eq!(sink.offer_evidence_numbered(only(stages(0))), Ok(1));
     assert_eq!(sink.offer(observation(120)), Err(CostSampleDrop::Capacity));
     assert_eq!(
-        sink.with_locked_queue(|| sink.offer_evidence_numbered(only(stages(0)))),
+        sink.with_locked_producer(|| sink.offer_evidence_numbered(only(stages(0)))),
         Err(CostSampleDrop::Contended)
     );
     let (ordinal, entry) = sink.pop_numbered().unwrap();

@@ -591,3 +591,6 @@ async fn session_reference_origins_are_bounded_and_failed_add_does_not_replace_l
 
 #[path = "tests/piecewise.rs"]
 mod piecewise;
+
+#[path = "tests/source_v1.rs"]
+mod source_v1;

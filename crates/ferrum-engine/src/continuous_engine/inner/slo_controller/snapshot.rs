@@ -1,8 +1,34 @@
 use super::*;
 use crate::continuous_engine::output_flow_runtime::OutputPlanningCreditView;
 use ferrum_scheduler::implementations::continuous::cost_model::{
-    BatchOrderSemantics, WaveExecutionPath, WaveGraphState,
+    BatchOrderSemantics, ExecutionFingerprint, WaveExecutionPath, WaveGraphState,
 };
+
+/// No model, timestamp, profile receipt or calibrated host-content authority is
+/// manufactured. This private adapter only selects the real Structured V2 input
+/// protocol. Its first unknown lookup prevents any successful future edge.
+struct UncalibratedQueryModel;
+impl PlanningCostModel for UncalibratedQueryModel {
+    fn model_version(&self) -> u64 {
+        0 // Explicit absent-model diagnostic marker, never a catalog epoch.
+    }
+    fn requires_statistical_evidence(&self) -> bool {
+        true
+    }
+    fn evidence_requirement(&self) -> PlanningCostEvidenceRequirement {
+        PlanningCostEvidenceRequirement::StructuredV2
+    }
+    fn predict(
+        &self,
+        _: &ExecutionFingerprint,
+        _: &ferrum_scheduler::implementations::continuous::cost_model::WaveExecutionShape,
+        _: u64,
+    ) -> Option<PlanningCost> {
+        None
+    }
+    // Default predict_with_evidence/predict_observed return None/ModelUnavailable.
+    // supports_empirical_host_content remains false: no future-domain authority.
+}
 
 impl EngineInner {
     pub(super) fn capture_slo_controller_snapshot(
@@ -29,7 +55,26 @@ impl EngineInner {
         optional_phase: Option<ControllerOptionalPhase>,
         route_unknown: &mut Option<ferrum_interfaces::vnext::ExecutionCostRouteUnknown>,
     ) -> ControllerResult<ControllerSnapshot> {
+        self.capture_slo_controller_snapshot_with_completion(
+            hint,
+            controller_budget,
+            optional_phase,
+            route_unknown,
+            None,
+        )
+    }
+
+    pub(super) fn capture_slo_controller_snapshot_with_completion(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        controller_budget: Arc<ControllerBudget>,
+        optional_phase: Option<ControllerOptionalPhase>,
+        route_unknown: &mut Option<ferrum_interfaces::vnext::ExecutionCostRouteUnknown>,
+        draft: Option<&mut completion::CompletionDraft>,
+    ) -> ControllerResult<ControllerSnapshot> {
         let fallback_count = self.scheduler.active_count() + self.scheduler.waiting_count();
+        let diagnostic_budget = Arc::clone(&controller_budget);
+        let _diagnostic = diagnostic_budget.diagnostic_scope("snapshot");
         let unavailable = |reason| Unavailable {
             reason,
             obligations: fallback_count,
@@ -74,6 +119,7 @@ impl EngineInner {
             )
             .map_err(|_| unavailable("scheduler_snapshot_unavailable"))?;
         drop(availability);
+        controller_budget.diagnostic_checkpoint("snapshot_queue_ready");
         let count = queue.requests().len();
         let unavailable = |reason| Unavailable {
             reason,
@@ -111,15 +157,59 @@ impl EngineInner {
             .cost_runtime
             .as_ref()
             .ok_or_else(|| unavailable("cost_runtime_unavailable"))?;
-        let model = runtime
+        let uncalibrated = self
+            .config
+            .scheduler
+            .slo
+            .required_query_observation
+            .is_uncalibrated();
+        // Also enforce this boundary here: private/manual callers cannot turn
+        // an uncalibrated diagnostic adapter into an Enforce cost source.
+        if uncalibrated
+            && (self.config.scheduler.slo.mode != ferrum_types::SloMode::Observe
+                || self.config.scheduler.slo.cost_profile.is_some()
+                || self.config.scheduler.slo.cost_observation.predictor
+                    != ferrum_types::SloCostPredictor::StructuredWholeWaveV2)
+        {
+            return Err(unavailable("uncalibrated_observation_scope_invalid"));
+        }
+        let (model, fingerprint): (Arc<dyn PlanningCostModel + Send + Sync>, _) = match runtime
             .try_snapshot()
             .ok_or_else(|| unavailable("cost_snapshot_busy"))?
-            .ok_or_else(|| unavailable("cost_unavailable"))?;
+        {
+            Some(_) if uncalibrated => {
+                return Err(unavailable("uncalibrated_observation_has_model"));
+            }
+            Some(model) => {
+                let fingerprint = model.fingerprint().clone();
+                (model, fingerprint)
+            }
+            None if uncalibrated => {
+                use ferrum_interfaces::execution_cost::{
+                    ExecutorCostIdentityAvailability, EXECUTOR_COST_IDENTITY_SCHEMA,
+                };
+                let ExecutorCostIdentityAvailability::Known(identity) = &runtime.identity else {
+                    return Err(unavailable("cost_identity_unavailable"));
+                };
+                if identity.schema_version != EXECUTOR_COST_IDENTITY_SCHEMA {
+                    return Err(unavailable("cost_identity_unavailable"));
+                }
+                let fingerprint = ExecutionFingerprint {
+                    model_weights: identity.model_weights,
+                    numerical_policy: identity.numerical_policy,
+                    device_runtime: identity.device_runtime,
+                    execution_config: identity.execution_config,
+                };
+                (Arc::new(UncalibratedQueryModel), fingerprint)
+            }
+            None => return Err(unavailable("cost_unavailable")),
+        };
         let reference = self
             .prefill_reference_runtime
             .as_ref()
             .ok_or_else(|| unavailable("missing_reference_work"))?
             .calibration();
+        controller_budget.diagnostic_checkpoint("snapshot_cost_and_reference_ready");
         let caps = self.model_executor.capabilities();
         // VNext owns recurrent state in PlanRuntime resources, not in the
         // legacy sequence handle. Match the logical per-owner state consumed
@@ -137,6 +227,8 @@ impl EngineInner {
         let mut milestone_count = 0_usize;
         let mut reference_chunks = std::collections::BTreeSet::new();
         let mut fences = Vec::with_capacity(count);
+        let candidate = self.strict_candidate(&sequences, &queue, model.model_version());
+        let mut waiting_fences = Vec::new();
         let mut requests = Vec::with_capacity(count);
         let mut engine_resource_requests = Vec::with_capacity(count);
         for row in queue.requests() {
@@ -144,11 +236,6 @@ impl EngineInner {
                 return Err(unavailable("compute_budget_exhausted"));
             }
             let sequence = &sequences[&row.key.request_id];
-            // Do not copy an unbounded sampling history into a planning view.
-            // More policies can join when their exact bounded route is known.
-            if sequence.sampling_params.repetition_penalty != 1.0 {
-                return Err(unavailable("sampling_route_unsupported"));
-            }
             let frontier = sequence
                 .cost_frontier
                 .ok_or_else(|| unavailable("engine_frontier_unknown"))?;
@@ -161,6 +248,58 @@ impl EngineInner {
             {
                 return Err(unavailable("frontier_mismatch"));
             }
+            let output = sequence
+                .credited_output
+                .as_ref()
+                .ok_or_else(|| unavailable("unbounded_output"))?;
+            let view = output.port.planning_snapshot();
+            let context = sequence
+                .model_kv
+                .as_ref()
+                .map_or(0, |kv| kv.handle().num_tokens());
+            let cache_id = sequence.model_cache_id();
+            let host_features = super::super::cost_observation::participant_host_features(sequence);
+            let mut fence = EngineFence {
+                key: row.key.clone(),
+                incarnation: frontier.owner_incarnation.get(),
+                generation: frontier.work_generation.get(),
+                generated: sequence.generated_tokens.len(),
+                context,
+                output: view,
+                cache_id: cache_id.map(str::to_owned),
+                prefill_complete: sequence.prefill_complete,
+                prefill_tokens_processed: sequence.prefill_tokens_processed,
+                prefill_total: sequence.prefill_context_len(),
+                logits_policy: sequence.model_decode_logits_policy(),
+                future_greedy_policy: None,
+                future_repetition: None,
+                host_features,
+            };
+            if self.requires_strict_acceptance()
+                && sequence
+                    .time_admission
+                    .as_ref()
+                    .is_some_and(SequenceTimeAdmission::before_acceptance)
+                && candidate.as_ref() != Some(&row.key.request_id)
+            {
+                // Preserve the real owner/output frontier and complete queue
+                // seal, without asking another unaccepted prompt for reference,
+                // forecast-route support or numeric planning budget.
+                waiting_fences.push(fence);
+                continue;
+            }
+            // Only obligations in this forecast require supported sampling and
+            // reference evidence. Omitted waiters cannot poison their peers.
+            if let Some(future) = sampling::future_policy(
+                sequence,
+                &fence.logits_policy,
+                self.model_executor.info().vocab_size as u64,
+            )
+            .map_err(|reason| unavailable(reason.label()))?
+            {
+                fence.future_greedy_policy = Some(future.policy);
+                fence.future_repetition = future.repetition;
+            }
             let maximum = u32::try_from(sequence.sampling_params.max_tokens)
                 .ok()
                 .and_then(NonZeroU32::new)
@@ -168,11 +307,6 @@ impl EngineInner {
             let timing = origin
                 .project_request(sequence.slo.as_ref().unwrap(), maximum)
                 .map_err(|_| unavailable("invalid_timing"))?;
-            let output = sequence
-                .credited_output
-                .as_ref()
-                .ok_or_else(|| unavailable("unbounded_output"))?;
-            let view = output.port.planning_snapshot();
             let credit = match view.future_capacity {
                 Some(credit) => credit
                     .try_into()
@@ -185,13 +319,8 @@ impl EngineInner {
                     },
                 },
             };
-            let context = sequence
-                .model_kv
-                .as_ref()
-                .map_or(0, |kv| kv.handle().num_tokens());
             let context_tokens =
                 u32::try_from(context).map_err(|_| unavailable("context_overflow"))?;
-            let cache_id = sequence.model_cache_id();
             if is_decode && cache_id.is_none() {
                 return Err(unavailable("cache_identity_missing"));
             }
@@ -351,68 +480,48 @@ impl EngineInner {
                 ranking_service_cost_ns: None,
                 optimistic_next_service: None,
             });
-            let host_features = super::super::cost_observation::participant_host_features(sequence);
-            let future_greedy_policy = host_features
-                .is_some_and(|host| host.supports_empirical_plain_text_content())
-                .then(
-                    || ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
-                        token_mask: sequence.argmax_token_mask.clone(),
-                        repetition_penalty: None,
-                    },
-                );
-            fences.push(EngineFence {
-                key: row.key.clone(),
-                incarnation: frontier.owner_incarnation.get(),
-                generation: frontier.work_generation.get(),
-                generated: sequence.generated_tokens.len(),
-                context,
-                output: view,
-                cache_id: cache_id.map(str::to_owned),
-                prefill_complete: sequence.prefill_complete,
-                prefill_tokens_processed: sequence.prefill_tokens_processed,
-                prefill_total: sequence.prefill_context_len(),
-                logits_policy: sequence.model_decode_logits_policy(),
-                future_greedy_policy,
-                host_features,
-            });
+            fences.push(fence);
             engine_resource_requests.push(ExecutorResourcePlanningRequest {
                 request_id: &sequence.request_id,
                 cache_id: if is_decode { cache_id } else { None },
             });
         }
-        let limits = ResourcePlanningLimits {
-            maximum_participants: 256,
-            maximum_projected_waves: self.config.scheduler.slo.planner.lookahead_waves.get(),
-            ..Default::default()
-        };
-        let route = match self.model_executor.execution_cost_route_view(
-            &engine_resource_requests,
-            limits,
-            &mut budget,
-        ) {
+        if requests.is_empty() {
+            return Err(unavailable("strict_waiting_evidence"));
+        }
+        let limits = self.controller_projection_limits();
+        controller_budget.diagnostic_checkpoint("snapshot_request_views_ready");
+        let shared =
+            draft.and_then(|draft| draft.take_compatible_forecast(&queue, &fences, limits));
+        let route = match shared.unwrap_or_else(|| {
+            self.model_executor.execution_cost_route_view(
+                &engine_resource_requests,
+                limits,
+                &mut controller_budget.observed_resource_budget(&mut budget),
+            )
+        }) {
             ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Known(value) => value,
-            ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
-                ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Resource(reason),
-            ) => {
-                *route_unknown =
-                    Some(ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Resource(reason));
-                return Err(unavailable(unknown_label(resources::resource_reason(
-                    reason,
-                ))));
-            }
-            ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
-                ferrum_interfaces::vnext::ExecutionCostRouteUnknown::BudgetExhausted,
-            ) => {
-                *route_unknown =
-                    Some(ferrum_interfaces::vnext::ExecutionCostRouteUnknown::BudgetExhausted);
-                return Err(unavailable("compute_budget_exhausted"));
-            }
             ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(reason) => {
                 *route_unknown = Some(reason);
-                return Err(unavailable("shape_unavailable"));
+                // Preserve the executor's exact failure in the existing bounded
+                // diagnostic stream before mapping it to a scheduling outcome.
+                // This also applies when the caller does not retain route_unknown.
+                controller_budget
+                    .diagnostic_checkpoint(resources::route_failure_checkpoint(reason));
+                let label = match reason {
+                    ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Resource(reason) => {
+                        unknown_label(resources::resource_reason(reason))
+                    }
+                    ferrum_interfaces::vnext::ExecutionCostRouteUnknown::BudgetExhausted => {
+                        "compute_budget_exhausted"
+                    }
+                    _ => "shape_unavailable",
+                };
+                return Err(unavailable(label));
             }
         };
         // Route and resource transitions must start in the same captured epoch.
+        controller_budget.diagnostic_checkpoint("snapshot_execution_route_ready");
         // The complete route view already contains the lane-bearing resource
         // evidence; a second capture has a different private state fence even
         // when its public counters happen to match. This is numeric evidence,
@@ -459,11 +568,19 @@ impl EngineInner {
                     .and_then(|span| classified_at_ns.checked_add(span))
             })
             .ok_or_else(|| unavailable("horizon_overflow"))?;
+        // Only the current typed cohort may explain its own captured follower
+        // gate. Contention or a stale owner leaves the original Unknown path.
+        let modeled_prefix_target = self.slo_controller.try_lock().and_then(|state| {
+            state
+                .prefix
+                .as_ref()
+                .and_then(|cohort| cohort.modeled_hold_target(&queue, &fences).cloned())
+        });
         let snapshot = SchedulerSnapshot {
             observed_at_ns: origin.observed_at_ns(),
             generation: queue.iteration(),
             cost_model_version: model.model_version(),
-            fingerprint: model.fingerprint().clone(),
+            fingerprint,
             requests,
             capabilities: BackendPlanningCapabilities {
                 work_policy: self.controller_work_policy(hint, &queue),
@@ -505,10 +622,12 @@ impl EngineInner {
                 reference_decode_token_ns: reference.tau_ref_ns(),
                 reference_work_version: reference.identity().revision.get(),
             },
-            has_unmodeled_maintenance: queue
-                .requests()
-                .iter()
-                .any(|row| row.readiness.maintenance_blocked || row.readiness.prefix_blocked),
+            has_unmodeled_maintenance: queue.requests().iter().any(|row| {
+                (row.readiness.maintenance_blocked
+                    || (row.readiness.prefix_blocked
+                        && modeled_prefix_target.as_ref() != Some(&row.key)))
+                    && fences.iter().any(|fence| fence.key == row.key)
+            }),
         };
         if !budget() {
             return Err(unavailable("compute_budget_exhausted"));
@@ -524,7 +643,21 @@ impl EngineInner {
             .map_err(|_| unavailable("recovery_scope_unavailable"))?,
         );
         let recovery_peers = self.capture_recovery_peers(&queue, Some(&protection), &mut budget)?;
+        controller_budget.diagnostic_checkpoint("snapshot_protection_ready");
+        let model: Arc<dyn PlanningCostModel + Send + Sync> =
+            if let Some(observation) = controller_budget.observation.get() {
+                observation.snapshot(&snapshot);
+                Arc::new(super::budget::ObservedModel {
+                    model,
+                    observation: observation.clone(),
+                    budget: Arc::clone(&controller_budget),
+                })
+            } else {
+                model
+            };
         Ok(ControllerSnapshot {
+            prefix_maintenance: None,
+            prefix_checkpoint: None,
             protection,
             recovery_peers,
             budget: controller_budget,
@@ -536,6 +669,8 @@ impl EngineInner {
             resources,
             route,
             fences,
+            waiting_fences,
+            before_acceptance_candidate: candidate,
             model,
         })
     }

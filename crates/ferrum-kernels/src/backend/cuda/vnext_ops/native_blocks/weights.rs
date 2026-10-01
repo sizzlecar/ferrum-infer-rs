@@ -41,6 +41,64 @@ pub(in crate::backend::cuda::vnext_ops) struct MatrixPart {
     pub(in crate::backend::cuda::vnext_ops) signs_region: Option<usize>,
 }
 
+/// CPU descriptor payload only; neither this descriptor nor its transforms
+/// retain a device region. Shared immutable identity strings are charged.
+pub(in crate::backend::cuda::vnext_ops) fn retained_payload_bytes(
+    parts: &[MatrixPart],
+) -> Option<usize> {
+    parts.iter().try_fold(
+        parts.len().checked_mul(std::mem::size_of::<MatrixPart>())?,
+        |bytes, part| {
+            let mut bytes = bytes.checked_add(part.component_id.as_str().len())?;
+            if let Some(HadamardTransformSpec {
+                signs: HadamardSigns::Explicit(signs),
+                ..
+            }) = &part.transform
+            {
+                bytes = bytes.checked_add(signs.component_id.as_str().len())?;
+                let (extra, padding) = match &signs.storage {
+                    PhysicalStorageLayout::Contiguous { padding } => (0, padding),
+                    PhysicalStorageLayout::Strided {
+                        strides_in_elements,
+                        padding,
+                    } => (
+                        strides_in_elements
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<u64>())?,
+                        padding,
+                    ),
+                    PhysicalStorageLayout::Tiled {
+                        tile_shape,
+                        axis_order,
+                        tile_strides_in_elements,
+                        padding,
+                    } => (
+                        tile_shape
+                            .capacity()
+                            .checked_add(tile_strides_in_elements.capacity())?
+                            .checked_mul(std::mem::size_of::<u64>())?
+                            .checked_add(
+                                axis_order
+                                    .capacity()
+                                    .checked_mul(std::mem::size_of::<u32>())?,
+                            )?,
+                        padding,
+                    ),
+                };
+                bytes = bytes.checked_add(extra)?;
+                if let PhysicalWeightPadding::ZeroFill { padded_dimensions } = padding {
+                    bytes = bytes.checked_add(
+                        padded_dimensions
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<u64>())?,
+                    )?;
+                }
+            }
+            Some(bytes)
+        },
+    )
+}
+
 pub(in crate::backend::cuda::vnext_ops) struct MatrixWeight {
     pub(in crate::backend::cuda::vnext_ops) parts: Vec<MatrixPart>,
     // Matrix payloads in logical output order, followed by unique F32 signs.

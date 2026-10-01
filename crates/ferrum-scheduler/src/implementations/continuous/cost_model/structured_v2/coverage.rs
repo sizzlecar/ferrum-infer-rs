@@ -34,6 +34,78 @@ impl StructuredCoverageReportV2 {
     }
 }
 impl StructuredScopeV2 {
+    /// Numerical membership only. This never changes the input's original
+    /// owner, row count, recipe binding, or physical state.
+    pub fn validate_population_input(
+        &self,
+        input: &StructuredInputV2,
+        policy: StructuredPopulationPolicyV1,
+    ) -> Result<()> {
+        match (&self.numerical_family, policy) {
+            (Some(expected), StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1) => {
+                if input.numerical_family_key()? != *expected {
+                    return Err(StructuredUnknown::WrongDomain);
+                }
+            }
+            (Some(_), StructuredPopulationPolicyV1::ExactOwnerV1) => {
+                return Err(StructuredUnknown::WrongProtocol);
+            }
+            (None, _) => {
+                if input.owner() != &self.owner {
+                    return Err(StructuredUnknown::WrongDomain);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Collector lookup preserves invalid protocol/evidence errors. A different
+    /// valid statistical identity simply belongs to another population.
+    pub fn has_same_population(
+        &self,
+        input: &StructuredInputV2,
+        policy: StructuredPopulationPolicyV1,
+    ) -> Result<bool> {
+        match (&self.numerical_family, policy) {
+            (Some(expected), StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1) => {
+                match input.numerical_family_key() {
+                    Ok(actual) => Ok(actual == *expected),
+                    Err(StructuredUnknown::UnsupportedScope) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
+            (Some(_), StructuredPopulationPolicyV1::ExactOwnerV1) => {
+                Err(StructuredUnknown::WrongProtocol)
+            }
+            (None, _) => Ok(input.owner() == &self.owner),
+        }
+    }
+
+    pub(in crate::implementations::continuous) fn retained_heap_bytes(&self) -> Option<usize> {
+        let c = &self.coverage;
+        let mut bytes = 0usize;
+        for values in [
+            &c.pending_eligible_positions,
+            &c.pending_counts,
+            &c.length_counts,
+            &c.pending_positions,
+            &c.length_positions,
+        ] {
+            bytes =
+                bytes.checked_add(values.capacity().checked_mul(std::mem::size_of::<u32>())?)?;
+        }
+        bytes
+            .checked_add(
+                c.authorized_pending_constraints
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<HostPendingConstraintV2>())?,
+            )?
+            .checked_add(
+                c.joint_counts
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(u32, u32)>())?,
+            )
+    }
     pub fn validate(&self) -> Result<()> {
         let n = self.owner.rows;
         if n == 0 || n > 128 {
@@ -91,15 +163,30 @@ impl StructuredScopeV2 {
         Ok(())
     }
     pub(super) fn authorize(&self, query: &StructuredQueryV2) -> Result<()> {
-        if query.owner() != &self.owner {
-            return Err(StructuredUnknown::WrongDomain);
+        self.authorize_detailed(query)
+            .map_err(StructuredQueryFailureV2::reason)
+    }
+    pub(super) fn authorize_detailed(&self, query: &StructuredQueryV2) -> QueryResult<()> {
+        if self.numerical_family.is_some() {
+            // Cross-width authorization belongs to the declared physical
+            // envelope's original phase challenges, never this representative.
+            return Err(StructuredUnknown::WrongProtocol.into());
+        }
+        if query
+            .input
+            .cost_template_identity(self.owner.cost_template_policy())
+            .is_none_or(|(owner, _)| owner != &self.owner)
+        {
+            return Err(StructuredUnknown::WrongDomain.into());
         }
         let c = &self.coverage;
         if c.length_counts
             .binary_search(&(query.input.length_positions.len() as u32))
             .is_err()
         {
-            return Err(StructuredUnknown::QualificationCoverage);
+            return Err(StructuredQueryFailureV2::OutsideSupport(
+                StructuredUnknown::QualificationCoverage,
+            ));
         }
         if query
             .input
@@ -112,7 +199,9 @@ impl StructuredScopeV2 {
                 .iter()
                 .any(|p| c.pending_positions.binary_search(p).is_err())
         {
-            return Err(StructuredUnknown::QualificationCoverage);
+            return Err(StructuredQueryFailureV2::OutsideSupport(
+                StructuredUnknown::QualificationCoverage,
+            ));
         }
         if let Some(p) = &query.pending {
             if !c.authorized_pending_constraints.contains(&p.constraint)
@@ -120,7 +209,9 @@ impl StructuredScopeV2 {
                     .iter()
                     .any(|v| c.pending_eligible_positions.binary_search(v).is_err())
             {
-                return Err(StructuredUnknown::UnsupportedScope);
+                return Err(StructuredQueryFailureV2::OutsideSupport(
+                    StructuredUnknown::UnsupportedScope,
+                ));
             }
         }
         let (minimum, maximum) = query.pending_count_range()?;
@@ -132,7 +223,9 @@ impl StructuredScopeV2 {
                         .is_err()
             })
         {
-            return Err(StructuredUnknown::QualificationCoverage);
+            return Err(StructuredQueryFailureV2::OutsideSupport(
+                StructuredUnknown::QualificationCoverage,
+            ));
         }
         Ok(())
     }
@@ -151,6 +244,9 @@ impl StructuredScopeV2 {
         &self,
         samples: &[StructuredNumericObservationV2],
     ) -> Result<StructuredCoverageReportV2> {
+        if self.numerical_family.is_some() {
+            return Err(StructuredUnknown::WrongProtocol);
+        }
         self.validate()?;
         if samples.len() > 4096 {
             return Err(StructuredUnknown::Capacity);

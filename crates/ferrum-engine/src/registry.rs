@@ -52,6 +52,10 @@ pub struct ComponentConfig {
     /// Prepared typed model derived from `model_sources`, when the composition
     /// root has already resolved a migrated family.
     pub defined_model: Option<Arc<DefinedProductionModel>>,
+    /// One CPU observation pool shared by cloned target/draft factory inputs.
+    /// Never serialized into product configuration.
+    pub observation_template_budget:
+        Option<Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>>,
 }
 
 impl ComponentConfig {
@@ -78,6 +82,7 @@ impl ComponentConfig {
             component_options: config.backend.backend_options.clone(),
             model_sources,
             defined_model,
+            observation_template_budget: None,
         }
     }
 
@@ -1232,6 +1237,36 @@ fn validate_registered_vnext_backend(
     }
 }
 
+fn install_factory_observation_budget<R: ferrum_interfaces::vnext::DeviceRuntime>(
+    config: &ComponentConfig,
+    runtime: &R,
+) -> Result<()> {
+    let maximum = config
+        .engine_config
+        .scheduler
+        .slo
+        .cost_observation
+        .maximum_template_bytes
+        .get();
+    let budget = match &config.observation_template_budget {
+        Some(budget) if budget.maximum_bytes() == maximum => budget.clone(),
+        Some(_) => {
+            return Err(FerrumError::config(
+                "factory observation template budget differs from typed configuration",
+            ))
+        }
+        None => ferrum_interfaces::vnext::DeviceObservationTemplateBudget::new(maximum)
+            .map_err(|error| FerrumError::config(error.to_string()))?,
+    };
+    runtime
+        .install_observation_template_budget(budget)
+        .map_err(|error| {
+            FerrumError::config(format!(
+                "install observation template budget before weight materialization: {error}"
+            ))
+        })
+}
+
 fn create_registered_vnext_executor(
     config: &ComponentConfig,
     model_path: &std::path::Path,
@@ -1312,6 +1347,7 @@ fn create_registered_vnext_executor(
                     weight_materializers,
                     catalog,
                 ) = composition.into_parts();
+                install_factory_observation_budget(config, runtime.as_ref())?;
                 let executor = crate::product_composition::create_vnext_executor(
                     &config.engine_config,
                     prepared.as_ref(),
@@ -1370,6 +1406,7 @@ fn create_registered_vnext_executor(
                 weight_materializer_id,
                 catalog,
             ) = composition.into_parts();
+            install_factory_observation_budget(config, runtime.as_ref())?;
             let weight_materializer_selection =
                 ferrum_interfaces::vnext::WeightMaterializerSelection::exact(
                     weight_materializer_id,
@@ -2666,6 +2703,7 @@ mod tests {
             component_options: options,
             model_sources: None,
             defined_model: None,
+            observation_template_budget: None,
         };
 
         assert_eq!(

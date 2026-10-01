@@ -5,21 +5,33 @@ use ferrum_interfaces::{engine::InferenceEngine, KvCacheHandle, ModelExecutor, T
 use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+mod admission_capacity;
 mod deferral;
+mod native_sessions;
+mod native_structured;
+mod prefix_checkpoint;
+mod query_projection;
+mod query_resources;
 mod revalidation_retry;
 mod snapshot_epoch;
 mod structured;
+mod token_policy_residency;
 
 #[path = "../../../../../../ferrum-interfaces/tests/vnext_device_operation_contract/mod.rs"]
 mod contract;
 
 struct CoreEvidence {
+    prefix: Option<prefix_checkpoint::NativePrefix>,
     fixture: Option<contract::Fixture>,
-    sessions: Vec<Arc<vnext::SequenceSession<contract::TestRuntime>>>,
+    sessions: native_sessions::Sessions,
+    session_serial: AtomicU64,
     lane: Option<Arc<vnext::ExecutionLane<contract::TestRuntime>>>,
 }
 impl CoreEvidence {
     fn new(width: usize) -> Self {
+        Self::new_options(width, false)
+    }
+    fn new_options(width: usize, checkpoint: bool) -> Self {
         // These fixtures test one controller's behavior. Unrelated parallel
         // tests must not change its process-wide device capacity evidence.
         // Shared-account resource tests continue to declare a shared DeviceId.
@@ -27,16 +39,25 @@ impl CoreEvidence {
         let instance = NEXT_DEVICE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("controller fixture device identities exhausted");
-        let fixture = contract::fixture_with_device_id(
-            vnext::DeviceId::new(format!("device.controller-fixture.{instance}")).unwrap(),
-        );
+        let device = vnext::DeviceId::new(format!("device.controller-fixture.{instance}")).unwrap();
+        let fixture = if checkpoint {
+            contract::fixture_with_checkpoint(device)
+        } else {
+            contract::fixture_with_device_id(device)
+        };
         let sessions = (0..width)
             .map(|index| {
                 let sequence = contract::logical_resources_with_work(
                     &fixture.plan_resources,
                     &format!("run.controller.{index}"),
                     &format!("request.controller.{index}"),
-                    vnext::TokenSpanWork::from_token_ids(&[1; 8], 0..8).unwrap(),
+                    if checkpoint {
+                        // Exact initial prompt used by this opt-in fixture.
+                        // The separate generation ceiling remains eight.
+                        vnext::TokenSpanWork::from_token_ids_with_fit(&[5; 4], 0..4, 8).unwrap()
+                    } else {
+                        vnext::TokenSpanWork::from_token_ids(&[1; 8], 0..8).unwrap()
+                    },
                 );
                 sequence.open_session().unwrap()
             })
@@ -68,14 +89,17 @@ impl CoreEvidence {
             }
         }
         Self {
+            prefix: checkpoint.then(prefix_checkpoint::NativePrefix::new),
             fixture: Some(fixture),
-            sessions,
+            sessions: native_sessions::Sessions::new(sessions),
+            session_serial: AtomicU64::new(0),
             lane: Some(lane),
         }
     }
 }
 impl Drop for CoreEvidence {
     fn drop(&mut self) {
+        self.prefix.take();
         self.sessions.clear();
         self.lane.take();
         if let Some(fixture) = self.fixture.take() {
@@ -96,10 +120,22 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     /// Models PlanRuntime-owned state without installing a legacy handle.
     pub typed_sequence_state: Mutex<Option<TypedSequenceStateMemory>>,
     pub startup_capability_override: Mutex<Option<ExecutorSloCapability>>,
+    pub profile_sink: Mutex<Option<Arc<dyn vnext::ExecutionEventSink>>>,
+    /// Synthetic input obligations for planner coverage tests only. Actual
+    /// CPU fill projections and resources remain independently authoritative;
+    /// this does not claim that the fill operator changes kernels here.
+    pub decode_context_coverage_override: Mutex<Option<Arc<vnext::ExecutorDecodeContextCoverage>>>,
     pub entries: AtomicUsize,
     pub physical: AtomicUsize,
+    /// Opt-in implementation of the ordinary tensor-free wave protocol for
+    /// controlled adaptive/single-wave comparisons. Existing guard fixtures
+    /// keep their original unsupported batch defaults.
+    pub plain_wave_protocol: AtomicBool,
     pub prefill_granularity: AtomicUsize,
     pub park: AtomicBool,
+    /// Opt-in gate after successful physical observation, before the host
+    /// receives outputs. Unlike `park`, this cannot exercise a zero-submit path.
+    pub park_after_submit: AtomicBool,
     pub fail_after_submit: AtomicBool,
     pub panic_before_submit: AtomicBool,
     pub narrow_last_mixed_prefill: AtomicBool,
@@ -107,13 +143,49 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     /// Optional controlled-backend observation of the inputs actually executed.
     /// This is protocol evidence in tests, not a Metal timing/route claim.
     pub emit_cost_observations: AtomicBool,
+    /// A controlled backend may lack an actual route while its real submitted
+    /// work still completes. This hook feeds the original bounded recorder;
+    /// tests never manufacture a CalibrationWaveReport or accepted sample.
+    pub actual_observation_unknown: Mutex<
+        Option<
+            Box<
+                dyn Fn(
+                        &[PlanRuntimePrefillInput],
+                        &[PlanRuntimeDecodeInput],
+                    ) -> Option<ActualWaveEvidenceUnknown>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    >,
     pub emit_structured_cost_observations: AtomicBool,
+    pub native_structured_submission: AtomicBool,
+    native_structured_history: Arc<Mutex<std::collections::HashMap<RequestId, Vec<u32>>>>,
+    token_policy_lifecycle: Mutex<token_policy_residency::Lifecycle>,
+    /// Opt-in future algebra for this fixture's actual CPU logits fill.
+    pub project_structured_cpu_fill: AtomicBool,
+    /// A real constrained CPU route: only single-row prefill is installed,
+    /// while the existing joint decode remains supported.
+    pub single_row_prefill_only: AtomicBool,
+    /// Test-only route readiness fault at the actual pure projection boundary.
+    /// The callback observes original completed CPU submissions; returning
+    /// None resumes the normal physical resource/provider projection.
+    pub projection_readiness_fault: Mutex<
+        Option<Box<dyn Fn(usize, usize) -> Option<vnext::ExecutionCostRouteUnknown> + Send + Sync>>,
+    >,
+    /// Select real CPU implementations from each decode row's context.
+    pub context_partitioned_cpu_fill: AtomicBool,
+    pub row_selected_cpu_fill: AtomicBool,
     pub completion_work_known: AtomicBool,
     pub completion_fail: AtomicBool,
     pub completion_calls: AtomicUsize,
     pub discarded_prefills: Mutex<Vec<String>>,
     pub produced_caches: Mutex<Vec<std::sync::Weak<MockKvCacheHandle>>>,
     session_bindings: Mutex<Vec<RequestId>>,
+    /// Sequential calibration can reuse the one physical fixture slot only
+    /// after its old request completed and every actual KV owner was dropped.
+    pub recycle_completed_bindings: AtomicBool,
+    completed_bindings: Mutex<std::collections::HashSet<RequestId>>,
     pub submitted_requests: Mutex<Vec<Vec<RequestId>>>,
     pub before_prefill_discard: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     pub before_resource_revalidation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -124,12 +196,119 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     pub cost_route_unknown: Mutex<Option<vnext::ExecutionCostRouteUnknown>>,
     pub resource_revalidation_changed: AtomicBool,
     pub deferrals: deferral::ControlledDeferrals,
+    admission_capacity: Mutex<Option<admission_capacity::RealAdmission>>,
     pub entered: Notify,
     pub resume: Notify,
+    pub submitted: Notify,
+    pub resume_after_submit: Notify,
 }
 
 #[async_trait::async_trait]
 impl ModelExecutor for ControlledExecutor {
+    fn decode_context_coverage(&self) -> Arc<vnext::ExecutorDecodeContextCoverage> {
+        self.decode_context_coverage_override
+            .lock()
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn calibration_invalidate_token_policy_residency(
+        &self,
+    ) -> ferrum_interfaces::model_executor::TokenPolicyResidencyInvalidation {
+        token_policy_residency::invalidate(self)
+    }
+
+    fn supports_guarded_prefix_maintenance(&self) -> bool {
+        self.evidence.prefix.is_some()
+    }
+    fn install_checkpoint_observation_sink(
+        &self,
+        sink: std::sync::Weak<dyn vnext::NativeCheckpointObservationSink>,
+    ) -> Result<bool> {
+        let Some(prefix) = self.evidence.prefix.as_ref() else {
+            return Ok(false);
+        };
+        prefix.install_observer(sink)?;
+        Ok(true)
+    }
+    fn plan_prefix_capture_boundary(
+        &self,
+        input: ferrum_interfaces::model_executor::PrefixCaptureBoundary<'_>,
+    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+        self.prefix_boundary(input)
+    }
+    fn plan_prompt_tail_capture_boundary(
+        &self,
+        chunk: ferrum_interfaces::model_executor::PrefillChunk,
+    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+        self.prefix_prompt_tail(chunk)
+    }
+    fn try_retain_ready_prefix(
+        &self,
+        input: ferrum_interfaces::model_executor::PrefixReadyRestoreRequest<'_>,
+        budget: &mut dyn vnext::ResourcePlanningBudget,
+    ) -> vnext::ExecutionCostRouteAvailability<
+        Option<Arc<dyn ferrum_interfaces::model_executor::PrefixCaptureLease>>,
+    > {
+        self.prefix_ready(input, budget)
+    }
+    fn bind_execution_ready_checkpoint(
+        &self,
+        view: &vnext::ExecutionCostRouteView,
+        state: &vnext::ExecutionCostRouteState,
+        lease: &dyn ferrum_interfaces::model_executor::PrefixCaptureLease,
+        budget: &mut dyn vnext::ResourcePlanningBudget,
+    ) -> vnext::ExecutionCostRouteAvailability<vnext::FutureRetainedCheckpointBinding> {
+        self.prefix_ready_bind(view, state, lease, budget)
+    }
+    fn retain_prefix_capture_interest(
+        &self,
+        input: ferrum_interfaces::model_executor::PrefixCaptureRequest<'_>,
+    ) -> Result<Option<Arc<dyn ferrum_interfaces::model_executor::PrefixCaptureLease>>> {
+        Ok(self.prefix_interest(input))
+    }
+    async fn try_capture_plan_runtime_prefix_guarded(
+        &self,
+        input: ferrum_interfaces::model_executor::PrefixCaptureRequest<'_>,
+        guard: Arc<dyn vnext::CheckpointTransferSubmissionGuard>,
+    ) -> Result<bool> {
+        self.prefix_capture(input, guard.as_ref())
+    }
+    async fn try_restore_plan_runtime_prefix_guarded(
+        &self,
+        input: ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreInput<'_>,
+        guard: Arc<dyn vnext::CheckpointTransferSubmissionGuard>,
+    ) -> Result<ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreOutcome> {
+        self.prefix_restore(input, guard.as_ref())
+    }
+    fn project_execution_checkpoint(
+        &self,
+        view: &vnext::ExecutionCostRouteView,
+        state: &vnext::ExecutionCostRouteState,
+        query: vnext::FutureCheckpointCostQuery<'_>,
+        budget: &mut dyn vnext::ResourcePlanningBudget,
+    ) -> vnext::ExecutionCostRouteAvailability<vnext::FutureCheckpointCostProjection> {
+        self.prefix_project(view, state, query, budget)
+    }
+    fn bind_execution_retained_checkpoint(
+        &self,
+        view: &vnext::ExecutionCostRouteView,
+        state: &vnext::ExecutionCostRouteState,
+        lease: &dyn ferrum_interfaces::model_executor::PrefixCaptureLease,
+        source: usize,
+        budget: &mut dyn vnext::ResourcePlanningBudget,
+    ) -> vnext::ExecutionCostRouteAvailability<vnext::FutureRetainedCheckpointBinding> {
+        self.prefix_bind(view, state, lease, source, budget)
+    }
+    fn execution_checkpoint_restore_completed(
+        &self,
+        view: &vnext::ExecutionCostRouteView,
+        lease: &dyn ferrum_interfaces::model_executor::PrefixCaptureLease,
+        target: usize,
+        budget: &mut dyn vnext::ResourcePlanningBudget,
+    ) -> vnext::ExecutionCostRouteAvailability<bool> {
+        self.prefix_restored(view, lease, target, budget)
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.base.info()
     }
@@ -147,12 +326,23 @@ impl ModelExecutor for ControlledExecutor {
         ExecutionResourceAuthority::PlanRuntime
     }
     fn slo_execution_capability(&self) -> ExecutorSloCapability {
+        if self
+            .profile_sink
+            .lock()
+            .as_ref()
+            .is_some_and(|sink| !sink.device_timing_mode().guarded_completion_compatible())
+        {
+            return ExecutorSloCapability::Unavailable;
+        }
         // The controlled backend executes all three guarded eager wave kinds
         // below. Missing future route evidence still returns Unknown; this is
         // an algorithm capability, never a promise of predictive coverage.
         self.startup_capability_override
             .lock()
             .unwrap_or(ExecutorSloCapability::GuardedEagerWaves)
+    }
+    fn attach_execution_event_sink(&self, sink: Arc<dyn vnext::ExecutionEventSink>) {
+        *self.profile_sink.lock() = Some(sink);
     }
     fn guarded_prefill_granularity(&self) -> Option<NonZeroUsize> {
         NonZeroUsize::new(self.prefill_granularity.load(Ordering::Acquire))
@@ -161,7 +351,18 @@ impl ModelExecutor for ControlledExecutor {
     fn execution_cost_identity(&self) -> ExecutorCostIdentityAvailability {
         identity()
     }
+    fn cost_workload_domain(&self) -> CostWorkloadDomainAvailability {
+        self.evidence
+            .prefix
+            .as_ref()
+            .and_then(|prefix| prefix.cost_domain.get().cloned())
+            .map(CostWorkloadDomainAvailability::Known)
+            .unwrap_or_default()
+    }
     fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        if let Some(admission) = self.admission_capacity.lock().as_ref() {
+            return Ok(Some(admission.epochs(&mut Vec::new())));
+        }
         Ok(Some(ExecutorAdmissionEpochs::new(
             NonZeroU64::new(47).unwrap(),
             0,
@@ -172,6 +373,9 @@ impl ModelExecutor for ControlledExecutor {
         &self,
         sources: &mut Vec<vnext::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        if let Some(admission) = self.admission_capacity.lock().as_ref() {
+            return Ok(Some(admission.epochs(sources)));
+        }
         sources.clear();
         sources.push(
             vnext::CapacityAvailabilityEpoch::new(
@@ -220,6 +424,27 @@ impl ModelExecutor for ControlledExecutor {
         self.route_for_requests(requests, limits, budget)
     }
 
+    fn project_execution_cost_wave(
+        &self,
+        view: &vnext::ExecutionCostRouteView,
+        state: &vnext::ExecutionCostRouteState,
+        query: &vnext::FutureWaveCostQuery<'_>,
+        budget: &mut dyn vnext::ResourcePlanningBudget,
+    ) -> vnext::ExecutionCostRouteAvailability<vnext::ExecutionCostRouteProjection> {
+        query_projection::project(self, view, state, query, budget)
+    }
+
+    fn project_execution_cost_wave_with_host_content(
+        &self,
+        view: &vnext::ExecutionCostRouteView,
+        state: &vnext::ExecutionCostRouteState,
+        query: &vnext::FutureWaveCostQuery<'_>,
+        host: &vnext::FutureHostPendingQueryV2<'_>,
+        budget: &mut dyn vnext::ResourcePlanningBudget,
+    ) -> vnext::ExecutionCostRouteAvailability<vnext::ExecutionCostRouteForecastV2> {
+        query_projection::project_with_host_content(self, view, state, query, host, budget)
+    }
+
     fn maintain_execution_capacity_once(
         &self,
         ticket: ExecutorExecutionMaintenanceTicket,
@@ -260,14 +485,46 @@ impl ModelExecutor for ControlledExecutor {
         input: ExecutorPrefillAdmission<'_>,
     ) -> Result<ExecutorPrefillAdmissionDecision> {
         input.validate()?;
-        Ok(ExecutorPrefillAdmissionDecision::Admitted(
-            ExecutorPrefillAdmissionReceipt {
+        let mut lifecycle = self.token_policy_lifecycle.lock();
+        let decision = match self.admission_capacity.lock().as_mut() {
+            Some(admission) => admission.admit(input),
+            None => ExecutorPrefillAdmissionDecision::Admitted(ExecutorPrefillAdmissionReceipt {
                 request_id: input.request_id.clone(),
-            },
-        ))
+            }),
+        };
+        if let ExecutorPrefillAdmissionDecision::Admitted(receipt) = &decision {
+            self.admit_checkpoint_native_session(input)?;
+            lifecycle.admitted.insert(receipt.request_id.clone());
+        }
+        Ok(decision)
     }
-    fn cancel_prefill_admission(&self, _: &RequestId) -> bool {
-        true
+    fn cancel_prefill_admission(&self, id: &RequestId) -> bool {
+        if let Some(prefix) = self.evidence.prefix.as_ref() {
+            prefix.cancel_pending(id);
+        }
+        let mut lifecycle = self.token_policy_lifecycle.lock();
+        let released = match self.admission_capacity.lock().as_mut() {
+            Some(admission) => admission.cancel(id),
+            None => true,
+        };
+        if released {
+            lifecycle.admitted.remove(id);
+        }
+        if released && self.recycle_completed_bindings.load(Ordering::Acquire) {
+            // A cancelled fresh root has no cache and never calls complete_cache.
+            // Existing KV owners still require their normal completion path.
+            let cache_id = format!("mock_{id}");
+            let no_cache = self
+                .produced_caches
+                .lock()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .all(|cache| cache.cache_id() != cache_id);
+            if no_cache {
+                self.completed_bindings.lock().insert(id.clone());
+            }
+        }
+        released
     }
     fn cancel_prefill_admission_observed(
         &self,
@@ -284,12 +541,51 @@ impl ModelExecutor for ControlledExecutor {
             },
         }
     }
+    fn release_cache(&self, cache_id: &str) {
+        // This opt-in fixture owns real native histories. Production cancels
+        // its registry owner when the engine releases an errored/cancelled
+        // cache; the inherited mock no-op must not leave that owner live.
+        if self.evidence.prefix.is_none() {
+            return;
+        }
+        let lifecycle = self.token_policy_lifecycle.lock();
+        if lifecycle.executing != 0 {
+            return;
+        }
+        let request = self
+            .session_bindings
+            .lock()
+            .iter()
+            .find(|request| format!("mock_{request}") == cache_id)
+            .cloned();
+        let Some(request) = request else {
+            return;
+        };
+        // Ordinary cache-reference updates cannot retire an admitted owner.
+        // Completion/cancellation first retires its exact admission as usual.
+        if lifecycle.admitted.contains(&request) {
+            return;
+        }
+        self.native_structured_history.lock().remove(&request);
+        if self.recycle_completed_bindings.load(Ordering::Acquire) {
+            self.completed_bindings.lock().insert(request);
+        }
+    }
     async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+        let _work = self.token_policy_work();
         self.completion_calls.fetch_add(1, Ordering::AcqRel);
         self.release_cache(completion.cache_id());
         if self.completion_fail.load(Ordering::Acquire) {
             Err(FerrumError::backend("controlled completion failure"))
         } else {
+            self.native_structured_history
+                .lock()
+                .remove(completion.request_id());
+            if self.recycle_completed_bindings.load(Ordering::Acquire) {
+                self.completed_bindings
+                    .lock()
+                    .insert(completion.request_id().clone());
+            }
             Ok(())
         }
     }
@@ -318,17 +614,62 @@ impl ModelExecutor for ControlledExecutor {
         Ok(())
     }
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        let _work = self.token_policy_work();
         self.base.prefill(input).await
     }
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        let _work = self.token_policy_work();
         self.base.decode(input).await
     }
     async fn plan_runtime_prefill_with_capacity(
         &self,
         input: &PlanRuntimePrefillInput,
     ) -> Result<PlanRuntimePrefillOutcome> {
+        let _work = self.token_policy_work();
+        if self.plain_wave_protocol.load(Ordering::Acquire) {
+            if let Some(deferral) = self.deferrals.take_plain(&self.entries) {
+                return Ok(PlanRuntimePrefillOutcome::Deferred(deferral));
+            }
+            self.record_plain_wave(std::slice::from_ref(input), &[]);
+        }
         self.prefill_output(input)
             .map(PlanRuntimePrefillOutcome::Completed)
+    }
+    async fn plan_runtime_batch_prefill_with_capacity(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
+    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
+        let _work = self.token_policy_work();
+        if !self.plain_wave_protocol.load(Ordering::Acquire) {
+            return Ok(PlanRuntimeBatchPrefillOutcome::Unsupported);
+        }
+        if let Some(deferral) = self.deferrals.take_plain(&self.entries) {
+            return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral));
+        }
+        self.record_plain_wave(inputs, &[]);
+        inputs
+            .iter()
+            .map(|input| self.prefill_output(input))
+            .collect::<Result<Vec<_>>>()
+            .map(PlanRuntimeBatchPrefillOutcome::Completed)
+    }
+    async fn plan_runtime_batch_decode_with_capacity(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        let _work = self.token_policy_work();
+        if !self.plain_wave_protocol.load(Ordering::Acquire) {
+            return Err(FerrumError::unsupported(
+                "tensor-free plan-runtime batch decode is not implemented",
+            ));
+        }
+        if let Some(deferral) = self.deferrals.take_plain(&self.entries) {
+            return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral));
+        }
+        self.record_plain_wave(&[], inputs);
+        Ok(PlanRuntimeBatchDecodeOutcome::Completed(
+            self.decode_outputs(inputs),
+        ))
     }
     async fn plan_runtime_batch_prefill_guarded_work_observed(
         &self,
@@ -337,7 +678,11 @@ impl ModelExecutor for ControlledExecutor {
         guard: &dyn NonblockingHostSubmissionGuard,
         mut observation: GuardedCostObservation<'_, '_>,
     ) -> GuardedDispatchOutcome<Vec<PlanRuntimePrefillCompletion>> {
-        if let Some(deferred) = self.deferrals.take(guard, &self.entries) {
+        let _work = self.token_policy_work();
+        if let Some(deferred) =
+            self.deferrals
+                .take_observed(guard, &self.entries, observation.as_deref_mut())
+        {
             return deferred;
         }
         if !self.enter_guarded(guard).await {
@@ -349,16 +694,32 @@ impl ModelExecutor for ControlledExecutor {
                 .map(|input| input.request_id.clone())
                 .collect(),
         );
-        self.begin_cost_observation(observation.as_deref_mut(), inputs, &[]);
+        let native = self.native_structured_output(observation.as_deref_mut(), inputs, &[], guard);
+        if native.is_none() {
+            self.begin_cost_observation(observation.as_deref_mut(), inputs, &[]);
+        }
         let result = if self.fail_after_submit.load(Ordering::Acquire) {
             Err(FerrumError::backend("injected submitted prefill failure"))
         } else {
-            inputs
-                .iter()
-                .map(|input| self.prefill_output(input))
-                .collect()
+            if let Some(native) = native {
+                native.and_then(|rows| {
+                    inputs
+                        .iter()
+                        .zip(rows)
+                        .map(|(input, logits)| self.prefill_output_from_logits(input, logits))
+                        .collect()
+                })
+            } else {
+                inputs
+                    .iter()
+                    .map(|input| self.prefill_output(input))
+                    .collect()
+            }
         };
         self.end_cost_observation(observation, result.is_ok());
+        if result.is_ok() {
+            self.wait_after_submit().await;
+        }
         GuardedDispatchOutcome::Submitted(result)
     }
     async fn plan_runtime_mixed_batch_guarded_work_observed(
@@ -369,7 +730,11 @@ impl ModelExecutor for ControlledExecutor {
         guard: &dyn NonblockingHostSubmissionGuard,
         mut observation: GuardedCostObservation<'_, '_>,
     ) -> GuardedDispatchOutcome<PlanRuntimeMixedBatchOutput> {
-        if let Some(deferred) = self.deferrals.take(guard, &self.entries) {
+        let _work = self.token_policy_work();
+        if let Some(deferred) =
+            self.deferrals
+                .take_observed(guard, &self.entries, observation.as_deref_mut())
+        {
             return deferred;
         }
         if !self.enter_guarded(guard).await {
@@ -423,6 +788,9 @@ impl ModelExecutor for ControlledExecutor {
                 })
         };
         self.end_cost_observation(observation, result.is_ok());
+        if result.is_ok() {
+            self.wait_after_submit().await;
+        }
         GuardedDispatchOutcome::Submitted(result)
     }
     async fn plan_runtime_batch_decode_guarded_work_observed(
@@ -432,7 +800,11 @@ impl ModelExecutor for ControlledExecutor {
         guard: &dyn NonblockingHostSubmissionGuard,
         mut observation: GuardedCostObservation<'_, '_>,
     ) -> GuardedDispatchOutcome<Vec<PlanRuntimeDecodeOutput>> {
-        if let Some(deferred) = self.deferrals.take(guard, &self.entries) {
+        let _work = self.token_policy_work();
+        if let Some(deferred) =
+            self.deferrals
+                .take_observed(guard, &self.entries, observation.as_deref_mut())
+        {
             return deferred;
         }
         if !self.enter_guarded(guard).await {
@@ -444,22 +816,60 @@ impl ModelExecutor for ControlledExecutor {
                 .map(|input| input.request_id.clone())
                 .collect(),
         );
-        self.begin_cost_observation(observation.as_deref_mut(), &[], inputs);
+        let native = self.native_structured_output(observation.as_deref_mut(), &[], inputs, guard);
+        if native.is_none() {
+            self.begin_cost_observation(observation.as_deref_mut(), &[], inputs);
+        }
         if self.fail_after_submit.load(Ordering::Acquire) {
             self.end_cost_observation(observation, false);
             return GuardedDispatchOutcome::Submitted(Err(FerrumError::backend(
                 "injected submitted failure",
             )));
         }
-        let result = self.decode_outputs(inputs);
-        self.end_cost_observation(observation, true);
-        GuardedDispatchOutcome::Submitted(Ok(result))
+        let result = if let Some(native) = native {
+            native.map(|rows| {
+                inputs
+                    .iter()
+                    .zip(rows)
+                    .map(|(input, logits)| self.decode_output_from_logits(input, logits))
+                    .collect()
+            })
+        } else {
+            Ok(self.decode_outputs(inputs))
+        };
+        self.end_cost_observation(observation, result.is_ok());
+        if result.is_ok() {
+            self.wait_after_submit().await;
+        }
+        GuardedDispatchOutcome::Submitted(result)
     }
 }
 
 impl ControlledExecutor {
+    async fn wait_after_submit(&self) {
+        if self.park_after_submit.load(Ordering::Acquire) {
+            self.submitted.notify_one();
+            self.resume_after_submit.notified().await;
+        }
+    }
+
+    fn record_plain_wave(
+        &self,
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+    ) {
+        self.entries.fetch_add(1, Ordering::AcqRel);
+        self.physical.fetch_add(1, Ordering::AcqRel);
+        self.submitted_requests.lock().push(
+            prefills
+                .iter()
+                .map(|input| input.request_id.clone())
+                .chain(decodes.iter().map(|input| input.request_id.clone()))
+                .collect(),
+        );
+    }
     pub(in crate::continuous_engine) fn abort_resource_sessions(&self) {
-        for session in &self.evidence.sessions {
+        for session in self.evidence.sessions.snapshot() {
             session.try_abort_if_quiescent().unwrap();
         }
     }
@@ -476,11 +886,31 @@ impl ControlledExecutor {
         let Some(context) = context else {
             return;
         };
+        let unknown = self
+            .actual_observation_unknown
+            .lock()
+            .as_ref()
+            .and_then(|hook| hook(prefills, decodes));
+        if let Some(reason) = unknown {
+            let started_at = context.now_ns();
+            context.physical_wave(Err(reason), started_at);
+            return;
+        }
         if self
             .emit_structured_cost_observations
             .load(Ordering::Acquire)
+            && prefills
+                .iter()
+                .map(|r| &r.request_id)
+                .chain(decodes.iter().map(|r| &r.request_id))
+                .all(|id| {
+                    context
+                        .participant(id)
+                        .and_then(|p| p.host_features)
+                        .is_some_and(|host| host.supports_installed_plain_text_content())
+                })
         {
-            structured::record(context, prefills, decodes);
+            structured::record(context, prefills, decodes, None);
             return;
         }
         if self.narrow_last_mixed_prefill.load(Ordering::Acquire) {
@@ -588,6 +1018,41 @@ impl ControlledExecutor {
             });
         }
     }
+    pub(in crate::continuous_engine::inner) fn enable_structured_query_route(&self) {
+        let fixture = self.evidence.fixture.as_ref().unwrap();
+        let mut trace = fixture.provider_trace.lock().unwrap();
+        trace.cost_route_supported = true;
+        trace.cost_route_statistics = true;
+        let mut runtime = fixture.runtime_trace.lock().unwrap();
+        runtime.structured_cost_capture_enabled = true;
+        runtime.cost_route_projection_enabled = true;
+    }
+
+    pub(in crate::continuous_engine::inner) fn enable_cost_route_eager_boundary(&self) {
+        let fixture = self.evidence.fixture.as_ref().unwrap();
+        fixture
+            .provider_trace
+            .lock()
+            .unwrap()
+            .cost_route_eager_boundary = true;
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .cost_direct_replay_projection_enabled = true;
+    }
+
+    pub(in crate::continuous_engine::inner) fn set_cost_graph_evidence(
+        &self,
+        state: Option<vnext::DeviceCostGraphStreamState>,
+        catalog: Option<vnext::DeviceCostGraphCatalog>,
+    ) {
+        let fixture = self.evidence.fixture.as_ref().unwrap();
+        let mut trace = fixture.runtime_trace.lock().unwrap();
+        trace.cost_graph_state = state;
+        trace.cost_graph_catalog = catalog;
+    }
+
     fn route_for_requests(
         &self,
         requests: &[ExecutorResourcePlanningRequest<'_>],
@@ -608,9 +1073,37 @@ impl ControlledExecutor {
         for request in requests {
             let index = match bindings.iter().position(|id| id == request.request_id) {
                 Some(index) => index,
+                None if self.evidence.prefix.is_some() => {
+                    // A read-only projection cannot mint a new admission.
+                    return ExecutionCostRouteAvailability::Unknown(
+                        vnext::ExecutionCostRouteUnknown::InvalidInput,
+                    );
+                }
                 None if bindings.len() < self.evidence.sessions.len() => {
                     bindings.push(request.request_id.clone());
                     bindings.len() - 1
+                }
+                None if self.recycle_completed_bindings.load(Ordering::Acquire) => {
+                    let mut completed = self.completed_bindings.lock();
+                    let caches = self.produced_caches.lock();
+                    let free = bindings.iter().enumerate().find_map(|(index, old)| {
+                        let cache_id = format!("mock_{old}");
+                        (completed.contains(old)
+                            && !indices.contains(&index)
+                            && caches
+                                .iter()
+                                .filter_map(std::sync::Weak::upgrade)
+                                .all(|cache| cache.cache_id() != cache_id))
+                        .then_some(index)
+                    });
+                    let Some(index) = free else {
+                        return ExecutionCostRouteAvailability::Unknown(
+                            vnext::ExecutionCostRouteUnknown::InvalidInput,
+                        );
+                    };
+                    completed.remove(&bindings[index]);
+                    bindings[index] = request.request_id.clone();
+                    index
                 }
                 None => {
                     return ExecutionCostRouteAvailability::Unknown(
@@ -626,17 +1119,94 @@ impl ControlledExecutor {
             indices.push(index);
         }
         drop(bindings);
-        let sessions = indices
+        let owned_sessions = indices
             .iter()
-            .map(|&index| self.evidence.sessions[index].as_ref())
+            .map(|&index| self.evidence.sessions.get(index).unwrap())
             .collect::<Vec<_>>();
+        let sessions = owned_sessions.iter().map(Arc::as_ref).collect::<Vec<_>>();
         let resources = &self.evidence.fixture.as_ref().unwrap().plan_resources;
-        let tokens = vec![1; sessions.len()];
+        let initial_query = self
+            .evidence
+            .fixture
+            .as_ref()
+            .unwrap()
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .cost_route_projection_enabled;
+        let frontiers = if self.project_structured_cpu_fill.load(Ordering::Acquire)
+            || self.native_structured_submission.load(Ordering::Acquire)
+        {
+            // Derive every current frontier from this actual CPU executor's
+            // retained KV handle; never reuse the old initial-only constant.
+            let caches = self.produced_caches.lock();
+            let mut frontiers = Vec::with_capacity(requests.len());
+            for request in requests {
+                let frontier = match request.cache_id {
+                    None if self.evidence.prefix.is_some() => {
+                        // Production reads its admitted sequence's completed
+                        // prefill frontier when the caller has no decode cache
+                        // ID. Our real native completion publishes that same
+                        // frontier in its retained output handle, even for an
+                        // intermediate prefill. Input-history length is the
+                        // full prompt and is not a completed-work frontier.
+                        let cache_id = format!("mock_{}", request.request_id);
+                        match caches
+                            .iter()
+                            .rev()
+                            .filter_map(std::sync::Weak::upgrade)
+                            .find(|cache| cache.cache_id() == cache_id)
+                        {
+                            Some(cache) => cache.num_tokens() as u64,
+                            None if self
+                                .native_structured_history
+                                .lock()
+                                .contains_key(request.request_id) =>
+                            {
+                                return ExecutionCostRouteAvailability::Unknown(
+                                    vnext::ExecutionCostRouteUnknown::StaleView,
+                                );
+                            }
+                            None => 0, // The admitted owner has no completed work.
+                        }
+                    }
+                    None => 0,
+                    Some(cache_id) => {
+                        let Some(cache) = caches
+                            .iter()
+                            .rev()
+                            .filter_map(std::sync::Weak::upgrade)
+                            .find(|cache| cache.cache_id() == cache_id)
+                        else {
+                            return ExecutionCostRouteAvailability::Unknown(
+                                vnext::ExecutionCostRouteUnknown::InvalidInput,
+                            );
+                        };
+                        cache.num_tokens() as u64
+                    }
+                };
+                frontiers.push(frontier);
+            }
+            frontiers
+        } else if initial_query {
+            // This opt-in projection fixture covers only genuine initial
+            // prefills. It has no native ledger for post-submit KV frontiers.
+            if self.physical.load(Ordering::Acquire) != 0
+                || requests.iter().any(|request| request.cache_id.is_some())
+            {
+                return ExecutionCostRouteAvailability::Unknown(
+                    vnext::ExecutionCostRouteUnknown::Unsupported,
+                );
+            }
+            vec![0; sessions.len()]
+        } else {
+            vec![1; sessions.len()]
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let route = loop {
             let route = resources.execution_cost_route_view(
                 &sessions,
-                &tokens,
+                &frontiers,
                 self.evidence.lane.as_ref().unwrap().as_ref(),
                 limits,
                 budget,
@@ -661,6 +1231,28 @@ impl ControlledExecutor {
                 other => break other,
             }
         };
+        if self.evidence.prefix.is_some() {
+            if let ExecutionCostRouteAvailability::Known(route) = &route {
+                for ((request, participant), frontier) in requests
+                    .iter()
+                    .zip(route.resource_view().participants())
+                    .zip(&frontiers)
+                {
+                    if request.cache_id.is_none()
+                        && participant
+                            .completed_checkpoint_boundary()
+                            .map_or(0, |boundary| boundary.completed_tokens())
+                            != *frontier
+                    {
+                        // An older output handle can outlive its replacement.
+                        // It cannot override this capture's native completion.
+                        return ExecutionCostRouteAvailability::Unknown(
+                            vnext::ExecutionCostRouteUnknown::StaleView,
+                        );
+                    }
+                }
+            }
+        }
         if let ExecutionCostRouteAvailability::Unknown(reason) = &route {
             *self.cost_route_unknown.lock() = Some(*reason);
             eprintln!("controlled executor cost route unavailable: {reason:?}");
@@ -693,7 +1285,9 @@ impl ControlledExecutor {
         if self.replan_before_encode.load(Ordering::Acquire) {
             return false;
         }
-        self.physical.fetch_add(1, Ordering::AcqRel);
+        if !self.native_structured_submission.load(Ordering::Acquire) {
+            self.physical.fetch_add(1, Ordering::AcqRel);
+        }
         true
     }
     fn prefill_output(
@@ -850,7 +1444,7 @@ pub(super) fn train_runtime(runtime: &Arc<EngineCostRuntime>) {
             committed_at_ns: Some(9),
         });
         sample_clock.0.store(10, Ordering::Relaxed);
-        assert_eq!(call.finish(), CostCallDisposition::Published);
+        assert_eq!(call.finish(), CostCallDisposition::Queued);
     }
     runtime.consume_samples();
     assert!(runtime.snapshot().is_some());
@@ -867,12 +1461,30 @@ pub(super) async fn fixture() -> (
 pub(in crate::continuous_engine) async fn startup_components(
     width: usize,
 ) -> (Arc<dyn Tokenizer + Send + Sync>, Arc<ControlledExecutor>) {
+    startup_components_options(width, false).await
+}
+
+async fn startup_components_options(
+    width: usize,
+    checkpoint: bool,
+) -> (Arc<dyn Tokenizer + Send + Sync>, Arc<ControlledExecutor>) {
+    startup_components_with_generation_config(width, checkpoint, None).await
+}
+
+async fn startup_components_with_generation_config(
+    width: usize,
+    checkpoint: bool,
+    generation_config: Option<&[u8]>,
+) -> (Arc<dyn Tokenizer + Send + Sync>, Arc<ControlledExecutor>) {
     let vocab = (0..64)
         .map(|id| {
             (
                 match id {
                     5 => "test".into(),
                     6 => "ok".into(),
+                    10 if checkpoint => "a".into(),
+                    11 if checkpoint => "Ã".into(),
+                    12 if checkpoint => "©".into(),
                     _ => format!("v{id}"),
                 },
                 id,
@@ -890,29 +1502,52 @@ pub(in crate::continuous_engine) async fn startup_components(
     raw.with_pre_tokenizer(Some(
         tokenizers::pre_tokenizers::whitespace::Whitespace::default(),
     ));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(HuggingFaceTokenizer::new(raw).await.unwrap());
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(match generation_config {
+        Some(config) => HuggingFaceTokenizer::from_source_bytes(
+            raw.to_string(false).unwrap().as_bytes(),
+            None,
+            Some(config),
+        )
+        .await
+        .unwrap(),
+        None => HuggingFaceTokenizer::new(raw).await.unwrap(),
+    });
     let executor = Arc::new(ControlledExecutor {
         base: MockModelExecutor::instant(64),
-        evidence: CoreEvidence::new(width),
+        evidence: CoreEvidence::new_options(width, checkpoint),
         typed_sequence_state: Mutex::new(None),
         startup_capability_override: Mutex::new(None),
+        profile_sink: Mutex::new(None),
+        decode_context_coverage_override: Mutex::new(None),
         entries: AtomicUsize::new(0),
         physical: AtomicUsize::new(0),
+        plain_wave_protocol: AtomicBool::new(false),
         prefill_granularity: AtomicUsize::new(1),
         park: AtomicBool::new(false),
+        park_after_submit: AtomicBool::new(false),
         fail_after_submit: AtomicBool::new(false),
         panic_before_submit: AtomicBool::new(false),
         narrow_last_mixed_prefill: AtomicBool::new(false),
         replan_before_encode: AtomicBool::new(false),
         emit_cost_observations: AtomicBool::new(false),
+        actual_observation_unknown: Mutex::new(None),
         emit_structured_cost_observations: AtomicBool::new(false),
+        native_structured_submission: AtomicBool::new(false),
+        native_structured_history: Arc::new(Mutex::new(Default::default())),
+        token_policy_lifecycle: Mutex::new(Default::default()),
+        project_structured_cpu_fill: AtomicBool::new(false),
+        single_row_prefill_only: AtomicBool::new(false),
+        projection_readiness_fault: Mutex::new(None),
+        context_partitioned_cpu_fill: AtomicBool::new(false),
+        row_selected_cpu_fill: AtomicBool::new(false),
         completion_work_known: AtomicBool::new(false),
         completion_fail: AtomicBool::new(false),
         completion_calls: AtomicUsize::new(0),
         discarded_prefills: Mutex::new(Vec::new()),
         produced_caches: Mutex::new(Vec::new()),
         session_bindings: Mutex::new(Vec::new()),
+        recycle_completed_bindings: AtomicBool::new(false),
+        completed_bindings: Mutex::new(std::collections::HashSet::new()),
         submitted_requests: Mutex::new(Vec::new()),
         before_prefill_discard: Mutex::new(None),
         before_resource_revalidation: Mutex::new(None),
@@ -921,9 +1556,36 @@ pub(in crate::continuous_engine) async fn startup_components(
         cost_route_unknown: Mutex::new(None),
         resource_revalidation_changed: AtomicBool::new(false),
         deferrals: Default::default(),
+        admission_capacity: Mutex::new(None),
         entered: Notify::new(),
         resume: Notify::new(),
+        submitted: Notify::new(),
+        resume_after_submit: Notify::new(),
     });
+    (tokenizer, executor)
+}
+
+/// Real native CPU checkpoint executor. Callers still construct the ordinary
+/// engine/runtime and must learn costs from its acknowledged transfer receipts.
+pub(in crate::continuous_engine) async fn startup_checkpoint_components(
+    width: usize,
+) -> (Arc<dyn Tokenizer + Send + Sync>, Arc<ControlledExecutor>) {
+    startup_checkpoint_components_with_generation_config(width, None).await
+}
+
+pub(in crate::continuous_engine) async fn startup_checkpoint_components_with_generation_config(
+    width: usize,
+    generation_config: Option<&[u8]>,
+) -> (Arc<dyn Tokenizer + Send + Sync>, Arc<ControlledExecutor>) {
+    let (tokenizer, executor) =
+        startup_components_with_generation_config(width, true, generation_config).await;
+    executor
+        .native_structured_submission
+        .store(true, Ordering::Release);
+    executor
+        .project_structured_cpu_fill
+        .store(true, Ordering::Release);
+    executor.enable_structured_query_route();
     (tokenizer, executor)
 }
 
@@ -945,8 +1607,97 @@ pub(in crate::continuous_engine::inner) async fn fixture_with_custom_config(
     Arc<ContinuousBatchScheduler>,
     Arc<ControlledExecutor>,
 ) {
-    let (tokenizer, executor) = startup_components(width).await;
+    fixture_with_custom_config_options(width, None, configure).await
+}
+
+/// Opt in to the existing native completed-boundary state program. Stateless
+/// guard fixtures keep their original plan and cost identity by default.
+pub(in crate::continuous_engine::inner) async fn fixture_with_checkpoint_config(
+    width: usize,
+    maximum_scheduled_tokens_per_wave: NonZeroU64,
+    configure: impl FnOnce(&mut ferrum_types::EngineConfig),
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<ControlledExecutor>,
+) {
+    fixture_with_custom_config_options(width, Some(maximum_scheduled_tokens_per_wave), configure)
+        .await
+}
+
+/// Read the original bounded controller capture, rather than replacing a
+/// request's dynamic executor feedback with a fixture-supplied private cap.
+pub(in crate::continuous_engine::inner) fn assert_prefill_step_work_policy(
+    engine: &ContinuousBatchEngine,
+    maximum_wave_tokens: NonZeroUsize,
+    per_row_step: NonZeroUsize,
+) {
+    let mut hint = ferrum_interfaces::BatchHint::simple(maximum_wave_tokens.get());
+    hint.max_tokens = maximum_wave_tokens.get();
+    let budget = ControllerBudget::new(slo_clock_now(), Duration::from_secs(1)).unwrap();
+    let captured = engine
+        .inner
+        .capture_slo_controller_snapshot(&hint, budget)
+        .expect("original admitted controller snapshot");
+    assert!(!captured.snapshot.requests.is_empty());
+    assert!(captured
+        .snapshot
+        .requests
+        .iter()
+        .all(|row| matches!(row.phase, RequestPhaseView::Prefill(_))));
+    let policy = captured.snapshot.capabilities.work_policy;
+    assert_eq!(
+        policy.prefill_step_chunk,
+        Some(u64::try_from(per_row_step.get()).unwrap())
+    );
+    assert_eq!(
+        policy.maximum_wave_tokens,
+        u64::try_from(maximum_wave_tokens.get()).unwrap()
+    );
+    let envelope = policy.for_ready_decoders(0);
+    assert_eq!(envelope.maximum_prefill_chunk, policy.prefill_step_chunk);
+    let mut usage =
+        ferrum_scheduler::implementations::continuous::work_policy::WaveWorkUsage::default();
+    let step = NonZeroU64::new(u64::try_from(per_row_step.get()).unwrap()).unwrap();
+    assert!(envelope.include(&mut usage, Some(step)));
+    assert!(envelope.include(&mut usage, Some(step)));
+    assert!(!envelope.include(&mut usage, Some(step)));
+    let oversized = NonZeroU64::new(step.get().checked_add(1).unwrap()).unwrap();
+    assert!(!envelope.include(
+        &mut ferrum_scheduler::implementations::continuous::work_policy::WaveWorkUsage::default(),
+        Some(oversized),
+    ));
+}
+
+async fn fixture_with_custom_config_options(
+    width: usize,
+    checkpoint_tokens: Option<NonZeroU64>,
+    configure: impl FnOnce(&mut ferrum_types::EngineConfig),
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<ControlledExecutor>,
+) {
+    let (tokenizer, executor) =
+        startup_components_options(width, checkpoint_tokens.is_some()).await;
+    let checkpoint_context = checkpoint_tokens.map(|tokens| {
+        // This is the original logical request ceiling. The Mock model's
+        // larger capability cannot confer additional resident authority.
+        let context = NonZeroU32::new(
+            executor
+                .native_request_fit_tokens()
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        executor.declare_checkpoint_cost_domain(context, tokens);
+        context
+    });
     let mut config = ferrum_types::EngineConfig::default();
+    if let Some(context) = checkpoint_context {
+        config.runtime.max_model_len = Some(context.get() as usize);
+    }
     // This fixture exercises mixed guards explicitly; the product default is Split.
     config.batching.prefill_decode_execution = ferrum_types::PrefillDecodeExecution::Mixed;
     config.scheduler.slo.output.max_queued_events_per_request = NonZeroUsize::new(2).unwrap();

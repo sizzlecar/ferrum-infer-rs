@@ -1267,7 +1267,9 @@ impl EngineInner {
             0,
         );
         let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
-        let gate = (time_gate && self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce)
+        let gate = (time_gate
+            && self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce
+            && self.config.scheduler.slo.execution_policy().time_admission)
             .then(|| self.prepare_time_activation(maximum_admissions, wake));
         let mut time_activated = Vec::new();
         let capture_trace = self.scheduler_trace_jsonl.is_some();
@@ -1423,6 +1425,9 @@ impl EngineInner {
                 "Typed prefill admission failed before device submission"
             );
             self.model_executor.cancel_prefill_admission(&request_id);
+            if self.reject_strict_pending(&request_id, error).await? {
+                continue;
+            }
             self.complete_request(&request_id, FinishReason::Error)
                 .await?;
         }
@@ -1692,6 +1697,7 @@ impl EngineInner {
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
         let _ = self.observe_slo_waits(slo_clock_now);
         self.cancel_abandoned_requests().await?;
+        self.expire_strict_admissions().await?;
         self.complete_credited_output_failures().await?;
         self.refresh_credited_output_readiness();
         self.complete_execution_readiness_failures().await?;
@@ -1745,6 +1751,15 @@ impl EngineInner {
         match self.prepare_slo_controller(&hint)? {
             slo_controller::SloIterationPlan::Legacy => {}
             slo_controller::SloIterationPlan::Idle => return self.slo_controller_idle_outcome(),
+            slo_controller::SloIterationPlan::Progressed => {
+                return Ok(EngineIterationOutcome::Progressed)
+            }
+            slo_controller::SloIterationPlan::PrefixMaintenance(work) => {
+                return self.execute_slo_prefix_maintenance(work).await;
+            }
+            slo_controller::SloIterationPlan::PrefixSampling(work) => {
+                return self.execute_prefix_sampling(work).await;
+            }
             slo_controller::SloIterationPlan::Selected(wave) => {
                 drop(iteration_guard);
                 return self.execute_slo_controller_wave(wave).await;

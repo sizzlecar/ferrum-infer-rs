@@ -30,6 +30,7 @@ pub struct HostPendingSetV2 {
     recipe: Arc<UnsettledStructuredWaveEvidenceV1>,
     eligible_positions: Vec<u32>,
     constraint: HostPendingConstraintV2,
+    repetition_upper_sum: Option<u64>,
 }
 
 impl HostPendingSetV2 {
@@ -42,6 +43,34 @@ impl HostPendingSetV2 {
         recipe: &Arc<UnsettledStructuredWaveEvidenceV1>,
         eligible_positions: &[u32],
         constraint: HostPendingConstraintV2,
+    ) -> Result<Self, StatisticalEvidenceUnknown> {
+        Self::new_bound(exact, recipe, eligible_positions, constraint, false, None)
+    }
+    /// Installed text policy only. The producer proves a fixed product route
+    /// throughout the repetition interval; the shape contains its lower anchor.
+    pub fn new_installed(
+        exact: &CanonicalWaveCostShape,
+        recipe: &Arc<UnsettledStructuredWaveEvidenceV1>,
+        eligible_positions: &[u32],
+        constraint: HostPendingConstraintV2,
+        repetition_upper_sum: Option<u64>,
+    ) -> Result<Self, StatisticalEvidenceUnknown> {
+        Self::new_bound(
+            exact,
+            recipe,
+            eligible_positions,
+            constraint,
+            true,
+            repetition_upper_sum,
+        )
+    }
+    fn new_bound(
+        exact: &CanonicalWaveCostShape,
+        recipe: &Arc<UnsettledStructuredWaveEvidenceV1>,
+        eligible_positions: &[u32],
+        constraint: HostPendingConstraintV2,
+        installed: bool,
+        repetition_upper_sum: Option<u64>,
     ) -> Result<Self, StatisticalEvidenceUnknown> {
         use StatisticalEvidenceUnknown::{Capacity, MissingHostDomain};
         recipe.validate_exact(exact)?;
@@ -57,7 +86,8 @@ impl HostPendingSetV2 {
             if row.physical_position != position
                 || row.role != HostRowRoleV2::Decode
                 || row.no_generated_history
-                || row.decode_requires_full_logits != Some(row.pending_decoded_utf8)
+                || row.decode_requires_full_logits
+                    != Some(row.pending_decoded_utf8 || (installed && always_full(row)))
             {
                 return Err(MissingHostDomain);
             }
@@ -67,11 +97,18 @@ impl HostPendingSetV2 {
         let mut anchor_has_eligible_pending = false;
         for (position, row) in rows.iter().enumerate() {
             if row.physical_position as usize != position
-                || row.installed_policy.empirical_content_domain
-                    != Some(HostContentDomainV1::PlainTextGreedyV1)
+                || !matches!(
+                    row.installed_policy.empirical_content_domain,
+                    Some(HostContentDomainV1::PlainTextGreedyV1)
+                ) && !(installed
+                    && matches!(
+                        row.installed_policy.empirical_content_domain,
+                        Some(HostContentDomainV1::PlainTextInstalledV2(_))
+                    ))
             {
                 return Err(MissingHostDomain);
             }
+            fixed_forces_full |= installed && always_full(row);
             if next_eligible.peek().copied() == Some(row.physical_position) {
                 next_eligible.next();
                 anchor_has_eligible_pending |= row.pending_decoded_utf8;
@@ -108,10 +145,31 @@ impl HostPendingSetV2 {
             .try_reserve_exact(eligible_positions.len())
             .map_err(|_| Capacity)?;
         eligible.extend_from_slice(eligible_positions);
+        if let Some(upper) = repetition_upper_sum {
+            let numeric = exact.numeric_features.as_ref().ok_or(MissingHostDomain)?;
+            let (lower, history) = numeric
+                .rows
+                .iter()
+                .try_fold((0u64, 0u64), |(a, b), row| {
+                    Some((
+                        a.checked_add(row.repetition_tokens)?,
+                        b.checked_add(row.sampling_history_tokens)?,
+                    ))
+                })
+                .ok_or(Capacity)?;
+            if !installed
+                || upper < lower
+                || upper > history
+                || recipe.device().product() != StructuredCostProductV1::GreedyToken
+            {
+                return Err(MissingHostDomain);
+            }
+        }
         Ok(Self {
             recipe: Arc::clone(recipe),
             eligible_positions: eligible,
             constraint,
+            repetition_upper_sum,
         })
     }
 
@@ -122,12 +180,28 @@ impl HostPendingSetV2 {
     pub fn constraint(&self) -> HostPendingConstraintV2 {
         self.constraint
     }
+    pub fn repetition_upper_sum(&self) -> Option<u64> {
+        self.repetition_upper_sum
+    }
 
     /// Additional allocation owned by this set. The retained immutable recipe
     /// is shared with the selected evidence and is accounted by that evidence.
     pub fn position_storage_bytes(&self) -> usize {
         self.eligible_positions.capacity() * std::mem::size_of::<u32>()
     }
+}
+
+fn always_full(row: &StructuredHostRowV1) -> bool {
+    row.role == HostRowRoleV2::Decode
+        && matches!(
+            row.installed_policy.empirical_content_domain,
+            Some(HostContentDomainV1::PlainTextInstalledV2(
+                PlainTextPolicyCapabilityV2 {
+                    sampling: PlainTextSamplingRouteV2::FullLogits,
+                    ..
+                }
+            ))
+        )
 }
 
 impl HostContentForecastV2 {

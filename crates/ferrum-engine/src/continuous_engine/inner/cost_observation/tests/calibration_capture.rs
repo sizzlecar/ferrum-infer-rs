@@ -20,10 +20,7 @@ fn calibration_actual_unknown_diagnostic_keeps_typed_reason_without_minting_host
         }
         call.record_host_result(committed(&shape.rows[0], 9));
         clock.set(10);
-        assert_eq!(
-            call.finish(),
-            CostCallDisposition::Rejected(CostCallRejection::ActualEvidenceUnknown)
-        );
+        assert_finished_rejection(call, &sink, CostCallRejection::ActualEvidenceUnknown);
         assert!(capture.host_stages().is_none());
         assert!(sink.pop().is_none());
         let diagnostic = capture.actual_evidence_diagnostic().unwrap();
@@ -72,10 +69,7 @@ fn calibration_actual_unknown_diagnostic_keeps_recorder_loss_bounded_and_first_r
         }
         context.finish_call(ObservedCallOutcome::Completed);
     }
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::Composite);
     let diagnostic = capture.actual_evidence_diagnostic().unwrap();
     assert_eq!(
         diagnostic.dispatch_unknown,
@@ -103,15 +97,12 @@ fn calibration_actual_unknown_diagnostic_stays_absent_without_a_typed_unknown() 
     let capture = Arc::new(CostCalibrationCapture::default());
     let (mut call, _) = begin(&shape, &sink);
     call.attach_calibration_capture(Arc::clone(&capture));
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::NoPhysicalWave)
-    );
+    assert_finished_rejection(call, &sink, CostCallRejection::NoPhysicalWave);
     assert!(capture.actual_evidence_diagnostic().is_none());
     let capture = Arc::new(CostCalibrationCapture::default());
     assert_eq!(
         measured(&shape, &sink, Arc::clone(&capture)).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     );
     assert!(capture.actual_evidence_diagnostic().is_none());
 }
@@ -145,7 +136,9 @@ fn calibration_capture_preserves_actual_order_commits_and_sample_clock() {
     let capture = Arc::new(CostCalibrationCapture::default());
     let call = measured(&shape, &sink, Arc::clone(&capture));
     assert!(matches!(capture.status(), CostCalibrationStatus::Pending));
-    assert!(matches!(call.finish(), CostCallDisposition::Published));
+    assert!(matches!(call.finish(), CostCallDisposition::Queued));
+    assert!(matches!(capture.status(), CostCalibrationStatus::Pending));
+    let queued = sink.pop().unwrap();
     let CostCalibrationStatus::Complete(result) = capture.status() else {
         panic!("actual observation");
     };
@@ -156,6 +149,7 @@ fn calibration_capture_preserves_actual_order_commits_and_sample_clock() {
         host_features,
         accepted_ordinal,
         disposition,
+        ..
     } = result.as_ref()
     else {
         panic!("accepted sample");
@@ -169,7 +163,6 @@ fn calibration_capture_preserves_actual_order_commits_and_sample_clock() {
     }
     assert_eq!(sample.observed_at_ns, 10);
     assert_eq!(sample.timing.wall_total_ns, 8);
-    let queued = sink.pop().unwrap();
     assert_eq!(queued.observed_at_ns, sample.observed_at_ns);
     assert_eq!(queued.timing, sample.timing);
     assert_eq!(queued.actual_shape, sample.actual_shape);
@@ -181,7 +174,7 @@ fn calibration_capture_reports_queue_drop_without_claiming_training() {
     let sink = sink(1, 16);
     assert!(matches!(
         completed(&shape, &sink).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     ));
     let capture = Arc::new(CostCalibrationCapture::default());
     assert!(matches!(
@@ -193,12 +186,10 @@ fn calibration_capture_reports_queue_drop_without_claiming_training() {
     };
     assert!(matches!(
         result.as_ref(),
-        CostCalibrationResult::Observed {
-            disposition: CostCallDisposition::Dropped(CostSampleDrop::Capacity),
-            accepted_ordinal: None,
-            ..
-        }
+        CostCalibrationResult::UnresolvedDropped(CostSampleDrop::Capacity)
     ));
+    assert_eq!(sink.stats().published, 0);
+    sink.pop().unwrap();
     assert_eq!(sink.stats().published, 1);
 }
 
@@ -213,10 +204,11 @@ fn calibration_capture_abandon_and_cancel_never_create_reference_samples() {
         if cancelled {
             execute(&mut call, &clock, shape.clone());
             call.host_cancelled(&shape.rows[0].request_id);
-            assert!(matches!(call.finish(), CostCallDisposition::Rejected(_)));
+            assert!(matches!(call.finish(), CostCallDisposition::Queued));
         } else {
             drop(call);
         }
+        assert!(sink.pop().is_none());
         let CostCalibrationStatus::Complete(result) = capture.status() else {
             panic!("terminal capture");
         };
@@ -235,7 +227,7 @@ fn calibration_capture_reuse_is_explicit_conflict_without_overwriting_a_sample()
     let capture = Arc::new(CostCalibrationCapture::default());
     assert!(matches!(
         measured(&shape, &sink, Arc::clone(&capture)).finish(),
-        CostCallDisposition::Published
+        CostCallDisposition::Queued
     ));
     let second = measured(&shape, &sink, Arc::clone(&capture));
     // The new call is still live: old completed evidence must already be hidden.
@@ -243,7 +235,9 @@ fn calibration_capture_reuse_is_explicit_conflict_without_overwriting_a_sample()
         capture.status(),
         CostCalibrationStatus::ConflictingCalls
     ));
-    assert!(matches!(second.finish(), CostCallDisposition::Published));
+    assert!(matches!(second.finish(), CostCallDisposition::Queued));
+    assert_eq!(sink.stats().published, 0);
+    while sink.pop().is_some() {}
     assert_eq!(sink.stats().published, 2);
 
     let concurrent = Arc::new(CostCalibrationCapture::default());
@@ -284,7 +278,8 @@ fn calibration_capture_joins_commits_when_physical_rows_reorder_inputs() {
         call.record_host_result(committed(row, 9));
     }
     clock.set(10);
-    assert!(matches!(call.finish(), CostCallDisposition::Published));
+    assert!(matches!(call.finish(), CostCallDisposition::Queued));
+    sink.pop().unwrap();
     let CostCalibrationStatus::Complete(result) = capture.status() else {
         panic!("completed");
     };
@@ -344,11 +339,12 @@ fn calibration_capture_accepted_ordinal_is_sink_order_not_call_identity() {
     assert!(matches!(
         dropped.status(),
         CostCalibrationStatus::Complete(value)
-            if matches!(value.as_ref(), CostCalibrationResult::Observed {accepted_ordinal: None, ..})
+            if matches!(value.as_ref(), CostCalibrationResult::UnresolvedDropped(CostSampleDrop::Capacity))
     ));
     assert_eq!(sink.pop_numbered().unwrap().0, 1);
     let third = Arc::new(CostCalibrationCapture::default());
     measured(&shape, &sink, Arc::clone(&third)).finish();
+    assert_eq!(sink.pop_numbered().unwrap().0, 2);
     let CostCalibrationStatus::Complete(value) = third.status() else {
         panic!("third call finished");
     };
@@ -360,5 +356,5 @@ fn calibration_capture_accepted_ordinal_is_sink_order_not_call_identity() {
             ..
         }
     ));
-    assert_eq!(sink.pop_numbered().unwrap().0, 2);
+    assert!(sink.pop_numbered().is_none());
 }

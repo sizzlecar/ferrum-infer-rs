@@ -464,6 +464,47 @@ async fn credited_selection_leaves_default_off_and_observe_legacy_routes_unchang
     }
 }
 
+#[tokio::test]
+async fn strict_time_refusals_are_distinct_json_errors_before_both_sse_responses() {
+    use ferrum_types::SloTimeAdmissionRejection;
+    for (reason, code) in [
+        (
+            SloTimeAdmissionRejection::TargetTimeImpossible,
+            "slo_target_time_impossible",
+        ),
+        (
+            SloTimeAdmissionRejection::WaitExpired,
+            "slo_admission_wait_expired",
+        ),
+    ] {
+        for (path, payload) in [
+            ("/v1/completions", completion_request()),
+            ("/v1/chat/completions", ordinary_chat_request(None)),
+        ] {
+            let mut engine = CreditedRouteLlm::new(SloOutputTransport::Credited).await;
+            engine.startup_failure = Some(Error::SloTimeAdmissionRejected { reason });
+            let engine = Arc::new(engine);
+            let response = post_json(
+                AxumServer::from_llm(engine.clone()).build_router(),
+                path,
+                payload,
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
+            assert!(response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json"));
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["type"], "slo_time_admission_error");
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(engine.credited_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(engine.legacy_calls.load(Ordering::Relaxed), 0);
+            engine.assert_released();
+        }
+    }
+}
+
 fn ordinary_chat_request(usage: Option<bool>) -> Value {
     let mut request = json!({"model":"wire-model", "messages":[{"role":"user", "content":"hello"}], "max_tokens":4, "stream":true});
     if let Some(usage) = usage {

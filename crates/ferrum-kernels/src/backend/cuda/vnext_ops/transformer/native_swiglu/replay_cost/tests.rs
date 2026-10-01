@@ -115,7 +115,7 @@ fn cuda_ffn_recipe_preserves_packed_m_and_ordered_participant_launches() {
                 None,
                 SloStructuredCostCapture::HostSettledV1,
             );
-            let recipe = Recipe::from_prepared(&prepared, q8, None).unwrap();
+            let recipe = Recipe::from_prepared(&prepared, q8, None, &budget()).unwrap();
             assert_same_table(&prepared, &recipe.project(5, &ranges).unwrap());
             // Equal-total repartition is legal only for the captured packed
             // launch. Ordered leaves fix both each M and its scratch offset.
@@ -139,7 +139,7 @@ fn cuda_ffn_recipe_preserves_packed_m_and_ordered_participant_launches() {
 }
 
 #[test]
-fn cuda_ffn_recipe_missing_actual_capture_and_inconsistent_launches_stay_unknown() {
+fn cuda_ffn_recipe_needs_actual_metadata_not_prior_evidence_and_rejects_inconsistent_launches() {
     let ranges = [0..2, 2..5];
     let disabled = prepared(
         &ranges,
@@ -148,7 +148,15 @@ fn cuda_ffn_recipe_missing_actual_capture_and_inconsistent_launches_stay_unknown
         None,
         SloStructuredCostCapture::Disabled,
     );
-    assert!(Recipe::from_prepared(&disabled, None, None).is_none());
+    assert!(disabled.selection.command.statistical_evidence().is_none());
+    let recipe = Recipe::from_prepared(&disabled, None, None, &budget()).unwrap();
+    let projected = recipe.project(5, &ranges).unwrap();
+    projected
+        .algorithm_work()
+        .unwrap()
+        .unwrap()
+        .validate_command(&projected)
+        .unwrap();
     let mut actual = prepared(
         &ranges,
         true,
@@ -157,7 +165,7 @@ fn cuda_ffn_recipe_missing_actual_capture_and_inconsistent_launches_stay_unknown
         SloStructuredCostCapture::HostSettledV1,
     );
     actual.launches[0].3 = 1;
-    assert!(Recipe::from_prepared(&actual, None, None).is_none());
+    assert!(Recipe::from_prepared(&actual, None, None, &budget()).is_none());
 
     // A total M beyond the one-launch CUDA row bound stays on its captured
     // participant path; it cannot be reassigned to an oversized owner.
@@ -170,7 +178,7 @@ fn cuda_ffn_recipe_missing_actual_capture_and_inconsistent_launches_stay_unknown
         SloStructuredCostCapture::HostSettledV1,
     );
     assert!(actual.selection.packed_rows.is_none());
-    let recipe = Recipe::from_prepared(&actual, None, None).unwrap();
+    let recipe = Recipe::from_prepared(&actual, None, None, &budget()).unwrap();
     assert_same_table(&actual, &recipe.project(65_536, &ranges).unwrap());
     assert!(recipe.project(65_536, &[0..65_536]).is_none());
     assert!(recipe.project(65_536, &[0..1, 1..65_536]).is_none());
@@ -202,14 +210,18 @@ fn cuda_ffn_recipe_retains_real_mmq_workspace_and_whole_m_policy() {
                     tokens == 8 && packed
                 };
                 assert_eq!(actual.selection.mmq_hit, expected_hit);
-                let recipe = Recipe::from_prepared(&actual, None, Some(&mmq)).unwrap();
+                let recipe = Recipe::from_prepared(&actual, None, Some(&mmq), &budget()).unwrap();
                 assert_same_table(&actual, &recipe.project(tokens, &ranges).unwrap());
                 // A previously selected hit cannot recreate cost with the
                 // strict fallback or an unavailable MMQ implementation.
                 if expected_hit {
-                    assert!(Recipe::from_prepared(&actual, None, None).is_none());
+                    assert!(Recipe::from_prepared(&actual, None, None, &budget()).is_none());
                 }
             }
         }
     }
+}
+
+fn budget() -> std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget> {
+    ferrum_interfaces::vnext::DeviceObservationTemplateBudget::new(1024 * 1024).unwrap()
 }

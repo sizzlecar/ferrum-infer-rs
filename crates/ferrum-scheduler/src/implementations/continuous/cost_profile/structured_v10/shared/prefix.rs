@@ -5,9 +5,12 @@ use crate::implementations::continuous::cost_model::structured_v2::prefixes::Str
 mod wire;
 use wire::*;
 mod lifecycle;
+mod owner_blocks;
 mod profile;
 mod stages;
 pub(super) use lifecycle::{Preparation, Progress};
+pub(in super::super) use owner_blocks::PreparedCohortLedgerV8;
+pub use owner_blocks::{StructuredCohortEventV8, StructuredPreparationEventV8};
 pub use profile::{
     export_structured_profile_v12, load_structured_profile_v12, ImportedStructuredCatalogV12,
     StructuredProfileExportReceiptV12,
@@ -59,7 +62,12 @@ pub(super) fn header(
 pub(super) fn is_preparation(value: &serde_json::Value) -> bool {
     matches!(
         value["kind"].as_str(),
-        Some("preparation_offered" | "preparation_completed" | "preparation_released")
+        Some(
+            "preparation_offered"
+                | "preparation_completed"
+                | "preparation_released"
+                | "native_prefix_restored"
+        )
     )
 }
 

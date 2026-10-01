@@ -14,7 +14,8 @@ impl CalibrationSession {
         options: StructuredCalibrationOptionsV2,
     ) -> Result<()> {
         self.selected_phase_boundary()?;
-        if self.structured_capture_v2.is_some()
+        if self.prefix_source8
+            || self.structured_capture_v2.is_some()
             || self.structured_group_v2.is_some()
             || self.structured_capture.is_some()
             || self.selected_capture_identity.is_some()
@@ -173,7 +174,8 @@ impl CalibrationWaveReport {
         if self.submission != CalibrationSubmissionState::HostReconciled || self.error.is_some() {
             return Err(U::InvalidSample);
         }
-        super::super::cost_observation::structured_discovery_input_v2(
+        super::super::cost_observation::structured_capture_input_v2(
+            &self.observation_capture,
             self.host_stages.as_ref().ok_or(U::MissingEvidence)?,
         )
     }

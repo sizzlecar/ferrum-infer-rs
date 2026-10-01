@@ -26,20 +26,38 @@ struct Wave {
 }
 
 fn wave(algorithm: &'static str) -> Wave {
+    wave_with_kv(algorithm, 7)
+}
+
+fn wave_with_kv(algorithm: &'static str, kv_tokens: u32) -> Wave {
     let (_, mut hosts) = selected_shape(&[3]);
     let mut host = hosts.remove(0);
     host.state.generated_tokens_before = 0;
     host.state.maximum_output_tokens = 1;
     host.state.sampling_history_tokens = 0;
-    let mut selected = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
+    wave_with_host(algorithm, kv_tokens, host)
+}
+
+fn wave_with_host(algorithm: &'static str, kv_tokens: u32, host: HostCostFeaturesV1) -> Wave {
+    wave_with_host_rows(algorithm, kv_tokens, host, 1)
+}
+
+fn wave_with_host_rows(
+    algorithm: &'static str,
+    kv_tokens: u32,
+    host: HostCostFeaturesV1,
+    rows: u32,
+) -> Wave {
+    assert!(rows > 0);
+    let mut selected = SelectedCommandCostBuilderV1::new_with_algorithm_work(u64::from(rows));
     selected
         .kernel_with_replay_geometry(
             SelectedAlgorithmClassV1::new(algorithm, 1, [1; 32], [2; 32]).unwrap(),
             KernelNumericWorkV1 {
-                logical_units: 32,
-                padded_units: 32,
+                logical_units: 32 * u64::from(rows),
+                padded_units: 32 * u64::from(rows),
                 inner_units_per_logical_unit: 32,
-                grid: [1, 1, 1],
+                grid: [rows, 1, 1],
                 scratch_bytes: 0,
                 staged_weight_bytes: 0,
             },
@@ -62,8 +80,8 @@ fn wave(algorithm: &'static str) -> Wave {
             provider: None,
             path: CostCommandPath::Eager,
             participant_start: 0,
-            participant_count: 1,
-            token_count: 1,
+            participant_count: rows,
+            token_count: u64::from(rows),
             batching_form: "packed",
             compute_dispatch_count: 1,
             transfer_command_count: 0,
@@ -74,56 +92,64 @@ fn wave(algorithm: &'static str) -> Wave {
     builder
         .core_readback_route(CoreReadbackRoute::HostSynchronized)
         .unwrap();
-    builder
-        .row(CanonicalCostRow {
-            work: ActualRowWork::Decode { kv_tokens: 7 },
-            host_policy_signature: [6; 32],
-            mask_upload_required: false,
-            host_features: Some(host),
-            output: CostRowOutput::Decode {
-                requires_full_logits: true,
-                repetition_tokens: 0,
-                repetition_penalty_bits: 1f32.to_bits(),
-            },
-        })
-        .unwrap();
+    for _ in 0..rows {
+        builder
+            .row(CanonicalCostRow {
+                work: ActualRowWork::Decode { kv_tokens },
+                host_policy_signature: [6; 32],
+                mask_upload_required: false,
+                host_features: Some(host),
+                output: CostRowOutput::Decode {
+                    requires_full_logits: true,
+                    repetition_tokens: 0,
+                    repetition_penalty_bits: 1f32.to_bits(),
+                },
+            })
+            .unwrap();
+    }
     let built = builder
         .finish_with_captured_structure(
             ActualWaveKind::Decode,
             ActualWavePath::PlanRuntime,
             ActualWaveGraphState::Disabled,
             ActualWaveRowOrder::Ordered,
-            64,
+            64 * u64::from(rows),
         )
         .unwrap();
     let selected = built.statistical.unwrap();
     let recipe = Arc::clone(selected.structured_capture().unwrap().unwrap());
     let owner = StructuredOwnerFactsV2::from_prepared(&built.exact, &selected, &recipe).unwrap();
-    let mut actual = shape(&[ActualRowWork::Decode { kv_tokens: 7 }]);
+    let mut actual = shape(&vec![ActualRowWork::Decode { kv_tokens }; rows as usize]);
+    actual.recurrent_state_bytes = built.exact.recurrent_state_bytes;
     actual.provider_signature = built.exact.provider_signature;
     actual.output_policy_signature = built.exact.output_policy_signature;
     actual.numeric_features = built.exact.numeric_features.clone();
     actual.host_content_features = built.exact.host_content_features;
     actual.row_multiset_features = built.exact.row_multiset_features.clone();
     actual.statistical_evidence = Some(selected.clone());
-    let row = &actual.rows[0];
+    let prepared_rows = actual
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(position, row)| PreparedRowBindingV2 {
+            request_id: row.request_id.clone(),
+            owner_incarnation: row.owner_incarnation,
+            work_generation: row.work_generation,
+            frontier: PreparedRowFactsV2 {
+                physical_position: position as u32,
+                work: PreparedWorkV2::Decode { kv_tokens },
+                generated_before: host.state.generated_tokens_before,
+                maximum_output: host.state.maximum_output_tokens,
+                context_before: u64::from(kv_tokens),
+            },
+        })
+        .collect();
     let prepared = PreparedStructuredFactsV2 {
         exact: built.exact,
         selected,
         recipe,
         owner,
-        rows: vec![PreparedRowBindingV2 {
-            request_id: row.request_id.clone(),
-            owner_incarnation: row.owner_incarnation,
-            work_generation: row.work_generation,
-            frontier: PreparedRowFactsV2 {
-                physical_position: 0,
-                work: PreparedWorkV2::Decode { kv_tokens: 7 },
-                generated_before: 0,
-                maximum_output: 1,
-                context_before: 7,
-            },
-        }],
+        rows: prepared_rows,
     };
     prepared.validate().unwrap();
     Wave {
@@ -166,9 +192,76 @@ fn record_with_hook(
     terminal_reason: Option<ferrum_types::FinishReason>,
     hook: impl FnOnce(&mut EngineCostCall),
 ) -> Arc<HostStageEvidenceV1> {
+    record_with_hooks(
+        ids,
+        queue,
+        clock,
+        actual,
+        host,
+        capture,
+        extra_wall,
+        terminal_reason,
+        |_| None,
+        hook,
+    )
+}
+
+fn record_with_hooks(
+    ids: &EngineCostIds,
+    queue: &Arc<BoundedCostSampleSink>,
+    clock: &Arc<VirtualClock>,
+    actual: ActualWaveShape,
+    host: HostCostFeaturesV1,
+    capture: Option<Arc<CostCalibrationCapture>>,
+    extra_wall: u64,
+    terminal_reason: Option<ferrum_types::FinishReason>,
+    before_call: impl FnOnce(
+        u64,
+    ) -> Option<
+        crate::continuous_engine::inner::cost_observation::live_calibration::Ticket,
+    >,
+    hook: impl FnOnce(&mut EngineCostCall),
+) -> Arc<HostStageEvidenceV1> {
+    record_with_hooks_expecting(
+        ids,
+        queue,
+        clock,
+        actual,
+        host,
+        capture,
+        extra_wall,
+        terminal_reason,
+        before_call,
+        hook,
+        CostCallDisposition::Queued,
+    )
+}
+
+fn record_with_hooks_expecting(
+    ids: &EngineCostIds,
+    queue: &Arc<BoundedCostSampleSink>,
+    clock: &Arc<VirtualClock>,
+    actual: ActualWaveShape,
+    host: HostCostFeaturesV1,
+    capture: Option<Arc<CostCalibrationCapture>>,
+    extra_wall: u64,
+    terminal_reason: Option<ferrum_types::FinishReason>,
+    before_call: impl FnOnce(
+        u64,
+    ) -> Option<
+        crate::continuous_engine::inner::cost_observation::live_calibration::Ticket,
+    >,
+    hook: impl FnOnce(&mut EngineCostCall),
+    expected_disposition: CostCallDisposition,
+) -> Arc<HostStageEvidenceV1> {
     let at = clock.now_ns().unwrap() + 100;
+    clock.set(at + 1);
+    let ticket = before_call(at + 1);
     clock.set(at + 2);
     let row = &actual.rows[0];
+    let ActualRowWork::Decode { kv_tokens } = row.work else {
+        panic!("feedback fixture requires actual decode work");
+    };
     let mut call = EngineCostCall::begin(
         ids,
         clock.clone(),
@@ -193,7 +286,8 @@ fn record_with_hook(
         },
     )
     .unwrap()
-    .with_structured_capture(true);
+    .with_structured_capture(true)
+    .with_live_ticket(ticket);
     if let Some(capture) = &capture {
         call.attach_calibration_capture(capture.clone());
     }
@@ -214,8 +308,8 @@ fn record_with_hook(
         work_generation: row.work_generation,
         input_index: row.input_index,
         outcome: HostCommitOutcome::Committed(HostCommittedWork::Decode {
-            kv_tokens_before: 7,
-            kv_tokens_after: 8,
+            kv_tokens_before: kv_tokens,
+            kv_tokens_after: kv_tokens + 1,
             generated_tokens_before: 0,
             generated_tokens_after: 1,
         }),
@@ -237,10 +331,17 @@ fn record_with_hook(
     call.reject(CostCallRejection::Composite);
     clock.set(settled_at + 10);
     let stages = call.make_host_stages().unwrap();
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(expected_rejection)
-    );
+    assert_eq!(call.finish(), expected_disposition);
+    // A capture-bearing source fixture is a synchronous calibration consumer.
+    // Its acknowledgement comes from the actual FIFO resolver. Serving tests
+    // attach no capture here and retain their raw entry for runtime consumption.
+    if capture.is_some() {
+        let (_, entry, ticket) = queue.pop_numbered_with_ticket().unwrap();
+        assert!(ticket.is_none(), "manual fixture has no live membership");
+        assert!(
+            matches!(entry, CostEvidenceEntry::StagesOnly { legacy_rejection, .. } if legacy_rejection == expected_rejection)
+        );
+    }
     capture.map_or(stages, |capture| capture.host_stages().unwrap())
 }
 
@@ -312,6 +413,7 @@ impl Fixture {
                 observations_path: directory.join(format!("source-{index}.jsonl")),
                 protocol_sha256: [91; 32],
                 scope: StructuredScopeV2 {
+                    numerical_family: None,
                     owner: owner.clone(),
                     coverage: StructuredCoverageV2 {
                         pending_eligible_positions: vec![],
@@ -653,12 +755,8 @@ async fn structured_feedback_same_source_resumes_across_new_local_clock_without_
     assert_eq!(next.typical_ns, prediction.typical_ns);
     assert!(next.valid_for_ns <= prediction.valid_for_ns);
     let old = first_receipt.structured_whole_wave_v2.as_ref().unwrap();
-    let new = resumed
-        .profile_receipt()
-        .unwrap()
-        .structured_whole_wave_v2
-        .as_ref()
-        .unwrap();
+    let resumed_receipt = resumed.profile_receipt().unwrap();
+    let new = resumed_receipt.structured_whole_wave_v2.as_ref().unwrap();
     for (old, new) in old.children.iter().zip(&new.children) {
         assert_eq!(old.profile_sha256, new.profile_sha256);
         assert_eq!(old.source_sha256, new.source_sha256);
@@ -697,7 +795,13 @@ async fn structured_feedback_real_worker_rejects_missing_private_settlement_and_
     invalid.structured_evidence = None;
     runtime
         .sink
-        .offer_evidence_numbered(entry(Arc::new(invalid)))
+        // Exercise invalid private settlement in the current source generation;
+        // an old generation is intentionally ignored after model replacement.
+        .offer_evidence_bound(
+            entry(Arc::new(invalid)),
+            None,
+            runtime.sink.source_generation(),
+        )
         .unwrap();
     runtime.consume_samples();
     assert!(runtime.snapshot().is_none());
@@ -712,9 +816,9 @@ async fn structured_feedback_real_worker_rejects_missing_private_settlement_and_
     f.config.max_samples_per_update = NonZeroUsize::new(1).unwrap();
     let runtime = f.build();
     let old = runtime.snapshot().unwrap();
-    for _ in 0..2 {
+    for index in 0..2 {
         let w = wave("fixture.feedback.a");
-        record(
+        record_with_hooks_expecting(
             &runtime.ids,
             &runtime.sink,
             &f.clock,
@@ -722,8 +826,19 @@ async fn structured_feedback_real_worker_rejects_missing_private_settlement_and_
             w.host,
             None,
             30,
+            None,
+            |_| None,
+            |_| {},
+            if index == 0 {
+                CostCallDisposition::Queued
+            } else {
+                CostCallDisposition::Dropped(CostSampleDrop::Capacity)
+            },
         );
     }
+    assert_eq!(runtime.sink.stats().raw_offered, 2);
+    assert_eq!(runtime.sink.stats().raw_accepted, 1);
+    assert_eq!(runtime.sink.stats().raw_lost, 1);
     runtime.consume_samples();
     assert!(runtime.snapshot().is_none());
     assert!(old
@@ -735,8 +850,28 @@ async fn structured_feedback_real_worker_rejects_missing_private_settlement_and_
 
 // Private prospective protocol is tested on this original recorder/source3/
 // profile10 fixture; constructing diagnostic rows cannot qualify the model.
+#[path = "issued_prediction.rs"]
+mod issued_prediction;
 #[path = "prospective.rs"]
 mod prospective;
 
 #[path = "feedback/shared_source.rs"]
 mod shared_source;
+
+#[path = "feedback/publication.rs"]
+mod publication;
+
+#[path = "feedback/publication_receipt.rs"]
+mod publication_receipt;
+
+#[path = "feedback/failure_evidence.rs"]
+mod failure_evidence;
+
+#[path = "feedback/live_service.rs"]
+mod live_service;
+
+#[path = "feedback/automatic_service.rs"]
+mod automatic_service;
+
+#[path = "feedback/route_population.rs"]
+mod route_population;

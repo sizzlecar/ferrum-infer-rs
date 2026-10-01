@@ -5,9 +5,9 @@ use super::{
     VNextError,
 };
 use crate::vnext::{
-    AllocationKind, AllocationLifetime, BufferUsage, PreparedSequenceStateTransfer,
-    SequenceBackingGeneration, SequenceCheckpointBytePlan, SequenceCheckpointLayout,
-    SequenceSessionEpoch, SequenceSessionFingerprint,
+    AllocationKind, AllocationLifetime, BufferUsage, NativeCheckpointTransferGeometryBuilder,
+    PreparedSequenceStateTransfer, SequenceBackingGeneration, SequenceCheckpointBytePlan,
+    SequenceCheckpointLayout, SequenceSessionEpoch, SequenceSessionFingerprint,
 };
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,11 +170,19 @@ impl PreparedBackingInitializations {
         for resource in byte_plan.resources() {
             let view =
                 pools.view_many(guard.backing().backing_slices_for(resource.resource_id()))?;
-            if resource
-                .ranges()
-                .iter()
-                .any(|range| range.source().end > view.size_bytes())
-            {
+            for region in resource.strided_ranges() {
+                if region.source_end_bytes()?
+                    > resource.sequence_copy_bound(view.size_bytes(), view.capacity_size_bytes())
+                {
+                    return Err(invalid_resource(
+                        "restore strided copy exceeds concrete target backing",
+                    ));
+                }
+            }
+            if resource.ranges().iter().any(|range| {
+                range.source().end
+                    > resource.sequence_copy_bound(view.size_bytes(), view.capacity_size_bytes())
+            }) {
                 return Err(invalid_resource(
                     "restore state copy exceeds the concrete target backing",
                 ));
@@ -321,7 +329,7 @@ impl PreparedBackingInitializations {
             .request
             .plan
             .dynamic_pools();
-        self.encode_in_pools(pools, runtime, commands)
+        self.encode_in_pools(pools, runtime, commands, None)
     }
 
     pub(crate) fn encode_restore<R: DeviceRuntime>(
@@ -329,6 +337,16 @@ impl PreparedBackingInitializations {
         guard: &PreparedSequenceStateTransfer<R>,
         runtime: &R,
         commands: &mut DeviceCommandBatch<R::Command>,
+    ) -> Result<usize, BackingInitializationEncodeError<R::Error>> {
+        self.encode_restore_with_geometry(guard, runtime, commands, None)
+    }
+
+    pub(crate) fn encode_restore_with_geometry<R: DeviceRuntime>(
+        &self,
+        guard: &PreparedSequenceStateTransfer<R>,
+        runtime: &R,
+        commands: &mut DeviceCommandBatch<R::Command>,
+        geometry: Option<&mut NativeCheckpointTransferGeometryBuilder>,
     ) -> Result<usize, BackingInitializationEncodeError<R::Error>> {
         let target = self.restore_target.as_ref().ok_or_else(|| {
             BackingInitializationEncodeError::Contract(invalid_resource(
@@ -349,6 +367,7 @@ impl PreparedBackingInitializations {
             guard.session().resources().request.plan.dynamic_pools(),
             runtime,
             commands,
+            geometry,
         )
     }
 
@@ -357,6 +376,7 @@ impl PreparedBackingInitializations {
         pools: &DynamicPoolSet<R>,
         runtime: &R,
         commands: &mut DeviceCommandBatch<R::Command>,
+        mut geometry: Option<&mut NativeCheckpointTransferGeometryBuilder>,
     ) -> Result<usize, BackingInitializationEncodeError<R::Error>> {
         if self.phase != PreparedBackingInitializationPhase::Prepared {
             return Err(BackingInitializationEncodeError::Contract(
@@ -407,6 +427,11 @@ impl PreparedBackingInitializations {
                             participant: claim.participant,
                             error,
                         })?;
+                    if let Some(geometry) = geometry.as_deref_mut() {
+                        geometry
+                            .push_initialization(authority.resource_id(), segment.length_bytes())
+                            .map_err(BackingInitializationEncodeError::Contract)?;
+                    }
                     commands.push_initialization(command);
                     command_count = command_count.checked_add(1).ok_or_else(|| {
                         BackingInitializationEncodeError::Contract(invalid_resource(

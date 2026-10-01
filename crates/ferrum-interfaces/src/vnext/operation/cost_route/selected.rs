@@ -3,6 +3,8 @@ use super::*;
 use crate::execution_cost::{CanonicalCostError, CanonicalWaveCostBuilder, CostLogicalCommand};
 use crate::vnext::{BoundOperationProviderSet, DeviceRuntime, ExecutablePlanView};
 
+mod future;
+
 struct NodeRoute<'a> {
     identity: CostProviderIdentity<'a>,
     route: OperationCostRoute,
@@ -201,18 +203,8 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
         poll_budget: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Result<Option<SelectedEagerCostRoute<'a>>, VNextError> {
-        let nodes = resolved.execution_plan().payload().nodes();
-        if nodes.is_empty() || nodes.len() != self.len() || nodes.len() > MAX_COST_COMMANDS {
-            return Err(invalid_operation(
-                "cost route requires a bounded complete selected plan",
-            ));
-        }
-        // Check all bindings before invoking any provider. A partial plan or
-        // a reordered provider list must not be silently reindexed.
-        for (provider, node) in self.providers().iter().zip(nodes) {
-            poll_budget()?;
-            provider.validate_binding(resolved, node.id())?;
-        }
+        poll_budget()?;
+        let nodes = self.prepared_cost_nodes(resolved)?;
         let mut result = Vec::new();
         result.try_reserve_exact(nodes.len()).map_err(|_| {
             invalid_operation("selected cost route allocation capacity unavailable")
@@ -220,8 +212,15 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         let mut physical_slots = 0_usize;
         for (provider, node) in self.providers().iter().zip(nodes) {
             poll_budget()?;
-            let route = match provider.eager_cost_route_with_ranges(resolved, rows, physical_ranges)
-            {
+            let request = OperationCostRouteRequest::new(
+                node,
+                resolved.execution_plan().payload().memory(),
+                rows,
+                provider.dispatch(),
+                provider.cost_data(),
+            )
+            .with_physical_ranges(physical_ranges);
+            let route = match provider.query_eager_cost_route(request) {
                 Ok(route) => route,
                 Err(error) => {
                     tracing::trace!(
@@ -608,17 +607,18 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         poll: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Result<bool, VNextError> {
         let plan = resolved.execution_plan();
-        let nodes = plan.payload().nodes();
-        if nodes.len() != self.len() || nodes.is_empty() || nodes.len() > MAX_COST_COMMANDS {
-            return Err(invalid_operation(
-                "future eager boundary requires the complete provider plan",
-            ));
-        }
+        poll()?;
+        let nodes = self.prepared_cost_nodes(resolved)?;
         for (provider, node) in self.providers().iter().zip(nodes) {
             poll()?;
-            provider.validate_binding(resolved, node.id())?;
-            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)
-                .with_physical_ranges(physical_ranges);
+            let request = OperationCostRouteRequest::new(
+                node,
+                plan.payload().memory(),
+                rows,
+                provider.dispatch(),
+                provider.cost_data(),
+            )
+            .with_physical_ranges(physical_ranges);
             let selected = provider
                 .provider()
                 .reusable_execution_cost_topology(request)?;
@@ -646,11 +646,9 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         use crate::vnext::*;
         let tokens = rows.immediate_tokens();
         let plan = resolved.execution_plan();
-        let nodes = plan.payload().nodes();
-        if nodes.len() != self.len()
-            || nodes.is_empty()
-            || nodes.len() > MAX_COST_COMMANDS
-            || slot.lane_id() != lane
+        poll()?;
+        let nodes = self.prepared_cost_nodes(resolved)?;
+        if slot.lane_id() != lane
             || slot.reusable_execution_bucket_id() != layout.reusable_execution_bucket_id()
             || slot.lifetime() != AllocationLifetime::Invocation
         {
@@ -662,9 +660,14 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         let mut eager = Vec::new();
         for (index, (provider, node)) in self.providers().iter().zip(nodes).enumerate() {
             poll()?;
-            provider.validate_binding(resolved, node.id())?;
-            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)
-                .with_physical_ranges(physical_ranges);
+            let request = OperationCostRouteRequest::new(
+                node,
+                plan.payload().memory(),
+                rows,
+                provider.dispatch(),
+                provider.cost_data(),
+            )
+            .with_physical_ranges(physical_ranges);
             let topology = match provider
                 .provider()
                 .reusable_execution_cost_topology(request)
@@ -695,14 +698,7 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
                         .map_err(|_| invalid_operation("topology node overflow"))?,
                 );
             }
-            digest.append(
-                index,
-                index,
-                node.id(),
-                provider.descriptor().provider_id(),
-                node.provider_execution_semantics().replay_equivalence(),
-                &topology,
-            )?;
+            digest.append_prepared(self.prepared_topology_node(index), &topology)?;
         }
         let id = DeviceReusableExecutionProgramId::new(
             plan.plan_hash().clone(),

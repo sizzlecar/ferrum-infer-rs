@@ -1,7 +1,5 @@
 use super::*;
-use ferrum_interfaces::execution_cost::{
-    SelectedAlgorithmClassV1, SelectedCommandCostBuilderV1, StatisticalTransferKindV1,
-};
+use ferrum_interfaces::execution_cost::StatisticalTransferKindV1;
 use half::f16;
 
 fn bytes(region: &MetalBufferRegion) -> Vec<u8> {
@@ -41,16 +39,18 @@ fn check_linear_native_statistics_match_future_and_bad_extension_preserves_exact
         let input = bytes(&regions[0]);
         let weight = bytes(&regions[1]);
         if invalid {
-            let mut wrong = SelectedCommandCostBuilderV1::new(8);
-            wrong
-                .transfer(
-                    SelectedAlgorithmClassV1::new("fixture.invalid.transfer", 1, [1; 32], [2; 32])
-                        .unwrap(),
-                    StatisticalTransferKindV1::Fill,
-                    4,
-                )
-                .unwrap();
-            command = command.with_statistical_evidence(Some(wrong.finish().unwrap()));
+            command = command.with_observation(
+                (Some(Arc::new(observation::CoreTransfer {
+                    kind: StatisticalTransferKindV1::Fill,
+                    bytes: 4,
+                    capture,
+                })))
+                .and_then(|template| {
+                    (runtime.observation_template_budget().as_ref())?
+                        .retain(template)
+                        .ok()
+                }),
+            );
         }
         let fence = runtime
             .submit_commands_with_attribution(
@@ -67,6 +67,20 @@ fn check_linear_native_statistics_match_future_and_bad_extension_preserves_exact
             .terminal()
             .is_succeeded());
         let attribution = runtime.submission_attribution(&fence).unwrap();
+        assert!(
+            attribution
+                .commands()
+                .iter()
+                .all(|v| v.statistical_evidence().is_none()),
+            "raw getters must not project"
+        );
+        let resolved = attribution.clone().resolve_observation();
+        if invalid {
+            assert!(resolved.is_err());
+        } else {
+            assert!(resolved.is_ok());
+        }
+        let attribution = resolved.as_ref().unwrap_or(&attribution);
         assert_eq!(attribution.commands().len(), 1);
         let actual = &attribution.commands()[0];
         assert_eq!(
@@ -176,7 +190,11 @@ fn check_core_transfer_statistics_match_proven_spans_and_rebound_scratch_work(
         .unwrap()
         .terminal()
         .is_succeeded());
-    let attribution = runtime.submission_attribution(&fence).unwrap();
+    let attribution = runtime
+        .submission_attribution(&fence)
+        .unwrap()
+        .resolve_observation()
+        .unwrap();
     assert_eq!(attribution.commands().len(), 3);
     for (actual, expected) in attribution.commands().iter().zip(&expected) {
         assert_eq!(actual.statistical_evidence(), Some(expected));
@@ -227,7 +245,11 @@ fn check_primitive_native_statistics_match_selected_psos_and_preserve_guarded_ou
             .unwrap()
             .terminal()
             .is_succeeded());
-        let attribution = runtime.submission_attribution(&fence).unwrap();
+        let attribution = runtime
+            .submission_attribution(&fence)
+            .unwrap()
+            .resolve_observation()
+            .unwrap();
         let [actual] = attribution.commands() else {
             panic!("one actual physical primitive command")
         };

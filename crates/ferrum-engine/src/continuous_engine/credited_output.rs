@@ -64,6 +64,20 @@ impl ContinuousBatchEngine {
         context: ferrum_interfaces::InferenceRequestContext,
         contract: Arc<OutputProjectionContract>,
     ) -> Result<CreditedOutputSession> {
+        if self
+            .inner
+            .config
+            .scheduler
+            .slo
+            .experiment_stage
+            .is_some_and(|stage| {
+                stage.output_transport() != ferrum_types::SloOutputTransport::Credited
+            })
+        {
+            return Err(FerrumError::config(
+                "this SLO experiment stage requires the legacy output entrypoint",
+            ));
+        }
         if self.inner.shutdown_started.load(Ordering::Acquire) {
             return Err(FerrumError::cancelled("inference engine is shutting down"));
         }
@@ -120,8 +134,25 @@ impl ContinuousBatchEngine {
             "derived credited output capacity before admission"
         );
         let decoder = CreditedDecodePolicy::from_plan(&plan);
-        let budget = RequestOutputBudget::open(self.inner.output_credit_pool()?, limits, plan)
-            .map_err(|error| FerrumError::resource_exhausted(error.to_string()))?;
+        let pool = self.inner.output_credit_pool()?;
+        let required_wire_bytes = plan.lifetime_wire_bytes();
+        let required_projection_bytes = plan.retained_projection_bytes();
+        let required_terminal = plan.terminal_credit();
+        let budget = RequestOutputBudget::open(pool, limits, plan).map_err(|error| {
+            let capacity = pool.snapshot();
+            tracing::warn!(
+                request_id = %request.id,
+                %error,
+                ?capacity,
+                required_wire_bytes,
+                required_projection_bytes,
+                ?required_terminal,
+                "Credited output admission could not reserve its declared capacity"
+            );
+            #[cfg(test)]
+            eprintln!("output admission error={error:?} capacity={capacity:?} required_wire_bytes={required_wire_bytes} required_projection_bytes={required_projection_bytes} required_terminal={required_terminal:?}");
+            FerrumError::resource_exhausted(error.to_string())
+        })?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
             serde_json::Value::from(input_tokens.len() as u64),
@@ -145,6 +176,7 @@ impl ContinuousBatchEngine {
             OutputFlowRuntimeOptions::from_config(&self.inner.config.scheduler.slo.output),
         );
         sequence.slo = slo;
+        sequence.admission_observation_ingress = Some(context.ingress());
         sequence.credited_output = Some(CreditedSequenceOutput {
             port,
             decoder,
@@ -156,6 +188,7 @@ impl ContinuousBatchEngine {
         });
         sequence.request_slot = Some(RequestSlotLease::open(&self.inner, request_id.clone()));
         self.inner.initialize_sequence_cost(&mut sequence);
+        let acceptance;
         {
             let _iteration = self.inner.iteration_lock.lock().await;
             if self.inner.shutdown_started.load(Ordering::Acquire) {
@@ -164,6 +197,24 @@ impl ContinuousBatchEngine {
                 }
                 return Err(FerrumError::cancelled("inference engine is shutting down"));
             }
+            if let Err(error) = self.inner.check_strict_waiting_capacity(&sequence) {
+                if let Some(slot) = sequence.request_slot.take() {
+                    slot.reject(&self.inner, error.to_string());
+                }
+                return Err(error);
+            }
+            if self.inner.requires_strict_acceptance() {
+                self.inner.initialize_sequence_time_admission(&mut sequence);
+            }
+            acceptance = match self.inner.install_strict_acceptance(&mut sequence) {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    if let Some(slot) = sequence.request_slot.take() {
+                        slot.reject(&self.inner, error.to_string());
+                    }
+                    return Err(error);
+                }
+            };
             {
                 let mut sequences = self.inner.sequences.write();
                 if sequences.contains_key(&request_id) {
@@ -195,14 +246,21 @@ impl ContinuousBatchEngine {
                 .expect("submitted sequence remains published");
             self.inner.initialize_sequence_prefill_reference(sequence);
             self.inner.initialize_sequence_time_admission(sequence);
-            sequence
-                .request_slot
-                .as_mut()
-                .expect("submitted request retains its slot")
-                .admit(&self.inner);
+            if acceptance.is_none() {
+                sequence
+                    .request_slot
+                    .as_mut()
+                    .expect("submitted request retains its slot")
+                    .admit(&self.inner);
+            }
         }
         self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
+        if let Some(receiver) = acceptance {
+            receiver.await.map_err(|_| {
+                FerrumError::cancelled("strict admission owner closed before a decision")
+            })??;
+        }
         Ok(session)
     }
 }

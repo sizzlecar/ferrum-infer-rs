@@ -2,6 +2,63 @@ use super::*;
 use crate::execution_cost::*;
 
 #[test]
+fn future_program_binding_prepared_metadata_requires_layout_and_live_budget() {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("test.prepared-binding-metadata").unwrap(),
+        ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+    )
+    .unwrap();
+    let id = bucket.bucket_id();
+    assert_eq!(
+        program_binding_nodes(0, 0, None, None, &mut || true),
+        Ok(&[][..])
+    );
+    assert_eq!(
+        program_binding_nodes(1, 1, None, None, &mut || true),
+        Ok(&[][..]),
+        "no selected reusable bucket has no program-binding handle"
+    );
+    assert_eq!(
+        program_binding_nodes(1, 0, Some(id), None, &mut || true),
+        Ok(&[][..])
+    );
+    assert_eq!(
+        program_binding_nodes(1, 1, Some(id), None, &mut || true),
+        Err(U::CoreLayout),
+        "prepared plan metadata cannot supply a missing physical layout"
+    );
+    assert_eq!(
+        program_binding_nodes(0, 0, None, None, &mut || false),
+        Err(U::BudgetExhausted),
+        "even an empty immutable index cannot bypass an expired budget"
+    );
+}
+
+#[test]
+fn future_program_binding_prepared_metadata_counts_unbound_nodes_towards_capacity() {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("test.prepared-binding-capacity").unwrap(),
+        ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+    )
+    .unwrap();
+    let id = bucket.bucket_id();
+    assert_eq!(
+        program_binding_nodes(MAX_COST_COMMANDS, 0, Some(id), None, &mut || true),
+        Ok(&[][..])
+    );
+    assert_eq!(
+        program_binding_nodes(MAX_COST_COMMANDS + 1, 0, Some(id), None, &mut || true),
+        Err(U::Capacity),
+        "an empty binding index cannot hide an oversized plan of unbound nodes"
+    );
+    assert_eq!(
+        program_binding_nodes(MAX_COST_COMMANDS + 1, 1, Some(id), None, &mut || true),
+        Err(U::Capacity),
+        "capacity is checked before layout presence, as on the original path"
+    );
+}
+
+#[test]
 fn graph_capable_runtime_requires_actual_unconfigured_empty_stream() {
     let state = |configuration| DeviceCostGraphStreamState::new(configuration, 0, 0, 0).unwrap();
     let empty = state(DeviceCostGraphConfiguration::Unconfigured);
@@ -31,6 +88,39 @@ fn graph_capable_runtime_requires_actual_unconfigured_empty_stream() {
             Some(state(configured))
         ));
     }
+}
+
+#[test]
+fn readiness_resident_program_requires_explicit_on_demand_and_replay() {
+    use DeviceCostGraphCaptureCapability as C;
+    use DeviceCostGraphConfiguration as G;
+    let state =
+        |configuration| Some(DeviceCostGraphStreamState::new(configuration, 0, 0, 0).unwrap());
+    assert_eq!(
+        missing_resident_program(C::Supported, state(G::OnDemand), true),
+        U::OnDemandResidentProgram
+    );
+    for capability in [C::Unknown, C::Unsupported] {
+        assert_eq!(
+            missing_resident_program(capability, state(G::OnDemand), true),
+            U::ExecutionPolicy
+        );
+    }
+    for stream in [
+        None,
+        state(G::Unconfigured),
+        state(G::StartupPreparing),
+        state(G::StartupReady),
+    ] {
+        assert_eq!(
+            missing_resident_program(C::Supported, stream, true),
+            U::ExecutionPolicy
+        );
+    }
+    assert_eq!(
+        missing_resident_program(C::Supported, state(G::OnDemand), false),
+        U::ExecutionPolicy
+    );
 }
 
 fn cuda_like() -> DeviceCoreCostCapabilities {

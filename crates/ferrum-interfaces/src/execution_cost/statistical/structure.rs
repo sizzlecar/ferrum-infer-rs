@@ -354,7 +354,7 @@ impl StructuredHostAccumulator {
         }
         let host = row
             .host_features
-            .filter(HostCostFeaturesV1::supports_empirical_plain_text_content)
+            .filter(HostCostFeaturesV1::supports_installed_plain_text_content)
             .ok_or(StatisticalEvidenceUnknown::MissingHostDomain)?;
         let numeric = project_host_cost_features(host, row.work, row.output)
             .map_err(|_| StatisticalEvidenceUnknown::MissingHostDomain)?;

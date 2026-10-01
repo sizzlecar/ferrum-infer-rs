@@ -27,10 +27,58 @@ pub(super) fn validate<'a>(
     binding: [u8; 32],
 ) -> Result<(u64, u64), CostProfileError> {
     let h = h.into();
+    validate_parts(
+        h.fingerprint,
+        h.opening.monotonic_ns,
+        h.opened_at_ns,
+        p,
+        s,
+        independent,
+        binding,
+        false,
+    )
+}
+/// Separate source6 natural-terminal population. Old sources call `validate`
+/// above and retain their original Length-only terminal eligibility.
+pub(super) fn validate_service_actual(
+    fingerprint: &ProfileFingerprint,
+    opening_ns: u64,
+    opened_at_ns: u64,
+    p: &Prepared,
+    s: &Stages,
+    independent: Option<&IndependentAttentionWaveEvidenceWireV2>,
+    binding: [u8; 32],
+) -> Result<(u64, u64), CostProfileError> {
+    if !matches!(s.structured_evidence, Some(Ok(_))) {
+        return Err(invalid(
+            "service wave lacks complete original structured settlement",
+        ));
+    }
+    validate_parts(
+        fingerprint,
+        opening_ns,
+        opened_at_ns,
+        p,
+        s,
+        independent,
+        binding,
+        true,
+    )
+}
+fn validate_parts(
+    fingerprint: &ProfileFingerprint,
+    opening_ns: u64,
+    opened_at_ns: u64,
+    p: &Prepared,
+    s: &Stages,
+    independent: Option<&IndependentAttentionWaveEvidenceWireV2>,
+    binding: [u8; 32],
+    natural_terminal: bool,
+) -> Result<(u64, u64), CostProfileError> {
     let fail = || invalid("original V2 host settlement differs from Prepared or terminal protocol");
     if s.schema_version != 1
         || s.call_id == 0
-        || s.fingerprint.as_ref() != Some(h.fingerprint)
+        || s.fingerprint.as_ref() != Some(fingerprint)
         || s.completeness != "complete_single_wave"
         || s.rows.len() != p.rows.len()
         || s.actual_shape.as_ref() != Some(&p.exact)
@@ -43,10 +91,7 @@ pub(super) fn validate<'a>(
     let prepare = s.prepare_started_at_ns.ok_or_else(fail)?;
     let returned = s.executor_returned_at_ns.ok_or_else(fail)?;
     let finalized = s.finalized_at_ns.ok_or_else(fail)?;
-    if prepare < h.opening.monotonic_ns
-        || prepare < h.opened_at_ns
-        || returned < prepare
-        || finalized < returned
+    if prepare < opening_ns || prepare < opened_at_ns || returned < prepare || finalized < returned
     {
         return Err(fail());
     }
@@ -107,7 +152,28 @@ pub(super) fn validate<'a>(
                 {
                     return Err(fail());
                 }
-                terminal(t)?;
+                if natural_terminal {
+                    terminal_service(t)?;
+                } else {
+                    terminal(t)?;
+                }
+            }
+            (Expectation::TokenMayTerminate, Some(t)) if natural_terminal => {
+                if !matches!(
+                    t.finish_reason,
+                    ferrum_types::FinishReason::EOS | ferrum_types::FinishReason::Stop
+                ) || t.generated_tokens
+                    != before
+                        .frontier
+                        .generated_before
+                        .checked_add(1)
+                        .ok_or_else(fail)?
+                    || t.generated_tokens >= before.frontier.maximum_output
+                    || row.completion_started_at_ns.is_none()
+                {
+                    return Err(fail());
+                }
+                terminal_service(t)?;
             }
             _ => return Err(fail()),
         }
@@ -136,8 +202,18 @@ pub(super) fn validate<'a>(
     Ok((wall, finalized))
 }
 pub(super) fn terminal(t: &Terminal) -> Result<(), CostProfileError> {
-    if t.finish_reason != ferrum_types::FinishReason::Length
-        || t.generated_tokens == 0
+    if t.finish_reason != ferrum_types::FinishReason::Length {
+        return Err(invalid("ineligible original terminal receipt"));
+    }
+    terminal_service(t)
+}
+pub(super) fn terminal_service(t: &Terminal) -> Result<(), CostProfileError> {
+    if !matches!(
+        t.finish_reason,
+        ferrum_types::FinishReason::Length
+            | ferrum_types::FinishReason::EOS
+            | ferrum_types::FinishReason::Stop
+    ) || t.generated_tokens == 0
         || t.output_failed
         || t.physical_failed
         || t.scheduler_failed

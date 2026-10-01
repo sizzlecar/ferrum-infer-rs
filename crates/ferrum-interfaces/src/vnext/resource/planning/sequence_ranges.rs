@@ -1,6 +1,8 @@
 //! Numeric sequence windows, copied under the same session/backing/pool bracket.
 //! These segments own no lease or buffer. Future growth uses the actual allocator
 //! projection; participant identity alone never implies physical disjointness.
+//! Windows retain committed physical capacity, including pitched prefix slots.
+//! Semantic demands and initialized copy regions remain independently checked.
 use super::*;
 
 pub(super) type SequenceRanges = Vec<Arc<BTreeMap<ResourceId, Arc<Vec<BackingSegment>>>>>;
@@ -16,12 +18,6 @@ pub(super) fn capture(
     for slice in slices {
         poll(budget)?;
         let evidence = slice.evidence();
-        if !matches!(
-            evidence.storage_profile().view(),
-            DynamicStorageView::PagedRegions { .. }
-        ) {
-            continue;
-        }
         let lease = &slice.segment_lease;
         if lease.released
             || lease.owner_instance_id != evidence.pool_instance_id()
@@ -31,15 +27,16 @@ pub(super) fn capture(
         {
             return Err(U::StaleIdentity);
         }
-        let matches = super::super::backing_extent::backing_segment_range_matches_with_poll(
-            &lease.segments,
-            evidence.physical_offset_bytes(),
-            evidence.capacity_size_bytes(),
-            evidence.segments(),
-            || budget.has_budget(),
-        )
-        .map_err(|_| U::InvalidDemand)?
-        .ok_or(U::BudgetExhausted)?;
+        let matches = lease
+            .segments
+            .range_matches_with_poll(
+                evidence.physical_offset_bytes(),
+                evidence.capacity_size_bytes(),
+                evidence.segments(),
+                || budget.has_budget(),
+            )
+            .map_err(|_| U::InvalidDemand)?
+            .ok_or(U::BudgetExhausted)?;
         if !matches {
             return Err(U::InvalidDemand);
         }
@@ -48,7 +45,7 @@ pub(super) fn capture(
             evidence.resource_id(),
             evidence.segments(),
             0,
-            evidence.size_bytes(),
+            evidence.capacity_size_bytes(),
             maximum,
             visited,
             budget,
@@ -113,6 +110,16 @@ pub(super) fn extend(
     budget: &mut dyn ResourcePlanningBudget,
 ) -> Result<(), ResourcePlanningUnknown> {
     use ResourcePlanningUnknown as U;
+    // An empty extension changes no range. In particular, do not detach the
+    // captured Arc and copy every resource merely because tokens advanced.
+    // Allocation/request disagreement remains invalid, including this case.
+    if requests.is_empty() {
+        return if allocated.is_empty() {
+            Ok(())
+        } else {
+            Err(U::InvalidDemand)
+        };
+    }
     let mut ordered: Vec<_> = requests.iter().collect();
     ordered.sort_by(|a, b| {
         a.domain
@@ -143,7 +150,7 @@ pub(super) fn extend(
                 projection.descriptor.base_resource_id(),
                 segments,
                 projection.physical_offset_bytes,
-                projection.logical_size_bytes,
+                projection.capacity_size_bytes,
                 maximum,
                 &mut count,
                 budget,
@@ -188,6 +195,37 @@ mod tests {
         )
         .unwrap()
     }
+
+    #[test]
+    fn sequence_empty_extension_preserves_shared_inventory_and_rejects_phantom_allocation() {
+        let original = Arc::new(BTreeMap::from([(
+            resource(),
+            Arc::new(vec![segment(0, 64), segment(128, 64)]),
+        )]));
+        let mut branch = Arc::clone(&original);
+        extend(&mut branch, &[], &[], 8, &mut || true).unwrap();
+        assert!(Arc::ptr_eq(&branch, &original));
+        assert_eq!(
+            branch.get(&resource()).unwrap().as_ref(),
+            &vec![segment(0, 64), segment(128, 64)]
+        );
+        assert_eq!(
+            extend(
+                &mut branch,
+                &[],
+                &[(0, vec![segment(256, 64)])],
+                8,
+                &mut || true
+            ),
+            Err(ResourcePlanningUnknown::InvalidDemand)
+        );
+        assert!(Arc::ptr_eq(&branch, &original));
+        assert_eq!(
+            check_bound(&vec![original, branch], 3),
+            Err(ResourcePlanningUnknown::LimitExceeded)
+        );
+    }
+
     #[test]
     fn sequence_numeric_windows_keep_logical_order_offsets_and_growth() {
         let mut map = BTreeMap::new();

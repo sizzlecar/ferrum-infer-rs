@@ -71,6 +71,8 @@ pub(super) struct Settings {
     pub max_wave_ns: u64,
     pub max_age_ns: u64,
     pub margin_ns: u64,
+    #[serde(default, skip_serializing_if = "StructuredLearnedDriftV2::is_disabled")]
+    pub learned_drift: StructuredLearnedDriftV2,
 }
 impl Settings {
     pub fn native(&self) -> StructuredSettingsV2 {
@@ -83,6 +85,7 @@ impl Settings {
             max_wave_ns: self.max_wave_ns,
             max_sample_age_ns: self.max_age_ns,
             static_margin_ns: self.margin_ns,
+            learned_drift: self.learned_drift,
         }
     }
 }

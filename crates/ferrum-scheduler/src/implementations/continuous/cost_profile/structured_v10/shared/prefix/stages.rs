@@ -2,7 +2,8 @@
 use super::*;
 
 pub(super) fn validate(
-    common: &CommonDeclarationV4,
+    fingerprint: &ProfileFingerprint,
+    source_opened_at_ns: u64,
     offered: &[Offered],
     s: &Stages,
     earliest: u64,
@@ -10,7 +11,7 @@ pub(super) fn validate(
     let fail = || invalid("incomplete original source5 preparation settlement");
     if s.schema_version != 1
         || s.call_id == 0
-        || s.fingerprint.as_ref() != Some(&common.fingerprint)
+        || s.fingerprint.as_ref() != Some(fingerprint)
         || s.completeness != "complete_single_wave"
         || s.rows.len() != offered.len()
         || s.rows.is_empty()
@@ -33,7 +34,7 @@ pub(super) fn validate(
     let returned = s.executor_returned_at_ns.ok_or_else(fail)?;
     let finalized = s.finalized_at_ns.ok_or_else(fail)?;
     if prepare < earliest
-        || prepare < common.opening.monotonic_ns
+        || prepare < source_opened_at_ns
         || returned < prepare
         || finalized < returned
     {

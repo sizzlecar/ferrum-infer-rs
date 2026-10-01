@@ -64,6 +64,9 @@ impl EngineInner {
             let Some(state) = &sequence.time_admission else {
                 continue;
             };
+            if state.before_acceptance() {
+                continue;
+            }
             let Some(frontier) = sequence.cost_frontier else {
                 return Err(unavailable("recovery_frontier_unknown"));
             };

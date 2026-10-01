@@ -2,11 +2,14 @@
 //! The controlled device is a CPU protocol fixture, never numerical evidence.
 use super::*;
 use crate::continuous_engine::inner::cost_observation::EngineCostRuntime;
-use crate::continuous_engine::inner::slo_controller::tests::fixture::fixture_with_custom_config;
+use crate::continuous_engine::inner::slo_controller::tests::fixture::{
+    fixture_with_checkpoint_config, fixture_with_custom_config,
+};
 use ferrum_interfaces::{output_flow::OutputCompletion, Tokenizer};
 use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use ferrum_types::{SamplingParams, TokenId};
 mod source5;
+mod source8;
 
 async fn prepared_session() -> (CalibrationSession, Arc<ControlledExecutor>) {
     prepared_session_with_width(1).await
@@ -15,12 +18,61 @@ async fn prepared_session() -> (CalibrationSession, Arc<ControlledExecutor>) {
 async fn prepared_session_with_width(
     width: usize,
 ) -> (CalibrationSession, Arc<ControlledExecutor>) {
-    let (mut engine, _, executor) = fixture_with_custom_config(width, |config| {
+    let (engine, executor) = prepared_engine_with_width(width).await;
+    (
+        CalibrationSession::from_fresh_engine(
+            engine,
+            CalibrationLimits::new(NonZeroUsize::new(width).unwrap()).unwrap(),
+        )
+        .unwrap(),
+        executor,
+    )
+}
+
+async fn prepared_engine_with_width(
+    width: usize,
+) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
+    prepared_engine_with_state(width, None).await
+}
+
+async fn prepared_checkpoint_engine_with_width(
+    width: usize,
+    maximum_scheduled_tokens_per_wave: NonZeroU64,
+) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
+    prepared_engine_with_state(width, Some(maximum_scheduled_tokens_per_wave)).await
+}
+
+async fn prepared_engine_with_state(
+    width: usize,
+    checkpoint_tokens: Option<NonZeroU64>,
+) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
+    prepared_engine_with_state_and_prefix_policy(width, checkpoint_tokens, false).await
+}
+
+async fn prepared_engine_with_state_and_prefix_policy(
+    width: usize,
+    checkpoint_tokens: Option<NonZeroU64>,
+    prefix_enabled: bool,
+) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
+    let configure = |config: &mut ferrum_types::EngineConfig| {
+        config.runtime.prefix_state_cache_enabled = prefix_enabled;
+        if checkpoint_tokens.is_some() {
+            // This opt-in gate exercises every real prompt span. Resolve the
+            // per-row work policy before constructing the actual scheduler;
+            // its immutable runtime then restricts every witnessed wave.
+            config.scheduler.prefill_step_chunk = Some(1);
+            config.runtime.chunked_prefill_size = Some(1);
+            config.batching.prefill_decode_execution =
+                ferrum_types::PrefillDecodeExecution::default();
+        }
         let cost = &mut config.scheduler.slo.cost_observation;
         cost.predictor = ferrum_types::SloCostPredictor::StructuredWholeWaveV2;
         cost.structured_capture = ferrum_types::SloStructuredCostCapture::HostSettledV1;
-    })
-    .await;
+    };
+    let (mut engine, _, executor) = match checkpoint_tokens {
+        Some(tokens) => fixture_with_checkpoint_config(width, tokens, configure).await,
+        None => fixture_with_custom_config(width, configure).await,
+    };
     // ByteLevel's real byte alphabet: Ã maps to C3, © maps to A9.
     let vocab = (0..64)
         .map(|id| {
@@ -64,14 +116,7 @@ async fn prepared_session_with_width(
     executor
         .completion_work_known
         .store(true, Ordering::Release);
-    (
-        CalibrationSession::from_fresh_engine(
-            engine,
-            CalibrationLimits::new(NonZeroUsize::new(width).unwrap()).unwrap(),
-        )
-        .unwrap(),
-        executor,
-    )
+    (engine, executor)
 }
 
 fn request(session: &CalibrationSession, maximum: usize) -> ferrum_types::InferenceRequest {

@@ -1,8 +1,22 @@
 //! Expiry after planning must not repeatedly consume the completion budget.
 use super::*;
+use ferrum_interfaces::engine::InferenceEngine;
 
 #[tokio::test(start_paused = true)]
 async fn expired_publication_idle_reserves_a_fresh_completion_turn() {
+    expired_publication_recovers_accepted_owner(
+        ferrum_types::SloTimeAdmissionPolicy::CompleteRequests,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_require_slo_preparation_preserves_accepted_completion() {
+    expired_publication_recovers_accepted_owner(ferrum_types::SloTimeAdmissionPolicy::RequireSlo)
+        .await;
+}
+
+async fn expired_publication_recovers_accepted_owner(policy: ferrum_types::SloTimeAdmissionPolicy) {
     let (mut engine, scheduler, executor) = fixture().await;
     Arc::get_mut(&mut engine.inner)
         .unwrap()
@@ -14,6 +28,20 @@ async fn expired_publication_idle_reserves_a_fresh_completion_turn() {
         installed(&engine, &scheduler, &executor, Duration::from_secs(1)).await;
     drop(prepared);
     engine.inner.drain_slo_execution().await.unwrap();
+    // Acceptance is an owner lifecycle fact, independent of the policy used
+    // by subsequent scheduling turns. Keep the actual accepted stream alive.
+    Arc::get_mut(&mut engine.inner)
+        .unwrap()
+        .config
+        .scheduler
+        .slo
+        .admission
+        .time_policy = policy;
+    assert!(!engine.inner.sequences.read()[&id]
+        .time_admission
+        .as_ref()
+        .unwrap()
+        .before_acceptance());
     ready(&engine, &id).await;
     let hint = ferrum_interfaces::BatchHint::simple(1);
     let budget = ControllerBudget::new(slo_clock_now(), Duration::from_millis(1)).unwrap();
@@ -141,12 +169,35 @@ async fn expired_failed_preparation_preserves_the_error() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn expired_require_slo_preparation_keeps_its_admission_policy() {
-    let (mut engine, _, _) = fixture().await;
+async fn expired_require_slo_preparation_keeps_pending_owner_waiting_and_fenced() {
+    let (mut engine, scheduler, executor) = fixture().await;
     let inner = Arc::get_mut(&mut engine.inner).unwrap();
     inner.config.scheduler.slo.mode = ferrum_types::SloMode::Enforce;
     inner.config.scheduler.slo.admission.time_policy =
         ferrum_types::SloTimeAdmissionPolicy::RequireSlo;
+    inner.config.scheduler.slo.admission.max_wait_ms = NonZeroU64::new(30_000).unwrap();
+    let mut request =
+        ferrum_types::InferenceRequest::new("test", engine.inner.config.model.model_id.clone());
+    request.stream = true;
+    request.sampling_params.max_tokens = 2;
+    request.sampling_params.temperature = 0.0;
+    request.sampling_params.repetition_penalty = 1.0;
+    let id = request.id.clone();
+    let ingress = slo_clock_now();
+    let mut submitted = Box::pin(engine.infer_credited_stream(
+        request,
+        InferenceRequestContext::from_ingress(ingress),
+        Arc::new(OutputProjectionContract::cli_text()),
+    ));
+    assert!(submitted.as_mut().now_or_never().is_none());
+    ready(&engine, &id).await;
+    prefill::admit(&engine, 1).await;
+    let captured = prefill::captured(&engine, &executor).await;
+    assert_eq!(captured.before_acceptance_candidate, Some(id.clone()));
+    assert_eq!(captured.fences.len(), 1);
+    assert_eq!(captured.fences[0].key.request_id, id);
+    let queue_phase = scheduler.trace_phase(&id);
+    assert!(queue_phase.is_some());
     let budget = ControllerBudget::new(slo_clock_now(), Duration::from_millis(1)).unwrap();
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(matches!(
@@ -157,5 +208,83 @@ async fn expired_require_slo_preparation_keeps_its_admission_policy() {
         SloIterationPlan::Idle
     ));
     assert!(engine.inner.controller_retry_pending());
+    // An intent to try completion does not authorize this pending owner.
+    assert!(matches!(
+        engine.inner.slo_controller.lock().completion_next,
+        Some(CompletionOnlyReason::SearchInconclusive)
+    ));
+    let backoff = Duration::from_millis(
+        engine
+            .inner
+            .config
+            .scheduler
+            .slo
+            .planner
+            .retry_backoff_ms
+            .get(),
+    );
+    let mut retry = Box::pin(engine.inner.wait_for_slo_controller_retry());
+    assert!(retry.as_mut().now_or_never().is_none());
+    tokio::time::advance(backoff + Duration::from_millis(1)).await;
+    assert!(retry.as_mut().now_or_never().is_some());
+    drop(retry);
+    assert!(matches!(
+        engine
+            .inner
+            .prepare_slo_controller(&ferrum_interfaces::BatchHint::simple(1))
+            .unwrap(),
+        SloIterationPlan::Idle
+    ));
     assert!(engine.inner.slo_controller.lock().completion_next.is_none());
+    assert_eq!(
+        engine
+            .inner
+            .slo_controller
+            .lock()
+            .last_observation
+            .unwrap()
+            .reason,
+        "no_accepted_work"
+    );
+    assert!(engine.inner.controller_frontiers_match(&captured));
+    assert_eq!(scheduler.trace_phase(&id), queue_phase);
+    {
+        let sequences = engine.inner.sequences.read();
+        let sequence = &sequences[&id];
+        assert!(sequence
+            .time_admission
+            .as_ref()
+            .unwrap()
+            .before_acceptance());
+        assert_eq!(sequence.slo.as_ref().unwrap().ingress(), ingress);
+        assert_eq!(sequence.prefill_tokens_processed, 0);
+        assert!(sequence.generated_tokens.is_empty());
+        assert!(sequence.credited_output.as_ref().unwrap().grant.is_none());
+    }
+    assert_eq!(scheduled(&engine), 0);
+    assert_eq!(executor.entries.load(Ordering::Acquire), 0);
+    assert_eq!(executor.physical.load(Ordering::Acquire), 0);
+    assert!(submitted.as_mut().now_or_never().is_none());
+    drop(captured);
+
+    // Neither the expired planning turn nor its completion retry can restart
+    // the original admission wait or accept the transport before its decision.
+    let mut admission_wait = Box::pin(engine.inner.wait_for_slo_time_admission());
+    assert!(admission_wait.as_mut().now_or_never().is_none());
+    let deadline = ingress + engine.inner.config.scheduler.slo.admission.max_wait();
+    tokio::time::advance(deadline.duration_since(slo_clock_now())).await;
+    assert!(admission_wait.as_mut().now_or_never().is_some());
+    drop(admission_wait);
+    engine.inner.run_iteration().await.unwrap();
+    assert!(matches!(
+        submitted.await,
+        Err(FerrumError::SloTimeAdmissionRejected {
+            reason: ferrum_types::errors::SloTimeAdmissionRejection::WaitExpired,
+        })
+    ));
+    assert!(engine.inner.sequences.read().is_empty());
+    assert_eq!(scheduler.trace_phase(&id), None);
+    assert_eq!(executor.entries.load(Ordering::Acquire), 0);
+    assert_eq!(executor.physical.load(Ordering::Acquire), 0);
+    engine.shutdown().await.unwrap();
 }

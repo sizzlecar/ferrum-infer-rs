@@ -123,7 +123,7 @@ fn selected_runtime_import_is_immutable_and_ttl_keeps_aging() {
     assert!(prediction.planning_ns >= 19 + fixture.config.model.drift_margin_ns);
     let receipt = runtime.profile_receipt().unwrap();
     assert_eq!(receipt.schema_version, 6);
-    assert_eq!(receipt.path, fixture.path);
+    assert_eq!(receipt.path.as_ref(), Some(&fixture.path));
     assert_eq!(receipt.recorded_samples, 16);
     assert_eq!(receipt.oldest_imported_age_ns, Some(10));
     let phases = receipt.selected_whole_wave.as_ref().unwrap();

@@ -357,11 +357,14 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
                 include_str!("gated_delta_attention.rs").as_bytes(),
                 include_str!("gated_delta_attention/cost_route.rs").as_bytes(),
                 include_str!("gated_delta_attention/selected.rs").as_bytes(),
+                include_str!("gated_delta_attention/selected/classes.rs").as_bytes(),
+                include_str!("gated_delta_attention/selected/observation.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 super::linear::FINGERPRINT_SOURCE.as_bytes(),
                 super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/selected.rs").as_bytes(),
+                include_str!("primitives/selected/observation.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
                 GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION.as_bytes(),
                 provider_id.as_bytes(),
@@ -446,6 +449,23 @@ impl OperationResourceEstimator for MetalGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttentionProvider {
+    fn prepare_cost_data(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostPreparationRequest<'_>,
+    ) -> Option<ferrum_interfaces::vnext::PreparedOperationCostData> {
+        if request.operation_id().as_str() != self.operation_id {
+            return None;
+        }
+        cost_route::PreparedCostData::new(
+            request.attributes(),
+            request.bindings(),
+            self.hidden_type,
+        )
+        .ok()
+        .flatten()
+        .map(ferrum_interfaces::vnext::PreparedOperationCostData::new)
+    }
+
     fn eager_cost_route(
         &self,
         request: OperationCostRouteRequest<'_>,
@@ -1399,28 +1419,34 @@ fn encode_attention(
             })
         }),
     )?;
-    let statistical_evidence = selected::evidence(
-        &attention,
-        &linear,
-        &primitives,
-        hidden_type,
-        total_tokens,
-        layout.required_bytes,
-        packed.as_ref().map(|v| selected::Projection {
-            params: v.params,
-            input: &v.input_projections,
-            output: v.output_projection,
-            staged: v.input_projection_workspace.is_some(),
-        }),
-        launches.iter().map(|v| selected::Row {
-            projection: selected::Projection {
-                params: v.params,
-                input: &v.input_projections,
-                output: v.output_projection,
-                staged: v.input_projection_workspace.is_some(),
-            },
-            form: v.execution_form,
-        }),
+    let statistical_evidence = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(route.compute_dispatch_count(), launches.len()),
+        || {
+            selected::observation(
+                &attention,
+                &linear,
+                &primitives,
+                hidden_type,
+                total_tokens,
+                layout.required_bytes,
+                packed.as_ref().map(|v| selected::Projection {
+                    params: v.params,
+                    input: &v.input_projections,
+                    output: v.output_projection,
+                    staged: v.input_projection_workspace.is_some(),
+                }),
+                launches.iter().map(|v| selected::Row {
+                    projection: selected::Projection {
+                        params: v.params,
+                        input: &v.input_projections,
+                        output: v.output_projection,
+                        staged: v.input_projection_workspace.is_some(),
+                    },
+                    form: v.execution_form,
+                }),
+            )
+        },
     );
     let dispatch_count = route.compute_dispatch_count();
     MetalDeviceCommand::operation(
@@ -1465,7 +1491,7 @@ fn encode_attention(
         route.participant_count(),
         route.token_count(),
     )
-    .map(|command| command.with_statistical_evidence(statistical_evidence))
+    .map(|command| command.with_observation(statistical_evidence))
     .map_err(|error| error.to_string())
 }
 

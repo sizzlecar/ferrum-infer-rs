@@ -9,6 +9,57 @@ use ferrum_interfaces::execution_cost::{
 use ferrum_interfaces::model_executor::PlanRuntimeMixedBatchOutput;
 
 impl EngineInner {
+    fn record_prefix_wave(
+        &self,
+        work: &owner::ControllerWork,
+        stage: crate::continuous_engine::profile::prefix::WaveStage,
+    ) {
+        use crate::continuous_engine::profile::prefix::{Event, Owner};
+        let (Some(recorder), Some(maintenance)) = (
+            &self.prefix_resource_recorder,
+            &work.proof.prefix_maintenance,
+        ) else {
+            return;
+        };
+        let inference_epoch = match &work.timing {
+            owner::ControllerTimingCommitment::Witness { model_version, .. } => {
+                Some(*model_version)
+            }
+            owner::ControllerTimingCommitment::CompleteRequests => None,
+        };
+        for row in work.rows() {
+            let Some(fence) = work
+                .proof
+                .fences
+                .iter()
+                .find(|fence| fence.key.request_id == row.request_id)
+            else {
+                continue;
+            };
+            let (prefill_start, prefill_tokens, final_prefill) = match &row.input {
+                ExpectedWaveInput::Prefill { chunk } => (
+                    Some(chunk.tokens_processed()),
+                    Some(chunk.tokens_to_process()),
+                    Some(chunk.is_final()),
+                ),
+                ExpectedWaveInput::Decode { .. } => (None, None, None),
+            };
+            recorder.record(Event::Wave {
+                owner: Owner::new(
+                    &fence.key.request_id,
+                    fence.incarnation,
+                    fence.key.generation.get(),
+                ),
+                stage,
+                inference_epoch,
+                maintenance_epoch: maintenance.model_version(),
+                prefill_start,
+                prefill_tokens,
+                final_prefill,
+            });
+        }
+    }
+
     pub(super) async fn dispatch_controller_wave(
         &self,
         flight: &ControllerFlight,
@@ -154,6 +205,10 @@ impl EngineInner {
         }
         if matches!(&outcome, GuardedDispatchOutcome::Submitted(_)) {
             work.proof.budget.record_backend_submitted();
+            self.record_prefix_wave(
+                work,
+                crate::continuous_engine::profile::prefix::WaveStage::BackendSubmitted,
+            );
             self.record_recovery_submission(work);
             if let owner::ControllerTimingCommitment::Witness {
                 admission: Some(admission),
@@ -351,6 +406,10 @@ impl EngineInner {
                 }
                 self.finish_controller_output(work);
                 work.proof.budget.record_host_reconciled();
+                self.record_prefix_wave(
+                    work,
+                    crate::continuous_engine::profile::prefix::WaveStage::HostReconciled,
+                );
                 if let Some(receipt) = &flight.calibration {
                     receipt.record(CalibrationSubmissionState::HostReconciled);
                 }

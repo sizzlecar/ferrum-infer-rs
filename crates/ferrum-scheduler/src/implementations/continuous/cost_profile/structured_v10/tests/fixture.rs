@@ -56,25 +56,206 @@ pub fn prepared_route_policy(
     graph: ActualWaveGraphState,
     base_policy: Option<[u8; 32]>,
 ) -> (Prepared, Vec<OfferedRow>, StructuredInputV2) {
-    let mut command = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
-    command
-        .kernel_with_replay_geometry(
-            SelectedAlgorithmClassV1::new("fixture.profile10", 1, [1; 32], [2; 32]).unwrap(),
-            KernelNumericWorkV1 {
-                logical_units: 16,
-                padded_units: 16,
-                inner_units_per_logical_unit: 2,
-                grid: [1, 1, 1],
-                scratch_bytes: 64,
-                staged_weight_bytes: 0,
-            },
-            KernelReplayGeometryV1 {
-                block: [32, 1, 1],
-                dynamic_shared_bytes: 0,
-                fixed_parameters: &[16],
-            },
-        )
-        .unwrap();
+    prepared_route_policy_bounds(
+        id,
+        generation,
+        generated,
+        resident,
+        graph,
+        base_policy,
+        64,
+        3,
+    )
+}
+/// Explicit input frontier for source population boundary tests. The exact
+/// physical shape, canonical rows, statistics, and Prepared all use these facts.
+pub fn prepared_route_policy_bounds(
+    id: &str,
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+    graph: ActualWaveGraphState,
+    base_policy: Option<[u8; 32]>,
+    decode_context: u32,
+    maximum_output: u64,
+) -> (Prepared, Vec<OfferedRow>, StructuredInputV2) {
+    let (prepared, offered, input, _) = prepared_route_policy_bounds_and_future(
+        id,
+        generation,
+        generated,
+        resident,
+        graph,
+        base_policy,
+        decode_context,
+        maximum_output,
+        None,
+    );
+    (prepared, offered, input)
+}
+/// A future query from the same real canonical builder as the source fixture.
+/// No imported model or measured sample is consulted when constructing it.
+pub fn future_query_with_domain(domain: &CostWorkloadDomainV1) -> StructuredQueryV2 {
+    prepared_route_policy_bounds_and_future(
+        "independent-future",
+        2,
+        1,
+        None,
+        ActualWaveGraphState::Disabled,
+        None,
+        64,
+        3,
+        Some(domain),
+    )
+    .3
+    .expect("explicit future domain")
+}
+fn prepared_route_policy_bounds_and_future(
+    id: &str,
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+    graph: ActualWaveGraphState,
+    base_policy: Option<[u8; 32]>,
+    decode_context: u32,
+    maximum_output: u64,
+    future_domain: Option<&CostWorkloadDomainV1>,
+) -> (
+    Prepared,
+    Vec<OfferedRow>,
+    StructuredInputV2,
+    Option<StructuredQueryV2>,
+) {
+    prepared_batch_route_policy_bounds_and_future(
+        &[id],
+        generation,
+        generated,
+        resident,
+        graph,
+        base_policy,
+        decode_context,
+        &[maximum_output],
+        future_domain,
+    )
+}
+
+/// Canonical batch producer shared by source replay and independent future
+/// queries. Every row keeps its actual request and complete-output frontier.
+#[allow(clippy::too_many_arguments)]
+pub fn prepared_batch_route_policy_bounds_and_future(
+    ids: &[&str],
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+    graph: ActualWaveGraphState,
+    base_policy: Option<[u8; 32]>,
+    decode_context: u32,
+    maximum_outputs: &[u64],
+    future_domain: Option<&CostWorkloadDomainV1>,
+) -> (
+    Prepared,
+    Vec<OfferedRow>,
+    StructuredInputV2,
+    Option<StructuredQueryV2>,
+) {
+    prepared_batch_algorithms_and_future(
+        ids,
+        generation,
+        generated,
+        resident,
+        graph,
+        base_policy,
+        decode_context,
+        maximum_outputs,
+        future_domain,
+        &["fixture.profile10"],
+    )
+}
+
+/// True canonical selected dispatches; roster identity is never replaced after
+/// capture. The ordinary helper above preserves all old fixture bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn prepared_batch_algorithms_and_future(
+    ids: &[&str],
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+    graph: ActualWaveGraphState,
+    base_policy: Option<[u8; 32]>,
+    decode_context: u32,
+    maximum_outputs: &[u64],
+    future_domain: Option<&CostWorkloadDomainV1>,
+    algorithms: &[&str],
+) -> (
+    Prepared,
+    Vec<OfferedRow>,
+    StructuredInputV2,
+    Option<StructuredQueryV2>,
+) {
+    prepared_batch_algorithms_with_host_policy(
+        ids,
+        generation,
+        generated,
+        resident,
+        graph,
+        base_policy,
+        decode_context,
+        maximum_outputs,
+        future_domain,
+        algorithms,
+        HostCostPolicyV2 {
+            empirical_content_domain: Some(HostContentDomainV1::PlainTextGreedyV1),
+            categorical_signature: [4; 32],
+            decoder_text_bytes_per_token: 4,
+            decoder_scratch_bytes_per_token: 8,
+            raw_token_bytes_bound: 4,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepared_batch_algorithms_with_host_policy(
+    ids: &[&str],
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+    graph: ActualWaveGraphState,
+    base_policy: Option<[u8; 32]>,
+    decode_context: u32,
+    maximum_outputs: &[u64],
+    future_domain: Option<&CostWorkloadDomainV1>,
+    algorithms: &[&str],
+    host_policy: HostCostPolicyV2,
+) -> (
+    Prepared,
+    Vec<OfferedRow>,
+    StructuredInputV2,
+    Option<StructuredQueryV2>,
+) {
+    assert!(!ids.is_empty());
+    assert_eq!(ids.len(), maximum_outputs.len());
+    let count = u32::try_from(ids.len()).unwrap();
+    let mut command = SelectedCommandCostBuilderV1::new_with_algorithm_work(u64::from(count));
+    assert!(!algorithms.is_empty());
+    for &algorithm in algorithms {
+        command
+            .kernel_with_replay_geometry(
+                SelectedAlgorithmClassV1::new(algorithm, 1, [1; 32], [2; 32]).unwrap(),
+                KernelNumericWorkV1 {
+                    logical_units: 16 * u64::from(count),
+                    padded_units: 16 * u64::from(count),
+                    inner_units_per_logical_unit: 2,
+                    grid: [count, 1, 1],
+                    scratch_bytes: 64 * u64::from(count),
+                    staged_weight_bytes: 0,
+                },
+                KernelReplayGeometryV1 {
+                    block: [32, 1, 1],
+                    dynamic_shared_bytes: 0,
+                    fixed_parameters: &[16],
+                },
+            )
+            .unwrap();
+    }
     let command = command.finish().unwrap();
     let mut b =
         CanonicalWaveCostBuilder::new_with_structured_statistics(0, CostProductOutput::FullLogits);
@@ -94,10 +275,10 @@ pub fn prepared_route_policy(
             CostCommandPath::Eager
         },
         participant_start: 0,
-        participant_count: 1,
-        token_count: 1,
+        participant_count: count,
+        token_count: u64::from(count),
         batching_form: "packed",
-        compute_dispatch_count: 1,
+        compute_dispatch_count: algorithms.len() as u64,
         transfer_command_count: 0,
         reusable_graph_node_count: resident.map(|_| 1),
         statistical_evidence: resident.is_none().then_some(&command),
@@ -114,10 +295,10 @@ pub fn prepared_route_policy(
                 implementation_fingerprint: "v1",
                 operation_fingerprint: "v1",
             },
-            participant_count: 1,
-            token_count: 1,
+            participant_count: count,
+            token_count: u64::from(count),
             batching_form: "packed",
-            compute_dispatch_count: 1,
+            compute_dispatch_count: algorithms.len() as u64,
             transfer_command_count: 0,
             reusable_graph_node_count: 1,
             statistical_evidence: Some(&command),
@@ -134,41 +315,39 @@ pub fn prepared_route_policy(
             total_prompt_tokens: 64,
         }
     } else {
-        ActualRowWork::Decode { kv_tokens: 64 }
+        ActualRowWork::Decode {
+            kv_tokens: decode_context,
+        }
     };
-    b.row(CanonicalCostRow {
-        work,
-        output: if first {
-            CostRowOutput::Prefill { final_logits: true }
-        } else {
-            CostRowOutput::Decode {
-                requires_full_logits: true,
-                repetition_tokens: generated,
-                repetition_penalty_bits: 1f32.to_bits(),
-            }
-        },
-        host_policy_signature: base_policy
-            .map_or([3; 32], |base| host_history_cost_signature(base, generated)),
-        mask_upload_required: false,
-        host_features: Some(HostCostFeaturesV1 {
-            policy: HostCostPolicyV2 {
-                empirical_content_domain: Some(HostContentDomainV1::PlainTextGreedyV1),
-                categorical_signature: [4; 32],
-                decoder_text_bytes_per_token: 4,
-                decoder_scratch_bytes_per_token: 8,
-                raw_token_bytes_bound: 4,
+    for &maximum_output in maximum_outputs {
+        b.row(CanonicalCostRow {
+            work,
+            output: if first {
+                CostRowOutput::Prefill { final_logits: true }
+            } else {
+                CostRowOutput::Decode {
+                    requires_full_logits: true,
+                    repetition_tokens: generated,
+                    repetition_penalty_bits: 1f32.to_bits(),
+                }
             },
-            state: HostCostStateV1 {
-                generated_tokens_before: generated,
-                maximum_output_tokens: 3,
-                sampling_history_tokens: generated,
-                sampling_history_scope: CostSamplingHistoryScope::FullGeneration,
-                pending_decoded_utf8: false,
-                completion_state_signature: satisfied_completion_cost_signature(),
-            },
-        }),
-    })
-    .unwrap();
+            host_policy_signature: base_policy
+                .map_or([3; 32], |base| host_history_cost_signature(base, generated)),
+            mask_upload_required: false,
+            host_features: Some(HostCostFeaturesV1 {
+                policy: host_policy,
+                state: HostCostStateV1 {
+                    generated_tokens_before: generated,
+                    maximum_output_tokens: maximum_output,
+                    sampling_history_tokens: generated,
+                    sampling_history_scope: CostSamplingHistoryScope::FullGeneration,
+                    pending_decoded_utf8: false,
+                    completion_state_signature: satisfied_completion_cost_signature(),
+                },
+            }),
+        })
+        .unwrap();
+    }
     let wave = b
         .finish_with_captured_structure(
             if first {
@@ -184,6 +363,16 @@ pub fn prepared_route_policy(
         .unwrap();
     let stat = wave.statistical.as_ref().unwrap();
     let recipe = stat.structured_capture().unwrap().unwrap();
+    let future = future_domain.map(|domain| {
+        StructuredQueryV2::from_future_with_domain(
+            &wave.exact,
+            stat,
+            recipe,
+            &HostContentForecastV2::Exact,
+            domain,
+        )
+        .unwrap()
+    });
     if graph != ActualWaveGraphState::Disabled {
         assert!(matches!(
             crate::implementations::continuous::cost_model::statistical::StatisticalModelInputV1::from_future(&wave.exact, stat),
@@ -210,13 +399,20 @@ pub fn prepared_route_policy(
                 ActualWaveGraphState::Cold => ProfileGraphState::Cold,
             },
             order: ProfileBatchOrder::Ordered,
-            decode_kv_tokens: if first { vec![] } else { vec![64] },
+            decode_kv_tokens: if first {
+                vec![]
+            } else {
+                vec![decode_context; ids.len()]
+            },
             prefill_chunks: if first {
-                vec![ProfilePrefillShape {
-                    offset: 0,
-                    count: one,
-                    total_prompt_tokens: one,
-                }]
+                vec![
+                    ProfilePrefillShape {
+                        offset: 0,
+                        count: one,
+                        total_prompt_tokens: one,
+                    };
+                    ids.len()
+                ]
             } else {
                 vec![]
             },
@@ -236,7 +432,9 @@ pub fn prepared_route_policy(
             total_prompt_tokens: 64,
         }
     } else {
-        PreparedWorkV2::Decode { kv_tokens: 64 }
+        PreparedWorkV2::Decode {
+            kv_tokens: decode_context,
+        }
     };
     let p = Prepared {
         exact,
@@ -244,35 +442,45 @@ pub fn prepared_route_policy(
         selected_independent_attention_v2: None,
         recipe: serde_json::from_value(serde_json::to_value(recipe.as_ref()).unwrap()).unwrap(),
         owner_facts: serde_json::to_value(facts).unwrap(),
-        rows: vec![PreparedRow {
-            request_id: id.into(),
-            owner_incarnation: 1,
-            work_generation: generation,
-            frontier: PreparedRowFactsV2 {
-                physical_position: 0,
-                work: frontier_work,
-                generated_before: generated,
-                maximum_output: 3,
-                context_before: if first { 0 } else { 64 },
-            },
-        }],
+        rows: ids
+            .iter()
+            .zip(maximum_outputs)
+            .enumerate()
+            .map(|(position, (&id, &maximum_output))| PreparedRow {
+                request_id: id.into(),
+                owner_incarnation: 1,
+                work_generation: generation,
+                frontier: PreparedRowFactsV2 {
+                    physical_position: position as u32,
+                    work: frontier_work.clone(),
+                    generated_before: generated,
+                    maximum_output,
+                    context_before: if first { 0 } else { u64::from(decode_context) },
+                },
+            })
+            .collect(),
     };
-    let offered = vec![OfferedRow {
-        request_id: id.into(),
-        owner: 1,
-        generation,
-        generated,
-        work: if first {
-            OfferedWork::Prefill {
-                offset: 0,
-                count: 64,
-                total_prompt_tokens: 64,
-            }
-        } else {
-            OfferedWork::Decode { kv_tokens: 64 }
-        },
-    }];
-    (p, offered, native)
+    let offered = ids
+        .iter()
+        .map(|&id| OfferedRow {
+            request_id: id.into(),
+            owner: 1,
+            generation,
+            generated,
+            work: if first {
+                OfferedWork::Prefill {
+                    offset: 0,
+                    count: 64,
+                    total_prompt_tokens: 64,
+                }
+            } else {
+                OfferedWork::Decode {
+                    kv_tokens: decode_context,
+                }
+            },
+        })
+        .collect();
+    (p, offered, native, future)
 }
 pub fn header() -> Header {
     header_graph(None)
@@ -281,6 +489,7 @@ pub fn header_graph(resident: Option<&str>) -> Header {
     let (_, _, input) = prepared_graph("seed", 1, 1, resident);
     let owner = input.owner().clone();
     let scope = StructuredScopeV2 {
+        numerical_family: None,
         owner: owner.clone(),
         coverage: StructuredCoverageV2 {
             pending_eligible_positions: vec![],
@@ -356,8 +565,13 @@ pub fn header_graph(resident: Option<&str>) -> Header {
             max_wave_ns: 1_000_000,
             max_age_ns: 1_000_000_000,
             margin_ns: 10,
+            learned_drift: StructuredLearnedDriftV2::Disabled,
         },
     };
+    resign_header(&mut h);
+    h
+}
+fn resign_header(h: &mut Header) {
     let mut sha = Sha256::new();
     sha.update(b"ferrum.structured-live-source.v2\0");
     sha.update(MODEL_REVISION_V2.as_bytes());
@@ -379,12 +593,13 @@ pub fn header_graph(resident: Option<&str>) -> Header {
     ]) {
         sha.update(n.to_le_bytes());
     }
+    if !h.settings.learned_drift.is_disabled() {
+        sha.update(h.settings.learned_drift.signature());
+    }
     h.protocol = sha.finalize().into();
-    h
 }
 pub(in super::super) fn stages(h: &Header, p: &Prepared, call: u64, wall_ns: u64) -> Stages {
     let start = call * 2000;
-    let last = p.rows[0].frontier.generated_before == 2;
     let mut s = Stages {
         schema_version: 1,
         call_id: call,
@@ -395,50 +610,81 @@ pub(in super::super) fn stages(h: &Header, p: &Prepared, call: u64, wall_ns: u64
         structured_evidence: None,
         prepare_started_at_ns: Some(start),
         executor_returned_at_ns: Some(start + 500),
-        rows: vec![StageRow {
-            request_id: p.rows[0].request_id.clone(),
-            owner_incarnation: 1,
-            work_generation: p.rows[0].work_generation,
-            input_index: 0,
-            actual_work: match p.rows[0].frontier.work {
-                PreparedWorkV2::Decode { kv_tokens } => RowWork::Decode { kv_tokens },
-                PreparedWorkV2::Prefill {
-                    offset,
-                    count,
-                    total_prompt_tokens,
-                } => RowWork::Prefill {
-                    offset,
-                    count,
-                    total_prompt_tokens,
-                },
-            },
-            host_processing_ordinal: Some(0),
-            host_started_at_ns: Some(start + 600),
-            token_committed_at_ns: Some(start + 700),
-            output_published_at_ns: Some(start + 800),
-            completion_started_at_ns: if last { Some(start + 900) } else { None },
-            settled_at_ns: Some(start + wall_ns),
-            terminal: if last {
-                Some(Terminal {
-                    finish_reason: ferrum_types::FinishReason::Length,
-                    generated_tokens: 3,
-                    through_output_ordinal: 3,
-                    output_failed: false,
-                    physical_failed: false,
-                    scheduler_failed: false,
-                    terminal_handoff_succeeded: true,
-                    pending_restore_removed: false,
-                    admission_cancellation_work: serde_json::json!("no_additional_work"),
-                    cache_completion_work: serde_json::json!("no_additional_work"),
-                    other_physical_resources: false,
-                    request_slot_closed: true,
-                    owner_matched: true,
-                })
-            } else {
-                None
-            },
-            completeness: "complete_single_wave".into(),
-        }],
+        rows: p
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(position, row)| {
+                let last = row.frontier.generated_before + 1 == row.frontier.maximum_output;
+                let (host_start, committed, published, completion_start, settled) = if p.rows.len()
+                    == 1
+                {
+                    (
+                        start + 600,
+                        start + 700,
+                        start + 800,
+                        start + 900,
+                        start + wall_ns,
+                    )
+                } else {
+                    let host_wall = wall_ns.checked_sub(500).unwrap();
+                    let begin = start + 500 + host_wall * position as u64 / p.rows.len() as u64;
+                    let end = start + 500 + host_wall * (position as u64 + 1) / p.rows.len() as u64;
+                    let span = end - begin;
+                    (
+                        begin,
+                        begin + span / 4,
+                        begin + span / 2,
+                        begin + span * 3 / 4,
+                        end,
+                    )
+                };
+                StageRow {
+                    request_id: row.request_id.clone(),
+                    owner_incarnation: 1,
+                    work_generation: row.work_generation,
+                    input_index: position as u32,
+                    actual_work: match row.frontier.work {
+                        PreparedWorkV2::Decode { kv_tokens } => RowWork::Decode { kv_tokens },
+                        PreparedWorkV2::Prefill {
+                            offset,
+                            count,
+                            total_prompt_tokens,
+                        } => RowWork::Prefill {
+                            offset,
+                            count,
+                            total_prompt_tokens,
+                        },
+                    },
+                    host_processing_ordinal: Some(position as u32),
+                    host_started_at_ns: Some(host_start),
+                    token_committed_at_ns: Some(committed),
+                    output_published_at_ns: Some(published),
+                    completion_started_at_ns: if last { Some(completion_start) } else { None },
+                    settled_at_ns: Some(settled),
+                    terminal: if last {
+                        Some(Terminal {
+                            finish_reason: ferrum_types::FinishReason::Length,
+                            generated_tokens: row.frontier.maximum_output,
+                            through_output_ordinal: row.frontier.maximum_output,
+                            output_failed: false,
+                            physical_failed: false,
+                            scheduler_failed: false,
+                            terminal_handoff_succeeded: true,
+                            pending_restore_removed: false,
+                            admission_cancellation_work: serde_json::json!("no_additional_work"),
+                            cache_completion_work: serde_json::json!("no_additional_work"),
+                            other_physical_resources: false,
+                            request_slot_closed: true,
+                            owner_matched: true,
+                        })
+                    } else {
+                        None
+                    },
+                    completeness: "complete_single_wave".into(),
+                }
+            })
+            .collect(),
         finalized_at_ns: Some(start + wall_ns + 100),
         full_wall_ns: Some(wall_ns),
         completeness: "complete_single_wave".into(),
@@ -468,20 +714,30 @@ pub fn source() -> (Vec<u8>, StructuredInputV2) {
     source_graph(None)
 }
 pub fn source_graph(resident: Option<&str>) -> (Vec<u8>, StructuredInputV2) {
-    source_graph_fit_tail(resident, false, None)
+    source_graph_fit_tail(resident, false, None, false)
 }
 pub fn source_with_fit_tail() -> (Vec<u8>, StructuredInputV2) {
-    source_graph_fit_tail(None, true, None)
+    source_graph_fit_tail(None, true, None, false)
 }
 pub fn source_policy(base_policy: [u8; 32]) -> (Vec<u8>, StructuredInputV2) {
-    source_graph_fit_tail(None, false, Some(base_policy))
+    source_graph_fit_tail(None, false, Some(base_policy), false)
+}
+pub fn source_with_learned_span(base_policy: Option<[u8; 32]>) -> (Vec<u8>, StructuredInputV2) {
+    source_graph_fit_tail(None, false, base_policy, true)
 }
 fn source_graph_fit_tail(
     resident: Option<&str>,
     fit_tail: bool,
     base_policy: Option<[u8; 32]>,
+    learned_span: bool,
 ) -> (Vec<u8>, StructuredInputV2) {
-    let h = header_graph(resident);
+    let mut h = header_graph(resident);
+    if learned_span {
+        h.settings.learned_drift = StructuredLearnedDriftV2::ObservedResidualSpanV1 {
+            maximum_span_margin_ns: std::num::NonZeroU64::new(400).unwrap(),
+        };
+        resign_header(&mut h);
+    }
     let mut bytes = Vec::new();
     let mut ordinal = 0;
     push(&mut bytes, &mut ordinal, &h);
@@ -545,6 +801,20 @@ fn source_graph_fit_tail(
                     && generated == 1
                 {
                     1600
+                } else if learned_span
+                    && phase == StructuredProfilePhaseV10::Residual
+                    && generated == 1
+                {
+                    if cohort % 2 == 0 {
+                        850
+                    } else {
+                        1250
+                    }
+                } else if learned_span
+                    && phase == StructuredProfilePhaseV10::Qualification
+                    && generated == 1
+                {
+                    1400
                 } else {
                     1000
                 };

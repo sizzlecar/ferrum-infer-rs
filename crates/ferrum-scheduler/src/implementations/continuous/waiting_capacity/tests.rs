@@ -117,6 +117,25 @@ async fn simultaneous_submit_cannot_both_acquire_the_last_waiting_slot() {
 }
 
 #[tokio::test]
+async fn strict_policy_preserves_real_waiting_count_token_and_utf8_byte_bounds() {
+    for limits in [(1, 100, 100), (10, 2, 100), (10, 100, 3)] {
+        let mut settings = config(limits.0, limits.1, limits.2);
+        settings.slo.admission.time_policy = ferrum_types::SloTimeAdmissionPolicy::RequireSlo;
+        let scheduler = ContinuousBatchScheduler::new(settings);
+        let id = scheduler.submit(request("中", 2)).await.unwrap();
+        assert!(matches!(
+            scheduler.submit(request("a", 1)).await,
+            Err(FerrumError::ResourceExhausted { .. })
+        ));
+        assert_eq!(scheduler.waiting_count(), 1);
+        scheduler.cancel(id).await.unwrap();
+        let replacement = scheduler.submit(request("a", 1)).await.unwrap();
+        scheduler.cancel(replacement).await.unwrap();
+        assert_eq!(scheduler.waiting_count(), 0);
+    }
+}
+
+#[tokio::test]
 async fn start_prefill_and_error_release_waiting_charge_but_requeue_keeps_accepted_work() {
     let scheduler = ContinuousBatchScheduler::new(config(1, 2, 2));
     let first = scheduler.submit(request("a", 2)).await.unwrap();

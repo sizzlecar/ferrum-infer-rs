@@ -208,6 +208,10 @@ pub(super) struct WaveTrainingCounts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(in crate::continuous_engine) struct TrainingAuditSnapshot {
+    /// Last successful runtime inventory transition. The profile receipt
+    /// separately describes the last real calibration, with its original epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) catalog_expiry: Option<CatalogExpiryTransition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) selected_serving: Option<SelectedServingAudit>,
     pub(super) host_content: HostContentAudit,
@@ -228,6 +232,7 @@ impl Default for TrainingAuditSnapshot {
 impl TrainingAuditSnapshot {
     fn filled(count: u64) -> Self {
         Self {
+            catalog_expiry: None,
             selected_serving: None,
             host_content: HostContentAudit::filled(count),
             consumed: count,
@@ -246,6 +251,15 @@ impl TrainingAuditSnapshot {
     pub fn maximum_serialized_counts() -> Self {
         let mut value = Self::filled(u64::MAX);
         value.selected_serving = Some(SelectedServingAudit::filled(u64::MAX));
+        value.catalog_expiry = Some(CatalogExpiryTransition {
+            observed_at_ns: u64::MAX,
+            previous_runtime_epoch: u64::MAX,
+            current_runtime_epoch: u64::MAX,
+            previous_children: usize::MAX,
+            current_children: usize::MAX,
+            removed_expired_children: usize::MAX,
+            reason: CatalogExpiryReason::OriginalSampleAgeExpired,
+        });
         // Reserve JSON's longer false spelling, not only maximum integers.
         value.counter_exhausted = false;
         value
@@ -286,13 +300,37 @@ impl TrainingAuditSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CatalogExpiryReason {
+    OriginalSampleAgeExpired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct CatalogExpiryTransition {
+    pub observed_at_ns: u64,
+    pub previous_runtime_epoch: u64,
+    pub current_runtime_epoch: u64,
+    pub previous_children: usize,
+    pub current_children: usize,
+    pub removed_expired_children: usize,
+    pub reason: CatalogExpiryReason,
+}
+
 /// A live snapshot is not atomic across producers and worker. Only a quiescent
 /// final summary may be reconciled as a settled funnel, and neither establishes
 /// that every physical executor path was instrumented.
 #[derive(Debug, Clone, Serialize)]
 pub(in crate::continuous_engine) struct ObservationFunnelSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic_reuse: Option<super::automatic_reuse::ReuseAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_structured_prediction:
+        Option<super::prospective_capture::IssuedPredictionAuditSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prospective_capture: Option<super::prospective_capture::CaptureAuditSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_calibration: Option<super::live_calibration::LiveAudit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_feedback: Option<super::selected_feedback::FeedbackAudit>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -26,7 +26,9 @@ use super::{
 };
 
 use super::{DeviceReadbackSnapshot, DeviceReadbackStagingBudget, DeviceSubmissionReadbackRequest};
+mod cost_population;
 mod resource_planning;
+pub use cost_population::IndexedExecutionLaneReusableCatalog;
 mod submission_readback;
 use submission_readback::PreparedCompletionReadbacks;
 
@@ -38,7 +40,20 @@ mod state_transfer;
 pub(crate) use state_transfer::*;
 mod checkpoint_access;
 pub use checkpoint_access::*;
+mod checkpoint_guard;
+mod checkpoint_observation;
+pub use checkpoint_guard::{CheckpointTransferSubmissionGuard, PreparedCheckpointTransfer};
 mod checkpoint_timings;
+use checkpoint_observation::PendingCheckpointObservation;
+pub(crate) use checkpoint_observation::{
+    checkpoint_byte_plan_fingerprint, NativeCheckpointTransferGeometryBuilder,
+};
+pub use checkpoint_observation::{
+    CheckpointTransferObservationStart, NativeCheckpointObservationSink,
+    NativeCheckpointTransferCostDomain, NativeCheckpointTransferGeometry,
+    NativeCheckpointTransferHostWork, NativeCheckpointTransferIdentity,
+    NativeCheckpointTransferKind, NativeCheckpointTransferObservation,
+};
 pub use checkpoint_timings::{
     CheckpointCacheTimingPhase, CheckpointCacheTimings, CheckpointCopyMeasurements,
     CheckpointDeviceTimings, CheckpointOperationTimings, CheckpointTimingMeasurement,
@@ -86,6 +101,7 @@ struct ExecutionLaneState<S> {
 
 #[derive(Debug, Clone)]
 pub struct ExecutionLaneReusableExecutionCatalog {
+    lane_id: ExecutionLaneId,
     epoch: u64,
     programs: Vec<DeviceReusableExecutionProgram>,
 }
@@ -148,7 +164,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             .validate()
             .map_err(ExecutionLaneCreationError::Contract)?;
         let descriptor = runtime.descriptor().clone();
-        let stream = runtime
+        let mut stream = runtime
             .create_stream()
             .map_err(ExecutionLaneCreationError::Device)?;
         if runtime.descriptor() != &descriptor
@@ -158,8 +174,12 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 "execution lane creation requires a stable runtime descriptor and ready stream",
             )));
         }
+        let id = ExecutionLaneId::mint().map_err(ExecutionLaneCreationError::Contract)?;
+        runtime
+            .bind_cost_graph_catalog_lane(&mut stream, id)
+            .map_err(ExecutionLaneCreationError::Device)?;
         Ok(Arc::new(Self {
-            id: ExecutionLaneId::mint().map_err(ExecutionLaneCreationError::Contract)?,
+            id,
             runtime,
             descriptor,
             fail_closed: AtomicBool::new(false),
@@ -361,6 +381,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         self.with_quiescent_stream("inspect reusable execution catalog", |runtime, stream| {
             runtime.reusable_execution_catalog(stream).map(|programs| {
                 ExecutionLaneReusableExecutionCatalog {
+                    lane_id: self.id(),
                     epoch: self.reusable_execution_epoch(),
                     programs,
                 }
@@ -380,6 +401,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             |runtime, stream| {
                 runtime.reusable_execution_catalog(stream).map(|programs| {
                     ExecutionLaneReusableExecutionCatalog {
+                        lane_id: self.id(),
                         epoch: self.reusable_execution_epoch(),
                         programs,
                     }
@@ -1849,6 +1871,7 @@ struct CompletionReaperState<R: DeviceRuntime> {
 pub struct CompletionReaper<R: DeviceRuntime> {
     state: Mutex<CompletionReaperState<R>>,
     checkpoint_timings: Arc<CheckpointTimingCounters>,
+    checkpoint_observation_sink: OnceLock<Weak<dyn NativeCheckpointObservationSink>>,
 }
 
 pub const MAX_COMPLETION_SWEEP_SLOTS: usize = 64;
@@ -1871,6 +1894,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 slots: BTreeMap::new(),
             }),
             checkpoint_timings: Arc::new(CheckpointTimingCounters::default()),
+            checkpoint_observation_sink: OnceLock::new(),
         })
     }
 

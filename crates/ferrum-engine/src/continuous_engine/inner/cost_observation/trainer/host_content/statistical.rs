@@ -3,6 +3,8 @@
 //! or execution authority is introduced here.
 use super::*;
 use model::statistical::model::{ModelUnknown, WholeWaveObservationV1};
+mod diagnostic;
+pub(in crate::continuous_engine::inner::cost_observation) use diagnostic::SettlementFailureDiagnostic;
 
 pub(in crate::continuous_engine::inner::cost_observation) fn whole_wave_observation(
     entry: &CostEvidenceEntry,
@@ -13,18 +15,43 @@ pub(in crate::continuous_engine::inner::cost_observation) fn whole_wave_observat
         return Err(ModelUnknown::WrongSource);
     }
     let actual = complete_observation(entry)?;
+    whole_wave_observation_from_actual(&actual, accepted_ordinal, source_sha256)
+}
+
+pub(in crate::continuous_engine::inner::cost_observation) fn whole_wave_observation_from_actual(
+    actual: &CompleteSelectedObservation,
+    accepted_ordinal: u64,
+    source_sha256: [u8; 32],
+) -> Result<WholeWaveObservationV1, ModelUnknown> {
+    if accepted_ordinal == 0 || source_sha256 == [0; 32] {
+        return Err(ModelUnknown::WrongSource);
+    }
+    require_legacy_route(actual)?;
     Ok(WholeWaveObservationV1 {
         source_sha256,
         accepted_ordinal,
         call_id: actual.call_id,
-        fingerprint: actual.fingerprint,
-        exact: actual.exact,
-        selected: actual.selected,
+        fingerprint: actual.fingerprint.clone(),
+        exact: actual.exact.clone(),
+        selected: actual.selected.clone(),
         boundary: actual.boundary,
         outcome: actual.outcome,
         observed_at_ns: actual.observed_at_ns,
         wall_ns: actual.wall_ns,
     })
+}
+
+pub(in crate::continuous_engine::inner::cost_observation) fn capture_actual(
+    capture: &CostCalibrationCapture,
+    stages: &Arc<HostStageEvidenceV1>,
+    entry: &CostEvidenceEntry,
+) -> Result<Arc<CompleteSelectedObservation>, ModelUnknown> {
+    let actual = match capture.actual_projection(stages) {
+        Some(actual) => actual?,
+        None => Arc::new(complete_observation(entry)?),
+    };
+    require_legacy_route(&actual)?;
+    Ok(actual)
 }
 
 /// Actual successful receipt without an offline capture identity. Ordinary
@@ -38,11 +65,16 @@ pub(in crate::continuous_engine::inner::cost_observation) struct CompleteSelecte
     pub outcome: model::WaveObservationOutcome,
     pub observed_at_ns: u64,
     pub wall_ns: u64,
+    // Computed with the same immutable stages, independent of V1/V2 numeric scope.
+    pub qualified_host_stages: Result<(), ModelUnknown>,
+    pub(super) observation_memory: Option<Arc<super::super::super::memory::ObservationBytePermit>>,
 }
 pub(in crate::continuous_engine::inner::cost_observation) fn complete_observation(
     entry: &CostEvidenceEntry,
 ) -> Result<CompleteSelectedObservation, ModelUnknown> {
-    complete_observation_with_graph(entry, false)
+    let actual = complete_actual_observation(entry)?;
+    require_legacy_route(&actual)?;
+    Ok(actual)
 }
 
 /// V2 alone supports complete warm graph work. This still consumes the actual
@@ -51,12 +83,25 @@ pub(in crate::continuous_engine::inner::cost_observation) fn complete_observatio
 pub(in crate::continuous_engine::inner::cost_observation) fn complete_structured_observation_v2(
     entry: &CostEvidenceEntry,
 ) -> Result<CompleteSelectedObservation, ModelUnknown> {
-    complete_observation_with_graph(entry, true)
+    let actual = complete_actual_observation(entry)?;
+    validate_structured_actual(entry, &actual)?;
+    Ok(actual)
 }
 
-fn complete_observation_with_graph(
+pub(in crate::continuous_engine::inner::cost_observation) fn require_legacy_route(
+    actual: &CompleteSelectedObservation,
+) -> Result<(), ModelUnknown> {
+    if actual.exact.graph != ActualWaveGraphState::Disabled {
+        return Err(ModelUnknown::Evidence(
+            StatisticalEvidenceUnknown::UnsupportedWave,
+        ));
+    }
+    Ok(())
+}
+
+/// Shared completed facts; protocol consumers retain their own route/scope rules.
+pub(in crate::continuous_engine::inner::cost_observation) fn complete_actual_observation(
     entry: &CostEvidenceEntry,
-    structured_v2: bool,
 ) -> Result<CompleteSelectedObservation, ModelUnknown> {
     let (stages, legacy) = match entry {
         CostEvidenceEntry::Training { sample, stages } => {
@@ -78,12 +123,12 @@ fn complete_observation_with_graph(
     let observed = sample(Some(stages), legacy, true).map_err(|_| ModelUnknown::InvalidSample)?;
     let shape = &observed.actual_shape;
     if shape.path != model::WaveExecutionPath::PlanRuntime
-        || !(shape.graph_state == model::WaveGraphState::Disabled
-            || (structured_v2
-                && matches!(
-                    shape.graph_state,
-                    model::WaveGraphState::Warm | model::WaveGraphState::ConfiguredEager
-                )))
+        || !matches!(
+            shape.graph_state,
+            model::WaveGraphState::Disabled
+                | model::WaveGraphState::Warm
+                | model::WaveGraphState::ConfiguredEager
+        )
         || shape.order != model::BatchOrderSemantics::Ordered
         || shape.restore_bytes != 0
         || shape.maintenance_bytes != 0
@@ -141,32 +186,11 @@ fn complete_observation_with_graph(
             StatisticalEvidenceUnknown::MissingProducer,
         ))?;
     selected.validate_exact(&exact)?;
-    if structured_v2 {
-        let qualified = stages
-            .structured_evidence
-            .as_ref()
-            .and_then(|value| value.as_ref().ok())
-            .ok_or(ModelUnknown::InvalidSample)?;
-        qualified
-            .validate_host_stages(stages)
-            .map_err(|_| ModelUnknown::InvalidSample)?;
-        let recipe = selected
-            .structured_capture()
-            .ok_or(ModelUnknown::Evidence(
-                StatisticalEvidenceUnknown::MissingProducer,
-            ))??;
-        recipe.validate_exact(&exact)?;
-        recipe.algorithm_work()?.validate_structure(recipe)?;
-        if !std::ptr::eq(qualified.recipe(), recipe.as_ref())
-            || qualified.full_wall_ns() != observed.timing.wall_total_ns
-        {
-            return Err(ModelUnknown::InvalidSample);
-        }
-    }
     if stages.call_id == 0 {
         return Err(ModelUnknown::InvalidSample);
     }
     Ok(CompleteSelectedObservation {
+        observation_memory: stages.observation_memory.clone(),
         call_id: stages.call_id,
         fingerprint: observed.fingerprint,
         exact,
@@ -175,5 +199,47 @@ fn complete_observation_with_graph(
         outcome: observed.outcome,
         observed_at_ns: observed.observed_at_ns,
         wall_ns: observed.timing.wall_total_ns,
+        qualified_host_stages: stages
+            .structured_evidence
+            .as_ref()
+            .and_then(|value| value.as_ref().ok())
+            .ok_or(ModelUnknown::InvalidSample)
+            .and_then(|qualified| {
+                qualified
+                    .validate_host_stages(stages)
+                    .map_err(|_| ModelUnknown::InvalidSample)
+            }),
     })
+}
+
+/// The V2 extension is checked against the already validated common facts.
+pub(in crate::continuous_engine::inner::cost_observation) fn validate_structured_actual(
+    entry: &CostEvidenceEntry,
+    actual: &CompleteSelectedObservation,
+) -> Result<(), ModelUnknown> {
+    actual.qualified_host_stages?;
+    let stages = match entry {
+        CostEvidenceEntry::Training { stages, .. } => stages.as_deref(),
+        CostEvidenceEntry::StagesOnly { stages, .. } => Some(stages.as_ref()),
+    }
+    .ok_or(ModelUnknown::InvalidSample)?;
+    let qualified = stages
+        .structured_evidence
+        .as_ref()
+        .and_then(|value| value.as_ref().ok())
+        .ok_or(ModelUnknown::InvalidSample)?;
+    let recipe = actual
+        .selected
+        .structured_capture()
+        .ok_or(ModelUnknown::Evidence(
+            StatisticalEvidenceUnknown::MissingProducer,
+        ))??;
+    recipe.validate_exact(&actual.exact)?;
+    recipe.algorithm_work()?.validate_structure(recipe)?;
+    if !std::ptr::eq(qualified.recipe(), recipe.as_ref())
+        || qualified.full_wall_ns() != actual.wall_ns
+    {
+        return Err(ModelUnknown::InvalidSample);
+    }
+    Ok(())
 }

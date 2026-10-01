@@ -169,8 +169,27 @@ impl OperationProvider<CudaDeviceRuntime> for Scale {
         }
         .unwrap()
         .with_work_attribution(DeviceBatchingForm::Packed, 1, 1, 1, 0)
-        .unwrap()
-        .with_statistical_evidence(self.selected_cost(&invocation));
+        .unwrap();
+        let command = if self.structured_capture.is_disabled() {
+            command
+        } else {
+            command.with_observation(
+                invocation
+                    .observation_template_budget()
+                    .unwrap()
+                    .reserve(std::mem::size_of::<ScaleObservation>())
+                    .unwrap()
+                    .retain(Arc::new(ScaleObservation))
+                    .unwrap()
+                    .packet(
+                        ferrum_interfaces::vnext::FrozenObservationInput::from_work_shape(
+                            invocation.work_shape(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+            )
+        };
         // A deliberately unavailable declared API contract exercises the
         // gate without inventing a selected library algorithm for this scale.
         let command = if self.missing_library_contract {
@@ -187,6 +206,68 @@ impl OperationProvider<CudaDeviceRuntime> for Scale {
     }
 }
 
+struct ScaleObservation;
+impl ferrum_interfaces::vnext::DeviceObservationTemplate for ScaleObservation {
+    fn command_count(&self) -> usize {
+        1
+    }
+    fn retained_payload_bytes(&self) -> Option<usize> {
+        Some(std::mem::size_of::<Self>())
+    }
+    fn projection_retained_bytes_upper_bound(&self) -> Option<usize> {
+        ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1::maximum_payload_bytes(1)?
+            .checked_add(std::mem::size_of::<
+                Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+            >())
+    }
+    fn project(
+        &self,
+        input: &ferrum_interfaces::vnext::FrozenObservationInput,
+    ) -> Result<
+        Vec<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>>,
+        ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown,
+    > {
+        if input.tokens() != 1 || input.participant_ranges().len() != 1 {
+            return Err(
+                ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown::CommandMismatch,
+            );
+        }
+        Ok(vec![scale_evidence()])
+    }
+}
+fn scale_evidence() -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
+    use ferrum_interfaces::execution_cost::{
+        KernelNumericWorkV1, KernelReplayGeometryV1, SelectedAlgorithmClassV1,
+        SelectedCommandCostBuilderV1,
+    };
+    let mut builder = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
+    let algorithm = SelectedAlgorithmClassV1::new(
+        "scale_inplace_f16",
+        1,
+        Sha256::digest(crate::ptx::FUSED_SILU_MUL.as_bytes()).into(),
+        Sha256::digest(b"in-place-f16.fixed-32-thread").into(),
+    )
+    .unwrap();
+    builder
+        .kernel_with_replay_geometry(
+            algorithm,
+            KernelNumericWorkV1 {
+                logical_units: 4,
+                padded_units: 32,
+                inner_units_per_logical_unit: 1,
+                grid: [1, 1, 1],
+                scratch_bytes: 0,
+                staged_weight_bytes: 0,
+            },
+            KernelReplayGeometryV1 {
+                block: [32, 1, 1],
+                dynamic_shared_bytes: 0,
+                fixed_parameters: &[4, u64::from(2_f32.to_bits())],
+            },
+        )
+        .unwrap();
+    Some(builder.finish().unwrap())
+}
 impl Scale {
     fn selected_cost(
         &self,
@@ -212,33 +293,7 @@ impl Scale {
                 CanonicalRational::new(2, 1).unwrap()
             ))
         );
-        let mut builder = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
-        let algorithm = SelectedAlgorithmClassV1::new(
-            "scale_inplace_f16",
-            1,
-            Sha256::digest(crate::ptx::FUSED_SILU_MUL.as_bytes()).into(),
-            Sha256::digest(b"in-place-f16.fixed-32-thread").into(),
-        )
-        .unwrap();
-        builder
-            .kernel_with_replay_geometry(
-                algorithm,
-                KernelNumericWorkV1 {
-                    logical_units: 4,
-                    padded_units: 32,
-                    inner_units_per_logical_unit: 1,
-                    grid: [1, 1, 1],
-                    scratch_bytes: 0,
-                    staged_weight_bytes: 0,
-                },
-                KernelReplayGeometryV1 {
-                    block: [32, 1, 1],
-                    dynamic_shared_bytes: 0,
-                    fixed_parameters: &[4, u64::from(2_f32.to_bits())],
-                },
-            )
-            .unwrap();
-        Some(builder.finish().unwrap())
+        scale_evidence()
     }
     fn binding_command(
         &self,
@@ -726,6 +781,23 @@ impl Fixture {
         program: Option<&DeviceReusableExecutionProgram>,
         timing: &S,
     ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
+        self.dispatch_program_with_device_timing(
+            wave,
+            guard,
+            program,
+            timing,
+            DeviceTimingMode::Off,
+        )
+    }
+
+    pub(super) fn dispatch_program_with_device_timing<S: SubmissionWaveDispatchTimingSink>(
+        &self,
+        wave: PreparedStepSubmissionWave<CudaDeviceRuntime>,
+        guard: Option<&dyn PreparedWaveSubmissionGuard>,
+        program: Option<&DeviceReusableExecutionProgram>,
+        timing: &S,
+        device_timing: DeviceTimingMode,
+    ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
         let active = TrustedActiveSequenceBinding::from_session(&self.session).unwrap();
         let identity = OperationDispatch::bind_submission_wave_identity(
             self.compilation.executable(),
@@ -764,14 +836,17 @@ impl Fixture {
                 ),
             );
         };
-        OperationDispatch::encode_and_submit_guarded_wave_with_program_and_timing(
+        OperationDispatch::encode_and_submit_guarded_wave_with_device_timing_and_cost_evidence_demand(
             self.providers.providers(),
             self.compilation.executable(),
             &identity,
             [&active].into_iter(),
+            device_timing,
             &[input],
             program,
             guard,
+            DeviceCostObservationDemand::Required,
+            ferrum_interfaces::execution_cost::StructuredCostSampleDemand::RuntimePolicy,
             timing,
             wave,
             &self.lane,

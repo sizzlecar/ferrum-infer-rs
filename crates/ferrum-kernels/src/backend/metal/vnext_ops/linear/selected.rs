@@ -8,6 +8,9 @@ use ferrum_interfaces::execution_cost::{
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
+pub(super) mod prepared;
+use prepared::PreparedLinearClasses;
+
 /// Numeric description of the actual dispatch_grid ABI.
 /// Native/transformed paths outside this first producer return None.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +154,7 @@ fn plain(
     pipelines: &MetalLinearPipelines,
     launch: LinearLaunch,
     scratch: u64,
+    classes: Option<&PreparedLinearClasses>,
 ) -> Option<()> {
     if launch.transform.is_some() {
         return None;
@@ -158,7 +162,13 @@ fn plain(
     let (pipeline, kind) =
         pipelines.plain_linear_dispatch(launch.format, launch.activation_type, launch.params);
     let geometry = grid(launch.params, kind)?;
-    let algorithm = class(entry(pipelines, pipeline)?, launch, geometry, false)?;
+    let algorithm = selected_class(
+        classes,
+        entry(pipelines, pipeline)?,
+        launch,
+        geometry,
+        false,
+    )?;
     builder
         .kernel(
             algorithm,
@@ -182,6 +192,30 @@ pub(super) fn projection(
     policy: Option<staged_prefill::StagingPolicy>,
     scratch: u64,
 ) -> Option<()> {
+    projection_with_classes(builder, pipelines, launch, policy, scratch, None)
+}
+
+fn selected_class(
+    classes: Option<&PreparedLinearClasses>,
+    entry: &'static str,
+    launch: LinearLaunch,
+    geometry: Grid,
+    staged: bool,
+) -> Option<SelectedAlgorithmClassV1> {
+    match classes {
+        Some(classes) => classes.get(entry, launch, geometry, staged),
+        None => class(entry, launch, geometry, staged),
+    }
+}
+
+pub(super) fn projection_with_classes(
+    builder: &mut SelectedCommandCostBuilderV1,
+    pipelines: &MetalLinearPipelines,
+    launch: LinearLaunch,
+    policy: Option<staged_prefill::StagingPolicy>,
+    scratch: u64,
+    classes: Option<&PreparedLinearClasses>,
+) -> Option<()> {
     if launch.transform.is_some() {
         return None;
     }
@@ -203,7 +237,7 @@ pub(super) fn projection(
         };
         builder
             .kernel(
-                class(stage_name, launch, stage, true)?,
+                selected_class(classes, stage_name, launch, stage, true)?,
                 KernelNumericWorkV1 {
                     logical_units: elements,
                     padded_units: stage.padded_outputs,
@@ -217,7 +251,7 @@ pub(super) fn projection(
         let geometry = grid(launch.params, LinearDispatchKind::TiledGemm)?;
         builder
             .kernel(
-                class("gemm_f16a_f16w_tiled", launch, geometry, true)?,
+                selected_class(classes, "gemm_f16a_f16w_tiled", launch, geometry, true)?,
                 KernelNumericWorkV1 {
                     logical_units: u64::from(launch.params.rows)
                         .checked_mul(u64::from(launch.params.out_features))?,
@@ -231,14 +265,14 @@ pub(super) fn projection(
             .ok()?;
     } else if let Some(parts) = launch.plain_plan.grouped_parts(launch) {
         for part in parts {
-            plain(builder, pipelines, part, scratch)?;
+            plain(builder, pipelines, part, scratch, classes)?;
         }
     } else if let Some(parts) = launch.plain_plan.parts(launch) {
         for part in parts {
-            plain(builder, pipelines, part, scratch)?;
+            plain(builder, pipelines, part, scratch, classes)?;
         }
     } else {
-        plain(builder, pipelines, launch, scratch)?;
+        plain(builder, pipelines, launch, scratch, classes)?;
     }
     Some(())
 }
@@ -267,14 +301,39 @@ pub(super) fn swiglu(
     tokens: u64,
     scratch: u64,
 ) -> Option<SelectedCommandCostEvidenceV1> {
+    swiglu_with_prepared_classes(
+        pipelines, gate, down, activation, policy, tokens, scratch, None,
+    )
+}
+
+pub(super) fn swiglu_with_prepared_classes(
+    pipelines: &MetalLinearPipelines,
+    gate: &[LinearLaunch],
+    down: LinearLaunch,
+    activation: SwiGluLaunch,
+    policy: Option<staged_prefill::StagingPolicy>,
+    tokens: u64,
+    scratch: u64,
+    classes: Option<&prepared::PreparedSwiGluClasses>,
+) -> Option<SelectedCommandCostEvidenceV1> {
+    if classes.is_some_and(|classes| classes.gate.len() != gate.len()) {
+        return None;
+    }
     let mut builder = crate::backend::metal::vnext_runtime::selected_cost_builder(
         pipelines.structured_capture(),
         tokens,
     );
     // Transformed routes are unavailable, so there is no hidden reuse decision
     // to reconstruct. Plain gate/up order is exactly Sequence::encode's order.
-    for &launch in gate {
-        projection(&mut builder, pipelines, launch, policy, scratch)?;
+    for (index, &launch) in gate.iter().enumerate() {
+        projection_with_classes(
+            &mut builder,
+            pipelines,
+            launch,
+            policy,
+            scratch,
+            classes.map(|classes| &classes.gate[index]),
+        )?;
     }
     let units = u64::from(activation.params.rows)
         .checked_mul(u64::from(activation.params.intermediate_size))?;
@@ -292,7 +351,10 @@ pub(super) fn swiglu(
     activation_abi.params.output_column_offset = 0;
     builder
         .kernel(
-            class(SWIGLU_KERNEL, activation_abi, geometry, false)?,
+            match classes {
+                Some(classes) => classes.activation(activation_abi, geometry)?,
+                None => class(SWIGLU_KERNEL, activation_abi, geometry, false)?,
+            },
             KernelNumericWorkV1 {
                 logical_units: units,
                 padded_units: geometry.padded_outputs,
@@ -303,9 +365,21 @@ pub(super) fn swiglu(
             },
         )
         .ok()?;
-    projection(&mut builder, pipelines, down, policy, scratch)?;
+    projection_with_classes(
+        &mut builder,
+        pipelines,
+        down,
+        policy,
+        scratch,
+        classes.map(|classes| &classes.down),
+    )?;
     builder.finish().ok()
 }
 
 #[cfg(test)]
 pub(super) mod tests;
+
+pub(super) mod observation;
+pub(super) use observation::{dense as dense_observation, swiglu as swiglu_observation};
+
+pub(super) use observation::payload_upper as observation_payload_upper;

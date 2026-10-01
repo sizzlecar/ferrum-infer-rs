@@ -108,7 +108,7 @@ impl StructuredCalibrationCollectorV2 {
             cohort_manifest: manifest,
             phase_members: options.phase_members,
         };
-        source.record(&serde_json::json!({
+        let mut header = serde_json::json!({
             "artifact_type":"ferrum.structured-live-source","schema_version":3,"model_revision":MODEL_REVISION_V2,
             "capture_identity":binding.identity(),"protocol":binding.protocol(),"declared_protocol":options.protocol_sha256,
             "rule_signature":rule,"fingerprint":profile::ProfileFingerprint::from(&fingerprint),
@@ -122,7 +122,12 @@ impl StructuredCalibrationCollectorV2 {
                 "max_phase_samples":options.settings.max_phase_samples,"max_axes":options.settings.max_axes,
                 "max_rank":options.settings.max_rank,"max_wave_ns":options.settings.max_wave_ns,
                 "max_age_ns":options.settings.max_sample_age_ns,"margin_ns":options.settings.static_margin_ns}
-        }))?;
+        });
+        if !options.settings.learned_drift.is_disabled() {
+            header["settings"]["learned_drift"] =
+                serde_json::to_value(options.settings.learned_drift)?;
+        }
+        source.record(&header)?;
         let cohorts = CohortLedgerV2::new(options.cohort_plan.clone())?;
         Ok(Self {
             options,

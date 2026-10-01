@@ -145,6 +145,16 @@ fn finish_resource_only_wave<R: DeviceRuntime>(
     Ok(identity)
 }
 
+fn poll_resource_budget(budget: &mut dyn ResourcePlanningBudget) -> Result<()> {
+    if budget.has_budget() {
+        Ok(())
+    } else {
+        Err(FerrumError::resource_exhausted(
+            "resource preparation original deadline expired",
+        ))
+    }
+}
+
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
     pub(super) async fn prepare_workspace_startup(
         &self,
@@ -243,18 +253,196 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }))
     }
 
+    pub(super) fn prepare_declared_resource_shapes(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePreparationRequest],
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<ferrum_interfaces::model_executor::ExecutorResourcePreparationReceipt> {
+        use ferrum_interfaces::model_executor::{
+            ExecutorResourcePreparationOutcome as Outcome, ExecutorResourcePreparationReceipt,
+        };
+        if requests.is_empty() {
+            return Err(FerrumError::invalid_request(
+                "resource preparation has no declared shapes",
+            ));
+        }
+        let mut ordered = Vec::with_capacity(requests.len());
+        for &request in requests {
+            if !budget.has_budget() {
+                return Ok(ExecutorResourcePreparationReceipt {
+                    outcome: Outcome::Unavailable,
+                    prepared_participants: 0,
+                });
+            }
+            let kind = match request.kind() {
+                ferrum_interfaces::execution_cost::ActualWaveKind::Prefill => {
+                    VNextExecutionWaveKind::Prefill
+                }
+                ferrum_interfaces::execution_cost::ActualWaveKind::Decode => {
+                    VNextExecutionWaveKind::Decode
+                }
+                _ => {
+                    return Err(FerrumError::invalid_request(
+                        "unsupported resource preparation phase",
+                    ))
+                }
+            };
+            let retained = u32::try_from(request.participants())
+                .ok()
+                .and_then(|rows| {
+                    request
+                        .participants()
+                        .checked_mul(request.tokens_per_sequence())
+                        .and_then(|tokens| u64::try_from(tokens).ok())
+                        .and_then(|tokens| self.reusable_bucket_for_shape(kind, rows, tokens, 0))
+                })
+                .is_some();
+            ordered.push((!retained, request));
+        }
+        // Resident lane slots consume shared pools after their owner retires.
+        // Materialize those real slots first so later transient preparation
+        // accounts for all retained claims. No extra shape or allocation is added.
+        ordered.sort_by_key(|(transient, _)| *transient);
+        let mut prepared_participants = 0usize;
+        for (_, request) in ordered {
+            if !budget.has_budget() {
+                return Ok(ExecutorResourcePreparationReceipt {
+                    outcome: Outcome::Unavailable,
+                    prepared_participants,
+                });
+            }
+            let outcome = self.prepare_declared_resource_shape(request, budget)?;
+            if outcome == Outcome::Prepared {
+                prepared_participants = prepared_participants
+                    .checked_add(request.participants())
+                    .ok_or_else(|| {
+                    FerrumError::internal("resource preparation receipt overflow")
+                })?;
+            }
+            if outcome != Outcome::Prepared || !budget.has_budget() {
+                return Ok(ExecutorResourcePreparationReceipt {
+                    outcome: if outcome == Outcome::Prepared {
+                        Outcome::Unavailable
+                    } else {
+                        outcome
+                    },
+                    prepared_participants,
+                });
+            }
+        }
+        Ok(ExecutorResourcePreparationReceipt {
+            outcome: Outcome::Prepared,
+            prepared_participants,
+        })
+    }
+
+    fn prepare_declared_resource_shape(
+        &self,
+        request: ferrum_interfaces::model_executor::ExecutorResourcePreparationRequest,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<ferrum_interfaces::model_executor::ExecutorResourcePreparationOutcome> {
+        use ferrum_interfaces::model_executor::ExecutorResourcePreparationOutcome as Outcome;
+        if !budget.has_budget() {
+            return Ok(Outcome::Unavailable);
+        }
+        let kind = match request.kind() {
+            ferrum_interfaces::execution_cost::ActualWaveKind::Prefill => {
+                VNextExecutionWaveKind::Prefill
+            }
+            ferrum_interfaces::execution_cost::ActualWaveKind::Decode => {
+                VNextExecutionWaveKind::Decode
+            }
+            _ => {
+                return Err(FerrumError::invalid_request(
+                    "unsupported resource preparation phase",
+                ))
+            }
+        };
+        if request.participants() > self.policy.memory().maximum_active_sequences as usize
+            || request.sequence_tokens() > self.maximum_model_tokens
+            || request
+                .participants()
+                .checked_mul(request.tokens_per_sequence())
+                .is_none_or(|tokens| {
+                    tokens as u64 > self.policy.admission().maximum_scheduled_tokens
+                })
+        {
+            return Ok(Outcome::Unavailable);
+        }
+        if self.sequences.lock().total_len() != 0 {
+            return Err(FerrumError::invalid_request(
+                "resource preparation requires an unused executor",
+            ));
+        }
+        let before = WorkspaceCapacitySnapshot::capture(&self.plan_resources)?;
+        let submissions = self.metrics.submitted_waves.load(Ordering::Acquire);
+        let result = self.prepare_resource_shape(
+            kind,
+            request.participants(),
+            request.sequence_tokens(),
+            request.tokens_per_sequence(),
+            None,
+            budget,
+        );
+        if self.sequences.lock().total_len() != 0
+            || self.metrics.submitted_waves.load(Ordering::Acquire) != submissions
+        {
+            return Err(FerrumError::internal(
+                "resource preparation retained owners or submitted model work",
+            ));
+        }
+        let after = WorkspaceCapacitySnapshot::capture(&self.plan_resources)?;
+        tracing::info!(target: "ferrum::resource_readiness", ?request, ?before, ?after,
+            failure = ?result.as_ref().err(),
+            "Declared resource preparation without model execution");
+        // Capacity failure is not a route proof and does not authorize actual
+        // inference as a fallback. The caller must recapture its original gap.
+        match result {
+            Ok(_) => Ok(Outcome::Prepared),
+            Err(FerrumError::ResourceExhausted { .. }) => Ok(Outcome::Unavailable),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn prepare_workspace_case(&self, case: &WorkspaceCase) -> Result<WorkspaceBucketReceipt> {
+        let (step, invocation) = self.prepare_resource_shape(
+            case.kind,
+            case.sequences,
+            case.tokens_per_sequence,
+            case.tokens_per_sequence,
+            Some(&case.bucket),
+            &mut || true,
+        )?;
+        Ok(WorkspaceBucketReceipt {
+            bucket: case.bucket.clone(),
+            sequences: case.sequences,
+            tokens_per_sequence: case.tokens_per_sequence,
+            step,
+            invocation,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_resource_shape(
+        &self,
+        kind: VNextExecutionWaveKind,
+        participants: usize,
+        sequence_tokens: usize,
+        tokens_per_sequence: usize,
+        expected_bucket: Option<&ReusableExecutionBucketId>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<(BatchStepId, BatchInvocationId)> {
         // Actual pending-prefill owners provide legal token-span and Sequence
         // authority. No decode state or cache handle is fabricated: `kind` here
         // selects a resource class only, and this path never executes that wave.
-        let tokens: Arc<[TokenId]> = vec![TokenId::new(0); case.tokens_per_sequence].into();
-        let mut owners = Vec::with_capacity(case.sequences);
+        let tokens: Arc<[TokenId]> = vec![TokenId::new(0); sequence_tokens].into();
+        let mut owners = Vec::with_capacity(participants);
         let mut sequences = BTreeMap::new();
-        for _ in 0..case.sequences {
+        for _ in 0..participants {
+            poll_resource_budget(budget)?;
             let mut owner = VNextStartupSequenceGuard::new(self);
             let request = self
-                .reserve_startup_sequence(&mut owner, &tokens, tokens.len())
-                .await?
+                .reserve_resource_preparation_sequence(&mut owner, &tokens, tokens.len())?
                 .ok_or_else(|| {
                     FerrumError::resource_exhausted(
                         "workspace startup admission could not fit the full declared bucket",
@@ -297,26 +485,49 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             })
             .collect::<Result<Vec<_>>>()?;
         let ids = tokens.iter().map(|token| token.get()).collect::<Vec<_>>();
-        let span = TokenSpanWork::from_token_ids(&ids, 0..ids.len())
+        let span = TokenSpanWork::from_token_ids(&ids, 0..tokens_per_sequence)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let sequence_span = TokenSpanWork::from_token_ids(&ids, 0..ids.len())
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         for sequence in &sequences {
-            let work = ResourceWorkShape::single(span.clone())
+            poll_resource_budget(budget)?;
+            let work = ResourceWorkShape::single(sequence_span.clone())
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
             match self.extend_sequence_with_capacity(sequence, work)? {
                 VNextExecutionCapacityDecision::Ready(()) => {}
-                _ => return Err(FerrumError::resource_exhausted("workspace startup Sequence backing remains deferred within the original maintenance/capacity limits")),
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "workspace Sequence backing deferred: {deferred:?}"
+                    )))
+                }
+                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "workspace Sequence Request-state deferred: {deferred:?}"
+                    )))
+                }
             }
         }
+        poll_resource_budget(budget)?;
         let spans = vec![span; sequences.len()];
-        let step = match self.begin_step_for_spans_with_capacity(&batch, &sequences, &spans, case.kind)? {
-            VNextExecutionCapacityDecision::Ready(step) => step,
-            _ => return Err(FerrumError::resource_exhausted("workspace startup Step remains deferred within the original maintenance/capacity limits")),
-        };
-        if step
-            .reusable_execution_bucket()
-            .map(|bucket| bucket.bucket_id())
-            != Some(&case.bucket)
-        {
+        let step =
+            match self.begin_step_for_spans_with_capacity(&batch, &sequences, &spans, kind)? {
+                VNextExecutionCapacityDecision::Ready(step) => step,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "workspace Step deferred: {deferred:?}"
+                    )))
+                }
+                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "workspace Step Request-state deferred: {deferred:?}"
+                    )))
+                }
+            };
+        if expected_bucket.is_some_and(|expected| {
+            step.reusable_execution_bucket()
+                .map(|bucket| bucket.bucket_id())
+                != Some(expected)
+        }) {
             return Err(self.abort_unsubmitted_step(
                 step,
                 FerrumError::internal(
@@ -324,9 +535,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ),
             ));
         }
-        let wave = match self.prepare_wave_for_spans_with_capacity(&step, &sequences, &spans, case.kind) {
+        if let Err(error) = poll_resource_budget(budget) {
+            return Err(self.abort_unsubmitted_step(step, error));
+        }
+        let wave = match self.prepare_wave_for_spans_with_capacity(&step, &sequences, &spans, kind)
+        {
             Ok(VNextExecutionCapacityDecision::Ready(wave)) => wave,
-            Ok(_) => return Err(self.abort_unsubmitted_step(step, FerrumError::resource_exhausted("workspace startup full wave remains deferred within the original maintenance/capacity limits"))),
+            Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
+                return Err(self.abort_unsubmitted_step(
+                    step,
+                    FerrumError::resource_exhausted(format!(
+                        "workspace Invocation deferred: {deferred:?}"
+                    )),
+                ))
+            }
+            Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
+                return Err(self.abort_unsubmitted_step(
+                    step,
+                    FerrumError::resource_exhausted(format!(
+                        "workspace Invocation Request-state deferred: {deferred:?}"
+                    )),
+                ))
+            }
             Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
         };
         let (step, invocation) = finish_resource_only_wave(wave, step)?;
@@ -335,13 +565,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         for owner in owners {
             owner.complete()?;
         }
-        Ok(WorkspaceBucketReceipt {
-            bucket: case.bucket.clone(),
-            sequences: case.sequences,
-            tokens_per_sequence: case.tokens_per_sequence,
-            step,
-            invocation,
-        })
+        Ok((step, invocation))
     }
 }
 

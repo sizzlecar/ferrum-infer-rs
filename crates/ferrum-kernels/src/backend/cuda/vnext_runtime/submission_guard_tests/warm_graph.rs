@@ -166,7 +166,7 @@ fn warm_rejected_then_retry_fixture<S: SubmissionWaveDispatchTimingSink>(
         _ => panic!("warm final guard must reject before enqueue or graph launch"),
     };
     assert!(guard.actual.lock().unwrap().is_some());
-    assert_selected_replay(guard.actual.lock().unwrap().as_ref().unwrap(), structured);
+    assert_selected_replay(guard.actual.lock().unwrap().as_ref().unwrap(), false);
     assert_eq!(
         f.output_bytes(),
         before_output,
@@ -208,15 +208,21 @@ fn warm_rejected_then_retry_fixture<S: SubmissionWaveDispatchTimingSink>(
         dispatched(f.dispatch_program_with_timing(wave, Some(&guard), Some(&program), timing))
             .into_parts();
     let attribution = attribution.unwrap();
-    assert_selected_replay(attribution.device(), structured);
+    assert_eq!(
+        attribution.device().has_unresolved_observation(),
+        structured
+    );
+    assert_selected_replay(attribution.device(), false);
     assert_eq!(
         attribution.device(),
         guard.actual.lock().unwrap().as_ref().unwrap()
     );
-    assert_selected_replay(guard.actual.lock().unwrap().as_ref().unwrap(), structured);
+    assert_selected_replay(guard.actual.lock().unwrap().as_ref().unwrap(), false);
     assert_eq!(f.encoded.load(Ordering::Relaxed), encoded);
     assert_eq!(f.enqueues.load(Ordering::Relaxed), enqueues);
     finish(&f, handle);
+    let resolved = attribution.device().clone().resolve_observation().unwrap();
+    assert_selected_replay(&resolved, structured);
     step.try_retire_normal().unwrap();
     f.close(true);
 }

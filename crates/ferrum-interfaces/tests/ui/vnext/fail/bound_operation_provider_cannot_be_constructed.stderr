@@ -21,4 +21,4 @@ error: cannot construct `ferrum_interfaces::vnext::BoundOperationProvider<'_, _>
 13 |         node_id,
    |         ------- private field
    |
-   = note: ...and other private field `dispatch` that was not provided
+   = note: ...and other private fields `dispatch`, `cost_data` and `decode_context_coverage` that were not provided

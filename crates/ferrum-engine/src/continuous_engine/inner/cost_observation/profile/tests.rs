@@ -233,7 +233,7 @@ fn file_import_retains_verified_provenance_and_age_at_process_start() {
     let runtime = fixture.build(Arc::new(Clock(AtomicU64::new(0)))).unwrap();
     let receipt = runtime.profile_receipt().unwrap();
     let bytes = fs::read(&fixture.path).unwrap();
-    assert_eq!(receipt.path, fixture.path.canonicalize().unwrap());
+    assert_eq!(receipt.path, Some(fixture.path.canonicalize().unwrap()));
     assert_eq!(
         receipt.file_sha256,
         format!("sha256:{:x}", Sha256::digest(&bytes))

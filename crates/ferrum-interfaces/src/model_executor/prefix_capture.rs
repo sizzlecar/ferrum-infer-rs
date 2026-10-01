@@ -38,6 +38,15 @@ pub struct PrefixCaptureRequest<'a> {
     pub expires_at: Instant,
 }
 
+/// Read-only lookup for an already admitted, untouched restore target. This
+/// does not wait for a producer or arm a future capture.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefixReadyRestoreRequest<'a> {
+    pub request_id: &'a RequestId,
+    pub input_tokens: &'a [TokenId],
+    pub maximum_sequence_tokens: usize,
+}
+
 /// Token lengths are only a boundary-planning hint. The caller must establish
 /// exact token equality; capture and restore independently validate full input
 /// and native source/target identity before making state available.

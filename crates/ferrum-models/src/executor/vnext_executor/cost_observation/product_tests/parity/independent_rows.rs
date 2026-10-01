@@ -141,7 +141,7 @@ async fn run(lengths: [usize; 3]) -> ([u8; 32], [u8; 32], DeviceNumericWorkV1, V
     ));
     assert_eq!(output.len(), 3);
     assert_eq!(fixture.submissions(), before + 1);
-    assert_canonical(&probe, &predicted.shape);
+    assert_canonical(&mut probe, &predicted.shape);
     let observations = probe.recorder.observations();
     let actual = observations[0].shape.as_ref().unwrap();
     let observed = actual

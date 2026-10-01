@@ -530,3 +530,26 @@ fn caller_deadline_charges_reads_before_snapshot_observation_and_cannot_extend_c
         }
     ));
 }
+
+#[test]
+fn required_query_observation_preserves_mapped_clock_and_mapping_failure() {
+    use super::super::{PlanningObservedCost, PlanningQueryOutcome};
+    let model = model();
+    let adapter =
+        AnchoredPlanningCostModel::new(model.as_ref(), PlanningCostClockAnchor::exact(1000, 40));
+    let original = adapter.predict_with_evidence(&fingerprint(), &shape(), None, 1000);
+    let observed = adapter.predict_observed(&fingerprint(), &shape(), None, 1000);
+    assert_eq!(observed.cost(), original);
+    assert_eq!(observed.cost_now_ns, Some(40));
+    assert_eq!(
+        adapter.predict_observed(&fingerprint(), &shape(), None, 999),
+        PlanningObservedCost {
+            outcome: PlanningQueryOutcome::ClockMappingFailed,
+            cost_now_ns: None
+        }
+    );
+    assert!(adapter
+        .predict_observed(&fingerprint(), &shape(), None, 1071)
+        .cost()
+        .is_none());
+}

@@ -1,3 +1,7 @@
+#[path = "vnext_device_operation_wave_contract/route_population.rs"]
+mod route_population;
+#[path = "vnext_device_operation_wave_contract/structured_demand.rs"]
+mod structured_demand;
 mod vnext_device_operation_contract;
 mod vnext_device_operation_wave_contract;
 

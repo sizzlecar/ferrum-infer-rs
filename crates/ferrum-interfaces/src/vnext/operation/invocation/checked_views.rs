@@ -127,7 +127,9 @@ impl<'a, B> InvocationViews<'a, B> {
                         "operation logical buffer range is empty or outside its resource",
                     ));
                 }
-                views.push(actual);
+                // Numeric views own their retained descriptor. Native full
+                // view validation can keep the borrowed result allocation-free.
+                views.push(actual.into_owned());
             }
         }
         Ok(())

@@ -7,6 +7,10 @@ use ferrum_interfaces::vnext::{
     PhysicalWeightLayout,
 };
 
+mod prepared;
+pub(super) use prepared::{prepare_dense, prepare_swiglu};
+use prepared::{PreparedDenseCostData, PreparedSwiGluCostData};
+
 /// Bounded, resource-free translation using the same ABI metadata translator
 /// as resolve_weight. Only plain leaves or a two-part plain composite qualify.
 pub(super) fn plain_weight(
@@ -80,56 +84,49 @@ pub(super) fn swiglu_route(
     {
         return Ok(None);
     }
-    let calculate = || -> Result<Option<(u64, Option<SelectedCommandCostEvidenceV1>)>, String> {
-        let hidden = unsigned_attribute(request.attributes(), "hidden_size")?;
-        let intermediate = unsigned_attribute(request.attributes(), "intermediate_size")?;
-        if hidden == 0 || intermediate == 0 {
-            return Err("SwiGLU cost has empty features".into());
+    let fallback;
+    let data = match request.prepared_cost_data::<PreparedSwiGluCostData>() {
+        Some(data) => data,
+        None => {
+            let Some(value) =
+                PreparedSwiGluCostData::unprepared(request.attributes(), request.bindings())
+                    .map_err(invalid_plan)?
+            else {
+                return Ok(None);
+            };
+            fallback = value;
+            &fallback
         }
-        validate_swiglu_bindings(request.bindings(), hidden, intermediate)?;
-        let Some((gate_components, gate_layout)) = plain_weight(
-            binding(request.bindings(), ResolvedValueRole::Input, 1)?,
-            true,
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some((down_components, down_layout)) = plain_weight(
-            binding(request.bindings(), ResolvedValueRole::Input, 2)?,
-            false,
-        )?
-        else {
-            return Ok(None);
-        };
-        let packed = intermediate
-            .checked_mul(2)
-            .ok_or("SwiGLU packed width overflows")?;
-        let gate_parts = match &gate_layout {
-            MetalResolvedWeightLayout::Composite { parts } => {
-                prepare_gate_up_partition(parts, intermediate, hidden, |layout, offset| {
-                    prepare_leaf_encoding(&gate_components, layout, intermediate, hidden, 2, offset)
-                })?
-            }
-            layout => vec![prepare_leaf_encoding(
-                &gate_components,
-                layout,
-                packed,
-                hidden,
-                2,
-                0,
-            )?],
-        };
-        let down =
-            prepare_leaf_encoding(&down_components, &down_layout, hidden, intermediate, 1, 0)?;
-        let tokens = request.immediate_tokens();
+    };
+    OperationCostRoute::new(vec![swiglu_command(
+        pipelines,
+        data,
+        request.rows().len() as u32,
+        request.immediate_tokens(),
+    )?])
+    .map(Some)
+}
+
+// The fresh and prepared paths share this exact current-query renderer.
+fn swiglu_command(
+    pipelines: &MetalLinearPipelines,
+    data: &PreparedSwiGluCostData,
+    participants: u32,
+    tokens: u64,
+) -> Result<OperationCostCommand, VNextError> {
+    let calculate = || -> Result<(u64, Option<SelectedCommandCostEvidenceV1>), String> {
+        let hidden = data.hidden;
+        let intermediate = data.intermediate;
+        let packed = data.packed;
+        let gate_parts = &data.gate;
+        let down = data.down;
         let elements = tokens
             .checked_mul(intermediate)
             .ok_or("SwiGLU activation elements overflow")?;
         let activation_bytes = elements
             .checked_mul(6)
             .ok_or("SwiGLU activation bytes overflow")?;
-        let staging_bytes =
-            staged_prefill::workspace_bytes(request.bindings(), hidden, intermediate)?;
+        let staging_bytes = data.staging_bytes;
         let scratch_bytes = activation_bytes
             .checked_add(staging_bytes)
             .ok_or("SwiGLU total scratch bytes overflow")?;
@@ -145,7 +142,7 @@ pub(super) fn swiglu_route(
         let policy = (staging_bytes > 0).then_some(staged_prefill::StagingPolicy::SwiGlu);
         let mut launches = Vec::with_capacity(gate_parts.len());
         let mut dispatches = 1_u64; // Pointwise activation, shared by all rows.
-        for part in gate_parts {
+        for &part in gate_parts {
             let launch = linear_launch(part, 0, 0, tokens, hidden, packed, 0, 0)?;
             launch.activation_bytes()?;
             dispatches += staged_prefill::policy_dispatch_count(launch, policy);
@@ -154,7 +151,7 @@ pub(super) fn swiglu_route(
         let launch = linear_launch(down, 0, 0, tokens, intermediate, hidden, 0, 0)?;
         launch.activation_bytes()?;
         dispatches += staged_prefill::policy_dispatch_count(launch, policy);
-        let statistics = selected::swiglu(
+        let statistics = selected::swiglu_with_prepared_classes(
             pipelines,
             &launches,
             launch,
@@ -162,13 +159,11 @@ pub(super) fn swiglu_route(
             policy,
             tokens,
             scratch_bytes,
+            data.classes.as_ref(),
         );
-        Ok(Some((dispatches, statistics)))
+        Ok((dispatches, statistics))
     };
-    let Some((dispatches, statistics)) = calculate().map_err(invalid_plan)? else {
-        return Ok(None);
-    };
-    let participants = request.rows().len() as u32;
+    let (dispatches, statistics) = calculate().map_err(invalid_plan)?;
     let command = OperationCostCommand::new(
         "vnext_dense_swiglu",
         DeviceCommandPhase::Compute,
@@ -179,7 +174,7 @@ pub(super) fn swiglu_route(
         },
         0,
         participants,
-        request.immediate_tokens(),
+        tokens,
         dispatches,
         0,
     )?;
@@ -191,7 +186,7 @@ pub(super) fn swiglu_route(
     } else {
         command
     };
-    OperationCostRoute::new(vec![command]).map(Some)
+    Ok(command)
 }
 
 pub(super) fn dense_command_selected(
@@ -250,51 +245,26 @@ pub(super) fn dense_route(
     if request.operation_id().as_str() != DENSE_LINEAR_OPERATION_ID {
         return Ok(None);
     }
-    let get_part = || -> Result<Option<PreparedLinearPart>, String> {
-        let input = unsigned_attribute(request.attributes(), "in_features")?;
-        let output = unsigned_attribute(request.attributes(), "out_features")?;
-        if input == 0 || output == 0 {
-            return Err("dense cost route has empty features".into());
+    let fallback;
+    let data = match request.prepared_cost_data::<PreparedDenseCostData>() {
+        Some(data) => data,
+        None => {
+            let Some(value) =
+                PreparedDenseCostData::unprepared(request.attributes(), request.bindings())
+                    .map_err(invalid_plan)?
+            else {
+                return Ok(None);
+            };
+            fallback = value;
+            &fallback
         }
-        checked_u32(input, "dense cost route input width")?;
-        checked_u32(output, "dense cost route output width")?;
-        validate_dense_linear_bindings(request.bindings(), input, output)?;
-        let binding = binding(request.bindings(), ResolvedValueRole::Input, 1)?;
-        let Some((metadata, layout)) = plain_weight(binding, false)? else {
-            return Ok(None);
-        };
-        prepare_leaf_encoding(&metadata, &layout, output, input, 1, 0).map(Some)
-    };
-    let Some(part) = get_part().map_err(invalid_plan)? else {
-        return Ok(None);
     };
     let input_packed =
         request.binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)?;
     let output_packed =
         request.binding_uses_packed_batch_coordinates(ResolvedValueRole::Output, 0)?;
     let packed = input_packed && output_packed;
-    let mut launches = Vec::new();
-    launches
-        .try_reserve_exact(if packed { 1 } else { request.rows().len() })
-        .map_err(|_| invalid_plan("dense cost route launch capacity unavailable"))?;
-    let input = unsigned_attribute(request.attributes(), "in_features").map_err(invalid_plan)?;
-    let output = unsigned_attribute(request.attributes(), "out_features").map_err(invalid_plan)?;
-    let mut append = |tokens: u64| -> Result<(), VNextError> {
-        // Launch contains numeric offsets only. No buffers, invocation, scratch
-        // reservation, or device encoding is created by this calculation.
-        let launch =
-            linear_launch(part, 0, 0, tokens, input, output, 0, 0).map_err(invalid_plan)?;
-        launch.activation_bytes().map_err(invalid_plan)?;
-        launches.push(launch);
-        Ok(())
-    };
-    if packed {
-        append(request.immediate_tokens())?;
-    } else {
-        for row in request.rows() {
-            append(row.count.get())?;
-        }
-    }
+    let launches = dense_launches(data, request.rows(), request.immediate_tokens(), packed)?;
     OperationCostRoute::new(vec![dense_command_selected(
         pipelines,
         request.rows().len() as u32,
@@ -302,6 +272,37 @@ pub(super) fn dense_route(
         &launches,
     )?])
     .map(Some)
+}
+
+// Only fixed ABI inputs are prepared. Actual rows, packed storage decisions,
+// launch partitioning and the current PSO/statistical evidence stay per query.
+fn dense_launches(
+    data: &PreparedDenseCostData,
+    rows: &[ferrum_interfaces::vnext::OperationCostWorkRow],
+    immediate_tokens: u64,
+    packed: bool,
+) -> Result<Vec<LinearLaunch>, VNextError> {
+    let mut launches = Vec::new();
+    launches
+        .try_reserve_exact(if packed { 1 } else { rows.len() })
+        .map_err(|_| invalid_plan("dense cost route launch capacity unavailable"))?;
+    let mut append = |tokens: u64| -> Result<(), VNextError> {
+        // Launch contains numeric offsets only. No buffers, invocation, scratch
+        // reservation, or device encoding is created by this calculation.
+        let launch = linear_launch(data.part, 0, 0, tokens, data.input, data.output, 0, 0)
+            .map_err(invalid_plan)?;
+        launch.activation_bytes().map_err(invalid_plan)?;
+        launches.push(launch);
+        Ok(())
+    };
+    if packed {
+        append(immediate_tokens)?;
+    } else {
+        for row in rows {
+            append(row.count.get())?;
+        }
+    }
+    Ok(launches)
 }
 
 #[cfg(test)]

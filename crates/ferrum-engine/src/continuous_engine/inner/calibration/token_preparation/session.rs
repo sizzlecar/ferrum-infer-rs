@@ -14,13 +14,19 @@ impl CalibrationSession {
         contract: Arc<OutputProjectionContract>,
         declaration: CalibrationPrefixTokensV1,
     ) -> Result<CreditedOutputSession> {
-        if self.prefix_source5 {
+        if self.prefix_source5 || self.prefix_source8 {
             return Err(invalid(
                 "source5 prefix authority comes only from its frozen cohort plan",
             ));
         }
-        self.install_prefix_request(request, context, contract, declaration, false)
-            .await
+        self.install_prefix_request(
+            request,
+            context,
+            contract,
+            declaration,
+            PrefixSource::Standalone,
+        )
+        .await
     }
 
     pub(super) async fn install_prefix_request(
@@ -29,7 +35,7 @@ impl CalibrationSession {
         context: InferenceRequestContext,
         contract: Arc<OutputProjectionContract>,
         declaration: CalibrationPrefixTokensV1,
-        source5: bool,
+        source: PrefixSource,
     ) -> Result<CreditedOutputSession> {
         let config = &self.configuration().scheduler.slo.cost_observation;
         if self.pending.is_some()
@@ -40,8 +46,10 @@ impl CalibrationSession {
             || self.selected_capture_identity.is_some()
             || self.structured_capture.is_some()
             || self.structured_capture_v2.is_some()
-            || (self.structured_group_v2.is_some() != source5)
-            || self.prefix_source5 != source5
+            || (self.structured_group_v2.is_some() != (source == PrefixSource::Source5))
+            || self.prefix_source5 != (source == PrefixSource::Source5)
+            || self.prefix_source8 != (source == PrefixSource::Source8)
+            || (self.prepared_owner_capture.is_some() != (source == PrefixSource::Source8))
             || config.predictor != ferrum_types::SloCostPredictor::StructuredWholeWaveV2
             || !config.selected_feedback.is_disabled()
             || !config.structured_feedback.is_disabled()
@@ -112,8 +120,13 @@ impl CalibrationSession {
                 || !sequence.generated_tokens.is_empty()
                 || sequence.model_kv.is_some()
                 || sequence.prefill_tokens_processed != 0
-                || normal_numeric.empirical_content_domain
-                    != Some(HostContentDomainV1::PlainTextGreedyV1)
+                || !match normal_numeric.empirical_content_domain {
+                    Some(HostContentDomainV1::PlainTextGreedyV1) => true,
+                    Some(HostContentDomainV1::PlainTextInstalledV2(_)) => {
+                        source == PrefixSource::Source8
+                    }
+                    _ => false,
+                }
                 || sequence.sampling_params.max_tokens != maximum.get()
                 || sequence.credited_output.is_none()
             {
@@ -123,12 +136,32 @@ impl CalibrationSession {
             }
             sequence.calibration_prefix = Some(InstalledPrefix {
                 plan,
+                authority: match normal_numeric.empirical_content_domain {
+                    Some(HostContentDomainV1::PlainTextInstalledV2(_)) => {
+                        PrefixPreparationAuthority::InstalledPlainTextV8 {
+                            prepared_policy: None,
+                        }
+                    }
+                    _ => PrefixPreparationAuthority::LengthV5,
+                },
                 owner: frontier.owner_incarnation.get(),
                 original_policy: normal_policy,
                 original_numeric: normal_numeric,
                 pending_commit: None,
             });
             self.engine.inner.refresh_sequence_cost_policy(sequence);
+            let prepared_policy =
+                sequence.current_host_cost_policy(self.engine.inner.tokenizer.as_ref());
+            if let Some(InstalledPrefix {
+                authority:
+                    PrefixPreparationAuthority::InstalledPlainTextV8 {
+                        prepared_policy: bound,
+                    },
+                ..
+            }) = sequence.calibration_prefix.as_mut()
+            {
+                *bound = prepared_policy;
+            }
             if sequence
                 .cost_numeric_policy
                 .is_none_or(|p| p.empirical_content_domain.is_some())
@@ -138,9 +171,9 @@ impl CalibrationSession {
                     "prefix failed to distinguish intervention authority",
                 ));
             }
-            Ok(frontier.owner_incarnation.get())
+            Ok((frontier.owner_incarnation.get(), normal_numeric))
         })();
-        let owner = match bind {
+        let (owner, numeric_policy) = match bind {
             Ok(owner) => owner,
             Err(error) => {
                 self.prefix_preparation
@@ -165,6 +198,7 @@ impl CalibrationSession {
                     declaration,
                     released: None,
                     completed_length: false,
+                    installed_policy: (source == PrefixSource::Source8).then_some(numeric_policy),
                     last_call: 0,
                     last_fifo: 0,
                 },
@@ -199,7 +233,7 @@ impl CalibrationSession {
                 || (record.released.is_none()
                     && sequence.generated_tokens.len() >= record.declaration.release_generated)
                 || (row.decode_route != CalibrationDecodeRoute::Actual
-                    && (!self.prefix_source5 || record.released.is_none()))
+                    && (!(self.prefix_source5 || self.prefix_source8) || record.released.is_none()))
             {
                 return Err(invalid(
                     "prefix wave must use original route and release at its fixed frontier",
@@ -354,9 +388,10 @@ impl CalibrationSession {
                         after.generated_tokens
                     }
                     (None, Some(terminal))
-                        if terminal.finish_reason == ferrum_types::FinishReason::Length
-                            && terminal.generated_tokens == record.maximum_output as u64
-                            && terminal.terminal_handoff_succeeded
+                        if record.accepts_terminal(
+                            terminal.finish_reason,
+                            terminal.generated_tokens,
+                        ) && terminal.terminal_handoff_succeeded
                             && terminal.owner_matched
                             && !terminal.output_failed
                             && !terminal.physical_failed
@@ -364,11 +399,12 @@ impl CalibrationSession {
                             && record.released.is_some() =>
                     {
                         record.completed_length = true;
-                        record.maximum_output
+                        usize::try_from(terminal.generated_tokens)
+                            .map_err(|_| invalid("prefix terminal count overflow"))?
                     }
                     _ => {
                         return Err(invalid(
-                            "prefix terminal/frontier differs from complete Length population",
+                            "prefix terminal/frontier differs from its original declared policy",
                         ))
                     }
                 };
@@ -424,9 +460,9 @@ impl CalibrationSession {
     }
 
     pub fn release_prefix_preparation(&mut self, id: &RequestId) -> Result<PrefixReleasedV1> {
-        if self.prefix_source5 {
+        if self.prefix_source5 || self.prefix_source8 {
             return Err(invalid(
-                "source5 releases the complete declared cohort through its writer",
+                "prepared source releases the complete declared cohort through its writer",
             ));
         }
         self.release_prefix_preparation_inner(id)

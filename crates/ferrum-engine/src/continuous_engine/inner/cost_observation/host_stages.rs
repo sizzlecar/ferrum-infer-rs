@@ -30,6 +30,7 @@ pub enum HostStageQueueDisposition {
     Published,
     DroppedCapacity,
     DroppedContended,
+    DroppedWorkerStopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -114,12 +115,61 @@ pub struct HostStageEvidenceV1 {
     #[serde(skip)]
     pub structured_evidence:
         Option<Result<QualifiedStructuredWaveEvidenceV1, StructuredSettlementUnknown>>,
+    #[serde(skip)]
+    pub(super) route_evidence: Option<Arc<super::route_population::LiveRouteEvidence>>,
     pub prepare_started_at_ns: Option<u64>,
     pub executor_returned_at_ns: Option<u64>,
     pub rows: Vec<HostRowStageV1>,
     pub finalized_at_ns: Option<u64>,
     pub full_wall_ns: Option<u64>,
     pub completeness: HostStageCompleteness,
+    #[serde(skip)]
+    pub(super) observation_memory: Option<Arc<super::memory::ObservationBytePermit>>,
+}
+
+/// Borrow of the freshly built original stages. Only this producer can create it;
+/// downstream diagnostic copies still require validate_host_stages.
+pub(super) struct OriginalHostStages<'a>(&'a HostStageEvidenceV1);
+impl<'a> OriginalHostStages<'a> {
+    pub(super) fn get(self) -> &'a HostStageEvidenceV1 {
+        self.0
+    }
+}
+
+/// Original, fully settled private calibration. Only the host-stage producer
+/// can mint this receipt; diagnostic copies and numerical qualifiers cannot.
+/// The Arc is shared transiently while the FIFO entry is resolved.
+pub(super) struct CompletePrivateCalibrationSettlement {
+    stages: Arc<HostStageEvidenceV1>,
+    kind: PrivateCalibrationSettlementKind,
+}
+#[derive(Clone, Copy)]
+enum PrivateCalibrationSettlementKind {
+    PrefixPreparation,
+    StartupReadiness,
+}
+impl CompletePrivateCalibrationSettlement {
+    pub(super) fn prefix_observed_at(&self, stages: &Arc<HostStageEvidenceV1>) -> Option<u64> {
+        matches!(
+            self.kind,
+            PrivateCalibrationSettlementKind::PrefixPreparation
+        )
+        .then(|| self.observed_at(stages))
+        .flatten()
+    }
+    pub(super) fn readiness_observed_at(&self, stages: &Arc<HostStageEvidenceV1>) -> Option<u64> {
+        matches!(
+            self.kind,
+            PrivateCalibrationSettlementKind::StartupReadiness
+        )
+        .then(|| self.observed_at(stages))
+        .flatten()
+    }
+    fn observed_at(&self, stages: &Arc<HostStageEvidenceV1>) -> Option<u64> {
+        Arc::ptr_eq(&self.stages, stages)
+            .then_some(stages.finalized_at_ns)
+            .flatten()
+    }
 }
 
 fn serialize_fingerprint<S: serde::Serializer>(
@@ -183,6 +233,28 @@ impl HostStageEvidenceV1 {
             structured_evidence: &self.structured_evidence,
         }
     }
+    /// The original source protocol's borrowed fields. Diagnostic prediction
+    /// receipts remain on this object and never become source membership.
+    pub(super) fn source_view(&self) -> impl Serialize + '_ {
+        wire::SourceEvidence::new(self)
+    }
+
+    /// Qualified source evidence, without unrelated diagnostic sidecars. This
+    /// preserves the existing source schema and the original settlement proof.
+    pub(super) fn structured_source_view(&self) -> impl Serialize + '_ {
+        #[derive(Serialize)]
+        struct View<'a, S: Serialize> {
+            #[serde(flatten)]
+            stages: S,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            structured_evidence:
+                &'a Option<Result<QualifiedStructuredWaveEvidenceV1, StructuredSettlementUnknown>>,
+        }
+        View {
+            stages: self.source_view(),
+            structured_evidence: &self.structured_evidence,
+        }
+    }
     pub(super) fn structured_retained_overhead_bytes(&self) -> usize {
         let copies = usize::from(
             self.statistical_evidence
@@ -227,6 +299,11 @@ impl HostStageEvidenceV1 {
                     .map_or(0, |features| features.rows.capacity()),
             )?;
         }
+        rows = rows.checked_add(
+            self.route_evidence
+                .as_ref()
+                .map_or(0, |r| r.retained_rows()),
+        )?;
         Some(rows)
     }
 }
@@ -242,6 +319,24 @@ pub(super) struct HostRowProgress {
     terminal: Option<HostTerminalStageV1>,
     work: Option<HostCommittedWork>,
     status: Option<HostStageCompleteness>,
+}
+
+impl HostRowProgress {
+    pub(super) fn is_pristine(&self) -> bool {
+        self.ordinal.is_none()
+            && self.started.is_none()
+            && self.committed.is_none()
+            && self.published.is_none()
+            && self.completion_started.is_none()
+            && self.settled.is_none()
+            && self.terminal.is_none()
+            && self.work.is_none()
+            && self.status.is_none()
+    }
+
+    pub(super) fn committed_work(&self) -> Option<HostCommittedWork> {
+        self.work
+    }
 }
 
 /// Call-local correlation only. It owns no output/KV/scheduler authority.
@@ -343,6 +438,10 @@ impl EngineCostCall {
                     Err(CostSampleDrop::Contended) => HostStageQueueReceipt {
                         accepted_ordinal: None,
                         disposition: HostStageQueueDisposition::DroppedContended,
+                    },
+                    Err(CostSampleDrop::WorkerStopped) => HostStageQueueReceipt {
+                        accepted_ordinal: None,
+                        disposition: HostStageQueueDisposition::DroppedWorkerStopped,
                     },
                 });
             }
@@ -487,28 +586,125 @@ impl EngineCostCall {
     }
 
     pub(super) fn make_host_stages(&self) -> Option<Arc<HostStageEvidenceV1>> {
+        self.make_host_stages_with_preparation()
+            .map(|(stages, _)| stages)
+    }
+
+    pub(super) fn make_host_stages_with_preparation(
+        &self,
+    ) -> Option<(
+        Arc<HostStageEvidenceV1>,
+        Option<CompletePrivateCalibrationSettlement>,
+    )> {
+        let result = self.build_host_stages_with_preparation();
+        if self.rejection == Some(CostCallRejection::CalibrationPreparation)
+            && result.as_ref().is_none_or(|(_, proof)| proof.is_none())
+        {
+            self.diagnose_unclassified_preparation(
+                result.as_ref().map(|(stages, _)| stages.as_ref()),
+            );
+        }
+        result
+    }
+
+    // Worker-side failure-only diagnostics. Fixed scalar fields also cover
+    // early stage-construction failure; no extra clock read, shape serialization
+    // or numerical qualification is performed, and successful waves are silent.
+    fn diagnose_unclassified_preparation(&self, stages: Option<&HostStageEvidenceV1>) {
+        if !tracing::enabled!(
+            target: "ferrum_engine::continuous_engine::inner::cost_observation::runtime",
+            tracing::Level::WARN
+        ) {
+            return;
+        }
+        let wave = self.recorder.observations().first();
+        let actual = wave.and_then(|wave| wave.shape.as_ref());
+        let first_incomplete_row = stages.and_then(|stages| {
+            stages.rows.iter().find(|row| {
+                row.completeness != HostStageCompleteness::CompleteSingleWave
+                    || row.terminal.is_some()
+                    || row.completion_started_at_ns.is_some()
+            })
+        });
+        tracing::warn!(
+            target: "ferrum_engine::continuous_engine::inner::cost_observation::runtime",
+            event = "calibration_preparation_feedback_unclassified_v1",
+            call_id = self.call_id.get(),
+            source_generation = self.source_generation,
+            rejection = ?self.rejection,
+            stage_rejection = ?self.stage_rejection,
+            calibration_capture = self.calibration_capture.is_some(),
+            original_route_capture = self.calibration_capture.as_ref()
+                .is_some_and(|capture| capture.requests_original_route()),
+            live_ticket = self.live_ticket.is_some(),
+            dispatch_waves = self.dispatch.waves,
+            retained_waves = self.recorder.observations().len(),
+            dispatch_outcome = ?self.dispatch.outcome,
+            dispatch_unknown = ?self.dispatch.unknown,
+            call_boundary = ?self.boundary,
+            wave_outcome = ?wave.and_then(|wave| wave.outcome),
+            wave_boundary = ?wave.map(|wave| wave.boundary),
+            path = ?actual.map(|actual| actual.path),
+            row_order = ?actual.map(|actual| actual.row_order),
+            additional_work = ?actual.map(|actual| (
+                actual.restore_bytes, actual.maintenance_bytes, actual.maintenance_units,
+            )),
+            stage_evidence_available = stages.is_some(),
+            stage_completeness = ?stages.map(|stages| stages.completeness),
+            fingerprint_available = stages.is_some_and(|stages| stages.fingerprint.is_some()),
+            actual_shape_available = stages.is_some_and(|stages| stages.actual_shape.is_some()),
+            full_wall_ns = ?stages.and_then(|stages| stages.full_wall_ns),
+            prepare_started_at_ns = ?self.prepare_started_at_ns,
+            executor_returned_at_ns = ?self.dispatch.returned_at_ns,
+            finalized_at_ns = ?stages.and_then(|stages| stages.finalized_at_ns),
+            participants = self.participants.len(),
+            stage_rows = stages.map_or(0, |stages| stages.rows.len()),
+            host_rows_started = self.host_stages.iter().filter(|row| row.ordinal.is_some()).count(),
+            first_incomplete_row = ?first_incomplete_row.map(|row| (
+                row.input_index, row.completeness,
+                row.terminal.is_some(), row.completion_started_at_ns.is_some(),
+            )),
+            "private calibration preparation lacks complete original feedback exclusion proof"
+        );
+    }
+
+    fn build_host_stages_with_preparation(
+        &self,
+    ) -> Option<(
+        Arc<HostStageEvidenceV1>,
+        Option<CompletePrivateCalibrationSettlement>,
+    )> {
         if self.host_stages.iter().all(|row| row.ordinal.is_none()) {
             return None;
         }
         let wave = self.recorder.observations().first()?;
-        let shape = wave.shape.as_ref()?;
+        let shape = wave.shape.as_ref();
+        let route_evidence = self.make_route_evidence();
+        let actual_rows = match shape {
+            Some(shape) => shape.rows.as_slice(),
+            None if route_evidence.as_ref().is_some_and(|r| r.is_outside()) => {
+                self.route_for_settlement()?.rows()
+            }
+            None => return None,
+        };
         let mut rows = Vec::new();
-        rows.try_reserve_exact(shape.rows.len()).ok()?;
+        rows.try_reserve_exact(actual_rows.len()).ok()?;
         let mut completeness = if self.dispatch.waves == 1
             && self.recorder.observations().len() == 1
             && self.dispatch.outcome == Some(ObservedCallOutcome::Completed)
             && wave.outcome == Some(ActualWaveOutcome::Completed)
             && self.boundary == WaveObservationBoundary::IsolatedPreparationToCommit
             && wave.boundary == WaveObservationBoundary::IsolatedPreparationToCommit
-            && self.dispatch.unknown.is_none()
+            && (self.dispatch.unknown.is_none()
+                || route_evidence.as_ref().is_some_and(|r| r.is_outside()))
         {
             HostStageCompleteness::CompleteSingleWave
         } else {
             HostStageCompleteness::AdditionalOrUnknownWork
         };
-        let same_rows = shape.rows.len() == self.participants.len()
-            && shape.rows.iter().enumerate().all(|(index, actual)| {
-                shape.rows[..index].iter().all(|prior| {
+        let same_rows = actual_rows.len() == self.participants.len()
+            && actual_rows.iter().enumerate().all(|(index, actual)| {
+                actual_rows[..index].iter().all(|prior| {
                     prior.request_id != actual.request_id && prior.input_index != actual.input_index
                 }) && self.participants.iter().any(|row| {
                     row.request_id == actual.request_id
@@ -532,9 +728,9 @@ impl EngineCostCall {
                 _ => HostStageCompleteness::IdentityMismatch,
             };
         }
-        let finalized = self.clock.now_ns();
+        let finalized = self.observation_time();
         let mut latest = self.prepare_started_at_ns;
-        for actual in &shape.rows {
+        for actual in actual_rows {
             let progress = self
                 .participants
                 .iter()
@@ -676,18 +872,23 @@ impl EngineCostCall {
             _ => None,
         };
         let mut stages = HostStageEvidenceV1 {
+            observation_memory: self.observation_memory.clone(),
             schema_version: 1,
             call_id: self.call_id.get(),
-            presubmit_prediction: self.presubmit_prediction.as_ref().map(|p| p.receipt(shape)),
+            presubmit_prediction: shape
+                .and_then(|shape| self.presubmit_prediction.as_ref().map(|p| p.receipt(shape))),
             prospective_capture: None,
             fingerprint,
-            actual_shape: super::sample::scheduler_shape(shape).ok(),
-            statistical_evidence: shape
-                .statistical_evidence
-                .as_ref()
-                .filter(|evidence| evidence.validate_actual(shape).is_ok())
-                .cloned(),
+            actual_shape: shape.and_then(|shape| super::sample::scheduler_shape(shape).ok()),
+            statistical_evidence: shape.and_then(|shape| {
+                shape
+                    .statistical_evidence
+                    .as_ref()
+                    .filter(|evidence| evidence.validate_actual(shape).is_ok())
+                    .cloned()
+            }),
             structured_evidence: None,
+            route_evidence,
             prepare_started_at_ns: self.prepare_started_at_ns,
             executor_returned_at_ns: self.dispatch.returned_at_ns,
             rows,
@@ -695,13 +896,71 @@ impl EngineCostCall {
             full_wall_ns,
             completeness,
         };
-        if self.structured_capture {
+        if let Some(shape) = shape.filter(|_| self.structured_capture) {
             stages.structured_evidence = Some(structured::qualify(self, shape, &stages));
         }
-        stages.prospective_capture = self
-            .prospective_capture
-            .as_ref()
-            .map(|capture| capture.receipt(shape, &stages));
-        Some(Arc::new(stages))
+        stages.prospective_capture = shape.and_then(|shape| {
+            self.prospective_capture
+                .as_ref()
+                .map(|capture| capture.receipt(shape, OriginalHostStages(&stages)))
+        });
+        let stages = Arc::new(stages);
+        // Private calibration exclusion comes from this original physical
+        // recorder and complete host settlement, never a public reason alone.
+        // Prefix intervention retains its stricter no-terminal rule below.
+        let complete_private = self.stage_rejection.is_none()
+            && self.live_ticket.is_none()
+            && self
+                .calibration_capture
+                .as_ref()
+                .is_some_and(|capture| capture.requests_original_route())
+            && stages.completeness == HostStageCompleteness::CompleteSingleWave
+            && stages.fingerprint.is_some()
+            && stages.actual_shape.is_some()
+            && stages.full_wall_ns.is_some()
+            && !stages.rows.is_empty()
+            && stages
+                .rows
+                .iter()
+                .all(|row| row.completeness == HostStageCompleteness::CompleteSingleWave)
+            && self.dispatch.unknown.is_none()
+            && shape.is_some_and(|actual| {
+                actual.path == ActualWavePath::PlanRuntime
+                    && actual.row_order == ActualWaveRowOrder::Ordered
+                    && actual.restore_bytes == 0
+                    && actual.maintenance_bytes == 0
+                    && actual.maintenance_units == 0
+            });
+        let kind = if complete_private
+            && self.rejection == Some(CostCallRejection::CalibrationPreparation)
+            && stages
+                .rows
+                .iter()
+                .all(|row| row.terminal.is_none() && row.completion_started_at_ns.is_none())
+        {
+            Some(PrivateCalibrationSettlementKind::PrefixPreparation)
+        } else if complete_private
+            && matches!(self.rejection, None | Some(CostCallRejection::Composite))
+            && self
+                .calibration_capture
+                .as_ref()
+                .is_some_and(|capture| capture.requests_startup_readiness())
+        {
+            // Unlike a prefix intervention, ordinary readiness may complete a
+            // request. CompleteSingleWave above is minted only after the
+            // original PendingHostRow consumes its owner, output handoff and
+            // no-additional-work completion receipt. Terminal presence alone
+            // never establishes this proof; failed/partial/unknown work fails
+            // the shared gate. The resolver accepts only a Completed sample or
+            // the legacy Composite marker used by actual terminal publication.
+            Some(PrivateCalibrationSettlementKind::StartupReadiness)
+        } else {
+            None
+        };
+        let preparation = kind.map(|kind| CompletePrivateCalibrationSettlement {
+            stages: Arc::clone(&stages),
+            kind,
+        });
+        Some((stages, preparation))
     }
 }

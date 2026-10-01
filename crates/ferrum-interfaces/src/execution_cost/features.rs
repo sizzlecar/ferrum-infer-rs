@@ -17,6 +17,25 @@ pub const HOST_CONTENT_FEATURE_SCHEMA_V1: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum HostContentDomainV1 {
     PlainTextGreedyV1,
+    /// Installed ordinary text policy. This does not grant the legacy greedy
+    /// pending forecast: sampling, repetition and termination need their own
+    /// producer evidence and independently qualified numerical support.
+    PlainTextInstalledV2(PlainTextPolicyCapabilityV2),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlainTextPolicyCapabilityV2 {
+    pub sampling: PlainTextSamplingRouteV2,
+    pub model_eos: bool,
+    pub user_stop: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlainTextSamplingRouteV2 {
+    Greedy { repetition_penalty: bool },
+    FullLogits,
 }
 
 /// Complete-wave identity with content-dependent host branches marginalized.
@@ -93,6 +112,17 @@ pub struct HostCostFeaturesV1 {
 }
 
 impl HostCostFeaturesV1 {
+    /// Actual capture capability, independent from future content authority.
+    pub fn supports_installed_plain_text_content(&self) -> bool {
+        matches!(
+            self.policy.empirical_content_domain,
+            Some(HostContentDomainV1::PlainTextGreedyV1)
+                | Some(HostContentDomainV1::PlainTextInstalledV2(_))
+        ) && self.state.sampling_history_scope == CostSamplingHistoryScope::FullGeneration
+            && self.state.sampling_history_tokens == self.state.generated_tokens_before
+            && self.state.completion_state_signature == satisfied_completion_cost_signature()
+    }
+
     pub fn supports_empirical_plain_text_content(&self) -> bool {
         self.policy.empirical_content_domain == Some(HostContentDomainV1::PlainTextGreedyV1)
             && self.state.sampling_history_scope == CostSamplingHistoryScope::FullGeneration

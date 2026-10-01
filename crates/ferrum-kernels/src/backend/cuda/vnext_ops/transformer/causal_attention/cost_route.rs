@@ -3,8 +3,11 @@
 use super::*;
 use ferrum_interfaces::vnext::{
     DeviceCommandPhase, OperationCostCommand, OperationCostRoute, OperationCostRouteRequest,
-    ProgramBindingCostWrite,
+    OperationCostSelection, OperationCostTopologyRequirement, ProgramBindingCostWrite,
 };
+
+mod prepared;
+pub(super) use prepared::PreparedCostData;
 
 pub(super) fn route(
     request: OperationCostRouteRequest<'_>,
@@ -16,37 +19,68 @@ pub(super) fn route(
     library_identity: Option<super::super::cublas_api::CublasHandleApiIdentity>,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
-    let checked = || -> Result<Option<OperationCostRoute>, String> {
+    selection(
+        request,
+        OperationCostTopologyRequirement::NotRequested,
+        &mut || Ok(()),
+        policy,
+        semantics,
+        precision,
+        capture,
+        operation,
+        library_identity,
+        #[cfg(feature = "vllm-marlin")]
+        projection_runtime,
+    )
+    .map(|selected| selected.map(OperationCostSelection::into_route))
+}
+
+pub(super) fn selection(
+    request: OperationCostRouteRequest<'_>,
+    topology: OperationCostTopologyRequirement,
+    poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    policy: AttentionExecutionPolicy,
+    semantics: CausalAttentionSemantics,
+    precision: CausalPrecision,
+    capture: SloStructuredCostCapture,
+    operation: &str,
+    library_identity: Option<super::super::cublas_api::CublasHandleApiIdentity>,
+    #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
+) -> Result<Option<OperationCostSelection>, VNextError> {
+    let mut checked = || -> Result<Option<OperationCostSelection>, String> {
         if request.operation_id().as_str() != operation {
             return Err("CUDA causal cost operation mismatch".into());
         }
-        let rounded = super::super::gguf_f16_projection::is_operation(request.operation_id());
-        super::super::gguf_f16_projection::validate_values(
-            request.operation_id(),
-            request.bindings(),
-        )?;
+        let fallback;
+        let prepared = match request.prepared_cost_data::<PreparedCostData>() {
+            Some(prepared) => prepared,
+            None => {
+                let Some(value) = PreparedCostData::new(
+                    request.operation_id(),
+                    request.bindings(),
+                    request.attributes(),
+                    semantics,
+                    precision,
+                    #[cfg(feature = "vllm-marlin")]
+                    projection_runtime,
+                )?
+                else {
+                    return Ok(None);
+                };
+                fallback = value;
+                &fallback
+            }
+        };
+        let rounded = prepared.rounded;
         if rounded && (capture.is_disabled() || library_identity.is_none()) {
             return Ok(None);
         }
-        let shape = CausalAttentionShape::from_attributes_for(request.attributes(), semantics)?;
-        validate_signature_values(request.bindings(), shape, semantics, precision)?;
-        if shape.int8_kv {
-            return Ok(None);
-        }
-        let projection = CausalProjection::from_values(
-            request.bindings(),
-            #[cfg(feature = "vllm-marlin")]
-            projection_runtime,
-        )?;
-        if !(matches!(projection, CausalProjection::Native { .. }) && !rounded
-            || matches!(projection, CausalProjection::F16) && rounded)
-        {
-            return Ok(None);
-        }
+        let shape = prepared.shape;
         let tokens = request.immediate_tokens();
-        ScratchLayout::for_participants(shape, tokens, request.rows().len(), projection, policy)?;
-        shape.cuda_shape()?;
-        let layout = BindingLayout::new(shape, request.rows().len())?;
+        let geometry = prepared
+            .template
+            .geometry(policy, tokens, request.rows().len())?;
+        let layout = geometry.bindings;
         let packed = request.rows().len() > 1
             && request
                 .binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)
@@ -57,10 +91,9 @@ pub(super) fn route(
         if packed {
             checked_i32(tokens, "packed causal attention token count")?;
         }
-        let mut paths = Vec::with_capacity(request.rows().len());
+        let mut rows = Vec::with_capacity(request.rows().len());
         let mut writes = Vec::with_capacity(request.rows().len());
         let mut packed_start = 0_u64;
-        let mut envelopes = Vec::with_capacity(request.rows().len());
         for (index, row) in request.rows().iter().enumerate() {
             let end = row
                 .offset
@@ -89,133 +122,73 @@ pub(super) fn route(
                 ProgramBindingCostWrite::new(layout.binding_offset(index)?, bytes)
                     .map_err(|error| error.to_string())?,
             );
-            let path = CausalAttentionKernelPath::select(policy, shape, row.count.get(), end)?;
-            let envelope = CausalAttentionReplayEnvelope::new(shape, path, end)?;
-            envelopes.push(envelope.sequence_capacity_tokens);
-            paths.push(path);
+            rows.push(
+                selected::Row::new(shape, policy, row.count.get(), end, false)
+                    .ok_or("causal query row selection is invalid")?,
+            );
             packed_start = packed_start
                 .checked_add(row.count.get())
                 .ok_or("causal attention packed extent overflow")?;
         }
-        if batch_decode::eligible(paths.iter().copied(), packed) {
-            for range in batch_decode::group_ranges(&paths) {
-                let binding = BindingLayout {
-                    slot_bytes: layout.slot_bytes,
-                    required_bytes: layout
-                        .slot_bytes
-                        .checked_mul(range.len() as u64)
-                        .ok_or("causal cost group binding extent overflows")?,
-                };
-                batch_decode::BatchDecode::dimensions(
-                    range.len(),
-                    binding,
-                    *envelopes[range]
-                        .iter()
-                        .max()
-                        .ok_or("empty causal cost group")?,
-                    shape.query_heads,
-                    shape.head_dim,
-                )?;
-            }
-        }
-        let parts = if rounded {
-            Vec::new()
-        } else {
-            (2..=5)
-                .map(|ordinal| {
-                    let value = binding(request.bindings(), ResolvedValueRole::Input, ordinal)?;
-                    weights::matrix_parts(
-                        value.weight().ok_or("causal projection metadata absent")?,
-                        value.tensor().dimensions(),
-                    )
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        };
-        let extra = |rows| {
-            parts.iter().try_fold(0_u64, |total, parts| {
-                total
-                    .checked_add(native_matrix_extra_dispatches(parts, rows)?)
-                    .ok_or_else(|| "causal projection dispatch count overflows".to_owned())
-            })
-        };
-        let extra = if packed {
-            extra(tokens)?
-        } else {
-            request.rows().iter().try_fold(0_u64, |total, row| {
-                total
-                    .checked_add(extra(row.count.get())?)
-                    .ok_or_else(|| "causal projection dispatch count overflows".to_owned())
-            })?
-        };
-        let dispatches = physical_dispatch_count(
-            paths.iter().copied(),
-            shape.output_gate,
-            shape.post_attention_norm,
-            packed,
-        )
-        .checked_add(extra)
-        .ok_or("causal compute dispatch count overflows")?;
-        let operation = paths
+        let parts = &prepared.parts;
+        let operation = rows
             .first()
-            .copied()
-            .filter(|first| paths.iter().all(|path| path == first))
+            .map(|row| row.path)
+            .filter(|first| rows.iter().all(|row| row.path == *first))
             .map(CausalAttentionKernelPath::operation)
             .unwrap_or(COMPUTE_MIXED_OPERATION);
         let participants = u32::try_from(request.rows().len())
             .map_err(|_| "CUDA causal participant count exceeds u32")?;
-        let selected_compute = (|| {
-            if capture == SloStructuredCostCapture::Disabled {
-                return None;
-            }
-            let rows = request
-                .rows()
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    let end = row.offset.checked_add(row.count.get())?;
-                    let inplace = if precision.inplace_residual_kernel().is_some() {
-                        let stride = shape
-                            .hidden_size
-                            .checked_mul(precision.hidden().size_bytes())?;
-                        let range = row.offset.checked_mul(stride)?..end.checked_mul(stride)?;
-                        let input = request
-                            .binding_physical_range(
-                                ResolvedValueRole::Input,
-                                0,
-                                0,
-                                index,
-                                range.clone(),
-                            )
-                            .ok()??;
-                        let output = request
-                            .binding_physical_range(ResolvedValueRole::Output, 0, 0, index, range)
-                            .ok()??;
-                        if input.allocation_id().is_some() != output.allocation_id().is_some() {
-                            return None;
-                        }
-                        input == output
-                    } else {
-                        false
-                    };
-                    selected::Row::new(shape, policy, row.count.get(), end, inplace)
-                })
-                .collect::<Option<Vec<_>>>()?;
-            selected::compute(
-                shape,
-                precision,
-                projection,
-                policy,
-                if rounded {
-                    selected::ProjectionWork::DenseF16(library_identity?)
-                } else {
-                    selected::ProjectionWork::Native([&parts[0], &parts[1], &parts[2], &parts[3]])
-                },
-                &rows,
-                tokens,
-                packed,
-                capture,
+        let projections = if rounded {
+            selected::ProjectionWork::DenseF16(
+                library_identity.ok_or("causal library identity absent")?,
             )
-        })();
+        } else {
+            selected::ProjectionWork::Native([&parts[0], &parts[1], &parts[2], &parts[3]])
+        };
+        let alias_checked = (|| {
+            if capture.is_disabled() {
+                return Some(());
+            }
+            for (index, (row, selected)) in request.rows().iter().zip(&mut rows).enumerate() {
+                selected.inplace = if precision.inplace_residual_kernel().is_some() {
+                    let end = row.offset.checked_add(row.count.get())?;
+                    let stride = shape
+                        .hidden_size
+                        .checked_mul(precision.hidden().size_bytes())?;
+                    let range = row.offset.checked_mul(stride)?..end.checked_mul(stride)?;
+                    let input = request
+                        .binding_physical_range(
+                            ResolvedValueRole::Input,
+                            0,
+                            0,
+                            index,
+                            range.clone(),
+                        )
+                        .ok()??;
+                    let output = request
+                        .binding_physical_range(ResolvedValueRole::Output, 0, 0, index, range)
+                        .ok()??;
+                    if input.allocation_id().is_some() != output.allocation_id().is_some() {
+                        return None;
+                    }
+                    input == output
+                } else {
+                    false
+                };
+            }
+            Some(())
+        })()
+        .is_some();
+        let query = geometry
+            .finish(&rows, packed, projections)
+            .ok_or("causal query geometry or projection work is invalid")?;
+        let dispatches = query.dispatches;
+        let selected_compute = if alias_checked {
+            query.compute(capture)
+        } else {
+            None
+        };
         if rounded && selected_compute.is_none() {
             return Ok(None);
         }
@@ -254,11 +227,107 @@ pub(super) fn route(
         .map_err(|error| error.to_string())?;
         let binding = selected::attach(binding, selected_binding);
         let compute = selected::attach(compute, selected_compute);
-        OperationCostRoute::new(vec![binding, compute])
+        let route = OperationCostRoute::new(vec![binding, compute])
             .and_then(|route| route.with_relocatable_binding(0))
             .and_then(|route| route.with_program_binding_writes(writes))
-            .map(Some)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let topology = match topology {
+            OperationCostTopologyRequirement::NotRequested => None,
+            OperationCostTopologyRequirement::Required => {
+                poll().map_err(|error| error.to_string())?;
+                // The cost route already selected every kernel path from these
+                // exact rows. Reuse that numerical choice inside this query,
+                // but still prove every address captured by the graph.
+                Some(
+                    topology_from_prepared_selection(&request, semantics, shape, &rows)
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+        };
+        Ok(Some(OperationCostSelection::new(route, topology)))
     };
     checked().map_err(invalid_plan)
+}
+
+/// The prepared path shares both selection and envelope construction, while
+/// every captured address still has to satisfy the current physical scope.
+fn topology_from_prepared_selection(
+    request: &impl ReusableExecutionTopologyView,
+    semantics: CausalAttentionSemantics,
+    shape: CausalAttentionShape,
+    rows: &[selected::Row],
+) -> Result<ReusableExecutionTopology, VNextError> {
+    if rows.len() != request.participant_count() {
+        return Err(invalid_plan(
+            "CUDA causal prepared topology row count changed",
+        ));
+    }
+    if !reusable_attention_address_scope(request, semantics)? {
+        return Ok(ReusableExecutionTopology::EagerBoundary);
+    }
+    reusable_attention_topology_from_envelopes(
+        shape,
+        rows.len(),
+        rows.iter().enumerate().map(|(index, selected)| {
+            let row = request
+                .token_row(index)
+                .ok_or("CUDA causal topology row missing")?;
+            let end = row
+                .offset
+                .checked_add(row.count.get())
+                .ok_or("CUDA causal topology end overflow")?;
+            if selected.tokens != row.count.get() || selected.sequence != end {
+                return Err("CUDA causal prepared topology query changed".to_owned());
+            }
+            Ok((
+                CausalAttentionTopologyRow {
+                    active_tokens: selected.tokens,
+                    sequence_tokens: selected.sequence,
+                },
+                selected.path,
+                selected.envelope,
+            ))
+        }),
+    )
+    .map_err(invalid_plan)
+}
+
+/// Private to this provider's synchronous selection. `paths` are the choices
+/// already checked while constructing this query's eager commands; no caller
+/// can supply paths through the public cost/topology interface.
+#[cfg(test)]
+fn topology_from_cost_selection(
+    request: &impl ReusableExecutionTopologyView,
+    semantics: CausalAttentionSemantics,
+    shape: CausalAttentionShape,
+    paths: &[CausalAttentionKernelPath],
+) -> Result<ReusableExecutionTopology, VNextError> {
+    if paths.len() != request.participant_count() {
+        return Err(invalid_plan(
+            "CUDA causal selected topology row count changed",
+        ));
+    }
+    if !reusable_attention_address_scope(request, semantics)? {
+        return Ok(ReusableExecutionTopology::EagerBoundary);
+    }
+    reusable_attention_topology_from_selected(
+        shape,
+        paths.len(),
+        paths.iter().copied().enumerate().map(|(index, path)| {
+            let row = request
+                .token_row(index)
+                .ok_or("CUDA causal topology row is missing")?;
+            Ok((
+                CausalAttentionTopologyRow {
+                    active_tokens: row.count.get(),
+                    sequence_tokens: row
+                        .offset
+                        .checked_add(row.count.get())
+                        .ok_or("CUDA causal topology token end overflow")?,
+                },
+                path,
+            ))
+        }),
+    )
+    .map_err(invalid_plan)
 }

@@ -2,9 +2,14 @@
 //! Neither path changes timing/capture or physical execution policy.
 
 pub(super) mod dispatch;
+pub(super) mod domain;
 
 #[cfg(all(test, feature = "metal", target_os = "macos"))]
 mod product_tests;
+
+#[cfg(test)]
+#[path = "../../../../ferrum-interfaces/tests/vnext_device_operation_contract/mod.rs"]
+mod identity_contract;
 
 use ferrum_interfaces::{
     execution_cost::{
@@ -178,6 +183,21 @@ fn execution_config_identity(
         })
         .collect();
     hash.serialized("reusable-chunks", &chunks)?;
+    // Completion instrumentation is part of the measured execution population.
+    // Keep existing unprofiled fingerprints stable; never borrow their models
+    // for a profile which enqueues device events or changes capture prefixes.
+    if config.device_timing_mode != super::DeviceTimingMode::Off {
+        hash.serialized("device-timing-mode", &config.device_timing_mode)?;
+        hash.serialized("device-timing-profile", &config.device_timing_profile)?;
+    }
+    // Preserve old default identities; new dynamic-sample policy is a distinct
+    // cost boundary population and cannot borrow an old policy profile.
+    if !config.structured_actual_capture.is_legacy() {
+        hash.serialized(
+            "structured-actual-capture",
+            &config.structured_actual_capture,
+        )?;
+    }
     Ok(hash.finish())
 }
 
@@ -234,6 +254,157 @@ fn hardware_digest(hardware: &DeviceCostHardwareIdentityAvailability) -> Option<
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{FileFingerprint, ResolvedModelSource};
+
+    #[test]
+    fn actual_capture_policy_binds_execution_identity_and_preserves_legacy_default() {
+        use ferrum_types::{
+            DataType, Device, EngineConfig, ModelInfo, ModelType, SloCostObservationConfig,
+            SloStructuredActualCapturePolicy,
+        };
+
+        // Reuse the core compiler's resolved CPU model and its actual runtime.
+        // This tests the product config-to-identity path, not GPU execution or
+        // the acceptability of an old profile under a different sample regime.
+        let fixture = identity_contract::fixture();
+        let info = ModelInfo {
+            model_id: "identity-contract".into(),
+            model_type: ModelType::Custom("identity-contract".into()),
+            num_parameters: 0,
+            hidden_size: 4,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            vocab_size: 16,
+            max_sequence_length: 64,
+            dtype: DataType::FP16,
+            device: Device::CPU,
+            version: None,
+            license: None,
+            metadata: Default::default(),
+        };
+        let omitted =
+            serde_json::to_value(SloCostObservationConfig::structured_whole_wave_v2()).unwrap();
+        assert!(omitted.get("structured_actual_capture").is_none());
+        let mut explicit_legacy = omitted.clone();
+        explicit_legacy["structured_actual_capture"] =
+            serde_json::to_value(SloStructuredActualCapturePolicy::LegacyEveryWave).unwrap();
+        let mut consumer = omitted.clone();
+        consumer["structured_actual_capture"] =
+            serde_json::to_value(SloStructuredActualCapturePolicy::ConsumerDrivenV1).unwrap();
+        let resolve = |wire| {
+            let mut engine = EngineConfig::default();
+            engine.backend.device = Device::CPU;
+            engine.backend.enable_reusable_execution = false;
+            engine.scheduler.max_running_requests = 1;
+            engine.batching.max_num_batched_tokens = 8;
+            engine.scheduler.slo.cost_observation = serde_json::from_value(wire).unwrap();
+            engine.scheduler.slo.cost_observation.validate().unwrap();
+            VNextExecutorConfig::from_engine_config(&engine, &info, fixture.runtime.as_ref())
+                .unwrap()
+        };
+        let omitted = resolve(omitted);
+        let legacy = resolve(explicit_legacy);
+        let consumer = resolve(consumer);
+        assert_eq!(
+            omitted.runtime_policy.fingerprint_str(),
+            consumer.runtime_policy.fingerprint_str(),
+            "observation policy must not change physical scheduling or memory policy"
+        );
+        assert_eq!(omitted.maximum_model_tokens, consumer.maximum_model_tokens);
+        assert_eq!(
+            omitted.device_reusable_execution_enabled,
+            consumer.device_reusable_execution_enabled
+        );
+        let original = execution_config_identity(&fixture.resolved, &omitted).unwrap();
+        assert_eq!(
+            execution_config_identity(&fixture.resolved, &legacy).unwrap(),
+            original
+        );
+        assert_ne!(
+            execution_config_identity(&fixture.resolved, &consumer).unwrap(),
+            original,
+            "identical plan and runtime must not alias different actual-sample policies"
+        );
+        // Close the fixture's real resources rather than relying on a detached
+        // fake plan or leaving a device-account claim behind after the test.
+        let mut close_checks = 0;
+        identity_contract::close_plan_runtime(fixture.plan_resources, &mut close_checks);
+    }
+
+    #[test]
+    fn completion_profile_identity_is_declared_before_sink_attachment() {
+        use ferrum_types::{
+            DataType, Device, EngineConfig, ModelInfo, ModelType, ObservabilityProfileDetail as D,
+            ProfileEntrypoint,
+        };
+        let fixture = identity_contract::fixture();
+        let info = ModelInfo {
+            model_id: "profile-identity-contract".into(),
+            model_type: ModelType::Custom("fixture".into()),
+            num_parameters: 0,
+            hidden_size: 4,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            vocab_size: 16,
+            max_sequence_length: 64,
+            dtype: DataType::FP16,
+            device: Device::CPU,
+            version: None,
+            license: None,
+            metadata: Default::default(),
+        };
+        let resolve = |entrypoint, detail, journal: bool| {
+            let mut engine = EngineConfig::default();
+            engine.backend.device = Device::CPU;
+            engine.backend.enable_reusable_execution = false;
+            engine.scheduler.max_running_requests = 1;
+            engine.batching.max_num_batched_tokens = 8;
+            engine.runtime.profile_entrypoint = Some(entrypoint);
+            engine.runtime.profile_detail = detail;
+            engine.runtime.profile_jsonl = journal.then(|| "logical-profile-path".into());
+            VNextExecutorConfig::from_engine_config(&engine, &info, fixture.runtime.as_ref())
+                .unwrap()
+        };
+        let off = resolve(ProfileEntrypoint::Run, D::Off, false);
+        let off_id = execution_config_identity(&fixture.resolved, &off).unwrap();
+        let mut basic_id = None;
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            for journal in [false, true] {
+                let config = resolve(entrypoint, D::Basic, journal);
+                assert_eq!(
+                    config.device_timing_mode,
+                    super::super::DeviceTimingMode::Completion
+                );
+                assert_eq!(
+                    config.runtime_policy.fingerprint_str(),
+                    off.runtime_policy.fingerprint_str()
+                );
+                let id = execution_config_identity(&fixture.resolved, &config).unwrap();
+                assert_ne!(
+                    id, off_id,
+                    "instrumented and uninstrumented profiles cannot share cost artifacts"
+                );
+                if let Some(expected) = basic_id {
+                    assert_eq!(id, expected);
+                } else {
+                    basic_id = Some(id);
+                }
+            }
+            let off_journal = resolve(entrypoint, D::Off, true);
+            assert_eq!(
+                execution_config_identity(&fixture.resolved, &off_journal).unwrap(),
+                off_id
+            );
+            for detail in [D::Replay, D::Kernel, D::Verify, D::Full] {
+                assert!(!resolve(entrypoint, detail, true)
+                    .device_timing_mode
+                    .guarded_completion_compatible());
+            }
+        }
+        let mut close_checks = 0;
+        identity_contract::close_plan_runtime(fixture.plan_resources, &mut close_checks);
+    }
 
     fn sources() -> ResolvedModelSources {
         let source = ResolvedModelSource {

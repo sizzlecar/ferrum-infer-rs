@@ -12,21 +12,24 @@ use ferrum_scheduler::implementations::continuous::slo_planner::PlanningCostEvid
 mod differential;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FutureHostMode {
+pub(in crate::continuous_engine::inner) enum FutureHostMode {
     Exact,
     Greedy,
     FullLogits,
 }
 
+#[derive(Clone)]
 pub(super) struct RouteDomain {
-    states: Vec<ExecutionCostRouteState>,
-    empirical: bool,
+    pub(super) states: Vec<ExecutionCostRouteState>,
+    pub(super) empirical: bool,
+    pub(super) checkpoints: Vec<ferrum_interfaces::vnext::ResourcePlanningCheckpoint>,
 }
 impl RouteDomain {
     pub(super) fn initial(state: ExecutionCostRouteState) -> Self {
         Self {
             states: vec![state],
             empirical: false,
+            checkpoints: Vec::new(),
         }
     }
 }
@@ -39,27 +42,45 @@ pub(super) fn row_host(
     request: &frontier::ProjectedRequest,
     mode: FutureHostMode,
 ) -> std::result::Result<Option<Option<HostCostFeaturesV1>>, PlanningUnknownReason> {
-    if !request.host_content_changed {
-        return Ok(Some(original));
+    Ok(projected_row_host(
+        original,
+        request.generated,
+        request.maximum_output_tokens.get(),
+        request.host_content_changed,
+        mode,
+    ))
+}
+
+/// Shared numerical host continuation for planning and cold geometry inventory.
+/// This does not assert a future token's text or completion outcome.
+pub(in crate::continuous_engine::inner) fn projected_row_host(
+    original: Option<HostCostFeaturesV1>,
+    generated: u32,
+    maximum_output_tokens: u32,
+    host_content_changed: bool,
+    mode: FutureHostMode,
+) -> Option<Option<HostCostFeaturesV1>> {
+    if !host_content_changed {
+        return Some(original);
     }
-    let Some(mut host) = original.filter(|host| host.supports_empirical_plain_text_content())
+    let Some(mut host) = original.filter(|host| host.supports_installed_plain_text_content())
     else {
-        return Ok(None);
+        return None;
     };
     if mode == FutureHostMode::Exact
-        || request.generated == 0
-        || u64::from(request.generated) <= host.state.generated_tokens_before
-        || u64::from(request.maximum_output_tokens.get()) != host.state.maximum_output_tokens
+        || generated == 0
+        || u64::from(generated) <= host.state.generated_tokens_before
+        || u64::from(maximum_output_tokens) != host.state.maximum_output_tokens
     {
-        return Ok(None);
+        return None;
     }
-    host.state.generated_tokens_before = u64::from(request.generated);
-    host.state.sampling_history_tokens = u64::from(request.generated);
+    host.state.generated_tokens_before = u64::from(generated);
+    host.state.sampling_history_tokens = u64::from(generated);
     // The completion contract remains Satisfied for this installed capability.
     // The two alternatives cover possible routing; this does not assert that
     // a particular generated prefix is, or is not, valid UTF-8.
     host.state.pending_decoded_utf8 = mode == FutureHostMode::FullLogits;
-    Ok(Some(Some(host)))
+    Some(Some(host))
 }
 
 impl ExecutorShape<'_> {
@@ -80,17 +101,18 @@ impl ExecutorShape<'_> {
                 changed = true;
                 if !fence
                     .host_features
-                    .is_some_and(|host| host.supports_empirical_plain_text_content())
+                    .is_some_and(|host| host.supports_installed_plain_text_content())
                 {
                     return Ok(None);
                 }
             }
             match selected.work {
                 ActualRowWork::Decode { .. } if request.host_content_changed => {
-                    if fence.future_greedy_policy.is_none() {
+                    let Some(clean) = &fence.future_greedy_policy else {
                         return Ok(None);
-                    }
-                    can_change_product = true;
+                    };
+                    forces_full_logits |= clean.requires_full_logits();
+                    can_change_product |= !clean.requires_full_logits();
                 }
                 ActualRowWork::Decode { .. } => {
                     forces_full_logits |=
@@ -277,7 +299,11 @@ impl ExecutorShape<'_> {
             } else {
                 None
             },
-            RouteDomain { states, empirical },
+            RouteDomain {
+                states,
+                empirical,
+                checkpoints: state.checkpoints.clone(),
+            },
         )))
     }
 }

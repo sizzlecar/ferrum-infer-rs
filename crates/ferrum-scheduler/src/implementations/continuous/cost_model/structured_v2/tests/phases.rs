@@ -2,6 +2,9 @@
 //! are synthetic, explicitly not a calibration-session or GPU performance test.
 use super::*;
 mod fit_floor;
+mod learned_span;
+mod owner_blocks;
+mod service_windows;
 fn fp() -> ExecutionFingerprint {
     ExecutionFingerprint {
         model_weights: [1; 32],
@@ -72,6 +75,7 @@ fn phase(phase: StructuredPhaseV2) -> Vec<StructuredNumericObservationV2> {
 fn scope(samples: &[StructuredNumericObservationV2]) -> StructuredScopeV2 {
     StructuredScopeV2 {
         owner: samples[0].input.owner().clone(),
+        numerical_family: None,
         coverage: StructuredCoverageV2 {
             pending_eligible_positions: vec![0, 1],
             authorized_pending_constraints: vec![
@@ -99,6 +103,46 @@ fn qualified() -> QualifiedStructuredModelV2 {
     calibrated()
         .qualify(&phase(StructuredPhaseV2::Qualification), 490)
         .unwrap()
+}
+
+#[test]
+fn qualified_payload_charges_reserved_capacity_without_changing_model_signature() {
+    let samples = phase(StructuredPhaseV2::Fit);
+    let original_scope = scope(&samples);
+    let mut reserved_scope = scope(&samples);
+    let before = reserved_scope.coverage.pending_counts.capacity();
+    reserved_scope.coverage.pending_counts.reserve_exact(1024);
+    let additional =
+        (reserved_scope.coverage.pending_counts.capacity() - before) * std::mem::size_of::<u32>();
+    let build = |scope| {
+        FittedStructuredModelV2::fit(fp(), settings(), scope, contract(), &samples, 170)
+            .unwrap()
+            .calibrate(&phase(StructuredPhaseV2::Residual), 330)
+            .unwrap()
+            .qualify(&phase(StructuredPhaseV2::Qualification), 490)
+            .unwrap()
+    };
+    let original = build(original_scope);
+    let reserved = build(reserved_scope);
+    assert_eq!(
+        original.parameters_signature(),
+        reserved.parameters_signature()
+    );
+    let original_bytes = original.retained_payload_bytes().unwrap();
+    let reserved_bytes = reserved.retained_payload_bytes().unwrap();
+    assert!(original_bytes > std::mem::size_of::<QualifiedStructuredModelV2>());
+    assert_eq!(reserved_bytes - original_bytes, additional);
+    let query = StructuredQueryV2::exact(samples[0].input.clone());
+    assert_eq!(
+        original
+            .predict_query(&fp(), &query, 500)
+            .unwrap()
+            .planning_ns,
+        reserved
+            .predict_query(&fp(), &query, 500)
+            .unwrap()
+            .planning_ns,
+    );
 }
 
 #[test]
@@ -154,6 +198,7 @@ fn structured_v2_three_complete_phases_freeze_one_model_and_future_envelope() {
     let actual = phase(StructuredPhaseV2::Qualification);
     let input = actual[0].input.clone();
     let query = StructuredQueryV2 {
+        repetition_upper_sum: None,
         input,
         pending: Some(PendingQuery {
             eligible: vec![0, 1],
@@ -194,6 +239,52 @@ fn structured_v2_three_complete_phases_freeze_one_model_and_future_envelope() {
         model.predict_query(&wrong, &query, 500),
         Err(StructuredUnknown::WrongFingerprint)
     ));
+}
+
+#[test]
+fn structured_v2_expired_feedback_validation_preserves_input_failures_and_original_ttl() {
+    let model = qualified();
+    let original_parameters = model.parameters_signature();
+    let query = StructuredQueryV2::exact(phase(StructuredPhaseV2::Qualification)[0].input.clone());
+    let expires = model
+        .predict_query(&fp(), &query, 500)
+        .unwrap()
+        .valid_until_ns;
+    assert_eq!(
+        model.predict_query(&fp(), &query, expires + 1).unwrap_err(),
+        StructuredUnknown::Stale
+    );
+    assert_eq!(
+        model.validate_retrospective_query_input(&fp(), &query),
+        Ok(())
+    );
+    let mut damaged = query.clone();
+    damaged.input.basis[0] = f64::NAN;
+    // The ordinary TTL gate masks later numeric validation. The separate
+    // integrity-only API must still expose it without issuing a stale cost.
+    assert_eq!(
+        model
+            .predict_query(&fp(), &damaged, expires + 1)
+            .unwrap_err(),
+        StructuredUnknown::Stale
+    );
+    assert!(matches!(
+        model.validate_retrospective_query_input(&fp(), &damaged),
+        Err(StructuredQueryFailureV2::Invalid(_))
+    ));
+    let mut foreign = fp();
+    foreign.device_runtime = [99; 32];
+    assert_eq!(
+        model.validate_retrospective_query_input(&foreign, &query),
+        Err(StructuredQueryFailureV2::Invalid(
+            StructuredUnknown::WrongFingerprint
+        ))
+    );
+    assert_eq!(model.parameters_signature(), original_parameters);
+    assert_eq!(
+        model.predict_query(&fp(), &query, expires + 1).unwrap_err(),
+        StructuredUnknown::Stale
+    );
 }
 #[test]
 fn structured_v2_cannot_omit_slow_member_in_any_phase() {
@@ -300,6 +391,7 @@ fn structured_v2_authorization_requires_actual_joint_and_position_challenges() {
     let samples = phase(StructuredPhaseV2::Qualification);
     let mut s = scope(&samples);
     let query = StructuredQueryV2 {
+        repetition_upper_sum: None,
         input: samples[0].input.clone(),
         pending: Some(PendingQuery {
             eligible: vec![0, 1],
@@ -340,6 +432,7 @@ fn structured_v2_conditional_empty_greedy_set_is_a_legal_singleton() {
     let samples = phase(StructuredPhaseV2::Qualification);
     let model = qualified();
     let query = StructuredQueryV2 {
+        repetition_upper_sum: None,
         input: samples[0].input.clone(),
         pending: Some(PendingQuery {
             eligible: vec![],

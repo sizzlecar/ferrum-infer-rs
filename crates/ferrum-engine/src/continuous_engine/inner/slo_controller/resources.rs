@@ -116,11 +116,73 @@ impl PlanningResourceProjection for Projection<'_> {
 
 pub(super) fn resource_reason(reason: ResourcePlanningUnknown) -> PlanningUnknownReason {
     match reason {
-        ResourcePlanningUnknown::LogicalCapacity | ResourcePlanningUnknown::PhysicalCapacity => {
+        ResourcePlanningUnknown::LogicalCapacity
+        | ResourcePlanningUnknown::UnmaterializedCapacity
+        | ResourcePlanningUnknown::PhysicalCapacity => {
             PlanningUnknownReason::OutputOrResourceBlocked
         }
         ResourcePlanningUnknown::BudgetExhausted => PlanningUnknownReason::ComputeBudgetExhausted,
         ResourcePlanningUnknown::MaintenanceRequired => PlanningUnknownReason::UnmodeledMaintenance,
         _ => PlanningUnknownReason::UnknownResourceEvidence,
+    }
+}
+
+/// Static labels preserve the typed capture failure without formatting or I/O
+/// on the controller thread. They do not change retry or scheduling policy.
+pub(super) fn route_failure_checkpoint(
+    reason: ferrum_interfaces::vnext::ExecutionCostRouteUnknown,
+) -> &'static str {
+    use ferrum_interfaces::vnext::{ExecutionCostRouteUnknown as Route, ResourcePlanningReadStage};
+    match reason {
+        Route::Unsupported => "route_failure_unsupported",
+        Route::InvalidInput => "route_failure_invalid_input",
+        Route::Capacity => "route_failure_capacity",
+        Route::BudgetExhausted => "route_failure_budget_exhausted",
+        Route::StaleView => "route_failure_stale_view",
+        Route::ExecutionPolicy => "route_failure_execution_policy",
+        Route::OnDemandResidentProgram => "route_failure_on_demand_resident_program",
+        Route::ProviderRoute => "route_failure_provider_route",
+        Route::CoreLayout => "route_failure_core_layout",
+        Route::InitializationState => "route_failure_initialization_state",
+        Route::ReadbackState => "route_failure_readback_state",
+        Route::OutputBranch => "route_failure_output_branch",
+        Route::Resource(reason) => match reason {
+            ResourcePlanningUnknown::Unsupported => "resource_failure_unsupported",
+            ResourcePlanningUnknown::BusyOrUnavailable => "resource_failure_busy_or_unavailable",
+            ResourcePlanningUnknown::LimitExceeded => "resource_failure_limit_exceeded",
+            ResourcePlanningUnknown::InvalidInput => "resource_failure_invalid_input",
+            ResourcePlanningUnknown::StaleIdentity => "resource_failure_stale_identity",
+            ResourcePlanningUnknown::ReusableExecution => "resource_failure_reusable_execution",
+            ResourcePlanningUnknown::MaintenanceRequired => "resource_failure_maintenance_required",
+            ResourcePlanningUnknown::LogicalCapacity => "resource_failure_logical_capacity",
+            ResourcePlanningUnknown::UnmaterializedCapacity => {
+                "resource_failure_unmaterialized_capacity"
+            }
+            ResourcePlanningUnknown::PhysicalCapacity => "resource_failure_physical_capacity",
+            ResourcePlanningUnknown::InvalidDemand => "resource_failure_invalid_demand",
+            ResourcePlanningUnknown::BudgetExhausted => "resource_failure_budget_exhausted",
+            ResourcePlanningUnknown::ReadUnavailable(stage) => match stage {
+                ResourcePlanningReadStage::Lifecycle => "resource_read_unavailable_lifecycle",
+                ResourcePlanningReadStage::DeferredCleanup => "resource_read_unavailable_cleanup",
+                ResourcePlanningReadStage::SequenceSession => "resource_read_unavailable_session",
+                ResourcePlanningReadStage::SequenceBacking => "resource_read_unavailable_backing",
+                ResourcePlanningReadStage::LogicalCapacity => "resource_read_unavailable_logical",
+                ResourcePlanningReadStage::DeviceBudget => {
+                    "resource_read_unavailable_device_budget"
+                }
+                ResourcePlanningReadStage::PhysicalPool => {
+                    "resource_read_unavailable_physical_pool"
+                }
+                ResourcePlanningReadStage::ExecutionLane => "resource_read_unavailable_lane",
+                ResourcePlanningReadStage::LaneWorkspace => "resource_read_unavailable_workspace",
+                ResourcePlanningReadStage::ModelRegistry => "resource_read_unavailable_registry",
+                ResourcePlanningReadStage::ModelRegistrySlot => {
+                    "resource_read_unavailable_registry_slot"
+                }
+                ResourcePlanningReadStage::ModelSequenceOperation => {
+                    "resource_read_unavailable_sequence_operation"
+                }
+            },
+        },
     }
 }

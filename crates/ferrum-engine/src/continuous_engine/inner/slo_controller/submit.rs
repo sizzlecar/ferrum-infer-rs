@@ -58,25 +58,29 @@ impl EngineInner {
         Ok(())
     }
 
-    fn controller_frontiers_match(&self, captured: &ControllerSnapshot) -> bool {
+    pub(super) fn controller_frontiers_match(&self, captured: &ControllerSnapshot) -> bool {
         let Some(sequences) = self.sequences.try_read() else {
             return false;
         };
-        if sequences.len() != captured.fences.len() {
+        if sequences.len() != captured.fences.len() + captured.waiting_fences.len() {
             return false;
         }
-        captured.fences.iter().all(|fence| {
-            if !captured.budget.poll() {
-                return false;
-            }
-            let Some(sequence) = sequences.get(&fence.key.request_id) else {
-                return false;
-            };
-            fence.matches_sequence(sequence)
-                && sequence.credited_output.as_ref().is_some_and(|output| {
-                    output.grant.is_none() && output.port.planning_snapshot() == fence.output
-                })
-        })
+        captured
+            .fences
+            .iter()
+            .chain(&captured.waiting_fences)
+            .all(|fence| {
+                if !captured.budget.poll() {
+                    return false;
+                }
+                let Some(sequence) = sequences.get(&fence.key.request_id) else {
+                    return false;
+                };
+                fence.matches_sequence(sequence)
+                    && sequence.credited_output.as_ref().is_some_and(|output| {
+                        output.grant.is_none() && output.port.planning_snapshot() == fence.output
+                    })
+            })
     }
 
     #[cfg(test)]
@@ -366,7 +370,8 @@ impl EngineInner {
                 valid_until,
             )
         });
-        self.install_controller_wave(
+        let strict_admission = admission.clone();
+        let prepared = self.install_controller_wave(
             owner::ControllerWork {
                 prospective_capture,
                 batch,
@@ -380,14 +385,21 @@ impl EngineInner {
                 expected,
             },
             receipt,
-        )
-        .map(SloIterationPlan::Selected)
+        )?;
+        if let Some(pending) = strict_admission.filter(|_| self.requires_strict_acceptance()) {
+            if !self.accept_strict_witness(&pending, valid_until) {
+                drop(prepared);
+                self.work_notify.notify_one();
+                return Ok(SloIterationPlan::Idle);
+            }
+        }
+        Ok(SloIterationPlan::Selected(prepared))
     }
 
-    fn controller_model_current(&self, version: u64) -> bool {
+    pub(super) fn controller_model_current(&self, version: u64) -> bool {
         self.cost_runtime
             .as_ref()
-            .and_then(|runtime| runtime.try_snapshot().flatten())
-            .is_some_and(|model| model.model_version() == version)
+            .and_then(|runtime| runtime.try_model_version_current(version))
+            .unwrap_or(false)
     }
 }

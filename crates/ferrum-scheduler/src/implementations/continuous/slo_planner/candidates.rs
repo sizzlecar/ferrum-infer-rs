@@ -5,6 +5,7 @@ use std::{cmp::Reverse, num::NonZeroU32};
 
 mod chunk_order;
 mod frontier;
+mod goal_order;
 pub(super) use frontier::FrontierCursor;
 
 fn runnable(request: &RequestSchedulingView) -> bool {

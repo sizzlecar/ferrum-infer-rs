@@ -594,6 +594,9 @@ pub struct VNextExecutorConfig {
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
     pub diagnostic_fault: Option<VNextDiagnosticFault>,
     plan_observation: VNextPlanObservationPolicy,
+    structured_actual_capture: ferrum_types::SloStructuredActualCapturePolicy,
+    device_timing_mode: DeviceTimingMode,
+    device_timing_profile: Option<(ObservabilityProfileDetail, Option<std::num::NonZeroU32>)>,
 }
 
 impl VNextExecutorConfig {
@@ -856,7 +859,24 @@ impl VNextExecutorConfig {
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
             diagnostic_fault,
+            device_timing_mode: if engine.runtime.profile_jsonl.is_some()
+                || engine.runtime.scheduler_trace_jsonl.is_some()
+                || engine.runtime.profile_detail == ObservabilityProfileDetail::Basic
+            {
+                DeviceTimingMode::for_profile_detail(engine.runtime.profile_detail)
+            } else {
+                DeviceTimingMode::Off
+            },
+            device_timing_profile: Some((
+                engine.runtime.profile_detail,
+                engine.runtime.profile_max_frames_per_request,
+            )),
             plan_observation,
+            structured_actual_capture: engine
+                .scheduler
+                .slo
+                .cost_observation
+                .structured_actual_capture,
         })
     }
 }
@@ -1328,10 +1348,7 @@ struct VNextIoBinding {
     greedy_token_output_layout: HostTransferLayout,
 }
 
-struct VNextReusableExecutionCatalog {
-    lane_epoch: u64,
-    programs: BTreeMap<DeviceReusableExecutionProgramId, DeviceReusableExecutionProgram>,
-}
+type VNextReusableExecutionCatalog = IndexedExecutionLaneReusableCatalog;
 
 const MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS: usize = 64;
 
@@ -2189,6 +2206,13 @@ struct VNextWaveTimingMetrics {
     node_invocation_construct: AtomicDurationMetrics,
     provider_dynamic_binding_encode: AtomicDurationMetrics,
     binding_validate_coalesce: AtomicDurationMetrics,
+    selected_replay_cost: AtomicDurationMetrics,
+    replay_cost_identity_resources: AtomicDurationMetrics,
+    replay_cost_materialize_cached: AtomicDurationMetrics,
+    replay_cost_materialize_unmaterialized_attempt: AtomicDurationMetrics,
+    replay_cost_numeric_resources: AtomicDurationMetrics,
+    replay_cost_full_executable_resources: AtomicDurationMetrics,
+    replay_cost_provider_projection: AtomicDurationMetrics,
     lane_reserve_submit_arm: AtomicDurationMetrics,
     lane_reserve: AtomicDurationMetrics,
     device_runtime_submit: AtomicDurationMetrics,
@@ -2300,6 +2324,17 @@ impl VNextWaveTimingMetrics {
                         "invocation_construct": self.node_invocation_construct.snapshot(),
                         "dynamic_binding_encode": self.provider_dynamic_binding_encode.snapshot(),
                         "binding_validate_coalesce": self.binding_validate_coalesce.snapshot(),
+                        "selected_replay_cost": self.selected_replay_cost.snapshot(),
+                        "selected_replay_cost_breakdown": {
+                            "identity_resources": self.replay_cost_identity_resources.snapshot(),
+                            "identity_resources_breakdown": {
+                                "materialize_cached": self.replay_cost_materialize_cached.snapshot(),
+                                "materialize_unmaterialized_attempt": self.replay_cost_materialize_unmaterialized_attempt.snapshot(),
+                                "numeric_resources": self.replay_cost_numeric_resources.snapshot(),
+                                "full_executable_resources": self.replay_cost_full_executable_resources.snapshot(),
+                            },
+                            "provider_projection": self.replay_cost_provider_projection.snapshot(),
+                        },
                     },
                     "lane_reserve_submit_arm": self.lane_reserve_submit_arm.snapshot(),
                     "lane_reserve_submit_arm_breakdown": {
@@ -2329,6 +2364,10 @@ impl VNextWaveTimingMetrics {
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
                 "provider_node_encode children sample node or patch operations, not waves; compare total_ns over parent wave samples rather than adding child averages",
                 "identity_materialize includes one bulk identity materialization on eager waves; dynamic_binding_encode covers reusable binding payloads only; eager provider compute encoding and command assembly remain in the parent residual",
+                "selected_replay_cost samples resident segments with passive capture enabled; identity_resources samples every attempted node and includes complete fresh resource validation or full invocation construction; provider_projection samples only providers without captured recipes",
+                "selected_replay_cost includes its two nested child intervals and ordered Unknown slot assembly; do not add nested totals to their parent; captured recipe evaluation in the device runtime remains outside this interval",
+                "identity_resources has four nested child timers: materialize_cached and materialize_unmaterialized_attempt partition materialization calls by an O(1) pre-call slot probe; the latter includes failed attempts and is not a count of successfully constructed nodes",
+                "numeric_resources retains every captured-recipe fresh resource check; full_executable_resources includes the original full invocation construction; cache probing and child timer overhead remain in identity_resources, with no probe or clock read on disabled timing paths",
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
                 "device_runtime_submit breakdown isolates backend validation/preparation, timing start, ordered command enqueue, and fence/accounting for runtimes that implement typed attribution",
@@ -2355,6 +2394,13 @@ impl VNextWaveTimingMetrics {
             &self.node_invocation_construct,
             &self.provider_dynamic_binding_encode,
             &self.binding_validate_coalesce,
+            &self.selected_replay_cost,
+            &self.replay_cost_identity_resources,
+            &self.replay_cost_materialize_cached,
+            &self.replay_cost_materialize_unmaterialized_attempt,
+            &self.replay_cost_numeric_resources,
+            &self.replay_cost_full_executable_resources,
+            &self.replay_cost_provider_projection,
             &self.lane_reserve_submit_arm,
             &self.lane_reserve,
             &self.device_runtime_submit,
@@ -2515,6 +2561,27 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
             }
             SubmissionWaveDispatchStage::BindingValidateAndCoalesce => {
                 self.binding_validate_coalesce.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SelectedReplayCost => {
+                self.selected_replay_cost.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::ReplayCostIdentityAndResources => {
+                self.replay_cost_identity_resources.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::ReplayCostMaterializeCached => {
+                self.replay_cost_materialize_cached.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::ReplayCostMaterializeUnmaterializedAttempt => self
+                .replay_cost_materialize_unmaterialized_attempt
+                .record(elapsed),
+            SubmissionWaveDispatchStage::ReplayCostNumericResources => {
+                self.replay_cost_numeric_resources.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::ReplayCostFullExecutableResources => {
+                self.replay_cost_full_executable_resources.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::ReplayCostProviderProjection => {
+                self.replay_cost_provider_projection.record(elapsed)
             }
             SubmissionWaveDispatchStage::LaneReserve => self.lane_reserve.record(elapsed),
             SubmissionWaveDispatchStage::DeviceRuntimeSubmit => {
@@ -3651,6 +3718,9 @@ impl Drop for VNextExecutionJournal {
 }
 
 struct VNextSequence<R: DeviceRuntime> {
+    // Once scheduled by a guarded engine, all optional checkpoint transfers
+    // belong to explicit maintenance turns, including terminal retention.
+    explicit_checkpoint_maintenance: AtomicBool,
     prefix_capture_interests:
         Mutex<Vec<std::sync::Weak<prefix_cache::rendezvous::NativePrefixCapture<R>>>>,
     cache_id: String,
@@ -4677,10 +4747,14 @@ impl<R: DeviceRuntime> Drop for VNextPrefillExecutionGuard<'_, R> {
 pub struct VNextModelExecutor<R: DeviceRuntime> {
     info: ModelInfo,
     cost_identity: ferrum_interfaces::execution_cost::ExecutorCostIdentityAvailability,
+    cost_workload_domain: ferrum_interfaces::execution_cost::CostWorkloadDomainAvailability,
+    decode_context_coverage: Arc<ferrum_interfaces::vnext::ExecutorDecodeContextCoverage>,
     resolved_plan: ResolvedModelPlan,
     capability_catalog: CapabilityCatalog,
     runtime: Arc<R>,
     providers: BoundOperationProviderSet<R>,
+    cost_observation_providers:
+        std::sync::OnceLock<Arc<cost_observation::dispatch::ProviderIdentityTable>>,
     policy: ResolvedRuntimePolicy,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
@@ -4715,7 +4789,11 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     prefix_capture_identity: Arc<()>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
+    structured_actual_capture: ferrum_types::SloStructuredActualCapturePolicy,
+    structured_artifact_consumer: AtomicBool,
+    numeric_artifact_consumer: AtomicBool,
     device_timing_mode: AtomicU8,
+    configured_device_timing_mode: DeviceTimingMode,
     bounded_profile_frames: AtomicBool,
     host_dispatch_timing: AtomicBool,
     diagnostic_fault: Option<VNextDiagnosticFault>,
@@ -5047,6 +5125,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let providers = registry
             .bind_plan(&resolved_plan)
             .map_err(|error| FerrumError::model(format!("vNext provider binding: {error}")))?;
+        let decode_context_coverage = Arc::new(providers.decode_context_coverage());
         resolve_bind_phase.finish();
         let io = Self::resolve_io(
             &resolved_plan,
@@ -5069,6 +5148,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &family_fingerprint,
             &program_fingerprint,
             &runtime.cost_hardware_identity(),
+        );
+        let cost_workload_domain = cost_observation::domain::cache(
+            &cost_identity,
+            &resolved_plan,
+            &config,
+            &io,
+            sequence_state_memory,
         );
         let static_bytes = resolved_plan
             .execution_plan()
@@ -5261,6 +5347,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         Ok(Self {
             info,
             cost_identity,
+            cost_workload_domain,
+            decode_context_coverage,
             resolved_plan,
             capability_catalog: catalog,
             runtime,
@@ -5280,6 +5368,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             program_fingerprint,
             static_provider_attribution,
             checkpoint_capture,
+            cost_observation_providers: std::sync::OnceLock::new(),
             teacher_capture_active: AtomicBool::new(false),
             teacher_wave_capture: Mutex::new(None),
             static_bytes,
@@ -5297,7 +5386,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             prefix_capture_identity: Arc::new(()),
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
-            device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
+            structured_actual_capture: config.structured_actual_capture,
+            structured_artifact_consumer: AtomicBool::new(false),
+            numeric_artifact_consumer: AtomicBool::new(false),
+            device_timing_mode: AtomicU8::new(config.device_timing_mode as u8),
+            configured_device_timing_mode: config.device_timing_mode,
             bounded_profile_frames: AtomicBool::new(false),
             host_dispatch_timing: AtomicBool::new(false),
             diagnostic_fault: config.diagnostic_fault,
@@ -5346,6 +5439,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     async fn reserve_startup_sequence(
+        &self,
+        resources: &mut VNextStartupSequenceGuard<'_, R>,
+        input_tokens: &[TokenId],
+        maximum_sequence_tokens: usize,
+    ) -> Result<Option<RequestId>> {
+        self.reserve_resource_preparation_sequence(resources, input_tokens, maximum_sequence_tokens)
+    }
+
+    fn reserve_resource_preparation_sequence(
         &self,
         resources: &mut VNextStartupSequenceGuard<'_, R>,
         input_tokens: &[TokenId],
@@ -5565,10 +5667,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<VNextReusableExecutionStartupReport> {
         let started = Instant::now();
         let Some(plan) = self.reusable_execution_startup_plan.clone() else {
-            self.install_reusable_execution_catalog(VNextReusableExecutionCatalog {
-                lane_epoch: self.lane.reusable_execution_epoch(),
-                programs: BTreeMap::new(),
-            })?;
+            self.install_reusable_execution_catalog(
+                VNextReusableExecutionCatalog::unobserved_empty(
+                    self.lane.reusable_execution_epoch(),
+                ),
+            )?;
             return Ok(VNextReusableExecutionStartupReport {
                 workspace_preparation: None,
                 enabled: self.device_reusable_execution_enabled,
@@ -5796,9 +5899,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext reusable execution catalog inspection failed: {error}"
             ))
         })?;
-        let (catalog_epoch, catalog) = catalog.into_parts();
-        let mut catalog_by_id = BTreeMap::new();
-        for program in catalog {
+        let catalog = catalog
+            .into_index()
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let catalog_by_id = catalog.programs();
+        for program in catalog_by_id.values() {
             let program_id = program.program_id();
             if program_id.plan_hash() != self.resolved_plan.execution_plan().plan_hash()
                 || program_id.runtime_implementation_fingerprint()
@@ -5811,11 +5916,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             {
                 return Err(FerrumError::internal(
                     "vNext reusable execution catalog differs from its immutable plan or lane",
-                ));
-            }
-            if catalog_by_id.insert(program_id.clone(), program).is_some() {
-                return Err(FerrumError::internal(
-                    "vNext reusable execution catalog contains a duplicate program identity",
                 ));
             }
         }
@@ -5936,10 +6036,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prepared_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
         prepared_prefill_token_counts.dedup();
         let incomplete_capture_cases = prepared_descriptors.len() != requested_descriptors.len();
-        self.install_reusable_execution_catalog(VNextReusableExecutionCatalog {
-            lane_epoch: catalog_epoch,
-            programs: catalog_by_id,
-        })?;
+        self.install_reusable_execution_catalog(catalog)?;
         let requested_wave_shapes = prepared_decode_widths.len() + plan.prefill_wave_shapes();
         Ok(VNextReusableExecutionStartupReport {
             workspace_preparation: None,
@@ -6441,6 +6538,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         };
         let sequence = Arc::new(VNextSequence {
+            explicit_checkpoint_maintenance: AtomicBool::new(false),
             prefix_capture_interests: Mutex::new(Vec::new()),
             cache_id: format!(
                 "vnext-cache-{request_id}-{}-{}",
@@ -6592,11 +6690,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         outcome: DynamicDeferredMaintenanceOutcome,
         source: VNextExecutionMaintenanceSource<'_>,
         participants: impl IntoIterator<Item = &'a VNextSequence<R>>,
-        progress_receipts: &mut Vec<DynamicPoolGrowthBatchReceipt>,
+        progress_receipts: &mut backing_maintenance::BackingMaintenanceProgress,
         prefix_maintenance: &mut prefix_cache::PrefixPressureMaintenance,
     ) -> Result<Option<ExecutorExecutionCapacityDeferral>> {
         match outcome {
-            DynamicDeferredMaintenanceOutcome::RetryAdmission { .. } => Ok(None),
+            DynamicDeferredMaintenanceOutcome::RetryAdmission {
+                lane_reclamation, ..
+            } => {
+                if let Some(receipt) = lane_reclamation {
+                    progress_receipts.record_reclamation(&receipt);
+                }
+                Ok(None)
+            }
             DynamicDeferredMaintenanceOutcome::Maintained(receipt) => {
                 progress_receipts.push(receipt.clone());
                 let Some(sink) = self.event_sink.read().clone() else {
@@ -6724,7 +6829,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<VNextExecutionCapacityDecision<()>> {
         let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
-        let mut maintenance_receipts = Vec::new();
+        let mut maintenance_receipts = backing_maintenance::BackingMaintenanceProgress::default();
         let mut rechecks = 0;
         loop {
             if !sequence.active.load(Ordering::Acquire) {
@@ -6786,11 +6891,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("sequence extension", &deferred));
                     }
-                    if !backing_maintenance::allows_backing_attempt(
+                    if !maintenance_receipts.allows_attempt(
                         &prefix_maintenance,
                         backing_attempts,
-                        &maintenance_receipts,
-                    ) {
+                        &self.plan_resources,
+                    )? {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6799,7 +6904,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             .bind_execution_maintenance_retry(
                                 deferral,
                                 backing_attempts,
-                                &maintenance_receipts,
+                                maintenance_receipts.receipts(),
                                 vec![sequence.request_id().clone()],
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
@@ -6824,11 +6929,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if !backing_maintenance::allows_backing_attempt(
+                    if !maintenance_receipts.allows_attempt(
                         &prefix_maintenance,
                         backing_attempts,
-                        &maintenance_receipts,
-                    ) {
+                        &self.plan_resources,
+                    )? {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6837,7 +6942,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             .bind_execution_maintenance_retry(
                                 deferral,
                                 backing_attempts,
-                                &maintenance_receipts,
+                                maintenance_receipts.receipts(),
                                 vec![sequence.request_id().clone()],
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
@@ -7019,7 +7124,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
-        let mut maintenance_receipts = Vec::new();
+        let mut maintenance_receipts = backing_maintenance::BackingMaintenanceProgress::default();
         loop {
             match self.try_begin_step_for_spans(batch, spans, kind)? {
                 StepResourceAdmissionDecision::Admitted(step) => {
@@ -7037,11 +7142,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("step admission", &deferred));
                     }
-                    if !backing_maintenance::allows_backing_attempt(
+                    if !maintenance_receipts.allows_attempt(
                         &prefix_maintenance,
                         backing_attempts,
-                        &maintenance_receipts,
-                    ) {
+                        &self.plan_resources,
+                    )? {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::StepAdmission,
@@ -7050,7 +7155,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             .bind_execution_maintenance_retry(
                                 deferral,
                                 backing_attempts,
-                                &maintenance_receipts,
+                                maintenance_receipts.receipts(),
                                 sequences
                                     .iter()
                                     .map(|sequence| sequence.request_id().clone())
@@ -7078,11 +7183,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if !backing_maintenance::allows_backing_attempt(
+                    if !maintenance_receipts.allows_attempt(
                         &prefix_maintenance,
                         backing_attempts,
-                        &maintenance_receipts,
-                    ) {
+                        &self.plan_resources,
+                    )? {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::StepAdmission,
@@ -7091,7 +7196,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             .bind_execution_maintenance_retry(
                                 deferral,
                                 backing_attempts,
-                                &maintenance_receipts,
+                                maintenance_receipts.receipts(),
                                 sequences
                                     .iter()
                                     .map(|sequence| sequence.request_id().clone())
@@ -7228,7 +7333,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .start_if(timing_enabled);
         let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
-        let mut maintenance_receipts = Vec::new();
+        let mut maintenance_receipts = backing_maintenance::BackingMaintenanceProgress::default();
         loop {
             match self.try_prepare_wave_for_spans(step, spans)? {
                 StepSubmissionWaveAdmissionDecision::Prepared(wave) => {
@@ -7247,11 +7352,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("submission wave", &deferred));
                     }
-                    if !backing_maintenance::allows_backing_attempt(
+                    if !maintenance_receipts.allows_attempt(
                         &prefix_maintenance,
                         backing_attempts,
-                        &maintenance_receipts,
-                    ) {
+                        &self.plan_resources,
+                    )? {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -7260,7 +7365,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             .bind_execution_maintenance_retry(
                                 deferral,
                                 backing_attempts,
-                                &maintenance_receipts,
+                                maintenance_receipts.receipts(),
                                 sequences
                                     .iter()
                                     .map(|sequence| sequence.request_id().clone())
@@ -7288,11 +7393,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if !backing_maintenance::allows_backing_attempt(
+                    if !maintenance_receipts.allows_attempt(
                         &prefix_maintenance,
                         backing_attempts,
-                        &maintenance_receipts,
-                    ) {
+                        &self.plan_resources,
+                    )? {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -7301,7 +7406,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             .bind_execution_maintenance_retry(
                                 deferral,
                                 backing_attempts,
-                                &maintenance_receipts,
+                                maintenance_receipts.receipts(),
                                 sequences
                                     .iter()
                                     .map(|sequence| sequence.request_id().clone())
@@ -7444,6 +7549,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 participants
                     .iter()
                     .map(|participant| participant.sequence.events.as_ref()),
+            );
+        let numeric_observation = if cost_observation
+            .as_ref()
+            .is_some_and(|context| context.cost_observation_demand().is_required())
+            || self.numeric_artifact_consumer.load(Ordering::Acquire)
+        {
+            DeviceCostObservationDemand::Required
+        } else {
+            DeviceCostObservationDemand::NotRequired
+        };
+        let structured_sample =
+            ferrum_interfaces::execution_cost::StructuredCostSampleDemand::for_call(
+                self.structured_actual_capture,
+                cost_observation
+                    .as_ref()
+                    .is_some_and(|context| context.structured_capture_enabled()),
+                self.structured_artifact_consumer.load(Ordering::Acquire),
             );
         let active_bindings = || {
             participants
@@ -7672,85 +7794,85 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let mut reusable_catalog_miss = None;
             let catalog_snapshot = self.reusable_execution_catalog.read().clone();
             let catalog = catalog_snapshot.as_deref();
-            let reusable_program = if !reusable_program_identity_required(
+            let (reusable_program, prepared_cost_route) = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
                 catalog.is_some(),
                 instrumentation.direct_reusable_execution_allowed,
                 reusable_direct_attempted,
             ) {
-                None
+                (
+                    None,
+                    cost_observation
+                        .as_ref()
+                        .filter(|context| context.structured_capture_enabled())
+                        .map(|_| {
+                            OperationDispatch::observe_non_reusable_cost_route_for_wave(
+                                &self.lane, &wave,
+                            )
+                        }),
+                )
             } else {
-                let program_id = match OperationDispatch::reusable_execution_program_id_for_wave(
+                let selection = match OperationDispatch::select_reusable_execution_for_cost(
                     self.providers.providers(),
                     &self.resolved_plan,
                     &wave,
                     &self.lane,
+                    catalog,
+                    cost_observation
+                        .as_ref()
+                        .is_some_and(|context| context.structured_capture_enabled()),
                 ) {
-                    Ok(program_id) => program_id,
-                    Err(error) => {
-                        return DispatchOutcome::QuiescentFailure(error.to_string());
-                    }
+                    Ok(selection) => selection,
+                    Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
                 };
-                match program_id {
-                    Some(program_id) => {
-                        if catalog.is_none() {
-                            self.record_startup_reusable_program(participants, kind, &program_id);
-                        }
-                        match catalog {
-                            Some(catalog)
-                                if catalog.lane_epoch != self.lane.reusable_execution_epoch() =>
-                            {
-                                reusable_catalog_miss =
-                                    Some(VNextReusableExecutionCatalogMissKey::from_program_id(
-                                        &program_id,
-                                        VNextReusableExecutionCatalogMissReason::EpochMismatch,
-                                    ));
-                                None
-                            }
-                            Some(catalog) if catalog.programs.is_empty() => {
-                                reusable_catalog_miss =
-                                    Some(VNextReusableExecutionCatalogMissKey::from_program_id(
-                                        &program_id,
-                                        VNextReusableExecutionCatalogMissReason::CatalogEmpty,
-                                    ));
-                                None
-                            }
-                            Some(catalog) => match catalog.programs.get(&program_id) {
-                                Some(program) if program.has_resident_segments() => Some(program),
-                                Some(_) => {
-                                    reusable_catalog_miss = Some(
-                                        VNextReusableExecutionCatalogMissKey::from_program_id(
-                                            &program_id,
-                                            VNextReusableExecutionCatalogMissReason::ProgramNonResident,
-                                        ),
-                                    );
-                                    None
-                                }
-                                None => {
-                                    reusable_catalog_miss = Some(
-                                        VNextReusableExecutionCatalogMissKey::from_program_id(
-                                            &program_id,
-                                            VNextReusableExecutionCatalogMissReason::ProgramAbsent,
-                                        ),
-                                    );
-                                    None
-                                }
-                            },
-                            None => None,
-                        }
+                use ferrum_interfaces::execution_cost::PreparedCostRouteReasonV1 as Reason;
+                let route = selection.route();
+                if let Some(program_id) = route.program_id() {
+                    if catalog.is_none() {
+                        self.record_startup_reusable_program(participants, kind, program_id);
                     }
-                    None if catalog.is_some() => {
-                        reusable_catalog_miss = Some(
-                            VNextReusableExecutionCatalogMissKey::without_program_identity(
-                                wave.claimed_backing().work_shape(),
-                                VNextReusableExecutionCatalogMissReason::ProgramIdentityUnavailable,
-                            ),
-                        );
-                        None
-                    }
-                    None => None,
+                    let reason = match route.reason() {
+                        Reason::CatalogEpochMismatch => {
+                            Some(VNextReusableExecutionCatalogMissReason::EpochMismatch)
+                        }
+                        Reason::CatalogEmpty => {
+                            Some(VNextReusableExecutionCatalogMissReason::CatalogEmpty)
+                        }
+                        Reason::ProgramAbsent => {
+                            Some(VNextReusableExecutionCatalogMissReason::ProgramAbsent)
+                        }
+                        Reason::ProgramNonResident => {
+                            Some(VNextReusableExecutionCatalogMissReason::ProgramNonResident)
+                        }
+                        _ => None,
+                    };
+                    reusable_catalog_miss = reason.map(|reason| {
+                        VNextReusableExecutionCatalogMissKey::from_program_id(program_id, reason)
+                    });
+                } else if catalog.is_some() {
+                    reusable_catalog_miss = Some(
+                        VNextReusableExecutionCatalogMissKey::without_program_identity(
+                            wave.claimed_backing().work_shape(),
+                            VNextReusableExecutionCatalogMissReason::ProgramIdentityUnavailable,
+                        ),
+                    );
                 }
+                let (program, route) = selection.into_parts();
+                (program, Some(route))
             };
+            if let Some(context) = cost_observation
+                .as_deref_mut()
+                .filter(|context| context.structured_capture_enabled())
+            {
+                if let Some(route) = prepared_cost_route {
+                    let rows = if route.class().is_outside() {
+                        cost_observation::dispatch::prepared_route_rows(participants, context)
+                    } else {
+                        Ok(Vec::new())
+                    };
+                    context.prepared_route(route, rows);
+                }
+            }
             reusable_direct_attempted |= reusable_program.is_some();
             if reusable_program.is_none() && self.on_demand_reusable_execution_enabled() {
                 self.reusable_execution_catalog_refresh_needed
@@ -7789,28 +7911,35 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         masks: token_mask_plans,
                     };
                     let outcome = if timing_enabled {
-                        OperationDispatch::encode_and_submit_guarded_wave_with_program_and_timing(
+                        OperationDispatch::encode_and_submit_guarded_wave_with_device_timing_and_cost_evidence_demand(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
                             active_bindings(),
+                            device_timing_mode,
                             &uploads,
                             reusable_program,
                             &guard,
+                            numeric_observation,
+                            structured_sample,
                             &timing_sink,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
                     } else {
-                        OperationDispatch::encode_and_submit_guarded_wave_with_program(
+                        OperationDispatch::encode_and_submit_guarded_wave_with_device_timing_and_cost_evidence_demand(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
                             active_bindings(),
+                            device_timing_mode,
                             &uploads,
                             reusable_program,
                             &guard,
+                            numeric_observation,
+                            structured_sample,
+                            &cost_observation::dispatch::NoTiming,
                             wave,
                             &self.lane,
                             &self.reaper,
@@ -7824,9 +7953,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             return DispatchOutcome::GuardRejected(rejection);
                         }
                     }
-                } else if cost_observation.is_some() {
-                    if timing_enabled && profile_capture_enabled {
-                        OperationDispatch::encode_and_submit_wave_with_cost_observation(
+                } else {
+                    let timed_artifact = timing_enabled && profile_capture_enabled;
+                    let retain_attribution = cost_observation.is_some() || timed_artifact;
+                    let result = if timed_artifact {
+                        OperationDispatch::encode_and_submit_wave_with_cost_evidence_demand(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
@@ -7835,14 +7966,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             &uploads,
                             execution_policy,
                             reusable_program,
+                            cost_observation.is_some(),
+                            numeric_observation,
+                            structured_sample,
                             &timing_sink,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
-                        .map(ProfiledSubmissionHandle::into_parts)
                     } else {
-                        OperationDispatch::encode_and_submit_wave_with_cost_observation(
+                        OperationDispatch::encode_and_submit_wave_with_cost_evidence_demand(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
@@ -7851,81 +7984,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             &uploads,
                             execution_policy,
                             reusable_program,
+                            cost_observation.is_some(),
+                            numeric_observation,
+                            structured_sample,
                             &cost_observation::dispatch::NoTiming,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
-                        .map(ProfiledSubmissionHandle::into_parts)
-                    }
-                } else if let Some(reusable_program) = reusable_program {
-                    if timing_enabled && profile_capture_enabled {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
-                            self.providers.providers(),
-                            &self.resolved_plan,
-                            &identity,
-                            active_bindings(),
-                            device_timing_mode,
-                            &uploads,
-                            reusable_program,
-                            execution_policy,
-                            &timing_sink,
-                            wave,
-                            &self.lane,
-                            &self.reaper,
+                    };
+                    result.map(|profiled| {
+                        let (completion, attribution) = profiled.into_parts();
+                        (
+                            completion,
+                            retain_attribution.then_some(attribution).flatten(),
                         )
-                        .map(ProfiledSubmissionHandle::into_parts)
-                    } else {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
-                            self.providers.providers(),
-                            &self.resolved_plan,
-                            &identity,
-                            active_bindings(),
-                            device_timing_mode,
-                            &uploads,
-                            reusable_program,
-                            execution_policy,
-                            wave,
-                            &self.lane,
-                            &self.reaper,
-                        )
-                        .map(|completion| (completion, None))
-                    }
-                } else if timing_enabled && profile_capture_enabled {
-                    OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
-                        self.providers.providers(),
-                        &self.resolved_plan,
-                        &identity,
-                        active_bindings(),
-                        device_timing_mode,
-                        &uploads,
-                        execution_policy,
-                        &timing_sink,
-                        wave,
-                        &self.lane,
-                        &self.reaper,
-                    )
-                    .map(ProfiledSubmissionHandle::into_parts)
-                } else {
-                    OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
-                        self.providers.providers(),
-                        &self.resolved_plan,
-                        &identity,
-                        active_bindings(),
-                        device_timing_mode,
-                        &uploads,
-                        execution_policy,
-                        wave,
-                        &self.lane,
-                        &self.reaper,
-                    )
-                    .map(|completion| (completion, None))
+                    })
                 }
             };
             match submission {
                 Ok((completion, attribution)) => {
                     if let Some(observation) = cost_observation.as_deref_mut() {
-                        let shape = cost_observation::dispatch::actual_shape(
+                        let shape = cost_observation::dispatch::pending_actual_shape(
                             self,
                             observation,
                             participants,
@@ -7935,8 +8015,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             attribution.as_ref(),
                             retries,
                             completion.core_readback_route(self.runtime.as_ref()),
+                            numeric_observation,
                         );
-                        observation.physical_wave(shape, cost_submit_started);
+                        observation.physical_wave_pending(shape, cost_submit_started);
+                        observation.route_submission(attribution.as_ref());
                     }
                     let identity_materialization = identity.materialization_snapshot();
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
@@ -8178,6 +8260,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             return Err(FerrumError::internal(
                 "vNext decode batch differs from its canonical participant set",
             ));
+        }
+        if guarded.is_some() {
+            for sequence in sequences {
+                sequence
+                    .explicit_checkpoint_maintenance
+                    .store(true, Ordering::Release);
+            }
         }
         let retained_spans = if self.checkpoint_token_evidence_enabled() {
             Some(
@@ -8469,7 +8558,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             DispatchOutcome::GuardRejected(rejection) => {
                 drop(completion_reservation);
                 token_mask_residency.invalidate_before_slot_release();
-                match rejection.reconcile_step(step) {
+                let rollback = match guarded {
+                    Some(guarded) => {
+                        rejection.reconcile_step_with_observation(step, guarded.expected.work())
+                    }
+                    None => rejection.reconcile_step(step),
+                };
+                match rollback {
                     Ok(receipt) => {
                         if let Some(guarded) = guarded {
                             guarded.record_reconciled(receipt);
@@ -10405,11 +10500,43 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     fn execution_cost_identity(
         &self,
     ) -> ferrum_interfaces::execution_cost::ExecutorCostIdentityAvailability {
+        if self.device_timing_mode() != self.configured_device_timing_mode {
+            return ferrum_interfaces::execution_cost::ExecutorCostIdentityAvailability::Unknown {
+                reason: ferrum_interfaces::execution_cost::CostIdentityUnknownReason::MissingExecutionConfig,
+                partial: None,
+            };
+        }
         self.cost_identity.clone()
+    }
+
+    fn cost_workload_domain(
+        &self,
+    ) -> ferrum_interfaces::execution_cost::CostWorkloadDomainAvailability {
+        self.cost_workload_domain.clone()
+    }
+
+    fn decode_context_coverage(
+        &self,
+    ) -> Arc<ferrum_interfaces::vnext::ExecutorDecodeContextCoverage> {
+        Arc::clone(&self.decode_context_coverage)
     }
 
     fn execution_cost_observation_capability(&self) -> ExecutorCostObservationCapability {
         ExecutorCostObservationCapability::SinglePhysicalWave
+    }
+
+    fn install_observation_template_budget(
+        &self,
+        budget: Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Result<()> {
+        self.runtime
+            .install_observation_template_budget(budget)
+            .map_err(|error| FerrumError::config(format!("observation template budget: {error}")))
+    }
+    fn observation_template_budget(
+        &self,
+    ) -> Option<Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>> {
+        self.runtime.observation_template_budget()
     }
 
     async fn plan_runtime_prefill_with_capacity_observed(
@@ -10424,11 +10551,15 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 Some(observation),
             )
             .await;
-        observation.finish_call(match &result {
-            Ok(PlanRuntimePrefillOutcome::Completed(_)) => ObservedCallOutcome::Completed,
-            Ok(PlanRuntimePrefillOutcome::Deferred(_)) => ObservedCallOutcome::Deferred,
-            Err(_) => ObservedCallOutcome::Failed,
-        });
+        match &result {
+            Ok(PlanRuntimePrefillOutcome::Deferred(deferral)) => {
+                observation.finish_capacity_deferred(deferral)
+            }
+            Ok(PlanRuntimePrefillOutcome::Completed(_)) => {
+                observation.finish_call(ObservedCallOutcome::Completed)
+            }
+            Err(_) => observation.finish_call(ObservedCallOutcome::Failed),
+        }
         ObservedDispatch::Executed(result)
     }
 
@@ -10440,14 +10571,18 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let result = self
             .execute_plan_runtime_prefill_batch_with_capacity(inputs, Some(observation))
             .await;
-        observation.finish_call(match &result {
-            Ok(PlanRuntimeBatchPrefillOutcome::Completed(_)) => ObservedCallOutcome::Completed,
-            Ok(PlanRuntimeBatchPrefillOutcome::Unsupported) => ObservedCallOutcome::Unsupported,
-            Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(_)) => {
-                ObservedCallOutcome::NotSubmitted
+        match &result {
+            Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral)) => {
+                observation.finish_capacity_not_submitted(deferral)
             }
-            Err(_) => ObservedCallOutcome::Failed,
-        });
+            Ok(PlanRuntimeBatchPrefillOutcome::Completed(_)) => {
+                observation.finish_call(ObservedCallOutcome::Completed)
+            }
+            Ok(PlanRuntimeBatchPrefillOutcome::Unsupported) => {
+                observation.finish_call(ObservedCallOutcome::Unsupported)
+            }
+            Err(_) => observation.finish_call(ObservedCallOutcome::Failed),
+        }
         ObservedDispatch::Executed(result)
     }
 
@@ -10460,12 +10595,18 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let result = self
             .execute_plan_runtime_mixed_batch(prefills, decodes, Some(observation))
             .await;
-        observation.finish_call(match &result {
-            Ok(PlanRuntimeMixedBatchOutcome::Completed { .. }) => ObservedCallOutcome::Completed,
-            Ok(PlanRuntimeMixedBatchOutcome::Unsupported) => ObservedCallOutcome::Unsupported,
-            Ok(PlanRuntimeMixedBatchOutcome::NotSubmitted(_)) => ObservedCallOutcome::NotSubmitted,
-            Err(_) => ObservedCallOutcome::Failed,
-        });
+        match &result {
+            Ok(PlanRuntimeMixedBatchOutcome::NotSubmitted(deferral)) => {
+                observation.finish_capacity_not_submitted(deferral)
+            }
+            Ok(PlanRuntimeMixedBatchOutcome::Completed { .. }) => {
+                observation.finish_call(ObservedCallOutcome::Completed)
+            }
+            Ok(PlanRuntimeMixedBatchOutcome::Unsupported) => {
+                observation.finish_call(ObservedCallOutcome::Unsupported)
+            }
+            Err(_) => observation.finish_call(ObservedCallOutcome::Failed),
+        }
         ObservedDispatch::Executed(result)
     }
 
@@ -10477,11 +10618,15 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let result = self
             .execute_plan_runtime_decode_batch(inputs, Some(observation))
             .await;
-        observation.finish_call(match &result {
-            Ok(PlanRuntimeBatchDecodeOutcome::Completed(_)) => ObservedCallOutcome::Completed,
-            Ok(PlanRuntimeBatchDecodeOutcome::Deferred(_)) => ObservedCallOutcome::Deferred,
-            Err(_) => ObservedCallOutcome::Failed,
-        });
+        match &result {
+            Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
+                observation.finish_capacity_deferred(deferral)
+            }
+            Ok(PlanRuntimeBatchDecodeOutcome::Completed(_)) => {
+                observation.finish_call(ObservedCallOutcome::Completed)
+            }
+            Err(_) => observation.finish_call(ObservedCallOutcome::Failed),
+        }
         ObservedDispatch::Executed(result)
     }
 
@@ -10615,6 +10760,26 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.prefix_restore_enabled()
     }
 
+    fn supports_guarded_prefix_maintenance(&self) -> bool {
+        self.prefix_restore_enabled() && self.supports_guarded_execution_policy()
+    }
+
+    async fn try_capture_plan_runtime_prefix_guarded(
+        &self,
+        input: PrefixCaptureRequest<'_>,
+        guard: Arc<dyn CheckpointTransferSubmissionGuard>,
+    ) -> Result<bool> {
+        self.capture_prefix_guarded(input, guard).await
+    }
+
+    async fn try_restore_plan_runtime_prefix_guarded(
+        &self,
+        input: PlanRuntimePrefixRestoreInput<'_>,
+        guard: Arc<dyn CheckpointTransferSubmissionGuard>,
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
+        self.restore_prefix_with_guard(input, Some(guard)).await
+    }
+
     async fn try_restore_plan_runtime_prefix(
         &self,
         input: PlanRuntimePrefixRestoreInput<'_>,
@@ -10702,6 +10867,26 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.capture_resource_planning_view(requests, limits, budget)
     }
 
+    fn prepare_execution_resources(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePreparationRequest],
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<ferrum_interfaces::model_executor::ExecutorResourcePreparationReceipt> {
+        self.prepare_declared_resource_shapes(requests, budget)
+    }
+
+    fn execution_completion_planning_capture(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
+        limits: ResourcePlanningLimits,
+        forecast_limits: ResourcePlanningLimits,
+        observer: &mut dyn ferrum_interfaces::model_executor::ExecutorPlanningCapture,
+    ) -> ResourcePlanningAvailability<
+        ferrum_interfaces::model_executor::ExecutorCompletionPlanningCapture,
+    > {
+        self.capture_completion_and_future_route(requests, limits, forecast_limits, observer)
+    }
+
     fn execution_cost_route_view(
         &self,
         requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
@@ -10719,6 +10904,133 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         budget: &mut dyn ResourcePlanningBudget,
     ) -> ExecutionCostRouteAvailability<ExecutionCostRouteProjection> {
         self.project_future_cost_route(view, state, query, budget)
+    }
+
+    fn project_execution_checkpoint(
+        &self,
+        view: &ExecutionCostRouteView,
+        state: &ExecutionCostRouteState,
+        query: FutureCheckpointCostQuery<'_>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<FutureCheckpointCostProjection> {
+        self.project_future_checkpoint(view, state, query, budget)
+    }
+
+    fn try_retain_ready_prefix(
+        &self,
+        input: ferrum_interfaces::model_executor::PrefixReadyRestoreRequest<'_>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<
+        Option<Arc<dyn ferrum_interfaces::model_executor::PrefixCaptureLease>>,
+    > {
+        self.try_ready_prefix(input, budget)
+    }
+
+    fn bind_execution_ready_checkpoint(
+        &self,
+        view: &ExecutionCostRouteView,
+        state: &ExecutionCostRouteState,
+        lease: &dyn ferrum_interfaces::model_executor::PrefixCaptureLease,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<FutureRetainedCheckpointBinding> {
+        if !budget.has_budget() {
+            return ExecutionCostRouteAvailability::Unknown(
+                ExecutionCostRouteUnknown::BudgetExhausted,
+            );
+        }
+        if view.lane_id() != self.lane.id() {
+            return ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::StaleView);
+        }
+        let Some(checkpoint) = self.try_retained_rendezvous_checkpoint(lease) else {
+            return ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::Resource(
+                ResourcePlanningUnknown::BusyOrUnavailable,
+            ));
+        };
+        self.plan_resources.bind_future_ready_checkpoint(
+            view,
+            state,
+            self.resolved_plan.execution_plan(),
+            &checkpoint,
+            budget,
+        )
+    }
+
+    fn bind_execution_retained_checkpoint(
+        &self,
+        view: &ExecutionCostRouteView,
+        state: &ExecutionCostRouteState,
+        lease: &dyn ferrum_interfaces::model_executor::PrefixCaptureLease,
+        source: usize,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<FutureRetainedCheckpointBinding> {
+        if !budget.has_budget() {
+            return ExecutionCostRouteAvailability::Unknown(
+                ExecutionCostRouteUnknown::BudgetExhausted,
+            );
+        }
+        if view.lane_id() != self.lane.id() {
+            return ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::StaleView);
+        }
+        let Some(checkpoint) = self.try_retained_rendezvous_checkpoint(lease) else {
+            return ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::Resource(
+                ResourcePlanningUnknown::BusyOrUnavailable,
+            ));
+        };
+        self.plan_resources.bind_future_retained_checkpoint(
+            view,
+            state,
+            self.resolved_plan.execution_plan(),
+            &checkpoint,
+            source,
+            budget,
+        )
+    }
+
+    fn execution_checkpoint_restore_completed(
+        &self,
+        view: &ExecutionCostRouteView,
+        lease: &dyn ferrum_interfaces::model_executor::PrefixCaptureLease,
+        target: usize,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<bool> {
+        if !budget.has_budget() {
+            return ExecutionCostRouteAvailability::Unknown(
+                ExecutionCostRouteUnknown::BudgetExhausted,
+            );
+        }
+        if view.lane_id() != self.lane.id() {
+            return ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::StaleView);
+        }
+        let Some(checkpoint) = self.try_retained_rendezvous_checkpoint(lease) else {
+            return ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::Resource(
+                ResourcePlanningUnknown::BusyOrUnavailable,
+            ));
+        };
+        match self.plan_resources.checkpoint_restore_completed(
+            view.resource_view(),
+            &checkpoint,
+            target,
+            budget,
+        ) {
+            ResourcePlanningAvailability::Known(value) => {
+                ExecutionCostRouteAvailability::Known(value)
+            }
+            ResourcePlanningAvailability::Unknown(reason) => {
+                ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::Resource(reason))
+            }
+        }
+    }
+
+    fn install_checkpoint_observation_sink(
+        &self,
+        sink: std::sync::Weak<dyn NativeCheckpointObservationSink>,
+    ) -> Result<bool> {
+        self.reaper
+            .install_checkpoint_observation_sink(sink)
+            .map_err(|error| {
+                FerrumError::config(format!("checkpoint observation sink: {error}"))
+            })?;
+        Ok(true)
     }
 
     fn project_execution_cost_wave_with_host_content(
@@ -10828,6 +11140,13 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        self.numeric_artifact_consumer.store(
+            sink.cost_observation_demand().is_required(),
+            Ordering::Release,
+        );
+
+        self.structured_artifact_consumer
+            .store(sink.needs_structured_cost_sample(), Ordering::Release);
         self.bounded_profile_frames.store(
             matches!(
                 sink.capture_policy(),
@@ -11050,7 +11369,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         drop(sequences);
         let outcome = outcome.expect("maintenance error was handled above");
         match outcome {
-            DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs } => {
+            DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs, .. } => {
                 Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission {
                     current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
                 })
@@ -12151,19 +12470,47 @@ mod tests {
         let stages = [
             (
                 SubmissionWaveDispatchStage::NodeIdentityMaterialize,
-                "identity_materialize",
+                "/identity_materialize",
             ),
             (
                 SubmissionWaveDispatchStage::NodeInvocationConstruct,
-                "invocation_construct",
+                "/invocation_construct",
             ),
             (
                 SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
-                "dynamic_binding_encode",
+                "/dynamic_binding_encode",
             ),
             (
                 SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
-                "binding_validate_coalesce",
+                "/binding_validate_coalesce",
+            ),
+            (
+                SubmissionWaveDispatchStage::SelectedReplayCost,
+                "/selected_replay_cost",
+            ),
+            (
+                SubmissionWaveDispatchStage::ReplayCostIdentityAndResources,
+                "/selected_replay_cost_breakdown/identity_resources",
+            ),
+            (
+                SubmissionWaveDispatchStage::ReplayCostProviderProjection,
+                "/selected_replay_cost_breakdown/provider_projection",
+            ),
+            (
+                SubmissionWaveDispatchStage::ReplayCostMaterializeCached,
+                "/selected_replay_cost_breakdown/identity_resources_breakdown/materialize_cached",
+            ),
+            (
+                SubmissionWaveDispatchStage::ReplayCostMaterializeUnmaterializedAttempt,
+                "/selected_replay_cost_breakdown/identity_resources_breakdown/materialize_unmaterialized_attempt",
+            ),
+            (
+                SubmissionWaveDispatchStage::ReplayCostNumericResources,
+                "/selected_replay_cost_breakdown/identity_resources_breakdown/numeric_resources",
+            ),
+            (
+                SubmissionWaveDispatchStage::ReplayCostFullExecutableResources,
+                "/selected_replay_cost_breakdown/identity_resources_breakdown/full_executable_resources",
             ),
         ];
         for (index, (stage, _)) in stages.iter().enumerate() {
@@ -12179,19 +12526,22 @@ mod tests {
             let snapshot = child(metrics);
             assert_eq!(snapshot["collection"], "profile_attached_only");
             for (index, (_, field)) in stages.iter().enumerate() {
-                assert_eq!(snapshot[field]["samples"], 2);
-                assert_eq!(snapshot[field]["total_ns"], 300 + 2 * index as u64);
+                assert_eq!(snapshot.pointer(field).unwrap()["samples"], 2);
+                assert_eq!(
+                    snapshot.pointer(field).unwrap()["total_ns"],
+                    300 + 2 * index as u64
+                );
             }
             // Recording a nested interval does not invent a parent wave sample.
             assert_eq!(metrics.snapshot()["submitted_wave_total"]["samples"], 0);
             metrics.reset();
             for (_, field) in stages {
-                assert_eq!(child(metrics)[field]["samples"], 0);
-                assert_eq!(child(metrics)[field]["total_ns"], 0);
+                assert_eq!(child(metrics).pointer(field).unwrap()["samples"], 0);
+                assert_eq!(child(metrics).pointer(field).unwrap()["total_ns"], 0);
             }
         }
         for (_, field) in stages {
-            assert_eq!(child(&other_phase)[field]["samples"], 0);
+            assert_eq!(child(&other_phase).pointer(field).unwrap()["samples"], 0);
         }
     }
 

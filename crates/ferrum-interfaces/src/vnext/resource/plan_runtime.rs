@@ -8,12 +8,12 @@ use super::{
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
     DeferredDeviceCleanupStatus, DeviceCapacityClaim, DeviceCapacitySignal, DeviceId,
     DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
-    DynamicPoolGrowthBatchReceipt, DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus,
-    DynamicPoolSet, DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest,
-    ExecutionLane, ExecutionLaneCreationError, FailureEnvelope, InvocationLivenessMode,
-    LaneBackingPrepareDecision, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
-    NoStatic, NodeId, Ordering, PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode,
-    ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
+    DynamicLaneSlotReclamation, DynamicPoolGrowthBatchReceipt, DynamicPoolMaintenanceController,
+    DynamicPoolMaintenanceStatus, DynamicPoolSet, DynamicResourceShape, EvaluatedBackingProjection,
+    EvaluatedBackingRequest, ExecutionLane, ExecutionLaneCreationError, FailureEnvelope,
+    InvocationLivenessMode, LaneBackingPrepareDecision, LogicalAdmissionCoordinator,
+    LogicalAdmissionCoordinatorId, Mutex, NoStatic, NodeId, Ordering, PhysicalBackingClaimIdentity,
+    PlanHash, PlanId, PlanNode, ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
     ResourceLedgerEntrySnapshot, ResourceOwnershipReason, ResourceOwnershipTransferFailure,
     ResourcePoolIdentity, ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
     ResourceTransactionAction, ResourceTransactionContext, ResourceTransactionDriver,
@@ -418,7 +418,7 @@ where
             .dynamic_pools
             .try_reclaim_expired_lane_slots()?
         {
-            return self.retry_admission();
+            return self.retry_admission_after_reclamation(true);
         }
         let outcome = self
             .resources
@@ -439,19 +439,31 @@ where
                     .try_reclaim_one_idle_lane_slot()?,
             };
             if reclaimed {
-                return self.retry_admission();
+                return self.retry_admission_after_reclamation(true);
             }
         }
         Ok(outcome)
     }
 
     pub(super) fn retry_admission(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        self.retry_admission_after_reclamation(false)
+    }
+
+    fn retry_admission_after_reclamation(
+        &self,
+        reclaimed: bool,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
         let mut availability = Vec::with_capacity(self.resources.dynamic_pools.domains.len() + 3);
         let current_epochs = self
             .resources
             .dynamic_pools
             .write_capacity_availability(&mut availability)?;
-        Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs })
+        Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission {
+            current_epochs,
+            lane_reclamation: reclaimed.then_some(DynamicLaneSlotReclamation {
+                epochs: current_epochs,
+            }),
+        })
     }
 
     pub(super) fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
@@ -907,6 +919,15 @@ where
         self.maintenance_controller.status()
     }
 
+    /// A finite bound for one foreground maintenance call. Count each real
+    /// lane slot once, regardless of how many backing pools it owns. Callers
+    /// capture this before their first maintenance action; concurrent new
+    /// slots must not increase the current call's retry allowance.
+    pub fn lane_stable_slot_count(&self) -> Result<usize, VNextError> {
+        let _lifecycle = self.read_lifecycle("bound lane-slot reclamation")?;
+        self.dynamic_pools.lane_stable_slot_count()
+    }
+
     pub fn write_dynamic_capacity_availability(
         &self,
         out: &mut Vec<CapacityAvailabilityEpoch>,
@@ -1231,22 +1252,35 @@ where
         let mut immediate_entries = Vec::new();
         let mut fit_entries = Vec::new();
         let mut requested_slices = Vec::new();
-        for domain in &self.dynamic_pools().domains {
+        let pools = self.dynamic_pools();
+        for (domain_index, domain) in pools.domains.iter().enumerate() {
             let mut immediate_pool_bytes = 0_u64;
             let mut fit_pool_bytes = 0_u64;
             let mut matched = false;
             if lifetime == AllocationLifetime::Step {
-                for slot in domain.pool.step_resource_slots() {
-                    let mut projections = Vec::with_capacity(slot.resource_ids().len());
+                let slots = pools
+                    .step_layouts
+                    .get(domain_index)
+                    .ok_or_else(|| invalid_resource("compiled Step layout is missing a pool"))?;
+                for slot in slots {
+                    let capacities = reusable_execution_bucket
+                        .map(|bucket| {
+                            slot.reusable_capacity
+                                .get(bucket.bucket_id())
+                                .ok_or_else(|| {
+                                    invalid_resource("Step bucket has no compiled capacity layout")
+                                })
+                        })
+                        .transpose()?;
+                    let mut projections = Vec::with_capacity(slot.descriptor_indices.len());
                     let mut immediate_slot_bytes = 0_u64;
                     let mut fit_slot_bytes = 0_u64;
                     let mut capacity_slot_bytes = 0_u64;
-                    for resource_id in slot.resource_ids() {
-                        let descriptor = domain
-                            .descriptors
-                            .iter()
-                            .find(|descriptor| descriptor.base_resource_id() == resource_id)
-                            .ok_or_else(|| {
+                    for (projection_index, &descriptor_index) in
+                        slot.descriptor_indices.iter().enumerate()
+                    {
+                        let descriptor =
+                            domain.descriptors.get(descriptor_index).ok_or_else(|| {
                                 invalid_resource(
                                     "step physical slot references a descriptor outside its pool",
                                 )
@@ -1258,9 +1292,17 @@ where
                         }
                         let logical_size_bytes =
                             descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
-                        let fit_bytes = descriptor.evaluate_request_bytes_for_shape(fit_shape)?;
-                        let capacity_size_bytes =
-                            descriptor.evaluate_request_bytes_for_shape(capacity_shape)?;
+                        let fit_bytes = if fit_shape == immediate_shape {
+                            logical_size_bytes
+                        } else {
+                            descriptor.evaluate_request_bytes_for_shape(fit_shape)?
+                        };
+                        let capacity_size_bytes = match capacities {
+                            Some(values) => *values.get(projection_index).ok_or_else(|| {
+                                invalid_resource("compiled Step projection capacity is missing")
+                            })?,
+                            None => logical_size_bytes,
+                        };
                         immediate_slot_bytes = immediate_slot_bytes.max(logical_size_bytes);
                         fit_slot_bytes = fit_slot_bytes.max(fit_bytes);
                         capacity_slot_bytes = capacity_slot_bytes.max(capacity_size_bytes);
@@ -1281,10 +1323,7 @@ where
                         .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
                     requested_slices.push(EvaluatedBackingRequest {
                         domain,
-                        claim_identity: PhysicalBackingClaimIdentity::new(
-                            domain.pool_id().clone(),
-                            slot.resource_ids().to_vec(),
-                        )?,
+                        claim_identity: slot.claim_identity.clone(),
                         capacity_size_bytes: capacity_slot_bytes,
                         reusable_execution_bucket_id: reusable_execution_bucket
                             .map(|bucket| bucket.bucket_id().clone()),

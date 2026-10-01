@@ -64,6 +64,21 @@ impl Fixture {
         .await
     }
 
+    pub async fn with_structured_layer_stack(
+        maximum_batch_tokens: usize,
+        layers: &[weights::LayerKind],
+    ) -> Self {
+        Self::with_capture_layers(
+            maximum_batch_tokens,
+            false,
+            weights::CausalGeometry::TINY,
+            ferrum_types::WorkspacePreparationMode::DemandDriven,
+            ferrum_types::SloStructuredCostCapture::HostSettledV1,
+            layers,
+        )
+        .await
+    }
+
     async fn with_capture(
         maximum_batch_tokens: usize,
         prefix: bool,
@@ -71,9 +86,28 @@ impl Fixture {
         preparation: ferrum_types::WorkspacePreparationMode,
         capture: ferrum_types::SloStructuredCostCapture,
     ) -> Self {
+        Self::with_capture_layers(
+            maximum_batch_tokens,
+            prefix,
+            geometry,
+            preparation,
+            capture,
+            &weights::TWO_LAYERS,
+        )
+        .await
+    }
+
+    async fn with_capture_layers(
+        maximum_batch_tokens: usize,
+        prefix: bool,
+        geometry: weights::CausalGeometry,
+        preparation: ferrum_types::WorkspacePreparationMode,
+        capture: ferrum_types::SloStructuredCostCapture,
+        layers: &[weights::LayerKind],
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        weights::write_config(directory.path(), geometry);
-        weights::write_weights(directory.path(), geometry);
+        weights::write_config_for_layers(directory.path(), geometry, layers);
+        weights::write_weights_for_layers(directory.path(), geometry, layers);
         std::fs::write(directory.path().join("tokenizer.json"), br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1,"<eos>":2},"unk_token":"<unk>"}}"#).unwrap();
         std::fs::write(directory.path().join("tokenizer_config.json"), br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
         let defined = define_from_model_dir(directory.path()).unwrap();

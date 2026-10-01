@@ -21,12 +21,14 @@ mod recovery;
 /// pin the same accounted extents; they do not retain the source execution slot.
 pub struct SequenceCheckpoint<R: DeviceRuntime> {
     inner: Arc<CapturedCheckpoint<R>>,
+    publication: Option<CheckpointCapturePublication>,
 }
 
 impl<R: DeviceRuntime> Clone for SequenceCheckpoint<R> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            publication: None,
         }
     }
 }
@@ -43,6 +45,17 @@ impl<R: DeviceRuntime> fmt::Debug for SequenceCheckpoint<R> {
 }
 
 impl<R: DeviceRuntime> SequenceCheckpoint<R> {
+    /// Internal immutable evidence; never exposes writable backing authority.
+    pub(crate) fn captured_evidence(&self) -> &CapturedCheckpoint<R> {
+        &self.inner
+    }
+    /// Take the unique successful-capture observation owner. The caller must
+    /// acknowledge only after its model cache/rendezvous publication succeeds.
+    /// Cloning a checkpoint never clones this publication authority.
+    pub fn take_publication_acknowledgement(&mut self) -> Option<CheckpointCapturePublication> {
+        self.publication.take()
+    }
+
     pub fn authority(&self) -> CheckpointAuthorityId {
         self.inner.backing().authority()
     }
@@ -105,6 +118,7 @@ pub enum NativeCheckpointStart<R: DeviceRuntime> {
         maintenance: CheckpointCapacityMaintenance<R>,
     },
     NotSubmitted(VNextError),
+    GuardRejected(crate::execution_cost::GuardedNotSubmittedReason),
     Submitted(NativeCheckpointTransfer<R>),
     Indeterminate(NativeCheckpointTransfer<R>),
     ContractAfterSubmission {
@@ -201,7 +215,7 @@ impl<R: DeviceRuntime> NativeCheckpointTransfer<R> {
             return Ok(None);
         };
         match result {
-            StateTransferResult::Captured(inner) => {
+            StateTransferResult::Captured(inner, observation) => {
                 if self.restore.is_some() {
                     return Err(invalid_completion(
                         "restore access received a capture result",
@@ -209,6 +223,8 @@ impl<R: DeviceRuntime> NativeCheckpointTransfer<R> {
                 }
                 Ok(Some(NativeCheckpointResult::Captured(SequenceCheckpoint {
                     inner,
+                    publication: observation
+                        .map(|observation| CheckpointCapturePublication { observation }),
                 })))
             }
             StateTransferResult::RestoreReady(pending) => {
@@ -242,6 +258,35 @@ impl<R: DeviceRuntime> Drop for NativeCheckpointTransfer<R> {
             let _ = input.target.request_cancel();
         }
         self.handle.abandon_consumer();
+    }
+}
+
+/// Single-use host receipt for the exact captured checkpoint. It retains no
+/// GPU allocation. Dropping it records no successful model publication.
+#[must_use = "acknowledge only after the exact checkpoint is published for reuse"]
+pub struct CheckpointCapturePublication {
+    observation: super::PendingCheckpointObservation,
+}
+impl CheckpointCapturePublication {
+    pub fn identity(&self) -> &crate::vnext::NativeCheckpointTransferIdentity {
+        &self.observation.identity
+    }
+
+    pub fn acknowledge<R: DeviceRuntime>(
+        self,
+        checkpoint: &SequenceCheckpoint<R>,
+    ) -> Result<(), VNextError> {
+        let expected = crate::vnext::NativeCheckpointTransferIdentity::new(
+            checkpoint.inner.slot_id(),
+            Arc::clone(checkpoint.inner.identity()),
+        );
+        if !self.identity().same_transfer(&expected) {
+            return Err(invalid_completion(
+                "capture publication acknowledges another transfer",
+            ));
+        }
+        self.observation.publish();
+        Ok(())
     }
 }
 

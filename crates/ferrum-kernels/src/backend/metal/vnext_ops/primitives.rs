@@ -231,6 +231,7 @@ impl MetalTokenEmbeddingProvider {
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
                 include_str!("primitives/selected.rs").as_bytes(),
+                include_str!("primitives/selected/observation.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 hadamard::FINGERPRINT_SOURCE.as_bytes(),
                 TOKEN_EMBEDDING_PROVIDER_ID.as_bytes(),
@@ -316,6 +317,7 @@ impl MetalRmsNormProvider {
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
                 include_str!("primitives/selected.rs").as_bytes(),
+                include_str!("primitives/selected/observation.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 RMS_NORM_PROVIDER_ID.as_bytes(),
             ]),
@@ -392,6 +394,7 @@ impl MetalResidualAddProvider {
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
                 include_str!("primitives/selected.rs").as_bytes(),
+                include_str!("primitives/selected/observation.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 RESIDUAL_ADD_PROVIDER_ID.as_bytes(),
             ]),
@@ -468,6 +471,7 @@ impl MetalLastTokenMaskedArgmaxProvider {
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
                 include_str!("primitives/selected.rs").as_bytes(),
+                include_str!("primitives/selected/observation.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID.as_bytes(),
             ]),
@@ -566,6 +570,7 @@ macro_rules! no_workspace_primitive_provider {
                         include_str!("primitives.rs").as_bytes(),
                         include_str!("primitives/cost_route.rs").as_bytes(),
                         include_str!("primitives/selected.rs").as_bytes(),
+                        include_str!("primitives/selected/observation.rs").as_bytes(),
                         SHADER_SOURCE.as_bytes(),
                         hadamard::FINGERPRINT_SOURCE.as_bytes(),
                         $provider_id.as_bytes(),
@@ -735,6 +740,7 @@ impl MetalLastTokenMaskedArgmaxF32Provider {
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
                 include_str!("primitives/selected.rs").as_bytes(),
+                include_str!("primitives/selected/observation.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID.as_bytes(),
             ]),
@@ -979,7 +985,11 @@ fn encode_token_embedding_typed(
         token_count,
     )
     .map_err(|error| error.to_string())?;
-    let statistical = selected::embedding_evidence(&pipelines, &launches, output_type, token_count);
+    let statistical = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(launches.len()),
+        || selected::embedding_observation(&pipelines, &launches, output_type, token_count),
+    );
     let dispatch_count = route.compute_dispatch_count();
     let batching = route.batching();
     MetalDeviceCommand::operation(
@@ -1034,7 +1044,7 @@ fn encode_token_embedding_typed(
         },
     )
     .map_err(|error| error.to_string())?
-    .with_statistical_evidence(statistical)
+    .with_observation(statistical)
     .with_work_shape(batching, participant_count, token_count)
     .map_err(|error| error.to_string())
 }
@@ -1160,7 +1170,11 @@ fn encode_rms_norm_typed(
     )?;
     let route = cost_route::compute_command(PrimitiveRoute::RmsNorm, participant_count, tokens)
         .map_err(|error| error.to_string())?;
-    let statistical = selected::rms_evidence(&pipelines, params, input_type, output_type);
+    let statistical = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(0),
+        || selected::rms_observation(&pipelines, params, input_type, output_type),
+    );
     let batching = route.batching();
     let dispatches = route.compute_dispatch_count();
     MetalDeviceCommand::operation(
@@ -1182,7 +1196,7 @@ fn encode_rms_norm_typed(
         },
     )
     .map_err(|error| error.to_string())?
-    .with_statistical_evidence(statistical)
+    .with_observation(statistical)
     .with_work_shape(batching, participant_count, tokens)
     .map_err(|error| error.to_string())
 }
@@ -1290,13 +1304,19 @@ fn encode_residual_add_typed(
     )?;
     let route = cost_route::compute_command(PrimitiveRoute::ResidualAdd, participant_count, tokens)
         .map_err(|error| error.to_string())?;
-    let statistical = selected::residual_evidence(
-        &pipelines,
-        params,
-        left_type,
-        right_type,
-        output_type,
-        tokens,
+    let statistical = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(0),
+        || {
+            selected::residual_observation(
+                &pipelines,
+                params,
+                left_type,
+                right_type,
+                output_type,
+                tokens,
+            )
+        },
     );
     let batching = route.batching();
     let dispatches = route.compute_dispatch_count();
@@ -1320,7 +1340,7 @@ fn encode_residual_add_typed(
         },
     )
     .map_err(|error| error.to_string())?
-    .with_statistical_evidence(statistical)
+    .with_observation(statistical)
     .with_work_shape(batching, participant_count, tokens)
     .map_err(|error| error.to_string())
 }
@@ -1467,8 +1487,11 @@ fn encode_last_token_masked_argmax_typed(
         invocation.work_shape().immediate_tokens(),
     )
     .map_err(|error| error.to_string())?;
-    let statistical =
-        selected::argmax_evidence(&pipelines, &launches, logits_type, required_scratch_bytes);
+    let statistical = crate::backend::metal::vnext_runtime::prepare_observation_template(
+        invocation.observation_template_budget(),
+        selected::observation_payload_upper(launches.len()),
+        || selected::argmax_observation(&pipelines, &launches, logits_type, required_scratch_bytes),
+    );
     let dispatch_count = route.compute_dispatch_count();
     let batching = route.batching();
     MetalDeviceCommand::operation(
@@ -1496,7 +1519,7 @@ fn encode_last_token_masked_argmax_typed(
         },
     )
     .map_err(|error| error.to_string())?
-    .with_statistical_evidence(statistical)
+    .with_observation(statistical)
     .with_work_shape(batching, participant_count, u64::from(participant_count))
     .map_err(|error| error.to_string())
 }
@@ -2895,3 +2918,5 @@ pub(super) fn append_selected_residual(
         scratch,
     )
 }
+
+pub(super) use selected::observation::FrozenPrimitive;

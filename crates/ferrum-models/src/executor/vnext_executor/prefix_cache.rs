@@ -696,6 +696,7 @@ fn finish_transfer<R: DeviceRuntime>(
     start: NativeCheckpointStart<R>,
 ) -> Result<Option<NativeCheckpointResult<R>>> {
     let (mut transfer, contract_error) = match start {
+        NativeCheckpointStart::GuardRejected(_) => return Ok(None),
         NativeCheckpointStart::Skipped(_) => return Ok(None),
         NativeCheckpointStart::CapacityMaintenance { .. } => {
             return Err(FerrumError::internal(
@@ -813,6 +814,59 @@ impl<R: DeviceRuntime> Drop for RestoreAcknowledgement<R> {
 }
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
+    pub(super) async fn capture_prefix_guarded(
+        &self,
+        input: PrefixCaptureRequest<'_>,
+        guard: Arc<dyn CheckpointTransferSubmissionGuard>,
+    ) -> Result<bool> {
+        let observation_start = CheckpointTransferObservationStart::now();
+        if !self.supports_guarded_prefix_maintenance() || Instant::now() >= input.expires_at {
+            return Ok(false);
+        }
+        let (slot, sequence) = self
+            .sequences
+            .lock()
+            .begin_prefill_execution(input.source_request_id)?;
+        let mut execution = VNextPrefillExecutionGuard::new(
+            &self.sequences,
+            Arc::clone(&slot),
+            Arc::clone(&sequence),
+        );
+        let _operation = sequence.operation.lock().await;
+        let tokens: Vec<_> = input
+            .source_tokens
+            .iter()
+            .map(|token| token.get())
+            .collect();
+        if sequence.maximum_tokens != input.maximum_sequence_tokens
+            || *sequence.tokens.lock() != tokens
+            || sequence.prefill_tokens_processed.load(Ordering::Acquire) != input.boundary
+            || slot.cancelled.load(Ordering::Acquire)
+            || !sequence.active.load(Ordering::Acquire)
+            || Instant::now() >= input.expires_at
+        {
+            execution.restore_ready()?;
+            return Ok(false);
+        }
+        sequence
+            .explicit_checkpoint_maintenance
+            .store(true, Ordering::Release);
+        let interests = rendezvous::interests_at(&sequence, input.boundary);
+        let result = self
+            .retain_sequence_boundary_with_guard(
+                &sequence,
+                &tokens,
+                input.boundary,
+                None,
+                observation_start,
+                Some(guard),
+            )
+            .await;
+        rendezvous::finish(&interests);
+        execution.restore_ready()?;
+        result
+    }
+
     pub(super) fn prefix_pressure_maintenance(&self) -> PrefixPressureMaintenance {
         // New captures from other callers cannot grow this call's retry budget.
         PrefixPressureMaintenance::new(self.prefix_cache.lock().entries.len())
@@ -1050,6 +1104,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         completed_tokens: usize,
         probe: Option<&Arc<completion_observation::CompletionProbe>>,
     ) -> Result<()> {
+        self.retain_sequence_boundary_with_guard(
+            sequence,
+            tokens,
+            completed_tokens,
+            probe,
+            CheckpointTransferObservationStart::now(),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn retain_sequence_boundary_with_guard(
+        &self,
+        sequence: &Arc<VNextSequence<R>>,
+        tokens: &[u32],
+        completed_tokens: usize,
+        probe: Option<&Arc<completion_observation::CompletionProbe>>,
+        observation_start: CheckpointTransferObservationStart,
+        submission_guard: Option<Arc<dyn CheckpointTransferSubmissionGuard>>,
+    ) -> Result<bool> {
         if let Some(probe) = probe {
             probe.retention();
         }
@@ -1074,6 +1149,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let entries = self.prefix_cache.lock().entries.len();
         let result = capture_with_capacity(entries, || async {
             let probe = probe.cloned();
+            let submission_guard = submission_guard.clone();
             let reaper = Arc::clone(&self.reaper);
             let plan = self.resolved_plan.execution_plan().clone();
             let resources = Arc::clone(&self.plan_resources);
@@ -1093,7 +1169,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let binding = resources
                         .trusted_runtime_binding()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    let start = match reaper.try_capture_sequence_checkpoint_with_timing(&plan, &binding, Arc::clone(&source), lane, timing_mode) {
+                    let started = if let Some(guard) = &submission_guard {
+                        reaper.try_capture_sequence_checkpoint_guarded(&plan, &binding, Arc::clone(&source), lane, timing_mode, observation_start, guard.as_ref())
+                    } else {
+                        reaper.try_capture_sequence_checkpoint_with_observation(&plan, &binding, Arc::clone(&source), lane, timing_mode, observation_start)
+                    };
+                    let start = match started {
                         Ok(NativeCheckpointStart::NotSubmitted(error)) | Err(error) => {
                             // A cancelled/poisoned source is not a cache miss.
                             // This existing projection rechecks the exact Open
@@ -1173,7 +1254,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .map_err(|error| FerrumError::backend(error.to_string()))?
         }, || self.evict_prefix_for_capture(purpose, sequence, completed_tokens)).await?;
         match result {
-            Some(NativeCheckpointResult::Captured(checkpoint)) => {
+            Some(NativeCheckpointResult::Captured(mut checkpoint)) => {
                 if checkpoint.completed_tokens() != completed_tokens
                     || tokens.get(..completed_tokens) != Some(checkpoint.token_prefix())
                     || checkpoint.full_input() != tokens
@@ -1183,6 +1264,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ));
                 }
                 let publication_started = Instant::now();
+                let observation = checkpoint.take_publication_acknowledgement();
+                let observation_owner = observation.as_ref().map(|_| checkpoint.clone());
                 tracing::debug!(
                     request_id = %sequence.request_id(),
                     checkpoint_authority = ?checkpoint.authority(),
@@ -1233,7 +1316,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     CheckpointCacheTimingPhase::ReplacementDrop,
                     replacement_started.elapsed(),
                 );
-                Ok(())
+                if let (Some(observation), Some(owner)) = (observation, observation_owner) {
+                    observation
+                        .acknowledge(&owner)
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
+                }
+                Ok(true)
             }
             None => {
                 tracing::debug!(
@@ -1243,7 +1331,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ?purpose,
                     "prefix checkpoint capture unavailable"
                 );
-                Ok(())
+                Ok(false)
             }
             Some(NativeCheckpointResult::Failed(reason)) => Err(FerrumError::backend(format!(
                 "capture completion contract failed: {reason:?}"
@@ -1258,6 +1346,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         input: PlanRuntimePrefixRestoreInput<'_>,
     ) -> Result<PlanRuntimePrefixRestoreOutcome> {
+        self.restore_prefix_with_guard(input, None).await
+    }
+
+    pub(super) async fn restore_prefix_with_guard(
+        &self,
+        input: PlanRuntimePrefixRestoreInput<'_>,
+        submission_guard: Option<Arc<dyn CheckpointTransferSubmissionGuard>>,
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
+        let observation_start = CheckpointTransferObservationStart::now();
         let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
@@ -1283,7 +1380,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .checkpoint
                 .and_then(|lease| self.retained_rendezvous_checkpoint(lease))
                 .filter(compatible);
-            let selected = {
+            let selected = if submission_guard.is_some() && input.checkpoint.is_some() {
+                // A cost witness belongs to this exact retained owner. Do not
+                // replace it with a newer/longer index hit after fresh replay.
+                let source = self.retained_restore_source(input.checkpoint.unwrap());
+                (rendezvous, source)
+            } else {
                 let mut index = self.prefix_cache.lock();
                 index.longest_or_rendezvous(
                     &tokens,
@@ -1362,16 +1464,29 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .completion_worker
             .execute(VNextCompletionTaskKind::CheckpointTransfer, move || {
                 let _ = reaper.recover_abandoned_checkpoints(MAX_COMPLETION_SWEEP_SLOTS);
-                let start = reaper
-                    .try_restore_sequence_checkpoint_with_timing(
+                let start = if let Some(guard) = &submission_guard {
+                    reaper.try_restore_sequence_checkpoint_guarded(
                         &plan,
                         target,
                         &checkpoint,
                         full_input,
                         lane,
                         timing_mode,
+                        observation_start,
+                        guard.as_ref(),
                     )
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
+                } else {
+                    reaper.try_restore_sequence_checkpoint_with_observation(
+                        &plan,
+                        target,
+                        &checkpoint,
+                        full_input,
+                        lane,
+                        timing_mode,
+                        observation_start,
+                    )
+                }
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
                 finish_transfer(&reaper, start)
             })
             .await

@@ -1,4 +1,9 @@
 use super::*;
+mod memory;
+mod pending;
+pub use memory::*;
+mod route_diagnostic;
+pub use route_diagnostic::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostRecorderLimits {
@@ -78,32 +83,179 @@ pub struct BoundedWaveRecorder {
     fence: Arc<()>,
     call_id: NonZeroU64,
     limits: CostRecorderLimits,
+    byte_limits: CostRecorderByteLimits,
+    pending_retained_bytes: usize,
+    pending_working_bytes: usize,
+    pending_retained_rows: usize,
+    memory_audit: CostRecorderMemoryAudit,
     observations: Vec<ActualWaveObservation>,
+    pending: Vec<Option<PendingActualWave>>,
     next_wave_ordinal: u64,
     retained_rows: usize,
+    prepared_route: Option<PreparedCallRouteV1>,
+    prepared_route_attempts: usize,
+    route_unknown: bool,
+    route_diagnostic: Option<RouteCaptureDiagnostic>,
     lost_observations: u64,
     invalid_observation: bool,
     unknown_evidence: Option<ActualWaveEvidenceUnknown>,
+    no_submission: Option<CallNoSubmissionV1>,
 }
 
 impl BoundedWaveRecorder {
+    /// A receipt remains valid only while this original recorder has never
+    /// attempted a physical observation or selected/submitted a device route.
+    pub fn no_submission(&self) -> Option<&CallNoSubmissionV1> {
+        self.no_submission
+            .as_ref()
+            .filter(|proof| match proof.reason {
+                CallNoSubmissionReasonV1::GuardRollback {
+                    batch_step,
+                    batch_invocation,
+                    lane_id,
+                    ..
+                } => self.pristine_guard_rollback(batch_step, batch_invocation, lane_id),
+                _ => self.pristine_without_wave(),
+            })
+    }
+
+    fn pristine_without_wave(&self) -> bool {
+        // Passive diagnostics may be enabled before any work. Only the actual
+        // recorder lifecycle can disqualify a typed no-submission receipt.
+        self.next_wave_ordinal == 0
+            && self.observations.is_empty()
+            && self.pending.is_empty()
+            && self.prepared_route.is_none()
+            && self.prepared_route_attempts == 0
+            && !self.route_unknown
+            && self.lost_observations == 0
+            && !self.invalid_observation
+            && self.unknown_evidence.is_none()
+    }
+
+    fn pristine_guard_rollback(&self, step: u64, invocation: u64, lane: u64) -> bool {
+        self.next_wave_ordinal == 0
+            && self.observations.is_empty()
+            && self.pending.is_empty()
+            && self.prepared_route_attempts == 1
+            && !self.route_unknown
+            && self.lost_observations == 0
+            && !self.invalid_observation
+            && self.unknown_evidence.is_none()
+            && self.prepared_route.as_ref().is_some_and(|p| {
+                p.submitted.is_none()
+                    && p.route.class != PreparedCostRouteClassV1::Unknown
+                    && p.route.batch_step == Some(step)
+                    && p.route.batch_invocation == Some(invocation)
+                    && p.route.lane_id == lane
+            })
+    }
+
+    pub(super) fn record_guard_rollback(
+        &mut self,
+        receipt: &GuardedNotSubmitted,
+        prepare_started_at_ns: u64,
+        returned_at_ns: u64,
+        participant_count: usize,
+        participant_signature: [u8; 32],
+    ) -> Result<(), CostRecorderError> {
+        let Some(bound) = receipt.observation.as_ref() else {
+            self.invalid_observation = true;
+            return Err(CostRecorderError::InvalidTransition);
+        };
+        if !self.pristine_guard_rollback(bound.batch_step, bound.batch_invocation, bound.lane_id)
+            || self.no_submission.is_some()
+            || self.prepared_route.as_ref().is_none_or(|p| {
+                p.selected_at_ns < prepare_started_at_ns || returned_at_ns < p.selected_at_ns
+            })
+        {
+            self.invalid_observation = true;
+            return Err(CostRecorderError::InvalidTransition);
+        }
+        self.no_submission = Some(CallNoSubmissionV1 {
+            call_id: self.call_id.get(),
+            prepare_started_at_ns,
+            returned_at_ns,
+            participant_count,
+            participant_signature,
+            reason: CallNoSubmissionReasonV1::GuardRollback {
+                batch_step: bound.batch_step,
+                batch_invocation: bound.batch_invocation,
+                lane_id: bound.lane_id,
+                reason: receipt.reason(),
+            },
+        });
+        Ok(())
+    }
+
+    pub(super) fn record_no_submission(
+        &mut self,
+        prepare_started_at_ns: u64,
+        returned_at_ns: u64,
+        participant_count: usize,
+        participant_signature: [u8; 32],
+        reason: CallNoSubmissionReasonV1,
+    ) -> Result<(), CostRecorderError> {
+        if !self.pristine_without_wave() || self.no_submission.is_some() {
+            self.invalid_observation = true;
+            return Err(CostRecorderError::InvalidTransition);
+        }
+        if returned_at_ns < prepare_started_at_ns {
+            self.invalid_observation = true;
+            return Err(CostRecorderError::InvalidTiming);
+        }
+        self.no_submission = Some(CallNoSubmissionV1 {
+            call_id: self.call_id.get(),
+            prepare_started_at_ns,
+            returned_at_ns,
+            participant_count,
+            participant_signature,
+            reason,
+        });
+        Ok(())
+    }
+
     /// Allocate the bounded wave slots before execution, not during callbacks.
     pub fn new(call_id: NonZeroU64, limits: CostRecorderLimits) -> Result<Self, CostRecorderError> {
+        Self::new_with_byte_limits(call_id, limits, CostRecorderByteLimits::default())
+    }
+
+    pub fn new_with_byte_limits(
+        call_id: NonZeroU64,
+        limits: CostRecorderLimits,
+        byte_limits: CostRecorderByteLimits,
+    ) -> Result<Self, CostRecorderError> {
         limits.validate()?;
+        byte_limits.validate()?;
         let mut observations = Vec::new();
         observations
+            .try_reserve_exact(limits.max_waves)
+            .map_err(|_| CostRecorderError::WaveCapacity)?;
+        let mut pending = Vec::new();
+        pending
             .try_reserve_exact(limits.max_waves)
             .map_err(|_| CostRecorderError::WaveCapacity)?;
         Ok(Self {
             fence: Arc::new(()),
             call_id,
             limits,
+            byte_limits,
+            pending_retained_bytes: 0,
+            pending_working_bytes: 0,
+            pending_retained_rows: 0,
+            memory_audit: CostRecorderMemoryAudit::default(),
             observations,
+            pending,
             next_wave_ordinal: 0,
             retained_rows: 0,
+            prepared_route: None,
+            prepared_route_attempts: 0,
+            route_unknown: false,
+            route_diagnostic: None,
             lost_observations: 0,
             invalid_observation: false,
             unknown_evidence: None,
+            no_submission: None,
         })
     }
 
@@ -113,6 +265,9 @@ impl BoundedWaveRecorder {
         boundary: WaveObservationBoundary,
         prepare_started_at_ns: u64,
     ) -> Result<WaveObservationHandle, CostRecorderError> {
+        if self.no_submission.is_some() {
+            return self.reject_begin(CostRecorderError::InvalidTransition);
+        }
         let ordinal = self.next_wave_ordinal;
         self.next_wave_ordinal = self.next_wave_ordinal.saturating_add(1);
         let Ok(physical_wave_ordinal) = u32::try_from(ordinal) else {
@@ -184,6 +339,7 @@ impl BoundedWaveRecorder {
             outcome: None,
         });
         self.retained_rows = rows;
+        self.pending.push(None);
         Ok(WaveObservationHandle {
             fence: Arc::clone(&self.fence),
             index,
@@ -198,6 +354,9 @@ impl BoundedWaveRecorder {
 
     pub fn note_unknown_evidence(&mut self, reason: ActualWaveEvidenceUnknown) {
         self.unknown_evidence.get_or_insert(reason);
+        // A first GraphPath cannot hide a later lifecycle/capacity/identity
+        // error from the independent Outside population proof.
+        self.route_unknown |= reason != ActualWaveEvidenceUnknown::GraphPath;
     }
 
     /// Preserve a real physical wave without inventing unavailable shape fields.
@@ -230,6 +389,7 @@ impl BoundedWaveRecorder {
             device_elapsed_ns: None,
             outcome: None,
         });
+        self.pending.push(None);
         Ok(WaveObservationHandle {
             fence: Arc::clone(&self.fence),
             index,
@@ -350,6 +510,149 @@ impl BoundedWaveRecorder {
         })
     }
 
+    /// Passive pre-submit evidence. Repeated preparations (including a
+    /// definitely-not-submitted retry) invalidate the one-attempt scope proof.
+    pub(crate) fn record_prepared_route(&mut self, route: Option<PreparedCallRouteV1>) {
+        self.prepared_route_attempts = self.prepared_route_attempts.saturating_add(1);
+        if self.prepared_route_attempts != 1 || !self.observations.is_empty() {
+            self.diagnose_route_rejection("multiple_or_late_preparation");
+            self.prepared_route = None;
+            return;
+        }
+        let Some(route) = route else { return };
+        let Some(retained) = self.retained_rows.checked_add(route.rows.capacity()) else {
+            self.diagnose_route_rejection("prepared_rows_capacity_overflow");
+            return;
+        };
+        if route.rows.capacity() > self.limits.max_rows_per_wave
+            || retained > self.limits.max_retained_rows
+        {
+            self.diagnose_route_rejection("prepared_rows_capacity_exceeded");
+            return;
+        }
+        self.retained_rows = retained;
+        self.prepared_route = Some(route);
+    }
+
+    pub(crate) fn record_route_submission(
+        &mut self,
+        attribution: Option<&crate::vnext::BoundDeviceSubmissionAttribution>,
+    ) {
+        self.diagnose_route_submission(attribution);
+        let Some(prepared) = self.prepared_route.as_mut() else {
+            // A submission callback without its preparation is a real invalid
+            // transition even when passive route diagnostics are disabled.
+            self.invalid_observation = true;
+            self.diagnose_route_rejection("prepared_route_missing_at_submission");
+            return;
+        };
+        if self.prepared_route_attempts != 1
+            || self.observations.len() != 1
+            || prepared.submitted.is_some()
+        {
+            self.diagnose_route_rejection("submission_not_one_preparation_one_wave");
+            self.prepared_route = None;
+            return;
+        }
+        let Some(attribution) = attribution else {
+            self.diagnose_route_rejection("submission_attribution_missing");
+            self.prepared_route = None;
+            return;
+        };
+        let Some(submitted_at) = self.observations[0].submission_started_at_ns else {
+            self.diagnose_route_rejection("submission_clock_missing");
+            self.prepared_route = None;
+            return;
+        };
+        let identity = attribution.batch_identity();
+        let graph = attribution.device().graph_evidence();
+        if prepared.selected_at_ns > submitted_at
+            || prepared.route.lane_id != identity.lane_id().get()
+        {
+            let gate = if prepared.selected_at_ns > submitted_at {
+                "selection_after_submission"
+            } else {
+                "submitted_lane_mismatch"
+            };
+            self.diagnose_route_rejection(gate);
+            self.prepared_route = None;
+            return;
+        }
+        if let Some(program) = prepared.route.program_id() {
+            if prepared.route.batch_step != Some(identity.batch_step_id().get())
+                || prepared.route.batch_invocation != Some(identity.batch_invocation_id().get())
+                || program.lane_id() != identity.lane_id()
+                || program.plan_hash() != identity.plan_hash()
+                || program.runtime_implementation_fingerprint()
+                    != identity.runtime_implementation_fingerprint()
+                || prepared.route.graph_state.is_none()
+                || prepared.route.graph_state != graph.map(|g| g.before_state())
+            {
+                let gate = if prepared.route.batch_step != Some(identity.batch_step_id().get()) {
+                    "submitted_step_mismatch"
+                } else if prepared.route.batch_invocation
+                    != Some(identity.batch_invocation_id().get())
+                {
+                    "submitted_invocation_mismatch"
+                } else if program.lane_id() != identity.lane_id() {
+                    "submitted_program_lane_mismatch"
+                } else if program.plan_hash() != identity.plan_hash() {
+                    "submitted_plan_mismatch"
+                } else if program.runtime_implementation_fingerprint()
+                    != identity.runtime_implementation_fingerprint()
+                {
+                    "submitted_runtime_mismatch"
+                } else if prepared.route.graph_state.is_none() {
+                    "selected_graph_missing"
+                } else {
+                    "submitted_graph_before_mismatch"
+                };
+                self.diagnose_route_rejection(gate);
+                self.prepared_route = None;
+                return;
+            }
+        } else if let Some(eager) = &prepared.route.non_reusable_wave {
+            if prepared.route.class() != PreparedCostRouteClassV1::OutsideProgramLayoutAbsent
+                || prepared.route.reason() != PreparedCostRouteReasonV1::ProgramLayoutAbsent
+                || prepared.route.batch_step != Some(identity.batch_step_id().get())
+                || prepared.route.batch_invocation != Some(identity.batch_invocation_id().get())
+                || eager.plan_hash != identity.plan_hash().as_str()
+                || eager.runtime_implementation_fingerprint
+                    != identity.runtime_implementation_fingerprint()
+                || prepared.route.catalog_epoch != Some(prepared.route.lane_epoch)
+                || graph.is_none_or(|actual| {
+                    prepared.route.graph_state != Some(actual.before_state())
+                        || !actual.proves_configured_eager_observation()
+                })
+            {
+                self.diagnose_route_rejection("submitted_non_reusable_wave_mismatch");
+                self.prepared_route = None;
+                return;
+            }
+        } else if prepared.route.class() != PreparedCostRouteClassV1::GraphDisabled {
+            self.diagnose_route_rejection("program_identity_missing_for_selected_class");
+            self.prepared_route = None;
+            return;
+        }
+        prepared.submitted = Some(SubmittedRouteEvidenceV1 {
+            batch_step: identity.batch_step_id().get(),
+            batch_invocation: identity.batch_invocation_id().get(),
+            plan_hash: identity.plan_hash().as_str().to_owned(),
+            runtime_implementation_fingerprint: identity
+                .runtime_implementation_fingerprint()
+                .to_owned(),
+            lane_id: identity.lane_id().get(),
+            submission_started_at_ns: submitted_at,
+            graph,
+        });
+    }
+
+    pub fn prepared_route(&self) -> Option<&PreparedCallRouteV1> {
+        (self.prepared_route_attempts == 1 && !self.route_unknown)
+            .then_some(self.prepared_route.as_ref())
+            .flatten()
+    }
+
     pub fn observations(&self) -> &[ActualWaveObservation] {
         &self.observations
     }
@@ -361,6 +664,8 @@ impl BoundedWaveRecorder {
             Some(CostObservationUnknownReason::InvalidObservation)
         } else if let Some(reason) = self.unknown_evidence {
             Some(CostObservationUnknownReason::EvidenceUnavailable(reason))
+        } else if self.pending.iter().any(Option::is_some) {
+            Some(CostObservationUnknownReason::IncompleteObservation)
         } else if self.observations.is_empty() {
             Some(CostObservationUnknownReason::NoObservations)
         } else if self.observations.iter().any(|wave| {

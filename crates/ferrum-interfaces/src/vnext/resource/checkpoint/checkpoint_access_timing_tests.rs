@@ -7,6 +7,9 @@ use crate::vnext::{
     DeviceExecutionTiming, DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
 };
 
+#[path = "checkpoint_access_observation_tests.rs"]
+mod checkpoint_access_observation_tests;
+
 fn start_capture(
     harness: &RestoreHarness,
     lane: &Arc<ExecutionLane<TestRuntime>>,
@@ -193,6 +196,7 @@ fn checkpoint_access_failed_and_unknown_transfers_never_report_successful_device
         let lane = harness.root.create_execution_lane().unwrap();
         let reaper = CompletionReaper::new();
         prove_prefix_source(&harness, &lane, &reaper);
+        let observations = checkpoint_access_observation_tests::observe_transfers(&reaper, 4);
         *harness.runtime.device_timing.lock().unwrap() =
             DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(999));
         harness.runtime.set_submit_behavior(submit);
@@ -232,6 +236,7 @@ fn checkpoint_access_failed_and_unknown_transfers_never_report_successful_device
         assert_eq!(capture.indeterminate_copies.samples, u64::from(unknown));
         assert_eq!(capture.device_execution.measured.samples, 0);
         assert_eq!(capture.device_execution.measured.total_ns, 0);
+        assert!(observations.samples.lock().unwrap().is_empty());
         assert_eq!(
             capture.device_execution.failed_or_unproven,
             u64::from(submitted || unknown)

@@ -8,7 +8,9 @@ use ferrum_types::TokenId;
 const POLICY: [u8; 32] = [44; 32];
 
 fn source5() -> Vec<u8> {
-    let (original, _) = fixture::source_policy(POLICY);
+    source5_from(fixture::source_policy(POLICY).0)
+}
+fn source5_from(original: Vec<u8>) -> Vec<u8> {
     let mut lines = original.split_inclusive(|b| *b == b'\n');
     let first: serde_json::Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
     let h: Header = serde_json::from_value(first["record"].clone()).unwrap();
@@ -476,7 +478,8 @@ fn source5_joint_release_tracks_partial_prefill_utf8_and_per_slot_fifo() {
         earliest: 1,
         calls: &mut calls,
         total_rows: &mut total,
-        common: &common,
+        fingerprint: &common.fingerprint,
+        source_opened_at_ns: common.opening.monotonic_ns,
         limits: &limits,
         lifecycle: &mut lifecycle,
     };
@@ -671,4 +674,51 @@ fn source5_two_owners_reuse_one_physical_pass_for_declared_ordinary_cohorts() {
         assert_eq!(child.total_shape_rows, 72);
         assert_eq!(child.reserved_members, 24);
     }
+}
+
+#[test]
+fn profile12_learned_span_replays_original_source5_and_rejects_parameter_tampering() {
+    let bytes = source5_from(fixture::source_with_learned_span(Some(POLICY)).0);
+    let files = Files::new();
+    let source = files.0.join("source5.jsonl");
+    let profile = files.0.join("profile12.json");
+    std::fs::write(&source, &bytes).unwrap();
+    let limits = CostProfileLoadLimits::default();
+    let receipt = export_structured_profile_v12(
+        &source,
+        Sha256::digest(&bytes).into(),
+        &profile,
+        &[0],
+        &limits,
+    )
+    .unwrap();
+    let clock = ProfileLoadClock {
+        wall_unix_ns: Some(1_000_000 + 72 * 2000 + 1399),
+        wall_max_error_ns: Some(0),
+        monotonic_now_ns: 7,
+    };
+    let loaded =
+        load_structured_profile_v12(&profile, &fixture::fingerprint(), &limits, clock).unwrap();
+    assert_eq!(receipt.source_sha256, loaded.source_sha256);
+    assert_eq!(loaded.total_shape_rows, 72);
+    let query = StructuredQueryV2::exact(fixture::prepared("query", 2, 1).2);
+    let p = loaded.children[0]
+        .predict_query_local(&fixture::fingerprint(), &query, 7)
+        .unwrap();
+    assert_eq!(p.learned_span_margin_ns, 400);
+    assert_eq!(p.planning_ns, 1660);
+    assert_eq!(p.valid_until_ns, 1_000_005_100);
+    assert!(
+        load_structured_profile_v11(&profile, &fixture::fingerprint(), &limits, clock).is_err()
+    );
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&profile).unwrap()).unwrap();
+    let current = metadata["children"][0]["parameters_sha256"][0]
+        .as_u64()
+        .unwrap();
+    metadata["children"][0]["parameters_sha256"][0] = (current ^ 1).into();
+    std::fs::write(&profile, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(
+        load_structured_profile_v12(&profile, &fixture::fingerprint(), &limits, clock).is_err()
+    );
 }

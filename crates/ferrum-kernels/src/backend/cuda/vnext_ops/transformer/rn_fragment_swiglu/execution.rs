@@ -63,6 +63,7 @@ pub(super) fn prepare(
 pub(super) fn encode(
     fingerprint: &str,
     mma: &CudaFunction,
+    mma_q6_prefetch: &CudaFunction,
     silu: &CudaFunction,
     capture: SloStructuredCostCapture,
     identity: Option<CublasHandleApiIdentity>,
@@ -73,7 +74,6 @@ pub(super) fn encode(
         participants,
         regions,
     } = prepare(&invocation)?;
-    let selected = shape.selected(capture, identity);
     let recipe = if capture.is_disabled() {
         None
     } else {
@@ -97,16 +97,20 @@ pub(super) fn encode(
             .u64(plan.n())
             .u64(plan.k())
             .u64(plan.packed_bytes());
+        if shape.fragment() {
+            key = key.u32(plan::FragmentKernel::for_format(plan.source_format()).replay_tag());
+        }
     }
     let key = key.finish();
     let silu = silu.clone();
     let command = if shape.fragment() {
-        let mma = mma.clone();
+        let gate_mma = plan::fragment_function(shape.gate_weight, mma, mma_q6_prefetch).clone();
+        let down_mma = plan::fragment_function(shape.down_weight, mma, mma_q6_prefetch).clone();
         CudaDeviceCommand::replayable_operation(LABEL, regions, key, move |stream, regions| {
             let (gate, activation) = scratch_addresses(shape, regions)?;
             plan::launch(
                 stream,
-                &mma,
+                &gate_mma,
                 shape,
                 shape.gate_weight,
                 regions[0].device_ptr(),
@@ -123,7 +127,7 @@ pub(super) fn encode(
             )?;
             plan::launch(
                 stream,
-                &mma,
+                &down_mma,
                 shape,
                 shape.down_weight,
                 activation,
@@ -167,9 +171,7 @@ pub(super) fn encode(
         command.with_work_attribution(DeviceBatchingForm::Packed, participants, shape.tokens, 3, 0)
     })
     .map_err(|e| e.to_string())?;
-    let command = command
-        .with_statistical_evidence(selected)
-        .with_replay_cost_recipe(recipe);
+    let command = command.with_replay_cost_recipe(recipe);
     Ok(if shape.fragment() {
         command
     } else {

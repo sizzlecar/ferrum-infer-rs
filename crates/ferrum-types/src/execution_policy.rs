@@ -136,6 +136,53 @@ pub struct ExecutorAdmissionSnapshot {
     active_decode_sequences: u32,
     current_batch_size: Option<u32>,
     capacity_blocked_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue_observation: Option<Result<ExecutorQueueObservation, String>>,
+}
+
+/// Passive scheduler membership at a server monotonic instant. The engine
+/// instance changes on reconstruction. Ages retain original trusted transport
+/// ingress, including preprocessing and any requeue; they are not queue-entry
+/// durations or a wall-clock timestamp. No execution permission is represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorQueueObservation {
+    pub schema_version: u32,
+    pub engine_instance: String,
+    pub observed_at_ns: u64,
+    pub waiting_requests: u32,
+    pub active_prefill_sequences: u32,
+    pub active_decode_sequences: u32,
+    pub preempted_requests: u32,
+    /// None exactly when no request is waiting.
+    pub oldest_waiting_ingress_age_ns: Option<u64>,
+    /// Includes waiting, active and preempted scheduler members. It excludes
+    /// requests still being parsed/tokenized and completed transport drains.
+    pub oldest_unfinished_ingress_age_ns: Option<u64>,
+}
+
+impl ExecutorQueueObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        let unfinished = self
+            .waiting_requests
+            .checked_add(self.active_prefill_sequences)
+            .and_then(|n| n.checked_add(self.active_decode_sequences))
+            .and_then(|n| n.checked_add(self.preempted_requests))
+            .ok_or("queue observation count overflow")?;
+        if self.schema_version != 1
+            || self.engine_instance.is_empty()
+            || self.engine_instance.len() > 128
+            || self.oldest_waiting_ingress_age_ns.is_some() != (self.waiting_requests > 0)
+            || self.oldest_unfinished_ingress_age_ns.is_some() != (unfinished > 0)
+            || self
+                .oldest_waiting_ingress_age_ns
+                .zip(self.oldest_unfinished_ingress_age_ns)
+                .is_some_and(|(waiting, unfinished)| waiting > unfinished)
+        {
+            return Err("invalid server queue observation".into());
+        }
+        Ok(())
+    }
 }
 
 impl ExecutorAdmissionSnapshot {
@@ -182,7 +229,29 @@ impl ExecutorAdmissionSnapshot {
             active_decode_sequences,
             current_batch_size,
             capacity_blocked_requests,
+            queue_observation: None,
         })
+    }
+
+    pub fn with_queue_observation(
+        mut self,
+        observation: Result<ExecutorQueueObservation, String>,
+    ) -> Self {
+        self.queue_observation = Some(observation.and_then(|value| {
+            value.validate()?;
+            if value.waiting_requests != self.waiting_requests
+                || value.active_prefill_sequences != self.active_prefill_sequences
+                || value.active_decode_sequences != self.active_decode_sequences
+            {
+                return Err("queue observation differs from admission phase counts".into());
+            }
+            Ok(value)
+        }));
+        self
+    }
+
+    pub fn queue_observation(&self) -> Option<&Result<ExecutorQueueObservation, String>> {
+        self.queue_observation.as_ref()
     }
 
     pub const fn resource_authority(&self) -> ExecutionResourceAuthority {

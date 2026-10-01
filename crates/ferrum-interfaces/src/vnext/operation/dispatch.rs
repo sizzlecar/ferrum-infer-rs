@@ -1,3 +1,5 @@
+mod route_population;
+use crate::execution_cost::StructuredCostSampleDemand;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -5,13 +7,14 @@ use super::super::{
     classify_device_error, AllocationKind, AllocationLifetime, BackingInitializationEncodeError,
     BufferUsage, CompletionHandle, CompletionReaper, CompletionReservation,
     DefinitelyNotSubmittedRetryAuthority, DeviceBatchingForm, DeviceCommandBatch,
-    DeviceCommandLogicalWork, DeviceComputePathRequirement, DeviceReusableExecutionCapture,
-    DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram,
-    DeviceReusableExecutionProgramId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, InvocationResourceLease, LaneSubmitOutcome, NodeId, NodeInvocationId,
-    OperationId, ParticipantNodeKey, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
-    ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment, SubmissionWavePurpose,
+    DeviceCommandLogicalWork, DeviceComputePathRequirement, DeviceCostObservationDemand,
+    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
+    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceTimingMode,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
+    InvocationResourceLease, LaneSubmitOutcome, NodeId, NodeInvocationId, OperationId,
+    ParticipantNodeKey, PreparedStepSubmissionWave, ProgramBindingNodeBinding, ProviderId,
+    ResourceId, SpanId, StepParticipantFrameAssignment, SubmissionWavePurpose,
     TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
 };
 use super::backing_upload::encode_submission_wave_backing_upload;
@@ -950,6 +953,8 @@ impl OperationDispatch {
             None,
             None,
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -987,6 +992,8 @@ impl OperationDispatch {
             None,
             None,
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -1029,6 +1036,8 @@ impl OperationDispatch {
             None,
             None,
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             timing_sink,
             wave,
@@ -1081,6 +1090,8 @@ impl OperationDispatch {
             Some(restore),
             None,
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -1168,6 +1179,8 @@ impl OperationDispatch {
             Some(restore),
             Some(reusable_program),
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -1213,6 +1226,8 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -1251,6 +1266,8 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -1291,6 +1308,8 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             false,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
             None,
             timing_sink,
             wave,
@@ -1332,6 +1351,54 @@ impl OperationDispatch {
             None,
             reusable_program,
             true,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
+            None,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    /// Product call with explicit dynamic sample demand. Logical attribution
+    /// and cold encoder templates remain independent of this demand.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_cost_evidence_demand<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        cost_attribution: bool,
+        numeric_observation: DeviceCostObservationDemand,
+        structured_sample: StructuredCostSampleDemand,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            reusable_program,
+            cost_attribution,
+            numeric_observation,
+            structured_sample,
             None,
             timing_sink,
             wave,
@@ -1429,13 +1496,100 @@ impl OperationDispatch {
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
         S: SubmissionWaveDispatchTimingSink,
     {
+        Self::encode_and_submit_guarded_wave_with_cost_evidence_demand(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            input_uploads,
+            reusable_program,
+            guard,
+            DeviceCostObservationDemand::Required,
+            StructuredCostSampleDemand::RuntimePolicy,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    /// Explicit actual-sample demand never disables guarded logical evidence
+    /// or the final native/host permission check.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_guarded_wave_with_cost_evidence_demand<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        guard: &dyn super::PreparedWaveSubmissionGuard,
+        numeric_observation: DeviceCostObservationDemand,
+        structured_sample: StructuredCostSampleDemand,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> super::GuardedWaveSubmissionOutcome<R>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_guarded_wave_with_device_timing_and_cost_evidence_demand(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            DeviceTimingMode::Off,
+            input_uploads,
+            reusable_program,
+            guard,
+            numeric_observation,
+            structured_sample,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    /// Preserve the requested completion timing through guarded dispatch. Native
+    /// backends still own authorization and rejection before any stream effect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_guarded_wave_with_device_timing_and_cost_evidence_demand<
+        'binding,
+        R,
+        I,
+        S,
+    >(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        device_timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        guard: &dyn super::PreparedWaveSubmissionGuard,
+        numeric_observation: DeviceCostObservationDemand,
+        structured_sample: StructuredCostSampleDemand,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> super::GuardedWaveSubmissionOutcome<R>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
         let mut rejection = None;
         let result = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
             batch_identity,
             active_bindings,
-            DeviceTimingMode::Off,
+            device_timing_mode,
             input_uploads,
             if reusable_program.is_some()
                 || matches!(
@@ -1451,6 +1605,8 @@ impl OperationDispatch {
             None,
             reusable_program,
             true,
+            numeric_observation,
+            structured_sample,
             Some((guard, &mut rejection)),
             timing_sink,
             wave,
@@ -1509,6 +1665,8 @@ impl OperationDispatch {
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
         reusable_program: Option<&DeviceReusableExecutionProgram>,
         cost_attribution: bool,
+        numeric_observation: DeviceCostObservationDemand,
+        structured_sample: StructuredCostSampleDemand,
         mut submission_guard: Option<(
             &dyn super::PreparedWaveSubmissionGuard,
             &mut Option<super::PendingGuardedWaveRejection>,
@@ -1682,6 +1840,20 @@ impl OperationDispatch {
         }
         drop(contract_stage);
 
+        // Cold capture needs immutable CPU templates even when this call has
+        // no current numeric ticket. This follows the original exact capture
+        // authority, not a guessed provider/model name or an observation flag.
+        let retain_cold_template = reusable_program.is_none()
+            && effective_compute_path != DeviceComputePathRequirement::EagerOnly
+            && reusable_execution_authority.is_some()
+            && runtime.cost_graph_capture_capability()
+                != crate::vnext::DeviceCostGraphCaptureCapability::Unsupported;
+        let template_demand = if numeric_observation.is_required() || retain_cold_template {
+            DeviceCostObservationDemand::Required
+        } else {
+            DeviceCostObservationDemand::NotRequired
+        };
+
         let backing_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
             SubmissionWaveDispatchStage::BackingAndInputEncode,
@@ -1700,6 +1872,7 @@ impl OperationDispatch {
             timing_mode,
             effective_compute_path,
         );
+        commands.set_cost_observation_demand(numeric_observation);
         if effective_compute_path
             == DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
         {
@@ -1775,6 +1948,14 @@ impl OperationDispatch {
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
         if let Some(reusable_program) = reusable_program {
+            let observation_input = (numeric_observation.is_required()
+                && structured_sample.enabled(runtime.structured_cost_capture()))
+            .then(|| {
+                crate::vnext::FrozenObservationInput::from_work_shape(
+                    completion.wave().claimed_backing().work_shape(),
+                )
+            })
+            .flatten();
             let mut node_index = 0_usize;
             let mut segment_index = 0_usize;
             while node_index < providers.len() {
@@ -1820,7 +2001,8 @@ impl OperationDispatch {
                             binding_node_index,
                             active_bindings.clone(),
                         )
-                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        .map_err(SubmissionWaveDispatchError::Contract)?
+                        .with_cost_observation_demand(template_demand);
                         drop(invocation_stage);
                         let expected_phase = invocation.operation().profile_phase;
                         let program_binding = invocation.program_binding().cloned();
@@ -1868,70 +2050,9 @@ impl OperationDispatch {
                         segment_dynamic_bindings.append(&mut dynamic_bindings);
                         segment_result_bindings.append(&mut result_bindings);
                     }
-                    // Optional diagnostics only. Every resident node keeps its
-                    // ordinal even when its producer/physical projection fails.
-                    // Captured recipes use the shared fresh checks without executable views;
-                    // other providers retain their original full producer.
-                    let selected_replay_cost = if runtime.structured_cost_capture()
-                        == ferrum_types::SloStructuredCostCapture::HostSettledV1
-                        && segment.logical_command_count() as usize
-                            <= crate::execution_cost::MAX_COST_COMMANDS
-                        && segment
-                            .start_node_index()
-                            .checked_add(segment.logical_command_count())
-                            == Some(segment.end_node_index())
-                    {
-                        Some(
-                            (segment.start_node_index()..segment.end_node_index())
-                                .map(|cost_node_index| {
-                                    let index = usize::try_from(cost_node_index).ok()?;
-                                    let provider = providers.get(index)?;
-                                    let identity = batch_identity.materialize_node(index).ok()?;
-                                    if provider.provider().uses_captured_replay_cost_recipe() {
-                                        BatchedOperationInvocation::validate_replay_cost_resources(
-                                            runtime,
-                                            resolved,
-                                            provider.dispatch(),
-                                            batch_identity,
-                                            identity,
-                                            completion.wave(),
-                                            index,
-                                            active_bindings.clone(),
-                                        )
-                                        .ok()
-                                        .map(crate::vnext::device::ReplayCostInput::CapturedRecipe)
-                                    } else {
-                                        let invocation =
-                                            BatchedOperationInvocation::from_wave_node(
-                                                runtime,
-                                                resolved,
-                                                provider.dispatch(),
-                                                batch_identity,
-                                                identity,
-                                                completion.wave(),
-                                                index,
-                                                active_bindings.clone(),
-                                            )
-                                            .ok()?;
-                                        Some(crate::vnext::device::ReplayCostInput::Selected(
-                                            provider
-                                                .provider()
-                                                .replayed_compute_cost_evidence(&invocation)
-                                                .ok()
-                                                .flatten(),
-                                        ))
-                                    }
-                                })
-                                .map(|input| {
-                                    input.unwrap_or(
-                                        crate::vnext::device::ReplayCostInput::Selected(None),
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    } else {
-                        None
-                    };
+                    // The resident executable already owns its immutable CPU
+                    // observation recipe. Capture the complete small numerical
+                    // wave once; actual runtime launch/completion binds it.
                     let invocation = DeviceReusableExecutionInvocation::new(
                         reusable_program.program_id().clone(),
                         segment.clone(),
@@ -1947,8 +2068,8 @@ impl OperationDispatch {
                             .immediate_tokens(),
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
-                    let invocation = match selected_replay_cost {
-                        Some(selected) => invocation.with_replay_cost_inputs(selected),
+                    let invocation = match observation_input.as_ref() {
+                        Some(input) => invocation.with_observation_input(input.clone()),
                         None => invocation,
                     };
                     let compute = runtime
@@ -2021,7 +2142,8 @@ impl OperationDispatch {
                     node_index,
                     active_bindings.clone(),
                 )
-                .map_err(SubmissionWaveDispatchError::Contract)?;
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .with_cost_observation_demand(template_demand);
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
@@ -2114,7 +2236,8 @@ impl OperationDispatch {
                     node_index,
                     active_bindings.clone(),
                 )
-                .map_err(SubmissionWaveDispatchError::Contract)?;
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .with_cost_observation_demand(template_demand);
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
@@ -2208,7 +2331,7 @@ impl OperationDispatch {
         }
         let uncoalesced_program_binding_count = program_bindings.len();
         let coalesced_program_bindings = runtime
-            .coalesce_program_bindings(program_bindings)
+            .coalesce_program_bindings_with_cost_observation(program_bindings, template_demand)
             .map_err(|error| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(format!(
                     "device runtime could not coalesce program bindings: {error}"
@@ -2316,7 +2439,7 @@ impl OperationDispatch {
                 if let Some((_, rejection)) = submission_guard.as_mut() {
                     **rejection = Some(super::PendingGuardedWaveRejection::new(
                         reason,
-                        batch_identity.batch_step_id(),
+                        batch_identity,
                     ));
                 }
                 Err(SubmissionWaveDispatchError::Contract(invalid_operation(

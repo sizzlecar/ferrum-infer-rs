@@ -1,9 +1,33 @@
 use super::*;
+pub(super) mod prefix;
 
 /// Enables typed host/completion timing without opening a journal or materializing events.
-pub(super) struct MetricsOnlyExecutionEventSink;
+pub(super) struct MetricsOnlyExecutionEventSink {
+    device_timing: ferrum_interfaces::vnext::DeviceTimingMode,
+}
+
+impl MetricsOnlyExecutionEventSink {
+    pub(super) fn for_detail(detail: ObservabilityProfileDetail) -> Option<Self> {
+        use ferrum_interfaces::vnext::DeviceTimingMode;
+        let device_timing = match detail {
+            ObservabilityProfileDetail::Basic => DeviceTimingMode::Completion,
+            ObservabilityProfileDetail::Host => DeviceTimingMode::Off,
+            _ => return None,
+        };
+        Some(Self { device_timing })
+    }
+}
 
 impl ExecutionEventSink for MetricsOnlyExecutionEventSink {
+    fn cost_observation_demand(&self) -> ferrum_interfaces::vnext::DeviceCostObservationDemand {
+        // This sink reads exact command identity/counts and host/device timing.
+        ferrum_interfaces::vnext::DeviceCostObservationDemand::NotRequired
+    }
+
+    fn needs_structured_cost_sample(&self) -> bool {
+        false
+    }
+
     fn enablement(&self) -> ferrum_interfaces::vnext::ExecutionEventSinkEnablement {
         ferrum_interfaces::vnext::ExecutionEventSinkEnablement::None
     }
@@ -13,7 +37,11 @@ impl ExecutionEventSink for MetricsOnlyExecutionEventSink {
     }
 
     fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
-        ferrum_interfaces::vnext::DeviceTimingMode::Completion
+        self.device_timing
+    }
+
+    fn host_dispatch_timing_enabled(&self) -> bool {
+        true
     }
 
     fn record(
@@ -76,6 +104,7 @@ struct DeferredVNextProfileEvent {
 enum SchedulerTraceRecord {
     Profile(FerrumProfileEvent),
     DeferredVNext(DeferredVNextProfileEvent),
+    Prefix(prefix::Record),
 }
 
 impl serde::Serialize for SchedulerTraceRecord {
@@ -85,6 +114,7 @@ impl serde::Serialize for SchedulerTraceRecord {
     {
         match self {
             Self::Profile(event) => serde::Serialize::serialize(event, serializer),
+            Self::Prefix(record) => serde::Serialize::serialize(record, serializer),
             Self::DeferredVNext(record) => {
                 let event = record
                     .context
@@ -1693,6 +1723,15 @@ impl VNextProfileExecutionEventSink {
 }
 
 impl ExecutionEventSink for VNextProfileExecutionEventSink {
+    fn needs_structured_cost_sample(&self) -> bool {
+        false
+    }
+
+    fn cost_observation_demand(&self) -> ferrum_interfaces::vnext::DeviceCostObservationDemand {
+        // This sink reads exact command identity/counts and host/device timing.
+        ferrum_interfaces::vnext::DeviceCostObservationDemand::NotRequired
+    }
+
     fn record_frame_capture_summary(
         &self,
         summary: &ferrum_interfaces::vnext::ExecutionFrameCaptureSummary,
@@ -1802,25 +1841,7 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
     }
 
     fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
-        match self.context.profile_detail {
-            ObservabilityProfileDetail::Off
-            | ObservabilityProfileDetail::Resource
-            | ObservabilityProfileDetail::Latency => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Off
-            }
-            ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Debug => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Completion
-            }
-            ObservabilityProfileDetail::Replay => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Replay
-            }
-            ObservabilityProfileDetail::Verify => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Verification
-            }
-            ObservabilityProfileDetail::Kernel | ObservabilityProfileDetail::Full => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Kernel
-            }
-        }
+        ferrum_interfaces::vnext::DeviceTimingMode::for_profile_detail(self.context.profile_detail)
     }
 
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {

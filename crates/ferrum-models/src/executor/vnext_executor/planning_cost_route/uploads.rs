@@ -60,15 +60,20 @@ pub(in crate::executor::vnext_executor) fn product_readback_binding(
 }
 
 /// Same product input order as dispatch_participant_wave: tokens, full masks,
-/// optional repetition IDs, offsets, penalties. This initial route has no
-/// repetition IDs; offsets and penalty uploads still occur on every row.
+/// optional repetition IDs, offsets, penalties. Nonempty repetition histories
+/// upload the real fixed-capacity padded layout, exactly as actual dispatch.
 pub(super) fn input_uploads<'a>(
     io: &'a VNextIoBinding,
     rows: &[OperationCostWorkRow],
+    roles: &[ProjectedOutputRole<'_>],
+    mode: VNextProductOutputMode,
 ) -> std::result::Result<Vec<EagerCoreInputUpload<'a>>, U> {
+    if rows.len() != roles.len() {
+        return Err(U::InvalidInput);
+    }
     let mut result = Vec::new();
     result
-        .try_reserve_exact(rows.len().checked_mul(4).ok_or(U::Capacity)?)
+        .try_reserve_exact(rows.len().checked_mul(5).ok_or(U::Capacity)?)
         .map_err(|_| U::Capacity)?;
     for (index, row) in rows.iter().enumerate() {
         let (logical_offset_bytes, layout) =
@@ -84,16 +89,40 @@ pub(super) fn input_uploads<'a>(
     }
     let ProductUploadLayouts {
         mask,
+        repetition_ids,
         offsets,
         penalty,
-        ..
     } = product_upload_layouts(io).map_err(|_| U::InvalidInput)?;
+    for index in 0..rows.len() {
+        result.push(EagerCoreInputUpload {
+            node_id: &io.token_mask_input_node_id,
+            input_ordinal: io.token_mask_input_ordinal,
+            participant_index: index,
+            logical_offset_bytes: 0,
+            layout: mask,
+        });
+    }
+    for (index, role) in roles.iter().enumerate() {
+        let (count, penalty) = role.repetition(mode);
+        if !penalty.is_finite()
+            || penalty <= 0.0
+            || count > io.repetition_capacity as u64
+            || u32::try_from(count).is_err()
+            || !role.validate_real_ids(mode, io.output_elements)
+        {
+            return Err(U::InvalidInput);
+        }
+        if count != 0 {
+            result.push(EagerCoreInputUpload {
+                node_id: &io.repetition_token_ids_input_node_id,
+                input_ordinal: io.repetition_token_ids_input_ordinal,
+                participant_index: index,
+                logical_offset_bytes: 0,
+                layout: repetition_ids,
+            });
+        }
+    }
     for (node, ordinal, layout) in [
-        (
-            &io.token_mask_input_node_id,
-            io.token_mask_input_ordinal,
-            mask,
-        ),
         (
             &io.repetition_offsets_input_node_id,
             io.repetition_offsets_input_ordinal,

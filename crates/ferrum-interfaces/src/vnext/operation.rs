@@ -6,6 +6,7 @@ mod checkpoint;
 mod compiled_identity;
 mod compiled_submission_wave;
 mod cost_route;
+mod decode_context;
 mod descriptor;
 mod determinism;
 mod determinism_artifact;
@@ -51,9 +52,15 @@ pub use checkpoint::{
 };
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
 pub use cost_route::{
-    coalesce_sorted_program_binding_writes, OperationCostCommand, OperationCostRoute,
-    OperationCostRouteRequest, OperationCostWorkRow, ProgramBindingCostPatch,
-    ProgramBindingCostWrite, ProgramBindingTransferLayout, SelectedEagerCostRoute,
+    coalesce_sorted_program_binding_writes, OperationCostCommand, OperationCostPreparationRequest,
+    OperationCostRoute, OperationCostRouteRequest, OperationCostSelection,
+    OperationCostTopologyRequirement, OperationCostWorkRow, PreparedOperationCostData,
+    ProgramBindingCostPatch, ProgramBindingCostWrite, ProgramBindingTransferLayout,
+    SelectedEagerCostRoute,
+};
+pub use decode_context::{
+    BoundDecodeContextCoverage, DecodeContextBoundary, DecodeContextBoundaryKind,
+    DecodeContextCoverage, ExecutorDecodeContextCoverage,
 };
 pub use descriptor::{
     OperationContract, OperationDescriptor, OracleSpec, ProfilePhase, ProviderRequirement,
@@ -85,8 +92,10 @@ pub use future_cost_route::{
     append_complete_eager_cost_route, selection_mask_bytes_match, DeviceCoreCostCapabilities,
     EagerCoreInputUpload, EagerCoreReadback, EagerCoreTokenMaskInput, EagerCoreWaveCostQuery,
     ExecutionCostRouteAvailability, ExecutionCostRouteForecastV2, ExecutionCostRouteProjection,
-    ExecutionCostRouteState, ExecutionCostRouteUnknown, ExecutionCostRouteView, FutureCostOutput,
-    FutureHostPendingQueryV2, FutureHostPendingRowV2, FutureWaveCostQuery, FutureWaveCostRow,
+    ExecutionCostRouteState, ExecutionCostRouteUnknown, ExecutionCostRouteView,
+    FutureCheckpointCostProjection, FutureCheckpointCostQuery, FutureCostOutput,
+    FutureHostPendingQueryV2, FutureHostPendingRowV2, FutureRepetitionRangeV3,
+    FutureRetainedCheckpointBinding, FutureWaveCostQuery, FutureWaveCostRow,
     ProductTokenMaskContent, ProductTokenMaskResidencyEntry, ProductTokenMaskResidencySnapshot,
     ProductTokenMaskSelection,
 };

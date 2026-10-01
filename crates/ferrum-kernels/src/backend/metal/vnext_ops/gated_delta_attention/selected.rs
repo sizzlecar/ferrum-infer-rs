@@ -7,6 +7,32 @@ use ferrum_interfaces::execution_cost::{
 };
 use std::sync::OnceLock;
 
+mod classes;
+pub(super) use classes::PreparedKernelClasses;
+
+mod observation;
+pub(super) use observation::freeze as observation;
+
+struct CommandBuilder<'a> {
+    selected: SelectedCommandCostBuilderV1,
+    classes: Option<&'a PreparedKernelClasses>,
+    linear_classes: Option<&'a super::cost_route::PreparedLinearProjectionClasses>,
+}
+
+impl<'a> CommandBuilder<'a> {
+    fn new(
+        capture: ferrum_types::SloStructuredCostCapture,
+        tokens: u64,
+        classes: Option<&'a PreparedKernelClasses>,
+    ) -> Self {
+        Self {
+            selected: crate::backend::metal::vnext_runtime::selected_cost_builder(capture, tokens),
+            classes,
+            linear_classes: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Projection<'a> {
     pub params: GatedDeltaParams,
@@ -47,7 +73,7 @@ pub(super) fn recurrent<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn kernel(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CommandBuilder<'_>,
     entry: &'static str,
     params: &GatedDeltaParams,
     logical: u64,
@@ -57,56 +83,30 @@ fn kernel(
     threads: u64,
     scratch: u64,
 ) -> Option<()> {
-    static NUMERIC: OnceLock<[u8; 32]> = OnceLock::new();
-    let numeric = *NUMERIC.get_or_init(|| {
-        let mut h = Sha256::new();
-        h.update(b"metal.gdn.default-compile-options.recurrent.v1");
-        h.update(SHADER_SOURCE.as_bytes());
-        h.update(include_str!("selected.rs").as_bytes());
-        h.finalize().into()
-    });
-    let mut layout = Sha256::new();
-    layout.update(b"gdn.params.f16conv.f32state.v1");
-    // Immutable layout/numerical ABI only. Token extent lives in work.
-    for n in [
-        params.hidden_size,
-        params.key_heads,
-        params.value_heads,
-        params.key_dim,
-        params.value_dim,
-        params.qkv_features,
-        params.value_features,
-        params.qkvz_features,
-        params.ba_features,
-        params.conv_kernel,
-        params.epsilon.to_bits(),
-        params.scale.to_bits(),
-        params.decay_parameterization,
-        params.value_head_mapping,
-    ] {
-        layout.update(n.to_le_bytes());
-    }
-    layout.update(threads.to_le_bytes());
-    let class = SelectedAlgorithmClassV1::new(entry, 1, numeric, layout.finalize().into()).ok()?;
-    b.kernel(
-        class,
-        KernelNumericWorkV1 {
-            logical_units: logical,
-            padded_units: padded,
-            inner_units_per_logical_unit: inner,
-            grid: [
-                u32::try_from(grid[0]).ok()?,
-                u32::try_from(grid[1]).ok()?,
-                u32::try_from(grid[2]).ok()?,
-            ],
-            scratch_bytes: scratch,
-            staged_weight_bytes: 0,
-        },
-    )
-    .ok()
+    let class = match b.classes {
+        Some(classes) => classes.get(entry, threads)?,
+        None => classes::fresh(entry, params, threads)?,
+    };
+    b.selected
+        .kernel(
+            class,
+            KernelNumericWorkV1 {
+                logical_units: logical,
+                padded_units: padded,
+                inner_units_per_logical_unit: inner,
+                grid: [
+                    u32::try_from(grid[0]).ok()?,
+                    u32::try_from(grid[1]).ok()?,
+                    u32::try_from(grid[2]).ok()?,
+                ],
+                scratch_bytes: scratch,
+                staged_weight_bytes: 0,
+            },
+        )
+        .ok()
 }
 fn elements(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CommandBuilder<'_>,
     entry: &'static str,
     p: &GatedDeltaParams,
     n: u64,
@@ -126,12 +126,7 @@ fn elements(
         scratch,
     )
 }
-fn norm(
-    b: &mut SelectedCommandCostBuilderV1,
-    p: &GatedDeltaParams,
-    gated: bool,
-    scratch: u64,
-) -> Option<()> {
+fn norm(b: &mut CommandBuilder<'_>, p: &GatedDeltaParams, gated: bool, scratch: u64) -> Option<()> {
     let heads = if gated { p.value_heads } else { p.key_heads };
     let n = u64::from(p.tokens).checked_mul(u64::from(heads))?;
     kernel(
@@ -150,7 +145,7 @@ fn norm(
         scratch,
     )
 }
-fn conv(b: &mut SelectedCommandCostBuilderV1, p: &GatedDeltaParams, scratch: u64) -> Option<()> {
+fn conv(b: &mut CommandBuilder<'_>, p: &GatedDeltaParams, scratch: u64) -> Option<()> {
     let n = u64::from(p.tokens).checked_mul(u64::from(p.qkvz_features))?;
     // Work units are physical element domains, not a FLOP claim (Z lanes copy).
     elements(b, PREPARE_CONV_KERNEL, p, n, 1, scratch)?;
@@ -158,7 +153,7 @@ fn conv(b: &mut SelectedCommandCostBuilderV1, p: &GatedDeltaParams, scratch: u64
     elements(b, COLLECT_CONV_STATE_KERNEL, p, state, 1, scratch)?;
     elements(b, COPY_F16_KERNEL, p, state, 1, scratch)
 }
-fn gates(b: &mut SelectedCommandCostBuilderV1, p: &GatedDeltaParams, scratch: u64) -> Option<()> {
+fn gates(b: &mut CommandBuilder<'_>, p: &GatedDeltaParams, scratch: u64) -> Option<()> {
     elements(
         b,
         PREPARE_GATES_KERNEL,
@@ -169,7 +164,7 @@ fn gates(b: &mut SelectedCommandCostBuilderV1, p: &GatedDeltaParams, scratch: u6
     )
 }
 fn delta(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CommandBuilder<'_>,
     a: &MetalGatedDeltaPipelines,
     p: &GatedDeltaParams,
     scratch: u64,
@@ -190,7 +185,7 @@ fn delta(
     )
 }
 fn input(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CommandBuilder<'_>,
     l: &MetalLinearPipelines,
     p: &MetalPrimitivePipelines,
     hidden: ElementType,
@@ -198,7 +193,7 @@ fn input(
     scratch: u64,
 ) -> Option<()> {
     super::super::primitives::append_selected_rms(
-        b,
+        &mut b.selected,
         p,
         hidden,
         ElementType::F16,
@@ -207,20 +202,26 @@ fn input(
         v.params.epsilon,
         scratch,
     )?;
-    for &launch in v.input {
-        super::super::linear::append_selected_projection(
-            b,
+    if b.linear_classes
+        .is_some_and(|classes| classes.input.len() != v.input.len())
+    {
+        return None;
+    }
+    for (index, &launch) in v.input.iter().enumerate() {
+        super::super::linear::append_selected_projection_with_classes(
+            &mut b.selected,
             l,
             launch,
             v.staged
                 .then_some(staged_prefill::StagingPolicy::GatedDelta),
             scratch,
+            b.linear_classes.map(|classes| &classes.input[index]),
         )?;
     }
     Some(())
 }
 fn output(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CommandBuilder<'_>,
     l: &MetalLinearPipelines,
     p: &MetalPrimitivePipelines,
     hidden: ElementType,
@@ -228,9 +229,16 @@ fn output(
     scratch: u64,
 ) -> Option<()> {
     norm(b, &v.params, true, scratch)?;
-    super::super::linear::append_selected_projection(b, l, v.output, None, scratch)?;
+    super::super::linear::append_selected_projection_with_classes(
+        &mut b.selected,
+        l,
+        v.output,
+        None,
+        scratch,
+        b.linear_classes.map(|classes| &classes.output),
+    )?;
     let n = v.params.tokens.checked_mul(v.params.hidden_size)?;
-    super::super::primitives::append_selected_residual(b, p, hidden, n, scratch)
+    super::super::primitives::append_selected_residual(&mut b.selected, p, hidden, n, scratch)
 }
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evidence<'a>(
@@ -243,10 +251,45 @@ pub(super) fn evidence<'a>(
     packed: Option<Projection<'a>>,
     rows: impl Iterator<Item = Row<'a>> + Clone,
 ) -> Option<SelectedCommandCostEvidenceV1> {
+    evidence_with_classes(a, l, p, hidden, tokens, scratch, packed, rows, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn evidence_with_classes<'a>(
+    a: &MetalGatedDeltaPipelines,
+    l: &MetalLinearPipelines,
+    p: &MetalPrimitivePipelines,
+    hidden: ElementType,
+    tokens: u64,
+    scratch: u64,
+    packed: Option<Projection<'a>>,
+    rows: impl Iterator<Item = Row<'a>> + Clone,
+    classes: Option<&PreparedKernelClasses>,
+) -> Option<SelectedCommandCostEvidenceV1> {
+    evidence_with_prepared_classes(
+        a, l, p, hidden, tokens, scratch, packed, rows, classes, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn evidence_with_prepared_classes<'a>(
+    a: &MetalGatedDeltaPipelines,
+    l: &MetalLinearPipelines,
+    p: &MetalPrimitivePipelines,
+    hidden: ElementType,
+    tokens: u64,
+    scratch: u64,
+    packed: Option<Projection<'a>>,
+    rows: impl Iterator<Item = Row<'a>> + Clone,
+    classes: Option<&PreparedKernelClasses>,
+    linear_classes: Option<&super::cost_route::PreparedLinearProjectionClasses>,
+) -> Option<SelectedCommandCostEvidenceV1> {
     let mut total = 0_u64;
     let mut count = 0_u64;
     for row in rows.clone() {
-        if !matches!(row.form, GatedDeltaExecutionForm::RecurrentScan) {
+        if !matches!(row.form, GatedDeltaExecutionForm::RecurrentScan)
+            || classes.is_some_and(|classes| !classes.matches(&row.projection.params))
+        {
             return None;
         }
         total = total.checked_add(u64::from(row.projection.params.tokens))?;
@@ -255,10 +298,12 @@ pub(super) fn evidence<'a>(
     if count == 0 || total != tokens {
         return None;
     }
-    let mut b =
-        crate::backend::metal::vnext_runtime::selected_cost_builder(l.structured_capture(), tokens);
+    let mut b = CommandBuilder::new(l.structured_capture(), tokens, classes);
+    b.linear_classes = linear_classes;
     if let Some(v) = packed {
-        if u64::from(v.params.tokens) != tokens {
+        if u64::from(v.params.tokens) != tokens
+            || classes.is_some_and(|classes| !classes.matches(&v.params))
+        {
             return None;
         }
         input(&mut b, l, p, hidden, v, scratch)?;
@@ -282,8 +327,10 @@ pub(super) fn evidence<'a>(
             output(&mut b, l, p, hidden, v, scratch)?;
         }
     }
-    b.finish().ok()
+    b.selected.finish().ok()
 }
 
 #[cfg(test)]
 mod tests;
+
+pub(super) use observation::payload_upper as observation_payload_upper;

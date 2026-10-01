@@ -21,6 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 
+mod automatic_cost_probe;
+
 #[derive(Args)]
 pub struct ServeCommand {
     /// Model alias, owner/repository[:QUANT], or local path (default: from config)
@@ -270,7 +272,7 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
-    /// Product observability detail level. Basic without artifact paths collects timing metrics only.
+    /// Product observability detail level. Basic without paths collects timing metrics; host collects only aggregate host timing and accepts no artifact paths.
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
@@ -556,6 +558,12 @@ async fn execute_with_compatibility(
         request_dump_dir.as_ref(),
         profile_sample_rate,
     );
+    if profile_detail == crate::observability_product::ProfileDetailArg::Host {
+        product_observability
+            .core
+            .validate()
+            .map_err(FerrumError::config)?;
+    }
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
     let process_start_sample = product_memory_enabled
@@ -1178,6 +1186,8 @@ async fn execute_with_compatibility(
                     "Initializing engine (continuous batching)...".dimmed()
                 );
                 let mut engine_config = product_engine_config;
+                engine_config.sampling.default_params =
+                    ferrum_server::default_chat_sampling_params();
                 engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
                 engine_config.backend.device = device;
                 engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
@@ -1209,16 +1219,38 @@ async fn execute_with_compatibility(
                     );
                 }
                 super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
+                let probe_templates = automatic_cost_probe::templates(
+                    &engine_config,
+                    model_chat_template.as_ref(),
+                    &primary_served_model_name,
+                    default_enable_thinking,
+                    interleaved_system_coalescing,
+                );
                 let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
                     Arc::from(match (defined_model, model_sources) {
                         (Some(prepared), _) => {
-                            ferrum_engine::create_defined_product_engine(engine_config, prepared)
-                                .await?
+                            ferrum_engine::create_defined_product_engine_with_automatic_cost_probes(
+                                engine_config,
+                                prepared,
+                                probe_templates,
+                            )
+                            .await?
                         }
                         (None, Some(sources)) => {
-                            ferrum_engine::create_product_engine(engine_config, sources).await?
+                            ferrum_engine::create_product_engine_with_automatic_cost_probes(
+                                engine_config,
+                                sources,
+                                probe_templates,
+                            )
+                            .await?
                         }
-                        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
+                        (None, None) => {
+                            ferrum_engine::create_engine_with_automatic_cost_probes(
+                                engine_config,
+                                probe_templates,
+                            )
+                            .await?
+                        }
                     });
                 crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
                 resolved_execution_metrics = engine.cache_metrics_snapshot();

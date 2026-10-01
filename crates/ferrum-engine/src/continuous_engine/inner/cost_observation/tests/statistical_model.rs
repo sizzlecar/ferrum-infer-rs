@@ -173,7 +173,7 @@ fn recorded_case_with_prediction(
         assert!(call.host_publication(&evidence, false, true).is_none());
         call.record_host_result(evidence);
         clock.set(epoch + 21 + host_delay_ns);
-        assert_eq!(call.finish(), CostCallDisposition::Published);
+        assert_eq!(call.finish(), CostCallDisposition::Queued);
         let (ordinal, entry) = queue.pop_numbered().unwrap();
         return (ordinal, entry, capture);
     }
@@ -208,10 +208,7 @@ fn recorded_case_with_prediction(
     ));
     call.reject(CostCallRejection::Composite);
     clock.set(epoch + 21 + host_delay_ns);
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
-    );
+    assert_eq!(call.finish(), CostCallDisposition::Queued);
     let (ordinal, entry) = queue.pop_numbered().unwrap();
     (ordinal, entry, capture)
 }
@@ -276,3 +273,22 @@ pub(in crate::continuous_engine::inner) mod runtime;
 
 #[path = "statistical_model/capture.rs"]
 pub(in crate::continuous_engine::inner) mod capture;
+
+#[test]
+fn async_observation_selected_without_v2_recipe_keeps_shared_legacy_capture() {
+    let (ordinal, entry, capture) = recorded_with_capture(&EngineCostIds::default(), &sink(4, 32));
+    let stages = capture.host_stages().unwrap();
+    let common = capture.actual_projection(&stages).unwrap().unwrap();
+    assert!(common.selected.structured_capture().is_none());
+    assert!(capture.structured_projection(&stages).unwrap().is_err());
+    let second = capture.actual_projection(&stages).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&common, &second));
+    let captured = super::super::profile_export::selected::SelectedCalibrationCapture::observation(
+        &capture, true, [7; 32],
+    )
+    .unwrap();
+    let expected = super::super::trainer::whole_wave_observation(&entry, ordinal, [7; 32]).unwrap();
+    assert_eq!(captured.exact, expected.exact);
+    assert_eq!(captured.wall_ns, expected.wall_ns);
+    assert_eq!(captured.accepted_ordinal, ordinal);
+}

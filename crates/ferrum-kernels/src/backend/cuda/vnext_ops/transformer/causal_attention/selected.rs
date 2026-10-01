@@ -12,6 +12,10 @@ use ferrum_interfaces::execution_cost::{
 use ferrum_types::SloStructuredCostCapture;
 use std::sync::OnceLock;
 
+mod template;
+use template::{CostBuilder, Query};
+pub(super) use template::{CostTemplate, Geometry};
+
 /// The actual projection ABI, never inferred from a cost-table success.
 /// DenseF16 is created only after the explicit RN consumer has validated its
 /// complete materialized operands and the runtime has frozen a live handle.
@@ -23,7 +27,7 @@ pub(super) enum ProjectionWork<'a> {
 impl ProjectionWork<'_> {
     fn append(
         self,
-        builder: &mut SelectedCommandCostBuilderV1,
+        builder: &mut CostBuilder<'_>,
         index: usize,
         rows: u64,
         output: u64,
@@ -32,14 +36,13 @@ impl ProjectionWork<'_> {
     ) -> Option<()> {
         match self {
             Self::Native(parts) => projection_work(builder, parts[index], rows, output, scratch),
-            Self::DenseF16(identity) => GemmF16ApiPlan::new(
+            Self::DenseF16(identity) => builder.gemm(
+                index,
                 checked_i32(rows, "causal GEMM rows").ok()?,
                 checked_i32(output, "causal GEMM output").ok()?,
                 checked_i32(input, "causal GEMM input").ok()?,
-            )
-            .ok()?
-            .append_selected(builder, identity)
-            .ok(),
+                identity,
+            ),
         }
     }
     fn extra_dispatches(self, rows: u64) -> Option<u64> {
@@ -57,8 +60,8 @@ pub(super) struct Row {
     pub tokens: u64,
     pub sequence: u64,
     pub inplace: bool,
-    path: CausalAttentionKernelPath,
-    envelope: CausalAttentionReplayEnvelope,
+    pub(super) path: CausalAttentionKernelPath,
+    pub(super) envelope: CausalAttentionReplayEnvelope,
 }
 impl Row {
     pub(super) fn new(
@@ -95,6 +98,7 @@ fn class(entry: &str, block: [u32; 3]) -> Option<SelectedAlgorithmClassV1> {
             include_bytes!("batch_decode.rs").as_slice(),
             include_bytes!("launch_geometry.rs").as_slice(),
             include_bytes!("selected.rs").as_slice(),
+            include_bytes!("selected/template.rs").as_slice(),
         ] {
             hash.update(source);
         }
@@ -123,7 +127,7 @@ fn class(entry: &str, block: [u32; 3]) -> Option<SelectedAlgorithmClassV1> {
     SelectedAlgorithmClassV1::new(entry, 1, numerical, layout.finalize().into()).ok()
 }
 fn kernel(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CostBuilder<'_>,
     entry: &str,
     config: LaunchConfig,
     logical: u64,
@@ -132,8 +136,9 @@ fn kernel(
     fixed: &[u64],
 ) -> Option<()> {
     let block = [config.block_dim.0, config.block_dim.1, config.block_dim.2];
+    let algorithm = b.class(entry, block)?;
     b.kernel_with_replay_geometry(
-        class(entry, block)?,
+        algorithm,
         KernelNumericWorkV1 {
             logical_units: logical,
             padded_units: logical,
@@ -150,19 +155,20 @@ fn kernel(
     )
     .ok()
 }
-pub(super) fn binding_evidence(
+pub(in crate::backend::cuda::vnext_ops::transformer) fn binding_evidence(
     bytes: impl IntoIterator<Item = u64>,
     tokens: u64,
     capture: SloStructuredCostCapture,
 ) -> Option<SelectedCommandCostEvidenceV1> {
     let mut b = selected_cost::builder(capture, tokens)?;
+    // This entry/block is independent of node, rows, context and addresses.
+    // Preserve the same class digest while rebuilding every transfer's bytes.
+    static CONTROL_CLASS: OnceLock<Option<SelectedAlgorithmClassV1>> = OnceLock::new();
+    let algorithm =
+        (*CONTROL_CLASS.get_or_init(|| class("cuda.cuMemcpyHtoDAsync.causal-control", [1, 1, 1])))?;
     for bytes in bytes {
-        b.transfer(
-            class("cuda.cuMemcpyHtoDAsync.causal-control", [1, 1, 1])?,
-            StatisticalTransferKindV1::HostToDevice,
-            bytes,
-        )
-        .ok()?;
+        b.transfer(algorithm, StatisticalTransferKindV1::HostToDevice, bytes)
+            .ok()?;
     }
     b.finish().ok()
 }
@@ -176,6 +182,32 @@ pub(super) fn attach(
             .with_statistical_evidence(evidence)
             .unwrap_or(command),
         None => command,
+    }
+}
+
+#[test]
+fn prepared_causal_control_class_keeps_each_transfer_geometry_and_legacy_evidence() {
+    let capture = SloStructuredCostCapture::HostSettledV1;
+    for sizes in [vec![32], vec![32, 48, 64]] {
+        let mut original = selected_cost::builder(capture, sizes.len() as u64).unwrap();
+        for &bytes in &sizes {
+            original
+                .transfer(
+                    class("cuda.cuMemcpyHtoDAsync.causal-control", [1, 1, 1]).unwrap(),
+                    StatisticalTransferKindV1::HostToDevice,
+                    bytes,
+                )
+                .unwrap();
+        }
+        let original = original.finish().unwrap();
+        let prepared =
+            binding_evidence(sizes.iter().copied(), sizes.len() as u64, capture).unwrap();
+        assert_eq!(prepared, original);
+        assert_eq!(prepared.algorithm_work(), original.algorithm_work());
+        assert_eq!(
+            prepared.work().host_to_device_bytes,
+            sizes.iter().sum::<u64>()
+        );
     }
 }
 pub(super) fn actual(
@@ -258,28 +290,44 @@ pub(super) fn compute(
     packed: bool,
     capture: SloStructuredCostCapture,
 ) -> Option<SelectedCommandCostEvidenceV1> {
-    let mut b = selected_cost::builder(capture, tokens)?;
-    if shape.int8_kv || rows.is_empty() {
+    if capture.is_disabled() {
         return None;
     }
-    match (projection, projections) {
-        (CausalProjection::Native { .. }, ProjectionWork::Native(parts))
-            if parts.iter().all(|part| !part.is_empty()) => {}
-        (CausalProjection::F16, ProjectionWork::DenseF16(_)) => {}
-        _ => return None,
-    }
-    let seen = rows
-        .iter()
-        .try_fold(0_u64, |sum, row| sum.checked_add(row.tokens))?;
-    if seen != tokens || (packed && rows.len() < 2) {
-        return None;
-    }
-    let layout =
-        ScratchLayout::for_participants(shape, tokens, rows.len(), projection, policy).ok()?;
-    let bindings = BindingLayout::new(shape, rows.len()).ok()?;
-    let cuda = shape.cuda_shape().ok()?;
+    Geometry::new(
+        shape,
+        precision,
+        projection,
+        policy,
+        shape.cuda_shape().ok()?,
+        tokens,
+        rows.len(),
+        None,
+    )
+    .ok()?
+    .finish(rows, packed, projections)?
+    .compute(capture)
+}
+
+fn compute_query(
+    query: &Query<'_>,
+    capture: SloStructuredCostCapture,
+) -> Option<SelectedCommandCostEvidenceV1> {
+    let mut b = CostBuilder::new(query, capture)?;
+    let Geometry {
+        shape,
+        precision,
+        projection,
+        cuda,
+        layout,
+        bindings,
+        tokens,
+        ..
+    } = query.geometry;
+    let rows = query.rows;
+    let projections = query.projections;
+    let packed = query.packed;
     let transform = projection.transform_bytes_per_token().checked_mul(tokens)?;
-    let before = |b: &mut SelectedCommandCostBuilderV1, n: u64| -> Option<()> {
+    let before = |b: &mut CostBuilder<'_>, n: u64| -> Option<()> {
         rms(b, shape, precision, n, layout.required_bytes)?;
         for (index, stride) in [
             shape.query_projection_features,
@@ -293,7 +341,7 @@ pub(super) fn compute(
         }
         Some(())
     };
-    let after = |b: &mut SelectedCommandCostBuilderV1, n: u64, inplace: bool| -> Option<()> {
+    let after = |b: &mut CostBuilder<'_>, n: u64, inplace: bool| -> Option<()> {
         projections.append(b, 3, n, shape.hidden_size, shape.query_features, transform)?;
         if shape.post_attention_norm {
             rms(b, shape, precision, n, layout.required_bytes)?;
@@ -323,8 +371,7 @@ pub(super) fn compute(
             return None;
         }
         before(&mut b, tokens)?;
-        if batch_decode::eligible(rows.iter().map(|row| row.path), true) {
-            let paths = rows.iter().map(|row| row.path).collect::<Vec<_>>();
+        if query.batch_decode {
             for row in rows {
                 if row.tokens != 1 {
                     return None;
@@ -341,29 +388,13 @@ pub(super) fn compute(
                 layout.required_bytes,
                 &[bindings.slot_bytes, u64::from(count)],
             )?;
-            for range in batch_decode::group_ranges(&paths) {
-                let group = &rows[range];
-                let maximum = group
-                    .iter()
-                    .map(|row| row.envelope.sequence_capacity_tokens)
-                    .max()?;
-                let local_binding = BindingLayout {
-                    slot_bytes: bindings.slot_bytes,
-                    required_bytes: bindings.slot_bytes.checked_mul(group.len() as u64)?,
-                };
-                batch_decode::BatchDecode::dimensions(
-                    group.len(),
-                    local_binding,
-                    maximum,
-                    shape.query_heads,
-                    shape.head_dim,
-                )
-                .ok()?;
+            for (range, maximum) in &query.groups {
+                let group = &rows[range.clone()];
                 native_attention(
                     &mut b,
                     shape,
                     group,
-                    maximum,
+                    *maximum,
                     bindings.slot_bytes.checked_div(POINTER_BYTES)?,
                     layout.required_bytes,
                 )?;
@@ -427,26 +458,190 @@ pub(super) fn compute(
             after(&mut b, row.tokens, row.inplace)?;
         }
     }
-    let evidence = b.finish().ok()?;
-    let extra = if packed {
-        projections.extra_dispatches(tokens)?
-    } else {
-        rows.iter().try_fold(0_u64, |sum, row| {
-            sum.checked_add(projections.extra_dispatches(row.tokens)?)
-        })?
-    };
-    let dispatches = physical_dispatch_count(
-        rows.iter().map(|row| row.path),
-        shape.output_gate,
-        shape.post_attention_norm,
-        packed,
-    )
-    .checked_add(extra)?;
-    evidence.validate_command(tokens, dispatches, 0).ok()?;
+    let evidence = b.finish()?;
+    evidence
+        .validate_command(tokens, query.dispatches, 0)
+        .ok()?;
     Some(evidence)
 }
+
+/// Frozen CPU counterpart of the selected actual attention launches. Current
+/// context changes only numerical work; the worker never reselects a path or
+/// reconstructs a runtime/PSO/buffer view.
+pub(in crate::backend::cuda::vnext_ops::transformer) struct Recipe {
+    shape: CausalAttentionShape,
+    precision: CausalPrecision,
+    projection: CausalProjection,
+    policy: AttentionExecutionPolicy,
+    native: Option<[std::sync::Arc<[weights::MatrixPart]>; 4]>,
+    library: Option<CublasHandleApiIdentity>,
+    rows: Box<[Row]>,
+    tokens: u64,
+    packed: bool,
+    retained: usize,
+    _construction: ferrum_interfaces::vnext::DeviceObservationTemplateReservation,
+}
+impl Recipe {
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn library_identity(
+        &self,
+    ) -> Option<CublasHandleApiIdentity> {
+        self.library
+    }
+    pub(super) fn from_prepared(
+        prepared: &prepared::Prepared,
+        policy: AttentionExecutionPolicy,
+        precision: CausalPrecision,
+        library: Option<CublasHandleApiIdentity>,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Option<Self> {
+        let weights = [
+            &prepared.shared.query_weight,
+            &prepared.shared.key_weight,
+            &prepared.shared.value_weight,
+            &prepared.shared.output_weight,
+        ];
+        let mut copied = prepared
+            .launches
+            .len()
+            .checked_mul(std::mem::size_of::<Row>())?
+            .checked_add(
+                4usize.checked_mul(std::mem::size_of::<std::sync::Arc<[weights::MatrixPart]>>())?,
+            )?;
+        for weight in weights {
+            if let SharedProjectionWeight::Native(matrix) = weight {
+                copied = copied
+                    .checked_add(weights::retained_payload_bytes(&matrix.parts)?)?
+                    .checked_add(2 * std::mem::size_of::<usize>())?;
+            }
+        }
+        let construction = budget
+            .reserve(std::mem::size_of::<Self>().checked_add(copied.checked_mul(2)?)?)
+            .ok()?;
+        let (native, library): (
+            Option<[std::sync::Arc<[weights::MatrixPart]>; 4]>,
+            Option<CublasHandleApiIdentity>,
+        ) = match prepared.projection {
+            CausalProjection::Native { .. } => {
+                let mut parts = Vec::with_capacity(4);
+                for weight in weights {
+                    let SharedProjectionWeight::Native(matrix) = weight else {
+                        return None;
+                    };
+                    parts.push(std::sync::Arc::clone(&matrix.parts));
+                }
+                (Some(parts.try_into().ok()?), None)
+            }
+            CausalProjection::F16
+                if weights
+                    .iter()
+                    .all(|w| matches!(w, SharedProjectionWeight::F16 { .. })) =>
+            {
+                (None, Some(library?))
+            }
+            _ => return None,
+        };
+        let rows: Box<[_]> = prepared
+            .launches
+            .iter()
+            .map(|launch| Row {
+                tokens: launch.tokens,
+                sequence: launch.sequence_tokens,
+                inplace: prepared.compute_regions[launch.input_region].device_ptr()
+                    == prepared.compute_regions[launch.output_region].device_ptr(),
+                path: launch.path,
+                envelope: launch.replay_topology.envelope(),
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        let mut retained = std::mem::size_of::<Self>()
+            .checked_add(rows.len().checked_mul(std::mem::size_of::<Row>())?)?;
+        if let Some(parts) = &native {
+            for part in parts.iter() {
+                retained = retained
+                    .checked_add(weights::retained_payload_bytes(part.as_ref())?)?
+                    .checked_add(2 * std::mem::size_of::<usize>())?;
+            }
+        }
+        Some(Self {
+            _construction: construction,
+            shape: prepared.shape,
+            precision,
+            projection: prepared.projection,
+            policy,
+            native,
+            library,
+            rows,
+            tokens: prepared.total_tokens,
+            packed: prepared.packed.is_some(),
+            retained,
+        })
+    }
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn retained_payload_bytes(&self) -> usize {
+        self.retained
+    }
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn projection_scratch_bytes(
+        &self,
+    ) -> Option<usize> {
+        // Fresh numerical rows plus the optional packed path list. Both use
+        // exact-size allocations; grouping itself is a borrowed iterator.
+        self.rows.len().checked_mul(
+            std::mem::size_of::<Row>()
+                .checked_add(std::mem::size_of::<CausalAttentionKernelPath>())?,
+        )
+    }
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn project(
+        &self,
+        current: &ferrum_interfaces::vnext::FrozenObservationInput,
+    ) -> Option<SelectedCommandCostEvidenceV1> {
+        if current.tokens() != self.tokens
+            || current.participant_ranges().len() != self.rows.len()
+            || current.source_ranges().len() != self.rows.len()
+        {
+            return None;
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.rows.len()).ok()?;
+        for ((&captured, immediate), source) in self
+            .rows
+            .iter()
+            .zip(current.participant_ranges())
+            .zip(current.source_ranges())
+        {
+            let tokens = immediate.end.checked_sub(immediate.start)?;
+            if tokens != captured.tokens
+                || source.end.checked_sub(source.start) != Some(tokens)
+                || source.end > self.shape.maximum_context_tokens
+                || source.end > captured.envelope.sequence_capacity_tokens
+            {
+                return None;
+            }
+            rows.push(Row {
+                sequence: source.end,
+                ..captured
+            });
+        }
+
+        let projections = match &self.native {
+            Some(parts) => ProjectionWork::Native([&parts[0], &parts[1], &parts[2], &parts[3]]),
+            None => ProjectionWork::DenseF16(self.library?),
+        };
+        compute(
+            self.shape,
+            self.precision,
+            self.projection,
+            self.policy,
+            projections,
+            &rows,
+            self.tokens,
+            self.packed,
+            SloStructuredCostCapture::HostSettledV1,
+        )
+    }
+}
 fn projection_work(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CostBuilder<'_>,
     parts: &[weights::MatrixPart],
     rows: u64,
     stride: u64,
@@ -465,7 +660,7 @@ fn projection_work(
     Some(())
 }
 fn rms(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CostBuilder<'_>,
     s: CausalAttentionShape,
     p: CausalPrecision,
     n: u64,
@@ -482,7 +677,7 @@ fn rms(
     )
 }
 fn prepare(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CostBuilder<'_>,
     s: CausalAttentionShape,
     c: CudaCausalAttentionShape,
     row: Row,
@@ -520,12 +715,7 @@ fn prepare(
         &fixed,
     )
 }
-fn gate(
-    b: &mut SelectedCommandCostBuilderV1,
-    s: CausalAttentionShape,
-    row: Row,
-    scratch: u64,
-) -> Option<()> {
+fn gate(b: &mut CostBuilder<'_>, s: CausalAttentionShape, row: Row, scratch: u64) -> Option<()> {
     let elements = row.tokens.checked_mul(s.query_features)?;
     kernel(
         b,
@@ -559,7 +749,7 @@ fn attention_work(s: CausalAttentionShape, rows: &[Row]) -> Option<u64> {
     })
 }
 fn fallback_attention(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CostBuilder<'_>,
     s: CausalAttentionShape,
     c: CudaCausalAttentionShape,
     rows: &[Row],
@@ -608,7 +798,7 @@ fn fallback_attention(
     )
 }
 fn attention(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CostBuilder<'_>,
     s: CausalAttentionShape,
     c: CudaCausalAttentionShape,
     row: Row,
@@ -656,7 +846,7 @@ fn attention(
 // 16-token blocks, 128 threads, 512-token V2 partitions). Bundle identity above
 // binds these formulas to the actual pinned library, not a family-name guess.
 fn native_attention(
-    b: &mut SelectedCommandCostBuilderV1,
+    b: &mut CostBuilder<'_>,
     s: CausalAttentionShape,
     rows: &[Row],
     envelope: u64,

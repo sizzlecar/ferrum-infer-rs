@@ -155,6 +155,7 @@ fn rn_fragment_product_launchers_keep_f16_stages_and_changed_input_graphs() {
         .load_module(Ptx::from_src(crate::ptx::VNEXT_GGUF))
         .unwrap();
     let mma = module.load_function(ENTRY).unwrap();
+    let q6_prefetch = module.load_function(Q6_PREFETCH_ENTRY).unwrap();
     let coeff = module
         .load_function("vnext_rn_fragment_coefficients")
         .unwrap();
@@ -209,7 +210,16 @@ fn rn_fragment_product_launchers_keep_f16_stages_and_changed_input_graphs() {
             );
             let enqueue = || {
                 if shape.fragment() {
-                    plan::launch(&stream, &mma, shape, gate_plan, x, gate_packet_ptr, g).unwrap();
+                    plan::launch(
+                        &stream,
+                        plan::fragment_function(gate_plan, &mma, &q6_prefetch),
+                        shape,
+                        gate_plan,
+                        x,
+                        gate_packet_ptr,
+                        g,
+                    )
+                    .unwrap();
                 } else {
                     shape
                         .gate
@@ -226,7 +236,16 @@ fn rn_fragment_product_launchers_keep_f16_stages_and_changed_input_graphs() {
                 )
                 .unwrap();
                 if shape.fragment() {
-                    plan::launch(&stream, &mma, shape, down_plan, a, down_packet_ptr, y).unwrap();
+                    plan::launch(
+                        &stream,
+                        plan::fragment_function(down_plan, &mma, &q6_prefetch),
+                        shape,
+                        down_plan,
+                        a,
+                        down_packet_ptr,
+                        y,
+                    )
+                    .unwrap();
                 } else {
                     shape
                         .down
@@ -294,3 +313,6 @@ fn rn_fragment_product_launchers_keep_f16_stages_and_changed_input_graphs() {
         );
     }
 }
+
+#[path = "gpu/q6_prefetch.rs"]
+mod q6_prefetch;

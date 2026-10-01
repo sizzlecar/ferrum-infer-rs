@@ -5,7 +5,114 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
 };
+#[path = "tests/no_submission.rs"]
+mod no_submission;
+mod outside_route;
+mod preparation;
+mod restart;
 mod structured_scope;
+
+#[test]
+fn automatic_outside_catalog_feedback_preserves_scope_but_enforces_clock_and_order() {
+    for (observed_at_ns, consumed_at_ns, expected) in [
+        (2, 1, Some(Revocation::IdentityOrClock)),
+        (1, 52, Some(Revocation::ObservationLag)),
+        (1, 51, None),
+    ] {
+        let mut monitor = Monitor::open_bound(
+            &policy(),
+            &Storage::MemoryOnly,
+            binding(),
+            1,
+            FeedbackKind::StructuredV2,
+            Some(vec![[7; 32]].into()),
+        )
+        .unwrap();
+        let before = monitor.current_view();
+        monitor.observe_classified(
+            1,
+            FeedbackObservation::OutsideCatalog {
+                observed_at_ns,
+                consumed_at_ns,
+            },
+        );
+        let audit = monitor.audit();
+        assert_eq!(audit.revoked, expected);
+        assert_eq!(audit.compared, 0);
+        assert_eq!(audit.uncomparable_observations, 0);
+        assert_eq!(audit.maximum_margin_ns, 0);
+        assert_eq!(
+            audit.outside_catalog_observations,
+            u64::from(expected.is_none())
+        );
+        if expected.is_none() {
+            assert!(Arc::ptr_eq(&before, &monitor.current_view()));
+            monitor.observe_classified(1, FeedbackObservation::NotSubmitted);
+            assert_eq!(monitor.audit().revoked, Some(Revocation::IdentityOrClock));
+        }
+    }
+}
+
+#[test]
+fn automatic_outside_support_is_not_a_timing_sample_and_cannot_bypass_identity_or_lag() {
+    for (observed_at_ns, consumed_at_ns, expected) in [
+        (2, 1, Some(Revocation::IdentityOrClock)),
+        (1, 52, Some(Revocation::ObservationLag)),
+        (1, 51, None),
+    ] {
+        let mut monitor = Monitor::open_bound(
+            &policy(),
+            &Storage::MemoryOnly,
+            binding(),
+            1,
+            FeedbackKind::StructuredV2,
+            Some(vec![[7; 32]].into()),
+        )
+        .unwrap();
+        let before = monitor.current_view();
+        monitor.observe_classified(
+            1,
+            FeedbackObservation::OutsideSupport {
+                observed_at_ns,
+                consumed_at_ns,
+            },
+        );
+        let audit = monitor.audit();
+        assert_eq!(audit.revoked, expected);
+        assert_eq!(audit.compared, 0);
+        assert_eq!(audit.uncomparable_observations, 0);
+        assert_eq!(audit.maximum_margin_ns, 0);
+        assert_eq!(audit.outside_catalog_observations, 0);
+        assert_eq!(
+            audit.outside_support_observations,
+            u64::from(expected.is_none())
+        );
+        if expected.is_none() {
+            assert!(Arc::ptr_eq(&before, &monitor.current_view()));
+            monitor.observe_classified(1, FeedbackObservation::NotSubmitted);
+            assert_eq!(monitor.audit().revoked, Some(Revocation::IdentityOrClock));
+        }
+    }
+}
+
+#[test]
+fn memory_feedback_is_bounded_and_starts_fresh_without_resuming_old_corrections() {
+    let p = policy();
+    let (mut store, mut state) =
+        store::Store::open(&Storage::MemoryOnly, &p, binding(), 1).unwrap();
+    state.compare(&p, 1, comparison(120));
+    state.compare(&p, 1, comparison(120));
+    store.persist(&state).unwrap();
+    assert_eq!(state.margin(&[7; 32]), 25);
+    store.finish(&state).unwrap();
+    assert!(store.persist(&state).is_err());
+    let (_, fresh) = store::Store::open(&Storage::MemoryOnly, &p, binding(), 1).unwrap();
+    assert_eq!(fresh.margin(&[7; 32]), 0);
+    assert_eq!(fresh.compared, 0);
+    let mut tiny = p;
+    tiny.maximum_state_bytes = NonZeroUsize::MIN;
+    assert!(store::Store::open(&Storage::MemoryOnly, &tiny, binding(), 1).is_err());
+}
 
 fn policy() -> SloSelectedFeedbackSettingsV1 {
     SloSelectedFeedbackSettingsV1 {

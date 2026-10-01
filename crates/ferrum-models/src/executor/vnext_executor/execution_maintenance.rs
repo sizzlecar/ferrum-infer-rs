@@ -239,7 +239,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         .map_err(|error| FerrumError::backend(error.to_string()))?;
         match outcome {
-            DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs } => {
+            DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs, .. } => {
                 Ok(Outcome::Recapture {
                     observed: ExecutorAdmissionEpochs::from_capacity(current_epochs),
                     progress: None,

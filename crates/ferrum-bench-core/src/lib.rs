@@ -23,6 +23,7 @@
 //! - CI95 fields are suppressed when `n_repeats < 3` (degenerate).
 
 pub mod arrivals;
+pub mod capacity_search;
 pub mod dataset;
 pub mod decode_isolation;
 pub mod env;
@@ -31,6 +32,7 @@ pub mod jsonl_journal;
 pub mod profile;
 pub mod release_regression;
 pub mod report;
+pub mod required_query_audit;
 pub mod slo;
 pub mod slo_comparison;
 pub mod slo_offline;

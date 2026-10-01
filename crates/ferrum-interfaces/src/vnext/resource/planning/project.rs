@@ -33,6 +33,17 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     ) -> ResourcePlanningAvailability<ResourcePlanningProjection> {
         match self.project_resource_wave_inner(view, state, rows, bucket, budget) {
             Ok(value) => ResourcePlanningAvailability::Known(value),
+            Err(ResourcePlanningUnknown::UnmaterializedCapacity) => {
+                // A first growable claim is insufficient evidence that the
+                // entire wave fits the configured maxima. Classify this cold
+                // failure using the original state and the remaining budget.
+                // Neither result authorizes growth or physical submission.
+                let reason = self
+                    .check_unmaterialized_wave_maximum(view, state, rows, bucket, budget)
+                    .err()
+                    .unwrap_or(ResourcePlanningUnknown::UnmaterializedCapacity);
+                ResourcePlanningAvailability::Unknown(reason)
+            }
             Err(reason) => ResourcePlanningAvailability::Unknown(reason),
         }
     }
@@ -104,9 +115,12 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                         AdmissionPressureAction::WaitForRelease,
                     )
                     .map_err(|_| U::InvalidDemand)?;
-                charge_logical(&mut next, &demand, &mut domains, true)?;
+                charge_logical(view, &mut next, &demand, &mut domains, true)?;
                 let allocated = reserve(&mut next, &requests, view.limits, budget)?;
-                if view.physical_ranges.is_some() {
+                // An advanced token frontier need not grow physical backing.
+                // Preserve the captured immutable range inventory in that case;
+                // only real additional claims can change its extent count.
+                if view.physical_ranges.is_some() && !requests.is_empty() {
                     sequence_ranges::extend(
                         &mut next.sequence_ranges[row.participant_index],
                         &requests,
@@ -173,7 +187,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             )
             .map_err(|_| U::InvalidDemand)?;
         poll(budget)?;
-        charge_logical(&mut next, &step_demand, &mut domains, false)?;
+        charge_logical(view, &mut next, &step_demand, &mut domains, false)?;
         let mut step_slot = None;
         let mut invocation_slot = None;
         let mut physical_proof = view
@@ -185,6 +199,9 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 &mut next,
                 &step_requests,
                 AllocationLifetime::Step,
+                self.dynamic_pools
+                    .lane_stable_layouts
+                    .get(bucket.map(|b| b.bucket_id()), AllocationLifetime::Step),
                 view.limits,
                 budget,
             )?;
@@ -208,12 +225,16 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 AdmissionPressureAction::WaitForRelease,
             )
             .map_err(|_| U::InvalidDemand)?;
-        charge_logical(&mut next, &wave_demand, &mut domains, false)?;
+        charge_logical(view, &mut next, &wave_demand, &mut domains, false)?;
         if bucket.is_some() {
             invocation_slot = workspace::reserve(
                 &mut next,
                 &wave_requests,
                 AllocationLifetime::Invocation,
+                self.dynamic_pools.lane_stable_layouts.get(
+                    bucket.map(|b| b.bucket_id()),
+                    AllocationLifetime::Invocation,
+                ),
                 view.limits,
                 budget,
             )?;
@@ -235,8 +256,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         for (pool_index, segments) in transient.into_iter().rev() {
             poll(budget)?;
             for segment in segments.iter().rev() {
-                next.pools[pool_index]
-                    .allocator
+                Arc::make_mut(&mut next.pools[pool_index].allocator)
                     .release(segment)
                     .map_err(|_| U::InvalidDemand)?;
             }
@@ -264,9 +284,133 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             physical_ranges: physical_proof,
         })
     }
+
+    /// Runs only after a growable logical failure. Stream the exact immutable
+    /// demand formulas again, retaining one request list and one sum per
+    /// captured domain. Successful projections keep the original single-pass
+    /// allocator path and never allocate a whole-wave request inventory.
+    fn check_unmaterialized_wave_maximum(
+        self: &Arc<Self>,
+        view: &ResourcePlanningView,
+        state: &ResourcePlanningState,
+        rows: &[ResourcePlanningRow],
+        bucket_id: Option<&ReusableExecutionBucketId>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<(), ResourcePlanningUnknown> {
+        use ResourcePlanningUnknown as U;
+        poll(budget)?;
+        let binding = TrustedPlanRuntimeBinding {
+            resources: Arc::clone(self),
+        };
+        let mut claims = BTreeMap::new();
+        let mut immediate_tokens = 0_u64;
+        for row in rows {
+            poll(budget)?;
+            let participant = view
+                .participants
+                .get(row.participant_index)
+                .ok_or(U::InvalidInput)?;
+            let end = row
+                .start_token
+                .checked_add(row.token_count)
+                .ok_or(U::InvalidInput)?;
+            if end > participant.maximum_tokens {
+                return Err(U::InvalidInput);
+            }
+            immediate_tokens = immediate_tokens
+                .checked_add(row.token_count)
+                .ok_or(U::InvalidInput)?;
+            let committed = state.covered[row.participant_index];
+            if end > committed.tokens() {
+                let (demand, requests) = binding
+                    .sequence_extension_demand(
+                        committed,
+                        DynamicResourceShape::from_validated(1, end, 0),
+                        AdmissionPressureAction::WaitForRelease,
+                    )
+                    .map_err(|_| U::InvalidDemand)?;
+                if requests.len() > view.limits.maximum_descriptors {
+                    return Err(U::LimitExceeded);
+                }
+                drop(requests);
+                charge_maximum_logical(view, state, &demand, &mut claims, budget)?;
+            }
+        }
+        let shape = DynamicResourceShape::from_validated(
+            u32::try_from(rows.len()).map_err(|_| U::InvalidInput)?,
+            immediate_tokens,
+            0,
+        );
+        let bucket = match bucket_id {
+            Some(id) => {
+                let plan = self
+                    .dynamic_pools
+                    .reusable_execution
+                    .as_ref()
+                    .ok_or(U::InvalidInput)?;
+                if plan.buckets().len() > view.limits.maximum_descriptors {
+                    return Err(U::LimitExceeded);
+                }
+                let mut selected = None;
+                for candidate in plan.buckets() {
+                    poll(budget)?;
+                    if candidate.bucket().bucket_id() == id {
+                        selected = Some(candidate.bucket());
+                        break;
+                    }
+                }
+                Some(selected.ok_or(U::InvalidInput)?)
+            }
+            None => None,
+        };
+        if bucket.is_some() && state.workspace.is_none() {
+            return Err(U::ReusableExecution);
+        }
+        if bucket.is_some_and(|bucket| {
+            !bucket
+                .capacity()
+                .covers(shape.sequences(), shape.tokens(), shape.pages())
+        }) {
+            return Err(U::InvalidInput);
+        }
+        poll(budget)?;
+        let (demand, requests) = binding
+            .scoped_demand(
+                AllocationLifetime::Step,
+                None,
+                shape,
+                shape,
+                bucket,
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .map_err(|_| U::InvalidDemand)?;
+        if requests.len() > view.limits.maximum_descriptors {
+            return Err(U::LimitExceeded);
+        }
+        drop(requests);
+        charge_maximum_logical(view, state, &demand, &mut claims, budget)?;
+        poll(budget)?;
+        let (demand, requests) = binding
+            .submission_wave_demand(
+                shape,
+                shape,
+                bucket,
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .map_err(|_| U::InvalidDemand)?;
+        if requests.len() > view.limits.maximum_descriptors {
+            return Err(U::LimitExceeded);
+        }
+        drop(requests);
+        charge_maximum_logical(view, state, &demand, &mut claims, budget)?;
+        poll(budget)
+    }
 }
 
-fn charge_logical(
+pub(super) fn charge_logical(
+    view: &ResourcePlanningView,
     state: &mut ResourcePlanningState,
     demand: &AdmissionDemand,
     evidence: &mut BTreeMap<CapacityDomainId, ResourcePlanningDomainDemand>,
@@ -278,9 +422,17 @@ fn charge_logical(
             .logical_available
             .get_mut(&entry.domain())
             .ok_or(U::InvalidDemand)?;
-        *available = available
-            .checked_sub(entry.units().get())
-            .ok_or(U::LogicalCapacity)?;
+        *available = match available.checked_sub(entry.units().get()) {
+            Some(remaining) => remaining,
+            None => {
+                let maximum = maximum_logical_available(view, entry.domain(), *available)?;
+                return Err(if entry.units().get() > maximum {
+                    U::LogicalCapacity
+                } else {
+                    U::UnmaterializedCapacity
+                });
+            }
+        };
         let evidence = evidence
             .entry(entry.domain())
             .or_insert(ResourcePlanningDomainDemand {
@@ -296,6 +448,53 @@ fn charge_logical(
         *total = total
             .checked_add(entry.units().get())
             .ok_or(U::InvalidDemand)?;
+    }
+    Ok(())
+}
+
+fn maximum_logical_available(
+    view: &ResourcePlanningView,
+    id: CapacityDomainId,
+    available: u64,
+) -> Result<u64, ResourcePlanningUnknown> {
+    use ResourcePlanningUnknown as U;
+    let domain = view
+        .logical
+        .domains()
+        .iter()
+        .find(|domain| domain.domain() == id)
+        .ok_or(U::InvalidDemand)?;
+    let growth = domain
+        .maximum_total()
+        .get()
+        .checked_sub(domain.total().get())
+        .ok_or(U::InvalidDemand)?;
+    available.checked_add(growth).ok_or(U::InvalidDemand)
+}
+
+fn charge_maximum_logical(
+    view: &ResourcePlanningView,
+    state: &ResourcePlanningState,
+    demand: &AdmissionDemand,
+    claims: &mut BTreeMap<CapacityDomainId, u64>,
+    budget: &mut dyn ResourcePlanningBudget,
+) -> Result<(), ResourcePlanningUnknown> {
+    use ResourcePlanningUnknown as U;
+    for entry in demand.immediate_claim().entries() {
+        poll(budget)?;
+        let available = state
+            .logical_available
+            .get(&entry.domain())
+            .copied()
+            .ok_or(U::InvalidDemand)?;
+        let maximum = maximum_logical_available(view, entry.domain(), available)?;
+        let total = claims.entry(entry.domain()).or_insert(0);
+        *total = total
+            .checked_add(entry.units().get())
+            .ok_or(U::InvalidDemand)?;
+        if *total > maximum {
+            return Err(U::LogicalCapacity);
+        }
     }
     Ok(())
 }
@@ -343,14 +542,15 @@ pub(super) fn reserve(
             .binary_search_by(|pool| pool.id.cmp(request.domain.pool_id()))
             .map_err(|_| U::InvalidDemand)?;
         let pool = &mut state.pools[index];
+        // Even an unsuccessful allocation can update search_probes. Detach
+        // before invoking the original allocator, not only after success.
+        let allocator = Arc::make_mut(&mut pool.allocator);
         let segments = match request.domain.pool.compatibility().profile().view() {
-            DynamicStorageView::Contiguous => pool
-                .allocator
+            DynamicStorageView::Contiguous => allocator
                 .allocate_contiguous(&pool.id, request.capacity_size_bytes)
                 .map(|value| value.map(|segment| vec![segment])),
             DynamicStorageView::PagedRegions { block_bytes } => {
-                pool.allocator
-                    .allocate_paged(&pool.id, request.capacity_size_bytes, block_bytes)
+                allocator.allocate_paged(&pool.id, request.capacity_size_bytes, block_bytes)
             }
         }
         .map_err(|_| U::InvalidDemand)?

@@ -3,6 +3,7 @@ use ferrum_interfaces::vnext::DeferredAction;
 use ferrum_types::ModelId;
 
 mod maintenance;
+mod modeled_hold;
 mod recompute;
 
 fn scheduler() -> ContinuousBatchScheduler {

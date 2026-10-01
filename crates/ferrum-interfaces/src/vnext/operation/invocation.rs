@@ -283,7 +283,7 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreparedOperationResourceSource {
+pub(super) enum PreparedOperationResourceSource {
     PlanStatic { slot_index: usize },
     Dynamic { descriptor_index: usize },
 }
@@ -397,6 +397,18 @@ pub(super) struct PreparedOperationDispatchBinding {
 }
 
 impl PreparedOperationDispatchBinding {
+    /// Classification from this node's immutable, validated plan binding.
+    /// No live address, backing or reusable scope is implied by this lookup.
+    pub(super) fn resource_source(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<PreparedOperationResourceSource> {
+        self.resources
+            .binary_search_by(|resource| resource.resource_id.cmp(resource_id))
+            .ok()
+            .map(|index| self.resources[index].source)
+    }
+
     pub(super) fn prepare(
         resolved: &dyn ExecutablePlanView,
         provider: &OperationProviderDescriptor,
@@ -1142,6 +1154,8 @@ pub struct BatchedOperationInvocation<'a, B> {
     node_identity: &'a BatchOperationNodeIdentity,
     participants: Vec<OperationInvocation<'a, B>>,
     program_binding: Option<ProgramBindingNodeBinding>,
+    observation_template_budget:
+        Option<std::sync::Arc<crate::vnext::DeviceObservationTemplateBudget>>,
 }
 
 impl<'a, B> BatchedOperationInvocation<'a, B> {
@@ -1277,6 +1291,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             node_identity,
             participants,
             program_binding,
+            observation_template_budget: runtime.observation_template_budget(),
         })
     }
 
@@ -1423,6 +1438,20 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     /// Passive numeric work, after this invocation's full resource validation.
     pub fn replay_cost_work(&self) -> Option<crate::vnext::DeviceReplayCostWork> {
         crate::vnext::DeviceReplayCostWork::from_shape(self.work_shape())
+    }
+    pub(super) fn with_cost_observation_demand(
+        mut self,
+        demand: crate::vnext::DeviceCostObservationDemand,
+    ) -> Self {
+        if !demand.is_required() {
+            self.observation_template_budget = None;
+        }
+        self
+    }
+    pub fn observation_template_budget(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::vnext::DeviceObservationTemplateBudget>> {
+        self.observation_template_budget.as_ref()
     }
 
     pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {

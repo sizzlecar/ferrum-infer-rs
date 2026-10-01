@@ -40,6 +40,7 @@ fn declaration(
         installed_policy: [3; 32],
     };
     let scope = StructuredScopeV2 {
+        numerical_family: None,
         owner: owner.clone(),
         coverage: StructuredCoverageV2 {
             pending_eligible_positions: vec![],

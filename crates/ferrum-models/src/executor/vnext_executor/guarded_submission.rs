@@ -239,11 +239,12 @@ impl<R: DeviceRuntime> PreparedWaveSubmissionGuard for ActualPreparedGuard<'_, '
 }
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
-    fn supports_guarded_execution_policy(&self) -> bool {
-        self.runtime.supports_guarded_submission()
+    pub(super) fn supports_guarded_execution_policy(&self) -> bool {
+        self.runtime
+            .supports_guarded_submission_with_timing(self.device_timing_mode())
+            && self.device_timing_mode() == self.configured_device_timing_mode
             && self.checkpoint_capture.is_none()
             && self.diagnostic_fault.is_none()
-            && self.device_timing_mode() == DeviceTimingMode::Off
             && (self
                 .resolved_plan
                 .execution_plan()
@@ -260,13 +261,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     pub(super) fn supports_slo_execution(&self) -> bool {
         self.supports_guarded_execution_policy()
-            && self
+            && (self
                 .resolved_plan
                 .execution_plan()
                 .payload()
                 .memory()
                 .checkpoint_capacity()
                 .is_none()
+                || self.supports_guarded_prefix_maintenance())
             && self.future_cost_policy().is_ok()
     }
 
@@ -327,16 +329,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         if let Some(receipt) = selected.reconciled.lock().take() {
             if let Some(observation) = observation {
-                observation.finish_call(ObservedCallOutcome::NotSubmitted);
+                observation.finish_guard_rollback(&receipt);
             }
             return GuardedDispatchOutcome::NotSubmittedAfterPreparation(receipt);
         }
         if let Some(observation) = observation {
-            observation.finish_call(match &result {
-                Ok(PlanRuntimeBatchDecodeOutcome::Completed(_)) => ObservedCallOutcome::Completed,
-                Ok(PlanRuntimeBatchDecodeOutcome::Deferred(_)) => ObservedCallOutcome::Deferred,
-                Err(_) => ObservedCallOutcome::Failed,
-            });
+            match &result {
+                Ok(PlanRuntimeBatchDecodeOutcome::Completed(_)) => {
+                    observation.finish_call(ObservedCallOutcome::Completed)
+                }
+                Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
+                    observation.finish_capacity_deferred(deferral)
+                }
+                Err(_) => observation.finish_call(ObservedCallOutcome::Failed),
+            }
         }
         let outcome = match result {
             Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {

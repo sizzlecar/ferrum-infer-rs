@@ -52,6 +52,7 @@ fn manifest() -> manifest::Manifest {
     };
     let scope = StructuredScopeV2 {
         owner: owner.clone(),
+        numerical_family: None,
         coverage: StructuredCoverageV2 {
             pending_eligible_positions: vec![],
             authorized_pending_constraints: vec![HostPendingConstraintV2::AnySubset],
@@ -85,7 +86,7 @@ fn manifest() -> manifest::Manifest {
                     rows: vec![row.clone(), row],
                 }],
             },
-            settings: structured::Settings::default(),
+            settings: Default::default(),
             phase_members: [16, 12, 12],
             maximum_offered_waves: NonZeroUsize::new(512).unwrap(),
             maximum_file_bytes: NonZeroU64::new(8 * 1024 * 1024).unwrap(),
@@ -290,4 +291,31 @@ fn structured_v2_warmup_is_hashed_but_never_enters_three_phase_slots() {
     };
     capture.warmup[0].prompts[0] = 1;
     assert!(value.validate().is_err());
+}
+
+#[test]
+fn structured_v2_learned_span_manifest_is_opt_in_and_binds_original_population() {
+    let original = manifest();
+    let old = serde_json::to_value(&original).unwrap();
+    assert!(old["validation_model"]["capture"]["settings"]
+        .get("learned_drift")
+        .is_none());
+    let mut changed = old.clone();
+    changed["validation_model"]["capture"]["settings"]["learned_drift"] = serde_json::json!({
+        "kind":"observed_residual_span_v1","maximum_span_margin_ns":1_000_000
+    });
+    let loaded: manifest::Manifest = serde_json::from_value(changed.clone()).unwrap();
+    loaded.validate().unwrap();
+    let plan = config::cohort_plan(&original, |_, _| Ok(73)).unwrap();
+    assert_ne!(
+        plan.signature(&old).unwrap(),
+        plan.signature(&changed).unwrap()
+    );
+    for field in ["training", "validation", "prompts", "protocol"] {
+        assert_eq!(old[field], changed[field]);
+    }
+    changed["validation_model"]["capture"]["settings"]["learned_drift"]["maximum_span_margin_ns"] =
+        u64::MAX.into();
+    let invalid: manifest::Manifest = serde_json::from_value(changed).unwrap();
+    assert!(invalid.validate().is_err());
 }

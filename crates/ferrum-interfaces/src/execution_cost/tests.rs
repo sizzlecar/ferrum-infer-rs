@@ -1,4 +1,6 @@
 use super::*;
+mod pending;
+mod route_diagnostic;
 
 fn limits(waves: usize, rows: usize) -> CostRecorderLimits {
     CostRecorderLimits {

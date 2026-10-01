@@ -527,3 +527,72 @@ fn planner_phase_shares_default_in_old_config_and_reject_empty_replay_share() {
         assert!(invalid.validate().is_err(), "{search}/{publication}");
     }
 }
+
+#[test]
+fn required_query_observation_default_retains_old_wire_and_rejects_off() {
+    let config = SloConfig::default();
+    let wire = serde_json::to_value(&config).unwrap();
+    assert!(wire.get("required_query_observation").is_none());
+    assert_eq!(serde_json::from_value::<SloConfig>(wire).unwrap(), config);
+    let mut config = configured(SloMode::Observe);
+    config.cost_observation = SloCostObservationConfig::structured_whole_wave_v2();
+    config.required_query_observation = SloRequiredQueryObservationConfig::StructuredRequiredV1 {
+        path: "required.jsonl".into(),
+        limits: Default::default(),
+    };
+    config.validate().unwrap();
+    assert_eq!(
+        serde_json::from_value::<SloConfig>(serde_json::to_value(&config).unwrap()).unwrap(),
+        config
+    );
+    config.mode = SloMode::Off;
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .contains("Observe or Enforce"));
+}
+
+#[test]
+fn uncalibrated_required_query_observation_requires_observe_reference_and_no_profile() {
+    let mut config = configured(SloMode::Observe);
+    config.cost_observation = SloCostObservationConfig::structured_whole_wave_v2();
+    config.cost_profile = None;
+    config.required_query_observation =
+        SloRequiredQueryObservationConfig::StructuredUncalibratedV1 {
+            path: "queries.jsonl".into(),
+            limits: Default::default(),
+        };
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .contains("real prefill reference"));
+    config.prefill_reference = Some(SloPrefillReferenceConfig {
+        artifact_path: "reference.json".into(),
+        expected_protocol_sha256: [1; 32],
+        limits: Default::default(),
+    });
+    config.validate().unwrap();
+    let wire = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        wire["required_query_observation"]["kind"],
+        "structured_uncalibrated_v1"
+    );
+    assert_eq!(serde_json::from_value::<SloConfig>(wire).unwrap(), config);
+    assert_eq!(
+        config.planner.max_planning_us,
+        SloConfig::default().planner.max_planning_us
+    );
+    config.cost_profile = Some("profile.json".into());
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .contains("without a cost_profile"));
+    config.cost_profile = None;
+    config.mode = SloMode::Enforce;
+    assert!(config.validate().unwrap_err().contains("Observe mode"));
+    config.mode = SloMode::Off;
+    assert!(config.validate().is_err());
+    config.mode = SloMode::Observe;
+    config.cost_observation = Default::default();
+    assert!(config.validate().unwrap_err().contains("Structured V2"));
+}

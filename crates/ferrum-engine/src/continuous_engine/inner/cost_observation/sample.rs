@@ -82,8 +82,7 @@ impl EngineCostCall {
             return Err(CostCallRejection::HostUnexpected);
         }
         let now = self
-            .clock
-            .now_ns()
+            .observation_time()
             .filter(|now| *now >= committed_at)
             .ok_or(CostCallRejection::Clock)?;
         let actual_shape = scheduler_shape(shape)?;

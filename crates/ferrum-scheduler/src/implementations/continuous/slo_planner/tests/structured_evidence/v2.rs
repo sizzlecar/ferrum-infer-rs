@@ -342,3 +342,7 @@ fn structured_v2_first_exact_wave_cannot_borrow_a_conditional_forecast() {
     .unwrap()
     .is_some());
 }
+
+mod observation;
+
+mod workload_domain;

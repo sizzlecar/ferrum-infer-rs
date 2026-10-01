@@ -310,7 +310,19 @@ impl ExecutorShape<'_> {
                             .structured_capture()
                             .ok_or(StructuredUnknownV2::MissingEvidence)?
                             .map_err(|_| StructuredUnknownV2::MissingEvidence)?;
-                        StructuredQueryV2::from_future(exact, selected, recipe, forecast)
+                        match self
+                            .engine
+                            .cost_runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.workload_domain())
+                        {
+                            Some(domain) => StructuredQueryV2::from_future_with_domain(
+                                exact, selected, recipe, forecast, domain,
+                            ),
+                            None => {
+                                StructuredQueryV2::from_future(exact, selected, recipe, forecast)
+                            }
+                        }
                     })();
                     let mut entry = RequiredFutureAuditQueryV2 {
                         path_index,

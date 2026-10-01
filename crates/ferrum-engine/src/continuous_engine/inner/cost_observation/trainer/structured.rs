@@ -15,13 +15,14 @@ fn whole_wave_numeric_observation(
     entry: &CostEvidenceEntry,
     accepted_ordinal: u64,
     session: &StructuredCaptureSessionBinding,
+    capture: Option<&CostCalibrationCapture>,
 ) -> Result<StructuredNumericObservationV1, StructuredUnknown> {
     if accepted_ordinal == 0 {
         return Err(StructuredUnknown::WrongSource);
     }
     let stages = match entry {
-        CostEvidenceEntry::Training { stages, .. } => stages.as_deref(),
-        CostEvidenceEntry::StagesOnly { stages, .. } => Some(stages.as_ref()),
+        CostEvidenceEntry::Training { stages, .. } => stages.as_ref(),
+        CostEvidenceEntry::StagesOnly { stages, .. } => Some(stages),
     }
     .ok_or(StructuredUnknown::MissingEvidence)?;
     if stages
@@ -36,13 +37,15 @@ fn whole_wave_numeric_observation(
         .ok_or(StructuredUnknown::MissingEvidence)?
         .as_ref()
         .map_err(|_| StructuredUnknown::MissingEvidence)?;
-    qualified
-        .validate_host_stages(stages)
-        .map_err(|_| StructuredUnknown::InvalidSample)?;
-    // This checks sample/stages identity, real clocks, physical rows, selected
-    // exact binding and the host-settled boundary. A public sample field saying
-    // Completed is not accepted as proof of any of those facts.
-    let actual = host_content::statistical::complete_observation(entry)
+    // Shared only for the exact original capture stages; mutated diagnostics
+    // take the full adapter. Legacy/V1 remains Disabled-only.
+    let actual = match capture {
+        Some(capture) => host_content::statistical::capture_actual(capture, stages, entry),
+        None => host_content::statistical::complete_observation(entry).map(Arc::new),
+    }
+    .map_err(|_| StructuredUnknown::InvalidSample)?;
+    actual
+        .qualified_host_stages
         .map_err(|_| StructuredUnknown::InvalidSample)?;
     if &actual.fingerprint != session.fingerprint() {
         return Err(StructuredUnknown::WrongFingerprint);
@@ -69,7 +72,7 @@ fn whole_wave_numeric_observation(
         ordinal: accepted_ordinal,
         membership: None,
         call_id: actual.call_id,
-        fingerprint: actual.fingerprint,
+        fingerprint: actual.fingerprint.clone(),
         input,
         boundary: actual.boundary,
         outcome: actual.outcome,
@@ -118,7 +121,7 @@ pub(in crate::continuous_engine::inner::cost_observation) fn capture_numeric_obs
         },
         _ => return Err(StructuredUnknown::InvalidSample),
     };
-    whole_wave_numeric_observation(&entry, ordinal, session)
+    whole_wave_numeric_observation(&entry, ordinal, session, Some(capture))
 }
 
 // Tests may inspect conversion failures after deliberately mutating diagnostic
@@ -129,7 +132,7 @@ pub(in crate::continuous_engine::inner::cost_observation) fn inspect_numeric_obs
     accepted_ordinal: u64,
     session: &StructuredCaptureSessionBinding,
 ) -> Result<StructuredNumericObservationV1, StructuredUnknown> {
-    whole_wave_numeric_observation(entry, accepted_ordinal, session)
+    whole_wave_numeric_observation(entry, accepted_ordinal, session, None)
 }
 
 /// Only returns a numerical input for independent discovery. In particular it
@@ -137,15 +140,26 @@ pub(in crate::continuous_engine::inner::cost_observation) fn inspect_numeric_obs
 pub(in crate::continuous_engine) fn structured_discovery_input(
     stages: &Arc<HostStageEvidenceV1>,
 ) -> Result<StructuredInputV1, StructuredUnknown> {
+    discovery_input(stages, None)
+}
+
+pub(in crate::continuous_engine) fn structured_capture_input(
+    capture: &CostCalibrationCapture,
+    stages: &Arc<HostStageEvidenceV1>,
+) -> Result<StructuredInputV1, StructuredUnknown> {
+    discovery_input(stages, Some(capture))
+}
+
+fn discovery_input(
+    stages: &Arc<HostStageEvidenceV1>,
+    capture: Option<&CostCalibrationCapture>,
+) -> Result<StructuredInputV1, StructuredUnknown> {
     let qualified = stages
         .structured_evidence
         .as_ref()
         .ok_or(StructuredUnknown::MissingEvidence)?
         .as_ref()
         .map_err(|_| StructuredUnknown::MissingEvidence)?;
-    qualified
-        .validate_host_stages(stages)
-        .map_err(|_| StructuredUnknown::InvalidSample)?;
     // Composite is the converter's stages-only compatibility tag. It does not
     // claim the legacy sample was rejected, or grant any training authority.
     // All identity, chronology, row and selected-route checks still run against
@@ -154,7 +168,13 @@ pub(in crate::continuous_engine) fn structured_discovery_input(
         stages: Arc::clone(stages),
         legacy_rejection: CostCallRejection::Composite,
     };
-    let actual = host_content::statistical::complete_observation(&entry)
+    let actual = match capture {
+        Some(capture) => host_content::statistical::capture_actual(capture, stages, &entry),
+        None => host_content::statistical::complete_observation(&entry).map(Arc::new),
+    }
+    .map_err(|_| StructuredUnknown::InvalidSample)?;
+    actual
+        .qualified_host_stages
         .map_err(|_| StructuredUnknown::InvalidSample)?;
     if actual.wall_ns != qualified.full_wall_ns() {
         return Err(StructuredUnknown::InvalidSample);

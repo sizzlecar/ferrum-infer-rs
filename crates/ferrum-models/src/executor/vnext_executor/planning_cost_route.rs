@@ -5,9 +5,13 @@ use ferrum_interfaces::execution_cost::*;
 use ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest;
 use std::num::NonZeroU64;
 
+mod checkpoint;
+mod completion_capture;
 mod host_content;
 mod masks;
+mod outputs;
 mod uploads;
+use outputs::ProjectedOutputRole;
 pub(super) use uploads::{
     product_readback_binding, product_token_upload_layout, product_upload_layouts,
 };
@@ -20,6 +24,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         limits: ResourcePlanningLimits,
         budget: &mut dyn ResourcePlanningBudget,
     ) -> ExecutionCostRouteAvailability<ExecutionCostRouteView> {
+        budget.diagnostic_checkpoint("model_capture_begin");
         if let Err(reason) = self.future_cost_policy() {
             return ExecutionCostRouteAvailability::Unknown(reason);
         }
@@ -29,6 +34,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             limits,
             budget,
             |sequences, sessions, budget| {
+                budget.diagnostic_checkpoint("model_capture_registry_ready");
                 let mut frontiers = Vec::new();
                 if frontiers.try_reserve_exact(sequences.len()).is_err() {
                     return ExecutionCostRouteAvailability::Unknown(U::Capacity);
@@ -65,6 +71,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         Ok(snapshot) => snapshot,
                         Err(reason) => return ExecutionCostRouteAvailability::Unknown(reason),
                     };
+                budget.diagnostic_checkpoint("model_capture_mask_ledger_ready");
                 let view = self
                     .plan_resources
                     .execution_cost_route_view(sessions, &frontiers, &self.lane, limits, budget);
@@ -91,7 +98,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     pub(super) fn future_cost_policy(&self) -> std::result::Result<(), U> {
         if self.checkpoint_capture.is_some()
             || self.diagnostic_fault.is_some()
-            || self.device_timing_mode() != DeviceTimingMode::Off
+            || self.device_timing_mode() != self.configured_device_timing_mode
+            || (self.device_timing_mode() != DeviceTimingMode::Off
+                && !self
+                    .runtime
+                    .supports_guarded_submission_with_timing(self.device_timing_mode()))
             || self
                 .resolved_plan
                 .execution_plan()
@@ -141,6 +152,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             {
                 Ok(())
             }
+            DeviceCostGraphCaptureCapability::Supported
+                if self.runtime.cost_direct_graph_replay_operation().is_some()
+                    && view.graph_catalog().is_none()
+                    && view.graph_stream_state().is_some_and(|state| {
+                        state.configuration() == DeviceCostGraphConfiguration::OnDemand
+                    }) =>
+            {
+                // A real action may prepare an on-demand program. This is
+                // still Unknown; the next capture must supply its catalog.
+                Err(U::OnDemandResidentProgram)
+            }
             _ => Err(U::ExecutionPolicy),
         }
     }
@@ -152,6 +174,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         query: &FutureWaveCostQuery<'_>,
         budget: &mut dyn ResourcePlanningBudget,
     ) -> ExecutionCostRouteAvailability<ExecutionCostRouteProjection> {
+        if query
+            .rows
+            .iter()
+            .any(|row| matches!(row.output, FutureCostOutput::ProjectedGreedy { .. }))
+        {
+            return ExecutionCostRouteAvailability::Unknown(U::OutputBranch);
+        }
         match self.project_future_cost_route_inner(view, state, query, budget) {
             Ok(projection) => ExecutionCostRouteAvailability::Known(projection),
             Err(reason) => ExecutionCostRouteAvailability::Unknown(reason),
@@ -165,6 +194,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         query: &FutureWaveCostQuery<'_>,
         budget: &mut dyn ResourcePlanningBudget,
     ) -> std::result::Result<ExecutionCostRouteProjection, U> {
+        budget.diagnostic_checkpoint("model_projection_inputs_begin");
         self.future_cost_policy()?;
         self.future_cost_graph_policy(view)?;
         if view.lane_id() != self.lane.id() {
@@ -215,26 +245,48 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         u64::from(count),
                         u64::from(total_prompt_tokens),
                         if final_logits {
-                            VNextParticipantOutputRole::FinalPrefill
+                            ProjectedOutputRole::FinalPrefill
                         } else {
-                            VNextParticipantOutputRole::IntermediatePrefill
+                            ProjectedOutputRole::IntermediatePrefill
                         },
                     )
                 }
                 (ActualRowWork::Decode { kv_tokens }, FutureCostOutput::Decode { policy }) => {
-                    match policy {
-                        LogitsReturnPolicy::GreedyArgmax {
-                            repetition_penalty: Some(_),
-                            ..
-                        } => return Err(U::OutputBranch),
-                        _ => {}
-                    }
                     let end = u64::from(kv_tokens).checked_add(1).ok_or(U::InvalidInput)?;
                     (
                         u64::from(kv_tokens),
                         1,
                         end,
-                        VNextParticipantOutputRole::Decode(policy.clone()),
+                        ProjectedOutputRole::Decode(policy),
+                    )
+                }
+                (
+                    ActualRowWork::Decode { kv_tokens },
+                    FutureCostOutput::ProjectedGreedy {
+                        token_mask,
+                        repetition,
+                        repetition_penalty,
+                    },
+                ) => {
+                    if repetition.minimum() == 0 && repetition.maximum() != 0 {
+                        return Err(U::OutputBranch);
+                    }
+                    outputs::validate_projected_repetition(
+                        row.host_features,
+                        repetition.maximum(),
+                        repetition_penalty,
+                        self.io.output_elements,
+                        self.io.repetition_capacity,
+                    )?;
+                    (
+                        u64::from(kv_tokens),
+                        1,
+                        u64::from(kv_tokens).checked_add(1).ok_or(U::InvalidInput)?,
+                        ProjectedOutputRole::Greedy {
+                            token_mask,
+                            repetition_tokens: repetition.minimum(),
+                            repetition_penalty,
+                        },
                     )
                 }
                 _ => return Err(U::InvalidInput),
@@ -247,7 +299,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             });
             indices.push(row.participant_index);
         }
-        let output_mode = product_output_mode_for_roles(kind, &roles);
+        let output_mode = outputs::output_mode(kind, &roles);
         let mut mask_contents = Vec::new();
         mask_contents
             .try_reserve_exact(roles.len())
@@ -256,7 +308,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             if !budget.has_budget() {
                 return Err(U::BudgetExhausted);
             }
-            mask_contents.push(masks::requested(
+            mask_contents.push(outputs::mask_content(
                 role,
                 output_mode,
                 self.io.output_elements,
@@ -271,7 +323,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         } else {
             CanonicalWaveCostBuilder::new(0, product)
         };
-        let uploads = uploads::input_uploads(&self.io, &work)?;
+        let uploads = uploads::input_uploads(&self.io, &work, &roles, output_mode)?;
         let readbacks = uploads::readbacks(&self.io, work.len(), output_mode)?;
         let total_tokens = work
             .iter()
@@ -307,6 +359,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &mut canonical,
             budget,
         )?;
+        budget.diagnostic_checkpoint("model_projection_host_rows_begin");
         let mask_uploads = next.last_token_mask_uploads().ok_or(U::OutputBranch)?;
         if mask_uploads.len() != query.rows.len() {
             return Err(U::InvalidInput);
@@ -317,18 +370,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(U::BudgetExhausted);
             }
             let output = match role {
-                VNextParticipantOutputRole::IntermediatePrefill => CostRowOutput::Prefill {
+                ProjectedOutputRole::IntermediatePrefill => CostRowOutput::Prefill {
                     final_logits: false,
                 },
-                VNextParticipantOutputRole::FinalPrefill => {
-                    CostRowOutput::Prefill { final_logits: true }
-                }
-                VNextParticipantOutputRole::Decode(policy) => {
-                    let repetition = product_repetition_input(Some(policy), output_mode);
+                ProjectedOutputRole::FinalPrefill => CostRowOutput::Prefill { final_logits: true },
+                ProjectedOutputRole::Decode(_) | ProjectedOutputRole::Greedy { .. } => {
+                    let (repetition_tokens, repetition_penalty) = role.repetition(output_mode);
                     CostRowOutput::Decode {
-                        requires_full_logits: policy.requires_full_logits(),
-                        repetition_tokens: repetition.token_ids.len() as u64,
-                        repetition_penalty_bits: repetition.penalty.to_bits(),
+                        requires_full_logits: role.requires_full_logits(),
+                        repetition_tokens,
+                        repetition_penalty_bits: repetition_penalty.to_bits(),
                     }
                 }
             };
@@ -347,6 +398,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .fixed_bytes_per_sequence
             .checked_mul(query.rows.len() as u64)
             .ok_or(U::Capacity)?;
+        budget.diagnostic_checkpoint("model_projection_canonical_begin");
         let shape = canonical
             .finish_with_captured_structure(
                 query.kind,
@@ -356,6 +408,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 recurrent,
             )
             .map_err(|_| U::InvalidInput)?;
+        budget.diagnostic_checkpoint("model_projection_canonical_complete");
         #[cfg(test)]
         if let Err(reason) = &shape.statistical {
             eprintln!(

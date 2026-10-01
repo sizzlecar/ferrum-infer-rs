@@ -5,6 +5,7 @@ use super::*;
 /// neither owns resources nor changes the request's original latency clocks.
 #[derive(Debug)]
 pub(in crate::continuous_engine) struct SequenceTimeAdmission {
+    pub(super) acceptance: Option<super::strict::StrictAcceptance>,
     pub(in crate::continuous_engine::inner::slo_controller) recovery_service: RecoveryServiceDebt,
     pub(in crate::continuous_engine::inner::slo_controller) recovery_seen: bool,
     pub(super) ingress: Instant,
@@ -27,8 +28,8 @@ pub(super) enum TimeAdmissionAssessmentKind {
     /// without a time promise, under the completion-first physical protocol.
     OverdueCompletion,
     AlreadyImpossible,
-    /// This first slice evaluates already accepted owners; it cannot apply a
-    /// before-acceptance rejection to them, even under RequireSlo.
+    RejectedBeforeAcceptance,
+    /// An accepted owner can never acquire a before-acceptance rejection.
     InvalidAcceptanceBoundary,
 }
 
@@ -52,7 +53,7 @@ pub(super) struct StartedTimeWitness {
 
 /// Retained with the actual guarded flight. Its private constructor can only
 /// follow a successful time assessment against the complete live snapshot.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(in crate::continuous_engine::inner::slo_controller) struct PendingTimeWitness {
     pub request_id: RequestId,
     pub owner: Arc<()>,
@@ -64,9 +65,33 @@ pub(in crate::continuous_engine::inner::slo_controller) struct PendingTimeWitnes
 }
 
 impl SequenceTimeAdmission {
+    pub(in crate::continuous_engine::inner) fn has_current_time_witness(
+        &self,
+        now: Instant,
+    ) -> bool {
+        self.before_acceptance()
+            || self
+                .started
+                .is_some_and(|witness| witness.validated_through > now)
+    }
+    /// Once transport acceptance succeeds this stays false through recompute,
+    /// expired forecasts and cost-model loss.
+    pub(in crate::continuous_engine) fn before_acceptance(&self) -> bool {
+        self.acceptance.is_some()
+    }
+
     #[cfg(test)]
     pub(in crate::continuous_engine::inner::slo_controller) fn has_started_witness(&self) -> bool {
         self.started.is_some()
+    }
+
+    #[cfg(test)]
+    pub(in crate::continuous_engine::inner::slo_controller) fn assert_no_time_admission_work(
+        &self,
+    ) {
+        assert!(self.last_assessment.is_none());
+        assert!(self.started.is_none());
+        assert!(self.deferred.is_none());
     }
 
     pub(in crate::continuous_engine) fn record_recovery_progress(&mut self) {
@@ -92,6 +117,7 @@ impl TimeAdmissionAssessmentKind {
             Self::Deferred(_) => "deferred_time_promise",
             Self::OverdueCompletion => "overdue_completion",
             Self::AlreadyImpossible => "best_effort",
+            Self::RejectedBeforeAcceptance => "rejected_before_acceptance",
             Self::InvalidAcceptanceBoundary => "invalid_acceptance_boundary",
         }
     }
@@ -113,6 +139,7 @@ impl EngineInner {
             return;
         };
         sequence.time_admission = Some(SequenceTimeAdmission {
+            acceptance: None,
             recovery_service: RecoveryServiceDebt::new(
                 self.config.scheduler.slo.admission.max_active_requests,
             ),
@@ -125,7 +152,9 @@ impl EngineInner {
             activated: false,
             deferred: None,
         });
-        counter!("ferrum.engine.slo_time_admission_accepted_untimed_total").increment(1);
+        if !self.requires_strict_acceptance() {
+            counter!("ferrum.engine.slo_time_admission_accepted_untimed_total").increment(1);
+        }
     }
 
     /// Called only for an actual Submitted outcome, before host commit mutates

@@ -442,7 +442,10 @@ impl EngineInner {
         Ok(())
     }
 
-    async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
+    pub(in crate::continuous_engine) async fn cancel_abandoned_request(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<()> {
         self.discard_pending_prefix_restore(request_id);
         let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
         let (completion_resources, terminal_token_trace, slo_observation) = {
@@ -649,6 +652,17 @@ impl EngineInner {
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
     ) -> Result<()> {
+        if self
+            .reject_strict_pending(
+                request_id,
+                explicit_terminal_error.clone().unwrap_or_else(|| {
+                    FerrumError::cancelled("request ended before strict time acceptance")
+                }),
+            )
+            .await?
+        {
+            return Ok(());
+        }
         if self
             .sequences
             .read()

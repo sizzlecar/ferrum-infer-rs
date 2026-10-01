@@ -14,6 +14,7 @@ const MEASURED: usize = 64;
 enum Mode {
     Correctness,
     ReleaseScreen,
+    ReleaseReplayScreen,
 }
 impl Mode {
     fn warmup(self) -> usize {
@@ -40,6 +41,8 @@ impl Mode {
     fn label(self) -> &'static str {
         if self == Self::Correctness {
             "correctness_only_1s_no_performance_claim"
+        } else if self == Self::ReleaseReplayScreen {
+            "capture_and_independent_reprojection_original_2ms"
         } else {
             "release_screen_original_2ms"
         }
@@ -52,6 +55,7 @@ struct Attempt {
     warmup: bool,
     capture_ns: u64,
     project_ns: Option<u64>,
+    replay_ns: Option<u64>,
     total_ns: u64,
     capture_polls: u64,
     project_polls: u64,
@@ -59,6 +63,33 @@ struct Attempt {
     deadline_live_at_end: bool,
     semantic_sha256: Option<String>,
     evidence_diagnostic: serde_json::Value,
+    checkpoints: Vec<(&'static str, u64)>,
+    checkpoints_truncated: bool,
+}
+
+struct DiagnosticBudget {
+    began: Instant,
+    deadline: Instant,
+    polls: u64,
+    checkpoints: Vec<(&'static str, u64)>,
+    truncated: bool,
+}
+impl ResourcePlanningBudget for DiagnosticBudget {
+    fn has_budget(&mut self) -> bool {
+        self.polls += 1;
+        let now = Instant::now();
+        now >= self.began && now < self.deadline
+    }
+    fn diagnostic_checkpoint(&mut self, stage: &'static str) {
+        // Preallocated, passive and bounded. No formatting or IO occurs in
+        // the measured projection; the complete record is printed afterwards.
+        if self.checkpoints.len() < self.checkpoints.capacity() {
+            self.checkpoints
+                .push((stage, elapsed_ns(self.began, Instant::now())));
+        } else {
+            self.truncated = true;
+        }
+    }
 }
 
 fn elapsed_ns(start: Instant, end: Instant) -> u64 {
@@ -126,24 +157,27 @@ fn attempt(
     allowance: Duration,
     mode: Mode,
 ) -> (Attempt, Option<ExecutionCostRouteProjection>) {
+    let checkpoints = Vec::with_capacity(128);
     let started = Instant::now();
     let deadline = started.checked_add(allowance).unwrap();
-    let polls = std::cell::Cell::new(0_u64);
-    let mut poll = || {
-        polls.set(polls.get() + 1);
-        let now = Instant::now();
-        now >= started && now < deadline
+    let mut poll = DiagnosticBudget {
+        began: started,
+        deadline,
+        polls: 0,
+        checkpoints,
+        truncated: false,
     };
     // EVERY attempt captures actual current lane/registry/resources. One
-    // unchanged deadline includes capture, initial_state, and projection.
+    // unchanged deadline includes capture, initial_state, projection, and,
+    // in the large-graph screen, one independent projection from fresh state.
     let captured = fixture.executor.execution_cost_route_view(
         black_box(requests),
         ResourcePlanningLimits::default(),
         &mut poll,
     );
     let captured_at = Instant::now();
-    let capture_polls = polls.get();
-    let (result, project_ns, stage, ended) = match captured {
+    let capture_polls = poll.polls;
+    let (result, project_ns, replay, replay_ns, stage, ended) = match captured {
         ExecutionCostRouteAvailability::Known(view) => {
             let view = view.with_structured_capture(true);
             let begin = Instant::now();
@@ -154,11 +188,42 @@ fn attempt(
                 black_box(query),
                 &mut poll,
             ));
-            let ended = Instant::now();
-            (result, Some(elapsed_ns(begin, ended)), "project", ended)
+            let projected_at = Instant::now();
+            if mode == Mode::ReleaseReplayScreen
+                && matches!(&result, ExecutionCostRouteAvailability::Known(_))
+            {
+                let replay_began = Instant::now();
+                let fresh = view.initial_state();
+                let replay = black_box(fixture.executor.project_execution_cost_wave(
+                    black_box(&view),
+                    black_box(&fresh),
+                    black_box(query),
+                    &mut poll,
+                ));
+                let ended = Instant::now();
+                (
+                    result,
+                    Some(elapsed_ns(begin, projected_at)),
+                    Some(replay),
+                    Some(elapsed_ns(replay_began, ended)),
+                    "project",
+                    ended,
+                )
+            } else {
+                (
+                    result,
+                    Some(elapsed_ns(begin, projected_at)),
+                    None,
+                    None,
+                    "project",
+                    projected_at,
+                )
+            }
         }
         ExecutionCostRouteAvailability::Unknown(reason) => (
             ExecutionCostRouteAvailability::Unknown(reason),
+            None,
+            None,
             None,
             "capture",
             captured_at,
@@ -170,6 +235,27 @@ fn attempt(
         }
         ExecutionCostRouteAvailability::Unknown(reason) => (format!("{stage}:{reason:?}"), None),
     };
+    if let Some(replay) = replay {
+        match (projection.as_ref(), replay) {
+            (Some(first), ExecutionCostRouteAvailability::Known(replayed)) => {
+                // Equality checks are outside the measured interval. The
+                // replay uses the captured state, never the first successor.
+                if first.shape != replayed.shape
+                    || first.statistical_evidence != replayed.statistical_evidence
+                    || !matches!(
+                        first.state.same_future_state(&replayed.state, &mut || true),
+                        Ok(true)
+                    )
+                {
+                    status = "independent_reprojection_mismatch".into();
+                }
+            }
+            (_, ExecutionCostRouteAvailability::Unknown(reason)) => {
+                status = format!("replay:{reason:?}");
+            }
+            (None, _) => unreachable!("reprojection follows a known first projection"),
+        }
+    }
     let digest = projection.as_ref().map(semantic).transpose();
     let semantic_sha256 = match digest {
         Ok(value) => value,
@@ -183,9 +269,10 @@ fn attempt(
         warmup: ordinal < mode.warmup(),
         capture_ns: elapsed_ns(started, captured_at),
         project_ns,
+        replay_ns,
         total_ns: elapsed_ns(started, ended),
         capture_polls,
-        project_polls: polls.get() - capture_polls,
+        project_polls: poll.polls - capture_polls,
         status,
         deadline_live_at_end: ended >= started && ended < deadline,
         // Hashing and semantic checks are outside the elapsed interval.
@@ -194,6 +281,8 @@ fn attempt(
             .as_ref()
             .map(evidence_diagnostic)
             .unwrap_or(serde_json::Value::Null),
+        checkpoints: poll.checkpoints,
+        checkpoints_truncated: poll.truncated,
     };
     let complete = report.status == "Known";
     (report, projection.filter(|_| complete))
@@ -390,8 +479,9 @@ fn measure(
         "deadline_overruns":measured.iter().filter(|r| !r.deadline_live_at_end).count(),
         "all_attempt_total_ns":distribution(measured.iter().map(|r| r.total_ns).collect()),
         "entered_projection_ns":distribution(measured.iter().filter_map(|r| r.project_ns).collect()),
+        "entered_replay_ns":distribution(measured.iter().filter_map(|r| r.replay_ns).collect()),
         "capture_ns":distribution(measured.iter().map(|r| r.capture_ns).collect()),
-        "comparison_eligible":eligible && mode == Mode::ReleaseScreen, "correctness_eligible":eligible, "resources_unchanged":unchanged,
+        "comparison_eligible":eligible && mode != Mode::Correctness, "correctness_eligible":eligible, "resources_unchanged":unchanged,
     });
     println!(
         "FUTURE_CPU_SCREEN {}",
@@ -399,7 +489,9 @@ fn measure(
             "schema_version":2,"case":case,"mode":mode.label(),"rows":query_rows.len(),
             "nodes":plan.nodes().len(),"dynamic_descriptors":plan.memory().dynamic_descriptors().len(),
             "warmup":mode.warmup(),"measured":mode.measured(),"budget_ns":allowance.as_nanos(),
-            "capture_and_projection_share_deadline":true,"boundaries":boundaries,
+            "capture_and_projection_share_deadline":true,
+            "independent_reprojection_shares_deadline":mode == Mode::ReleaseReplayScreen,
+            "boundaries":boundaries,
             "attempts":reports,"semantic_sha256":expected_digest,"summary":summary,
             "limitation":"CPU wall for tiny real Metal Qwen eager projection; no GPU/9B/SLO inference",
         })
@@ -446,12 +538,17 @@ fn probe(ids: &[&RequestId], generated: u64) -> Probe {
 }
 
 fn verify_actual(
-    probe: &Probe,
+    probe: &mut Probe,
     projection: &Option<ExecutionCostRouteProjection>,
     case: &str,
 ) -> bool {
+    let pending_before_consume = probe.recorder.has_pending_projection();
+    // Consumer work follows actual completion and is outside CPU projection
+    // timing. Use the original frozen native attribution, never prediction.
+    let resolution = probe.recorder.resolve_pending();
     let observations = probe.recorder.observations();
     let result = (|| -> std::result::Result<(), String> {
+        resolution.map_err(|reason| format!("actual_projection_resolution:{reason:?}"))?;
         let projection = projection.as_ref().ok_or("no_complete_prediction")?;
         if observations.len() != 1 {
             return Err(format!("actual_wave_count:{}", observations.len()));
@@ -555,7 +652,9 @@ fn verify_actual(
         "FUTURE_CPU_ACTUAL {}",
         serde_json::json!({"case":case,"parity_verified":result.is_ok(),
         "observed_waves":observations.len(),"diagnostic":result.as_ref().err(),
-        "actual_statistics_present":observations.first().and_then(|w|w.shape.as_ref()).is_some_and(|s|s.statistical_evidence.is_some())})
+        "actual_statistics_present":observations.first().and_then(|w|w.shape.as_ref()).is_some_and(|s|s.statistical_evidence.is_some()),
+        "pending_before_consume":pending_before_consume,
+        "shape_unknown":observations.first().and_then(|w|w.shape_unknown).map(|reason|format!("{reason:?}"))})
     );
     result.is_ok()
 }
@@ -564,19 +663,31 @@ fn verify_actual(
 #[ignore = "real Metal correctness only, explicit 1s read budget, no performance result"]
 async fn future_metal_product_projection_cpu_correctness() {
     assert!(
-        run(Mode::Correctness).await,
+        run(Mode::Correctness, &weights::TWO_LAYERS).await,
         "see all retained cell/attempt diagnostics"
     );
 }
 #[tokio::test]
 #[ignore = "same-host paired release CPU diagnostic; real Metal fixture"]
 async fn future_metal_product_projection_cpu_screen() {
-    run(Mode::ReleaseScreen).await;
+    run(Mode::ReleaseScreen, &weights::TWO_LAYERS).await;
 }
-async fn run(mode: Mode) -> bool {
+
+/// Exercise graph traversal at 32 actual compiled transformer layers while
+/// retaining tiny deterministic tensors. This is a CPU projection diagnostic,
+/// not Qwen3.5-9B numerical or serving performance evidence.
+#[tokio::test]
+#[ignore = "32-layer Metal graph CPU diagnostic; exclusive local GPU for parity execution"]
+async fn future_metal_model_scale_projection_cpu_screen() {
+    use weights::LayerKind::{Full, Linear};
+    let layers = [Linear, Linear, Linear, Full].repeat(8);
+    run(Mode::ReleaseReplayScreen, &layers).await;
+}
+
+async fn run(mode: Mode, layers: &[weights::LayerKind]) -> bool {
     let mut complete = true;
     for width in [1, 4] {
-        let fixture = Fixture::with_structured_capture(32).await;
+        let fixture = Fixture::with_structured_layer_stack(32, layers).await;
         let prefills: Vec<_> = (0..width)
             .map(|i| {
                 let tokens: Vec<_> = (0..i + 1).map(|j| ((j + i) % 3) as u32).collect();
@@ -594,7 +705,7 @@ async fn run(mode: Mode) -> bool {
         }
         let ids: Vec<_> = prefills.iter().map(|p| &p.request_id).collect();
         let mut prefill_probe = probe(&ids, 0);
-        let case = format!("prefill_full_b{width}");
+        let case = format!("layers{}_prefill_full_b{width}", layers.len());
         let (predicted, eligible) = measure(&fixture, &prefills, &[], &prefill_probe, &case, mode);
         let outputs = match executed(
             fixture
@@ -608,7 +719,7 @@ async fn run(mode: Mode) -> bool {
             PlanRuntimeBatchPrefillOutcome::Completed(outputs) => outputs,
             _ => panic!("real prefill did not complete"),
         };
-        complete &= verify_actual(&prefill_probe, &predicted, &case) && eligible;
+        complete &= verify_actual(&mut prefill_probe, &predicted, &case) && eligible;
         let mut decodes: Vec<_> = prefills
             .iter()
             .zip(outputs)
@@ -628,7 +739,7 @@ async fn run(mode: Mode) -> bool {
         for (step, label) in ["cold_mask", "resident_mask"].into_iter().enumerate() {
             let ids: Vec<_> = decodes.iter().map(|p| &p.request_id).collect();
             let mut decode_probe = probe(&ids, 1 + step as u64);
-            let case = format!("decode_{label}_b{width}");
+            let case = format!("layers{}_decode_{label}_b{width}", layers.len());
             let (predicted, eligible) =
                 measure(&fixture, &[], &decodes, &decode_probe, &case, mode);
             let outputs = decode_outputs(executed(
@@ -640,7 +751,7 @@ async fn run(mode: Mode) -> bool {
                     )
                     .await,
             ));
-            complete &= verify_actual(&decode_probe, &predicted, &case) && eligible;
+            complete &= verify_actual(&mut decode_probe, &predicted, &case) && eligible;
             for (input, output) in decodes.iter_mut().zip(outputs) {
                 input.kv_cache = Arc::clone(&output.kv_cache);
             }
@@ -652,7 +763,7 @@ async fn run(mode: Mode) -> bool {
     println!(
         "FUTURE_CPU_PROTOCOL {}",
         serde_json::json!({"revision":2,"mode":mode.label(),
-        "complete":complete,"performance_result":mode==Mode::ReleaseScreen,"budget_ns":mode.allowance().as_nanos()})
+        "complete":complete,"performance_result":mode!=Mode::Correctness && complete,"budget_ns":mode.allowance().as_nanos()})
     );
     complete
 }

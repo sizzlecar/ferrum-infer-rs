@@ -188,6 +188,9 @@ impl ExpectedWaveWork {
 /// time witness. This does not authorize abandoning physical or output limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionOnlyReason {
+    /// Explicit deadline ordering using trusted ingress/commit times; no
+    /// learned duration or predicted feasibility is asserted.
+    DeadlinePolicy,
     CostUnavailable,
     WitnessExpired,
     SearchInconclusive,

@@ -79,6 +79,30 @@ fn projections(shape: AttentionShape, tokens: u64) -> (Vec<LinearLaunch>, Linear
         make(shape.hidden_size, shape.value_features, shape.hidden_size),
     )
 }
+
+#[test]
+fn prepared_gdn_classes_keep_layout_identity_and_exclude_current_token_extent() {
+    let mut p = shape().params(1).unwrap();
+    let prepared = PreparedKernelClasses::new(&p).unwrap();
+    for tokens in [1, 8, 257] {
+        p.tokens = tokens;
+        assert!(prepared.matches(&p));
+        for (entry, threads) in [
+            (PREPARE_CONV_KERNEL, THREADS_PER_GROUP),
+            (DELTA_KERNEL, THREADS_PER_GROUP),
+            (SIMD_DELTA_KERNEL, SIMD_DELTA_THREADS),
+        ] {
+            assert_eq!(
+                prepared.get(entry, threads),
+                classes::fresh(entry, &p, threads)
+            );
+            assert!(prepared.get(entry, threads + 1).is_none());
+        }
+    }
+    p.key_dim *= 2;
+    assert!(!prepared.matches(&p));
+    assert!(prepared.get("unknown.entry", THREADS_PER_GROUP).is_none());
+}
 #[test]
 fn recurrent_gdn_selected_chain_preserves_packed_order_work_and_unknown_boundary() {
     let device = Device::system_default().expect("actual Metal GDN PSO catalog");
@@ -116,6 +140,121 @@ fn recurrent_gdn_selected_chain_preserves_packed_order_work_and_unknown_boundary
         staged: false,
     };
     let scratch = ScratchLayout::new(s, 4).unwrap().required_bytes;
+    let classes = PreparedKernelClasses::new(&s.params(1).unwrap()).unwrap();
+    let linear_classes = super::super::cost_route::PreparedLinearProjectionClasses::new(
+        s,
+        &[dense(s.qkvzba_features, s.hidden_size)],
+        dense(s.hidden_size, s.value_features),
+    )
+    .unwrap();
+    for packed in [None, Some(packed)] {
+        let expected = evidence(
+            &a,
+            &l,
+            &p,
+            ElementType::F32,
+            4,
+            scratch,
+            packed,
+            rows.into_iter(),
+        )
+        .unwrap();
+        let prepared = evidence_with_classes(
+            &a,
+            &l,
+            &p,
+            ElementType::F32,
+            4,
+            scratch,
+            packed,
+            rows.into_iter(),
+            Some(&classes),
+        )
+        .unwrap();
+        assert_eq!(prepared, expected);
+        assert_eq!(prepared.algorithm_work(), expected.algorithm_work());
+        let compiled_linear = evidence_with_prepared_classes(
+            &a,
+            &l,
+            &p,
+            ElementType::F32,
+            4,
+            scratch,
+            packed,
+            rows.into_iter(),
+            Some(&classes),
+            Some(&linear_classes),
+        )
+        .unwrap();
+        assert_eq!(compiled_linear, expected);
+        assert_eq!(compiled_linear.algorithm_work(), expected.algorithm_work());
+        let mut wrong = rows;
+        wrong[0].projection.params.epsilon = 2e-6;
+        assert!(evidence_with_classes(
+            &a,
+            &l,
+            &p,
+            ElementType::F32,
+            4,
+            scratch,
+            packed,
+            wrong.into_iter(),
+            Some(&classes),
+        )
+        .is_none());
+        let template = observation(
+            &a,
+            &l,
+            &p,
+            ElementType::F32,
+            4,
+            scratch,
+            packed,
+            rows.into_iter(),
+        )
+        .unwrap();
+        let actual = template
+            .project(&ferrum_interfaces::vnext::FrozenObservationInput::command(
+                4,
+            ))
+            .unwrap();
+        let dispatches = match packed {
+            Some(v) => {
+                5 + v.input.iter().map(|l| l.dispatch_count()).sum::<u64>()
+                    + v.output.dispatch_count()
+                    + 4 * rows.len() as u64
+            }
+            None => rows
+                .iter()
+                .map(|r| {
+                    9 + r
+                        .projection
+                        .input
+                        .iter()
+                        .map(|l| l.dispatch_count())
+                        .sum::<u64>()
+                        + r.projection.output.dispatch_count()
+                })
+                .sum(),
+        };
+        assert!(
+            template.retained_payload_bytes().unwrap()
+                <= observation_payload_upper(dispatches, rows.len()).unwrap()
+        );
+        assert_eq!(actual, vec![Some(expected)]);
+        let bytes = actual[0]
+            .as_ref()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+            + std::mem::size_of_val(&actual[0]);
+        assert!(bytes <= template.projection_retained_bytes_upper_bound().unwrap());
+        assert!(template
+            .project(&ferrum_interfaces::vnext::FrozenObservationInput::command(
+                5
+            ))
+            .is_err());
+    }
     let packed_e = evidence(
         &a,
         &l,

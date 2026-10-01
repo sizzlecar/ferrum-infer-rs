@@ -1,7 +1,8 @@
 //! Passive, GPU-free evidence for an executor's actual physical waves.
 //!
 //! This is observation, not resource or execution authority. All timestamps in
-//! one recorder use the caller's single monotonic clock; no epoch is persisted.
+//! one recorder use the caller's single monotonic clock. Cross-process reuse
+//! additionally requires an explicit, freshly matched OS clock domain.
 //! Recorders never perform I/O, serialize, or change an execution decision.
 //! The separate submission-guard contract validates this evidence at an actual
 //! commit boundary; the evidence itself still grants no resource authority.
@@ -10,10 +11,20 @@ use std::{num::NonZeroU64, sync::Arc};
 
 use ferrum_types::RequestId;
 
+mod domain;
+pub use domain::*;
+mod monotonic_domain;
+pub use monotonic_domain::*;
 mod recorder;
 pub use recorder::*;
+mod pending;
+pub use pending::*;
+mod route_population;
+pub use route_population::*;
 mod context;
 pub use context::*;
+mod no_submission;
+pub use no_submission::*;
 mod statistical;
 pub use statistical::*;
 mod canonical;

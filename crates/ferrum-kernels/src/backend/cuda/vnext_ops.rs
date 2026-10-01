@@ -956,6 +956,20 @@ pub fn cuda_native_operator_catalog_input(
     cuda_native_operator_catalog_input_from_composition(composition)
 }
 
+// These explicit callers use only current token-prefix values, immutable weights,
+// and invocation-local scratch. They have no durable state or suffix lookahead.
+// This does not declare support for another selected operation or state provider.
+fn stateless_token_prefix_checkpoint() -> ProviderCheckpointCapability {
+    ProviderCheckpointCapability::CompletedBoundary(
+        ProviderCheckpointContract::new(
+            CheckpointInputDependency::ExactTokenPrefix,
+            CheckpointBoundaryConstraint::any_positive(),
+            CheckpointPartitionNumerics::CapturedExecutionContinuation,
+        )
+        .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+    )
+}
+
 pub struct CudaTokenEmbeddingProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
@@ -1170,7 +1184,8 @@ impl CudaLastTokenDenseLinearProvider {
         };
         let contract = contract.map_err(contract_error)?;
         let descriptor =
-            native_io::descriptor(runtime, &contract, provider, capability, estimator)?;
+            native_io::descriptor(runtime, &contract, provider, capability, estimator)?
+                .with_checkpoint_capability(stateless_token_prefix_checkpoint());
         Ok(Self {
             descriptor,
             native: native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
@@ -1304,7 +1319,8 @@ impl CudaLastTokenMaskedArgmaxProvider {
                 crate::ptx::ARGMAX_ROWS.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
-        )?;
+        )?
+        .with_checkpoint_capability(stateless_token_prefix_checkpoint());
         let functions = ArgmaxFunctions::load(runtime.context(), precision)?;
         Ok(Self {
             descriptor,
@@ -1989,7 +2005,8 @@ fn encode_token_embedding(
         participants: participant_count,
         tokens: token_count,
     } = embedding::prepare_dense(&invocation)?;
-    let selected = embedding::selected_dense(
+    let observation_recipe = CudaReplayCostRecipe::dense_embedding(
+        &invocation,
         launches.iter().map(|l| {
             (
                 u64::from(l.vocabulary_size),
@@ -1997,7 +2014,6 @@ fn encode_token_embedding(
                 l.token_count,
             )
         }),
-        token_count,
         structured_capture,
     );
     let compute_dispatch_count = launches
@@ -2078,7 +2094,7 @@ fn encode_token_embedding(
             0,
         )
     })
-    .map(|command| command.with_statistical_evidence(selected))
+    .map(|command| command.with_replay_cost_recipe(observation_recipe))
     .map_err(|error| error.to_string())
 }
 

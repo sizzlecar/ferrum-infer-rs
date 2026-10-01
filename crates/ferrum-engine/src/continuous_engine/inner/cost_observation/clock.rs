@@ -1,28 +1,52 @@
 use super::*;
+use ferrum_interfaces::execution_cost::CostMonotonicDomainV1;
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
 
+mod system;
+
 /// Independent cost clock. It never changes request ingress or the SLO clock.
 pub(in crate::continuous_engine) struct EngineCostClock {
-    epoch: Instant,
+    source: ClockSource,
+}
+enum ClockSource {
+    SameBoot(system::SystemCostClock),
+    ProcessLocal(Instant),
 }
 impl Default for EngineCostClock {
     fn default() -> Self {
-        Self {
-            epoch: Instant::now(),
-        }
+        Self::from_system(system::SystemCostClock::capture())
     }
 }
 impl EngineCostClock {
-    pub fn at_ns(&self, instant: Instant) -> Option<u64> {
-        u64::try_from(instant.checked_duration_since(self.epoch)?.as_nanos()).ok()
+    fn from_system(system: Option<system::SystemCostClock>) -> Self {
+        Self {
+            source: match system {
+                Some(clock) => ClockSource::SameBoot(clock),
+                None => ClockSource::ProcessLocal(Instant::now()),
+            },
+        }
     }
+}
+fn process_ns_at(epoch: Instant, instant: Instant) -> Option<u64> {
+    u64::try_from(instant.checked_duration_since(epoch)?.as_nanos()).ok()
 }
 impl CostObservationClock for EngineCostClock {
     fn now_ns(&self) -> Option<u64> {
-        self.at_ns(Instant::now())
+        match &self.source {
+            // A failed OS read cannot switch origin to the process-local
+            // fallback: all existing observations use the selected clock.
+            ClockSource::SameBoot(clock) => clock.now_ns(),
+            ClockSource::ProcessLocal(epoch) => process_ns_at(*epoch, Instant::now()),
+        }
+    }
+    fn monotonic_domain(&self) -> Option<&CostMonotonicDomainV1> {
+        match &self.source {
+            ClockSource::SameBoot(clock) => Some(clock.domain()),
+            ClockSource::ProcessLocal(_) => None,
+        }
     }
 }
 
@@ -88,13 +112,23 @@ mod tests {
     #[test]
     fn clock_rejects_pre_epoch_ingress_instead_of_resetting_it() {
         let epoch = Instant::now();
-        let clock = EngineCostClock { epoch };
-        assert_eq!(clock.at_ns(epoch), Some(0));
+        assert_eq!(process_ns_at(epoch, epoch), Some(0));
         assert_eq!(
-            clock.at_ns(epoch.checked_sub(Duration::from_nanos(1)).unwrap()),
+            process_ns_at(epoch, epoch.checked_sub(Duration::from_nanos(1)).unwrap()),
             None
         );
-        assert_eq!(clock.at_ns(epoch + Duration::from_nanos(7)), Some(7));
+        assert_eq!(
+            process_ns_at(epoch, epoch + Duration::from_nanos(7)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn unavailable_system_identity_preserves_local_clock_without_reuse_domain() {
+        let clock = EngineCostClock::from_system(None);
+        assert!(clock.monotonic_domain().is_none());
+        let first = clock.now_ns().unwrap();
+        assert!(clock.now_ns().unwrap() >= first);
     }
 
     #[test]

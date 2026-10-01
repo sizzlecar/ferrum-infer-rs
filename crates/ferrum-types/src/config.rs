@@ -221,6 +221,18 @@ pub struct RuntimeKnobs {
 }
 
 impl RuntimeKnobs {
+    /// Validate the observation policy before constructing any execution journal.
+    pub fn validate_profile_observation(&self) -> std::result::Result<(), String> {
+        if self.profile_detail == ObservabilityProfileDetail::Host
+            && (self.profile_jsonl.is_some()
+                || self.scheduler_trace_jsonl.is_some()
+                || self.legacy_scheduler_trace_jsonl.is_some())
+        {
+            return Err("host profile detail collects aggregate host metrics only and cannot be combined with execution journal paths".to_owned());
+        }
+        self.validate_profile_frame_limit()
+    }
+
     pub fn validate_profile_frame_limit(&self) -> std::result::Result<(), String> {
         if self.profile_max_frames_per_request.is_none() {
             return Ok(());
@@ -401,7 +413,7 @@ impl EngineConfig {
             self.runtime.profile_detail =
                 ObservabilityProfileDetail::parse(value).ok_or_else(|| {
                     format!(
-                    "FERRUM_PROFILE_DETAIL: expected one of off, basic, resource, latency, kernel, debug, replay, verify, full; got {value:?}"
+                    "FERRUM_PROFILE_DETAIL: expected one of off, basic, host, resource, latency, kernel, debug, replay, verify, full; got {value:?}"
                     )
                 })?;
         }
@@ -1636,6 +1648,37 @@ mod tests {
             config.runtime.profile_detail,
             ObservabilityProfileDetail::Full
         );
+    }
+
+    #[test]
+    fn host_profile_runtime_config_preserves_no_journal_contract() {
+        let snapshot = RuntimeConfigSnapshot::from_entries([crate::RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_DETAIL",
+            "host",
+            crate::RuntimeConfigSource::Cli,
+        )]);
+        let mut config = EngineConfig::default();
+        config.apply_runtime_config_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            config.runtime.profile_detail,
+            ObservabilityProfileDetail::Host
+        );
+        let restored: RuntimeKnobs =
+            serde_json::from_value(serde_json::to_value(&config.runtime).unwrap()).unwrap();
+        assert!(restored.validate_profile_observation().is_ok());
+        for journal in 0..3 {
+            let mut invalid = restored.clone();
+            let path = Some(PathBuf::from("journal.jsonl"));
+            match journal {
+                0 => invalid.profile_jsonl = path,
+                1 => invalid.scheduler_trace_jsonl = path,
+                _ => invalid.legacy_scheduler_trace_jsonl = path,
+            }
+            assert!(invalid.validate_profile_observation().is_err());
+        }
+        let mut bounded = restored;
+        bounded.profile_max_frames_per_request = std::num::NonZeroU32::new(1);
+        assert!(bounded.validate_profile_observation().is_err());
     }
 
     #[test]

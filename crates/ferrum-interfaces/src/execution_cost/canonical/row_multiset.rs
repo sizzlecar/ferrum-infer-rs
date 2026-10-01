@@ -7,7 +7,7 @@ pub(super) fn static_row(
     numeric: CostRowNumericFeatures,
 ) -> Option<HostRowStaticCostFeaturesV2> {
     let host = row.host_features?;
-    if !host.supports_empirical_plain_text_content() {
+    if !host.supports_installed_plain_text_content() {
         return None;
     }
     let role = match row.work {

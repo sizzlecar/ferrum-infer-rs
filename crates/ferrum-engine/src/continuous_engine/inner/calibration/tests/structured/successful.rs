@@ -30,6 +30,12 @@ async fn observed_session() -> (CalibrationSession, Arc<ControlledExecutor>) {
     let (mut engine, _, executor) = fixture_with_custom_config(OWNER_SLOTS, |config| {
         config.scheduler.slo.cost_observation.structured_capture =
             ferrum_types::SloStructuredCostCapture::HostSettledV1;
+        config
+            .scheduler
+            .slo
+            .cost_observation
+            .structured_actual_capture =
+            ferrum_types::SloStructuredActualCapturePolicy::ConsumerDrivenV1;
     })
     .await;
     let inner = Arc::get_mut(&mut engine.inner).unwrap();
@@ -169,18 +175,14 @@ async fn structured_collector_real_driver_completes_three_frozen_populations_and
         (StructuredCapturePhase::Residual, PHASE_REQUESTS[1]),
         (StructuredCapturePhase::Qualification, PHASE_REQUESTS[2]),
     ] {
-        // The production sink may drop on try_lock contention. This success
-        // protocol fixture queues its declared finite population while the
-        // real worker is paused, then uses the normal FIFO freeze barrier to
-        // drain it. Loss/error behavior is exercised by the separate tests.
-        let runtime = Arc::clone(session.engine.inner.cost_runtime.as_ref().unwrap());
-        runtime
-            .with_training_paused_async(async {
-                for _ in 0..requests {
-                    completed_request(&mut session, &executor).await;
-                }
-            })
-            .await;
+        // A completed manual wave now waits for its original FIFO observation
+        // to resolve. Keep that consumer running: pausing its trainer across
+        // this await would prevent the same worker from resolving the wave.
+        // Every report still requires its genuine qualified settlement; the
+        // phase barrier below freezes the complete original population.
+        for _ in 0..requests {
+            completed_request(&mut session, &executor).await;
+        }
         let progress = session.structured_cost_progress().unwrap();
         assert_eq!(progress.phase, phase);
         assert_eq!(progress.failed_members, [0, 0, 0], "{progress:?}");
@@ -506,4 +508,21 @@ async fn structured_v2_discovery_keeps_original_receipt_clock_and_outer_shape_bi
     assert_eq!(before, after);
     assert!(session.structured_cost_progress_v2().is_none());
     bounded(session.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
+async fn consumer_driven_manual_discovery_keeps_actual_settlement_before_collector() {
+    let (mut session, executor) = observed_session().await;
+    assert!(session.structured_capture.is_none());
+    assert!(session.structured_capture_v2.is_none());
+    assert!(session.structured_group_v2.is_none());
+    let reports = completed_request(&mut session, &executor).await;
+    assert_eq!(reports.len(), OUTPUTS_PER_REQUEST);
+    assert!(reports.iter().all(
+        |report| report.host_stages.as_ref().is_some_and(|stages| stages
+            .structured_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_ok()))
+    ));
+    session.shutdown().await.unwrap();
 }

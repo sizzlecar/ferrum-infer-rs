@@ -12,6 +12,8 @@ mod types;
 pub use types::*;
 
 mod capabilities;
+#[cfg(any(feature = "cuda", test))]
+pub(crate) mod causal_attention_selector;
 mod memory;
 pub use memory::probe_device_memory;
 #[cfg(any(feature = "cuda", test))]

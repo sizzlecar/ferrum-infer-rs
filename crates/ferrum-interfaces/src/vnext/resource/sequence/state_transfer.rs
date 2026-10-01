@@ -145,6 +145,52 @@ impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
         Ok(())
     }
 
+    /// A final native guard must not wait or acquire the backing mutex. This
+    /// exact reservation excludes backing extension and all execution flights.
+    /// The authority selector follows the original authority -> session order.
+    pub(crate) fn try_validate_for_submission(
+        &self,
+    ) -> Result<(), crate::execution_cost::GuardedNotSubmittedReason> {
+        use crate::execution_cost::{
+            GuardedNotSubmittedReason as Rejected, HostSubmissionRejection,
+        };
+        let busy = |_| Rejected::HostRejected(HostSubmissionRejection::Busy);
+        let resources = self.session.resources();
+        let authority = resources.authority_source.try_lock().map_err(busy)?;
+        if *authority != super::SequenceExecutionAuthoritySource::SequenceSession
+            || super::sequence_dispatch_is_poisoned(&resources.sequence_dispatch_gate)
+            || super::sequence_slot_is_poisoned(
+                resources.state.load(std::sync::atomic::Ordering::Acquire),
+            )
+        {
+            return Err(Rejected::ResourceClaimMismatch);
+        }
+        let state = self
+            .reservation
+            .slot
+            .state
+            .try_lock()
+            .map_err(|_| Rejected::HostRejected(HostSubmissionRejection::Busy))?;
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            return Err(Rejected::ResourceClaimMismatch);
+        };
+        if active.phase == SequenceSessionPhase::CancelRequested {
+            return Err(Rejected::HostRejected(HostSubmissionRejection::Cancelled));
+        }
+        if active.phase != SequenceSessionPhase::Open
+            || self
+                .reservation
+                .released
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self.ensure_active_reservation(&active).is_err()
+            || active.active_frame.is_some()
+            || active.has_participant_flights()
+        {
+            return Err(Rejected::ResourceClaimMismatch);
+        }
+        Ok(())
+    }
+
     /// The caller holds the session slot and exact backing locks and has
     /// validated the installed restore frontier before opening this gate.
     pub(super) fn release_active_reservation(

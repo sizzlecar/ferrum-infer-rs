@@ -521,3 +521,136 @@ async fn workspace_startup_cuda_keeps_independent_startup_graph_lifecycle_usable
     );
     fixture.release(inputs);
 }
+
+#[test]
+#[ignore = "requires the actual CUDA registry; compiles metadata without model upload"]
+fn cuda_actual_product_f16_and_f32_master_close_causal_and_recurrent_checkpoint_layout() {
+    use crate::vnext::qwen35::{F16_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID};
+    use ferrum_interfaces::vnext::{
+        CheckpointCompletedInputCapture, ProviderCheckpointCapability,
+        ProviderCheckpointStateLayout, SequenceCheckpointCapability,
+    };
+    use ferrum_types::NumericalExecutionPolicy;
+    for geometry in [
+        weights::CausalGeometry::TINY,
+        weights::CausalGeometry::GROUPED,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        weights::write_config(directory.path(), geometry);
+        weights::write_weights(directory.path(), geometry);
+        std::fs::write(directory.path().join("tokenizer.json"),br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1,"<eos>":2},"unk_token":"<unk>"}}"#).unwrap();
+        std::fs::write(directory.path().join("tokenizer_config.json"),br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
+        let defined = crate::vnext::qwen35::define_from_model_dir(directory.path()).unwrap();
+        let (runtime, operations, materializers, catalog) = CudaVNextComposition::create(
+            0,
+            DeviceId::new(format!("device.checkpoint-plan.{}", uuid::Uuid::new_v4())).unwrap(),
+            AttentionExecutionPolicy::Portable,
+        )
+        .unwrap()
+        .into_parts();
+        let composition = VNextRuntimeComposition::new(runtime, operations, materializers, catalog);
+        for profile in [F16_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID] {
+            let mut engine = EngineConfig::default();
+            engine.backend.device = Device::CUDA(0);
+            engine.backend.enable_reusable_execution = false;
+            engine.runtime.prefix_state_cache_enabled = true;
+            engine.runtime.attention_execution_policy = AttentionExecutionPolicy::Portable;
+            engine.scheduler.max_running_requests = 2;
+            engine.scheduler.prefill_step_chunk = Some(8);
+            engine.batching.max_num_batched_tokens = 8;
+            engine.memory.usable_capacity_bytes = Some(256 << 20);
+            engine.numerical_execution =
+                NumericalExecutionPolicy::Require(profile.parse().unwrap());
+            let prepared = defined.prepare(&profile.parse().unwrap()).unwrap();
+            let info =
+                prepared.model_info(ModelId::new("checkpoint-plan-product"), Device::CUDA(0));
+            let config =
+                VNextExecutorConfig::from_engine_config(&engine, &info, composition.runtime())
+                    .unwrap();
+            let selection = cuda_weight_materializer_selection(prepared.family()).unwrap();
+            let compiled = composition
+                .compile_model(&prepared, info, &engine, config, selection)
+                .unwrap();
+            let plan = compiled.compilation().executable().execution_plan();
+            assert!(plan.payload().memory().checkpoint_capacity().is_some());
+            let layout = match plan.sequence_checkpoint_capability() {
+                SequenceCheckpointCapability::Enabled(layout) => layout,
+                SequenceCheckpointCapability::Unsupported(reasons) => {
+                    panic!("actual {profile} selected plan lacks checkpoint closure: {reasons:?}")
+                }
+            };
+            let nodes = plan.payload().nodes();
+            assert!(nodes.iter().any(|node| node
+                .operation_id()
+                .as_str()
+                .contains("causal_paged_attention")));
+            assert!(nodes.iter().any(|node| node
+                .operation_id()
+                .as_str()
+                .contains("gated_delta_recurrent_attention")));
+            assert_eq!(layout.providers().len(), nodes.len());
+            for node in nodes {
+                let descriptor = composition
+                    .catalog()
+                    .providers_for(node.operation_id())
+                    .unwrap()
+                    .iter()
+                    .find(|provider| provider.provider_id() == node.selection().selected_provider())
+                    .unwrap();
+                let ProviderCheckpointCapability::CompletedBoundary(contract) =
+                    descriptor.checkpoint_capability()
+                else {
+                    panic!(
+                        "actual selected provider {} has no contract",
+                        descriptor.provider_id()
+                    );
+                };
+                let bound = layout
+                    .providers()
+                    .iter()
+                    .find(|provider| provider.node_id() == node.id())
+                    .unwrap();
+                assert_eq!(bound.provider_id(), descriptor.provider_id());
+                assert_eq!(bound.contract(), contract);
+            }
+            assert!(layout.states().iter().any(|state| matches!(
+                state.layout(),
+                ProviderCheckpointStateLayout::PagedKeyValueBlockPrefix { .. }
+            )));
+            assert!(layout.states().iter().any(|state| matches!(
+                state.layout(),
+                ProviderCheckpointStateLayout::ContiguousBoundaryValue
+            )));
+            assert_eq!(
+                layout.completed_input_capture(),
+                CheckpointCompletedInputCapture::Supported
+            );
+            for boundary in [1_u64, 7, 15, 16, 17] {
+                if boundary > geometry.context as u64 {
+                    continue;
+                }
+                assert!(layout.permits_capture_from(0, boundary, boundary));
+                let byte_plan = plan.checkpoint_byte_plan(boundary).unwrap();
+                assert_eq!(
+                    byte_plan
+                        .resources()
+                        .iter()
+                        .map(|r| r.logical_bytes())
+                        .sum::<u64>(),
+                    byte_plan.logical_bytes()
+                );
+                let blocked = byte_plan
+                    .resources()
+                    .iter()
+                    .filter(|resource| !resource.strided_ranges().is_empty())
+                    .collect::<Vec<_>>();
+                if boundary % 16 != 0 {
+                    assert!(!blocked.is_empty());
+                    for resource in blocked {
+                        assert_eq!(resource.strided_ranges().len(), 2);
+                    }
+                }
+            }
+        }
+    }
+}

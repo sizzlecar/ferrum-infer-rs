@@ -45,6 +45,9 @@ impl<'de> Deserialize<'de> for ReusableExecutionClassId {
 pub struct ReusableExecutionBucketId(String);
 
 impl ReusableExecutionBucketId {
+    pub(crate) fn retained_text_bytes(&self) -> usize {
+        self.0.capacity()
+    }
     fn derive(
         class_id: &ReusableExecutionClassId,
         capacity: &ReusableExecutionCapacity,

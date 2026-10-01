@@ -25,7 +25,7 @@ impl Serialize for CompletedWire<'_> {
         out.serialize_field("reconciled", &self.reconciled)?;
         out.serialize_field(
             "host_stages",
-            &r.member.map(|_| stages.structured_diagnostic_view()),
+            &r.member.map(|_| stages.structured_source_view()),
         )?;
         out.serialize_field(
             "outside_settlement",

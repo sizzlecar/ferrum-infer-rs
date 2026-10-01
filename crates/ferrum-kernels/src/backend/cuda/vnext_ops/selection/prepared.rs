@@ -165,7 +165,20 @@ pub(in crate::backend::cuda::vnext_ops) fn encode(
         parallel,
         replay_key,
         cost_work,
-    } = prepare(provider_fingerprint, precision, capture, &invocation)?;
+    } = prepare(
+        provider_fingerprint,
+        precision,
+        SloStructuredCostCapture::Disabled,
+        &invocation,
+    )?;
+    let observation_recipe = super::super::CudaReplayCostRecipe::argmax(
+        &invocation,
+        precision,
+        launches
+            .iter()
+            .map(|row| (row.vocabulary_size, row.repetition_capacity)),
+        capture,
+    );
     let functions = functions.clone();
     CudaDeviceCommand::replayable_operation(
         "vnext_last_token_masked_argmax",
@@ -207,5 +220,6 @@ pub(in crate::backend::cuda::vnext_ops) fn encode(
         },
     )
     .and_then(|command| cost_route::apply(command, cost_work))
+    .map(|command| command.with_replay_cost_recipe(observation_recipe))
     .map_err(|error| error.to_string())
 }

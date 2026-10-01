@@ -82,6 +82,16 @@ impl Default for JsonlJournalConfig {
     }
 }
 
+/// Best-effort callers never wait for another producer, queue space or I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonlJournalTryError {
+    Contended,
+    Full,
+    Closed,
+    Failed,
+    Disconnected,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonlJournalError {
     message: String,
@@ -379,6 +389,39 @@ where
                 encoded.push(b'\n');
                 Ok(())
             })))
+    }
+
+    /// Serialization stays on the existing writer. Rejection leaves the
+    /// journal healthy; the caller must disclose loss in its own diagnostics.
+    /// The same gate as close prevents acceptance after its terminal barrier.
+    pub fn try_enqueue(&self, event: T) -> Result<(), JsonlJournalTryError> {
+        let _gate = match self.inner.send_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(JsonlJournalTryError::Contended)
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(JsonlJournalTryError::Failed),
+        };
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(JsonlJournalTryError::Closed);
+        }
+        if self.inner.failure.failed.load(Ordering::Acquire) {
+            return Err(JsonlJournalTryError::Failed);
+        }
+        let command = JournalCommand::Encode(Box::new(move |encoded| {
+            serde_json::to_writer(&mut *encoded, &event)?;
+            encoded.push(b'\n');
+            Ok(())
+        }));
+        self.inner
+            .sender
+            .try_send(command)
+            .map_err(|error| match error {
+                std::sync::mpsc::TrySendError::Full(_) => JsonlJournalTryError::Full,
+                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    JsonlJournalTryError::Disconnected
+                }
+            })
     }
 
     pub fn enqueue_batch(&self, events: Vec<T>) -> Result<(), JsonlJournalError> {
@@ -948,6 +991,76 @@ mod tests {
             state.serialize_field("ordinal", &self.ordinal)?;
             state.end()
         }
+    }
+
+    #[test]
+    fn try_enqueue_is_bounded_and_preserves_close_barrier() {
+        let path = temp_path("try-bounded");
+        let journal = JsonlJournal::open(
+            path.clone(),
+            JsonlJournalOpenMode::Truncate,
+            JsonlJournalConfig {
+                queue_capacity: 1,
+                ..JsonlJournalConfig::default()
+            },
+        )
+        .unwrap();
+        let gate = Arc::new(BlockingGate::default());
+        journal
+            .try_enqueue(BlockingEvent {
+                ordinal: 1,
+                gate: Some(gate.clone()),
+            })
+            .unwrap();
+        gate.wait_until_blocked();
+        journal
+            .try_enqueue(BlockingEvent {
+                ordinal: 2,
+                gate: None,
+            })
+            .unwrap();
+        let full = journal.try_enqueue(BlockingEvent {
+            ordinal: 3,
+            gate: None,
+        });
+        // Always unblock the worker before assertions, including on failure.
+        gate.release();
+        assert_eq!(full, Err(JsonlJournalTryError::Full));
+        journal.close().unwrap();
+        assert_eq!(
+            journal.try_enqueue(BlockingEvent {
+                ordinal: 4,
+                gate: None
+            }),
+            Err(JsonlJournalTryError::Closed)
+        );
+        let ordinals: Vec<_> = read_values(&path)
+            .into_iter()
+            .map(|v| v["ordinal"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ordinals, vec![1, 2]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_enqueue_does_not_wait_for_another_sender() {
+        let path = temp_path("try-contended");
+        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let guard = journal.inner.send_gate.lock().unwrap();
+        assert_eq!(
+            journal.try_enqueue(serde_json::json!({"rejected": true})),
+            Err(JsonlJournalTryError::Contended)
+        );
+        drop(guard);
+        journal
+            .try_enqueue(serde_json::json!({"accepted": true}))
+            .unwrap();
+        journal.close().unwrap();
+        assert_eq!(
+            read_values(&path),
+            vec![serde_json::json!({"accepted": true})]
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

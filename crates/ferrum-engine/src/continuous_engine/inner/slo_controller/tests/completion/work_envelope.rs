@@ -159,11 +159,14 @@ async fn completion_publisher_policy_rejects_changed_amounts_without_acquiring_w
     let per_request_bad = vec![selection(&a, 3)];
     let aggregate_bad = vec![selection(&a, 2), selection(&b, 2)];
     let proof = ControllerSafetyProof {
+        prefix_maintenance: None,
+        _prefix_checkpoint: None,
         recovery_peers: Vec::new(),
         protection: None,
         budget: ControllerBudget::new(slo_clock_now(), Duration::from_secs(30)).unwrap(),
         queue,
         fences: Vec::new(),
+        waiting_fences: Vec::new(),
     };
     let mut hint = ferrum_interfaces::BatchHint::simple(3);
     hint.max_tokens = 100;

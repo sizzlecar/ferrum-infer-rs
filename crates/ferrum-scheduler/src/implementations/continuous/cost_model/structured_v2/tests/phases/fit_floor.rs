@@ -12,6 +12,7 @@ fn observations(kind: StructuredPhaseV2) -> Vec<StructuredNumericObservationV2> 
 fn exact_scope(values: &[StructuredNumericObservationV2]) -> StructuredScopeV2 {
     StructuredScopeV2 {
         owner: values[0].input.owner().clone(),
+        numerical_family: None,
         coverage: StructuredCoverageV2 {
             pending_eligible_positions: vec![],
             authorized_pending_constraints: vec![],
@@ -134,7 +135,7 @@ fn structured_v2_fit_floor_qualification_can_only_challenge_frozen_uncertainty()
     ));
 }
 
-fn varied(kind: StructuredPhaseV2) -> Vec<StructuredNumericObservationV2> {
+pub(super) fn varied(kind: StructuredPhaseV2) -> Vec<StructuredNumericObservationV2> {
     let mut values = observations(kind);
     for (i, value) in values.iter_mut().enumerate() {
         let work = if i % 2 == 0 { 8 } else { 16 };

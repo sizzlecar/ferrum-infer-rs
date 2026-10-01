@@ -37,7 +37,10 @@ impl Witness {
             disposition: CalibrationQueueDisposition::Published,
         } = &report.observation
         else {
-            return Err(invalid("reference wave has no accepted actual observation"));
+            return Err(invalid(format!(
+                "reference wave has no accepted actual observation; diagnostic={}",
+                unavailable_summary(report)
+            )));
         };
         if report.submission != CalibrationSubmissionState::HostReconciled
             || report.error.is_some()
@@ -136,4 +139,118 @@ impl Witness {
     pub fn matches(&self, shape: &ProfileWaveShapeV2, host: HostCostFeaturesV1) -> bool {
         self.host == host && ProfileWaveShapeV2::from(&self.sample.actual_shape) == *shape
     }
+}
+
+/// Cold failure diagnostics only. Never serialize the full report, actual
+/// shape, request identity, input text, token values, or a backend error body.
+/// Retained detail is bounded independently of recorder and request capacity.
+pub(in crate::continuous_engine::inner::calibration) fn unavailable_summary(
+    report: &CalibrationWaveReport,
+) -> serde_json::Value {
+    use serde_json::json;
+    const DETAIL_LIMIT: usize = 4;
+    let reason = |value: &str| -> String {
+        value
+            .chars()
+            .take(128)
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    };
+    let observation = match &report.observation {
+        CalibrationObservation::PendingOrUnavailable => json!({"kind":"pending_or_unavailable"}),
+        CalibrationObservation::ConflictingCalls => json!({"kind":"conflicting_calls"}),
+        CalibrationObservation::Rejected { reason: rejection } => {
+            json!({"kind":"rejected", "reason":reason(rejection)})
+        }
+        CalibrationObservation::InvalidIdentityJoin => json!({"kind":"invalid_identity_join"}),
+        CalibrationObservation::Observed {
+            sample,
+            actual_rows,
+            commits,
+            host_features,
+            accepted_ordinal,
+            disposition,
+        } => {
+            let queue = match disposition {
+                CalibrationQueueDisposition::Published => json!({"kind":"published"}),
+                CalibrationQueueDisposition::Dropped { reason: rejection } => {
+                    json!({"kind":"dropped", "reason":reason(rejection)})
+                }
+            };
+            json!({
+                "kind":"observed", "queue":queue, "accepted_ordinal":accepted_ordinal,
+                "actual_rows":actual_rows.len(), "commits":commits.len(),
+                "host_features":host_features.len(), "boundary":format!("{:?}", sample.boundary),
+                "outcome":format!("{:?}", sample.outcome), "wall_ns":sample.timing.wall_total_ns,
+            })
+        }
+    };
+    let stages = report.host_stages.as_ref().map(|stages| {
+        let structured = match stages.structured_evidence.as_ref() {
+            None => json!({"kind":"absent"}),
+            Some(Ok(_)) => json!({"kind":"qualified"}),
+            Some(Err(reason)) => json!({"kind":"rejected", "reason":format!("{reason:?}")}),
+        };
+        let rows = stages
+            .rows
+            .iter()
+            .take(DETAIL_LIMIT)
+            .map(|row| {
+                json!({
+                    "input_index":row.input_index, "completeness":row.completeness,
+                    "host_processing_ordinal":row.host_processing_ordinal,
+                    "host_started_at_ns":row.host_started_at_ns,
+                    "token_committed_at_ns":row.token_committed_at_ns,
+                    "output_published_at_ns":row.output_published_at_ns,
+                    "completion_started_at_ns":row.completion_started_at_ns,
+                    "settled_at_ns":row.settled_at_ns,
+                    "terminal_present":row.terminal.is_some(),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "schema_version":stages.schema_version, "call_id":stages.call_id,
+            "completeness":stages.completeness, "row_count":stages.rows.len(),
+            "rows":rows, "rows_truncated":stages.rows.len()>DETAIL_LIMIT,
+            "actual_shape_present":stages.actual_shape.is_some(),
+            "fingerprint_present":stages.fingerprint.is_some(),
+            "statistical_evidence_present":stages.statistical_evidence.is_some(),
+            "structured_evidence":structured,
+            "prepare_started_at_ns":stages.prepare_started_at_ns,
+            "executor_returned_at_ns":stages.executor_returned_at_ns,
+            "finalized_at_ns":stages.finalized_at_ns, "full_wall_ns":stages.full_wall_ns,
+        })
+    });
+    let actual = report.actual_evidence_diagnostic.as_ref().map(|actual| {
+        let waves = actual
+            .waves
+            .iter()
+            .take(DETAIL_LIMIT)
+            .map(|wave| {
+                json!({
+                    "physical_wave_ordinal":wave.physical_wave_ordinal,
+                    "reason":format!("{:?}", wave.reason),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "call_id":actual.call_id, "physical_waves":actual.physical_waves,
+            "retained_waves":actual.retained_waves, "lost_observations":actual.lost_observations,
+            "dispatch_unknown":actual.dispatch_unknown.map(|reason|format!("{reason:?}")),
+            "unknown_wave_count":actual.waves.len(), "waves":waves,
+            "waves_truncated":actual.waves.len()>DETAIL_LIMIT,
+            "retained_wave_details_complete":actual.retained_wave_details_complete,
+        })
+    });
+    json!({
+        "submission":format!("{:?}",report.submission), "execution_error_present":report.error.is_some(),
+        "observation":observation, "host_stage_queue":report.host_stage_queue,
+        "host_stages":stages, "actual_evidence":actual,
+    })
 }

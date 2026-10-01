@@ -1,15 +1,20 @@
 use super::{
     execution::{self, PlanningExecutionContext, PlanningExecutionState},
     obligations::PlanningObligationSet,
+    observation::{AttemptObservation, PlanningQueryAttemptEnd, PlanningQueryPhase},
     types::*,
 };
 use std::{ops::Deref, sync::Arc};
 
+mod prefix;
+pub(super) use prefix::{advance_prefix, restrict_cache_capture, restrict_prefix_wait};
+
 #[derive(Clone)]
 pub(super) struct PlanningState<'epoch> {
     logical: SimulatedSequence,
-    execution: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
+    pub(super) execution: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
     depth: usize,
+    pub observed_replay: Option<u64>,
     future_controller_ns: u64,
     pub first_wave_candidate: Option<Arc<WaveCandidate>>,
     pub first_wave_statistics:
@@ -75,6 +80,7 @@ pub(super) fn begin_with_controller_time<'epoch>(
     Ok(PlanningState {
         execution,
         depth: 0,
+        observed_replay: None,
         future_controller_ns,
         first_wave_candidate: None,
         first_wave_statistics: None,
@@ -119,71 +125,114 @@ pub(super) fn advance<'epoch>(
     milestones_enabled: bool,
     protection: Option<&PlanningObligationSet>,
 ) -> Result<VerifiedTransition<'epoch>, TransitionFailure> {
-    let projected = execution::project(
+    advance_observed(
         snapshot,
-        &parent.requests,
+        parent,
         work,
-        parent.execution.as_ref(),
-        parent.depth == 0,
-        model.evidence_requirement(),
-        poll,
-    )
-    .map_err(|reason| TransitionFailure {
-        cause: reason.into(),
-        projected: false,
-    })?
-    .ok_or(TransitionFailure {
-        cause: SimulationFailure::SequenceViolation,
-        projected: false,
-    })?;
-    let mut logical = parent.logical.clone();
-    // Only subsequent waves incur another controller transaction. Do this
-    // before the model lookup so its age/TTL and every obligation use the same
-    // delayed timeline. Current real planning elapsed is handled by replay.
-    if parent.depth > 0 {
-        logical.now_ns = logical
-            .now_ns
-            .checked_add(parent.future_controller_ns)
-            .ok_or(TransitionFailure {
-                cause: PlanningUnknownReason::ArithmeticOverflow.into(),
-                projected: true,
-            })?;
-    }
-    apply(
-        snapshot,
-        &mut logical,
-        &projected.wave,
         model,
         complete_resources,
         poll,
         milestones_enabled,
         protection,
-        parent.depth == 0,
+        PlanningQueryPhase::Search,
     )
-    .map_err(|cause| TransitionFailure {
-        cause,
-        projected: true,
-    })?;
-    Ok(VerifiedTransition {
-        wave: projected.wave,
-        state: PlanningState {
-            logical,
-            execution: projected.successor,
-            depth: parent.depth + 1,
-            future_controller_ns: parent.future_controller_ns,
-            first_wave_candidate: parent.first_wave_candidate.clone(),
-            first_wave_statistics: if parent.depth == 0 {
-                projected.first_statistics
-            } else {
-                parent.first_wave_statistics.clone()
+}
+
+pub(super) fn advance_observed<'epoch>(
+    snapshot: &SchedulerSnapshot,
+    parent: &PlanningState<'epoch>,
+    work: &[CandidateWork],
+    model: &dyn PlanningCostModel,
+    complete_resources: bool,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    milestones_enabled: bool,
+    protection: Option<&PlanningObligationSet>,
+    phase: PlanningQueryPhase,
+) -> Result<VerifiedTransition<'epoch>, TransitionFailure> {
+    let observation = model.query_observer().map(|observer| {
+        AttemptObservation::new(observer, phase, parent.depth, &parent.requests, work)
+    });
+    let result = (|| {
+        let projected = execution::project_observed(
+            snapshot,
+            &parent.requests,
+            work,
+            parent.execution.as_ref(),
+            parent.depth == 0,
+            model.evidence_requirement(),
+            poll,
+            observation.as_ref(),
+        )
+        .map_err(|reason| TransitionFailure {
+            cause: reason.into(),
+            projected: false,
+        })?
+        .ok_or(TransitionFailure {
+            cause: SimulationFailure::SequenceViolation,
+            projected: false,
+        })?;
+        let mut logical = parent.logical.clone();
+        // Only subsequent waves incur another controller transaction. Do this
+        // before the model lookup so its age/TTL and every obligation use the same
+        // delayed timeline. Current real planning elapsed is handled by replay.
+        if parent.depth > 0 {
+            logical.now_ns = logical
+                .now_ns
+                .checked_add(parent.future_controller_ns)
+                .ok_or(TransitionFailure {
+                    cause: PlanningUnknownReason::ArithmeticOverflow.into(),
+                    projected: true,
+                })?;
+        }
+        apply(
+            snapshot,
+            &mut logical,
+            &projected.wave,
+            model,
+            complete_resources,
+            poll,
+            milestones_enabled,
+            protection,
+            parent.depth == 0,
+            observation.as_ref(),
+        )
+        .map_err(|cause| TransitionFailure {
+            cause,
+            projected: true,
+        })?;
+        Ok(VerifiedTransition {
+            wave: projected.wave,
+            state: PlanningState {
+                logical,
+                execution: projected.successor,
+                depth: parent.depth + 1,
+                observed_replay: parent.observed_replay,
+                future_controller_ns: parent.future_controller_ns,
+                first_wave_candidate: parent.first_wave_candidate.clone(),
+                first_wave_statistics: if parent.depth == 0 {
+                    projected.first_statistics
+                } else {
+                    parent.first_wave_statistics.clone()
+                },
+                first_wave_canonical: if parent.depth == 0 {
+                    projected.first_canonical
+                } else {
+                    parent.first_wave_canonical.clone()
+                },
             },
-            first_wave_canonical: if parent.depth == 0 {
-                projected.first_canonical
-            } else {
-                parent.first_wave_canonical.clone()
-            },
-        },
-    })
+        })
+    })();
+    if let Some(observation) = &observation {
+        observation.finish(match &result {
+            Ok(_) => PlanningQueryAttemptEnd::Completed,
+            Err(TransitionFailure {
+                cause: SimulationFailure::Unknown(reason),
+                ..
+            }) => PlanningQueryAttemptEnd::Unknown(*reason),
+            Err(_) => PlanningQueryAttemptEnd::SequenceViolation,
+        });
+    }
+    result
 }
 
 /// Independent replay initializes a fresh backend state and resolves every
@@ -200,31 +249,59 @@ pub(super) fn replay<'epoch>(
     milestones_enabled: bool,
     protection: Option<&PlanningObligationSet>,
 ) -> Result<PlanningState<'epoch>, SimulationFailure> {
-    let mut state =
-        begin_with_controller_time(snapshot, context, poll, started_at_ns, future_controller_ns)?;
-    for wave in waves {
-        let transition = advance(
+    let observer = model.query_observer();
+    let replay = observer.map(|observer| observer.begin_replay(waves.len()));
+    let result = (|| {
+        let mut state = begin_with_controller_time(
             snapshot,
-            &state,
-            &wave.work,
-            model,
-            complete_resources,
+            context,
             poll,
-            milestones_enabled,
-            protection,
-        )
-        .map_err(|failure| failure.cause)?;
-        if transition.wave != *wave {
-            return Err(SimulationFailure::SequenceViolation);
+            started_at_ns,
+            future_controller_ns,
+        )?;
+        state.observed_replay = replay;
+        for wave in waves {
+            let transition = advance_observed(
+                snapshot,
+                &state,
+                &wave.work,
+                model,
+                complete_resources,
+                poll,
+                milestones_enabled,
+                protection,
+                PlanningQueryPhase::IndependentReplay {
+                    replay: replay.unwrap_or(0),
+                },
+            )
+            .map_err(|failure| failure.cause)?;
+            if transition.wave != *wave {
+                return Err(SimulationFailure::SequenceViolation);
+            }
+            state = transition.state;
+            if state.depth == 1 {
+                // Move the independently replayed bound input; search sidecars
+                // never become publication/capture evidence. No second bind/clone.
+                state.first_wave_candidate = Some(Arc::new(transition.wave));
+            }
         }
-        state = transition.state;
-        if state.depth == 1 {
-            // Move the independently replayed bound input; search sidecars
-            // never become publication/capture evidence. No second bind/clone.
-            state.first_wave_candidate = Some(Arc::new(transition.wave));
-        }
+        Ok(state)
+    })();
+    if let (Some(observer), Some(replay)) = (observer, replay) {
+        observer.end_replay(
+            replay,
+            match &result {
+                Ok(_) => PlanningQueryAttemptEnd::Completed,
+                Err(SimulationFailure::Unknown(reason)) => {
+                    PlanningQueryAttemptEnd::Unknown(*reason)
+                }
+                Err(SimulationFailure::SequenceViolation) => {
+                    PlanningQueryAttemptEnd::SequenceViolation
+                }
+            },
+        );
     }
-    Ok(state)
+    result
 }
 
 #[cfg(test)]
@@ -270,6 +347,7 @@ fn apply(
     milestones_enabled: bool,
     protection: Option<&PlanningObligationSet>,
     first_wave: bool,
+    observation: Option<&AttemptObservation<'_>>,
 ) -> Result<(), SimulationFailure> {
     if wave.based_on_generation != snapshot.generation
         || wave.cost_model_version != snapshot.cost_model_version
@@ -331,13 +409,14 @@ fn apply(
     if first_wave && shape.exact().is_none() {
         return Err(PlanningUnknownReason::InvalidShapeEvidence.into());
     }
-    let cost = domain_cost(
+    let cost = domain_cost_observed(
         snapshot,
         model,
         shape,
         wave.cost_evidence.as_ref(),
         state.now_ns,
         poll_budget,
+        observation,
     )?;
     state.minimum_cost_freshness_slack_ns =
         state.minimum_cost_freshness_slack_ns.min(cost.valid_for_ns);
@@ -383,6 +462,11 @@ fn apply(
     }
     for (work, (index, new_context, emits, output_credit)) in wave.work.iter().zip(advances) {
         let request = &mut state.requests[index];
+        let previous_work = if milestones_enabled {
+            logical_work(&snapshot.requests[index], request)?
+        } else {
+            0
+        };
         request.recovery_service.progressed();
         if first_wave {
             state.first_fairness_rank = state.first_fairness_rank.min(request.fairness_rank);
@@ -429,29 +513,22 @@ fn apply(
                 .checked_add(1)
                 .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
         }
+        if milestones_enabled {
+            if let Some(slack) = newly_completed_milestone_slack(
+                snapshot,
+                index,
+                previous_work,
+                logical_work(&snapshot.requests[index], request)?,
+                end_ns,
+                protection,
+            ) {
+                state.minimum_start_slack_ns = state.minimum_start_slack_ns.min(slack);
+            }
+        }
     }
     if milestones_enabled {
         for (index, request) in state.requests.iter().enumerate() {
             check_milestones(snapshot, index, request, end_ns, true, protection)?;
-            if let RequestPhaseView::Prefill(progress) = &snapshot.requests[index].phase {
-                let completed = logical_work(&snapshot.requests[index], request)?;
-                if snapshot.requests[index].timing.committed_tokens == 0 {
-                    for (_, milestone) in
-                        progress
-                            .milestones
-                            .iter()
-                            .enumerate()
-                            .filter(|(m, milestone)| {
-                                protection.is_none_or(|scope| scope.requires_milestone(index, *m))
-                                    && milestone.at_ns >= end_ns
-                                    && milestone.required_reference_work_ns <= completed
-                            })
-                    {
-                        state.minimum_start_slack_ns =
-                            state.minimum_start_slack_ns.min(milestone.at_ns - end_ns);
-                    }
-                }
-            }
         }
     }
     state.now_ns = end_ns;
@@ -472,6 +549,18 @@ pub(super) fn domain_cost(
     evidence: Option<&PlanningShapeDomain<PlanningCostEvidence>>,
     now_ns: u64,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<PlanningCost, PlanningUnknownReason> {
+    domain_cost_observed(snapshot, model, domain, evidence, now_ns, poll, None)
+}
+
+pub(super) fn domain_cost_observed(
+    snapshot: &SchedulerSnapshot,
+    model: &dyn PlanningCostModel,
+    domain: &PlanningShapeDomain<super::super::cost_model::WaveExecutionShape>,
+    evidence: Option<&PlanningShapeDomain<PlanningCostEvidence>>,
+    now_ns: u64,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    observation: Option<&AttemptObservation<'_>>,
 ) -> Result<PlanningCost, PlanningUnknownReason> {
     let alternatives = matches!(domain, PlanningShapeDomain::HostContentAlternatives(_));
     if alternatives && !model.supports_empirical_host_content() {
@@ -499,14 +588,24 @@ pub(super) fn domain_cost(
     });
     for (index, shape) in domain.shapes().iter().enumerate() {
         poll()?;
-        let cost = model
-            .predict_with_evidence(
+        let cost = if let Some(observation) = observation {
+            let result = model.predict_observed(
+                &snapshot.fingerprint,
+                shape,
+                evidence.map(|domain| &domain.shapes()[index]),
+                now_ns,
+            );
+            observation.lookup(index, now_ns, result);
+            result.cost()
+        } else {
+            model.predict_with_evidence(
                 &snapshot.fingerprint,
                 shape,
                 evidence.map(|domain| &domain.shapes()[index]),
                 now_ns,
             )
-            .ok_or(PlanningUnknownReason::CostUnavailable)?;
+        }
+        .ok_or(PlanningUnknownReason::CostUnavailable)?;
         poll()?;
         if cost.model_version != snapshot.cost_model_version {
             return Err(PlanningUnknownReason::ModelVersionMismatch);
@@ -542,6 +641,39 @@ fn logical_work(
         .reference
         .work_at(high_water)
         .ok_or(PlanningUnknownReason::MissingReferenceWork)
+}
+
+/// Only the edge that first crosses a reference-work threshold owes its
+/// completion time to that milestone. Previously committed work, including
+/// replay credit, is not performed again by later peer or maintenance edges.
+/// Late or still-incomplete work remains rejected by `check_milestones`.
+fn newly_completed_milestone_slack(
+    snapshot: &SchedulerSnapshot,
+    index: usize,
+    previous_work: u64,
+    completed_work: u64,
+    end_ns: u64,
+    protection: Option<&PlanningObligationSet>,
+) -> Option<u64> {
+    let initial = &snapshot.requests[index];
+    let RequestPhaseView::Prefill(progress) = &initial.phase else {
+        return None;
+    };
+    if initial.timing.committed_tokens > 0 {
+        return None;
+    }
+    progress
+        .milestones
+        .iter()
+        .enumerate()
+        .filter(|(m, milestone)| {
+            protection.is_none_or(|scope| scope.requires_milestone(index, *m))
+                && previous_work < milestone.required_reference_work_ns
+                && milestone.required_reference_work_ns <= completed_work
+                && milestone.at_ns >= end_ns
+        })
+        .map(|(_, milestone)| milestone.at_ns - end_ns)
+        .min()
 }
 
 fn check_milestones(

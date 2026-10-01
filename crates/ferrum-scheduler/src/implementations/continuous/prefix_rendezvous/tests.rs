@@ -1,5 +1,130 @@
 use super::*;
 
+#[tokio::test]
+async fn admitted_prefix_hold_retains_capacity_and_blocks_real_batches_until_release() {
+    let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+        prefill_step_chunk: Some(8),
+        prefill_first_until_active: Some(3),
+        ..Default::default()
+    });
+    let source = scheduler.submit(request()).await.unwrap();
+    let follower = scheduler.submit(request()).await.unwrap();
+    let other = scheduler.submit(request()).await.unwrap();
+    assert_eq!(admit(&scheduler, 3).len(), 3);
+    let source_key = key(&scheduler, &source);
+    let follower_key = key(&scheduler, &follower);
+    let hold = scheduler
+        .hold_admitted_prefix_follower(&source_key, &follower_key, plan(7))
+        .unwrap();
+    assert_eq!(scheduler.active_count(), 3);
+    assert_eq!(scheduler.waiting_count(), 0);
+    let captured = scheduler
+        .planning_state(std::num::NonZeroUsize::new(8).unwrap(), wake())
+        .unwrap();
+    let target = captured
+        .requests()
+        .iter()
+        .find(|r| r.key.request_id == follower)
+        .unwrap();
+    assert!(target.readiness.admitted && target.readiness.prefix_blocked);
+    let mut hint = BatchHint::simple(3);
+    hint.max_tokens = 32;
+    let batch = scheduler
+        .next_batch_with_prepared_admission_observed(hint.clone(), wake(), &mut |_| {})
+        .unwrap()
+        .unwrap();
+    assert!(!batch.requests.iter().any(|r| r.request.id == follower));
+    assert!(batch.requests.iter().any(|r| r.request.id == other));
+    assert_eq!(
+        batch
+            .requests
+            .iter()
+            .find(|r| r.request.id == source)
+            .unwrap()
+            .tokens_to_process,
+        Some(7)
+    );
+    for row in &batch.requests {
+        scheduler.mark_prefill_chunk_processed(&row.request.id, 13, row.tokens_to_process.unwrap());
+    }
+    hold.release();
+    assert_eq!(scheduler.active_count(), 3);
+    let resumed = scheduler
+        .next_batch_with_prepared_admission_observed(hint, wake(), &mut |_| {})
+        .unwrap()
+        .unwrap();
+    assert!(resumed.requests.iter().any(|r| r.request.id == follower));
+    assert_eq!(scheduler.waiting_count(), 0);
+}
+
+#[tokio::test]
+async fn admitted_prefix_hold_rejects_stale_progress_inflight_and_pending_restore() {
+    let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+    let source = scheduler.submit(request()).await.unwrap();
+    let follower = scheduler.submit(request()).await.unwrap();
+    admit(&scheduler, 2);
+    let stale_source = key(&scheduler, &source);
+    let follower_key = key(&scheduler, &follower);
+    scheduler.mark_prefill_chunk_processed(&source, 13, 4);
+    assert!(scheduler
+        .hold_admitted_prefix_follower(&stale_source, &follower_key, plan(9))
+        .is_none());
+    let source_key = key(&scheduler, &source);
+    let restore = scheduler
+        .prepare_prefix_restore(&follower, 0, 13)
+        .unwrap()
+        .unwrap();
+    assert!(scheduler
+        .hold_admitted_prefix_follower(&source_key, &follower_key, plan(9))
+        .is_none());
+    drop(restore);
+    let mut hint = BatchHint::simple(2);
+    hint.max_tokens = 32;
+    let batch = scheduler
+        .next_batch_with_prepared_admission_observed(hint, wake(), &mut |_| {})
+        .unwrap()
+        .unwrap();
+    assert!(batch.requests.iter().any(|r| r.request.id == follower));
+    assert!(scheduler
+        .hold_admitted_prefix_follower(&source_key, &follower_key, plan(9))
+        .is_none());
+    assert_eq!(scheduler.active_count(), 2);
+}
+
+#[tokio::test]
+async fn admitted_prefix_hold_drop_and_source_cancellation_release_real_dependencies() {
+    for cancel_source in [false, true] {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prefill_step_chunk: Some(8),
+            ..Default::default()
+        });
+        let source = scheduler.submit(request()).await.unwrap();
+        let follower = scheduler.submit(request()).await.unwrap();
+        admit(&scheduler, 2);
+        let hold = scheduler
+            .hold_admitted_prefix_follower(
+                &key(&scheduler, &source),
+                &key(&scheduler, &follower),
+                plan(7),
+            )
+            .unwrap();
+        if cancel_source {
+            assert!(scheduler.cancel(source.clone()).await.unwrap());
+            assert!(!hold.is_pending());
+        }
+        drop(hold);
+        let mut hint = BatchHint::simple(2);
+        hint.max_tokens = 32;
+        let batch = scheduler
+            .next_batch_with_prepared_admission_observed(hint, wake(), &mut |_| {})
+            .unwrap()
+            .unwrap();
+        assert!(batch.requests.iter().any(|r| r.request.id == follower));
+        assert_eq!(scheduler.active_count(), if cancel_source { 1 } else { 2 });
+        assert_eq!(scheduler.waiting_count(), 0);
+    }
+}
+
 fn plan(boundary: usize) -> PrefixCapturePlan {
     PrefixCapturePlan {
         boundary,

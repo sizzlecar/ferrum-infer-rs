@@ -17,6 +17,17 @@ struct Maintenance {
 }
 
 impl ControlledDeferrals {
+    pub(super) fn take_plain(&self, entries: &AtomicUsize) -> Option<ExecutorExecutionDeferral> {
+        let value = self.pending.lock().take()?;
+        entries.fetch_add(1, Ordering::AcqRel);
+        match value {
+            GuardedDispatchOutcome::Deferred(deferral) => Some(deferral),
+            _ => panic!(
+                "plain fixture accepts only a pre-submit deferral without a maintenance ticket"
+            ),
+        }
+    }
+
     pub fn capacity(&self, ids: &[RequestId], maintenance: Option<bool>) {
         let epoch = self.capacity_epoch.load(Ordering::Acquire);
         let observed = ExecutorAdmissionEpochs::new(NonZeroU64::new(47).unwrap(), 0, epoch);
@@ -64,6 +75,28 @@ impl ControlledDeferrals {
             None => GuardedDispatchOutcome::Deferred(deferral),
         };
         assert!(self.pending.lock().replace(outcome).is_none());
+    }
+
+    /// Record the original typed pre-submit capacity decision through the same
+    /// recorder API used by production executors. A generic control outcome
+    /// or a failed guard never creates NoSubmission evidence.
+    pub(super) fn take_observed<T>(
+        &self,
+        guard: &dyn NonblockingHostSubmissionGuard,
+        entries: &AtomicUsize,
+        observation: GuardedCostObservation<'_, '_>,
+    ) -> Option<GuardedDispatchOutcome<T>> {
+        let outcome = self.take(guard, entries)?;
+        if let Some(context) = observation {
+            match &outcome {
+                GuardedDispatchOutcome::Deferred(deferral)
+                | GuardedDispatchOutcome::MaintenanceDeferred { deferral, .. } => {
+                    context.finish_capacity_deferred(deferral);
+                }
+                _ => {}
+            }
+        }
+        Some(outcome)
     }
 
     pub fn take<T>(

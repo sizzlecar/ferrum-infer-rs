@@ -19,8 +19,10 @@ use std::{
 
 mod execution_completion;
 mod execution_maintenance;
+mod planning_capture;
 mod prefix_capture;
 mod prefix_restore;
+mod resource_preparation;
 mod token_policy_residency;
 pub use execution_completion::{
     ExecutorAdmissionCancellationObservation, ExecutorCompletionActivities,
@@ -29,14 +31,19 @@ pub use execution_completion::{
 pub use execution_maintenance::{
     ExecutorExecutionMaintenanceOutcome, ExecutorExecutionMaintenanceTicket,
 };
+pub use planning_capture::{ExecutorCompletionPlanningCapture, ExecutorPlanningCapture};
 pub use prefix_capture::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
-    PrefixCaptureStatus,
+    PrefixCaptureStatus, PrefixReadyRestoreRequest,
 };
 pub use prefix_restore::{
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
     PrefixRestoreObservation, PrefixRestoreSource,
+};
+pub use resource_preparation::{
+    ExecutorResourcePreparationOutcome, ExecutorResourcePreparationReceipt,
+    ExecutorResourcePreparationRequest,
 };
 pub use token_policy_residency::{
     TokenPolicyResidencyInvalidation, TokenPolicyResidencyUnavailable,
@@ -3122,12 +3129,51 @@ pub trait ModelExecutor: Send + Sync {
         crate::execution_cost::ExecutorCostIdentityAvailability::default()
     }
 
+    /// Cached finite workload metadata for an empirical cost model. This does
+    /// not authorize a route: each actual/future query still needs its original
+    /// validated projection and live resource proof. External executors remain
+    /// explicitly unknown unless they export real compiled limits.
+    fn cost_workload_domain(&self) -> crate::execution_cost::CostWorkloadDomainAvailability {
+        crate::execution_cost::CostWorkloadDomainAvailability::default()
+    }
+
+    /// Cached decode-context boundaries from the actual selected providers.
+    /// Empty nodes mean no declaration; neither this metadata nor a complete
+    /// declaration establishes measured cost coverage or execution authority.
+    fn decode_context_coverage(&self) -> Arc<crate::vnext::ExecutorDecodeContextCoverage> {
+        Arc::new(crate::vnext::ExecutorDecodeContextCoverage::default())
+    }
+
     /// Observability is separate from resource authority and native batching.
     /// Remain unavailable until an actual per-physical-wave observer is wired.
     fn execution_cost_observation_capability(
         &self,
     ) -> crate::execution_cost::ExecutorCostObservationCapability {
         crate::execution_cost::ExecutorCostObservationCapability::Unavailable
+    }
+
+    /// Cold shared-engine installation before startup captures any immutable
+    /// observation templates. This budget grants no execution resource.
+    fn install_observation_template_budget(
+        &self,
+        _budget: Arc<crate::vnext::DeviceObservationTemplateBudget>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Returns the existing shared CPU budget, never a numerical projection.
+    fn observation_template_budget(
+        &self,
+    ) -> Option<Arc<crate::vnext::DeviceObservationTemplateBudget>> {
+        None
+    }
+
+    /// Install one nonblocking native checkpoint observer before execution.
+    /// Unsupported executors retain their existing behavior and return false.
+    fn install_checkpoint_observation_sink(
+        &self,
+        _sink: std::sync::Weak<dyn crate::vnext::NativeCheckpointObservationSink>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Plan an optional prompt-tail checkpoint before a prefill chunk is
@@ -3156,6 +3202,19 @@ pub trait ModelExecutor: Send + Sync {
         _input: PrefixCaptureRequest<'_>,
     ) -> Result<Option<Arc<dyn PrefixCaptureLease>>> {
         Ok(None)
+    }
+
+    /// Retain one currently ready compatible cache entry without waiting or
+    /// creating a producer dependency. The returned owner must independently
+    /// pass the current numeric and native restore proofs.
+    fn try_retain_ready_prefix(
+        &self,
+        _input: PrefixReadyRestoreRequest<'_>,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<Option<Arc<dyn PrefixCaptureLease>>> {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
     }
 
     /// Get model information and metadata
@@ -3206,6 +3265,50 @@ pub trait ModelExecutor: Send + Sync {
         )
     }
 
+    /// Materialize only the declared resource shapes using disposable real
+    /// owners. This cold, exclusive preparation may allocate and maintain
+    /// backing; it must not encode, submit, initialize model token state, or
+    /// publish cost evidence. The caller reserves every participant first and
+    /// must capture/prove live resources again afterward. The original budget
+    /// is polled between bounded allocator operations and is never renewed.
+    /// Implementations prepare retained workspace shapes before transient ones,
+    /// using their actual resource selectors; input order is not execution order.
+    fn prepare_execution_resources(
+        &self,
+        _requests: &[ExecutorResourcePreparationRequest],
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> Result<ExecutorResourcePreparationReceipt> {
+        Ok(ExecutorResourcePreparationReceipt {
+            outcome: ExecutorResourcePreparationOutcome::Unsupported,
+            prepared_participants: 0,
+        })
+    }
+
+    /// Capture completion first; capable executors may attach forecast evidence
+    /// under the same fresh resource/lane bracket. The default keeps the
+    /// completion-only protocol and never performs an extra resource capture.
+    fn execution_completion_planning_capture(
+        &self,
+        requests: &[ExecutorResourcePlanningRequest<'_>],
+        limits: crate::vnext::ResourcePlanningLimits,
+        _forecast_limits: crate::vnext::ResourcePlanningLimits,
+        observer: &mut dyn ExecutorPlanningCapture,
+    ) -> crate::vnext::ResourcePlanningAvailability<ExecutorCompletionPlanningCapture> {
+        use crate::vnext::ResourcePlanningAvailability as A;
+        match self.execution_resource_planning_view(requests, limits, observer.resource_budget()) {
+            A::Known(resources) => {
+                if observer.completion_ready(&resources) {
+                    observer.forecast_finished();
+                }
+                A::Known(ExecutorCompletionPlanningCapture {
+                    resources,
+                    forecast: None,
+                })
+            }
+            A::Unknown(reason) => A::Unknown(reason),
+        }
+    }
+
     /// Capture bounded numeric evidence for complete future eager waves.
     /// This does not prepare work or alter any execution policy.
     fn execution_cost_route_view(
@@ -3229,6 +3332,62 @@ pub trait ModelExecutor: Send + Sync {
         _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
     ) -> crate::vnext::ExecutionCostRouteAvailability<crate::vnext::ExecutionCostRouteProjection>
     {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
+    /// Project Capture/Restore under the same captured resource and route
+    /// identity as inference. Numerical successors grant no submission permit.
+    fn project_execution_checkpoint(
+        &self,
+        _view: &crate::vnext::ExecutionCostRouteView,
+        _state: &crate::vnext::ExecutionCostRouteState,
+        _query: crate::vnext::FutureCheckpointCostQuery<'_>,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<crate::vnext::FutureCheckpointCostProjection>
+    {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
+    fn bind_execution_retained_checkpoint(
+        &self,
+        _view: &crate::vnext::ExecutionCostRouteView,
+        _state: &crate::vnext::ExecutionCostRouteState,
+        _lease: &dyn PrefixCaptureLease,
+        _source: usize,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<crate::vnext::FutureRetainedCheckpointBinding>
+    {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
+    /// Bind an existing cache owner without requiring its retired producer in
+    /// the scheduling snapshot. Never reinterpret the target as that producer.
+    fn bind_execution_ready_checkpoint(
+        &self,
+        _view: &crate::vnext::ExecutionCostRouteView,
+        _state: &crate::vnext::ExecutionCostRouteState,
+        _lease: &dyn PrefixCaptureLease,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<crate::vnext::FutureRetainedCheckpointBinding>
+    {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
+    fn execution_checkpoint_restore_completed(
+        &self,
+        _view: &crate::vnext::ExecutionCostRouteView,
+        _lease: &dyn PrefixCaptureLease,
+        _target: usize,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<bool> {
         crate::vnext::ExecutionCostRouteAvailability::Unknown(
             crate::vnext::ExecutionCostRouteUnknown::Unsupported,
         )
@@ -3398,6 +3557,32 @@ pub trait ModelExecutor: Send + Sync {
     /// This must include resolved model/provider support and product policy.
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
         false
+    }
+
+    /// Explicit capture/restore turns have a native final submission guard.
+    /// Guarded inference also preserves the exact selected prefill span and
+    /// suppresses implicit checkpoint copies: declared cache opportunities are
+    /// executed only as independently planned maintenance turns.
+    fn supports_guarded_prefix_maintenance(&self) -> bool {
+        false
+    }
+
+    /// Capture this already-retired source boundary in a separate maintenance
+    /// turn. False means no reusable checkpoint was published.
+    async fn try_capture_plan_runtime_prefix_guarded(
+        &self,
+        _input: PrefixCaptureRequest<'_>,
+        _guard: Arc<dyn crate::vnext::CheckpointTransferSubmissionGuard>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn try_restore_plan_runtime_prefix_guarded(
+        &self,
+        _input: PlanRuntimePrefixRestoreInput<'_>,
+        _guard: Arc<dyn crate::vnext::CheckpointTransferSubmissionGuard>,
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
+        Ok(PlanRuntimePrefixRestoreOutcome::Unavailable)
     }
 
     /// Restore a proper prefix into a freshly admitted request before the

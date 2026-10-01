@@ -351,7 +351,7 @@ impl StructuredCalibrationCollector {
         let recorded = self.source.record(
             &serde_json::json!({"kind":"completed","offered":reserved.offered,
             "member":reserved.member,"phase":reserved.phase,"queue":queue,"reconciled":reconciled,
-            "host_stages":stages.as_ref().map(|value|value.structured_diagnostic_view()),
+            "host_stages":stages.as_ref().map(|value|value.structured_source_view()),
             "selected_independent_attention_v2":stages.as_ref().and_then(|value|value.statistical_evidence.as_ref())
                 .and_then(|value|value.independent_attention_v2()),
             "selected_structured_capture":stages.as_ref().and_then(|value|value.statistical_evidence.as_ref())

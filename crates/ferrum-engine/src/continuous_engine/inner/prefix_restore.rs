@@ -71,6 +71,59 @@ impl EngineInner {
             .resume_prefix_restore_after_capacity(prepared, wake, &release)
     }
 
+    /// The native acknowledgement follows the same scheduler and engine
+    /// frontier commit for ordinary and SLO-guarded checkpoint restoration.
+    pub(super) fn commit_prefix_restore_output(
+        &self,
+        request_id: &RequestId,
+        prepared: PreparedPrefixRestore,
+        tokens: &[TokenId],
+        output: ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreOutput,
+    ) -> Result<()> {
+        let prompt_tokens = tokens.len();
+        output.validate_for(request_id, prompt_tokens)?;
+        let restored_tokens = output.restored_tokens();
+        let (update, acknowledged) = {
+            let mut sequences = self.sequences.write();
+            let sequence = sequences
+                .get_mut(request_id)
+                .ok_or_else(|| FerrumError::internal("prefix restore lost its outer sequence"))?;
+            if sequence.prefill_tokens_processed != 0
+                || sequence.prefill_complete
+                || sequence.prefill_context_tokens() != tokens
+            {
+                return Err(FerrumError::internal(
+                    "prefix restore outer sequence changed before publication",
+                ));
+            }
+            self.scheduler
+                .commit_prefix_restored(prepared, restored_tokens)?;
+            let reference_commit = sequence.prepare_prefill_reference_commit(
+                ferrum_interfaces::model_executor::PrefillChunk::new(
+                    0,
+                    restored_tokens,
+                    prompt_tokens,
+                )?,
+            );
+            let update = sequence.commit_plan_runtime_prefill_chunk_resources(
+                Arc::clone(output.kv_cache()),
+                restored_tokens,
+                false,
+            );
+            let acknowledged = output.acknowledge();
+            if acknowledged.is_ok() {
+                sequence.publish_prefill_reference_commit(reference_commit);
+            }
+            (update, acknowledged)
+        };
+        self.apply_model_cache_ref_update(request_id, update);
+        acknowledged?;
+        self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+        counter!("ferrum.engine.prefix_cache_hits").increment(1);
+        counter!("ferrum.engine.prefix_cache_tokens_total").increment(restored_tokens as u64);
+        Ok(())
+    }
+
     /// Called under the existing iteration lock, after admission and before
     /// publishing a batch. Submit/replacement uses the same lock, so one
     /// scheduler preparation cannot be applied to another outer sequence.
@@ -196,64 +249,13 @@ impl EngineInner {
                     continue;
                 }
             };
-            if let Err(error) = output.validate_for(&request_id, prompt_tokens) {
-                drop(output);
-                drop(prepared);
-                self.complete_request_with_error(&request_id, error).await?;
-                continue;
-            }
             let restored_tokens = output.restored_tokens();
-            let committed = (|| {
-                let mut sequences = self.sequences.write();
-                let sequence = sequences.get_mut(&request_id).ok_or_else(|| {
-                    FerrumError::internal("prefix restore lost its outer sequence")
-                })?;
-                if sequence.prefill_tokens_processed != 0
-                    || sequence.prefill_complete
-                    || sequence.prefill_context_tokens() != tokens
-                {
-                    return Err(FerrumError::internal(
-                        "prefix restore outer sequence changed before publication",
-                    ));
-                }
-                self.scheduler
-                    .commit_prefix_restored(prepared, restored_tokens)?;
-                let reference_commit = sequence.prepare_prefill_reference_commit(
-                    ferrum_interfaces::model_executor::PrefillChunk::new(
-                        0,
-                        restored_tokens,
-                        prompt_tokens,
-                    )?,
-                );
-                let update = sequence.commit_plan_runtime_prefill_chunk_resources(
-                    Arc::clone(output.kv_cache()),
-                    restored_tokens,
-                    false,
-                );
-                // Both outer owners now agree. Only the native publication
-                // may open the target execution gate. The closure also drops
-                // that owner before error cleanup awaits request release.
-                let acknowledged = output.acknowledge();
-                if acknowledged.is_ok() {
-                    sequence.publish_prefill_reference_commit(reference_commit);
-                }
-                Ok((update, acknowledged))
-            })();
-            let (update, acknowledged) = match committed {
-                Ok(value) => value,
-                Err(error) => {
-                    self.complete_request_with_error(&request_id, error).await?;
-                    continue;
-                }
-            };
-            self.apply_model_cache_ref_update(&request_id, update);
-            if let Err(error) = acknowledged {
+            if let Err(error) =
+                self.commit_prefix_restore_output(&request_id, prepared, &tokens, output)
+            {
                 self.complete_request_with_error(&request_id, error).await?;
                 continue;
             }
-            self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
-            counter!("ferrum.engine.prefix_cache_hits").increment(1);
-            counter!("ferrum.engine.prefix_cache_tokens_total").increment(restored_tokens as u64);
             self.write_executor_scheduler_profile_event(
                 &request_id,
                 "vnext.prefix_restore",

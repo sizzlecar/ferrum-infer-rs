@@ -17,13 +17,24 @@ use super::{
     VNextError, WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
+mod strided_copy;
+pub use strided_copy::StridedCopyRegion;
+pub(crate) use strided_copy::{split_strided_copy, StridedCopySplitError};
+
 mod cost_identity;
 pub use cost_identity::*;
 mod cost_graph;
 pub use cost_graph::*;
 mod cost_range;
+mod observation;
 mod replay_cost;
 pub use cost_range::*;
+pub use observation::{
+    DeviceObservationPacket, DeviceObservationTemplate, DeviceObservationTemplateBudget,
+    DeviceObservationTemplateReservation, DeviceReplayedCommandCatalogue, FrozenObservationInput,
+    RetainedDeviceObservationTemplate, DEFAULT_OBSERVATION_TEMPLATE_BYTES,
+    MAXIMUM_OBSERVATION_TEMPLATE_BYTES,
+};
 pub use replay_cost::DeviceReplayCostWork;
 pub(crate) use replay_cost::ReplayCostInput;
 mod submission_guard;
@@ -730,6 +741,24 @@ pub enum DeviceTimingMode {
 }
 
 impl DeviceTimingMode {
+    /// Completion profiling retains the same native execution path. Kernel and
+    /// replay diagnostics need a separate guarded protocol and remain unsupported.
+    pub const fn guarded_completion_compatible(self) -> bool {
+        matches!(self, Self::Off | Self::Completion)
+    }
+
+    /// Shared product mapping used before cost identity construction and by sinks.
+    pub const fn for_profile_detail(detail: ferrum_types::ObservabilityProfileDetail) -> Self {
+        use ferrum_types::ObservabilityProfileDetail as D;
+        match detail {
+            D::Off | D::Host | D::Resource | D::Latency => Self::Off,
+            D::Basic | D::Debug => Self::Completion,
+            D::Replay => Self::Replay,
+            D::Verify => Self::Verification,
+            D::Kernel | D::Full => Self::Kernel,
+        }
+    }
+
     pub const fn completion_enabled(self) -> bool {
         !matches!(self, Self::Off)
     }
@@ -1587,6 +1616,8 @@ impl DeviceReusableExecutionProgram {
 pub struct DeviceReusableExecutionInvocation {
     #[serde(skip)]
     selected_replay_cost: Option<Arc<[replay_cost::ReplayCostInput]>>,
+    #[serde(skip)]
+    observation_input: Option<FrozenObservationInput>,
     program_id: DeviceReusableExecutionProgramId,
     segment: DeviceReusableExecutionSegment,
     participant_count: u32,
@@ -1616,6 +1647,7 @@ impl DeviceReusableExecutionInvocation {
             participant_count,
             token_count,
             selected_replay_cost: None,
+            observation_input: None,
         })
     }
 
@@ -1633,6 +1665,20 @@ impl DeviceReusableExecutionInvocation {
 
     pub const fn token_count(&self) -> u64 {
         self.token_count
+    }
+
+    pub(crate) fn with_observation_input(mut self, input: FrozenObservationInput) -> Self {
+        if input.tokens() == self.token_count
+            && input.participant_ranges().len() == self.participant_count as usize
+        {
+            self.observation_input = Some(input);
+        }
+        self
+    }
+    /// CPU-only current work supplied by core's actual wave. It is not an
+    /// execution receipt until the runtime binds it to a successful launch.
+    pub fn observation_input(&self) -> Option<&FrozenObservationInput> {
+        self.observation_input.as_ref()
     }
 }
 
@@ -2573,6 +2619,8 @@ pub struct DeviceNativeWorkAttribution {
     reusable_graph_node_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     statistical_evidence: Option<crate::execution_cost::SelectedCommandCostEvidenceV1>,
+    #[serde(skip)]
+    observation: Option<DeviceObservationPacket>,
 }
 // Equality retains the legacy exact contract. Passive statistics must be
 // compared explicitly and can never alter an execution/route equality gate.
@@ -2663,6 +2711,7 @@ impl DeviceNativeWorkAttribution {
             transfer_command_count,
             reusable_graph_node_count,
             statistical_evidence: None,
+            observation: None,
         })
     }
 
@@ -2846,13 +2895,34 @@ impl DeviceReplayedLogicalCommandAttribution {
 /// Physical timing remains indexed by `physical_command_index`; the ordered
 /// logical rows bind that launch back to every plan node captured in the
 /// sealed program segment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceReplayedSegmentAttribution {
     physical_command_index: u32,
     program_id: DeviceReusableExecutionProgramId,
     segment: DeviceReusableExecutionSegment,
     reusable_executable_fingerprint: String,
-    logical_commands: Box<[DeviceReplayedLogicalCommandAttribution]>,
+    #[serde(serialize_with = "serialize_replayed_logical_commands")]
+    logical_commands: Arc<[DeviceReplayedLogicalCommandAttribution]>,
+    #[serde(skip)]
+    observation: Option<DeviceObservationPacket>,
+    #[serde(skip)]
+    logical_payload_bytes: usize,
+    #[serde(skip)]
+    logical_graph_nodes: u64,
+    #[serde(skip)]
+    logical_participants: u32,
+    #[serde(skip)]
+    logical_has_statistical_evidence: bool,
+}
+
+fn serialize_replayed_logical_commands<S>(
+    commands: &Arc<[DeviceReplayedLogicalCommandAttribution]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    commands.as_ref().serialize(serializer)
 }
 
 impl DeviceReplayedSegmentAttribution {
@@ -2863,6 +2933,47 @@ impl DeviceReplayedSegmentAttribution {
         reusable_executable_fingerprint: String,
         logical_commands: Vec<DeviceReplayedLogicalCommandAttribution>,
     ) -> Option<Self> {
+        Self::from_logical_commands(
+            physical_command_index,
+            program_id,
+            segment,
+            reusable_executable_fingerprint,
+            logical_commands,
+        )
+    }
+
+    /// Retain an immutable logical population without copying every row.
+    /// This performs the same validation as `new` and grants no execution
+    /// authority. A sampled population must still come from the current wave;
+    /// sharing cannot substitute a prior wave's numerical evidence.
+    pub fn from_shared_logical_commands(
+        physical_command_index: u32,
+        program_id: DeviceReusableExecutionProgramId,
+        segment: DeviceReusableExecutionSegment,
+        reusable_executable_fingerprint: String,
+        logical_commands: Arc<[DeviceReplayedLogicalCommandAttribution]>,
+    ) -> Option<Self> {
+        Self::from_logical_commands(
+            physical_command_index,
+            program_id,
+            segment,
+            reusable_executable_fingerprint,
+            logical_commands,
+        )
+    }
+
+    fn from_logical_commands<L>(
+        physical_command_index: u32,
+        program_id: DeviceReusableExecutionProgramId,
+        segment: DeviceReusableExecutionSegment,
+        reusable_executable_fingerprint: String,
+        logical_commands: L,
+    ) -> Option<Self>
+    where
+        L: AsRef<[DeviceReplayedLogicalCommandAttribution]>
+            + Into<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
+    {
+        let rows = logical_commands.as_ref();
         let canonical_sha256 = reusable_executable_fingerprint.len() == 64
             && reusable_executable_fingerprint
                 .bytes()
@@ -2872,26 +2983,30 @@ impl DeviceReplayedSegmentAttribution {
                 .start_node_index()
                 .checked_add(segment.logical_command_count())
                 != Some(segment.end_node_index())
-            || logical_commands.len() != segment.logical_command_count() as usize
-            || logical_commands
-                .iter()
-                .enumerate()
-                .any(|(ordinal, command)| {
-                    u32::try_from(ordinal).ok() != Some(command.logical_command_ordinal())
-                        || segment
-                            .start_node_index()
-                            .checked_add(command.logical_command_ordinal())
-                            != Some(command.node_index())
-                })
+            || rows.len() != segment.logical_command_count() as usize
+            || rows.iter().enumerate().any(|(ordinal, command)| {
+                u32::try_from(ordinal).ok() != Some(command.logical_command_ordinal())
+                    || segment
+                        .start_node_index()
+                        .checked_add(command.logical_command_ordinal())
+                        != Some(command.node_index())
+            })
         {
             return None;
         }
+        let catalogue =
+            DeviceReplayedCommandCatalogue::new(segment.clone(), logical_commands.into())?;
         Some(Self {
             physical_command_index,
             program_id,
             segment,
             reusable_executable_fingerprint,
-            logical_commands: logical_commands.into_boxed_slice(),
+            logical_commands: Arc::clone(&catalogue.commands),
+            observation: None,
+            logical_payload_bytes: catalogue.payload_bytes,
+            logical_graph_nodes: catalogue.graph_nodes,
+            logical_participants: catalogue.participants,
+            logical_has_statistical_evidence: catalogue.has_statistical_evidence,
         })
     }
 
@@ -2918,8 +3033,10 @@ impl DeviceReplayedSegmentAttribution {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceSubmissionAttribution {
-    commands: Box<[DeviceNativeWorkAttribution]>,
-    replayed_segments: Box<[DeviceReplayedSegmentAttribution]>,
+    #[serde(serialize_with = "observation::serialize_commands")]
+    commands: Arc<[DeviceNativeWorkAttribution]>,
+    #[serde(serialize_with = "observation::serialize_segments")]
+    replayed_segments: Arc<[DeviceReplayedSegmentAttribution]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     graph_evidence: Option<DeviceSubmissionGraphEvidence>,
 }
@@ -2951,12 +3068,7 @@ impl DeviceSubmissionAttribution {
                 })
                 .ok()?;
             let physical = commands.get(physical_index)?;
-            let logical_graph_node_count = segment
-                .logical_commands()
-                .iter()
-                .try_fold(0_u64, |total, logical| {
-                    total.checked_add(logical.reusable_graph_node_count())
-                })?;
+            let logical_graph_node_count = segment.logical_graph_nodes;
             if physical.command_index() != segment.physical_command_index()
                 || physical.command_phase() != DeviceCommandPhase::Compute
                 || physical.execution_path() != DeviceExecutionPath::Replayed
@@ -2965,17 +3077,14 @@ impl DeviceSubmissionAttribution {
                 || physical.participant_start() != 0
                 || physical.participant_count() != segment.program_id().immediate_sequences()
                 || physical.token_count() != segment.program_id().immediate_tokens()
-                || segment
-                    .logical_commands()
-                    .iter()
-                    .any(|logical| logical.participant_count() != physical.participant_count())
+                || segment.logical_participants != physical.participant_count()
             {
                 return None;
             }
         }
         Some(Self {
-            commands: commands.into_boxed_slice(),
-            replayed_segments: replayed_segments.into_boxed_slice(),
+            commands: commands.into(),
+            replayed_segments: replayed_segments.into(),
             graph_evidence: None,
         })
     }
@@ -3177,6 +3286,21 @@ impl<C> DeviceCommandEntry<C> {
     }
 }
 
+/// Passive numerical observation demand for this call. Exact execution
+/// attribution and submission permission are separate, unchanged contracts.
+/// Legacy low-level callers retain their existing observation behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeviceCostObservationDemand {
+    #[default]
+    Required,
+    NotRequired,
+}
+impl DeviceCostObservationDemand {
+    pub const fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
 /// Core-owned physical submission unit.
 ///
 /// Operation providers produce individual commands, while the execution
@@ -3190,6 +3314,7 @@ pub struct DeviceCommandBatch<C> {
     compute_path_requirement: DeviceComputePathRequirement,
     declared_eager_compute_node_indices: Vec<u32>,
     attribution_requirement: DeviceSubmissionAttributionRequirement,
+    cost_observation_demand: DeviceCostObservationDemand,
     reusable_execution_capture: Option<DeviceReusableExecutionCapture>,
 }
 
@@ -3206,6 +3331,7 @@ impl<C> DeviceCommandBatch<C> {
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            cost_observation_demand: DeviceCostObservationDemand::Required,
             reusable_execution_capture: None,
         }
     }
@@ -3217,6 +3343,7 @@ impl<C> DeviceCommandBatch<C> {
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            cost_observation_demand: DeviceCostObservationDemand::Required,
             reusable_execution_capture: None,
         }
     }
@@ -3228,6 +3355,7 @@ impl<C> DeviceCommandBatch<C> {
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            cost_observation_demand: DeviceCostObservationDemand::Required,
             reusable_execution_capture: None,
         }
     }
@@ -3243,8 +3371,16 @@ impl<C> DeviceCommandBatch<C> {
             compute_path_requirement,
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            cost_observation_demand: DeviceCostObservationDemand::Required,
             reusable_execution_capture: None,
         }
+    }
+
+    pub(crate) fn set_cost_observation_demand(&mut self, demand: DeviceCostObservationDemand) {
+        self.cost_observation_demand = demand;
+    }
+    pub const fn cost_observation_demand(&self) -> DeviceCostObservationDemand {
+        self.cost_observation_demand
     }
 
     pub(crate) fn set_declared_eager_compute_node_indices(
@@ -3550,6 +3686,18 @@ pub struct DeviceMemoryTelemetrySnapshot {
     pub end_reason: Option<String>,
 }
 
+/// One fresh descriptor read, with an owned fallback for existing runtimes.
+/// This adapter retains no cache and does not validate resource authority.
+pub(crate) fn read_buffer_descriptor<'buffer, R: DeviceRuntime>(
+    runtime: &R,
+    buffer: &'buffer R::Buffer,
+) -> std::borrow::Cow<'buffer, BufferDescriptor> {
+    match runtime.borrowed_buffer_descriptor(buffer) {
+        Some(descriptor) => std::borrow::Cow::Borrowed(descriptor),
+        None => std::borrow::Cow::Owned(runtime.buffer_descriptor(buffer)),
+    }
+}
+
 /// Stable primitive boundary implemented by a concrete device runtime.
 ///
 /// Associated buffer, stream, command, and error types preserve compile-time
@@ -3565,6 +3713,17 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// numeric invocations/tables. This is not timing or execution capability.
     fn structured_cost_capture(&self) -> ferrum_types::SloStructuredCostCapture {
         ferrum_types::SloStructuredCostCapture::Disabled
+    }
+    /// Install once before any cold execution/preparation. Unsupported
+    /// observers accept installation but expose None, preserving inference.
+    fn install_observation_template_budget(
+        &self,
+        _budget: Arc<DeviceObservationTemplateBudget>,
+    ) -> Result<(), VNextError> {
+        Ok(())
+    }
+    fn observation_template_budget(&self) -> Option<Arc<DeviceObservationTemplateBudget>> {
+        None
     }
 
     fn descriptor(&self) -> &DeviceDescriptor;
@@ -3583,6 +3742,29 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         DeviceCostGraphCaptureCapability::Unknown
     }
 
+    /// One-time numeric ownership binding performed by ExecutionLane::create
+    /// on its actual ready stream. Queries must never claim a lane by looking
+    /// at a requested program ID. Existing runtimes need no additional state.
+    fn bind_cost_graph_catalog_lane(
+        &self,
+        _stream: &mut Self::Stream,
+        _lane: ExecutionLaneId,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Read only: no copying, index construction, capture or upload. Ready is
+    /// a complete root checked against this actual stream's current writer
+    /// generation. Unprepared never falls back to an older/partial catalog.
+    /// Unsupported preserves the existing bounded producer for old runtimes.
+    fn cost_prepared_reusable_graph_catalog(
+        &self,
+        _stream: &Self::Stream,
+        _poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<DevicePreparedCostGraphCatalogAvailability, Self::Error> {
+        Ok(DevicePreparedCostGraphCatalogAvailability::Unsupported)
+    }
+
     /// Nonblocking numeric state of this exact stream's graph preparation and
     /// resident cache. Callers must hold the owning lane's quiescent bracket.
     /// Missing evidence remains unknown even when no replay was observed.
@@ -3593,6 +3775,20 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         _poll: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Option<Result<DeviceCostGraphCatalog, Self::Error>> {
         None
+    }
+
+    /// Shared immutable numeric metadata, not an executable or resource lease.
+    /// Backends may reuse a catalog only within its real stream owner and must
+    /// invalidate it on every catalog mutation. The default preserves the owned
+    /// producer and its cancellation/limit behavior for existing backends.
+    fn cost_reusable_graph_catalog_shared(
+        &self,
+        stream: &Self::Stream,
+        limits: DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<Arc<DeviceCostGraphCatalog>, Self::Error>> {
+        self.cost_reusable_graph_catalog(stream, limits, poll)
+            .map(|result| result.map(Arc::new))
     }
 
     fn cost_graph_stream_state(
@@ -3662,6 +3858,18 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error>;
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor;
+
+    /// Optional current descriptor borrowed from immutable buffer-owned data.
+    /// Returning Some must agree with `buffer_descriptor` at this read. The
+    /// descriptor remains immutable for its borrow; it grants no resource or
+    /// execution authority and does not make later reads unnecessary. Runtimes
+    /// with computed/interior-mutable descriptors retain the owned fallback.
+    fn borrowed_buffer_descriptor<'buffer>(
+        &self,
+        _buffer: &'buffer Self::Buffer,
+    ) -> Option<&'buffer BufferDescriptor> {
+        None
+    }
 
     /// Opt-in numeric layout evidence for cost prediction. Other runtimes do
     /// not incur range capture or imply that resource IDs prove non-aliasing.
@@ -3772,6 +3980,17 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         region: CopyRegion,
     ) -> Result<Self::Command, Self::Error>;
 
+    /// Optional native rectangle copy. Callers reject unavailable support;
+    /// the default never expands a rectangle into unbounded row commands.
+    fn encode_strided_copy(
+        &self,
+        _source: &Self::Buffer,
+        _destination: &Self::Buffer,
+        _region: StridedCopyRegion,
+    ) -> Option<Result<Self::Command, Self::Error>> {
+        None
+    }
+
     fn encode_upload(
         &self,
         source: &[u8],
@@ -3799,6 +4018,16 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         Ok(commands)
     }
 
+    /// The default retains the existing backend coalescer. Implementations
+    /// may avoid passive metadata when no numerical consumer needs this wave.
+    fn coalesce_program_bindings_with_cost_observation(
+        &self,
+        commands: Vec<Self::Command>,
+        _demand: DeviceCostObservationDemand,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
+        self.coalesce_program_bindings(commands)
+    }
+
     /// Submits one non-empty ordered command batch and returns its exact
     /// completion fence. A backend must preserve command order and must not
     /// manufacture intermediate host-visible completion boundaries.
@@ -3818,6 +4047,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// commit boundary. A declaration of eager execution alone is insufficient.
     fn supports_guarded_submission(&self) -> bool {
         false
+    }
+
+    /// Native timing support for the same final guarded commit. Opting into
+    /// Completion requires timing setup to occur only after authorization, or
+    /// to be passive until the authorized command buffer is committed.
+    fn supports_guarded_submission_with_timing(&self, mode: DeviceTimingMode) -> bool {
+        self.supports_guarded_submission() && mode == DeviceTimingMode::Off
     }
 
     /// Separately implemented transaction for a cost-uncommitted cold wave.

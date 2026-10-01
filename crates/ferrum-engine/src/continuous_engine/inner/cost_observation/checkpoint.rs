@@ -13,6 +13,8 @@ pub(in crate::continuous_engine) enum CheckpointRequestError {
     Closing,
     #[error("cost observation ordinal is exhausted")]
     CounterExhausted,
+    #[error("qualified catalog cutoff differs from the accepted observation boundary")]
+    CutoffChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -31,6 +33,10 @@ pub(in crate::continuous_engine) struct FrozenCostCheckpoint {
     pub export: ExportAuditSnapshot,
     /// Independent immutable training evidence, not serialization of snapshot.
     pub profile_cut: Option<Result<CostProfileCutReceipt, String>>,
+    /// A private startup activation uses this same FIFO barrier. The worker
+    /// returns the installed epoch or the original installation failure; a
+    /// completed observation cut alone never attests to an installed catalog.
+    pub catalog_activation: Option<Result<u64, String>>,
 }
 
 /// Dropping the waiter never withdraws the barrier or discards queued samples.
@@ -50,6 +56,7 @@ pub(super) struct PendingCheckpoint {
     pub cutoff: u64,
     pub freezing: bool,
     pub export_paths: Option<CostProfileCutPaths>,
+    pub catalog_activation: Option<super::live_calibration::StartupCatalogActivation>,
     reply: oneshot::Sender<Result<FrozenCostCheckpoint, CheckpointError>>,
 }
 
@@ -64,6 +71,7 @@ impl PendingCheckpoint {
                 cutoff,
                 freezing: false,
                 export_paths,
+                catalog_activation: None,
                 reply,
             },
             CostCheckpointWaiter { receiver },
@@ -73,6 +81,12 @@ impl PendingCheckpoint {
         // Cancellation releases the returned Arc; it cannot stop training.
         let _ = self.reply.send(value);
     }
+}
+
+pub(super) struct CheckpointWork {
+    pub cutoff: u64,
+    pub export_paths: Option<CostProfileCutPaths>,
+    pub catalog_activation: Option<super::live_calibration::StartupCatalogActivation>,
 }
 
 #[cfg(test)]

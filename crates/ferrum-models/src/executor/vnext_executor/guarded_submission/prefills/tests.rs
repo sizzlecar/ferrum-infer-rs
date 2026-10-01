@@ -28,6 +28,7 @@ impl Harness {
                     .unwrap();
             let binding = Arc::new(TrustedActiveSequenceBinding::from_session(&session).unwrap());
             let sequence = Arc::new(VNextSequence {
+                explicit_checkpoint_maintenance: AtomicBool::new(false),
                 prefix_capture_interests: Mutex::new(Vec::new()),
                 cache_id: format!("guarded.{index}"),
                 request: root,

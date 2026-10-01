@@ -50,7 +50,29 @@ fn observe(
     cancel: bool,
     expect_attached: bool,
 ) -> Arc<HostStageEvidenceV1> {
-    record_with_hook(
+    observe_expecting(
+        f,
+        runtime,
+        pending,
+        wave,
+        terminal,
+        cancel,
+        expect_attached,
+        CostCallDisposition::Queued,
+    )
+}
+
+fn observe_expecting(
+    f: &Fixture,
+    runtime: &EngineCostRuntime,
+    pending: &Arc<ProspectiveCapture>,
+    wave: &Wave,
+    terminal: Option<ferrum_types::FinishReason>,
+    cancel: bool,
+    expect_attached: bool,
+    expected_disposition: CostCallDisposition,
+) -> Arc<HostStageEvidenceV1> {
+    record_with_hooks_expecting(
         &runtime.ids,
         &runtime.sink,
         &f.clock,
@@ -59,12 +81,14 @@ fn observe(
         None,
         0,
         terminal,
+        |_| None,
         |call| {
             attach(call, pending, expect_attached);
             if cancel {
                 call.host_cancelled(&call.participants[0].request_id.clone());
             }
         },
+        expected_disposition,
     )
 }
 fn count(runtime: &EngineCostRuntime, outcome: &str) -> u64 {
@@ -210,10 +234,23 @@ async fn prospective_fifo_loss_does_not_become_accepted_evidence() {
     f.config.max_samples_per_update = NonZeroUsize::new(1).unwrap();
     f.config.structured_feedback = SloStructuredFeedbackPolicy::Disabled;
     let runtime = f.build();
-    for _ in 0..2 {
+    for index in 0..2 {
         let w = wave("fixture.feedback.a");
         let pending = capture(&f, &runtime, &w, Instant::now() + Duration::from_secs(30));
-        let stages = observe(&f, &runtime, &pending, &w, None, false, true);
+        let stages = observe_expecting(
+            &f,
+            &runtime,
+            &pending,
+            &w,
+            None,
+            false,
+            true,
+            if index == 0 {
+                CostCallDisposition::Queued
+            } else {
+                CostCallDisposition::Dropped(CostSampleDrop::Capacity)
+            },
+        );
         assert_eq!(
             stages.prospective_capture.as_ref().unwrap().outcome(),
             Outcome::Matched
@@ -407,4 +444,72 @@ async fn prospective_duplicate_at_finish_boundary_uses_one_terminal_result() {
     drop(second);
     drop(pending);
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn prospective_raw_loss_records_queue_outcome_without_projecting_match() {
+    let mut f = fixture();
+    f.config.max_queued_samples = NonZeroUsize::new(1).unwrap();
+    f.config.max_samples_per_update = NonZeroUsize::new(1).unwrap();
+    f.config.structured_feedback = SloStructuredFeedbackPolicy::Disabled;
+    let runtime = f.build();
+    let mut retained = Vec::new();
+    for index in 0..2 {
+        let w = wave("fixture.feedback.a");
+        let pending = capture(&f, &runtime, &w, Instant::now() + Duration::from_secs(30));
+        let row = &w.actual.rows[0];
+        let mut call = EngineCostCall::begin(
+            &runtime.ids,
+            f.clock.clone(),
+            runtime.sink.clone(),
+            EngineCostCallSpec {
+                identity: identity(),
+                participants: vec![CostObservationParticipant {
+                    request_id: row.request_id.clone(),
+                    owner_incarnation: row.owner_incarnation,
+                    work_generation: row.work_generation,
+                    input_index: row.input_index,
+                    output_policy_signature: Some([6; 32]),
+                    host_features: Some(w.host),
+                }],
+                prepare_started_at_ns: f.clock.now_ns(),
+                boundary: WaveObservationBoundary::IsolatedPreparationToCommit,
+                recorder_limits: runtime.recorder_limits,
+            },
+        )
+        .unwrap()
+        .with_structured_capture(true);
+        attach(&mut call, &pending, true);
+        // No completed execution and no diagnostic make_host_stages call.
+        // Queue accounting cannot manufacture a successful actual match.
+        assert_eq!(
+            call.finish(),
+            if index == 0 {
+                CostCallDisposition::Queued
+            } else {
+                CostCallDisposition::Dropped(CostSampleDrop::Capacity)
+            }
+        );
+        retained.push(pending);
+    }
+    let audit = serde_json::to_value(runtime.audit_snapshot()).unwrap();
+    assert_eq!(audit["prospective_capture"]["queued"], 1);
+    assert_eq!(audit["prospective_capture"]["queue_dropped"], 1);
+    assert_eq!(count(&runtime, "matched"), 0);
+    assert_eq!(
+        count(&runtime, "abandoned"),
+        1,
+        "raw refusal terminates the original capture even while a caller retains it"
+    );
+    assert_eq!(runtime.sink.stats().raw_accepted, 1);
+    assert_eq!(runtime.sink.stats().raw_lost, 1);
+    runtime.shutdown().await.unwrap();
+    assert_eq!(count(&runtime, "matched"), 0);
+    assert_eq!(count(&runtime, "abandoned"), 2);
+    drop(retained);
+    assert_eq!(
+        count(&runtime, "abandoned"),
+        2,
+        "each original capture ends once"
+    );
 }

@@ -317,3 +317,237 @@ fn production_attention_host_binding_gap_does_not_discard_the_wave() {
         shape(&wrong, 0).provider_signature
     );
 }
+
+fn captured_attribution(tokens: u64, statistics: bool) -> DeviceSubmissionAttribution {
+    let mut command = DeviceNativeWorkAttribution::new(
+        0,
+        Some(0),
+        DeviceCommandPhase::Compute,
+        DeviceNativeOperationId::new("fixture.actual-capture").unwrap(),
+        DeviceExecutionPath::Eager,
+        DeviceBatchingForm::Packed,
+        1,
+        tokens,
+        1,
+        0,
+        None,
+    )
+    .unwrap();
+    if statistics {
+        let mut selected = SelectedCommandCostBuilderV1::new_with_algorithm_work(tokens);
+        selected
+            .kernel(
+                SelectedAlgorithmClassV1::new("fixture.actual-capture", 1, [5; 32], [6; 32])
+                    .unwrap(),
+                KernelNumericWorkV1 {
+                    logical_units: tokens * 64,
+                    padded_units: tokens * 64,
+                    inner_units_per_logical_unit: 1,
+                    grid: [1, 1, 1],
+                    scratch_bytes: 0,
+                    staged_weight_bytes: 0,
+                },
+            )
+            .unwrap();
+        command = command
+            .with_statistical_evidence(selected.finish().unwrap())
+            .unwrap();
+    }
+    DeviceSubmissionAttribution::new(vec![command]).unwrap()
+}
+
+fn project_actual_capture(
+    attribution: &DeviceSubmissionAttribution,
+    row: CanonicalCostRow,
+    product: CostProductOutput,
+    readback: CoreReadbackRoute,
+    capture: bool,
+) -> CanonicalStatisticalWave {
+    // This is the production adapter used by actual_shape_from_device_with_capture,
+    // including the real canonical builder's optional structured finish path.
+    let mut observed = actual_route_with_capture(
+        Some(attribution),
+        provider,
+        DeviceCostGraphCaptureCapability::Unsupported,
+        product,
+        0,
+        capture,
+    )
+    .unwrap();
+    observed.canonical.core_readback_route(readback).unwrap();
+    observed.canonical.row(row).unwrap();
+    observed
+        .canonical
+        .finish_with_captured_structure(
+            match row.work {
+                ActualRowWork::Prefill { .. } => ActualWaveKind::Prefill,
+                ActualRowWork::Decode { .. } => ActualWaveKind::Decode,
+                _ => unreachable!("inference-only cases"),
+            },
+            ActualWavePath::PlanRuntime,
+            observed.graph,
+            ActualWaveRowOrder::Ordered,
+            128,
+        )
+        .unwrap()
+}
+
+#[test]
+fn production_structured_actual_capture_preserves_legal_exact_routes_and_missing_sidecars() {
+    let token_readbacks = [
+        CoreReadbackRoute::SubmissionStaged,
+        CoreReadbackRoute::HostSynchronized,
+        CoreReadbackRoute::SubmissionFallbackSynchronized,
+    ];
+    let no_readback = [CoreReadbackRoute::NoReadback];
+    // Product prefill always requests FullLogits; its body produces no token
+    // and has no readback. Final prefill and decode can have the three real
+    // readback outcomes. GreedyToken is a decode product, not a prefill guess.
+    let cases = [
+        (
+            ActualRowWork::Prefill {
+                offset: 0,
+                count: 4,
+                total_prompt_tokens: 8,
+            },
+            CostRowOutput::Prefill {
+                final_logits: false,
+            },
+            CostProductOutput::FullLogits,
+            0,
+            no_readback.as_slice(),
+        ),
+        (
+            ActualRowWork::Prefill {
+                offset: 4,
+                count: 4,
+                total_prompt_tokens: 8,
+            },
+            CostRowOutput::Prefill { final_logits: true },
+            CostProductOutput::FullLogits,
+            0,
+            token_readbacks.as_slice(),
+        ),
+        (
+            ActualRowWork::Decode { kv_tokens: 12 },
+            CostRowOutput::Decode {
+                requires_full_logits: true,
+                repetition_tokens: 0,
+                repetition_penalty_bits: 1.0f32.to_bits(),
+            },
+            CostProductOutput::FullLogits,
+            1,
+            token_readbacks.as_slice(),
+        ),
+        (
+            ActualRowWork::Decode { kv_tokens: 12 },
+            CostRowOutput::Decode {
+                requires_full_logits: false,
+                repetition_tokens: 0,
+                repetition_penalty_bits: 1.0f32.to_bits(),
+            },
+            CostProductOutput::GreedyToken,
+            1,
+            token_readbacks.as_slice(),
+        ),
+    ];
+    for (work, output, product, generated, readbacks) in cases {
+        for &readback in readbacks {
+            // Exercise both independently missing inputs. Neither one is
+            // permission to erase a valid exact observation or invent a sidecar.
+            for (statistics, host_domain) in [(true, true), (false, true), (true, false)] {
+                let row = CanonicalCostRow {
+                    work,
+                    output,
+                    host_policy_signature: host_history_cost_signature([3; 32], generated),
+                    mask_upload_required: false,
+                    host_features: Some(HostCostFeaturesV1 {
+                        policy: HostCostPolicyV2 {
+                            empirical_content_domain: host_domain
+                                .then_some(HostContentDomainV1::PlainTextGreedyV1),
+                            categorical_signature: [4; 32],
+                            decoder_text_bytes_per_token: 4,
+                            decoder_scratch_bytes_per_token: 8,
+                            raw_token_bytes_bound: 4,
+                        },
+                        state: HostCostStateV1 {
+                            generated_tokens_before: generated,
+                            maximum_output_tokens: 8,
+                            sampling_history_tokens: generated,
+                            sampling_history_scope: CostSamplingHistoryScope::FullGeneration,
+                            pending_decoded_utf8: false,
+                            completion_state_signature: satisfied_completion_cost_signature(),
+                        },
+                    }),
+                };
+                let tokens = match work {
+                    ActualRowWork::Prefill { count, .. } => u64::from(count),
+                    _ => 1,
+                };
+                let attribution = captured_attribution(tokens, statistics);
+                let baseline = project_actual_capture(&attribution, row, product, readback, false);
+                let demand = StructuredCostSampleDemand::for_call(
+                    ferrum_types::SloStructuredActualCapturePolicy::ConsumerDrivenV1,
+                    true,
+                    false,
+                );
+                let captured = project_actual_capture(
+                    &attribution,
+                    row,
+                    product,
+                    readback,
+                    demand.enabled(ferrum_types::SloStructuredCostCapture::HostSettledV1),
+                );
+                assert_eq!(captured.exact, baseline.exact,
+                    "{work:?}/{product:?}/{readback:?}, statistics={statistics}, host_domain={host_domain}");
+                assert_eq!(captured.exact.rows, vec![work]);
+                assert_eq!(captured.exact.row_order, ActualWaveRowOrder::Ordered);
+                let numeric = captured.exact.numeric_features.as_ref().unwrap();
+                numeric.validate(1).unwrap();
+                assert_eq!(
+                    numeric.rows[0],
+                    project_host_cost_features(row.host_features.unwrap(), work, output).unwrap()
+                );
+                if !statistics {
+                    assert!(matches!(
+                        captured.statistical,
+                        Err(StatisticalEvidenceUnknown::MissingProducer)
+                    ));
+                    continue;
+                }
+                if !host_domain {
+                    assert!(matches!(
+                        captured.statistical,
+                        Err(StatisticalEvidenceUnknown::MissingHostDomain)
+                    ));
+                    continue;
+                }
+                let selected = captured.statistical.unwrap();
+                selected.validate_exact(&captured.exact).unwrap();
+                let structured = selected
+                    .structured_capture()
+                    .expect("requested dynamic sidecar");
+                let structured = structured.unwrap();
+                structured.validate_exact(&captured.exact).unwrap();
+                structured.algorithm_work().unwrap();
+                let host = &structured.physical_host_rows()[0];
+                assert_eq!(structured.physical_host_rows().len(), 1);
+                assert_eq!(host.physical_position, 0);
+                assert_eq!(host.installed_policy, row.host_features.unwrap().policy);
+                assert_eq!(
+                    host.terminal_expectation,
+                    if matches!(
+                        output,
+                        CostRowOutput::Prefill {
+                            final_logits: false
+                        }
+                    ) {
+                        HostTerminalExpectationV1::NoTokenProduced
+                    } else {
+                        HostTerminalExpectationV1::TokenMayTerminate
+                    }
+                );
+            }
+        }
+    }
+}

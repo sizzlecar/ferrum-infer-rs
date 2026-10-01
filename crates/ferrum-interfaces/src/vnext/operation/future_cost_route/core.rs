@@ -46,6 +46,8 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
     canonical: &mut CanonicalWaveCostBuilder,
     budget: &mut dyn ResourcePlanningBudget,
 ) -> Result<ExecutionCostRouteState, U> {
+    let mut timing = ProjectionTiming::new(query.rows.len(), providers.len());
+    budget.diagnostic_checkpoint("route_validation_begin");
     poll(budget)?;
     if !Arc::ptr_eq(&view.fence, &state.fence) {
         return Err(U::StaleView);
@@ -85,10 +87,20 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         } else {
             None
         };
-    if !capability.single_transfer_commands
-        || (has_program_policy || !eager_graph_state) && warm_catalog.is_none()
-    {
+    if !capability.single_transfer_commands {
         return Err(U::ExecutionPolicy);
+    }
+    if (has_program_policy || !eager_graph_state) && warm_catalog.is_none() {
+        if view.graph_catalog().is_some() {
+            // A catalog with a different stream identity is not a missing
+            // on-demand program and cannot be repaired by assuming readiness.
+            return Err(U::ExecutionPolicy);
+        }
+        return Err(missing_resident_program(
+            runtime.cost_graph_capture_capability(),
+            view.graph_stream_state(),
+            runtime.cost_direct_graph_replay_operation().is_some(),
+        ));
     }
     let mut projection_rows = Vec::new();
     projection_rows
@@ -96,7 +108,13 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         .map_err(|_| U::Capacity)?;
     let mut validated_rows = ValidatedCostRowsBuilder::new(query.rows).map_err(|_| U::Capacity)?;
     let mut pending_initializations = Vec::new();
-    let mut next = state.clone();
+    // Resource projection below creates its own successor. Copy only the
+    // independent route state here; cloning resources would be discarded
+    // unread when that successor is installed.
+    let mut frontiers = state.frontiers.clone();
+    let mut initialized = state.initialized.clone();
+    let token_masks = state.token_masks.clone();
+    let last_token_mask_uploads = state.last_token_mask_uploads.clone();
     let mut previous_authority = None;
     for (row, &index) in query.rows.iter().zip(query.participant_indices) {
         poll(budget)?;
@@ -105,7 +123,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             return Err(U::InvalidInput);
         }
         previous_authority = Some(authority);
-        let frontier = next.frontiers.get_mut(index).ok_or(U::InvalidInput)?;
+        let frontier = frontiers.get_mut(index).ok_or(U::InvalidInput)?;
         if *frontier != row.offset {
             return Err(U::StaleView);
         }
@@ -113,12 +131,12 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         // later providers/transfers borrow the completed numerical summary.
         let end = validated_rows.push_next().map_err(|_| U::InvalidInput)?;
         *frontier = end;
-        if !next.initialized[index] {
+        if !initialized[index] {
             pending_initializations
                 .try_reserve_exact(1)
                 .map_err(|_| U::Capacity)?;
             pending_initializations.push(index);
-            next.initialized[index] = true;
+            initialized[index] = true;
         }
         // New zero-initialized growth requires its own physical-piece proof.
         // Fixed recurrent state is supported; token-scaled zero state stays
@@ -161,6 +179,8 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
     }
     let validated_rows = validated_rows.finish().map_err(|_| U::InvalidInput)?;
     let total_tokens = validated_rows.immediate_tokens();
+    timing.enter(1);
+    budget.diagnostic_checkpoint("route_resources_begin");
     let projection = match resources.project_resource_wave_with_bucket(
         &view.resources,
         &state.resources,
@@ -171,8 +191,18 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         ResourcePlanningAvailability::Known(projection) => projection,
         ResourcePlanningAvailability::Unknown(reason) => return Err(U::Resource(reason)),
     };
+    timing.enter(2);
+    budget.diagnostic_checkpoint("route_core_transfers_begin");
     let selected_step = projection.step_slot;
-    next.resources = projection.state;
+    let mut next = ExecutionCostRouteState {
+        fence: Arc::clone(&state.fence),
+        resources: projection.state,
+        frontiers,
+        initialized,
+        token_masks,
+        last_token_mask_uploads,
+        projected_graph_state: state.projected_graph_state,
+    };
     let mut command_index = 0_u32;
     let zeros = view
         .resources
@@ -254,8 +284,13 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             evidence.as_ref(),
         )?;
     }
-    let mut input_commands =
-        super::uploads::input_transfer_bytes(resolved, &validated_rows, query.uploads, budget)?;
+    let mut input_commands = super::uploads::input_transfer_bytes(
+        providers,
+        resolved,
+        &validated_rows,
+        query.uploads,
+        budget,
+    )?;
     next.last_token_mask_uploads = None;
     if let Some(mask) = query.token_mask_input {
         if mask.contents.len() != query.rows.len() {
@@ -306,8 +341,13 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
                     filtered.push(*upload);
                 }
             }
-            input_commands =
-                super::uploads::input_transfer_bytes(resolved, &validated_rows, &filtered, budget)?;
+            input_commands = super::uploads::input_transfer_bytes(
+                providers,
+                resolved,
+                &validated_rows,
+                &filtered,
+                budget,
+            )?;
         }
         next.last_token_mask_uploads = Some(uploads);
     }
@@ -329,11 +369,18 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             evidence.as_ref(),
         )?;
     }
-    let route = providers
-        .eager_cost_route_with_ranges(
+    timing.enter(3);
+    budget.diagnostic_checkpoint("route_providers_begin");
+    let selected_route = providers
+        .future_cost_route_with_ranges(
             resolved,
             &validated_rows,
             projection.physical_ranges.as_ref(),
+            if warm_catalog.is_some() {
+                OperationCostTopologyRequirement::Required
+            } else {
+                OperationCostTopologyRequirement::NotRequested
+            },
             &mut || {
                 if budget.has_budget() {
                     Ok(())
@@ -353,11 +400,15 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         })?
         .ok_or(U::ProviderRoute)?;
     poll(budget)?;
+    let route = selected_route.route();
+    timing.enter(4);
+    budget.diagnostic_checkpoint("route_graph_and_commands_begin");
     let binding_layout = query
         .reusable_bucket
         .and_then(|bucket| resources.planning_program_binding_layout(bucket));
     let binding_nodes = program_binding_nodes(
-        resolved.execution_plan().payload().nodes(),
+        providers.len(),
+        providers.program_binding_count(),
         query.reusable_bucket,
         binding_layout,
         budget,
@@ -381,13 +432,8 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         let configured_eager = if let Some(catalog) = warm_catalog {
             query.reusable_bucket.is_none()
                 && catalog.stream_state().configuration() == DeviceCostGraphConfiguration::OnDemand
-                && providers
-                    .future_has_only_eager_boundaries(
-                        resolved,
-                        &validated_rows,
-                        projection.physical_ranges.as_ref(),
-                        &mut poll_provider,
-                    )
+                && selected_route
+                    .only_eager_boundaries(&mut poll_provider)
                     .map_err(|_| U::ProviderRoute)?
         } else {
             false
@@ -395,27 +441,30 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         let warm_program = if let Some(catalog) = warm_catalog.filter(|_| !configured_eager) {
             let layout = binding_layout.ok_or(U::CoreLayout)?;
             let slot = projection.invocation_slot.as_ref().ok_or(U::CoreLayout)?;
-            let (id, eager) = providers
-                .future_reusable_program_id(
-                    resolved,
-                    &validated_rows,
-                    projection.physical_ranges.as_ref(),
-                    layout,
-                    slot,
-                    view.lane_id(),
-                    &mut poll_provider,
-                )
+            let (id, eager) = selected_route
+                .reusable_program_id(layout, slot, view.lane_id(), &mut poll_provider)
                 .map_err(|_| U::ProviderRoute)?
                 .ok_or(U::ProviderRoute)?;
-            let mut matched = None;
-            for candidate in catalog.programs() {
-                poll_provider().map_err(|_| U::BudgetExhausted)?;
-                if candidate.program().program_id() == &id {
-                    matched = Some(candidate);
-                    break;
-                }
-            }
-            let matched = matched.ok_or(U::ExecutionPolicy)?;
+            let limits = view.resource_view().limits();
+            let selected_limits = DeviceCostGraphCatalogLimits::new(
+                1,
+                limits.maximum_free_extents,
+                limits.maximum_free_extents,
+            )
+            .map_err(|_| U::Capacity)?;
+            let matched = view
+                .graph_catalog
+                .as_ref()
+                .ok_or(U::ExecutionPolicy)?
+                .lookup(&id, selected_limits, &mut poll_provider)
+                .map_err(|_| U::ExecutionPolicy)?;
+            let matched = matched.ok_or_else(|| {
+                missing_resident_program(
+                    runtime.cost_graph_capture_capability(),
+                    Some(catalog.stream_state()),
+                    runtime.cost_direct_graph_replay_operation().is_some(),
+                )
+            })?;
             if matched.program().eager_boundary_node_indices() != eager
                 || matched.uploaded_segments().len() != matched.program().segments().len()
             {
@@ -427,7 +476,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         };
         let merged = if !binding_nodes.is_empty() && !capability.preserves_program_bindings {
             let patches = route
-                .program_binding_patches(&binding_nodes)
+                .program_binding_patches(binding_nodes)
                 .map_err(|_| U::ProviderRoute)?;
             Some(
                 runtime
@@ -447,7 +496,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
                 .append_canonical_warm_program(
                     canonical,
                     command_index,
-                    &binding_nodes,
+                    binding_nodes,
                     merged.as_ref(),
                     program,
                     runtime
@@ -466,14 +515,14 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
                 route.append_canonical_with_coalesced_program_binding(
                     canonical,
                     command_index,
-                    &binding_nodes,
+                    binding_nodes,
                     merged,
                 )
             } else {
                 route.append_canonical_with_program_bindings(
                     canonical,
                     command_index,
-                    &binding_nodes,
+                    binding_nodes,
                 )
             };
             command_index = appended.map_err(|error| match error {
@@ -496,8 +545,15 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
     if command_index as usize > MAX_COST_COMMANDS {
         return Err(U::Capacity);
     }
-    let readback_bytes =
-        super::uploads::readback_bytes(resolved, &validated_rows, query.readbacks, budget)?;
+    timing.enter(5);
+    budget.diagnostic_checkpoint("route_readbacks_begin");
+    let readback_bytes = super::uploads::readback_bytes(
+        providers,
+        resolved,
+        &validated_rows,
+        query.readbacks,
+        budget,
+    )?;
     let readback = append_readback_route(
         capability,
         query.attempt_staged_readbacks,
@@ -603,6 +659,22 @@ fn append_readback_route(
     Ok(readback)
 }
 
+fn missing_resident_program(
+    capability: DeviceCostGraphCaptureCapability,
+    stream: Option<DeviceCostGraphStreamState>,
+    direct_replay_supported: bool,
+) -> U {
+    if capability == DeviceCostGraphCaptureCapability::Supported
+        && direct_replay_supported
+        && stream
+            .is_some_and(|stream| stream.configuration() == DeviceCostGraphConfiguration::OnDemand)
+    {
+        U::OnDemandResidentProgram
+    } else {
+        U::ExecutionPolicy
+    }
+}
+
 fn graph_policy_is_eager(
     capability: DeviceCostGraphCaptureCapability,
     stream: Option<DeviceCostGraphStreamState>,
@@ -616,53 +688,46 @@ fn graph_policy_is_eager(
     }
 }
 
-fn program_binding_nodes(
-    nodes: &[PlanNode],
+fn program_binding_nodes<'layout>(
+    total_node_count: usize,
+    binding_node_count: usize,
     bucket: Option<&ReusableExecutionBucketId>,
-    layout: Option<&ProgramBindingLayout>,
+    layout: Option<&'layout ProgramBindingLayout>,
     budget: &mut dyn ResourcePlanningBudget,
-) -> Result<Vec<usize>, U> {
+) -> Result<&'layout [usize], U> {
+    poll(budget)?;
     let Some(bucket) = bucket else {
         // Actual invocation creation has no program-binding handle here;
         // validate_program_binding_patch requires zero program patches.
         return if layout.is_none() {
-            Ok(Vec::new())
+            Ok(&[])
         } else {
             Err(U::CoreLayout)
         };
     };
-    if nodes.len() > MAX_COST_COMMANDS {
+    // Keep the original whole-plan capacity boundary, including nodes without
+    // a program binding. The selected provider set gives the same count in O(1).
+    if total_node_count > MAX_COST_COMMANDS {
         return Err(U::Capacity);
     }
-    let count = nodes
-        .iter()
-        .filter(|node| node.binding_resource().is_some())
-        .count();
-    if count == 0 {
+    if binding_node_count == 0 {
         return if layout.is_none() {
-            Ok(Vec::new())
+            Ok(&[])
         } else {
             Err(U::CoreLayout)
         };
     }
     let layout = layout.ok_or(U::CoreLayout)?;
-    if layout.reusable_execution_bucket_id() != bucket || layout.slots().len() != count {
-        return Err(U::CoreLayout);
-    }
-    let mut result = Vec::new();
-    result.try_reserve_exact(count).map_err(|_| U::Capacity)?;
-    for (index, node) in nodes.iter().enumerate() {
-        poll(budget)?;
-        let Some(resource) = node.binding_resource() else {
-            continue;
-        };
-        let slot = layout.slot_for_node(index).ok_or(U::CoreLayout)?;
-        if slot.node_id() != node.id() || slot.resource_id() != resource {
-            return Err(U::CoreLayout);
-        }
-        result.push(index);
-    }
-    Ok(result)
+    let indices = layout
+        .node_indices_for(bucket, binding_node_count)
+        .ok_or(U::CoreLayout)?;
+    // The layout came from this PlanRuntimeResources after its plan hash and
+    // runtime were checked above; the selected provider set has independently
+    // checked every plan/node binding before this call. Cold compilation proves
+    // complete node/resource membership. Dynamic physical program matching,
+    // resources, core transfers and final publication remain per-wave checks.
+    poll(budget)?;
+    Ok(indices)
 }
 
 fn append_transfer<'a>(
@@ -702,4 +767,49 @@ fn append_transfer<'a>(
         .map_err(|_| U::InvalidInput)?;
     *index = index.checked_add(1).ok_or(U::Capacity)?;
     Ok(())
+}
+
+/// Optional, fixed-size diagnostic of the actual route construction. Records
+/// once on return (including errors); disabled tracing performs no clock reads.
+struct ProjectionTiming {
+    started: Option<std::time::Instant>,
+    stage: usize,
+    stage_ns: [u64; 6],
+    rows: usize,
+    nodes: usize,
+}
+impl ProjectionTiming {
+    fn new(rows: usize, nodes: usize) -> Self {
+        Self {
+            started:
+                tracing::enabled!(target: "ferrum::slo_projection_timing", tracing::Level::TRACE)
+                    .then(std::time::Instant::now),
+            stage: 0,
+            stage_ns: [0; 6],
+            rows,
+            nodes,
+        }
+    }
+    fn enter(&mut self, stage: usize) {
+        if let Some(started) = self.started.as_mut() {
+            let now = std::time::Instant::now();
+            self.stage_ns[self.stage] = self.stage_ns[self.stage].saturating_add(
+                u64::try_from(now.duration_since(*started).as_nanos()).unwrap_or(u64::MAX),
+            );
+            *started = now;
+        }
+        self.stage = stage;
+    }
+}
+impl Drop for ProjectionTiming {
+    fn drop(&mut self) {
+        if self.started.is_none() {
+            return;
+        }
+        self.enter(self.stage);
+        tracing::trace!(target: "ferrum::slo_projection_timing",
+            rows=self.rows, nodes=self.nodes, last_stage=self.stage, stage_ns=?self.stage_ns,
+            stages="validate,resources,core_transfers,provider_routes,graph_and_commands,readbacks",
+            "original cost route construction wall time");
+    }
 }

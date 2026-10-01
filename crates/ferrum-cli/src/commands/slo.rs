@@ -8,7 +8,7 @@ use ferrum_types::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub(super) const HELP: &str = "Load a TOML or JSON SLO policy for this model. Defaults to Off; Observe measures the existing policy, while Enforce requires supported bounded execution and a validated cost profile. Internal token-commit budgets and optional client-visible targets are separate. Config: runtime.slo_config. No environment override.";
+pub(super) const HELP: &str = "Load a TOML or JSON SLO policy for this model. Defaults to Off; Observe measures the existing policy, while Enforce requires supported bounded execution and validated evidence from automatic calibration or imported profiles. For ordinary Enforce with CompleteRequests, omitted cost settings select automatic calibration and credited output; explicit legacy/disabled/manual choices are preserved. Automatic calibration needs no declaration or imported profile; SLO coverage remains unknown until qualified. Internal token-commit budgets and optional client-visible targets are separate. Config: runtime.slo_config. No environment override.";
 
 #[derive(Debug)]
 pub(super) struct LoadedSloConfig {
@@ -100,12 +100,57 @@ pub(super) async fn load(
             }
         }
     }
+    match &mut config.cost_observation.live_structured_calibration {
+        ferrum_types::SloLiveStructuredCalibration::ServiceWindowsV1 {
+            declaration,
+            evidence_directory,
+            ..
+        } => {
+            for path in [declaration, evidence_directory] {
+                if path.is_relative() {
+                    *path = absolute.parent().unwrap_or(Path::new("/")).join(&*path);
+                }
+            }
+        }
+        ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { settings } => {
+            if let ferrum_types::SloAutomaticCalibrationReuseV1::SameBootCleanShutdownV1 {
+                location: ferrum_types::SloAutomaticCalibrationCacheLocationV1::Directory { path },
+                ..
+            } = &mut settings.reuse
+            {
+                if path.is_relative() {
+                    *path = absolute.parent().unwrap_or(Path::new("/")).join(&*path);
+                }
+            }
+            if let ferrum_types::SloAutomaticCalibrationDiagnosticsV1::Directory {
+                directory, ..
+            } = &mut settings.diagnostics
+            {
+                if directory.is_relative() {
+                    *directory = absolute
+                        .parent()
+                        .unwrap_or(Path::new("/"))
+                        .join(&*directory);
+                }
+            }
+        }
+        ferrum_types::SloLiveStructuredCalibration::Disabled => {}
+    }
     if let Some(reference) = config.prefill_reference.as_mut() {
         if reference.artifact_path.is_relative() {
             reference.artifact_path = absolute
                 .parent()
                 .unwrap_or(Path::new("/"))
                 .join(&reference.artifact_path);
+        }
+    }
+    if let ferrum_types::SloRequiredQueryObservationConfig::StructuredRequiredV1 { path, .. }
+    | ferrum_types::SloRequiredQueryObservationConfig::StructuredUncalibratedV1 {
+        path, ..
+    } = &mut config.required_query_observation
+    {
+        if path.is_relative() {
+            *path = absolute.parent().unwrap_or(Path::new("/")).join(&*path);
         }
     }
     let entries = vec![

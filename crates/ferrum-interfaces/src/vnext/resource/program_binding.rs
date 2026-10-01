@@ -54,9 +54,23 @@ pub struct ProgramBindingLayout {
     physical_size_bytes: u64,
     slots: Vec<ProgramBindingSlot>,
     fingerprint: String,
+    /// Derived from the complete cold-validated slot set. This is only an
+    /// index into immutable plan metadata, never live execution authority.
+    #[serde(skip)]
+    node_indices: Vec<usize>,
 }
 
 impl ProgramBindingLayout {
+    pub(crate) fn node_indices_for(
+        &self,
+        bucket: &ReusableExecutionBucketId,
+        binding_node_count: usize,
+    ) -> Option<&[usize]> {
+        (self.reusable_execution_bucket_id() == bucket
+            && self.node_indices.len() == binding_node_count)
+            .then_some(self.node_indices.as_slice())
+    }
+
     pub fn reusable_execution_bucket_id(&self) -> &ReusableExecutionBucketId {
         &self.reusable_execution_bucket_id
     }
@@ -214,6 +228,10 @@ pub(super) fn compile_program_binding_layouts(
         Vec<Option<SubmissionWaveDomainCapacityLayout>>,
     >,
 ) -> Result<BTreeMap<ReusableExecutionBucketId, ProgramBindingLayout>, VNextError> {
+    let binding_node_count = nodes
+        .iter()
+        .filter(|node| node.binding_resource().is_some())
+        .count();
     if domains.len() != layouts.len()
         || reusable_capacity_layouts
             .values()
@@ -352,6 +370,15 @@ pub(super) fn compile_program_binding_layouts(
                     "program binding slots do not have unique plan-node owners",
                 ));
             }
+            // Every slot has already proved exact node/resource ownership and
+            // unique node order. Equal cardinality proves that no bound node
+            // was omitted, so future queries need not rescan the entire plan.
+            if slots.len() != binding_node_count {
+                return Err(invalid_resource(
+                    "program binding layout omits a plan node binding",
+                ));
+            }
+            let node_indices = slots.iter().map(ProgramBindingSlot::node_index).collect();
 
             #[derive(Serialize)]
             struct FingerprintMaterial<'a> {
@@ -379,6 +406,7 @@ pub(super) fn compile_program_binding_layouts(
                 physical_size_bytes: capacity.physical_size_bytes,
                 slots,
                 fingerprint: format!("sha256/{:x}", Sha256::digest(bytes)),
+                node_indices,
             };
             Ok((bucket_id.clone(), layout))
         })
@@ -532,5 +560,114 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not own its binding descriptor"));
+    }
+
+    #[test]
+    fn binding_layout_prepared_indices_cover_nonadjacent_owners_without_wire_changes() {
+        let (mut nodes, domains, layouts, capacities, bucket) = compile_two_node_layout();
+        nodes.insert(
+            1,
+            PlanNode::resource_test_node(NodeId::new("node/unbound-between").unwrap()),
+        );
+        let compiled =
+            compile_program_binding_layouts(&domains, &nodes, &layouts, &capacities).unwrap();
+        let layout = &compiled[&bucket];
+        let indices = layout.node_indices_for(&bucket, 2).unwrap();
+        assert_eq!(indices, &[0, 2]);
+        assert_eq!(
+            indices,
+            nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| node.binding_resource().map(|_| index))
+                .collect::<Vec<_>>()
+        );
+        let clone = layout.clone();
+        assert_eq!(clone.node_indices_for(&bucket, 2), Some(indices));
+        assert!(layout.node_indices_for(&bucket, 1).is_none());
+        assert!(layout.node_indices_for(&bucket, 3).is_none());
+        let other = ReusableExecutionBucketSpec::new(
+            ReusableExecutionClassId::new("test.other-program-binding").unwrap(),
+            ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(layout.node_indices_for(other.bucket_id(), 2).is_none());
+        let encoded = serde_json::to_value(layout).unwrap();
+        assert!(encoded.get("node_indices").is_none());
+        assert_eq!(encoded["fingerprint"], layout.fingerprint());
+    }
+
+    #[test]
+    fn binding_layout_prepared_indices_reject_an_omitted_binding_owner_at_compile() {
+        let (mut nodes, domains, layouts, capacities, _) = compile_two_node_layout();
+        nodes.push(PlanNode::resource_test_node_with_binding(
+            NodeId::new("node/omitted-binding").unwrap(),
+            ResourceId::new("resource/omitted-binding").unwrap(),
+        ));
+        let error =
+            compile_program_binding_layouts(&domains, &nodes, &layouts, &capacities).unwrap_err();
+        assert!(error.to_string().contains("omits a plan node binding"));
+    }
+
+    /// Isolates the removed metadata scan/allocation, not complete planning or
+    /// any backend work. Timings are diagnostic only; speed is not a test gate.
+    #[test]
+    #[ignore = "manual bounded CPU metadata microbenchmark"]
+    fn binding_layout_prepared_indices_microbenchmark() {
+        use std::{
+            hint::black_box,
+            time::{Duration, Instant},
+        };
+
+        let (mut nodes, domains, layouts, capacities, bucket) = compile_two_node_layout();
+        for index in 2..1024 {
+            nodes.push(PlanNode::resource_test_node(
+                NodeId::new(format!("node/unbound/{index}")).unwrap(),
+            ));
+        }
+        let compiled =
+            compile_program_binding_layouts(&domains, &nodes, &layouts, &capacities).unwrap();
+        let layout = &compiled[&bucket];
+        let legacy = || {
+            let count = black_box(&nodes)
+                .iter()
+                .filter(|node| node.binding_resource().is_some())
+                .count();
+            let mut indices = Vec::with_capacity(count);
+            for (index, node) in nodes.iter().enumerate() {
+                if let Some(resource) = node.binding_resource() {
+                    let slot = layout.slot_for_node(index).unwrap();
+                    assert_eq!(slot.node_id(), node.id());
+                    assert_eq!(slot.resource_id(), resource);
+                    indices.push(index);
+                }
+            }
+            indices
+        };
+        assert_eq!(legacy(), layout.node_indices_for(&bucket, 2).unwrap());
+        let measure = |operation: &mut dyn FnMut()| {
+            let start = Instant::now();
+            let mut samples = 0u64;
+            while start.elapsed() < Duration::from_millis(50) {
+                operation();
+                samples += 1;
+            }
+            (samples, start.elapsed().as_nanos())
+        };
+        let (legacy_samples, legacy_ns) = measure(&mut || {
+            black_box(legacy());
+        });
+        let (prepared_samples, prepared_ns) = measure(&mut || {
+            black_box(black_box(layout).node_indices_for(black_box(&bucket), black_box(2)));
+        });
+        println!(
+            "BINDING_METADATA_BENCH {}",
+            serde_json::json!({
+                "scope": "synthetic immutable metadata only; no planner/backend/SLO claim",
+                "plan_nodes": nodes.len(), "binding_nodes": layout.slots().len(),
+                "legacy": {"samples":legacy_samples,"elapsed_ns":legacy_ns},
+                "prepared": {"samples":prepared_samples,"elapsed_ns":prepared_ns}
+            })
+        );
     }
 }

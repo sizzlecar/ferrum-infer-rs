@@ -67,6 +67,25 @@ pub(super) struct State {
     pub failed_or_partial: u64,
     pub queue_drops: u64,
     pub corrections: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_progress: Option<RestartProgressV1>,
+}
+
+/// Original final drain in the preceding clean process. The next process's
+/// sink ordinals and drop counters start at zero; these are historical cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::continuous_engine::inner::cost_observation) struct RestartProgressV1 {
+    pub schema_version: u32,
+    pub previous_session: u64,
+    pub previous_processed_fifo: u64,
+    pub previous_feedback_fifo: u64,
+    pub previous_queue_drops: u64,
+    pub outside_catalog_observations: u64,
+    pub outside_support_observations: u64,
+    pub outside_route_observations: u64,
+    pub no_submission_observations: u64,
+    pub outside_preparation_observations: u64,
 }
 
 pub(in crate::continuous_engine::inner::cost_observation) struct Comparison {
@@ -91,6 +110,7 @@ impl State {
             failed_or_partial: 0,
             queue_drops: 0,
             corrections: 0,
+            restart_progress: None,
         }
     }
 
@@ -98,6 +118,12 @@ impl State {
         self.schema_version == 1
             && &self.binding == binding
             && self.epoch > 0
+            && self.restart_progress.is_none_or(|v| {
+                v.schema_version == 1
+                    && v.previous_session > 0
+                    && v.previous_session <= self.session
+                    && v.previous_feedback_fifo <= v.previous_processed_fifo
+            })
             && self.families.len() <= capacity
             && self.families.iter().enumerate().all(|(i, family)| {
                 family.margin_ns <= policy.maximum_family_margin_ns.get()
@@ -113,6 +139,22 @@ impl State {
         if self.revoked.is_none() {
             self.revoked = Some(reason);
         }
+    }
+
+    pub(super) fn retained_payload_bytes(&self) -> Option<usize> {
+        let bytes = std::mem::size_of::<Self>().checked_add(
+            self.families
+                .capacity()
+                .checked_mul(std::mem::size_of::<Family>())?,
+        )?;
+        self.families.iter().try_fold(bytes, |sum, family| {
+            sum.checked_add(
+                family
+                    .window
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<WindowItem>())?,
+            )
+        })
     }
 
     pub fn compare(&mut self, p: &Settings, capacity: usize, value: Comparison) {

@@ -33,12 +33,52 @@ pub(super) fn actual_route_with_capture<'a>(
     retries: u32,
     structured_capture: bool,
 ) -> std::result::Result<ObservedRoute, ActualWaveEvidenceUnknown> {
+    actual_route_projection(
+        attribution,
+        provider_at,
+        graph_capability,
+        product,
+        retries,
+        structured_capture,
+        true,
+    )
+}
+
+pub(super) fn actual_route_exact<'a>(
+    attribution: Option<&DeviceSubmissionAttribution>,
+    provider_at: impl Fn(u32) -> Option<CostProviderIdentity<'a>>,
+    graph_capability: DeviceCostGraphCaptureCapability,
+    product: CostProductOutput,
+    retries: u32,
+) -> std::result::Result<ObservedRoute, ActualWaveEvidenceUnknown> {
+    actual_route_projection(
+        attribution,
+        provider_at,
+        graph_capability,
+        product,
+        retries,
+        false,
+        false,
+    )
+}
+
+pub(super) fn actual_route_projection<'a>(
+    attribution: Option<&DeviceSubmissionAttribution>,
+    provider_at: impl Fn(u32) -> Option<CostProviderIdentity<'a>>,
+    graph_capability: DeviceCostGraphCaptureCapability,
+    product: CostProductOutput,
+    retries: u32,
+    structured_capture: bool,
+    statistics: bool,
+) -> std::result::Result<ObservedRoute, ActualWaveEvidenceUnknown> {
     let attribution = attribution.ok_or(ActualWaveEvidenceUnknown::GraphPath)?;
     let commands = attribution.commands();
     if commands.is_empty() || commands.len() > MAX_COST_COMMANDS {
         return Err(ActualWaveEvidenceUnknown::ProviderPath);
     }
-    let mut canonical = if structured_capture {
+    let mut canonical = if !statistics {
+        CanonicalWaveCostBuilder::new_exact(retries, product)
+    } else if structured_capture {
         CanonicalWaveCostBuilder::new_with_structured_statistics(retries, product)
     } else {
         CanonicalWaveCostBuilder::new(retries, product)

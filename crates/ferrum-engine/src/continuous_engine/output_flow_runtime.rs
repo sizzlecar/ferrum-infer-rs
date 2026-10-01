@@ -343,7 +343,8 @@ impl OutputFlowPort {
             _ => OutputReadiness::ProjectionBusy,
         }
     }
-    #[cfg(test)]
+    /// Observe readiness changes without taking output credit. The private
+    /// startup driver uses this cold wait before requesting a guarded wave.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.shared.change.subscribe()
     }

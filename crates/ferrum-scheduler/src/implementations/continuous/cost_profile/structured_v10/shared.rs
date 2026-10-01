@@ -4,6 +4,8 @@ use super::*;
 mod wire;
 use wire::*;
 mod prefix;
+pub(super) use prefix::PreparedCohortLedgerV8;
+pub use prefix::{StructuredCohortEventV8, StructuredPreparationEventV8};
 mod profile;
 mod replay;
 pub use prefix::{

@@ -25,6 +25,14 @@ pub struct StructuredAlgorithmFactV2 {
     pub signature: [u8; 32],
     pub kind: AlgorithmWorkKindV1,
 }
+/// A single call's checked immutable recipe and numerical projection. This is
+/// private to V2 construction and carries no execution or cross-wave authority.
+pub(super) struct ValidatedPreparedV2 {
+    pub(super) facts: StructuredOwnerFactsV2,
+    pub(super) owner: StructuredOwnerKeyV2,
+    pub(super) numeric: super::super::statistical::StatisticalModelInputV1,
+}
+
 impl StructuredOwnerFactsV2 {
     /// Numerical replay only. The importer validates the complete original
     /// ledger; this helper cannot mint a live recipe or settlement receipt.
@@ -74,6 +82,13 @@ impl StructuredOwnerFactsV2 {
         selected: &StatisticalWaveEvidenceV1,
         recipe: &Arc<UnsettledStructuredWaveEvidenceV1>,
     ) -> Result<Self> {
+        Self::validated_prepared(exact, selected, recipe).map(|value| value.facts)
+    }
+    pub(super) fn validated_prepared(
+        exact: &CanonicalWaveCostShape,
+        selected: &StatisticalWaveEvidenceV1,
+        recipe: &Arc<UnsettledStructuredWaveEvidenceV1>,
+    ) -> Result<ValidatedPreparedV2> {
         let attached = selected
             .structured_capture()
             .ok_or(StructuredUnknown::MissingEvidence)?
@@ -90,10 +105,11 @@ impl StructuredOwnerFactsV2 {
         work.validate_structure(recipe)
             .map_err(|_| StructuredUnknown::MissingEvidence)?;
         // Validate the original exact/statistical bridge as well as the sidecar.
-        super::super::statistical::StatisticalModelInputV1::from_future_structured_v2(
-            exact, selected,
-        )
-        .map_err(|_| StructuredUnknown::MissingEvidence)?;
+        let numeric =
+            super::super::statistical::StatisticalModelInputV1::from_future_structured_v2(
+                exact, selected,
+            )
+            .map_err(|_| StructuredUnknown::MissingEvidence)?;
         let device = recipe.device();
         let value = Self {
             rows: recipe
@@ -124,8 +140,12 @@ impl StructuredOwnerFactsV2 {
                 })
                 .collect(),
         };
-        value.owner_key()?;
-        Ok(value)
+        let owner = value.owner_key()?;
+        Ok(ValidatedPreparedV2 {
+            facts: value,
+            owner,
+            numeric,
+        })
     }
     pub fn physical_rows(&self) -> &[StructuredOwnerRowFactV2] {
         &self.rows
@@ -140,7 +160,9 @@ impl StructuredOwnerFactsV2 {
             return Err(StructuredUnknown::InvalidInput);
         }
         let template = match self.provider_template {
-            StructuredTemplateV2::Ordered(v) | StructuredTemplateV2::ProviderGrouped(v) => v,
+            StructuredTemplateV2::Ordered(v)
+            | StructuredTemplateV2::ProviderGrouped(v)
+            | StructuredTemplateV2::InstalledAlgorithmSetV1(v) => v,
         };
         if template == [0; 32] {
             return Err(StructuredUnknown::MissingEvidence);
@@ -159,8 +181,11 @@ impl StructuredOwnerFactsV2 {
                 HostRowRoleV2::Prefill => prefill += 1,
             }
             let p = row.installed_policy;
-            if p.empirical_content_domain != Some(HostContentDomainV1::PlainTextGreedyV1)
-                || p.categorical_signature == [0; 32]
+            if !matches!(
+                p.empirical_content_domain,
+                Some(HostContentDomainV1::PlainTextGreedyV1)
+                    | Some(HostContentDomainV1::PlainTextInstalledV2(_))
+            ) || p.categorical_signature == [0; 32]
                 || p.decoder_text_bytes_per_token == 0
                 || p.raw_token_bytes_bound == 0
                 || [

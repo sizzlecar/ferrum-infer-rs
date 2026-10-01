@@ -16,6 +16,31 @@ pub enum StructuredProductV2 {
 pub enum StructuredTemplateV2 {
     Ordered([u8; 32]),
     ProviderGrouped([u8; 32]),
+    /// Empirical numerical family; never execution permutation authority.
+    InstalledAlgorithmSetV1([u8; 32]),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredCostTemplatePolicyV1 {
+    #[default]
+    OrderedV1,
+    InstalledAlgorithmSetV1,
+}
+impl StructuredCostTemplatePolicyV1 {
+    pub fn is_ordered(&self) -> bool {
+        *self == Self::OrderedV1
+    }
+}
+impl StructuredOwnerKeyV2 {
+    pub fn cost_template_policy(&self) -> StructuredCostTemplatePolicyV1 {
+        match self.provider_template {
+            StructuredTemplateV2::InstalledAlgorithmSetV1(_) => {
+                StructuredCostTemplatePolicyV1::InstalledAlgorithmSetV1
+            }
+            _ => StructuredCostTemplatePolicyV1::OrderedV1,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +74,10 @@ pub struct StructuredCoverageV2 {
 pub struct StructuredScopeV2 {
     pub owner: StructuredOwnerKeyV2,
     pub coverage: StructuredCoverageV2,
+    /// Explicit numerical population identity. The owner and coverage remain
+    /// the original discovery representative, not cross-width execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numerical_family: Option<NumericalFamilyKeyV1>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +127,9 @@ pub struct StructuredUncertaintyV2 {
     /// max(fit_error_floor_ns, residual_ns), before the declared static margin.
     pub effective_residual_ns: u64,
     pub static_margin_ns: u64,
+    /// Extra observed residual span, frozen before qualification; no future bound.
+    #[serde(skip_serializing_if = "zero_span")]
+    pub learned_span_margin_ns: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct StructuredPredictionV2 {
@@ -109,10 +141,15 @@ pub struct StructuredPredictionV2 {
     pub fit_error_floor_ns: u64,
     /// max(fit_error_floor_ns, residual_ns), before the declared static margin.
     pub effective_residual_ns: u64,
+    pub learned_span_margin_ns: u64,
     pub planning_ns: u64,
     /// Original model epoch. Engine must subtract imported.model_now_ns(local_now).
     pub valid_until_ns: u64,
     pub fit_samples: usize,
     pub residual_samples: usize,
     pub identified_rank: usize,
+}
+
+fn zero_span(value: &u64) -> bool {
+    *value == 0
 }

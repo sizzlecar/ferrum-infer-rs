@@ -17,6 +17,11 @@ pub(in super::super) struct PrefixRendezvous {
 
 impl EngineInner {
     pub(super) fn prepare_prefix_rendezvous(&self) -> Result<()> {
+        // Enforce compares admitted owners under one complete time/resource
+        // witness. Off/Observe retain their original optional waiting behavior.
+        if self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce {
+            return Ok(());
+        }
         let Some(max_wait) = self.config.scheduler.prefix_rendezvous_max_wait_ms else {
             return Ok(());
         };
@@ -210,6 +215,7 @@ impl EngineInner {
     /// materialization preserves sharing. Call only outside scheduler/capacity
     /// locks; releasing a pin grants no admission or physical allocation.
     pub(super) fn release_prefix_rendezvous_for_capacity_pressure(&self) {
+        self.release_slo_prefix_for_capacity_pressure();
         self.release_pending_prefix_restores_for_capacity_pressure();
         if self
             .config
@@ -265,6 +271,7 @@ impl EngineInner {
             .iter()
             .map(|cohort| cohort.expires_at)
             .min();
+        let deadline = deadline.into_iter().chain(self.slo_prefix_deadline()).min();
         match deadline {
             Some(deadline) => {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await

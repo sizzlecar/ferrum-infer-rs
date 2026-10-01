@@ -194,6 +194,9 @@ pub(super) fn header_valid_ref(
     ]) {
         protocol.update(n.to_le_bytes());
     }
+    if !h.settings.learned_drift.is_disabled() {
+        protocol.update(h.settings.learned_drift.signature());
+    }
     if <[u8; 32]>::from(protocol.finalize()) != h.protocol {
         return Err(fail());
     }

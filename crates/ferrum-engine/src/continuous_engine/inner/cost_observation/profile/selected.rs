@@ -70,6 +70,8 @@ pub(super) fn load_seed(
     .map_err(profile_error)?;
     let p = &imported.provenance;
     let receipt = SloCostProfileReceipt {
+        storage: ferrum_types::SloCostProfileStorage::File,
+        clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
         structured_whole_wave: None,
         structured_whole_wave_v2: None,
         selected_whole_wave: Some(ferrum_types::SloSelectedWholeWaveReceiptV1 {
@@ -83,10 +85,11 @@ pub(super) fn load_seed(
             residual_records: imported.residual_records,
         }),
         schema_version: schema,
-        path: p
-            .loaded_from
-            .clone()
-            .ok_or_else(|| FerrumError::internal("file import has no source path"))?,
+        path: Some(
+            p.loaded_from
+                .clone()
+                .ok_or_else(|| FerrumError::internal("file import has no source path"))?,
+        ),
         file_sha256: format!(
             "sha256:{}",
             imported
@@ -99,7 +102,7 @@ pub(super) fn load_seed(
         generated_unix_ns: p.generated_unix_ns,
         loaded_unix_ns: p.loaded_unix_ns,
         conservative_clock_error_ns: imported.conservative_clock_error_ns,
-        declared_local_clock_max_error_ns: declared,
+        declared_local_clock_max_error_ns: Some(declared),
         oldest_imported_age_ns: Some(p.oldest_imported_age_ns),
         newest_imported_age_ns: Some(p.newest_imported_age_ns),
         offered_samples: imported.fit_records + imported.residual_records,

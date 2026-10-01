@@ -16,10 +16,12 @@ pub(super) fn stages(start: u64, wall: u64, terminal: bool) -> Arc<HostStageEvid
         shape.numeric_features.as_mut().unwrap().rows[0].maximum_output_tokens = 4;
     }
     Arc::new(HostStageEvidenceV1 {
+        observation_memory: None,
         presubmit_prediction: None,
         prospective_capture: None,
         statistical_evidence: None,
         structured_evidence: None,
+        route_evidence: None,
         schema_version: 1,
         call_id: start + 1,
         fingerprint: Some(fingerprint()),

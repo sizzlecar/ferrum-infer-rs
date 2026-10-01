@@ -137,7 +137,8 @@ async fn structured_group_metal_two_live_owners_sources_profiles_catalog_query()
         let owner=input.owner().clone();
         StructuredCalibrationOptionsV2 {
             observations_path:files.0.join(format!("source-{child}.jsonl")),protocol_sha256:[91;32],
-            scope:StructuredScopeV2 {owner:owner.clone(),coverage:StructuredCoverageV2 {
+            scope:StructuredScopeV2 {numerical_family: None,
+owner:owner.clone(),coverage:StructuredCoverageV2 {
                 pending_eligible_positions:vec![],authorized_pending_constraints:vec![HostPendingConstraintV2::AnySubset],
                 pending_counts:vec![0],length_counts:vec![0,1],pending_positions:vec![],length_positions:vec![0],joint_counts:vec![(0,0),(0,1)]}},
             membership_rule:MembershipRuleV2 {owner,windows:vec![FrontierWindowV2 {rows:vec![RowWindowV2 {

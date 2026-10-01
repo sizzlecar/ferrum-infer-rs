@@ -108,13 +108,18 @@ impl LoadedPrefillReference {
 /// Large intermediate chunks are inserted first so a small optional budget
 /// does not replace all throughput opportunities with tiny chunks. At most
 /// 32 doubling steps are possible for a u32 token count. This is a bounded
-/// search heuristic, not a claim that intermediate physical costs are known
+/// search heuristic. Cold cost inputs reuse this declaration before fitting
+/// reference work; it grants no reference, cost, or execution authority.
+/// This is not a claim that intermediate physical costs are known
 /// or that latency is monotonic in the token count.
-fn piecewise_chunk_candidates(
+pub fn piecewise_chunk_candidates(
     remaining: u32,
     reference_granule: NonZeroU32,
     limits: ReferenceChunkLimits,
 ) -> Result<Vec<NonZeroU32>, ReferenceUnknown> {
+    if limits.maximum_candidates.get() > 64 {
+        return Err(ReferenceUnknown::PointBudget);
+    }
     let alignment = limits.alignment.get();
     let ceiling = remaining.min(limits.maximum_tokens.get());
     let mut counts = std::collections::BTreeSet::new();

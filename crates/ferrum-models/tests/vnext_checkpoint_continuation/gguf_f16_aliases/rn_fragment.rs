@@ -127,6 +127,15 @@ fn build(capture: SloStructuredCostCapture, mode: FixtureExecutionMode, rows: u6
         else {
             panic!("actual resolved provider must bind both representations");
         };
+        assert_eq!(
+            *source_format,
+            if ordinal == 1 {
+                RnF16FragmentSourceFormatV1::Q4K
+            } else {
+                RnF16FragmentSourceFormatV1::Q6K
+            },
+            "the native fixture must exercise both the original and Q6-prefetch projections",
+        );
         let plan =
             RnF16FragmentPlanV1::from_dimensions(*source_format, value.tensor().dimensions())
                 .unwrap();
@@ -218,7 +227,14 @@ fn rn_fragment_model_actual_future_and_dual_receipt_cover_whole_m_boundary() {
         FixtureExecutionMode::Eager,
         9,
     );
-    for counts in [&[1][..], &[8][..], &[9][..], &[4, 4][..], &[4, 5][..]] {
+    for counts in [
+        &[1][..],
+        &[7][..],
+        &[8][..],
+        &[9][..],
+        &[4, 4][..],
+        &[4, 5][..],
+    ] {
         let expected = full_cost_route::run_with_output(&disabled, counts, false, "node.ffn").0;
         // This submits the actual OperationProvider and compares its original
         // device attribution to the pre-submission query, including sealed
@@ -233,7 +249,7 @@ fn rn_fragment_model_actual_future_and_dual_receipt_cover_whole_m_boundary() {
 
 #[test]
 fn rn_fragment_model_changed_inputs_and_checkpoint_continue_in_retained_graph() {
-    for rows in [1usize, 8, 9] {
+    for rows in [1usize, 7, 8, 9] {
         let eager = build(
             SloStructuredCostCapture::Disabled,
             FixtureExecutionMode::Eager,
@@ -319,4 +335,134 @@ fn rn_fragment_model_changed_inputs_and_checkpoint_continue_in_retained_graph() 
         restored.try_complete().unwrap();
         expected_owner.try_complete().unwrap();
     }
+}
+
+#[test]
+fn rn_fragment_resident_consumer_demand_keeps_future_templates_and_actual_state() {
+    use ferrum_interfaces::execution_cost::{
+        GuardedNotSubmittedReason, HostSubmissionRejection, StructuredCostSampleDemand,
+    };
+    use ferrum_types::SloStructuredActualCapturePolicy;
+
+    const ROWS: usize = 8;
+    const WAVES: usize = 5;
+    let eager = build(
+        SloStructuredCostCapture::Disabled,
+        FixtureExecutionMode::Eager,
+        ROWS as u64,
+    );
+    let replay = build(
+        SloStructuredCostCapture::HostSettledV1,
+        FixtureExecutionMode::Replay,
+        ROWS as u64,
+    );
+    let tokens: Arc<[u32]> = (0..WAVES * ROWS)
+        .map(|i| 1 + ((i * 7 + i / ROWS) % 29) as u32)
+        .collect();
+    let expected_owner = eager.admit("sample-demand-eager", Arc::clone(&tokens));
+    let owner = replay.admit("sample-demand-resident", Arc::clone(&tokens));
+    let demand = |has_actual_consumer| {
+        StructuredCostSampleDemand::for_call(
+            SloStructuredActualCapturePolicy::ConsumerDrivenV1,
+            has_actual_consumer,
+            false,
+        )
+    };
+    assert_eq!(demand(false), StructuredCostSampleDemand::NotRequested);
+    assert_eq!(demand(true), StructuredCostSampleDemand::Requested);
+
+    replay
+        .lane
+        .configure_submission_readback_staging(1 << 20)
+        .unwrap();
+
+    let mut expected = Vec::new();
+    for index in 0..WAVES {
+        expected.push(
+            eager
+                .execute_checked_output_node(
+                    &expected_owner,
+                    Arc::clone(&tokens),
+                    index * ROWS..(index + 1) * ROWS,
+                    false,
+                    false,
+                    false,
+                    "node.ffn",
+                )
+                .unwrap(),
+        );
+    }
+    // Two actual foreground warm/capture waves are the existing fixture's
+    // backend contract. Neither asks for a dynamic actual sample.
+    for index in 0..2 {
+        let actual = replay
+            .execute_checked_output_node_with_sample_demand(
+                &owner,
+                Arc::clone(&tokens),
+                index * ROWS..(index + 1) * ROWS,
+                false,
+                false,
+                true,
+                "node.ffn",
+                Some(demand(false)),
+            )
+            .unwrap();
+        expected[index].assert_same(&actual, "omitted cold sample preserves real model state");
+    }
+    let programs = replay.lane.reusable_execution_catalog().unwrap();
+    let programs = programs.programs().to_vec();
+    assert!(!programs.is_empty());
+    // The exact native guard runs only on an already-warmed resident program.
+    // The original helper checks one host call, staging release and no fence;
+    // reconciliation must leave this same owner able to execute its real input.
+    let (pending, step) = guarded_cost_route::reject_encoded_output_with_sample_demand(
+        &replay,
+        &owner,
+        2 * ROWS..3 * ROWS,
+        Arc::clone(&tokens),
+        demand(false),
+        "node.ffn",
+        true,
+    );
+    let rejected = pending
+        .reconcile_step(step)
+        .unwrap_or_else(|(error, _)| panic!("sample omission changed guard rollback: {error}"));
+    assert_eq!(
+        rejected.reason(),
+        GuardedNotSubmittedReason::HostRejected(HostSubmissionRejection::WitnessExpired)
+    );
+    drop(rejected);
+
+    assert_eq!(
+        replay.lane.reusable_execution_catalog().unwrap().programs(),
+        programs.as_slice(),
+        "guard rejection cannot replace the captured program",
+    );
+    for (index, has_actual_consumer) in [(2, true), (3, false), (4, true)] {
+        let actual = replay
+            .execute_checked_output_node_with_sample_demand(
+                &owner,
+                Arc::clone(&tokens),
+                index * ROWS..(index + 1) * ROWS,
+                true,
+                false,
+                true,
+                "node.ffn",
+                Some(demand(has_actual_consumer)),
+            )
+            .unwrap();
+        expected[index].assert_same(
+            &actual,
+            "sample demand preserves resident output and states",
+        );
+        actual.assert_state_nonzero();
+        actual.assert_different_output(&expected[index - 1]);
+        assert_eq!(
+            replay.lane.reusable_execution_catalog().unwrap().programs(),
+            programs.as_slice(),
+            "sampling cannot replace the retained executable program"
+        );
+    }
+    owner.try_complete().unwrap();
+    expected_owner.try_complete().unwrap();
 }

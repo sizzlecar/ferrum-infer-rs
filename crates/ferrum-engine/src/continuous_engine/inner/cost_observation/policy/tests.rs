@@ -3,6 +3,8 @@ use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use ferrum_types::{InferenceRequest, ResponseFormat, SamplingParams, TokenId};
 use std::sync::Arc;
 
+mod benchmark_chat;
+
 #[tokio::test]
 async fn host_algorithm_revision_invalidates_old_exact_and_numeric_cost_policy() {
     let tokenizer = tokenizer().await;
@@ -191,6 +193,21 @@ fn credited_sequence_from_request(
     SequenceState,
     ferrum_interfaces::output_flow::CreditedOutputSession,
 ) {
+    credited_sequence_with_contract(
+        tokenizer,
+        request,
+        ferrum_interfaces::output_flow::OutputProjectionContract::cli_text(),
+    )
+}
+
+fn credited_sequence_with_contract(
+    tokenizer: Arc<HuggingFaceTokenizer>,
+    request: InferenceRequest,
+    contract: ferrum_interfaces::output_flow::OutputProjectionContract,
+) -> (
+    SequenceState,
+    ferrum_interfaces::output_flow::CreditedOutputSession,
+) {
     use crate::continuous_engine::credited_output::{CreditedDecodePolicy, CreditedSequenceOutput};
     use crate::continuous_engine::output_flow_runtime::{
         spawn_output_flow_runtime, OutputFlowRuntimeOptions,
@@ -198,14 +215,12 @@ fn credited_sequence_from_request(
     use ferrum_interfaces::output_credit::{
         OutputAccountLimits, OutputCreditPool, OutputPoolLimits,
     };
-    use ferrum_interfaces::output_flow::{
-        OutputProjectionContract, RequestOutputBudget, RequestOutputPlan,
-    };
+    use ferrum_interfaces::output_flow::{RequestOutputBudget, RequestOutputPlan};
     use std::num::NonZeroUsize;
     let mut state = sequence_from_request(tokenizer.clone(), request);
     state.stream_sender = None;
     let plan = RequestOutputPlan::derive(
-        Arc::new(OutputProjectionContract::cli_text()),
+        Arc::new(contract),
         tokenizer.as_ref(),
         &state.original_request,
         state.input_tokens.len(),
@@ -247,6 +262,144 @@ fn fixed_output_request(sampling: SamplingParams) -> InferenceRequest {
         .metadata
         .insert("ferrum_ignore_eos".into(), serde_json::Value::Bool(true));
     request
+}
+
+#[tokio::test]
+async fn installed_plain_text_keeps_real_repeat_history_and_natural_stop_policy() {
+    use ferrum_interfaces::model_executor::LogitsReturnPolicy;
+    let tokenizer = tokenizer().await;
+    let (mut state, _session) = credited_sequence(
+        tokenizer.clone(),
+        SamplingParams {
+            repetition_penalty: 1.1,
+            stop_sequences: vec!["ab".into(), "</s>".into()],
+            ..SamplingParams::greedy()
+        },
+    );
+    let policy = host_numeric_policy(&state, tokenizer.as_ref()).unwrap();
+    assert_eq!(
+        policy.empirical_content_domain,
+        Some(HostContentDomainV1::PlainTextInstalledV2(
+            PlainTextPolicyCapabilityV2 {
+                sampling: PlainTextSamplingRouteV2::Greedy {
+                    repetition_penalty: true
+                },
+                model_eos: false,
+                user_stop: true,
+            }
+        ))
+    );
+    state.cost_numeric_policy = Some(policy);
+    for id in [0, 1, 0] {
+        state.generated_tokens.push(TokenId::new(id));
+        state.sampling_history.record(TokenId::new(id));
+    }
+    let LogitsReturnPolicy::GreedyArgmax {
+        repetition_penalty: Some(repetition),
+        ..
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("installed greedy repetition path");
+    };
+    assert_eq!(repetition.penalty(), 1.1);
+    assert_eq!(repetition.token_ids(), [0, 1]);
+    let actual = super::super::participant_host_features(&state).unwrap();
+    assert!(actual.supports_installed_plain_text_content());
+    assert!(
+        !actual.supports_empirical_plain_text_content(),
+        "legacy future domain stays narrow"
+    );
+    assert_eq!(actual.state.sampling_history_tokens, 3);
+    assert_eq!(
+        host_numeric_policy(&state, tokenizer.as_ref()).unwrap(),
+        policy
+    );
+    assert!(state
+        .model_eos_token_ids
+        .iter()
+        .all(|id| state.stop_token_ids.contains(id)));
+    assert_eq!(state.stop_text_seqs, ["ab", "</s>"]);
+    // Existing product precedence: an explicit user stop with the EOS ID is
+    // classified as Stop. The union is preserved; no stop is removed for SLO.
+    let eos = tokenizer.token_id("</s>").unwrap().get();
+    assert!(state.user_stop_token_ids.contains(&eos));
+    assert!(!state.model_eos_token_ids.contains(&eos));
+    state.generated_tokens.push(TokenId::new(eos));
+    assert_eq!(
+        state.stop_reason(Some(tokenizer.as_ref())),
+        Some(ferrum_types::FinishReason::Stop)
+    );
+}
+
+#[tokio::test]
+async fn installed_plain_text_sampling_is_bound_to_the_installed_plan_and_evidence() {
+    use ferrum_interfaces::model_executor::LogitsReturnPolicy;
+    let tokenizer = tokenizer().await;
+    let sampling = SamplingParams {
+        temperature: 0.7,
+        top_p: 0.8,
+        top_k: Some(4),
+        repetition_penalty: 1.1,
+        frequency_penalty: 0.2,
+        presence_penalty: 0.3,
+        min_p: Some(0.01),
+        ..SamplingParams::greedy()
+    };
+    let (mut state, _session) = credited_sequence(tokenizer.clone(), sampling.clone());
+    let policy = host_numeric_policy(&state, tokenizer.as_ref()).unwrap();
+    assert_eq!(
+        policy.empirical_content_domain,
+        Some(HostContentDomainV1::PlainTextInstalledV2(
+            PlainTextPolicyCapabilityV2 {
+                sampling: PlainTextSamplingRouteV2::FullLogits,
+                model_eos: true,
+                user_stop: false,
+            }
+        ))
+    );
+    assert!(matches!(
+        state.model_decode_logits_policy(),
+        LogitsReturnPolicy::FullLogits
+    ));
+    let (mut other, _other_session) = credited_sequence(
+        tokenizer.clone(),
+        SamplingParams {
+            seed: Some(123),
+            ..sampling
+        },
+    );
+    other.original_request.prompt = "other real prompt".into();
+    assert_eq!(
+        host_numeric_policy(&other, tokenizer.as_ref()).unwrap(),
+        policy
+    );
+    other
+        .original_request
+        .evidence_request
+        .capture_engine_token_timing = true;
+    assert_ne!(
+        host_numeric_policy(&other, tokenizer.as_ref()).unwrap(),
+        policy
+    );
+    state.sampling_params.top_k = Some(2);
+    assert!(
+        host_numeric_policy(&state, tokenizer.as_ref()).is_none(),
+        "parameters cannot rebind an installed sampler"
+    );
+    state.sampling_params.top_k = Some(4);
+    assert_eq!(
+        host_numeric_policy(&state, tokenizer.as_ref()),
+        Some(policy)
+    );
+    let changed_plan = SamplingParams {
+        top_k: Some(2),
+        ..state.sampling_params.clone()
+    };
+    state.sampling_plan = SamplingConfig::from_params(&changed_plan);
+    assert!(
+        host_numeric_policy(&state, tokenizer.as_ref()).is_none(),
+        "an independently replaced installed plan cannot borrow the request identity"
+    );
 }
 
 #[tokio::test]
@@ -377,10 +530,20 @@ async fn plain_text_domain_normal_constructor_resolves_length_only_without_early
         .model_eos_token_ids
         .iter()
         .all(|id| automatic.stop_token_ids.contains(id)));
-    assert!(host_numeric_policy(&automatic, tokenizer.as_ref())
-        .unwrap()
-        .empirical_content_domain
-        .is_none());
+    assert_eq!(
+        host_numeric_policy(&automatic, tokenizer.as_ref())
+            .unwrap()
+            .empirical_content_domain,
+        Some(HostContentDomainV1::PlainTextInstalledV2(
+            PlainTextPolicyCapabilityV2 {
+                sampling: PlainTextSamplingRouteV2::Greedy {
+                    repetition_penalty: false
+                },
+                model_eos: true,
+                user_stop: false,
+            }
+        ))
+    );
     automatic.generated_tokens.push(TokenId::new(eos));
     assert_eq!(
         automatic.stop_reason(Some(tokenizer.as_ref())),
@@ -427,10 +590,20 @@ async fn plain_text_domain_ignore_eos_preserves_user_stops_and_structured_bounda
         assert!(state.model_eos_token_ids.is_empty());
         assert_eq!(state.stop_text_seqs, vec![stop]);
         assert_eq!(state.user_stop_token_ids.contains(&0), tokens.len() == 1);
-        assert!(host_numeric_policy(&state, tokenizer.as_ref())
-            .unwrap()
-            .empirical_content_domain
-            .is_none());
+        assert_eq!(
+            host_numeric_policy(&state, tokenizer.as_ref())
+                .unwrap()
+                .empirical_content_domain,
+            Some(HostContentDomainV1::PlainTextInstalledV2(
+                PlainTextPolicyCapabilityV2 {
+                    sampling: PlainTextSamplingRouteV2::Greedy {
+                        repetition_penalty: false
+                    },
+                    model_eos: false,
+                    user_stop: true,
+                }
+            ))
+        );
         state
             .generated_tokens
             .extend(tokens.into_iter().map(TokenId::new));

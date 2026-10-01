@@ -249,7 +249,9 @@ fn same_alternative(
     match (expected_forecast, forecast) {
         (HostContentForecastV2::Exact, HostContentForecastV2::Exact) => true,
         (HostContentForecastV2::Unresolved(a), HostContentForecastV2::Unresolved(b)) => {
-            a.eligible_positions() == b.eligible_positions() && a.constraint() == b.constraint()
+            a.eligible_positions() == b.eligible_positions()
+                && a.constraint() == b.constraint()
+                && a.repetition_upper_sum() == b.repetition_upper_sum()
         }
         _ => false,
     }

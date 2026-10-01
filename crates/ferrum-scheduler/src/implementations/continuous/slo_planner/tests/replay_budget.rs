@@ -114,6 +114,21 @@ impl PlanningClock for VirtualClock<'_> {
         })
     }
 }
+struct PhaseClock<'a> {
+    now: &'a Cell<u64>,
+    cap_ns: u64,
+}
+impl PlanningClock for PhaseClock<'_> {
+    fn now_ns(&mut self) -> u64 {
+        self.now.get()
+    }
+    fn planning_budget_window(&self) -> Option<PlanningBudgetWindow> {
+        VirtualClock(self.now).planning_budget_window()
+    }
+    fn planning_phase_deadline_ns(&self) -> Option<u64> {
+        Some(self.cap_ns)
+    }
+}
 fn workload() -> SchedulerSnapshot {
     let mut row = decode(1);
     row.timing.maximum_output_tokens = n32(5);
@@ -204,6 +219,91 @@ fn replay_reserve_cannot_save_a_witness_whose_fresh_replay_does_not_fit() {
     assert_eq!(search.replay_reserve_ns, 950_000);
     assert_eq!(search.phase, PlanningSearchPhase::Finalization);
     assert_eq!(search.search_soft_stops, 1);
+}
+
+/// A fast, fully Known execution prediction cannot recover CPU time spent
+/// constructing the same route twice. This deterministic schedule isolates
+/// that failure with the engine's earlier completion/publication boundary;
+/// it is not a backend timing benchmark or an extrapolation from the fixture.
+#[test]
+fn known_fast_prediction_cannot_pay_for_repeated_projection_outside_phase_budget() {
+    for predicted_execution_ns in [1_000, 100_000] {
+        let mut s = workload();
+        s.observed_at_ns = 500_000;
+        // Only one remaining token: no optional tail, uncovered shape or
+        // long generation is needed to reproduce the CPU-budget failure.
+        s.requests[0].timing.maximum_output_tokens = n32(2);
+        let mut context = TimedContext::new(800_000);
+        context.now.set(s.observed_at_ns);
+        context.begin_ns = 0;
+        let decision = planner(1).propose_with_execution(
+            &s,
+            &Model(|_: &WaveExecutionShape| Some(predicted_execution_ns)),
+            &context,
+            &mut PhaseClock {
+                now: &context.now,
+                cap_ns: 1_350_000,
+            },
+        );
+        let PlanningDecision::Unknown { reason, search } = decision else {
+            panic!("a cost estimate cannot authorize an over-budget replay: {decision:?}");
+        };
+        assert_eq!(reason, PlanningUnknownReason::ComputeBudgetExhausted);
+        assert_eq!(search.phase, PlanningSearchPhase::Finalization);
+        assert_eq!(search.generated_candidates, 1);
+        assert_eq!(search.cost_unknown_candidates, 0);
+        assert_eq!(context.begins.get(), 2);
+        assert_eq!(context.now.get(), 2_100_000);
+    }
+}
+
+#[test]
+fn publication_phase_keeps_fresh_replay_and_rejects_at_its_exact_boundary() {
+    // A 250us draft plus 100us of capture have already elapsed. The same
+    // future publication stage can reserve 400us; adding the draft estimate
+    // again would cap replay at 1350us. Neither cap changes the hard deadline.
+    for (cap_ns, edge_ns, expected_end_ns, fits) in [
+        (1_350_000, 550_000, 1_550_000, false),
+        (1_600_000, 550_000, 1_550_000, true),
+        (1_600_000, 575_000, 1_600_000, false),
+        (1_600_000, 600_000, 1_650_000, false),
+    ] {
+        let mut s = workload();
+        s.observed_at_ns = 350_000;
+        s.requests[0].timing.maximum_output_tokens = n32(2);
+        let before = s.clone();
+        let context = TimedContext::new(edge_ns);
+        context.now.set(s.observed_at_ns);
+        let decision = planner(1).propose_with_execution(
+            &s,
+            &Model(|_: &WaveExecutionShape| Some(100_000)),
+            &context,
+            &mut PhaseClock {
+                now: &context.now,
+                cap_ns,
+            },
+        );
+        assert_eq!(context.begins.get(), 2);
+        assert_eq!(context.now.get(), expected_end_ns);
+        assert_eq!(s, before);
+        if fits {
+            let (selected, witness, _) = feasible(decision);
+            assert_eq!(witness.waves, 1);
+            let seen = context.seen.borrow();
+            assert_eq!(seen.iter().map(|row| row.0).collect::<Vec<_>>(), [1, 2]);
+            assert_eq!(
+                selected.replayed_first_wave(&s).unwrap().rows.as_ptr() as usize,
+                seen[1].2
+            );
+            assert_ne!(seen[0].2, seen[1].2);
+        } else {
+            let PlanningDecision::Unknown { reason, search } = decision else {
+                panic!("replay at or after its cap must not produce a witness: {decision:?}");
+            };
+            assert_eq!(reason, PlanningUnknownReason::ComputeBudgetExhausted);
+            assert_eq!(search.phase, PlanningSearchPhase::Finalization);
+        }
+    }
 }
 
 #[test]

@@ -1,8 +1,10 @@
 //! Read-only route declarations from the provider selected by a compiled plan.
 //! No buffer, request identity, allocator or submission authority is exposed.
+mod prepared;
 mod program_bindings;
 mod rows;
 mod selected;
+pub use prepared::{OperationCostPreparationRequest, PreparedOperationCostData};
 pub use program_bindings::{
     coalesce_sorted_program_binding_writes, ProgramBindingCostPatch, ProgramBindingCostWrite,
     ProgramBindingTransferLayout,
@@ -11,6 +13,7 @@ pub(crate) use rows::{ValidatedCostRows, ValidatedCostRowsBuilder};
 pub use selected::SelectedEagerCostRoute;
 use std::{collections::BTreeMap, num::NonZeroU64};
 
+use super::invocation::{PreparedOperationDispatchBinding, PreparedOperationResourceSource};
 use super::{
     foundation::invalid_operation, resolved_value::resource_uses_packed_batch_coordinates,
     AttributeId, ResolvedValueBinding, ResolvedValueRole,
@@ -32,9 +35,12 @@ pub struct OperationCostWorkRow {
     pub full_input_tokens: NonZeroU64,
 }
 
+#[derive(Clone, Copy)]
 pub struct OperationCostRouteRequest<'a> {
     node: &'a PlanNode,
     memory: &'a MemoryPlan,
+    prepared: &'a PreparedOperationDispatchBinding,
+    cost_data: Option<&'a PreparedOperationCostData>,
     rows: &'a [OperationCostWorkRow],
     immediate_tokens: u64,
     packed_starts: &'a [u64],
@@ -46,15 +52,26 @@ impl<'a> OperationCostRouteRequest<'a> {
         node: &'a PlanNode,
         memory: &'a MemoryPlan,
         rows: &'a ValidatedCostRows<'a>,
+        prepared: &'a PreparedOperationDispatchBinding,
+        cost_data: Option<&'a PreparedOperationCostData>,
     ) -> Self {
         Self {
             node,
             memory,
+            prepared,
+            cost_data,
             rows: rows.rows(),
             immediate_tokens: rows.immediate_tokens(),
             packed_starts: rows.packed_starts(),
             physical_ranges: None,
         }
+    }
+
+    /// Numerical metadata from this exact bound provider and plan node.
+    /// A different provider type or absent preparation yields None; callers
+    /// retain their original checked projection path in that case.
+    pub fn prepared_cost_data<T: std::any::Any>(&self) -> Option<&T> {
+        self.cost_data.and_then(PreparedOperationCostData::get::<T>)
     }
 
     pub(super) fn with_physical_ranges(
@@ -63,6 +80,44 @@ impl<'a> OperationCostRouteRequest<'a> {
     ) -> Self {
         self.physical_ranges = ranges;
         self
+    }
+
+    fn dynamic_descriptor(
+        &self,
+        resource: &crate::vnext::ResourceId,
+    ) -> Option<&crate::vnext::DynamicResourceDescriptor> {
+        match self.prepared.resource_source(resource) {
+            Some(PreparedOperationResourceSource::PlanStatic { .. }) => None,
+            Some(PreparedOperationResourceSource::Dynamic { descriptor_index }) => {
+                self.memory.dynamic_descriptors().get(descriptor_index)
+            }
+            // Preserve queries outside the node's own declared bindings.
+            None => self.memory.dynamic_descriptor(resource),
+        }
+    }
+
+    fn packed_coordinates(&self, resource: &crate::vnext::ResourceId) -> Result<bool, VNextError> {
+        match self.prepared.resource_source(resource) {
+            Some(PreparedOperationResourceSource::PlanStatic { .. }) => Ok(false),
+            Some(PreparedOperationResourceSource::Dynamic { descriptor_index }) => {
+                let descriptor = self
+                    .memory
+                    .dynamic_descriptors()
+                    .get(descriptor_index)
+                    .ok_or_else(|| {
+                        invalid_operation("prepared cost route descriptor is missing")
+                    })?;
+                Ok(matches!(
+                    descriptor.demand(),
+                    crate::vnext::DynamicResourceDemand::Tokens { .. }
+                ) && matches!(
+                    descriptor.lifetime(),
+                    crate::vnext::AllocationLifetime::Step
+                        | crate::vnext::AllocationLifetime::Invocation
+                ))
+            }
+            None => resource_uses_packed_batch_coordinates(self.memory, resource),
+        }
     }
 
     /// The exact participant-local byte range mapped through the same Step
@@ -96,7 +151,7 @@ impl<'a> OperationCostRouteRequest<'a> {
         else {
             return Ok(None);
         };
-        let descriptor = self.memory.dynamic_descriptor(component.resource_id());
+        let descriptor = self.dynamic_descriptor(component.resource_id());
         let range = if let Some(descriptor) = descriptor {
             if descriptor.lifetime() != crate::vnext::AllocationLifetime::Step {
                 return Ok(None);
@@ -153,7 +208,7 @@ impl<'a> OperationCostRouteRequest<'a> {
         {
             return Ok(None);
         }
-        let Some(descriptor) = self.memory.dynamic_descriptor(component.resource_id()) else {
+        let Some(descriptor) = self.dynamic_descriptor(component.resource_id()) else {
             return Ok(None);
         };
         if descriptor.lifetime() != crate::vnext::AllocationLifetime::Sequence
@@ -233,7 +288,7 @@ impl<'a> OperationCostRouteRequest<'a> {
         let [component] = binding.storage().components() else {
             return Ok(None);
         };
-        let descriptor = self.memory.dynamic_descriptor(component.resource_id());
+        let descriptor = self.dynamic_descriptor(component.resource_id());
         Ok(descriptor
             .filter(|descriptor| {
                 matches!(
@@ -261,7 +316,7 @@ impl<'a> OperationCostRouteRequest<'a> {
                 "cost route coordinate ownership needs one resource component",
             ));
         };
-        resource_uses_packed_batch_coordinates(self.memory, component.resource_id())
+        self.packed_coordinates(component.resource_id())
     }
 }
 
@@ -402,6 +457,43 @@ impl OperationCostCommand {
             reusable_graph_node_count: None,
             statistical_evidence: self.statistical_evidence.as_ref(),
         })
+    }
+}
+
+/// Whether this projection must also establish the selected graph topology.
+/// Eager-only projections do not query graph selectors on unsupported backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationCostTopologyRequirement {
+    NotRequested,
+    Required,
+}
+
+/// One provider's declarations from one numerical request. This is neither a
+/// reusable cache entry nor a resource/graph permit. A missing required topology
+/// remains unavailable even when the eager route is known.
+pub struct OperationCostSelection {
+    route: OperationCostRoute,
+    topology: Option<super::ReusableExecutionTopology>,
+}
+
+impl OperationCostSelection {
+    pub fn new(
+        route: OperationCostRoute,
+        topology: Option<super::ReusableExecutionTopology>,
+    ) -> Self {
+        Self { route, topology }
+    }
+
+    pub fn route(&self) -> &OperationCostRoute {
+        &self.route
+    }
+
+    pub fn topology(&self) -> Option<&super::ReusableExecutionTopology> {
+        self.topology.as_ref()
+    }
+
+    pub fn into_route(self) -> OperationCostRoute {
+        self.route
     }
 }
 
@@ -577,6 +669,24 @@ mod tests {
 }
 
 impl super::ReusableExecutionTopologyView for OperationCostRouteRequest<'_> {
+    fn binding_uses_packed_batch_coordinates(
+        &self,
+        role: ResolvedValueRole,
+        ordinal: u32,
+    ) -> Result<bool, VNextError> {
+        // Preserve the topology interface's validation and error semantics.
+        let binding = self
+            .bindings()
+            .iter()
+            .find(|binding| binding.role() == role && binding.ordinal() == ordinal)
+            .ok_or_else(|| invalid_operation("topology references unknown binding"))?;
+        let [component] = binding.storage().components() else {
+            return Err(invalid_operation(
+                "topology coordinate ownership requires one resource component",
+            ));
+        };
+        self.packed_coordinates(component.resource_id())
+    }
     fn operation_id(&self) -> &OperationId {
         self.node.operation_id()
     }
@@ -613,6 +723,19 @@ impl super::ReusableExecutionTopologyView for OperationCostRouteRequest<'_> {
         &self,
         resource: &crate::vnext::ResourceId,
     ) -> Result<Option<crate::vnext::DeviceReusableAddressScope>, VNextError> {
+        match self.prepared.resource_source(resource) {
+            Some(PreparedOperationResourceSource::PlanStatic { .. }) => {
+                return Ok(Some(crate::vnext::DeviceReusableAddressScope::Plan));
+            }
+            Some(PreparedOperationResourceSource::Dynamic { .. }) => {
+                // This proof is supplied by the current fenced projection.
+                // The immutable classification never supplies lane residency.
+                return Ok(self
+                    .physical_ranges
+                    .and_then(|proof| proof.reusable_scope(resource)));
+            }
+            None => {}
+        }
         if self
             .memory
             .static_allocations()

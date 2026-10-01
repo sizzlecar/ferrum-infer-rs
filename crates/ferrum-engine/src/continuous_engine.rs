@@ -1216,6 +1216,8 @@ fn token_id_tail(tokens: &[TokenId], limit: usize) -> Vec<u32> {
     tokens[start..].iter().map(|token| token.get()).collect()
 }
 
+mod admission_observer;
+mod query_observation;
 mod sequence;
 pub use inner::calibration::{
     CalibrationAction, CalibrationAuditReadinessV2, CalibrationAuditRowReadinessV2,
@@ -1223,15 +1225,15 @@ pub use inner::calibration::{
     CalibrationDecodeRoute, CalibrationFrontier, CalibrationLimits, CalibrationObservation,
     CalibrationProfileArtifact, CalibrationProfilePaths, CalibrationQueueDisposition,
     CalibrationReferenceArtifact, CalibrationReferenceCollector, CalibrationReferenceCurve,
-    CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
-    CalibrationRequestEvidence, CalibrationSession, CalibrationSubmissionState, CalibrationTurn,
-    CalibrationWaveReport, CalibrationWork, FrozenCalibrationModel, ImportedCalibrationModel,
-    RequiredFutureAuditActionV2, RequiredFutureAuditCostV2, RequiredFutureAuditFailureV2,
-    RequiredFutureAuditFrontierV2, RequiredFutureAuditLimitsV2, RequiredFutureAuditPathReportV2,
-    RequiredFutureAuditPathV2, RequiredFutureAuditPlanV2, RequiredFutureAuditQueryV2,
-    RequiredFutureAuditReportV2, RequiredFutureAuditRowV2, SelectedCalibrationOptions,
-    SelectedFitFreezeReceipt, StructuredPreparedProjectionBudgetV2,
-    StructuredPreparedProjectionReportV2,
+    CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceSourceV1,
+    CalibrationReferenceTrial, CalibrationRequestEvidence, CalibrationSession,
+    CalibrationSubmissionState, CalibrationTurn, CalibrationWaveReport, CalibrationWork,
+    FrozenCalibrationModel, ImportedCalibrationModel, RequiredFutureAuditActionV2,
+    RequiredFutureAuditCostV2, RequiredFutureAuditFailureV2, RequiredFutureAuditFrontierV2,
+    RequiredFutureAuditLimitsV2, RequiredFutureAuditPathReportV2, RequiredFutureAuditPathV2,
+    RequiredFutureAuditPlanV2, RequiredFutureAuditQueryV2, RequiredFutureAuditReportV2,
+    RequiredFutureAuditRowV2, SelectedCalibrationOptions, SelectedFitFreezeReceipt,
+    StructuredPreparedProjectionBudgetV2, StructuredPreparedProjectionReportV2,
 };
 pub use inner::calibration::{
     CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleaseProgressV5,
@@ -1430,9 +1432,11 @@ impl EngineResourceComposition {
 }
 
 struct EngineInner {
+    admission_observer: admission_observer::Clock,
     prefill_reference_runtime:
         Option<Arc<inner::prefill_reference_runtime::EnginePrefillReferenceRuntime>>,
     cost_runtime: Option<Arc<inner::cost_observation::EngineCostRuntime>>,
+    required_query_observation: Option<Arc<query_observation::Writer>>,
     slo_controller: Mutex<inner::slo_controller::SloControllerState>,
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
@@ -1465,6 +1469,10 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
+    prefix_resource_recorder: Option<profile::prefix::Recorder>,
+    /// Pins only the optional observer adapter installed as a native weak sink.
+    _prefix_resource_sink:
+        Option<Arc<dyn ferrum_interfaces::vnext::NativeCheckpointObservationSink>>,
     profile_trace_jsonl: Option<SchedulerTraceJournal>,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
@@ -1495,6 +1503,9 @@ struct EngineInner {
     /// Only a freshly constructed exclusive CalibrationSession can set this.
     /// Ordinary Observe and the public Enforce startup gate are unchanged.
     manual_calibration_driver: bool,
+    /// Only the unpublished shared startup path can install this authority.
+    /// It is cleared after all private probes retire, before user admission.
+    automatic_reference_bootstrap: bool,
     shutdown_started: AtomicBool,
     shutdown_lock: tokio::sync::Mutex<()>,
     background_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -2840,7 +2851,7 @@ impl ContinuousBatchEngine {
         )?;
         config
             .runtime
-            .validate_profile_frame_limit()
+            .validate_profile_observation()
             .map_err(FerrumError::config)?;
         if config.runtime.profile_max_frames_per_request.is_some()
             && executor_authority != ExecutionResourceAuthority::PlanRuntime
@@ -2923,6 +2934,15 @@ impl ContinuousBatchEngine {
                 execution_profile_journals.push(journal.clone());
             }
         }
+        let prefix_resource_recorder = profile::prefix::Recorder::for_detail(
+            &config,
+            runtime_config
+                .profile_entrypoint
+                .unwrap_or(ProfileEntrypoint::Synthetic),
+            profile_trace_jsonl
+                .as_ref()
+                .or(scheduler_trace_jsonl.as_ref()),
+        );
         let execution_sink: Option<Arc<dyn ExecutionEventSink>> =
             if !execution_profile_journals.is_empty() {
                 Some(Arc::new(VNextProfileExecutionEventSink::with_journals(
@@ -2932,10 +2952,9 @@ impl ContinuousBatchEngine {
                         .unwrap_or(ProfileEntrypoint::Synthetic),
                     &config,
                 )))
-            } else if config.runtime.profile_detail == ObservabilityProfileDetail::Basic {
-                Some(Arc::new(MetricsOnlyExecutionEventSink))
             } else {
-                None
+                MetricsOnlyExecutionEventSink::for_detail(config.runtime.profile_detail)
+                    .map(|sink| Arc::new(sink) as Arc<dyn ExecutionEventSink>)
             };
         if let Some(sink) = execution_sink {
             model_executor.attach_execution_event_sink(Arc::clone(&sink));
@@ -2944,21 +2963,85 @@ impl ContinuousBatchEngine {
             }
         }
 
+        // Attaching the actual product sink may change executor capabilities.
+        // Validate the final composition before loading observations or startup work.
+        slo_startup::validate_execution(
+            &config,
+            model_executor.as_ref(),
+            draft_executor.is_some() || spec_config.is_some(),
+        )?;
+
         let prefill_reference_runtime =
             inner::prefill_reference_runtime::EnginePrefillReferenceRuntime::load(
                 config.scheduler.slo.prefill_reference.as_ref(),
                 || model_executor.execution_cost_identity(),
             )
             .map_err(|error| FerrumError::config(error.to_string()))?;
+        // One shared cold budget for all immutable CPU templates belonging to
+        // this engine. Builder run/serve and manual/automatic calibration all
+        // pass here before prepare_startup, warmup or any user execution.
+        let maximum = config
+            .scheduler
+            .slo
+            .cost_observation
+            .maximum_template_bytes
+            .get();
+        let observation_templates = match model_executor.observation_template_budget() {
+            Some(budget) if budget.maximum_bytes() == maximum => budget,
+            Some(_) => {
+                return Err(FerrumError::config(
+                    "executor observation template budget differs from typed configuration",
+                ))
+            }
+            None => ferrum_interfaces::vnext::DeviceObservationTemplateBudget::new(maximum)
+                .map_err(|error| {
+                    FerrumError::config(format!("observation template budget: {error}"))
+                })?,
+        };
+        model_executor.install_observation_template_budget(observation_templates.clone())?;
+        if let Some(draft) = &draft_executor {
+            if draft
+                .observation_template_budget()
+                .is_some_and(|budget| !Arc::ptr_eq(&budget, &observation_templates))
+            {
+                return Err(FerrumError::config("target and draft must share the original observation template budget before model initialization"));
+            }
+            draft.install_observation_template_budget(observation_templates)?;
+        }
         let cost_runtime = if config.scheduler.slo.mode == ferrum_types::SloMode::Off {
             None
+        } else if !config.scheduler.slo.execution_policy().cost_observation {
+            Some(Arc::new(
+                inner::cost_observation::EngineCostRuntime::new_identity_only(
+                    model_executor.execution_cost_identity(),
+                    &config.scheduler.slo.cost_observation,
+                )?,
+            ))
         } else {
-            Some(Arc::new(inner::cost_observation::EngineCostRuntime::new(
+            Some(Arc::new(inner::cost_observation::EngineCostRuntime::new_with_domain(
                 model_executor.execution_cost_identity(),
                 &config.scheduler.slo.cost_observation,
                 config.scheduler.slo.cost_profile.as_deref(),
+                match model_executor.cost_workload_domain() {
+                    ferrum_interfaces::execution_cost::CostWorkloadDomainAvailability::Known(domain) => Some(domain.as_ref().clone()),
+                    ferrum_interfaces::execution_cost::CostWorkloadDomainAvailability::Unknown(_) => None,
+                },
             )?))
         };
+        let mut prefix_resource_sink = None;
+        if let Some(sink) = cost_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.prefix_cost_sink())
+        {
+            let sink = if let Some(recorder) = &prefix_resource_recorder {
+                let observer = profile::prefix::NativeSink::wrap(sink, recorder.clone());
+                prefix_resource_sink = Some(Arc::clone(&observer));
+                observer
+            } else {
+                sink
+            };
+            model_executor.install_checkpoint_observation_sink(Arc::downgrade(&sink))?;
+        }
         slo_startup::validate_loaded(
             &config,
             cost_runtime.as_deref(),
@@ -2966,11 +3049,21 @@ impl ContinuousBatchEngine {
         )?;
         config.slo_cost_profile_receipt = cost_runtime
             .as_ref()
-            .and_then(|runtime| runtime.profile_receipt().cloned());
+            .and_then(|runtime| runtime.profile_receipt());
+        let required_query_observation =
+            query_observation::Writer::open(&config.scheduler.slo.required_query_observation)?;
+        if let Some(writer) = &required_query_observation {
+            writer.bind_identity(
+                &config.scheduler.slo,
+                config.slo_cost_profile_receipt.as_ref(),
+            )?;
+        }
         Ok(Self {
             inner: Arc::new(EngineInner {
+                admission_observer: admission_observer::Clock::new(),
                 prefill_reference_runtime,
                 cost_runtime,
+                required_query_observation,
                 slo_controller: Mutex::new(inner::slo_controller::SloControllerState::default()),
                 config,
                 scheduler,
@@ -2991,6 +3084,8 @@ impl ContinuousBatchEngine {
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
+                prefix_resource_recorder,
+                _prefix_resource_sink: prefix_resource_sink,
                 profile_trace_jsonl,
                 scheduler_trace_jsonl,
                 legacy_scheduler_trace_jsonl,
@@ -3013,6 +3108,7 @@ impl ContinuousBatchEngine {
                 model_execution_time_samples: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
                 manual_calibration_driver: false,
+                automatic_reference_bootstrap: false,
                 shutdown_started: AtomicBool::new(false),
                 shutdown_lock: tokio::sync::Mutex::new(()),
                 background_loop: Mutex::new(None),
@@ -3210,6 +3306,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 structured_factory.as_deref(),
             )?;
         seq_state.slo = slo;
+        seq_state.admission_observation_ingress = Some(context.ingress());
         gauge!("ferrum.engine.active_requests").increment(1.0);
         let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.response_sender = Some(resp_tx);
@@ -3348,6 +3445,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             )?;
         let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.slo = slo;
+        seq_state.admission_observation_ingress = Some(context.ingress());
         seq_state.stream_sender = Some(tx);
         seq_state.request_slot = Some(request_slot);
         self.inner.initialize_sequence_cost(&mut seq_state);
@@ -3524,12 +3622,20 @@ impl InferenceEngine for ContinuousBatchEngine {
                 trace_journals.push(journal);
             }
         }
+        let prefix_resource_recorder = self.inner.prefix_resource_recorder.clone();
         let trace_result = if trace_journals.is_empty() {
             Ok(())
         } else {
             tokio::task::spawn_blocking(move || {
+                // Native completions and the learner are quiescent above.
+                let summary = prefix_resource_recorder
+                    .as_ref()
+                    .map(|recorder| recorder.finish());
                 for journal in trace_journals {
                     journal.close()?;
+                }
+                if let Some(result) = summary {
+                    result?;
                 }
                 Ok::<(), JsonlJournalError>(())
             })
@@ -3543,6 +3649,20 @@ impl InferenceEngine for ContinuousBatchEngine {
                 })
             })
         };
+
+        let query_observation_result =
+            if let Some(writer) = self.inner.required_query_observation.clone() {
+                tokio::task::spawn_blocking(move || writer.close())
+                    .await
+                    .map_err(|error| {
+                        FerrumError::internal(format!(
+                            "required-query observation close task failed: {error}"
+                        ))
+                    })
+                    .and_then(|result| result)
+            } else {
+                Ok(())
+            };
 
         // Always finalize enabled diagnostics, including when another shutdown
         // step failed. The sampler owns no inference resources or GPU waits.
@@ -3559,8 +3679,15 @@ impl InferenceEngine for ContinuousBatchEngine {
         output_result?;
         cost_result?;
         trace_result?;
+        query_observation_result?;
         memory_result?;
-        draft_memory_result
+        draft_memory_result?;
+        // Cache clean is acknowledged only after every original shutdown
+        // result, including the cost worker join and output drain, succeeded.
+        if let Some(runtime) = &self.inner.cost_runtime {
+            runtime.acknowledge_restart_shutdown();
+        }
+        Ok(())
     }
 
     fn config(&self) -> &EngineConfig {
@@ -3591,24 +3718,35 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        if let Some(snapshot) = self.inner.model_executor.cache_metrics_snapshot() {
-            return Some(snapshot);
+        let mut snapshot = self
+            .inner
+            .model_executor
+            .cache_metrics_snapshot()
+            .unwrap_or_else(|| {
+                let stats = self.inner.prefix_cache.stats();
+                serde_json::json!({
+                    "position": "engine-whole-prompt-debug-cache",
+                    "source": "continuous-engine-whole-prompt-prefix-cache",
+                    "enabled": self.inner.runtime_config.prefix_cache_enabled,
+                    "hits": stats.hits as u64,
+                    "misses": stats.misses as u64,
+                    "evictions": stats.evictions as u64,
+                    "saved_prefill_tokens": self.inner.prefix_cache_hits.load(Ordering::Relaxed),
+                    "entries": stats.active_prefixes as u64,
+                    "bytes": 0u64,
+                    "cached_tokens": stats.total_cached_tokens as u64,
+                    "hit_rate": stats.hit_rate,
+                })
+            });
+        if let Some(writer) = &self.inner.required_query_observation {
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("required_query_observation".into(), writer.snapshot());
+            } else {
+                snapshot = serde_json::json!({ "executor": snapshot,
+                    "required_query_observation": writer.snapshot() });
+            }
         }
-
-        let stats = self.inner.prefix_cache.stats();
-        Some(serde_json::json!({
-            "position": "engine-whole-prompt-debug-cache",
-            "source": "continuous-engine-whole-prompt-prefix-cache",
-            "enabled": self.inner.runtime_config.prefix_cache_enabled,
-            "hits": stats.hits as u64,
-            "misses": stats.misses as u64,
-            "evictions": stats.evictions as u64,
-            "saved_prefill_tokens": self.inner.prefix_cache_hits.load(Ordering::Relaxed),
-            "entries": stats.active_prefixes as u64,
-            "bytes": 0u64,
-            "cached_tokens": stats.total_cached_tokens as u64,
-            "hit_rate": stats.hit_rate,
-        }))
+        Some(snapshot)
     }
 
     fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
@@ -3618,7 +3756,11 @@ impl InferenceEngine for ContinuousBatchEngine {
     fn admission_snapshot(
         &self,
     ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
-        let scheduler = self.inner.scheduler.admission_phase_counts();
+        let observed = admission_observer::capture(&self.inner);
+        let scheduler = observed
+            .as_ref()
+            .map(|(counts, _)| *counts)
+            .unwrap_or_else(|_| self.inner.scheduler.admission_phase_counts());
         let authority = self.inner.resource_composition.authority();
         let limits = match authority {
             ExecutionResourceAuthority::PlanRuntime => self
@@ -3664,7 +3806,7 @@ impl InferenceEngine for ContinuousBatchEngine {
             None,
             None,
         )
-        .map(Some)
+        .map(|snapshot| Some(snapshot.with_queue_observation(observed.map(|(_, queue)| queue))))
         .map_err(|reason| {
             FerrumError::internal(format!(
                 "runtime admission snapshot violated its typed contract: {reason}"

@@ -36,11 +36,11 @@ pub(super) fn validate_observability(
         || config.scheduler_trace_jsonl.is_some()
         || !matches!(
             config.profile_detail,
-            Detail::Off | Detail::Basic | Detail::Latency | Detail::Kernel
+            Detail::Off | Detail::Basic | Detail::Host | Detail::Latency | Detail::Kernel
         )
     {
         return Err(FerrumError::unsupported(
-            "credited CLI output supports basic, latency, and kernel terminal profiles; resource/lifecycle sinks and replay/debug/verify/full bundles require separate output contracts",
+            "credited CLI output supports host aggregate timing and basic, latency, and kernel terminal profiles; resource/lifecycle sinks and replay/debug/verify/full bundles require separate output contracts",
         ));
     }
     config

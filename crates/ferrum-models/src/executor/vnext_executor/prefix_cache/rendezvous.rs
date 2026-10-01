@@ -1,7 +1,7 @@
 use super::*;
 use ferrum_interfaces::model_executor::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
-    PrefixCaptureStatus,
+    PrefixCaptureStatus, PrefixReadyRestoreRequest,
 };
 
 pub(in super::super) struct NativePrefixCapture<R: DeviceRuntime> {
@@ -118,6 +118,105 @@ impl<R: DeviceRuntime> PrefixCaptureLease for RetainedRestoreCheckpoint<R> {
 }
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
+    pub(in super::super) fn try_ready_prefix(
+        &self,
+        input: PrefixReadyRestoreRequest<'_>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<Option<Arc<dyn PrefixCaptureLease>>> {
+        let result = (|| {
+            if !budget.has_budget() {
+                return Err(ExecutionCostRouteUnknown::BudgetExhausted);
+            }
+            let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+                return Err(ExecutionCostRouteUnknown::Unsupported);
+            };
+            let busy =
+                || ExecutionCostRouteUnknown::Resource(ResourcePlanningUnknown::BusyOrUnavailable);
+            let sequence = {
+                let registry = self.sequences.try_lock().ok_or_else(busy)?;
+                let slot = registry
+                    .prefills
+                    .get(input.request_id)
+                    .ok_or(ExecutionCostRouteUnknown::StaleView)?;
+                if slot.cancelled.load(Ordering::Acquire) {
+                    return Err(ExecutionCostRouteUnknown::StaleView);
+                }
+                let state = slot.state.try_lock().ok_or_else(busy)?;
+                match &*state {
+                    VNextPrefillSlotState::Ready(sequence) => Arc::clone(sequence),
+                    _ => return Err(busy()),
+                }
+            };
+            if !sequence.active.load(Ordering::Acquire)
+                || sequence.maximum_tokens != input.maximum_sequence_tokens
+                || sequence.prefill_tokens_processed.load(Ordering::Acquire) != 0
+            {
+                return Err(ExecutionCostRouteUnknown::StaleView);
+            }
+            let tokens = sequence.tokens.try_lock().ok_or_else(busy)?;
+            if tokens
+                .iter()
+                .copied()
+                .ne(input.input_tokens.iter().map(|token| token.get()))
+            {
+                return Err(ExecutionCostRouteUnknown::InvalidInput);
+            }
+            let mut index = self.prefix_cache.try_lock().ok_or_else(busy)?;
+            let mut selected = None;
+            for (ordinal, entry) in index.entries.iter().enumerate() {
+                if !budget.has_budget() {
+                    return Err(ExecutionCostRouteUnknown::BudgetExhausted);
+                }
+                if entry.matches_restore(
+                    &tokens,
+                    layout.input_dependency() == CheckpointInputDependency::EntireTokenInput,
+                    &|boundary| layout.permits_suffix(boundary as u64, tokens.len() as u64),
+                ) && selected.is_none_or(|(length, _)| entry.prefix.len() > length)
+                {
+                    selected = Some((entry.prefix.len(), ordinal));
+                }
+            }
+            if !budget.has_budget() {
+                return Err(ExecutionCostRouteUnknown::BudgetExhausted);
+            }
+            let checkpoint = selected.map(|(_, ordinal)| {
+                let entry = index.entries.remove(ordinal).expect("selected ready entry");
+                let checkpoint = entry.checkpoint.clone();
+                index.entries.push_back(entry);
+                checkpoint
+            });
+            drop(index);
+            drop(tokens);
+            Ok(checkpoint.map(|checkpoint| self.retain_restore_checkpoint(checkpoint)))
+        })();
+        match result {
+            Ok(value) => ExecutionCostRouteAvailability::Known(value),
+            Err(reason) => ExecutionCostRouteAvailability::Unknown(reason),
+        }
+    }
+
+    /// Planning never waits for publication and never fetches another cache
+    /// entry when the exact retained cohort lease is absent or busy.
+    pub(in super::super) fn try_retained_rendezvous_checkpoint(
+        &self,
+        lease: &dyn PrefixCaptureLease,
+    ) -> Option<SequenceCheckpoint<R>> {
+        if let Some(retained) = lease
+            .as_any()
+            .downcast_ref::<RetainedRestoreCheckpoint<R>>()
+        {
+            return Arc::ptr_eq(&retained.owner, &self.prefix_capture_identity)
+                .then(|| retained.checkpoint.clone());
+        }
+        let native = lease.as_any().downcast_ref::<NativePrefixCapture<R>>()?;
+        if !Arc::ptr_eq(&native.owner, &self.prefix_capture_identity)
+            || Instant::now() >= native.expires_at
+            || native.unavailable.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        native.checkpoint.try_lock()?.clone()
+    }
     pub(in super::super) fn prompt_tail_boundary(
         &self,
         chunk: PrefillChunk,
@@ -133,6 +232,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             owner: Arc::clone(&self.prefix_capture_identity),
             checkpoint,
         })
+    }
+
+    pub(super) fn retained_restore_source(
+        &self,
+        lease: &dyn PrefixCaptureLease,
+    ) -> PrefixRestoreSource {
+        if lease.as_any().is::<RetainedRestoreCheckpoint<R>>() {
+            PrefixRestoreSource::Index
+        } else {
+            PrefixRestoreSource::Rendezvous
+        }
     }
 
     pub(in super::super) fn rendezvous_boundary(

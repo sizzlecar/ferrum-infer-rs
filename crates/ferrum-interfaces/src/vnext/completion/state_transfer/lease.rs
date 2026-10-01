@@ -3,6 +3,7 @@ use super::*;
 use crate::vnext::{
     BackingInitializationEncodeError, CheckpointCapturePermit, CompletedSequenceBoundary,
     CompletionSlotId, DeferredDeviceCleanupDomainId, DeviceCommandBatch, DeviceTimingMode,
+    NativeCheckpointTransferGeometry, NativeCheckpointTransferIdentity,
     PreparedBackingInitializations, SequenceCheckpointLayout,
 };
 
@@ -93,6 +94,31 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
         &self.identity
     }
 
+    pub(super) fn try_validate_for_submission(
+        &self,
+    ) -> Result<(), crate::execution_cost::GuardedNotSubmittedReason> {
+        let guard = self
+            .guard
+            .as_ref()
+            .ok_or(crate::execution_cost::GuardedNotSubmittedReason::ResourceClaimMismatch)?;
+        if !self.identity.matches_guard(guard) {
+            return Err(crate::execution_cost::GuardedNotSubmittedReason::ResourceClaimMismatch);
+        }
+        guard.try_validate_for_submission()
+    }
+
+    pub(super) fn source_capture_identity(&self) -> Option<NativeCheckpointTransferIdentity> {
+        match &self.destination {
+            TransferDestination::Capture { .. } => None,
+            TransferDestination::Restore { checkpoint, .. } => {
+                Some(NativeCheckpointTransferIdentity::new(
+                    checkpoint.slot_id(),
+                    Arc::clone(checkpoint.identity()),
+                ))
+            }
+        }
+    }
+
     pub(in crate::vnext::completion) fn deferred_cleanup_domain(
         &self,
     ) -> DeferredDeviceCleanupDomainId {
@@ -106,7 +132,15 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
         &mut self,
         lane: &ExecutionLane<R>,
         timing_mode: DeviceTimingMode,
-    ) -> Result<(DeviceCommandBatch<R::Command>, CheckpointCopyGeometry), VNextError> {
+        observe_geometry: bool,
+    ) -> Result<
+        (
+            DeviceCommandBatch<R::Command>,
+            CheckpointCopyGeometry,
+            Option<NativeCheckpointTransferGeometry>,
+        ),
+        VNextError,
+    > {
         if self.copy_retentions.is_some() {
             return Err(invalid_completion("state transfer was already encoded"));
         }
@@ -128,25 +162,44 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
                 (checkpoint.backing(), checkpoint.byte_plan())
             }
         };
-        let copies = PreparedStateTransferCopies::encode(guard, checkpoint, byte_plan, lane)
-            .map_err(|error| match error {
-                StateTransferCopyEncodeError::Contract(error) => error,
-                StateTransferCopyEncodeError::Runtime {
-                    resource_id,
-                    region,
-                    error,
-                } => invalid_completion(format!(
-                    "state copy encode failed for {resource_id:?} at {region:?}: {error}"
-                )),
-            })?;
+        let copies = PreparedStateTransferCopies::encode_with_geometry(
+            guard,
+            checkpoint,
+            byte_plan,
+            lane,
+            observe_geometry,
+        )
+        .map_err(|error| match error {
+            StateTransferCopyEncodeError::Contract(error) => error,
+            StateTransferCopyEncodeError::StridedRuntime {
+                resource_id,
+                region,
+                error,
+            } => invalid_completion(format!(
+                "strided state copy encode failed for {resource_id:?} at {region:?}: {error}"
+            )),
+            StateTransferCopyEncodeError::Runtime {
+                resource_id,
+                region,
+                error,
+            } => invalid_completion(format!(
+                "state copy encode failed for {resource_id:?} at {region:?}: {error}"
+            )),
+        })?;
         let geometry = copies.geometry();
+        let mut cost_geometry = copies.cost_geometry();
         let mut commands = DeviceCommandBatch::with_capacity_and_timing(copies.len(), timing_mode);
         if let TransferDestination::Restore {
             initializations, ..
         } = &self.destination
         {
             initializations
-                .encode_restore(guard, lane.runtime(), &mut commands)
+                .encode_restore_with_geometry(
+                    guard,
+                    lane.runtime(),
+                    &mut commands,
+                    cost_geometry.as_mut(),
+                )
                 .map_err(|error| match error {
                     BackingInitializationEncodeError::Contract(error) => error,
                     BackingInitializationEncodeError::Runtime { error, .. } => {
@@ -155,7 +208,13 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
                 })?;
         }
         self.copy_retentions = Some(copies.append_to(&mut commands));
-        Ok((commands, geometry))
+        Ok((
+            commands,
+            geometry,
+            cost_geometry
+                .map(|geometry| geometry.finish())
+                .transpose()?,
+        ))
     }
 
     pub(super) fn mark_possibly_submitted(&mut self) -> Result<(), VNextError> {

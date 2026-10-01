@@ -90,8 +90,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             sequence.replayed_output_tokens,
             &completion,
         )?;
-        self.retain_completed_sequence_boundary(&sequence, probe)
-            .await?;
+        if !sequence
+            .explicit_checkpoint_maintenance
+            .load(Ordering::Acquire)
+        {
+            self.retain_completed_sequence_boundary(&sequence, probe)
+                .await?;
+        }
         sequence.complete(&completion)?;
         pending.completed = true;
         Ok(())

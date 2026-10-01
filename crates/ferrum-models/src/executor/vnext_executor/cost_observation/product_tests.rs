@@ -62,6 +62,10 @@ impl Probe {
         )
     }
     fn assert_wave(&self, kind: ActualWaveKind, works: &[ActualRowWork]) {
+        assert!(
+            !self.recorder.has_pending_projection(),
+            "the evidence consumer must resolve frozen observations before checking shape"
+        );
         let records = self.recorder.observations();
         assert_eq!(records.len(), 1);
         let wave = &records[0];
@@ -163,6 +167,7 @@ async fn observed_metal_product_partial_final_decode_mixed_matches_ordinary() {
     };
     assert_prefill_same(&partial, &ordinary);
     assert_eq!(actual.submissions(), before + 1);
+    probe.recorder.resolve_pending().unwrap();
     probe.assert_wave(
         ActualWaveKind::Prefill,
         &[ActualRowWork::Prefill {
@@ -209,6 +214,7 @@ async fn observed_metal_product_partial_final_decode_mixed_matches_ordinary() {
         _ => panic!("ordinary final did not complete"),
     };
     assert_prefill_same(&final_output, &ordinary);
+    probe.recorder.resolve_pending().unwrap();
     probe.assert_wave(
         ActualWaveKind::Prefill,
         &[ActualRowWork::Prefill {
@@ -245,6 +251,7 @@ async fn observed_metal_product_partial_final_decode_mixed_matches_ordinary() {
             .unwrap(),
     );
     assert_decode_same(&decoded, &ordinary_decoded);
+    probe.recorder.resolve_pending().unwrap();
     probe.assert_wave(
         ActualWaveKind::Decode,
         &[ActualRowWork::Decode { kv_tokens: 4 }],
@@ -301,6 +308,7 @@ async fn observed_metal_product_partial_final_decode_mixed_matches_ordinary() {
     assert_eq!(b_p.len(), 1);
     assert_prefill_same(&a_p[0], &b_p[0]);
     assert_decode_same(&a_d, &b_d);
+    probe.recorder.resolve_pending().unwrap();
     probe.assert_wave(
         ActualWaveKind::Mixed,
         &[

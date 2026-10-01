@@ -99,6 +99,50 @@ pub struct PlanningRequestState {
     seal: RequestSeal,
 }
 
+impl PlanningRequestState {
+    /// True only for the untouched admitted follower of this still-live hold.
+    /// Uses the captured private scheduler seal, including the source's exact
+    /// boundary, rather than a caller-supplied readiness flag. This describes
+    /// a modeled dependency; it never makes the follower runnable.
+    pub fn is_modeled_rendezvous_follower(
+        &self,
+        source: &Self,
+        hold: &PrefixRendezvousHold,
+    ) -> bool {
+        let [target] = hold.followers() else {
+            return false;
+        };
+        hold.is_pending()
+            && self.queue == PlanningQueueKind::Prefill
+            && source.queue == PlanningQueueKind::Prefill
+            && self.readiness.admitted
+            && source.readiness.ready()
+            && !self.readiness.output_limit_reached
+            && !self.readiness.unfinished_work
+            && !self.readiness.pressure_held
+            && !self.readiness.execution_blocked
+            && !self.readiness.capacity_blocked
+            && !self.readiness.maintenance_blocked
+            && self.readiness.prefix_blocked
+            && self.seal.prefix_rendezvous.0
+            && self.seal.prefix_restore == (false, 0, false, false)
+            && source.seal.prefix_restore == (false, 0, false, false)
+            && source.seal.prefix_rendezvous.1.is_some_and(|span| span.0 == hold.boundary())
+            && self.key.request_id == *target.request_id()
+            && self.key.ticket.get() == target.ordinal()
+            && self.key.generation == target.work_generation()
+            && source.key.request_id == *hold.source().request_id()
+            && source.key.ticket.get() == hold.source().ordinal()
+            // Source generation may advance as it executes toward the held
+            // boundary. Its current queue/fence join is checked by the engine.
+            && self.computed_tokens == 0
+            && self.resident_tokens == 0
+            && self.scheduled_tokens == 0
+            && self.committed_output_tokens == 0
+            && self.prefill_offset == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequestSeal {
     frontier: LogicalWorkFrontier,

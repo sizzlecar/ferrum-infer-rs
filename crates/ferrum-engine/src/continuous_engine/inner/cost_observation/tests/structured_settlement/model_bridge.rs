@@ -6,6 +6,12 @@ use super::super::super::trainer::structured::{
 use super::*;
 #[path = "model_bridge/feedback.rs"]
 mod feedback;
+#[path = "model_bridge/live_windows.rs"]
+mod live_windows;
+#[path = "model_bridge/physical_isolation.rs"]
+mod physical_isolation;
+#[path = "model_bridge/source6_installed.rs"]
+mod source6_installed;
 use ferrum_interfaces::execution_cost::{
     CostLogicalCommand, CostProviderIdentity, KernelReplayGeometryV1,
 };
@@ -191,7 +197,8 @@ fn stages_for_actual(
 ) -> Arc<HostStageEvidenceV1> {
     // This fixture retains the additional per-algorithm table. Keep the old
     // shared begin default (32) and production limits untouched.
-    let (call, clock) = begin_with_retained_capacity(&actual, &sink(8, 256), 64);
+    let queue = sink(8, 256);
+    let (call, clock) = begin_with_retained_capacity(&actual, &queue, 64);
     let mut call = call.with_structured_capture(true);
     for (participant, host) in call.participants.iter_mut().zip(&hosts) {
         participant.host_features = Some(*host);
@@ -211,13 +218,17 @@ fn stages_for_actual(
     }
     call.reject(CostCallRejection::Composite);
     clock.set(100);
-    let stages = call.make_host_stages().unwrap();
     // Finish once through the real writer. Dropping an unfinished attached call
     // publishes Abandoned; subsequent manual complete_* would mark a conflict.
-    assert_eq!(
-        call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
-    );
+    assert_eq!(call.finish(), CostCallDisposition::Queued);
+    let (_, entry) = queue.pop_numbered().unwrap();
+    let CostEvidenceEntry::StagesOnly {
+        stages,
+        legacy_rejection: CostCallRejection::Composite,
+    } = entry
+    else {
+        panic!("original terminal settlement");
+    };
     capture.map_or(stages, |capture| capture.host_stages().unwrap())
 }
 fn entry(stages: Arc<HostStageEvidenceV1>) -> CostEvidenceEntry {
@@ -227,13 +238,69 @@ fn entry(stages: Arc<HostStageEvidenceV1>) -> CostEvidenceEntry {
     }
 }
 
+#[test]
+fn async_observation_calibration_shares_frozen_projection_but_revalidates_changed_diagnostics() {
+    let capture = Arc::new(CostCalibrationCapture::default());
+    let original = stages_with_capture(&[4], None, 8, Some(capture.clone()));
+    assert!(matches!(
+        capture.status(),
+        CostCalibrationStatus::Complete(_)
+    ));
+    let first = capture.structured_projection(&original).unwrap().unwrap();
+    let second = capture.structured_projection(&original).unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "consumers share the one resolved result"
+    );
+    assert!(Arc::ptr_eq(&first.actual, &second.actual));
+    let common = capture.actual_projection(&original).unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&common, &first.actual),
+        "V1 and V2 share completed facts"
+    );
+    let legacy =
+        super::super::super::trainer::structured::structured_capture_input(&capture, &original)
+            .unwrap();
+    assert_eq!(
+        legacy,
+        super::super::super::trainer::structured::structured_discovery_input(&original).unwrap()
+    );
+    let input = super::super::super::trainer::structured_v2::structured_capture_input_v2(
+        &capture, &original,
+    )
+    .unwrap();
+    assert_eq!(&input, first.query.input());
+    let mut changed = (*original).clone();
+    changed.full_wall_ns = changed.full_wall_ns.map(|ns| ns + 1);
+    let changed = Arc::new(changed);
+    assert!(capture.structured_projection(&changed).is_none());
+    assert!(capture.actual_projection(&changed).is_none());
+    assert!(
+        super::super::super::trainer::structured::structured_capture_input(&capture, &changed)
+            .is_err()
+    );
+    assert!(
+        super::super::super::trainer::structured_v2::structured_capture_input_v2(
+            &capture, &changed
+        )
+        .is_err()
+    );
+}
+
 #[path = "model_bridge/multi.rs"]
 mod multi;
 
 #[test]
 fn structured_bridge_v2_warm_graph_uses_private_settlement_and_keeps_legacy_closed() {
     use super::super::super::trainer::structured_v2;
-    let stages_a = stages_with_graph(&[3], Some(terminal()), 8, None, Some("resident-A"));
+    let capture = Arc::new(CostCalibrationCapture::default());
+    let stages_a = stages_with_graph(
+        &[3],
+        Some(terminal()),
+        8,
+        Some(capture.clone()),
+        Some("resident-A"),
+    );
     let stages_b = stages_with_graph(&[3], Some(terminal()), 8, None, Some("resident-B"));
     let input_a = structured_v2::structured_discovery_input_v2(&stages_a).unwrap();
     let input_b = structured_v2::structured_discovery_input_v2(&stages_b).unwrap();
@@ -244,6 +311,17 @@ fn structured_bridge_v2_warm_graph_uses_private_settlement_and_keeps_legacy_clos
     );
     assert_eq!(stages_a.full_wall_ns, Some(12));
     assert_ne!(stages_a.actual_shape, stages_b.actual_shape);
+    assert!(capture.actual_projection(&stages_a).unwrap().is_ok());
+    assert!(
+        super::super::super::trainer::structured::structured_capture_input(&capture, &stages_a)
+            .is_err()
+    );
+    assert!(
+        super::super::super::profile_export::selected::SelectedCalibrationCapture::observation(
+            &capture, true, [7; 32]
+        )
+        .is_err()
+    );
     assert!(whole_wave_numeric_observation(&entry(stages_a), 1, &session()).is_err());
 }
 
@@ -515,6 +593,7 @@ fn structured_bridge_rejects_observed_receipt_ordinal_disagreement() {
     };
     capture.complete_host_stages(stages);
     capture.complete(CostCalibrationResult::Observed {
+        observation_memory: None,
         sample: Box::new(sample),
         actual_rows: Vec::new(),
         commits: Vec::new(),

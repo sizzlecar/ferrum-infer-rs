@@ -53,10 +53,41 @@ pub(super) struct CostTrainingWorker {
     completion: Arc<WorkerCompletion>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkerProgress {
+    Ready,
+    /// A bounded owned computation will unpark this worker on completion.
+    Waiting,
+    Idle,
+}
+
 impl CostTrainingWorker {
     /// `consume` processes one bounded batch and reports whether retained work
     /// remains. It must capture training state, never the owner of this worker.
-    pub fn spawn(mut consume: impl FnMut() -> bool + Send + 'static) -> std::io::Result<Self> {
+    pub fn spawn(consume: impl FnMut() -> bool + Send + 'static) -> std::io::Result<Self> {
+        Self::spawn_with_poll_interval(consume, None)
+    }
+
+    pub fn spawn_with_poll_interval(
+        mut consume: impl FnMut() -> bool + Send + 'static,
+        poll_interval: Option<std::time::Duration>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_progress(
+            move || {
+                if consume() {
+                    WorkerProgress::Ready
+                } else {
+                    WorkerProgress::Idle
+                }
+            },
+            poll_interval,
+        )
+    }
+
+    pub fn spawn_with_progress(
+        mut consume: impl FnMut() -> WorkerProgress + Send + 'static,
+        poll_interval: Option<std::time::Duration>,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let handle = thread::Builder::new()
@@ -64,19 +95,27 @@ impl CostTrainingWorker {
             .spawn(move || loop {
                 // unpark retains one permit: publication before park and a
                 // shutdown racing with the last drain cannot lose their wake.
-                thread::park();
-                while consume() {
-                    thread::yield_now();
+                match poll_interval {
+                    Some(interval) => thread::park_timeout(interval),
+                    None => thread::park(),
                 }
-                if stopped.load(Ordering::Acquire) {
+                let progress = loop {
+                    let progress = consume();
+                    if progress != WorkerProgress::Ready {
+                        break progress;
+                    }
+                    thread::yield_now();
+                };
+                if stopped.load(Ordering::Acquire) && progress == WorkerProgress::Idle {
                     // Shutdown may have published a final checkpoint after
                     // the last empty observation. The acquire above sees its
                     // preceding writes; drain once more before leaving. An
                     // unpark permit alone cannot help after this loop exits.
-                    while consume() {
-                        thread::yield_now();
+                    match consume() {
+                        WorkerProgress::Idle => break,
+                        WorkerProgress::Ready => thread::current().unpark(),
+                        WorkerProgress::Waiting => {}
                     }
-                    break;
                 }
             })?;
         Ok(Self {

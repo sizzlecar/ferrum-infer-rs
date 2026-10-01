@@ -605,14 +605,14 @@ pub(super) fn sequence_execution_shape(
 
 /// The static identity/descriptor check is shared with numeric-only fresh
 /// inspection; neither path treats a retained pointer as current validation.
-pub(super) fn validate_static_runtime<B, R: DeviceRuntime<Buffer = B>>(
+pub(super) fn validate_static_runtime<'view, B, R: DeviceRuntime<Buffer = B>>(
     runtime: &R,
-    view: &LeasedBufferView<'_, B>,
+    view: &'view LeasedBufferView<'_, B>,
     expected_identity: Option<&ResourceTransactionIdentity>,
-) -> Result<BufferDescriptor, VNextError> {
-    let actual = runtime.buffer_descriptor(view.buffer());
+) -> Result<std::borrow::Cow<'view, BufferDescriptor>, VNextError> {
+    let actual = crate::vnext::device::read_buffer_descriptor(runtime, view.buffer());
     if Some(view.identity()) != expected_identity
-        || &actual != view.committed_descriptor()
+        || actual.as_ref() != view.committed_descriptor()
         || view.generation() == 0
     {
         return Err(invalid_operation(format!(
@@ -725,10 +725,13 @@ impl<'a, B> OperationBufferView<'a, B> {
                         .iter()
                         .zip(backing_view.committed_evidence_segments())
                         .any(|(binding, evidence)| {
-                            let actual = runtime.buffer_descriptor(binding.buffer());
+                            let actual = crate::vnext::device::read_buffer_descriptor(
+                                runtime,
+                                binding.buffer(),
+                            );
                             binding.segment() != evidence
                                 || binding.chunk() != evidence.chunk()
-                                || &actual != binding.descriptor()
+                                || actual.as_ref() != binding.descriptor()
                                 || binding
                                     .segment()
                                     .offset_bytes()

@@ -23,18 +23,20 @@ use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement,
-    DeviceCostGraphCaptureCapability, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
-    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionSpanKind,
-    DeviceExecutionTiming, DeviceId, DeviceNativeOperationId, DeviceNativeWorkAttribution,
-    DeviceRuntime, DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan,
-    DeviceSubmissionExecutionTiming, DeviceSubmissionGuard, DeviceSubmissionReadbackRequest,
-    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
-    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
-    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
-    FenceQuery, GuardedDeviceSubmissionError, HostTransferLayout, PreparedDeviceSubmissionReadback,
-    RetainedHostMemoryRegion, StaticWeightImportSession, StreamState, VNextError,
-    WeightComponentPayload, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
-    HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceCostGraphCaptureCapability, DeviceCostObservationDemand, DeviceDescriptor,
+    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
+    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
+    DeviceNativeWorkAttribution, DeviceObservationPacket, DeviceObservationTemplate,
+    DeviceObservationTemplateBudget, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionGuard,
+    DeviceSubmissionReadbackRequest, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, FenceIndeterminate, FenceQuery, FrozenObservationInput,
+    GuardedDeviceSubmissionError, HostTransferLayout, PreparedDeviceSubmissionReadback,
+    RetainedDeviceObservationTemplate, RetainedHostMemoryRegion, StaticWeightImportSession,
+    StreamState, VNextError, WeightComponentPayload, DEVICE_COPY_NATIVE_OPERATION_ID,
+    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use metal::foreign_types::ForeignType;
 use metal::objc::runtime::{Object, BOOL, YES};
@@ -54,7 +56,11 @@ use counter_readback::CounterReadbackStats;
 mod core_cost_route;
 mod cost_identity;
 mod device_memory;
+mod observation;
 use device_memory::DeviceMemorySampler;
+pub(crate) use observation::{
+    capacity_upper as observation_capacity_upper, prepare_template as prepare_observation_template,
+};
 #[cfg(test)]
 mod submission_guard_tests;
 mod submission_readback;
@@ -1485,12 +1491,8 @@ pub struct MetalDeviceCommand {
     participant_start: u32,
     participant_count: u32,
     token_count: u64,
-    statistical_evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
-    core_transfer: Option<(
-        ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
-        u64,
-        ferrum_types::SloStructuredCostCapture,
-    )>,
+    observation_template: Option<RetainedDeviceObservationTemplate>,
+    core_transfer: Option<observation::CoreTransfer>,
     regions: Vec<MetalBufferRegion>,
     staging: Vec<Buffer>,
     encode: EncodeAction,
@@ -1534,7 +1536,7 @@ impl MetalDeviceCommand {
             participant_start: 0,
             participant_count: 1,
             token_count: 0,
-            statistical_evidence: None,
+            observation_template: None,
             core_transfer: None,
             regions,
             staging: Vec::new(),
@@ -1603,13 +1605,13 @@ impl MetalDeviceCommand {
         Ok(())
     }
 
-    /// Passive metadata is checked against encoder counts at actual submit.
-    /// Unsupported producers leave None; this never changes execution rights.
-    pub(crate) fn with_statistical_evidence(
+    /// Only CPU facts from the actual selector/encoder may enter this packet.
+    /// Projection is performed explicitly by the shared observation worker.
+    pub(crate) fn with_observation(
         mut self,
-        evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+        template: Option<RetainedDeviceObservationTemplate>,
     ) -> Self {
-        self.statistical_evidence = evidence;
+        self.observation_template = template;
         self
     }
 
@@ -1644,10 +1646,6 @@ impl MetalDeviceCommand {
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
-        if let Some((kind, bytes, capture)) = self.core_transfer {
-            self.statistical_evidence =
-                core_cost_route::transfer_evidence(kind, bytes, self.token_count, capture);
-        }
         Ok(self)
     }
 
@@ -1657,10 +1655,35 @@ impl MetalDeviceCommand {
         bytes: u64,
         capture: ferrum_types::SloStructuredCostCapture,
     ) -> Self {
-        self.core_transfer = Some((kind, bytes, capture));
-        self.statistical_evidence =
-            core_cost_route::transfer_evidence(kind, bytes, self.token_count, capture);
+        self.core_transfer = Some(observation::CoreTransfer {
+            kind,
+            bytes,
+            capture,
+        });
         self
+    }
+
+    // Called only after a real command has encoded and exact attribution exists.
+    // The lazy pool getter is never evaluated for NotRequired or provider packets.
+    fn observation_packet(
+        &self,
+        demand: DeviceCostObservationDemand,
+        budget: impl FnOnce() -> Option<Arc<DeviceObservationTemplateBudget>>,
+    ) -> Option<DeviceObservationPacket> {
+        if !demand.is_required() {
+            return None;
+        }
+        let input = FrozenObservationInput::command(self.token_count);
+        if let Some(template) = &self.observation_template {
+            return template.packet(input).ok();
+        }
+        let core = self.core_transfer?;
+        let budget = budget()?;
+        let template =
+            prepare_observation_template(Some(&budget), core.retained_payload_bytes(), || {
+                Some(Arc::new(core))
+            })?;
+        template.packet(input).ok()
     }
 
     fn transfer(
@@ -1677,7 +1700,7 @@ impl MetalDeviceCommand {
             participant_start: 0,
             participant_count: 0,
             token_count: 0,
-            statistical_evidence: None,
+            observation_template: None,
             core_transfer: None,
             regions,
             staging,
@@ -2038,6 +2061,7 @@ pub struct MetalDeviceRuntime {
     counter_readback_stats: Arc<CounterReadbackStats>,
     static_weight_import_gate: Mutex<()>,
     device_memory_sampler: OnceLock<DeviceMemorySampler>,
+    observation_budget: OnceLock<Arc<DeviceObservationTemplateBudget>>,
 }
 
 impl fmt::Debug for MetalDeviceRuntime {
@@ -2091,6 +2115,7 @@ impl MetalDeviceRuntime {
             counter_readback_stats,
             static_weight_import_gate: Mutex::new(()),
             device_memory_sampler: OnceLock::new(),
+            observation_budget: OnceLock::new(),
         })
     }
 
@@ -2231,12 +2256,35 @@ impl MetalDeviceRuntime {
         self.submit_commands_with_attribution(stream, entries, timing_mode, false, timing_sink)
     }
 
+    #[cfg(test)]
     fn submit_commands_with_attribution<S>(
         &self,
         stream: &mut MetalDeviceStream,
         entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
         timing_mode: DeviceTimingMode,
         logical_attribution: bool,
+        timing_sink: &S,
+    ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
+        self.submit_commands_with_demand(
+            stream,
+            entries,
+            timing_mode,
+            logical_attribution,
+            DeviceCostObservationDemand::Required,
+            timing_sink,
+        )
+    }
+
+    fn submit_commands_with_demand<S>(
+        &self,
+        stream: &mut MetalDeviceStream,
+        entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
+        timing_mode: DeviceTimingMode,
+        logical_attribution: bool,
+        observation_demand: DeviceCostObservationDemand,
         timing_sink: &S,
     ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
     where
@@ -2253,6 +2301,7 @@ impl MetalDeviceRuntime {
                 entries,
                 timing_mode,
                 logical_attribution,
+                observation_demand,
                 timing_sink,
                 None,
             )
@@ -2273,6 +2322,7 @@ impl MetalDeviceRuntime {
         entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
         timing_mode: DeviceTimingMode,
         logical_attribution: bool,
+        observation_demand: DeviceCostObservationDemand,
         timing_sink: &S,
         guard: Option<&dyn DeviceSubmissionGuard>,
     ) -> Result<MetalDeviceFence, GuardedDeviceSubmissionError<MetalDeviceRuntimeError>>
@@ -2399,14 +2449,10 @@ impl MetalDeviceRuntime {
                     // A missing/mismatched extension does not erase the old
                     // exact attribution or change inference completion.
                     let observation = command
-                        .statistical_evidence
-                        .as_ref()
-                        .and_then(|evidence| {
-                            observation
-                                .clone()
-                                .with_statistical_evidence(evidence.clone())
-                                .ok()
+                        .observation_packet(observation_demand, || {
+                            self.observation_template_budget()
                         })
+                        .and_then(|packet| observation.clone().with_observation(packet))
                         .unwrap_or(observation);
                     attribution.push(observation);
                 }
@@ -2530,6 +2576,45 @@ impl DeviceRuntime for MetalDeviceRuntime {
         &self.descriptor
     }
 
+    fn install_observation_template_budget(
+        &self,
+        budget: Arc<DeviceObservationTemplateBudget>,
+    ) -> Result<(), VNextError> {
+        if let Some(installed) = self.observation_budget.get() {
+            return if Arc::ptr_eq(installed, &budget) {
+                Ok(())
+            } else {
+                Err(VNextError::InvalidExecutionPlan {
+                    reason: "Metal observation budget is already installed".to_owned(),
+                })
+            };
+        }
+        match self.observation_budget.set(budget) {
+            Ok(()) => Ok(()),
+            Err(candidate) => {
+                if self
+                    .observation_budget
+                    .get()
+                    .is_some_and(|v| Arc::ptr_eq(v, &candidate))
+                {
+                    Ok(())
+                } else {
+                    Err(VNextError::InvalidExecutionPlan {
+                        reason: "Metal observation budget changed during installation".to_owned(),
+                    })
+                }
+            }
+        }
+    }
+    fn observation_template_budget(&self) -> Option<Arc<DeviceObservationTemplateBudget>> {
+        Some(Arc::clone(self.observation_budget.get_or_init(|| {
+            DeviceObservationTemplateBudget::new(
+                ferrum_interfaces::vnext::DEFAULT_OBSERVATION_TEMPLATE_BYTES,
+            )
+            .expect("bounded default CPU observation budget")
+        })))
+    }
+
     fn cost_graph_capture_capability(&self) -> DeviceCostGraphCaptureCapability {
         // This implementation only encodes eager Metal commands. It has no
         // graph capture or replay path, regardless of product timing settings.
@@ -2609,6 +2694,13 @@ impl DeviceRuntime for MetalDeviceRuntime {
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
         buffer.descriptor.clone()
+    }
+
+    fn borrowed_buffer_descriptor<'buffer>(
+        &self,
+        buffer: &'buffer Self::Buffer,
+    ) -> Option<&'buffer BufferDescriptor> {
+        Some(&buffer.descriptor)
     }
 
     fn begin_static_weight_import(
@@ -2831,6 +2923,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         S: DeviceSubmissionTimingSink,
     {
         let timing_mode = commands.timing_mode();
+        let observation_demand = commands.cost_observation_demand();
         let logical_attribution = commands
             .attribution_requirement()
             .logical_execution_path_required();
@@ -2858,11 +2951,12 @@ impl DeviceRuntime for MetalDeviceRuntime {
             })
             .collect::<Result<Vec<_>, MetalDeviceRuntimeError>>()
             .map_err(DefinitelyNotSubmitted::new)?;
-        self.submit_commands_with_attribution(
+        self.submit_commands_with_demand(
             stream,
             entries,
             timing_mode,
             logical_attribution,
+            observation_demand,
             timing_sink,
         )
     }
@@ -2871,13 +2965,17 @@ impl DeviceRuntime for MetalDeviceRuntime {
         true
     }
 
+    fn supports_guarded_submission_with_timing(&self, mode: DeviceTimingMode) -> bool {
+        mode.guarded_completion_compatible()
+    }
+
     fn submit_guarded(
         &self,
         stream: &mut Self::Stream,
         commands: DeviceCommandBatch<Self::Command>,
         guard: &dyn DeviceSubmissionGuard,
     ) -> Result<Self::Fence, GuardedDeviceSubmissionError<Self::Error>> {
-        if commands.timing_mode() != DeviceTimingMode::Off
+        if !commands.timing_mode().guarded_completion_compatible()
             || matches!(
                 commands.compute_path_requirement(),
                 DeviceComputePathRequirement::ReplayedOnly
@@ -2888,6 +2986,8 @@ impl DeviceRuntime for MetalDeviceRuntime {
                 ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::ActualRouteMismatch,
             ));
         }
+        let observation_demand = commands.cost_observation_demand();
+        let timing_mode = commands.timing_mode();
         let entries = commands
             .into_entries()
             .into_iter()
@@ -2905,8 +3005,9 @@ impl DeviceRuntime for MetalDeviceRuntime {
             self.submit_commands_inner(
                 stream,
                 entries,
-                DeviceTimingMode::Off,
+                timing_mode,
                 true,
+                observation_demand,
                 &DisabledDeviceSubmissionTimingSink,
                 Some(guard),
             )

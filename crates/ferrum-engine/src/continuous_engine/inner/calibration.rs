@@ -9,6 +9,7 @@ use ferrum_interfaces::InferenceRequestContext;
 mod artifact;
 mod selected;
 pub use selected::{SelectedCalibrationOptions, SelectedFitFreezeReceipt};
+mod prepared_owner;
 mod structured;
 mod structured_group_v2;
 mod structured_prefix_v5;
@@ -24,7 +25,9 @@ pub use structured_group_v2::{
 pub use structured_v2::{StructuredCalibrationArtifactV2, StructuredCalibrationOptionsV2};
 mod audit_readiness;
 mod checkpoint;
+mod cohort_driver;
 mod evidence;
+mod geometry_projection;
 mod planning_audit;
 mod prepared_projection;
 pub use audit_readiness::{CalibrationAuditReadinessV2, CalibrationAuditRowReadinessV2};
@@ -39,6 +42,8 @@ pub use prepared_projection::{
 };
 mod observation;
 mod reference;
+mod startup;
+pub(in crate::continuous_engine::inner) use startup::AcknowledgedProbePrefixRestore;
 mod token_policy_residency;
 pub(in crate::continuous_engine) mod token_preparation;
 pub use artifact::{CalibrationProfileArtifact, CalibrationProfilePaths, ImportedCalibrationModel};
@@ -46,7 +51,8 @@ pub use checkpoint::FrozenCalibrationModel;
 pub use evidence::CalibrationRequestEvidence;
 pub use reference::{
     CalibrationReferenceArtifact, CalibrationReferenceCollector, CalibrationReferenceCurve,
-    CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
+    CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceSourceV1,
+    CalibrationReferenceTrial,
 };
 pub use token_preparation::{
     CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleaseProgressV5,
@@ -67,9 +73,15 @@ pub use types::{
 };
 
 pub struct CalibrationSession {
+    /// Private automatic preparation, never a public calibration exception.
+    startup_checkpoint_sampling: bool,
     prefix_preparation: Option<token_preparation::PrefixPreparationRun>,
     // Permanent session isolation, including ordinary cohorts and after close.
     prefix_source5: bool,
+    // Permanent private source8 isolation survives its per-cohort reset.
+    prefix_source8: bool,
+    prepared_owner_capture: Option<super::cost_observation::PreparedOwnerCalibration>,
+    startup_owner_series: Option<prepared_owner::StartupOwnerSeries>,
     selected_capture: Option<super::cost_observation::SelectedCalibrationCapture>,
     selected_capture_identity: Option<[u8; 32]>,
     structured_capture: Option<super::cost_observation::StructuredCalibrationCollector>,
@@ -107,13 +119,28 @@ impl CalibrationSession {
             || inner.scheduler.active_count() != 0
             || inner.scheduler.waiting_count() != 0
             || inner.cost_runtime.is_none()
+            || !inner
+                .config
+                .scheduler
+                .slo
+                .cost_observation
+                .live_structured_calibration
+                .is_disabled()
         {
             return Err(FerrumError::config("calibration requires fresh PlanRuntime Observe/CompleteRequests with cost observation and no background driver"));
         }
         inner.manual_calibration_driver = true;
-        Ok(Self {
+        Ok(Self::new_driver_session(engine, limits))
+    }
+
+    fn new_driver_session(engine: ContinuousBatchEngine, limits: CalibrationLimits) -> Self {
+        Self {
+            startup_checkpoint_sampling: false,
             prefix_preparation: None,
             prefix_source5: false,
+            prefix_source8: false,
+            prepared_owner_capture: None,
+            startup_owner_series: None,
             selected_capture: None,
             selected_capture_identity: None,
             structured_capture: None,
@@ -125,7 +152,7 @@ impl CalibrationSession {
             pending: None,
             indeterminate: false,
             reference_origins: Default::default(),
-        })
+        }
     }
 
     #[cfg(test)]
@@ -158,6 +185,11 @@ impl CalibrationSession {
         context: InferenceRequestContext,
         contract: Arc<OutputProjectionContract>,
     ) -> Result<CreditedOutputSession> {
+        if self.prepared_owner_source_active() {
+            return self
+                .add_declared_prepared_owner_request(request, context, contract)
+                .await;
+        }
         if self.prefix_source5 {
             return self
                 .add_declared_prefix_source_request_v5(request, context, contract)
@@ -220,9 +252,26 @@ impl CalibrationSession {
         }
         if let Some(group) = &mut self.structured_group_v2 {
             if group.collecting() {
-                if let Err(error) = group.admitted(id, declared_maximum) {
+                if let Err(error) = group.admitted(id.clone(), declared_maximum) {
                     group.invalidate(error.to_string());
                 }
+            }
+        }
+        if let Some(collector) = &mut self.prepared_owner_capture {
+            let sequences = self.engine.inner.sequences.read();
+            let result = sequences
+                .get(&id)
+                .ok_or_else(|| FerrumError::internal("source8 actual admitted owner disappeared"))
+                .and_then(|sequence| {
+                    collector
+                        .admitted(sequence)
+                        .map(|_| ())
+                        .map_err(structured::capture_error)
+                });
+            if let Err(error) = result {
+                collector.invalidate(error.to_string());
+                drop(output);
+                return Err(error);
             }
         }
         Ok(output)
@@ -280,13 +329,19 @@ impl CalibrationSession {
     pub async fn step(&mut self, action: CalibrationAction) -> Result<CalibrationTurn> {
         if let Some(receipt) = self.pending.as_ref().cloned() {
             let result = self.engine.inner.drain_slo_execution().await;
+            receipt.retain_execution_error(result.err());
+            #[cfg(test)]
+            if let Some(runtime) = &self.engine.inner.cost_runtime {
+                runtime.drain_calibration_fixture();
+            }
+            receipt.wait_observation().await;
             self.pending.take();
-            let mut report = receipt.report(result.err());
+            let mut report = receipt.report(None);
             self.indeterminate |= report.submission == CalibrationSubmissionState::InFlightUnknown;
             self.record_selected_capture(&receipt, &mut report)?;
             self.record_structured_capture(&receipt, &report);
             self.record_structured_v2_capture(&receipt, &report);
-            self.record_prefix_wave(&report);
+            self.record_prepared_owner_settlement(&report);
             return Ok(CalibrationTurn::Reaped(report));
         }
         if self.indeterminate {
@@ -341,16 +396,25 @@ impl CalibrationSession {
                     ));
                 }
                 self.check_prefix_wave(&rows)?;
-                let prefix_preparing = self.prefix_source5
+                let prefix_preparing = (self.prefix_source5
                     && self
                         .structured_group_v2
                         .as_ref()
                         .ok_or_else(|| FerrumError::invalid_request("source5 collector is closed"))?
                         .preparing_prefix()
-                        .map_err(structured::capture_error)?;
+                        .map_err(structured::capture_error)?)
+                    || (self.prefix_source8
+                        && self
+                            .prepared_owner_capture
+                            .as_ref()
+                            .is_some_and(|collector| collector.preparing_prefix()));
                 if prefix_preparing {
                     self.offer_prefix_wave(&rows)?;
-                    self.offer_prefix_source_wave_v5()?;
+                    if self.prefix_source8 {
+                        self.offer_prepared_owner_prefix()?;
+                    } else {
+                        self.offer_prefix_source_wave_v5()?;
+                    }
                 }
                 if let Some(collector) = &mut self.structured_capture {
                     if let Err(error) = collector.offer(&rows) {
@@ -368,6 +432,14 @@ impl CalibrationSession {
                     if group.collecting() && !prefix_preparing {
                         if let Err(error) = group.offer(&rows) {
                             group.invalidate(error.to_string());
+                        }
+                    }
+                }
+                if let Some(collector) = &mut self.prepared_owner_capture {
+                    if !prefix_preparing {
+                        if let Err(error) = collector.offer(&rows) {
+                            collector.invalidate(error.to_string());
+                            return Err(structured::capture_error(error));
                         }
                     }
                 }
@@ -391,6 +463,16 @@ impl CalibrationSession {
                 let receipt = prepared.calibration_receipt().ok_or_else(|| {
                     FerrumError::internal("manual calibration wave lost its submission receipt")
                 })?;
+                if self.startup_inventory_active() || self.startup_checkpoint_sampling {
+                    receipt.bind_structured_capture(Arc::new(
+                        super::cost_observation::CostCalibrationCapture::for_startup_readiness(),
+                    ))?;
+                } else if self.prepared_owner_source_active() {
+                    receipt.bind_structured_capture(Arc::new(
+                        super::cost_observation::CostCalibrationCapture::default()
+                            .with_original_route_capture()?,
+                    ))?;
+                }
                 if let Some(collector) = &mut self.structured_capture {
                     if collector.collecting() {
                         if let Err(error) = collector.reserve_prepared() {
@@ -464,14 +546,20 @@ impl CalibrationSession {
                 self.pending = Some(Arc::clone(&receipt));
                 drop(iteration);
                 let result = inner.execute_slo_controller_wave(prepared).await;
+                receipt.retain_execution_error(result.err());
+                #[cfg(test)]
+                if let Some(runtime) = &inner.cost_runtime {
+                    runtime.drain_calibration_fixture();
+                }
+                receipt.wait_observation().await;
                 self.pending.take();
-                let mut report = receipt.report(result.err());
+                let mut report = receipt.report(None);
                 self.indeterminate |=
                     report.submission == CalibrationSubmissionState::InFlightUnknown;
                 self.record_selected_capture(&receipt, &mut report)?;
                 self.record_structured_capture(&receipt, &report);
                 self.record_structured_v2_capture(&receipt, &report);
-                self.record_prefix_wave(&report);
+                self.record_prepared_owner_settlement(&report);
                 Ok(CalibrationTurn::Wave(report))
             }
         }

@@ -71,6 +71,13 @@ impl CheckpointClaimLedger {
         // The supported Rust targets have at most 64-bit address spaces.
         self.live.len() as u64
     }
+
+    pub(super) fn planning_retention(&self) -> Option<(u64, u64)> {
+        (!self.closed)
+            .then_some(self.capacity)
+            .flatten()
+            .map(|policy| (self.retained_bytes, policy.maximum_retained_bytes()))
+    }
 }
 
 /// A checkpoint's independent domain claim. This lease has no request or

@@ -1,11 +1,12 @@
-//! Default completion-first requests may acquire a finite common time witness
-//! after acceptance. This is not strict before-acceptance admission: real
-//! physical preparation remains owned by the existing admission protocol.
+//! Completion-first requests may acquire a finite common witness after
+//! acceptance; explicit strict requests must obtain it before their transport
+//! future resolves. Physical preparation retains its existing real authority.
 use super::*;
 use ferrum_scheduler::implementations::continuous::slo_planner::time_admission::*;
 
 mod defer;
 mod state;
+mod strict;
 pub(super) use defer::TimeActivationState;
 pub(super) use state::PendingTimeWitness;
 pub(in crate::continuous_engine) use state::SequenceTimeAdmission;
@@ -15,6 +16,7 @@ pub(super) struct TimeAdmissionProposal {
     pub decision: Option<PlanningDecision>,
     pub deferred: Option<TimeAdmissionDeferReason>,
     pub pending: Option<PendingTimeWitness>,
+    pub rejected_before_acceptance: bool,
 }
 
 impl TimeAdmissionProposal {
@@ -26,6 +28,7 @@ impl TimeAdmissionProposal {
             }),
             deferred: None,
             pending: None,
+            rejected_before_acceptance: false,
         }
     }
 }
@@ -38,12 +41,11 @@ impl EngineInner {
         &self,
         captured: &ControllerSnapshot,
     ) -> Option<TimeAdmissionProposal> {
-        if self.config.scheduler.slo.admission.time_policy
-            != ferrum_types::SloTimeAdmissionPolicy::CompleteRequests
-        {
+        if !self.config.scheduler.slo.execution_policy().time_admission {
             return None;
         }
-        if captured.protection.needs_recovery() {
+        let strict = self.requires_strict_acceptance();
+        if captured.protection.needs_recovery() && !strict {
             // Keep one common search. A protected continuation cannot create
             // another pending promise, even when its new target is healthy.
             if let Ok(Some(target)) = self.time_admission_target(captured) {
@@ -65,16 +67,14 @@ impl EngineInner {
         }
         let target = match self.time_admission_target(captured) {
             Ok(Some(target)) => target,
-            Ok(None) => return None,
+            Ok(None) => {
+                return (strict && captured.before_acceptance_candidate.is_some())
+                    .then(|| TimeAdmissionProposal::unknown(PlanningUnknownReason::NoWork))
+            }
             Err(reason) => return Some(TimeAdmissionProposal::unknown(reason)),
         };
         let mut active = Vec::with_capacity(captured.snapshot.requests.len());
-        for (row, queued) in captured
-            .snapshot
-            .requests
-            .iter()
-            .zip(captured.queue.requests())
-        {
+        for row in &captured.snapshot.requests {
             if !captured.poll_planning() {
                 return Some(TimeAdmissionProposal::unknown(
                     PlanningUnknownReason::ComputeBudgetExhausted,
@@ -82,10 +82,14 @@ impl EngineInner {
             }
             if row.key != target
                 && !row.timing.completed()
-                && matches!(
-                    queued.queue,
-                    PlanningQueueKind::Prefill | PlanningQueueKind::Decode
-                )
+                && (strict
+                    || captured.queue.requests().iter().any(|queued| {
+                        queued.key.request_id == row.key.request_id
+                            && matches!(
+                                queued.queue,
+                                PlanningQueueKind::Prefill | PlanningQueueKind::Decode
+                            )
+                    }))
             {
                 active.push(row.key.clone());
             }
@@ -120,7 +124,11 @@ impl EngineInner {
                     snapshot: &captured.snapshot,
                     target: &target,
                     active: &active,
-                    boundary: TimeAdmissionBoundary::Accepted,
+                    boundary: if strict {
+                        TimeAdmissionBoundary::BeforeAcceptance
+                    } else {
+                        TimeAdmissionBoundary::Accepted
+                    },
                 },
                 window,
                 slo_clock_now,
@@ -159,6 +167,9 @@ impl EngineInner {
             let Some(state) = sequence.time_admission.as_ref() else {
                 continue;
             };
+            if self.requires_strict_acceptance() && !state.before_acceptance() {
+                continue;
+            }
             if state.started.is_some() || !state.matches(sequence) {
                 continue;
             }
@@ -184,17 +195,24 @@ impl EngineInner {
         decision: TimeAdmissionDecision,
     ) -> TimeAdmissionProposal {
         let review_at = match &decision {
-            TimeAdmissionDecision::Defer { wait, .. } => match wait.review_at_ns {
-                Some(at) => match captured.origin.instant_at_ns(at) {
-                    Ok(at) => Some(at),
-                    Err(_) => {
-                        return TimeAdmissionProposal::unknown(
-                            PlanningUnknownReason::ArithmeticOverflow,
-                        )
-                    }
-                },
-                None => None,
-            },
+            TimeAdmissionDecision::Defer { wait, .. }
+            | TimeAdmissionDecision::Unknown { wait, .. } => {
+                match [wait.review_at_ns, wait.strict_expiry_at_ns]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                {
+                    Some(at) => match captured.origin.instant_at_ns(at) {
+                        Ok(at) => Some(at),
+                        Err(_) => {
+                            return TimeAdmissionProposal::unknown(
+                                PlanningUnknownReason::ArithmeticOverflow,
+                            )
+                        }
+                    },
+                    None => None,
+                }
+            }
             _ => None,
         };
         let kind = match &decision {
@@ -207,6 +225,9 @@ impl EngineInner {
             }
             TimeAdmissionDecision::BestEffort { .. } => {
                 TimeAdmissionAssessmentKind::AlreadyImpossible
+            }
+            TimeAdmissionDecision::Reject { .. } if self.requires_strict_acceptance() => {
+                TimeAdmissionAssessmentKind::RejectedBeforeAcceptance
             }
             TimeAdmissionDecision::Reject { .. } => {
                 TimeAdmissionAssessmentKind::InvalidAcceptanceBoundary
@@ -241,8 +262,11 @@ impl EngineInner {
             kind,
         };
         state.last_assessment = Some(assessment);
-        state.deferred = match &decision {
-            TimeAdmissionDecision::Defer { .. } => Some(defer::TimeAdmissionReview {
+        let retain_review = matches!(&decision, TimeAdmissionDecision::Defer { .. })
+            || (self.requires_strict_acceptance()
+                && matches!(&decision, TimeAdmissionDecision::Unknown { .. }));
+        state.deferred = if retain_review {
+            Some(defer::TimeAdmissionReview {
                 review_at,
                 queue_iteration: captured.queue.iteration(),
                 wake_epochs: captured.queue.wake_epochs(),
@@ -255,14 +279,15 @@ impl EngineInner {
                     .iter()
                     .map(|row| (row.key.clone(), row.queue))
                     .collect(),
-            }),
-            _ => None,
+            })
+        } else {
+            None
         };
         counter!("ferrum.engine.slo_time_admission_assessments_total", "decision" => assessment.kind.label()).increment(1);
         tracing::trace!(request_id = %target.request_id,
             snapshot_generation = assessment.snapshot_generation,
             model_version = assessment.model_version, decision = ?assessment.kind,
-            "assessed accepted request against complete finite obligation set");
+            "assessed request at its transport acceptance boundary");
         match decision {
             TimeAdmissionDecision::Admit {
                 first_wave,
@@ -299,6 +324,7 @@ impl EngineInner {
                     }),
                     deferred: None,
                     pending: Some(pending),
+                    rejected_before_acceptance: false,
                 }
             }
             TimeAdmissionDecision::BestEffort { reason } => TimeAdmissionProposal {
@@ -309,8 +335,20 @@ impl EngineInner {
                 }),
                 deferred: None,
                 pending: None,
+                rejected_before_acceptance: false,
             },
             TimeAdmissionDecision::Unknown { reason, .. } => {
+                if self.requires_strict_acceptance()
+                    && self
+                        .strict_candidate(
+                            &sequences,
+                            &captured.queue,
+                            captured.model.model_version(),
+                        )
+                        .is_some()
+                {
+                    self.work_notify.notify_one();
+                }
                 TimeAdmissionProposal::unknown(match reason {
                     TimeAdmissionUnknown::Planning(reason) => reason,
                     TimeAdmissionUnknown::LengthStatisticsUnavailable
@@ -319,13 +357,38 @@ impl EngineInner {
                     }
                 })
             }
-            TimeAdmissionDecision::Defer { reason, .. } => TimeAdmissionProposal {
-                decision: None,
-                deferred: Some(reason),
-                pending: None,
-            },
-            TimeAdmissionDecision::Reject { .. } => {
-                TimeAdmissionProposal::unknown(PlanningUnknownReason::InvalidSnapshot)
+            TimeAdmissionDecision::Defer { reason, .. } => {
+                if self.requires_strict_acceptance()
+                    && self
+                        .strict_candidate(
+                            &sequences,
+                            &captured.queue,
+                            captured.model.model_version(),
+                        )
+                        .is_some()
+                {
+                    self.work_notify.notify_one();
+                }
+                TimeAdmissionProposal {
+                    decision: None,
+                    deferred: Some(reason),
+                    pending: None,
+                    rejected_before_acceptance: false,
+                }
+            }
+            TimeAdmissionDecision::Reject { reason } => {
+                drop(sequences);
+                if self.requires_strict_acceptance() {
+                    self.record_strict_rejection(target, reason);
+                    TimeAdmissionProposal {
+                        decision: None,
+                        deferred: None,
+                        pending: None,
+                        rejected_before_acceptance: true,
+                    }
+                } else {
+                    TimeAdmissionProposal::unknown(PlanningUnknownReason::InvalidSnapshot)
+                }
             }
         }
     }

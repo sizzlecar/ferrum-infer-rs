@@ -9,6 +9,9 @@ use ferrum_interfaces::execution_cost::{
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
+mod observation;
+pub(super) use observation::freeze as observation;
+
 #[derive(Clone, Copy)]
 pub(super) struct Projection {
     pub tokens: u32,
@@ -94,6 +97,7 @@ fn kernel(
         h.update(SHADER_SOURCE.as_bytes());
         h.update(include_str!("head_dim_specialization.rs").as_bytes());
         h.update(include_str!("selected.rs").as_bytes());
+        h.update(include_str!("selected/observation.rs").as_bytes());
         h.finalize().into()
     });
     let mut layout = Sha256::new();
@@ -399,3 +403,5 @@ pub(super) fn evidence(
 }
 #[cfg(test)]
 mod tests;
+
+pub(super) use observation::payload_upper as observation_payload_upper;

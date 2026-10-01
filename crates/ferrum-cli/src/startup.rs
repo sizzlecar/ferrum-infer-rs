@@ -20,13 +20,15 @@ pub(crate) fn resolve_config(
     authority: ExecutionResourceAuthority,
     usage: StartupUsage,
 ) -> Result<ResolvedFerrumConfig> {
-    if authority == ExecutionResourceAuthority::PlanRuntime
-        && crate::runtime_env::runtime_snapshot_value(&requested, "FERRUM_PREFIX_CACHE").is_none()
-    {
+    let prefix_is_unset =
+        crate::runtime_env::runtime_snapshot_value(&requested, "FERRUM_PREFIX_CACHE").is_none();
+    if authority == ExecutionResourceAuthority::PlanRuntime && prefix_is_unset {
         // This requests optional native state retention within the existing
         // runtime memory budget. The compiled plan and selected providers
-        // determine whether checkpoints are usable; unsupported plans keep
-        // executing without a cache. Explicit values, including presets, win.
+        // determine whether checkpoints are usable. The shared engine
+        // constructor checks the actual guarded maintenance capability before
+        // automatic calibration or Enforce may use an enabled cache. Explicit
+        // values, including presets, are never silently rewritten.
         requested.upsert(
             "FERRUM_PREFIX_CACHE",
             match usage {
@@ -119,7 +121,10 @@ pub(crate) fn apply_engine_plan(resolved: &mut ResolvedFerrumConfig, engine_conf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_types::{DeviceMemorySnapshot, RuntimeConfigEntry};
+    use ferrum_types::{
+        DeviceMemorySnapshot, RuntimeConfigEntry, SloConfig, SloLiveStructuredCalibration, SloMode,
+        SloTimeAdmissionPolicy,
+    };
 
     #[test]
     fn cost_profile_receipt_comes_from_engine_for_both_product_usages() {
@@ -157,17 +162,19 @@ mod tests {
                 .iter()
                 .all(|entry| entry.key != key));
             let receipt = ferrum_types::SloCostProfileReceipt {
+                storage: ferrum_types::SloCostProfileStorage::File,
+                clock_basis: ferrum_types::SloCostProfileClockBasis::ImportedWallClock,
                 structured_whole_wave: None,
                 structured_whole_wave_v2: None,
                 selected_whole_wave: None,
                 schema_version: 1,
-                path: "/profile/imported.json".into(),
+                path: Some("/profile/imported.json".into()),
                 file_sha256: format!("sha256:{}", "ab".repeat(32)),
                 file_bytes: 1024,
                 generated_unix_ns: 900,
                 loaded_unix_ns: 1000,
                 conservative_clock_error_ns: 20,
-                declared_local_clock_max_error_ns: 10,
+                declared_local_clock_max_error_ns: Some(10),
                 oldest_imported_age_ns: Some(120),
                 newest_imported_age_ns: Some(100),
                 offered_samples: 3,
@@ -240,7 +247,6 @@ mod tests {
             .iter()
             .find(|entry| entry.key == "FERRUM_PREFIX_CACHE")
             .expect("resolved prefix-state request");
-        assert_eq!(entry.effective_value, if enabled { "1" } else { "0" });
         assert_eq!(entry.source, source);
         let decision = resolved
             .decisions
@@ -282,6 +288,125 @@ mod tests {
             .unwrap();
             assert_prefix_state_cache(&resolved, enabled, RuntimeConfigSource::Default);
         }
+    }
+
+    fn automatic_policy(mode: SloMode) -> SloConfig {
+        use ferrum_types::{ServiceSloConfig, SloCostObservationConfig, SloLatencyBudgets};
+        use std::num::NonZeroU64;
+
+        let mut observation = SloCostObservationConfig::structured_whole_wave_v2();
+        observation.live_structured_calibration = SloLiveStructuredCalibration::AutomaticV1 {
+            settings: Default::default(),
+        };
+        let policy = SloConfig {
+            mode,
+            default_service_class: Some("interactive".into()),
+            services: vec![ServiceSloConfig {
+                id: "interactive".into(),
+                server_token_commit: SloLatencyBudgets {
+                    ttft_ms: NonZeroU64::new(500).unwrap(),
+                    tpot_ms: NonZeroU64::new(40).unwrap(),
+                    itl_ms: NonZeroU64::new(80).unwrap(),
+                },
+                attainment: Default::default(),
+                client_visible: None,
+            }],
+            cost_observation: observation,
+            ..Default::default()
+        };
+        policy.validate().unwrap();
+        policy
+    }
+
+    fn policy_snapshot(policy: &SloConfig) -> RuntimeConfigSnapshot {
+        RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            ferrum_types::SLO_CONFIG_RUNTIME_KEY,
+            serde_json::to_string(policy).unwrap(),
+            RuntimeConfigSource::ConfigFile,
+        )])
+    }
+
+    #[test]
+    fn automatic_slo_prefix_defaults_follow_both_product_usages() {
+        for mode in [SloMode::Observe, SloMode::Enforce] {
+            let policy = automatic_policy(mode);
+            for (usage, enabled) in [
+                (StartupUsage::SingleRequest, false),
+                (StartupUsage::PersistentServing, true),
+            ] {
+                let resolved = resolve_config(
+                    policy_snapshot(&policy),
+                    model(),
+                    hardware(),
+                    WorkloadProfile::serving_default(),
+                    ExecutionResourceAuthority::PlanRuntime,
+                    usage,
+                )
+                .unwrap();
+                assert_prefix_state_cache(&resolved, enabled, RuntimeConfigSource::Default);
+                let mut engine = EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(engine.scheduler.slo, policy);
+                assert!(engine.scheduler.slo.cost_profile.is_none());
+                assert!(engine.scheduler.slo.prefill_reference.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_slo_prefix_preserves_explicit_values_pending_actual_capability() {
+        for mode in [SloMode::Observe, SloMode::Enforce] {
+            let policy = automatic_policy(mode);
+            for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+                for source in [
+                    RuntimeConfigSource::ConfigFile,
+                    RuntimeConfigSource::Env,
+                    RuntimeConfigSource::Cli,
+                    RuntimeConfigSource::ScriptCase,
+                    RuntimeConfigSource::Default,
+                ] {
+                    for (value, enabled) in [
+                        ("0", false),
+                        ("false", false),
+                        ("1", true),
+                        ("true", true),
+                        ("on", true),
+                    ] {
+                        let mut requested = policy_snapshot(&policy);
+                        requested.upsert("FERRUM_PREFIX_CACHE", value, source);
+                        let resolved = resolve_config(
+                            requested,
+                            model(),
+                            hardware(),
+                            WorkloadProfile::serving_default(),
+                            ExecutionResourceAuthority::PlanRuntime,
+                            usage,
+                        );
+                        assert_prefix_state_cache(&resolved.unwrap(), enabled, source);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_observe_retains_the_existing_prefix_default() {
+        let mut policy = automatic_policy(SloMode::Observe);
+        policy.cost_observation.live_structured_calibration =
+            SloLiveStructuredCalibration::Disabled;
+        policy.validate().unwrap();
+        let resolved = resolve_config(
+            policy_snapshot(&policy),
+            model(),
+            hardware(),
+            WorkloadProfile::serving_default(),
+            ExecutionResourceAuthority::PlanRuntime,
+            StartupUsage::PersistentServing,
+        )
+        .unwrap();
+        assert_prefix_state_cache(&resolved, true, RuntimeConfigSource::Default);
     }
 
     #[test]

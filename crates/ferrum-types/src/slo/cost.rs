@@ -5,6 +5,10 @@ use std::{
     path::PathBuf,
 };
 
+mod live_calibration;
+pub use live_calibration::*;
+mod actual_capture;
+pub use actual_capture::*;
 mod feedback;
 pub use feedback::*;
 mod structured_feedback;
@@ -29,9 +33,21 @@ pub struct SloCostObservationConfig {
     /// Passive structural capture only; never changes the predictor/profile.
     #[serde(skip_serializing_if = "SloStructuredCostCapture::is_disabled")]
     pub structured_capture: SloStructuredCostCapture,
+    /// Explicit policy for per-call dynamic samples; route capability is unchanged.
+    #[serde(skip_serializing_if = "SloStructuredActualCapturePolicy::is_legacy")]
+    pub structured_actual_capture: SloStructuredActualCapturePolicy,
+    #[serde(skip_serializing_if = "SloLiveStructuredCalibration::is_disabled")]
+    pub live_structured_calibration: SloLiveStructuredCalibration,
     pub max_queued_samples: NonZeroUsize,
     /// Sum of allocated row capacities in the pending sample queue.
     pub max_queued_shape_rows: NonZeroUsize,
+    /// Shared CPU-only immutable observation templates, including resident and
+    /// queued references. This does not reserve device or profile-file memory.
+    pub maximum_template_bytes: NonZeroUsize,
+    /// Call-owned raw facts awaiting the CPU consumer, independently of rows.
+    pub maximum_queued_bytes: NonZeroUsize,
+    /// Worker expansion and resolved receipts, retained until their last consumer.
+    pub maximum_working_bytes: NonZeroUsize,
     /// A worker publishes at most one snapshot for each bounded drain batch.
     pub max_samples_per_update: NonZeroUsize,
     pub max_waves_per_call: NonZeroUsize,
@@ -51,8 +67,13 @@ impl Default for SloCostObservationConfig {
             structured_feedback: SloStructuredFeedbackPolicy::Disabled,
             prospective_structured_capture: SloProspectiveStructuredCapture::Disabled,
             structured_capture: SloStructuredCostCapture::Disabled,
+            structured_actual_capture: SloStructuredActualCapturePolicy::LegacyEveryWave,
+            live_structured_calibration: SloLiveStructuredCalibration::Disabled,
             max_queued_samples: NonZeroUsize::new(256).unwrap(),
             max_queued_shape_rows: NonZeroUsize::new(8192).unwrap(),
+            maximum_template_bytes: NonZeroUsize::new(32 * 1024 * 1024).unwrap(),
+            maximum_queued_bytes: NonZeroUsize::new(128 * 1024 * 1024).unwrap(),
+            maximum_working_bytes: NonZeroUsize::new(128 * 1024 * 1024).unwrap(),
             max_samples_per_update: NonZeroUsize::new(256).unwrap(),
             max_waves_per_call: NonZeroUsize::new(4).unwrap(),
             max_rows_per_wave: NonZeroUsize::new(1024).unwrap(),
@@ -152,6 +173,7 @@ impl SloCostObservationConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         self.model.validate()?;
+        self.live_structured_calibration.validate(self)?;
         self.selected_feedback.validate(self)?;
         self.structured_feedback.validate(self)?;
         self.prospective_structured_capture.validate(self)?;
@@ -188,6 +210,9 @@ impl SloCostObservationConfig {
             export.validate()?;
         }
         if self.max_queued_samples.get() > 4096
+            || self.maximum_template_bytes.get() > 256 * 1024 * 1024
+            || self.maximum_queued_bytes.get() > 128 * 1024 * 1024
+            || self.maximum_working_bytes.get() > 128 * 1024 * 1024
             || self.max_queued_shape_rows.get() > 65_536
             || self.max_samples_per_update.get() > 4096
             || self.max_waves_per_call.get() > 4096
@@ -391,11 +416,47 @@ impl SloCostProfileImportConfig {
     }
 }
 
+/// How original sample times were mapped into this runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloCostProfileClockBasis {
+    #[default]
+    ImportedWallClock,
+    SameProcessMonotonic,
+    /// Original boot-relative coordinates verified against the current OS clock domain.
+    SameBootMonotonic,
+}
+impl SloCostProfileClockBasis {
+    pub fn is_imported_wall_clock(&self) -> bool {
+        matches!(self, Self::ImportedWallClock)
+    }
+}
+
+/// Whether the source and predictor metadata were persisted. For Memory,
+/// byte counts and hashes describe the canonical encoded stream, not a file
+/// or resident-memory measurement; raw observations are not retained.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloCostProfileStorage {
+    #[default]
+    File,
+    Memory,
+}
+impl SloCostProfileStorage {
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File)
+    }
+}
+
 /// Actual import receipt, separate from user policy and its original hash.
 /// File integrity and declarations are not hardware or clock attestations;
 /// recorded samples do not imply coverage of a subsequent execution shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SloCostProfileReceipt {
+    #[serde(skip_serializing_if = "SloCostProfileStorage::is_file")]
+    pub storage: SloCostProfileStorage,
+    #[serde(skip_serializing_if = "SloCostProfileClockBasis::is_imported_wall_clock")]
+    pub clock_basis: SloCostProfileClockBasis,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_whole_wave: Option<SloSelectedWholeWaveReceiptV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -403,13 +464,15 @@ pub struct SloCostProfileReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_whole_wave_v2: Option<SloStructuredWholeWaveReceiptV2>,
     pub schema_version: u32,
-    pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
     pub file_sha256: String,
     pub file_bytes: usize,
     pub generated_unix_ns: u64,
     pub loaded_unix_ns: u64,
     pub conservative_clock_error_ns: u64,
-    pub declared_local_clock_max_error_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_local_clock_max_error_ns: Option<u64>,
     pub oldest_imported_age_ns: Option<u64>,
     pub newest_imported_age_ns: Option<u64>,
     pub offered_samples: usize,
@@ -431,8 +494,8 @@ pub struct SloStructuredWholeWaveReceiptV2 {
     pub model_revision: String,
     pub artifact_kind: SloStructuredArtifactKindV2,
     pub child_count: usize,
-    /// Physical imported bytes. SharedCatalogV11 counts its common source and
-    /// profile once; per-child references are not additional files.
+    /// Canonical encoded bytes (physical imported bytes for File storage).
+    /// Shared catalogs count their common source and profile once.
     pub total_imported_bytes: u64,
     pub total_shape_rows: u64,
     /// Present only for a catalog; every original source digest is in children.
@@ -448,10 +511,21 @@ pub enum SloStructuredArtifactKindV2 {
     SharedCatalogV11,
     /// Schema12: one original source5 with verified preparation and full Length.
     PrefixCatalogV12,
+    /// Schema13: ordinary service waves in independently frozen offered windows.
+    ServiceWindowCatalogV13,
+    /// Schema14: independently progressing owners in complete source7 blocks.
+    OwnerBlockCatalogV14,
+    /// Schema15: original source8 preparation and independently frozen ordinary suffixes.
+    PreparedOwnerBlockCatalogV15,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SloStructuredChildReceiptV2 {
-    pub profile_path: PathBuf,
+    #[serde(skip_serializing_if = "SloCostProfileStorage::is_file")]
+    pub storage: SloCostProfileStorage,
+    #[serde(skip_serializing_if = "SloCostProfileClockBasis::is_imported_wall_clock")]
+    pub clock_basis: SloCostProfileClockBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_path: Option<PathBuf>,
     pub profile_sha256: [u8; 32],
     pub profile_bytes: u64,
     pub domain_signature: [u8; 32],
@@ -464,7 +538,8 @@ pub struct SloStructuredChildReceiptV2 {
     pub rule_signature: [u8; 32],
     pub cohort_manifest_sha256: [u8; 32],
     pub parameters_sha256: [u8; 32],
-    pub source_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
     pub source_sha256: [u8; 32],
     pub source_bytes: u64,
     pub offered_attempts: u64,
@@ -631,6 +706,29 @@ mod tests {
             serde_json::from_str::<SloCostObservationConfig>(&encoded).unwrap(),
             policy.cost_observation
         );
+    }
+
+    #[test]
+    fn observation_template_budget_defaults_roundtrips_and_has_a_separate_bound() {
+        let default: SloCostObservationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.maximum_template_bytes.get(), 32 * 1024 * 1024);
+        let mut configured = default.clone();
+        configured.maximum_template_bytes = NonZeroUsize::new(48 * 1024 * 1024).unwrap();
+        configured.validate().unwrap();
+        let encoded = serde_json::to_string(&configured).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SloCostObservationConfig>(&encoded).unwrap(),
+            configured
+        );
+        assert_eq!(configured.profile_import, default.profile_import);
+        assert!(serde_json::from_str::<SloCostObservationConfig>(
+            r#"{"maximum_template_bytes":0}"#
+        )
+        .is_err());
+        configured.maximum_template_bytes = NonZeroUsize::new(256 * 1024 * 1024).unwrap();
+        configured.validate().unwrap();
+        configured.maximum_template_bytes = NonZeroUsize::new(256 * 1024 * 1024 + 1).unwrap();
+        assert!(configured.validate().is_err());
     }
 
     #[test]
@@ -893,5 +991,28 @@ mod structured_v2_tests {
         let mut changed = config;
         changed.model.drift_margin_ns += 1;
         assert!(changed.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod observation_byte_capacity_tests {
+    use super::*;
+    #[test]
+    fn observation_byte_capacities_default_independently_of_rows_and_reject_overflow() {
+        let config: SloCostObservationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.maximum_queued_bytes.get(), 128 * 1024 * 1024);
+        assert_eq!(config.maximum_working_bytes.get(), 128 * 1024 * 1024);
+        for field in ["maximum_queued_bytes", "maximum_working_bytes"] {
+            assert!(serde_json::from_value::<SloCostObservationConfig>(
+                serde_json::json!({(field): 0})
+            )
+            .is_err());
+            let invalid: SloCostObservationConfig =
+                serde_json::from_value(serde_json::json!({(field): 128 * 1024 * 1024 + 1}))
+                    .unwrap();
+            assert!(invalid.validate().is_err());
+        }
+        let config: SloCostObservationConfig = serde_json::from_str(r#"{"max_rows_per_wave":1,"max_retained_rows_per_call":1,"maximum_queued_bytes":1048576,"maximum_working_bytes":2097152}"#).unwrap();
+        config.validate().unwrap();
     }
 }

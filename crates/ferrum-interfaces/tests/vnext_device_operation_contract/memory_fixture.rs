@@ -36,6 +36,53 @@ impl TestMemoryBuffer {
 
 type Bytes = Arc<Mutex<Vec<u8>>>;
 
+/// Fixed state really written by the controlled CPU command, then copied by
+/// the normal native checkpoint facade. This is never run during encoding.
+pub(super) struct CheckpointStateWrite {
+    bytes: Bytes,
+    offset: usize,
+    completed: u32,
+}
+impl CheckpointStateWrite {
+    pub(super) fn execute(&self) {
+        self.bytes.lock().unwrap()[self.offset..self.offset + 4]
+            .copy_from_slice(&self.completed.to_le_bytes());
+    }
+}
+
+pub(super) fn checkpoint_state_writes(
+    invocation: &BatchedOperationInvocation<'_, TestBuffer>,
+) -> Vec<CheckpointStateWrite> {
+    invocation
+        .participants()
+        .iter()
+        .zip(invocation.work_shape().participant_work())
+        .filter_map(|(participant, work)| {
+            let binding = participant
+                .bindings()
+                .iter()
+                .find(|binding| binding.value_id().as_str() == "value.state")?;
+            let component = binding.storage().components().first().unwrap();
+            let view = participant
+                .views()
+                .iter()
+                .find(|view| view.resource_id() == component.resource_id())
+                .unwrap();
+            let translated = view.translate(component.offset_bytes(), 4).unwrap();
+            let mut pieces = translated.iter();
+            let piece = pieces.next().unwrap();
+            assert!(pieces.next().is_none());
+            let (buffer, physical, _retention) = piece.buffer_and_physical_range();
+            let memory = buffer.memory.as_ref()?;
+            Some(CheckpointStateWrite {
+                bytes: Arc::clone(&memory.bytes),
+                offset: usize::try_from(physical.start).unwrap(),
+                completed: u32::try_from(work.token_span().immediate_token_range().end).unwrap(),
+            })
+        })
+        .collect()
+}
+
 enum MemoryAction {
     Copy(Bytes, Range<usize>, Bytes, Range<usize>),
     Upload(Vec<u8>, Bytes, Range<usize>),
@@ -46,6 +93,13 @@ enum MemoryAction {
 pub(crate) struct TestMemoryRegistry {
     next: u64,
     pending: BTreeMap<u64, MemoryAction>,
+    copied_payloads: Vec<Vec<u8>>,
+}
+
+impl TestMemoryRegistry {
+    pub(crate) fn copied_payloads(&self) -> &[Vec<u8>] {
+        &self.copied_payloads
+    }
 }
 
 pub(super) fn encode_copy(
@@ -153,6 +207,7 @@ pub(super) fn execute(registry: &Arc<Mutex<TestMemoryRegistry>>, commands: &[Tes
             MemoryAction::Copy(source, source_range, destination, destination_range) => {
                 let bytes = source.lock().unwrap()[source_range].to_vec();
                 destination.lock().unwrap()[destination_range].copy_from_slice(&bytes);
+                registry.lock().unwrap().copied_payloads.push(bytes);
             }
             MemoryAction::Upload(bytes, destination, destination_range) => {
                 destination.lock().unwrap()[destination_range].copy_from_slice(&bytes);

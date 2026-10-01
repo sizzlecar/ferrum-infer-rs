@@ -63,6 +63,17 @@ fn predict_with_host(
     probe: &Probe,
     host: Option<&FutureHostPendingQueryV2<'_>>,
 ) -> ExecutionCostRouteForecastV2 {
+    predict_with_host_and_numeric_repetition(fixture, prefills, decodes, probe, host, false)
+}
+
+fn predict_with_host_and_numeric_repetition(
+    fixture: &Fixture,
+    prefills: &[PlanRuntimePrefillInput],
+    decodes: &[PlanRuntimeDecodeInput],
+    probe: &Probe,
+    host: Option<&FutureHostPendingQueryV2<'_>>,
+    projected_repetition: bool,
+) -> ExecutionCostRouteForecastV2 {
     fixture.warm(prefills, decodes);
     let before = fixture.target_resource_evidence(prefills, decodes);
     let submissions = fixture.submissions();
@@ -125,8 +136,29 @@ fn predict_with_host(
                     ActualRowWork::Decode {
                         kv_tokens: range.start.try_into().unwrap(),
                     },
-                    FutureCostOutput::Decode {
-                        policy: &input.logits_policy,
+                    if projected_repetition {
+                        let LogitsReturnPolicy::GreedyArgmax {
+                            token_mask,
+                            repetition_penalty: Some(repetition),
+                        } = &input.logits_policy
+                        else {
+                            panic!("real repetition fixture");
+                        };
+                        FutureCostOutput::ProjectedGreedy {
+                            token_mask: token_mask.as_ref(),
+                            repetition: FutureRepetitionRangeV3::from_observed_history(
+                                repetition.token_ids().len() as u64,
+                                repetition.token_ids().len() as u64,
+                                host.host_features.unwrap().state.generated_tokens_before,
+                                fixture.executor.info().vocab_size as u64,
+                            )
+                            .unwrap(),
+                            repetition_penalty: repetition.penalty(),
+                        }
+                    } else {
+                        FutureCostOutput::Decode {
+                            policy: &input.logits_policy,
+                        }
                     },
                 )
             };
@@ -217,8 +249,12 @@ fn predict_with_host(
 }
 
 mod host_forecast;
+mod repetition;
 
-fn assert_canonical(probe: &Probe, expected: &CanonicalWaveCostShape) {
+fn assert_canonical(probe: &mut Probe, expected: &CanonicalWaveCostShape) {
+    // Original asynchronous evidence is consumed after dispatch, as in the
+    // engine worker. It is not part of future projection or device execution.
+    probe.recorder.resolve_pending().unwrap();
     let observed = &probe.recorder.observations()[0];
     let actual = observed.shape.as_ref().unwrap();
     probe.assert_wave(
@@ -276,7 +312,7 @@ async fn future_metal_product_full_canonical_partial_final_decode_and_mixed() {
     );
     assert!(matches!(partial, PlanRuntimePrefillOutcome::Completed(_)));
     assert_eq!(fixture.submissions(), before + 1);
-    assert_canonical(&probe, &expected);
+    assert_canonical(&mut probe, &expected);
 
     input.chunk = PrefillChunk::new(2, 2, 4).unwrap();
     let mut probe = Probe::new(&[&input.request_id]);
@@ -294,7 +330,7 @@ async fn future_metal_product_full_canonical_partial_final_decode_and_mixed() {
         PlanRuntimeBatchPrefillOutcome::Completed(mut outputs) => outputs.remove(0),
         _ => panic!("real final prefill did not complete"),
     };
-    assert_canonical(&probe, &expected);
+    assert_canonical(&mut probe, &expected);
     let mut decode = PlanRuntimeDecodeInput::new(
         input.request_id.clone(),
         TokenId::new(1),
@@ -353,7 +389,7 @@ async fn future_metal_product_full_canonical_partial_final_decode_and_mixed() {
                 )
                 .await,
         ));
-        assert_canonical(&probe, &expected);
+        assert_canonical(&mut probe, &expected);
         assert_eq!(mask_counts(&fixture).0 - masks.0, uploads);
         assert_eq!(mask_counts(&fixture).1 - masks.1, 1 - uploads);
         decode.kv_cache = Arc::clone(&outputs[0].kv_cache);
@@ -383,7 +419,7 @@ async fn future_metal_product_full_canonical_partial_final_decode_and_mixed() {
             )
             .await,
     ));
-    assert_canonical(&probe, &expected);
+    assert_canonical(&mut probe, &expected);
     assert_eq!(mask_counts(&fixture).0 - masks.0, 1);
     assert_eq!(mask_counts(&fixture).1 - masks.1, 0);
     decode.kv_cache = Arc::clone(&outputs[0].kv_cache);
@@ -424,7 +460,7 @@ async fn future_metal_product_full_canonical_partial_final_decode_and_mixed() {
     let PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes } = output else {
         panic!("real mixed wave did not complete");
     };
-    assert_canonical(&probe, &expected);
+    assert_canonical(&mut probe, &expected);
     assert_eq!(
         probe.recorder.observations()[0]
             .shape
@@ -459,3 +495,5 @@ mod grouped;
 mod independent_rows;
 
 mod cpu_screen;
+
+mod completion_capture;

@@ -2,6 +2,7 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod prefix_audit;
 mod timing_metrics;
 
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +88,8 @@ pub(in crate::continuous_engine) struct ControllerAudit {
 }
 
 pub(super) struct ControllerBudget {
+    pub observation:
+        std::sync::OnceLock<Arc<crate::continuous_engine::query_observation::Transaction>>,
     started_at: Instant,
     deadline: Instant,
     budget_ns: u64,
@@ -98,6 +101,9 @@ pub(super) struct ControllerBudget {
     exhausted: AtomicBool,
     clock_invalid: AtomicBool,
     emitted: AtomicBool,
+    diagnostic_optional_end_ns: AtomicU64,
+    diagnostic_completion_ns: AtomicU64,
+    diagnostic_publication_ns: AtomicU64,
     search: Mutex<PlanningSearchStats>,
     witness: Mutex<Option<ControllerWitnessAudit>>,
     backend_submitted: AtomicBool,
@@ -120,10 +126,43 @@ impl ControllerOptionalPhase {
             return false;
         }
         if now >= self.deadline {
-            self.budget.planner_exhausted.store(true, Ordering::Release);
+            if !self.budget.planner_exhausted.swap(true, Ordering::AcqRel) {
+                self.budget
+                    .diagnostic_checkpoint_at("optional_deadline_exhausted", "point", now);
+            }
             return false;
         }
         true
+    }
+
+    /// Finalize the same phase with the complete mandatory preparation cost.
+    /// A later report can only shorten this original transaction's deadline.
+    pub fn tighten_for_completion_preparation(
+        &mut self,
+        preparation_wall: std::time::Duration,
+        publication_reserve_percent: u8,
+    ) {
+        let (deadline, _) = self
+            .budget
+            .completion_reserve_deadline(preparation_wall, publication_reserve_percent);
+        self.deadline = self.deadline.min(deadline);
+        if self.budget.observation.get().is_some() {
+            self.budget.diagnostic_optional_end_ns.store(
+                u64::try_from(
+                    self.deadline
+                        .duration_since(self.budget.started_at)
+                        .as_nanos(),
+                )
+                .unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.budget.diagnostic_completion_ns.store(
+                u64::try_from(preparation_wall.as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.budget
+                .diagnostic_checkpoint("completion_preparation_finalized");
+        }
     }
 
     pub fn planning_window(
@@ -145,6 +184,7 @@ impl ControllerBudget {
         let budget_ns = u64::try_from(allowance.as_nanos())
             .map_err(|_| FerrumError::config("controller planning budget overflow"))?;
         Ok(Arc::new(Self {
+            observation: std::sync::OnceLock::new(),
             started_at,
             deadline,
             budget_ns,
@@ -156,6 +196,9 @@ impl ControllerBudget {
             exhausted: AtomicBool::new(false),
             clock_invalid: AtomicBool::new(false),
             emitted: AtomicBool::new(false),
+            diagnostic_optional_end_ns: AtomicU64::new(u64::MAX),
+            diagnostic_completion_ns: AtomicU64::new(u64::MAX),
+            diagnostic_publication_ns: AtomicU64::new(u64::MAX),
             search: Mutex::new(PlanningSearchStats::default()),
             witness: Mutex::new(None),
             backend_submitted: AtomicBool::new(false),
@@ -172,27 +215,53 @@ impl ControllerBudget {
             deadline_ns: origin.at_ns(self.deadline)?,
         })
     }
-    /// Reserve the work measured while preparing this transaction's executable
-    /// completion draft, plus the configured publication window. Like planner
-    /// replay reservation, this stops optional work; it is not a duration proof.
+    /// The configured publication window already covers resource, route and
+    /// output revalidation. Preparing this transaction's executable draft is
+    /// an estimate for that same future stage, so it may enlarge the reserve
+    /// but is not added as another stage. Like planner replay reservation,
+    /// this stops optional work; it is not a duration proof.
     /// A slow callback still fails the unchanged hard deadline at publication.
     pub fn completion_optional_phase(
         self: &Arc<Self>,
         preparation_wall: std::time::Duration,
         publication_reserve_percent: u8,
     ) -> ControllerOptionalPhase {
-        let configured = std::time::Duration::from_nanos(
-            ((u128::from(self.budget_ns) * u128::from(publication_reserve_percent.min(100))) / 100)
-                as u64,
-        );
-        let deadline = preparation_wall
-            .checked_add(configured)
-            .and_then(|reserve| self.deadline.checked_sub(reserve))
-            .map_or(self.started_at, |end| end.max(self.started_at));
+        let (deadline, configured) =
+            self.completion_reserve_deadline(preparation_wall, publication_reserve_percent);
+        if self.observation.get().is_some() {
+            let ns = |duration: std::time::Duration| {
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+            };
+            self.diagnostic_optional_end_ns.store(
+                ns(deadline.duration_since(self.started_at)),
+                Ordering::Relaxed,
+            );
+            self.diagnostic_completion_ns
+                .store(ns(preparation_wall), Ordering::Relaxed);
+            self.diagnostic_publication_ns
+                .store(ns(configured), Ordering::Relaxed);
+            self.diagnostic_checkpoint("optional_budget_allocated");
+        }
         ControllerOptionalPhase {
             budget: Arc::clone(self),
             deadline,
         }
+    }
+    fn completion_reserve_deadline(
+        &self,
+        preparation_wall: std::time::Duration,
+        publication_reserve_percent: u8,
+    ) -> (Instant, std::time::Duration) {
+        let configured = std::time::Duration::from_nanos(
+            ((u128::from(self.budget_ns) * u128::from(publication_reserve_percent.min(100))) / 100)
+                as u64,
+        );
+        let reserve = preparation_wall.max(configured);
+        let deadline = self
+            .deadline
+            .checked_sub(reserve)
+            .map_or(self.started_at, |end| end.max(self.started_at));
+        (deadline, configured)
     }
     pub fn poll(&self) -> bool {
         self.poll_at(slo_clock_now())
@@ -204,8 +273,8 @@ impl ControllerBudget {
             return false;
         }
         let live = now < self.deadline;
-        if !live {
-            self.exhausted.store(true, Ordering::Release);
+        if !live && !self.exhausted.swap(true, Ordering::AcqRel) {
+            self.diagnostic_checkpoint_at("hard_deadline_exhausted", "point", now);
         }
         live
     }
@@ -222,6 +291,55 @@ impl ControllerBudget {
     }
     pub fn record_unavailable(&self, reason: &'static str) {
         *self.decision.lock() = ("unknown", reason);
+    }
+
+    pub fn diagnostic_checkpoint(&self, stage: &'static str) {
+        if self.observation.get().is_some() {
+            self.diagnostic_checkpoint_at(stage, "point", slo_clock_now());
+        }
+    }
+
+    pub fn diagnostic_scope(&self, stage: &'static str) -> ControllerDiagnosticScope<'_> {
+        if self.observation.get().is_some() {
+            self.diagnostic_checkpoint_at(stage, "begin", slo_clock_now());
+        }
+        ControllerDiagnosticScope {
+            budget: self,
+            stage,
+        }
+    }
+
+    pub fn observed_resource_budget<'a>(
+        &'a self,
+        poll: &'a mut dyn FnMut() -> bool,
+    ) -> ObservedResourceBudget<'a> {
+        ObservedResourceBudget {
+            controller: self,
+            poll,
+        }
+    }
+
+    fn diagnostic_checkpoint_at(&self, stage: &'static str, edge: &'static str, now: Instant) {
+        let Some(observation) = self.observation.get() else {
+            return;
+        };
+        let optional = |value: &AtomicU64| {
+            let value = value.load(Ordering::Relaxed);
+            (value != u64::MAX).then_some(value)
+        };
+        observation.checkpoint(
+            crate::continuous_engine::query_observation::ControllerCheckpoint {
+                stage,
+                edge,
+                elapsed_ns: now
+                    .checked_duration_since(self.started_at)
+                    .and_then(|value| u64::try_from(value.as_nanos()).ok()),
+                hard_budget_ns: self.budget_ns,
+                optional_deadline_elapsed_ns: optional(&self.diagnostic_optional_end_ns),
+                completion_preparation_ns: optional(&self.diagnostic_completion_ns),
+                publication_reserve_ns: optional(&self.diagnostic_publication_ns),
+            },
+        );
     }
     pub fn record_search(&self, decision: &PlanningDecision) {
         *self.witness.lock() = match decision {
@@ -280,10 +398,12 @@ impl ControllerBudget {
         self.host_reconciled.store(true, Ordering::Release);
     }
     pub fn stage(&self, stage: ControllerStage) -> ControllerStageTimer<'_> {
+        let began = slo_clock_now();
+        self.diagnostic_checkpoint_at(stage.label(), "begin", began);
         ControllerStageTimer {
             budget: self,
             stage,
-            began: slo_clock_now(),
+            began,
         }
     }
     pub fn record_ready_queue(&self) {
@@ -348,6 +468,32 @@ fn add(counter: &AtomicU64, value: u64) {
         Some(current.saturating_add(value))
     });
 }
+
+pub(super) struct ControllerDiagnosticScope<'a> {
+    budget: &'a ControllerBudget,
+    stage: &'static str,
+}
+
+pub(super) struct ObservedResourceBudget<'a> {
+    controller: &'a ControllerBudget,
+    poll: &'a mut dyn FnMut() -> bool,
+}
+impl ferrum_interfaces::vnext::ResourcePlanningBudget for ObservedResourceBudget<'_> {
+    fn has_budget(&mut self) -> bool {
+        (self.poll)()
+    }
+    fn diagnostic_checkpoint(&mut self, stage: &'static str) {
+        self.controller.diagnostic_checkpoint(stage);
+    }
+}
+impl Drop for ControllerDiagnosticScope<'_> {
+    fn drop(&mut self) {
+        if self.budget.observation.get().is_some() {
+            self.budget
+                .diagnostic_checkpoint_at(self.stage, "end", slo_clock_now());
+        }
+    }
+}
 pub(super) struct ControllerStageTimer<'a> {
     budget: &'a ControllerBudget,
     stage: ControllerStage,
@@ -355,7 +501,10 @@ pub(super) struct ControllerStageTimer<'a> {
 }
 impl Drop for ControllerStageTimer<'_> {
     fn drop(&mut self) {
-        self.budget.record(self.stage, self.began, slo_clock_now());
+        let ended = slo_clock_now();
+        self.budget.record(self.stage, self.began, ended);
+        self.budget
+            .diagnostic_checkpoint_at(self.stage.label(), "end", ended);
     }
 }
 
@@ -364,6 +513,19 @@ impl EngineInner {
         let Some(audit) = budget.take_audit(outcome) else {
             return;
         };
+        budget.diagnostic_checkpoint("transaction_finished");
+        if let Some(observation) = budget.observation.get() {
+            observation.finish(
+                audit.outcome,
+                audit.decision,
+                audit.reason,
+                audit.planning_wall_ns,
+                audit.budget_ns,
+                audit.planner_budget_exhausted,
+                audit.budget_exhausted,
+                &audit.search,
+            );
+        }
         {
             let mut controller = self.slo_controller.lock();
             timing_metrics::accumulate(
@@ -434,7 +596,9 @@ impl EngineInner {
             counter!("ferrum.engine.slo_controller_search_work_total", "kind" => kind)
                 .increment(value as u64);
         }
-        tracing::trace!(?audit, budget_ns=audit.budget_ns, budget_polls=audit.budget_polls,
+        tracing::trace!(target: "ferrum::slo_transaction",
+            transaction=budget.observation.get().map(|o| o.id()),
+            ?audit, budget_ns=audit.budget_ns, budget_polls=audit.budget_polls,
             planner_budget_exhausted=audit.planner_budget_exhausted,
             budget_exhausted=audit.budget_exhausted,
             decision=audit.decision, reason=audit.reason,
@@ -445,3 +609,59 @@ impl EngineInner {
 
 #[cfg(test)]
 mod tests;
+
+/// A read-only adapter installed only for an explicitly enabled transaction.
+/// It owns neither an execution permit nor a replacement model/clock.
+pub(super) struct ObservedModel {
+    pub model: Arc<dyn PlanningCostModel + Send + Sync>,
+    pub observation: Arc<crate::continuous_engine::query_observation::Transaction>,
+    pub budget: Arc<ControllerBudget>,
+}
+impl PlanningCostModel for ObservedModel {
+    fn query_observer(&self) -> Option<&dyn PlanningQueryObserver> {
+        Some(self.observation.as_ref())
+    }
+    fn evidence_requirement(&self) -> PlanningCostEvidenceRequirement {
+        self.model.evidence_requirement()
+    }
+    fn requires_statistical_evidence(&self) -> bool {
+        self.model.requires_statistical_evidence()
+    }
+    fn supports_empirical_host_content(&self) -> bool {
+        self.model.supports_empirical_host_content()
+    }
+    fn model_version(&self) -> u64 {
+        self.model.model_version()
+    }
+    fn predict(
+        &self,
+        fingerprint: &ferrum_scheduler::implementations::continuous::cost_model::ExecutionFingerprint,
+        shape: &ferrum_scheduler::implementations::continuous::cost_model::WaveExecutionShape,
+        now: u64,
+    ) -> Option<PlanningCost> {
+        let _diagnostic = self.budget.diagnostic_scope("cost_predict");
+        self.model.predict(fingerprint, shape, now)
+    }
+    fn predict_with_evidence(
+        &self,
+        fingerprint: &ferrum_scheduler::implementations::continuous::cost_model::ExecutionFingerprint,
+        shape: &ferrum_scheduler::implementations::continuous::cost_model::WaveExecutionShape,
+        evidence: Option<&PlanningCostEvidence>,
+        now: u64,
+    ) -> Option<PlanningCost> {
+        let _diagnostic = self.budget.diagnostic_scope("cost_predict_with_evidence");
+        self.model
+            .predict_with_evidence(fingerprint, shape, evidence, now)
+    }
+    fn predict_observed(
+        &self,
+        fingerprint: &ferrum_scheduler::implementations::continuous::cost_model::ExecutionFingerprint,
+        shape: &ferrum_scheduler::implementations::continuous::cost_model::WaveExecutionShape,
+        evidence: Option<&PlanningCostEvidence>,
+        now: u64,
+    ) -> PlanningObservedCost {
+        let _diagnostic = self.budget.diagnostic_scope("cost_predict_observed");
+        self.model
+            .predict_observed(fingerprint, shape, evidence, now)
+    }
+}

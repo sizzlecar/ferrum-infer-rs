@@ -11,12 +11,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         serde_json::json!({
             "state": "installed",
             "catalog_lifetime": self.reusable_execution_startup_plan.as_ref().map(|plan| plan.device_plan.catalog_lifetime()),
-            "lane_epoch": catalog.lane_epoch,
+            "lane_epoch": catalog.epoch(),
             "current_lane_epoch": self.lane.reusable_execution_epoch(),
             "refresh_pending": self.reusable_execution_catalog_refresh_needed.load(Ordering::Acquire),
             "maximum_device_executables": self.reusable_execution_startup_plan.as_ref().map(|plan| plan.device_plan.maximum_executables()).unwrap_or(0),
-            "programs": catalog.programs.len(),
-            "programs_with_resident_segments": catalog.programs.values().filter(|program| program.has_resident_segments()).count(),
+            "programs": catalog.programs().len(),
+            "programs_with_resident_segments": catalog.programs().values().filter(|program| program.has_resident_segments()).count(),
             "scope": "last_published_quiescent_catalog; physical segments may be shared by programs",
         })
     }
@@ -69,16 +69,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .lane
             .reusable_execution_catalog()
             .map_err(|error| FerrumError::device(error.to_string()))?;
-        let (lane_epoch, programs) = catalog.into_parts();
-        if !programs.is_empty() {
+        let catalog = catalog
+            .into_index()
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        if !catalog.programs().is_empty() {
             return Err(FerrumError::internal(
                 "vNext on-demand catalog must start empty",
             ));
         }
-        self.install_reusable_execution_catalog(VNextReusableExecutionCatalog {
-            lane_epoch,
-            programs: BTreeMap::new(),
-        })?;
+        self.install_reusable_execution_catalog(catalog)?;
         Ok(VNextReusableExecutionStartupReport {
             workspace_preparation: None,
             enabled: true,
@@ -136,7 +135,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .store(true, Ordering::Release);
             return Ok(());
         };
-        let (lane_epoch, programs) = snapshot.into_parts();
+        let catalog = snapshot
+            .into_index()
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
         let maximum_programs = self
             .reusable_execution_startup_plan
             .as_ref()
@@ -145,13 +146,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             })?
             .device_plan
             .maximum_executables();
-        if programs.len() > maximum_programs {
+        if catalog.programs().len() > maximum_programs {
             return Err(FerrumError::internal(
                 "vNext on-demand program catalog exceeds its immutable capacity",
             ));
         }
-        let mut catalog = BTreeMap::new();
-        for program in programs {
+        for program in catalog.programs().values() {
             let id = program.program_id();
             if id.plan_hash() != self.resolved_plan.execution_plan().plan_hash()
                 || id.runtime_implementation_fingerprint()
@@ -166,16 +166,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "vNext on-demand catalog differs from its immutable plan or lane",
                 ));
             }
-            if catalog.insert(id.clone(), program).is_some() {
-                return Err(FerrumError::internal(
-                    "vNext on-demand catalog contains a duplicate program identity",
-                ));
-            }
         }
-        *installed = Some(Arc::new(VNextReusableExecutionCatalog {
-            lane_epoch,
-            programs: catalog,
-        }));
+        *installed = Some(Arc::new(catalog));
         Ok(())
     }
 }

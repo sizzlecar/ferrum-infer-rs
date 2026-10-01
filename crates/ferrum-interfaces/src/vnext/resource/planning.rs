@@ -8,11 +8,13 @@
 
 use super::*;
 use crate::vnext::{
-    CapacityDomainId, CapacitySnapshot, DynamicResourceShape, ReusableExecutionBucketId,
-    SequenceAuthorityId,
+    CapacityDomainId, CapacitySnapshot, CheckpointCaptureAttemptId, DynamicResourceShape,
+    ReusableExecutionBucketId, SequenceAuthorityId,
 };
 
 mod capture;
+mod checkpoint;
+pub use checkpoint::*;
 mod cost_route;
 mod physical_ranges;
 mod project;
@@ -20,6 +22,7 @@ mod sequence_ranges;
 mod state_equivalence;
 mod workspace;
 pub(crate) use physical_ranges::ResourceCostRangeProof;
+pub(super) use workspace::SlotGeometry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePlanningUnknown {
@@ -30,6 +33,10 @@ pub enum ResourcePlanningUnknown {
     StaleIdentity,
     ReusableExecution,
     MaintenanceRequired,
+    /// The whole wave exceeds currently materialized logical capacity, but
+    /// its cumulative claims fit every captured domain maximum after prior
+    /// simulated waves. This grants no physical growth, fit, or submission authority.
+    UnmaterializedCapacity,
     LogicalCapacity,
     PhysicalCapacity,
     InvalidDemand,
@@ -71,6 +78,9 @@ pub(super) fn read_lock_error<T>(
 /// after this API returns.
 pub trait ResourcePlanningBudget {
     fn has_budget(&mut self) -> bool;
+    /// Optional passive phase marker. It cannot extend the budget or authorize
+    /// work. Implementations must be bounded and must not wait for I/O.
+    fn diagnostic_checkpoint(&mut self, _stage: &'static str) {}
 }
 
 impl<F: FnMut() -> bool> ResourcePlanningBudget for F {
@@ -143,6 +153,30 @@ struct PendingZeroInitialization {
     // Exact ordering key only. It never enters a statistical algorithm class.
     target_fingerprint: Arc<str>,
     transfer_bytes: Arc<[u64]>,
+    transfer_resources: Arc<[ResourceId]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePlanningCompletedBoundary {
+    span_start: u64,
+    completed_tokens: u64,
+    prompt_tokens: u64,
+    restored_from: Option<CheckpointCaptureAttemptId>,
+}
+
+impl ResourcePlanningCompletedBoundary {
+    pub fn span_start(&self) -> u64 {
+        self.span_start
+    }
+    pub fn completed_tokens(&self) -> u64 {
+        self.completed_tokens
+    }
+    pub fn prompt_tokens(&self) -> u64 {
+        self.prompt_tokens
+    }
+    pub fn restored(&self) -> bool {
+        self.restored_from.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,9 +189,19 @@ pub struct ResourcePlanningParticipant {
     maximum_tokens: u64,
     retired_frames: u64,
     pending_zero_initializations: Option<Arc<[PendingZeroInitialization]>>,
+    /// Native restore requires every Zero cell to be Pending, even when no
+    /// model frame has retired. Inference may legitimately skip Initialized.
+    restore_zero_initializations_pending: bool,
+    restore_frontier_fresh: bool,
+    completed_checkpoint_boundary: Option<ResourcePlanningCompletedBoundary>,
 }
 
 impl ResourcePlanningParticipant {
+    /// Proven under the same session/backing bracket as this resource view.
+    /// The value carries no permission to read, restore or submit device work.
+    pub fn completed_checkpoint_boundary(&self) -> Option<&ResourcePlanningCompletedBoundary> {
+        self.completed_checkpoint_boundary.as_ref()
+    }
     pub fn matches_session_identity<R: DeviceRuntime>(&self, session: &SequenceSession<R>) -> bool {
         self.authority == session.sequence_authority()
             && self.epoch == session.epoch()
@@ -192,7 +236,10 @@ struct PoolReadView {
     instance: u64,
     next_extent_generation: u64,
     resident_bytes: u64,
-    allocator: FreeExtentIndex,
+    // Immutable numeric free-layout evidence only. A branch detaches the
+    // touched allocator before every allocation attempt or release; no live
+    // resource, lease or device buffer is retained by this Arc.
+    allocator: Arc<FreeExtentIndex>,
 }
 
 impl PartialEq for PoolReadView {
@@ -231,12 +278,32 @@ pub struct ResourcePlanningView {
     budget: BudgetReadView,
     pools: Vec<PoolReadView>,
     participants: Vec<ResourcePlanningParticipant>,
-    workspace: Option<workspace::WorkspaceReadView>,
+    workspace: Option<Arc<workspace::WorkspaceReadView>>,
     physical_ranges: Option<physical_ranges::PhysicalRanges>,
     sequence_ranges: sequence_ranges::SequenceRanges,
 }
 
 impl ResourcePlanningView {
+    /// The same fresh numeric capture may serve independent completion and
+    /// forecast consumers. Only their future wave bound can differ: all live
+    /// capture cardinalities and capacity limits must remain identical.
+    pub(crate) fn with_projection_limits(
+        &self,
+        limits: ResourcePlanningLimits,
+    ) -> Result<Self, ResourcePlanningUnknown> {
+        if !limits.is_valid()
+            || (ResourcePlanningLimits {
+                maximum_projected_waves: self.limits.maximum_projected_waves,
+                ..limits
+            }) != self.limits
+        {
+            return Err(ResourcePlanningUnknown::InvalidInput);
+        }
+        let mut view = self.clone();
+        view.limits = limits;
+        Ok(view)
+    }
+
     /// Match actual whole-wave cell order, then its ordered/deduplicated
     /// physical extents. Selecting a subset never changes relative cell order.
     /// The snapshot owns only numbers/keys, not cells, buffers or permissions.
@@ -315,6 +382,8 @@ impl ResourcePlanningView {
                 .collect(),
             covered: self.participants.iter().map(|p| p.covered).collect(),
             sequence_ranges: self.sequence_ranges.clone(),
+            checkpoint_retained_bytes: self.logical.checkpoint_retention().map(|value| value.0),
+            checkpoint_tokens: Vec::new(),
             waves: 0,
         }
     }
@@ -339,14 +408,28 @@ impl ResourcePlanningView {
 pub struct ResourcePlanningState {
     fence: Arc<()>,
     pools: Vec<PoolReadView>,
-    workspace: Option<workspace::WorkspaceReadView>,
+    // Read-only retained slots are shared across branches. A branch creating
+    // a new simulated slot detaches this numeric inventory before mutation.
+    // It contains no buffer, lease, or live execution authority.
+    workspace: Option<Arc<workspace::WorkspaceReadView>>,
     logical_available: BTreeMap<CapacityDomainId, u64>,
     covered: Vec<DynamicResourceShape>,
     sequence_ranges: sequence_ranges::SequenceRanges,
+    checkpoint_retained_bytes: Option<u64>,
+    checkpoint_tokens: Vec<Arc<()>>,
     waves: usize,
 }
 
 impl ResourcePlanningState {
+    #[cfg(test)]
+    pub(super) fn shares_pool_allocator(&self, other: &Self, id: &DynamicBackingPoolId) -> bool {
+        let find = |state: &Self| state.pools.binary_search_by(|pool| pool.id.cmp(id)).ok();
+        match (find(self), find(other)) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&self.pools[a].allocator, &other.pools[b].allocator),
+            _ => false,
+        }
+    }
+
     pub fn projected_waves(&self) -> usize {
         self.waves
     }

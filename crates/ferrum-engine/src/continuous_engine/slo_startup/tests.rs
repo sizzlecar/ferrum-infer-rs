@@ -15,6 +15,9 @@ use ferrum_types::{ApiChatRequest, ApiRequest, ApiStreamOptions, ServiceSloConfi
 use futures::StreamExt;
 use std::{fs, num::NonZeroU64, path::PathBuf, time::SystemTime};
 
+mod automatic;
+mod prefix_capability;
+mod stage_ablation;
 mod waiting_capacity;
 
 #[tokio::test]
@@ -192,14 +195,16 @@ async fn enforce_constructor_imports_real_files_and_does_not_reuse_a_prior_recei
     assert!(receipt.bucket_count > 0);
     assert_eq!(
         receipt.path,
-        f.config
-            .scheduler
-            .slo
-            .cost_profile
-            .clone()
-            .unwrap()
-            .canonicalize()
-            .unwrap()
+        Some(
+            f.config
+                .scheduler
+                .slo
+                .cost_profile
+                .clone()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        )
     );
     assert!(engine
         .inner
@@ -288,7 +293,7 @@ async fn enforce_constructor_rejects_missing_artifacts_wrong_identity_and_expire
 }
 
 #[tokio::test]
-async fn enforce_rejects_unconnected_transport_and_strict_admission_before_execution() {
+async fn enforce_rejects_unconnected_transport_and_strict_requires_loaded_artifacts() {
     let f = Fixture::new().await;
     let mut legacy = f.config.clone();
     legacy.scheduler.slo.output.transport = SloOutputTransport::Legacy;
@@ -298,11 +303,40 @@ async fn enforce_rejects_unconnected_transport_and_strict_admission_before_execu
     ));
     let mut strict = f.config.clone();
     strict.scheduler.slo.admission.time_policy = SloTimeAdmissionPolicy::RequireSlo;
-    assert!(matches!(
-        f.build(strict),
-        Err(FerrumError::Unsupported { .. })
-    ));
+    let engine = f.build(strict.clone()).unwrap();
+    engine.shutdown().await.unwrap();
+    strict.scheduler.slo.cost_profile = None;
+    assert!(matches!(f.build(strict), Err(FerrumError::Config { .. })));
     assert_eq!(f.executor.entries.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn strict_product_unknown_returns_typed_expiry_before_any_user_inference() {
+    let f = Fixture::new().await;
+    let mut config = f.config.clone();
+    config.scheduler.slo.admission.time_policy = SloTimeAdmissionPolicy::RequireSlo;
+    config.scheduler.slo.admission.max_wait_ms = NonZeroU64::new(20).unwrap();
+    let engine = f.build(config.clone()).unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        engine.infer_credited_stream(
+            request(&config),
+            InferenceRequestContext::capture(),
+            Arc::new(OutputProjectionContract::cli_text()),
+        ),
+    )
+    .await
+    .expect("strict original-ingress expiry must wake the live driver");
+    assert!(matches!(
+        result,
+        Err(FerrumError::SloTimeAdmissionRejected {
+            reason: ferrum_types::SloTimeAdmissionRejection::WaitExpired,
+        })
+    ));
+    assert!(engine.inner.sequences.read().is_empty());
+    assert_eq!(f.executor.entries.load(Ordering::Acquire), 0);
+    assert_eq!(f.executor.physical.load(Ordering::Acquire), 0);
+    engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]

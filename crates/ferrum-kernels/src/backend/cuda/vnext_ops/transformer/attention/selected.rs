@@ -15,6 +15,11 @@ use ferrum_interfaces::execution_cost::{
 use ferrum_types::SloStructuredCostCapture;
 use std::sync::OnceLock;
 
+mod classes;
+pub(super) use classes::PreparedKernelClasses;
+mod query;
+pub(super) use query::{CheckedGdnQuery, PreparedCostTemplate};
+
 pub(super) fn attach(
     command: ferrum_interfaces::vnext::OperationCostCommand,
     evidence: Option<SelectedCommandCostEvidenceV1>,
@@ -57,14 +62,16 @@ fn transfer(
     kind: StatisticalTransferKindV1,
     bytes: u64,
 ) -> Option<()> {
-    let entry = match kind {
-        StatisticalTransferKindV1::HostToDevice => "cuda.cuMemcpyHtoDAsync.gdn-control",
-        StatisticalTransferKindV1::Fill => "cuda.cuMemsetD8Async.gdn-token-sequence",
+    static UPLOAD: OnceLock<Option<SelectedAlgorithmClassV1>> = OnceLock::new();
+    static FILL: OnceLock<Option<SelectedAlgorithmClassV1>> = OnceLock::new();
+    let (entry, prepared) = match kind {
+        StatisticalTransferKindV1::HostToDevice => ("cuda.cuMemcpyHtoDAsync.gdn-control", &UPLOAD),
+        StatisticalTransferKindV1::Fill => ("cuda.cuMemsetD8Async.gdn-token-sequence", &FILL),
         _ => return None,
     };
     builder
         .transfer(
-            class(entry, b"gdn.retained-contiguous-control.v1")?,
+            (*prepared.get_or_init(|| class(entry, b"gdn.retained-contiguous-control.v1")))?,
             kind,
             bytes,
         )
@@ -81,15 +88,15 @@ fn kernel(
     inner: u64,
     scratch: u64,
     fixed: &[u64],
+    classes: Option<&PreparedKernelClasses>,
 ) -> Option<()> {
-    let mut layout = Vec::with_capacity(40);
-    layout.extend_from_slice(b"gdn.native-kernel-geometry.v1");
-    for dimension in [config.block_dim.0, config.block_dim.1, config.block_dim.2] {
-        layout.extend_from_slice(&dimension.to_le_bytes());
-    }
+    let class = match classes {
+        Some(classes) => classes.get(entry, config.block_dim)?,
+        None => classes::kernel_class(entry, config.block_dim)?,
+    };
     builder
         .kernel_with_replay_geometry(
-            class(entry, &layout)?,
+            class,
             KernelNumericWorkV1 {
                 logical_units: logical,
                 padded_units: padded,
@@ -107,7 +114,7 @@ fn kernel(
         .ok()
 }
 
-pub(super) fn bindings(
+pub(in crate::backend::cuda::vnext_ops::transformer) fn bindings(
     participants: usize,
     tokens: u64,
     capture: SloStructuredCostCapture,
@@ -147,6 +154,62 @@ pub(super) fn compute(
     pair_enabled: bool,
     capture: SloStructuredCostCapture,
 ) -> Option<SelectedCommandCostEvidenceV1> {
+    compute_with_classes(
+        shape,
+        precision,
+        projection,
+        evidence,
+        leaves,
+        tokens,
+        participants,
+        pair_enabled,
+        capture,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compute_with_classes(
+    shape: AttentionShape,
+    precision: AttentionPrecision,
+    projection: AttentionProjection,
+    evidence: ProjectionEvidence<'_>,
+    leaves: impl IntoIterator<Item = (u64, u32, bool)>,
+    tokens: u64,
+    participants: usize,
+    pair_enabled: bool,
+    capture: SloStructuredCostCapture,
+    classes: Option<&PreparedKernelClasses>,
+) -> Option<SelectedCommandCostEvidenceV1> {
+    compute_inner(
+        shape,
+        precision,
+        projection,
+        evidence,
+        leaves,
+        tokens,
+        participants,
+        pair_enabled,
+        capture,
+        classes,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_inner(
+    shape: AttentionShape,
+    precision: AttentionPrecision,
+    projection: AttentionProjection,
+    evidence: ProjectionEvidence<'_>,
+    leaves: impl IntoIterator<Item = (u64, u32, bool)>,
+    tokens: u64,
+    participants: usize,
+    pair_enabled: bool,
+    capture: SloStructuredCostCapture,
+    classes: Option<&PreparedKernelClasses>,
+    query: Option<&CheckedGdnQuery<'_>>,
+) -> Option<SelectedCommandCostEvidenceV1> {
     let mut builder = selected_cost::builder(capture, tokens)?;
     if matches!(precision, AttentionPrecision::F32MasterGgufF16Projections)
         != matches!(evidence, ProjectionEvidence::Library(_))
@@ -168,8 +231,13 @@ pub(super) fn compute(
     if q8.is_some() != precision.quantizes_projections() {
         return None;
     }
-    let layout = ScratchLayout::new(shape, tokens, participants, projection).ok()?;
-    let cuda = shape.cuda_shape().ok()?;
+    let (layout, cuda) = match query {
+        Some(query) => query.geometry(),
+        None => (
+            ScratchLayout::new(shape, tokens, participants, projection).ok()?,
+            shape.cuda_shape().ok()?,
+        ),
+    };
     let scratch = layout.required_bytes;
     let transform_bytes = projection
         .staging_bytes_per_token(shape.projection_staging_features())
@@ -188,7 +256,9 @@ pub(super) fn compute(
         }
         let batch_i32 = i32::try_from(batch).ok()?;
         let count_i32 = i32::try_from(count).ok()?;
-        shape.validate_launch_extents(count).ok()?;
+        if query.is_none() {
+            shape.validate_launch_extents(count).ok()?;
+        }
         transfer(
             &mut builder,
             StatisticalTransferKindV1::HostToDevice,
@@ -212,6 +282,7 @@ pub(super) fn compute(
             shape.hidden_size,
             scratch,
             &[shape.hidden_size, u64::from(shape.epsilon.to_bits())],
+            classes,
         )?;
         let pack_bytes = match projection {
             AttentionProjection::NativeQ8 {
@@ -232,6 +303,8 @@ pub(super) fn compute(
             )?,
             ProjectionEvidence::Library(identity) => library_projection(
                 &mut builder,
+                query,
+                0,
                 identity,
                 count,
                 shape.qkvzba_features,
@@ -270,6 +343,7 @@ pub(super) fn compute(
             shape.conv_kernel.max(1),
             scratch,
             &dimensions,
+            classes,
         )?;
         let conv_elements = shape.conv_state_elements().ok()?;
         let conv_config =
@@ -283,6 +357,7 @@ pub(super) fn compute(
             1,
             scratch,
             &[u64::from(batch), conv_elements],
+            classes,
         )?;
         let qk_rows = count.checked_mul(shape.key_heads)?;
         kernel(
@@ -299,6 +374,7 @@ pub(super) fn compute(
                 shape.key_head_dim,
                 u64::from(1.0e-6_f32.to_bits()),
             ],
+            classes,
         )?;
         let delta_logical = u64::from(batch).checked_mul(shape.value_features)?;
         let delta_config = launch_geometry::delta(batch_i32, cuda).ok()?;
@@ -328,6 +404,7 @@ pub(super) fn compute(
                 0,
                 u64::from(cuda.scale.to_bits()),
             ],
+            classes,
         )?;
         let gated_rows = count.checked_mul(shape.value_heads)?;
         kernel(
@@ -343,6 +420,7 @@ pub(super) fn compute(
                 shape.value_head_dim,
                 u64::from(shape.epsilon.to_bits()),
             ],
+            classes,
         )?;
         let cast_elements = count.checked_mul(shape.value_features)?;
         let cast_config = launch_geometry::cast(cast_elements).ok()?;
@@ -355,6 +433,7 @@ pub(super) fn compute(
             1,
             scratch,
             &[cast_elements],
+            classes,
         )?;
         match evidence {
             ProjectionEvidence::Native { output, .. } => projection_work(
@@ -369,6 +448,8 @@ pub(super) fn compute(
             )?,
             ProjectionEvidence::Library(identity) => library_projection(
                 &mut builder,
+                query,
+                1,
                 identity,
                 count,
                 shape.hidden_size,
@@ -386,6 +467,7 @@ pub(super) fn compute(
             1,
             scratch,
             &[residual_elements],
+            classes,
         )?;
     }
     if seen_tokens != tokens || seen_participants != participants {
@@ -396,11 +478,16 @@ pub(super) fn compute(
 
 fn library_projection(
     builder: &mut SelectedCommandCostBuilderV1,
+    query: Option<&CheckedGdnQuery<'_>>,
+    index: usize,
     identity: CublasHandleApiIdentity,
     rows: u64,
     columns: u64,
     reduction: u64,
 ) -> Option<()> {
+    if let Some(query) = query {
+        return query.append_library(builder, index, identity, rows, columns, reduction);
+    }
     GemmF16ApiPlan::new(
         i32::try_from(rows).ok()?,
         i32::try_from(columns).ok()?,
@@ -469,6 +556,7 @@ fn projection_work(
                         u64::from(columns),
                         0,
                         &fixed,
+                        None,
                     )?;
                     index += 2;
                 } else {
@@ -528,6 +616,150 @@ pub(super) fn from_prepared(
         pair_enabled,
         capture,
     )
+}
+
+/// CPU-only metadata taken from the actual preparation. No resource view or
+/// runtime handle survives in this recipe. Native/library choice is frozen.
+pub(in crate::backend::cuda::vnext_ops::transformer) struct Recipe {
+    shape: AttentionShape,
+    precision: AttentionPrecision,
+    projection: AttentionProjection,
+    native: Option<(
+        std::sync::Arc<[weights::MatrixPart]>,
+        std::sync::Arc<[weights::MatrixPart]>,
+    )>,
+    library: Option<CublasHandleApiIdentity>,
+    leaves: Box<[(u64, u32, bool)]>,
+    participant_tokens: Box<[u64]>,
+    tokens: u64,
+    pair_enabled: bool,
+    retained: usize,
+    _construction: ferrum_interfaces::vnext::DeviceObservationTemplateReservation,
+}
+impl Recipe {
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn library_identity(
+        &self,
+    ) -> Option<CublasHandleApiIdentity> {
+        self.library
+    }
+    pub(super) fn from_prepared(
+        prepared: &prepared::PreparedAttention,
+        precision: AttentionPrecision,
+        pair_enabled: bool,
+        identity: Option<CublasHandleApiIdentity>,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Option<Self> {
+        let mut copied = prepared
+            .launches
+            .len()
+            .checked_mul(std::mem::size_of::<(u64, u32, bool)>())?
+            .checked_add(
+                prepared
+                    .participant_token_counts
+                    .len()
+                    .checked_mul(std::mem::size_of::<u64>())?,
+            )?;
+        for weight in [&prepared.shared.qkvzba, &prepared.shared.output] {
+            if let SharedProjectionWeight::Native { parts, .. } = weight {
+                copied = copied
+                    .checked_add(weights::retained_payload_bytes(parts)?)?
+                    .checked_add(2 * std::mem::size_of::<usize>())?;
+            }
+        }
+        let construction = budget
+            .reserve(std::mem::size_of::<Self>().checked_add(copied.checked_mul(2)?)?)
+            .ok()?;
+        let (native, library) = match (&prepared.shared.qkvzba, &prepared.shared.output) {
+            (
+                SharedProjectionWeight::Native { parts: input, .. },
+                SharedProjectionWeight::Native { parts: output, .. },
+            ) => (
+                Some((std::sync::Arc::clone(input), std::sync::Arc::clone(output))),
+                None,
+            ),
+            (SharedProjectionWeight::F16 { .. }, SharedProjectionWeight::F16 { .. })
+                if matches!(precision, AttentionPrecision::F32MasterGgufF16Projections) =>
+            {
+                (None, Some(identity?))
+            }
+            _ => return None,
+        };
+        let leaves: Box<[_]> = prepared
+            .launches
+            .iter()
+            .map(|l| {
+                (
+                    l.tokens,
+                    l.batch_i32 as u32,
+                    l.host_token_seq_indices.is_some(),
+                )
+            })
+            .collect();
+        let participant_tokens = prepared.participant_token_counts.clone().into_boxed_slice();
+        let mut retained = std::mem::size_of::<Self>()
+            .checked_add(
+                leaves
+                    .len()
+                    .checked_mul(std::mem::size_of::<(u64, u32, bool)>())?,
+            )?
+            .checked_add(
+                participant_tokens
+                    .len()
+                    .checked_mul(std::mem::size_of::<u64>())?,
+            )?;
+        if let Some((input, output)) = &native {
+            retained = retained
+                .checked_add(weights::retained_payload_bytes(input)?)?
+                .checked_add(weights::retained_payload_bytes(output)?)?
+                .checked_add(4 * std::mem::size_of::<usize>())?;
+        }
+        Some(Self {
+            _construction: construction,
+            shape: prepared.shape,
+            precision,
+            projection: prepared.projection,
+            native,
+            library,
+            leaves,
+            participant_tokens,
+            tokens: prepared.total_tokens,
+            pair_enabled,
+            retained,
+        })
+    }
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn retained_payload_bytes(&self) -> usize {
+        self.retained
+    }
+    pub(in crate::backend::cuda::vnext_ops::transformer) fn project(
+        &self,
+        current: &ferrum_interfaces::vnext::DeviceReplayCostWork,
+    ) -> Option<SelectedCommandCostEvidenceV1> {
+        if current.tokens() != self.tokens
+            || current.participant_ranges().len() != self.participant_tokens.len()
+            || current
+                .participant_ranges()
+                .iter()
+                .zip(self.participant_tokens.iter())
+                .any(|(range, count)| range.end.checked_sub(range.start) != Some(*count))
+        {
+            return None;
+        }
+        let evidence = match &self.native {
+            Some((input, output)) => ProjectionEvidence::Native { input, output },
+            None => ProjectionEvidence::Library(self.library?),
+        };
+        compute(
+            self.shape,
+            self.precision,
+            self.projection,
+            evidence,
+            self.leaves.iter().copied(),
+            self.tokens,
+            self.participant_tokens.len(),
+            self.pair_enabled,
+            SloStructuredCostCapture::HostSettledV1,
+        )
+    }
 }
 
 #[cfg(test)]

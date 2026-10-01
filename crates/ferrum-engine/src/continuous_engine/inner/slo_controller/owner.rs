@@ -56,6 +56,14 @@ impl ControllerWork {
 
     fn check_time(&self, engine: &EngineInner) -> std::result::Result<(), HostSubmissionRejection> {
         use HostSubmissionRejection::*;
+        if self
+            .proof
+            .prefix_maintenance
+            .as_ref()
+            .is_some_and(|model| !model.current())
+        {
+            return Err(CostModelChanged);
+        }
         match (&self.timing, self.expected.commitment()) {
             (ControllerTimingCommitment::CompleteRequests, WaveCommitment::CompleteRequests(_)) => {
                 Ok(())
@@ -72,12 +80,10 @@ impl ControllerWork {
                     return Err(WitnessExpired);
                 }
                 let runtime = engine.cost_runtime.as_ref().ok_or(CostModelChanged)?;
-                let model = runtime
-                    .try_snapshot()
-                    .ok_or(Busy)?
-                    .ok_or(CostModelChanged)?;
-                if model.model_version() != *model_version {
-                    return Err(CostModelChanged);
+                match runtime.try_model_version_current(*model_version) {
+                    None => return Err(Busy),
+                    Some(false) => return Err(CostModelChanged),
+                    Some(true) => {}
                 }
                 Ok(())
             }
@@ -154,10 +160,19 @@ impl NonblockingHostSubmissionGuard for HostGuard<'_> {
         self.work.check_time(self.engine)?;
         let sequences = self.engine.sequences.try_read().ok_or(Busy)?;
         let witnessed = matches!(self.work.timing, ControllerTimingCommitment::Witness { .. });
-        if witnessed && sequences.len() != self.work.proof.fences.len() {
+        if witnessed
+            && sequences.len()
+                != self.work.proof.fences.len() + self.work.proof.waiting_fences.len()
+        {
             return Err(FrontierChanged);
         }
-        for fence in &self.work.proof.fences {
+        for fence in self
+            .work
+            .proof
+            .fences
+            .iter()
+            .chain(&self.work.proof.waiting_fences)
+        {
             let selected = self
                 .work
                 .rows()
@@ -170,6 +185,14 @@ impl NonblockingHostSubmissionGuard for HostGuard<'_> {
                 .ok_or(FrontierChanged)?;
             if !fence.matches_sequence(sequence) {
                 return Err(FrontierChanged);
+            }
+            if selected.is_some()
+                && sequence
+                    .time_admission
+                    .as_ref()
+                    .is_some_and(SequenceTimeAdmission::before_acceptance)
+            {
+                return Err(Cancelled);
             }
             let output = sequence.credited_output.as_ref().ok_or(OutputRevoked)?;
             if output.failure.is_some() || output.port.consumer_closed() {

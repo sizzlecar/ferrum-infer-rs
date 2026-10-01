@@ -289,6 +289,7 @@ struct Engine {
     seen: Mutex<Option<(InferenceRequest, InferenceRequestContext)>>,
     shutdowns: AtomicUsize,
     reject: bool,
+    time_reject: Option<ferrum_types::SloTimeAdmissionRejection>,
 }
 
 impl Engine {
@@ -299,6 +300,7 @@ impl Engine {
             seen: Mutex::new(None),
             shutdowns: AtomicUsize::new(0),
             reject: false,
+            time_reject: None,
         }
     }
 }
@@ -344,6 +346,9 @@ impl LlmInferenceEngine for Engine {
         _: Arc<OutputProjectionContract>,
     ) -> Result<CreditedOutputSession> {
         *self.seen.lock().unwrap() = Some((request, context));
+        if let Some(reason) = self.time_reject {
+            return Err(FerrumError::SloTimeAdmissionRejected { reason });
+        }
         if self.reject {
             return Err(FerrumError::unsupported("injected admission rejection"));
         }
@@ -417,6 +422,33 @@ async fn credited_one_shot_write_failure_shuts_down_and_cancels() {
     assert_eq!(consumer.0.load(Ordering::Relaxed), 1);
     assert_eq!(engine.shutdowns.load(Ordering::Relaxed), 1);
     assert_eq!(pool.snapshot().retained_accounts, 0);
+}
+
+#[tokio::test]
+async fn strict_time_rejection_preserves_typed_cause_and_writes_no_text() {
+    for reason in [
+        ferrum_types::SloTimeAdmissionRejection::TargetTimeImpossible,
+        ferrum_types::SloTimeAdmissionRejection::WaitExpired,
+    ] {
+        let (session, pool, _, _) = session(b"must not be visible", Some(b""));
+        let mut engine = Engine::new(session);
+        engine.time_reject = Some(reason);
+        let writer = Writer::default();
+        let result = bounded(execute_with(
+            &engine,
+            InferenceRequest::new("prompt", "model"),
+            InferenceRequestContext::capture(),
+            writer.clone(),
+            std::io::sink(),
+        ))
+        .await;
+        assert!(
+            matches!(result, Err(FerrumError::SloTimeAdmissionRejected { reason: actual }) if actual == reason)
+        );
+        assert!(writer.bytes.lock().unwrap().is_empty());
+        assert_eq!(engine.shutdowns.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.snapshot().retained_accounts, 0);
+    }
 }
 
 #[test]

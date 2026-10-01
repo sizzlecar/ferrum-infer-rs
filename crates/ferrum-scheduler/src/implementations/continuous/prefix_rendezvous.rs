@@ -1,4 +1,6 @@
-//! Logical prefix dependencies before admission. No resource authority lives here.
+//! Logical prefix dependencies. Admitted holds retain their existing resources;
+//! neither kind of hold grants checkpoint or execution authority.
+use super::pressure::LogicalWorkKind;
 use super::*;
 use ferrum_interfaces::model_executor::PrefixCapturePlan;
 use std::sync::Weak;
@@ -8,6 +10,7 @@ pub struct PrefixRequestKey {
     request_id: RequestId,
     ticket: WaitingAdmissionTicket,
     incarnation: Arc<()>,
+    capture_generation: LogicalWorkGeneration,
 }
 
 impl PrefixRequestKey {
@@ -16,6 +19,11 @@ impl PrefixRequestKey {
     }
     pub fn ordinal(&self) -> u64 {
         self.ticket.get()
+    }
+    /// Progress observed when this key was captured. Ordinary progress lookup
+    /// still follows an existing hold, but new admitted holds require equality.
+    pub fn work_generation(&self) -> LogicalWorkGeneration {
+        self.capture_generation
     }
     fn matches(&self, request: &ContinuousBatchRequest) -> bool {
         request.inner.request.id == self.request_id
@@ -34,6 +42,7 @@ pub struct PrefixRendezvousCandidate {
 
 #[derive(Debug)]
 struct Dependency {
+    admitted_follower: bool,
     boundary: usize,
     span: ferrum_interfaces::vnext::CheckpointTokenSpanConstraint,
     pending: AtomicBool,
@@ -59,7 +68,8 @@ impl PrefixRendezvousHold {
     pub fn is_pending(&self) -> bool {
         self.dependency.pending.load(Ordering::Acquire)
     }
-    /// This only permits an ordinary admission probe. It grants no capacity.
+    /// Removes the dependency. A waiting follower may probe admission; an
+    /// admitted follower keeps its resources and may use ordinary execution.
     pub fn release(&self) {
         self.dependency.pending.store(false, Ordering::Release);
     }
@@ -91,6 +101,16 @@ impl Default for PrefixRendezvousRequestState {
 }
 
 impl PrefixRendezvousRequestState {
+    pub(super) fn cancel_admitted_dependency(&self) {
+        for dependency in [self.source.upgrade(), self.follower.upgrade()]
+            .into_iter()
+            .flatten()
+        {
+            if dependency.admitted_follower {
+                dependency.pending.store(false, Ordering::Release);
+            }
+        }
+    }
     /// Unlike `cap`, this never releases a dependency when a span cannot fit.
     pub(super) fn planning_state(&self) -> (bool, Option<(usize, u64, u64)>) {
         (
@@ -168,6 +188,7 @@ fn candidate(request: &ContinuousBatchRequest) -> Option<PrefixRendezvousCandida
             request_id: request.inner.request.id.clone(),
             ticket: request.waiting_admission_ticket?,
             incarnation: Arc::clone(&request.prefix_rendezvous.incarnation),
+            capture_generation: request.logical_work_frontier.progress_generation(),
         },
         processed_tokens: request.prefill_chunk_offset,
         waiting: request.phase == RequestPhase::Waiting,
@@ -176,6 +197,122 @@ fn candidate(request: &ContinuousBatchRequest) -> Option<PrefixRendezvousCandida
 }
 
 impl ContinuousBatchScheduler {
+    /// The SLO transaction must not wait for ingress while enumerating prefix
+    /// candidates. Failure returns no partial candidate population.
+    pub fn try_prefix_rendezvous_candidates(
+        &self,
+        maximum_requests: usize,
+        poll: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<PrefixRendezvousCandidate>> {
+        if !poll() {
+            return None;
+        }
+        let waiting = self.waiting_queue.try_read()?;
+        let prefill = self.prefill_queue.try_read()?;
+        if waiting.len().checked_add(prefill.len())? > maximum_requests {
+            return None;
+        }
+        let mut result = Vec::with_capacity(waiting.len() + prefill.len());
+        for request in prefill.iter().chain(waiting.iter()) {
+            if !poll() {
+                return None;
+            }
+            if let Some(value) = candidate(request) {
+                result.push(value);
+            }
+        }
+        result.sort_by_key(|item| (item.waiting, item.key.ordinal()));
+        poll().then_some(result)
+    }
+    /// Install a dependency for one already admitted, untouched prefill owner.
+    /// The caller separately holds a fresh complete SLO comparison and must
+    /// revalidate its clock/physical evidence. This API never reallocates,
+    /// returns resources, moves a request to Waiting, or clears another blocker.
+    pub fn hold_admitted_prefix_follower(
+        &self,
+        source: &PrefixRequestKey,
+        follower: &PrefixRequestKey,
+        plan: PrefixCapturePlan,
+    ) -> Option<PrefixRendezvousHold> {
+        if source.request_id == follower.request_id || plan.boundary == 0 {
+            return None;
+        }
+        let mut prefill = self.prefill_queue.try_write()?;
+        let index = self.request_index.try_read()?;
+        let pressure = self.pressure_coordinator.try_lock()?;
+        let producer = prefill.iter().find(|request| source.matches(request))?;
+        let target = prefill.iter().find(|request| follower.matches(request))?;
+        let source_candidate = candidate(producer)?;
+        let target_candidate = candidate(target)?;
+        for request in [producer, target] {
+            if index.get(&request.inner.request.id) != Some(&RequestPhase::Prefilling)
+                || pressure.planning_is_held(&request.inner.request.id)
+                || request.prefix_restore.is_pending()
+                || request.prefix_restore.planning_state().2
+                || request.prefix_restore.planning_state().3
+                || request.execution_capacity_deferral.is_some()
+                || request.execution_readiness_block.is_some()
+                || request.execution_maintenance_retry.is_some()
+            {
+                return None;
+            }
+        }
+        let source_tokens = if producer.prefill_tokens != 0 {
+            producer.prefill_tokens
+        } else {
+            self.prompt_token_estimate(producer)?
+        };
+        let target_tokens = if target.prefill_tokens != 0 {
+            target.prefill_tokens
+        } else {
+            self.prompt_token_estimate(target)?
+        };
+        let target_counters = target.logical_work_frontier.planning_counters();
+        if source_candidate.waiting
+            || target_candidate.waiting
+            || producer.inner.state != RequestState::Running
+            || target.inner.state != RequestState::Running
+            || source.capture_generation != producer.logical_work_frontier.progress_generation()
+            || follower.capture_generation != target.logical_work_frontier.progress_generation()
+            || target.logical_work_frontier.work_kind() != LogicalWorkKind::Prefill
+            || target_counters.0 != 0
+            || target_counters.1 != 0
+            || target_counters.2 != 0
+            || target_counters.3 != 0
+            || target.decode_tokens != 0
+            || target.prefill_chunk_offset != 0
+            || target_candidate.priority > source_candidate.priority
+            || plan.boundary <= producer.prefill_chunk_offset
+            || plan.boundary >= source_tokens
+            || plan.boundary >= target_tokens
+            || !plan
+                .span
+                .permits((plan.boundary - producer.prefill_chunk_offset) as u64)
+        {
+            return None;
+        }
+        let dependency = Arc::new(Dependency {
+            admitted_follower: true,
+            boundary: plan.boundary,
+            span: plan.span,
+            pending: AtomicBool::new(true),
+        });
+        for request in prefill.iter_mut() {
+            if source.matches(request) {
+                request.prefix_rendezvous.attempted = true;
+                request.prefix_rendezvous.source = Arc::downgrade(&dependency);
+            } else if follower.matches(request) {
+                request.prefix_rendezvous.attempted = true;
+                request.prefix_rendezvous.follower = Arc::downgrade(&dependency);
+            }
+        }
+        Some(PrefixRendezvousHold {
+            dependency,
+            source: source.clone(),
+            followers: vec![follower.clone()],
+        })
+    }
+
     pub fn prefix_rendezvous_candidates(&self) -> Vec<PrefixRendezvousCandidate> {
         let waiting = self.waiting_queue.read();
         let prefill = self.prefill_queue.read();
@@ -247,6 +384,7 @@ impl ContinuousBatchScheduler {
             }
         }
         let dependency = Arc::new(Dependency {
+            admitted_follower: false,
             boundary,
             span: plan.span,
             pending: AtomicBool::new(true),

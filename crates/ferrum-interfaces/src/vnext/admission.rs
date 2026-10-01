@@ -383,6 +383,7 @@ pub struct CapacitySnapshot {
     active_sequences: u32,
     active_child_claims: u64,
     active_checkpoint_claims: u64,
+    checkpoint_retention: Option<(u64, u64)>,
     maximum_active_sequences: u32,
     release_epoch: u64,
     capacity_epoch: u64,
@@ -418,6 +419,12 @@ impl CapacitySnapshot {
     /// request or sequence execution slots.
     pub const fn active_checkpoint_claims(&self) -> u64 {
         self.active_checkpoint_claims
+    }
+
+    /// Retained and maximum aligned checkpoint bytes captured under the same
+    /// coordinator lock as the domain capacities. Absence forbids new capture.
+    pub const fn checkpoint_retention(&self) -> Option<(u64, u64)> {
+        self.checkpoint_retention
     }
 
     pub const fn maximum_active_sequences(&self) -> u32 {
@@ -975,6 +982,7 @@ impl CoordinatorState {
             active_sequences: self.active_sequences,
             active_child_claims: self.active_child_claims,
             active_checkpoint_claims: self.checkpoint_claims.count(),
+            checkpoint_retention: self.checkpoint_claims.planning_retention(),
             maximum_active_sequences: self.maximum_active_sequences,
             release_epoch: self.release_epoch,
             capacity_epoch: self.capacity_epoch,

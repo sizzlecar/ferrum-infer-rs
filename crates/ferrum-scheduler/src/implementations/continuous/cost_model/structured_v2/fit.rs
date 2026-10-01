@@ -3,6 +3,12 @@
 //! row space is never silently assigned a zero coefficient.
 use super::*;
 
+pub(super) mod input_pivots;
+mod readiness_v2;
+pub(super) use readiness_v2::input_geometry_readiness_v2;
+mod readiness_v3;
+pub(super) use readiness_v3::input_geometry_readiness_v3;
+
 pub(super) struct FitRow<'a> {
     pub basis: &'a [f64],
     pub wall_ns: u64,
@@ -21,6 +27,19 @@ pub(super) struct RowSpaceFit {
     fit_error_floor_ns: u64,
 }
 impl RowSpaceFit {
+    pub(super) fn retained_heap_bytes(&self) -> Option<usize> {
+        let mut bytes = self
+            .basis
+            .capacity()
+            .checked_mul(std::mem::size_of::<Vec<f64>>())?;
+        for row in std::iter::once(&self.scale)
+            .chain(self.basis.iter())
+            .chain([&self.coefficients, &self.input_coefficients])
+        {
+            bytes = bytes.checked_add(row.capacity().checked_mul(std::mem::size_of::<f64>())?)?;
+        }
+        Some(bytes)
+    }
     pub(super) fn bind_parameters(&self, digest: &mut sha2::Sha256) {
         use sha2::Digest;
         digest.update(b"row-space-parameters-with-fit-floor-v1\0");
@@ -60,71 +79,11 @@ impl RowSpaceFit {
         }) {
             return Err(StructuredUnknown::InvalidInput);
         }
-        let dims = samples[0].basis.len();
-        if dims == 0 || dims > settings.max_axes {
-            return Err(StructuredUnknown::Capacity);
-        }
-        let mut scale = vec![1.0_f64; dims];
-        for sample in samples {
-            if sample.basis.len() != dims {
-                return Err(StructuredUnknown::InvalidInput);
-            }
-            for (s, x) in scale.iter_mut().zip(sample.basis) {
-                *s = s.max(*x);
-            }
-        }
-        let rows: Vec<Vec<f64>> = samples
-            .iter()
-            .map(|sample| {
-                sample
-                    .basis
-                    .iter()
-                    .zip(&scale)
-                    .map(|(x, s)| x / s)
-                    .collect()
-            })
-            .collect();
-        let largest_norm = rows.iter().map(|r| norm(r)).fold(0.0_f64, f64::max);
-        if largest_norm == 0.0 {
-            return Err(StructuredUnknown::Numerical);
-        }
-        let mut basis: Vec<Vec<f64>> = Vec::new();
-        loop {
-            // Complete pivoting over the remaining sample directions. Two
-            // orthogonalization passes reduce loss from correlated counters.
-            let mut pivot = vec![0.0; dims];
-            let mut largest = 0.0;
-            for row in &rows {
-                let mut residual = row.clone();
-                orthogonalize(&mut residual, &basis);
-                let size = norm(&residual);
-                if size > largest {
-                    largest = size;
-                    pivot = residual;
-                }
-            }
-            let relative = largest / largest_norm;
-            if relative <= DEPENDENT {
-                break;
-            }
-            if relative < MIN_PIVOT {
-                return Err(StructuredUnknown::IllConditioned);
-            }
-            if basis.len() == settings.max_rank {
-                return Err(StructuredUnknown::Capacity);
-            }
-            for value in &mut pivot {
-                *value /= largest;
-            }
-            basis.push(pivot);
-        }
+        let FitGeometry {
+            scale, rows, basis, ..
+        } = input_geometry(samples, settings)?;
+        let dims = scale.len();
         let rank = basis.len();
-        let required = rank
-            .checked_add(settings.min_fit_redundancy)
-            .ok_or(StructuredUnknown::InvalidSettings)?;
-        if rank == 0 || samples.len() < required {
-            return Err(StructuredUnknown::InsufficientRedundancy);
-        }
         let projected: Vec<Vec<f64>> = rows
             .iter()
             .map(|row| basis.iter().map(|direction| dot(row, direction)).collect())
@@ -192,14 +151,20 @@ impl RowSpaceFit {
     }
     /// Signed directions are allowed here. Physical inputs are checked separately.
     pub(super) fn identify(&self, input: &[f64]) -> Result<()> {
+        self.identify_detailed(input)
+            .map_err(StructuredQueryFailureV2::reason)
+    }
+    pub(super) fn identify_detailed(&self, input: &[f64]) -> QueryResult<()> {
         if input.len() != self.scale.len() || input.iter().any(|x| !x.is_finite()) {
-            return Err(StructuredUnknown::InvalidInput);
+            return Err(StructuredUnknown::InvalidInput.into());
         }
         let mut residual: Vec<f64> = input.iter().zip(&self.scale).map(|(x, s)| x / s).collect();
         let original_norm = norm(&residual);
         orthogonalize(&mut residual, &self.basis);
         if norm(&residual) > QUERY_TOLERANCE * original_norm.max(1.0) {
-            return Err(StructuredUnknown::UnidentifiedDirection);
+            return Err(StructuredQueryFailureV2::OutsideSupport(
+                StructuredUnknown::UnidentifiedDirection,
+            ));
         }
         Ok(())
     }
@@ -215,13 +180,19 @@ impl RowSpaceFit {
         Ok(predicted)
     }
     pub(super) fn predict(&self, input: &[f64]) -> Result<u64> {
+        self.predict_detailed(input)
+            .map_err(StructuredQueryFailureV2::reason)
+    }
+    pub(super) fn predict_detailed(&self, input: &[f64]) -> QueryResult<u64> {
         if input.iter().any(|x| *x < 0.) {
-            return Err(StructuredUnknown::InvalidInput);
+            return Err(StructuredUnknown::InvalidInput.into());
         }
-        self.identify(input)?;
+        self.identify_detailed(input)?;
         let predicted = self.linear_value(input)?;
         if predicted <= 0.0 || predicted > (1u64 << 53) as f64 {
-            return Err(StructuredUnknown::Numerical);
+            return Err(StructuredQueryFailureV2::OutsidePredictionRange(
+                StructuredUnknown::Numerical,
+            ));
         }
         Ok(predicted.ceil() as u64)
     }
@@ -244,4 +215,171 @@ fn orthogonalize(row: &mut [f64], basis: &[Vec<f64>]) {
             subtract(row, direction, component);
         }
     }
+}
+
+/// Input-only geometry shared by the two explicitly different numerical models.
+/// This does not regress walls or authorize any query direction.
+pub(super) struct FitGeometry {
+    pub scale: Vec<f64>,
+    pub rows: Vec<Vec<f64>>,
+    pub basis: Vec<Vec<f64>>,
+    /// Original sample row chosen by each complete-pivoting step, in basis order.
+    pub pivot_indices: Vec<usize>,
+}
+pub(super) fn input_geometry(
+    samples: &[FitRow<'_>],
+    settings: &StructuredSettingsV2,
+) -> Result<FitGeometry> {
+    input_geometry_with_work(samples, settings, None)
+}
+
+/// Explicit cold-work charge: one visit is one examined scalar coordinate.
+pub(super) struct GeometryWork {
+    pub used: u64,
+    pub limit: u64,
+    pub exhausted: bool,
+}
+impl GeometryWork {
+    fn charge(&mut self, visits: usize) -> Result<()> {
+        let visits = u64::try_from(visits).map_err(|_| StructuredUnknown::Capacity)?;
+        match self.used.checked_add(visits) {
+            Some(total) if total <= self.limit => {
+                self.used = total;
+                Ok(())
+            }
+            _ => {
+                self.exhausted = true;
+                Err(StructuredUnknown::Capacity)
+            }
+        }
+    }
+}
+
+pub(super) fn input_geometry_with_work(
+    samples: &[FitRow<'_>],
+    settings: &StructuredSettingsV2,
+    work: Option<&mut GeometryWork>,
+) -> Result<FitGeometry> {
+    input_geometry_core(samples, settings, work, true, &[])
+}
+
+fn input_geometry_core(
+    samples: &[FitRow<'_>],
+    settings: &StructuredSettingsV2,
+    mut work: Option<&mut GeometryWork>,
+    require_redundancy: bool,
+    anchor_indices: &[usize],
+) -> Result<FitGeometry> {
+    if samples.is_empty() {
+        return Err(StructuredUnknown::InsufficientSamples);
+    }
+    let dims = samples[0].basis.len();
+    if dims == 0 || dims > settings.max_axes {
+        return Err(StructuredUnknown::Capacity);
+    }
+    if let Some(w) = &mut work {
+        w.charge(
+            samples
+                .len()
+                .checked_mul(dims)
+                .and_then(|v| v.checked_mul(3))
+                .ok_or(StructuredUnknown::Capacity)?,
+        )?;
+    }
+    let mut scale = vec![1.0_f64; dims];
+    for sample in samples {
+        if sample.basis.len() != dims {
+            return Err(StructuredUnknown::InvalidInput);
+        }
+        for (s, x) in scale.iter_mut().zip(sample.basis) {
+            *s = s.max(*x);
+        }
+    }
+    let rows: Vec<Vec<f64>> = samples
+        .iter()
+        .map(|sample| {
+            sample
+                .basis
+                .iter()
+                .zip(&scale)
+                .map(|(x, s)| x / s)
+                .collect()
+        })
+        .collect();
+    let largest_norm = rows.iter().map(|r| norm(r)).fold(0.0_f64, f64::max);
+    if largest_norm == 0.0 {
+        return Err(StructuredUnknown::Numerical);
+    }
+    let maximum_rank = settings.max_rank.min(samples.len()).min(dims);
+    let mut basis: Vec<Vec<f64>> = Vec::with_capacity(maximum_rank);
+    let mut pivot_indices = Vec::with_capacity(maximum_rank);
+    let mut anchor_mask = (!anchor_indices.is_empty()).then(|| vec![false; rows.len()]);
+    if let Some(mask) = &mut anchor_mask {
+        for &index in anchor_indices {
+            *mask.get_mut(index).ok_or(StructuredUnknown::InvalidInput)? = true;
+        }
+    }
+    let mut anchor_pass = anchor_mask.is_some();
+    loop {
+        // Complete pivoting over the remaining sample directions. Two
+        // orthogonalization passes reduce loss from correlated counters.
+        let mut pivot = vec![0.0; dims];
+        let mut largest = 0.0;
+        let mut pivot_index = 0;
+        for (row_index, row) in rows.iter().enumerate() {
+            if anchor_pass && !anchor_mask.as_ref().unwrap()[row_index] {
+                continue;
+            }
+            if let Some(w) = &mut work {
+                // Copy, two dot/subtract passes for each direction, and norm.
+                w.charge(
+                    dims.checked_mul(4 * basis.len() + 2)
+                        .ok_or(StructuredUnknown::Capacity)?,
+                )?;
+            }
+            let mut residual = row.clone();
+            orthogonalize(&mut residual, &basis);
+            let size = norm(&residual);
+            if size > largest {
+                largest = size;
+                pivot = residual;
+                pivot_index = row_index;
+            }
+        }
+        let relative = largest / largest_norm;
+        if relative <= DEPENDENT {
+            if anchor_pass {
+                // Cold selection preserves mandatory input anchors, then
+                // extends this same normalized basis with remaining rows.
+                // Numerical Fit supplies no anchors and follows its old path.
+                anchor_pass = false;
+                continue;
+            }
+            break;
+        }
+        if relative < MIN_PIVOT {
+            return Err(StructuredUnknown::IllConditioned);
+        }
+        if basis.len() == settings.max_rank {
+            return Err(StructuredUnknown::Capacity);
+        }
+        for value in &mut pivot {
+            *value /= largest;
+        }
+        basis.push(pivot);
+        pivot_indices.push(pivot_index);
+    }
+    let rank = basis.len();
+    let required = rank
+        .checked_add(settings.min_fit_redundancy)
+        .ok_or(StructuredUnknown::InvalidSettings)?;
+    if rank == 0 || (require_redundancy && samples.len() < required) {
+        return Err(StructuredUnknown::InsufficientRedundancy);
+    }
+    Ok(FitGeometry {
+        scale,
+        rows,
+        basis,
+        pivot_indices,
+    })
 }

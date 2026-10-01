@@ -120,7 +120,7 @@ async fn future_metal_pending_host_subsets_match_actual_full_and_greedy_routes()
                 .await,
         ));
         assert_eq!(fixture.submissions(), before + 1);
-        assert_canonical(&probe, &forecast.projection.shape);
+        assert_canonical(&mut probe, &forecast.projection.shape);
         let observations = probe.recorder.observations();
         let actual = observations[0].shape.as_ref().unwrap();
         let actual_recipe = actual

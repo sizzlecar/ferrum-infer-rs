@@ -4,7 +4,9 @@
 )]
 
 pub(crate) use ferrum_interfaces::vnext::*;
+mod controlled_fill;
 mod guarded_submission;
+pub(crate) use controlled_fill::{ControlledCpuFill, ControlledCpuFillLayout};
 #[path = "../vnext_numerical_fixture/mod.rs"]
 mod numerical_fixture;
 pub(crate) use numerical_fixture::*;
@@ -134,6 +136,8 @@ pub(crate) struct TestConfig {
     pub(crate) recurrent_state: bool,
     #[serde(default)]
     pub(crate) token_io: bool,
+    #[serde(default)]
+    pub(crate) checkpoint: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -142,6 +146,7 @@ pub(crate) struct TestStateProfile {
     pub(crate) token_scaled_state: bool,
     pub(crate) recurrent_state: bool,
     pub(crate) token_io: bool,
+    pub(crate) checkpoint: bool,
 }
 
 impl TestStateProfile {
@@ -151,6 +156,14 @@ impl TestStateProfile {
             token_scaled_state: false,
             recurrent_state: false,
             token_io: false,
+            checkpoint: false,
+        }
+    }
+
+    pub(crate) const fn checkpoint() -> Self {
+        Self {
+            checkpoint: true,
+            ..Self::fixed_sequence()
         }
     }
 
@@ -167,6 +180,7 @@ impl TestStateProfile {
             token_scaled_state: false,
             recurrent_state: false,
             token_io: false,
+            checkpoint: false,
         }
     }
 
@@ -176,6 +190,7 @@ impl TestStateProfile {
             token_scaled_state: true,
             recurrent_state: false,
             token_io: false,
+            checkpoint: false,
         }
     }
 
@@ -185,6 +200,7 @@ impl TestStateProfile {
             token_scaled_state: true,
             recurrent_state: true,
             token_io: false,
+            checkpoint: false,
         }
     }
 
@@ -237,6 +253,18 @@ impl ModelFamilyProvider for TestFamily {
                 reason: error.to_string(),
             }
         })?;
+        if config.checkpoint
+            && (!config.zero_state
+                || config.token_scaled_state
+                || config.recurrent_state
+                || config.token_io)
+        {
+            return Err(VNextError::InvalidModelConfig {
+                family_id: self.family_id().to_string(),
+                field: "checkpoint".into(),
+                reason: "checkpoint fixture requires one fixed boundary state".into(),
+            });
+        }
         if config.width != 4 {
             return Err(VNextError::InvalidModelConfig {
                 family_id: self.family_id().to_string(),
@@ -333,8 +361,19 @@ impl ModelFamilyProvider for TestFamily {
                 } else {
                     StateCapacityDemand::FixedPerScope
                 },
-                initialization: StateInitialization::Zero,
-                checkpoint: StateCheckpointCapability::Unsupported,
+                initialization: if config.checkpoint {
+                    StateInitialization::None
+                } else {
+                    StateInitialization::Zero
+                },
+                checkpoint: if config.checkpoint {
+                    StateCheckpointCapability::CompletedBoundary(StateCheckpointContract::new(
+                        StateCheckpointContents::BoundaryValue,
+                        CheckpointInputDependency::ExactTokenPrefix,
+                    ))
+                } else {
+                    StateCheckpointCapability::Unsupported
+                },
             }]
         } else {
             Vec::new()
@@ -414,7 +453,7 @@ impl ModelFamilyProvider for TestFamily {
         } else {
             ProgramNodeWorkSpec::Fixed
         };
-        ModelProgram::new(
+        let program = ModelProgram::new(
             self.family_id().clone(),
             vec![id("value.input")],
             vec![ProgramBlock {
@@ -451,7 +490,15 @@ impl ModelFamilyProvider for TestFamily {
                 },
             }],
             vec![id("value.output")],
-        )
+        )?;
+        if config.checkpoint {
+            program.with_checkpoint_inputs(ProgramCheckpointInputs::new(
+                id("value.input"),
+                BTreeSet::new(),
+            )?)
+        } else {
+            Ok(program)
+        }
     }
 
     fn semantic_metadata(
@@ -540,6 +587,7 @@ fn operation_with_resource_options_and_work(
             token_scaled_state,
             recurrent_state: false,
             token_io: false,
+            checkpoint: false,
         },
         scratch,
     )
@@ -685,6 +733,24 @@ fn catalog_on_device(
         sha('b'),
     )
     .unwrap();
+    let provider = if state_profile.checkpoint {
+        provider.with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::BitwiseEquivalent,
+            )
+            .with_state_ports(vec![ProviderCheckpointStatePort::new(
+                ResolvedValueRole::Input,
+                2,
+                contiguous_storage_profile(),
+                ProviderCheckpointStateLayout::ContiguousBoundaryValue,
+            )])
+            .unwrap(),
+        ))
+    } else {
+        provider
+    };
     CapabilityCatalog::new(
         DeviceDescriptor {
             id: device_id.clone(),
@@ -763,7 +829,19 @@ impl ProviderBehavior {
 
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
+    pub(crate) decode_context_declarations: BTreeMap<NodeId, DecodeContextCoverage>,
+    pub(crate) decode_context_preparations: Vec<NodeId>,
+    pub(crate) cost_data_supported: bool,
+    pub(crate) cost_data_preparations: Vec<NodeId>,
+    pub(crate) cost_data_queries: Vec<Option<(NodeId, OperationId, usize)>>,
+    pub(crate) controlled_cpu_fill: Option<Arc<ControlledCpuFill>>,
+    pub(crate) replay_cost_queries: Vec<u64>,
     pub(crate) cost_route_supported: bool,
+    /// Opt-in numerical declaration for query-construction tests; no timing fit.
+    pub(crate) cost_route_statistics: bool,
+    /// Both real dispatch and pure cost projection select the same explicit
+    /// eager boundary. Default-off preserves the original unknown topology.
+    pub(crate) cost_route_eager_boundary: bool,
     pub(crate) cost_route_extra_participants: u32,
     pub(crate) cost_route_queries: Vec<Vec<OperationCostWorkRow>>,
     pub(crate) cost_route_input_alignment: Vec<Option<u64>>,
@@ -772,6 +850,8 @@ pub(crate) struct ProviderTrace {
     pub(crate) reusable_topology_calls: u64,
     pub(crate) reusable_topology_packed_input_coordinates: Vec<bool>,
     pub(crate) encode_calls: u64,
+    pub(crate) observation_template_requests: Vec<bool>,
+    pub(crate) binding_observation_template_requests: Vec<bool>,
     pub(crate) reusable_binding_encode_calls: u64,
     pub(crate) last_participant_count: usize,
     pub(crate) last_work_sequences: u32,
@@ -788,6 +868,22 @@ pub(crate) struct TestProvider {
     pub(crate) descriptor: OperationProviderDescriptor,
     pub(crate) behavior: Arc<Mutex<ProviderBehavior>>,
     pub(crate) trace: Arc<Mutex<ProviderTrace>>,
+}
+
+struct TestCostData {
+    node: NodeId,
+    operation: OperationId,
+    bindings: usize,
+}
+
+impl TestProvider {
+    fn selected_eager_cost_topology(&self) -> Option<ReusableExecutionTopology> {
+        self.trace
+            .lock()
+            .unwrap()
+            .cost_route_eager_boundary
+            .then_some(ReusableExecutionTopology::EagerBoundary)
+    }
 }
 
 impl OperationResourceEstimator for TestProvider {
@@ -853,12 +949,62 @@ impl OperationResourceEstimator for TestProvider {
 }
 
 impl OperationProvider<TestRuntime> for TestProvider {
+    fn decode_context_coverage(
+        &self,
+        request: OperationCostPreparationRequest<'_>,
+    ) -> DecodeContextCoverage {
+        let mut trace = self.trace.lock().unwrap();
+        trace
+            .decode_context_preparations
+            .push(request.node_id().clone());
+        trace
+            .decode_context_declarations
+            .get(request.node_id())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn prepare_cost_data(
+        &self,
+        request: OperationCostPreparationRequest<'_>,
+    ) -> Option<PreparedOperationCostData> {
+        let mut trace = self.trace.lock().unwrap();
+        trace.cost_data_preparations.push(request.node_id().clone());
+        trace.cost_data_supported.then(|| {
+            PreparedOperationCostData::new(TestCostData {
+                node: request.node_id().clone(),
+                operation: request.operation_id().clone(),
+                bindings: request.bindings().len(),
+            })
+        })
+    }
+
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, TestBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        self.trace
+            .lock()
+            .unwrap()
+            .replay_cost_queries
+            .push(invocation.work_shape().immediate_tokens());
+        // This fixture has no statistical producer; Unknown remains explicit.
+        Ok(None)
+    }
+
     fn eager_cost_route(
         &self,
         request: OperationCostRouteRequest<'_>,
     ) -> Result<Option<OperationCostRoute>, VNextError> {
         let mut trace = self.trace.lock().unwrap();
         trace.cost_route_queries.push(request.rows().to_vec());
+        assert!(request.prepared_cost_data::<u64>().is_none());
+        trace.cost_data_queries.push(
+            request
+                .prepared_cost_data::<TestCostData>()
+                .map(|data| (data.node.clone(), data.operation.clone(), data.bindings)),
+        );
         trace.cost_route_input_alignment.push(
             request
                 .binding_contiguous_base_alignment(ResolvedValueRole::Input, 0)?
@@ -867,7 +1013,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
         if !trace.cost_route_supported {
             return Ok(None);
         }
-        OperationCostRoute::new(vec![OperationCostCommand::new(
+        let mut command = OperationCostCommand::new(
             "fixture.cost-route",
             DeviceCommandPhase::Compute,
             DeviceBatchingForm::ParticipantLoop,
@@ -876,12 +1022,47 @@ impl OperationProvider<TestRuntime> for TestProvider {
             request.immediate_tokens(),
             request.rows().len() as u64,
             0,
-        )?])
-        .map(Some)
+        )?;
+        if trace.cost_route_statistics {
+            use ferrum_interfaces::execution_cost::{
+                KernelNumericWorkV1, SelectedAlgorithmClassV1, SelectedCommandCostBuilderV1,
+            };
+            // Same participant-loop command declared above. Only the input
+            // protocol is exercised; this is not a learned or measured cost.
+            let mut statistics =
+                SelectedCommandCostBuilderV1::new_with_algorithm_work(request.immediate_tokens());
+            for row in request.rows() {
+                statistics
+                    .kernel(
+                        SelectedAlgorithmClassV1::new("fixture.cost-route", 1, [3; 32], [4; 32])
+                            .unwrap(),
+                        KernelNumericWorkV1 {
+                            logical_units: row.count.get(),
+                            padded_units: row.count.get(),
+                            inner_units_per_logical_unit: 1,
+                            grid: [1, 1, 1],
+                            scratch_bytes: 0,
+                            staged_weight_bytes: 0,
+                        },
+                    )
+                    .unwrap();
+            }
+            command = command
+                .with_statistical_evidence(statistics.finish().unwrap())
+                .unwrap();
+        }
+        OperationCostRoute::new(vec![command]).map(Some)
     }
 
     fn reusable_binding_resources(&self) -> ReusableBindingResources {
         self.trace.lock().unwrap().reusable_binding_resources
+    }
+
+    fn reusable_execution_cost_topology(
+        &self,
+        _request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        Ok(self.selected_eager_cost_topology())
     }
 
     fn reusable_execution_topology(
@@ -896,6 +1077,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
             trace
                 .reusable_topology_packed_input_coordinates
                 .push(packed_input);
+        }
+        if let Some(topology) = self.selected_eager_cost_topology() {
+            return Ok(topology);
         }
         match *self.behavior.lock().unwrap() {
             ProviderBehavior::ProgramBindingWithScratchTail
@@ -983,6 +1167,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
     ) -> Result<EncodedDeviceOperation<TestCommand>, OperationFailure> {
         let mut trace = self.trace.lock().unwrap();
         trace.encode_calls += 1;
+        trace
+            .observation_template_requests
+            .push(invocation.observation_template_budget().is_some());
         trace.last_participant_count = invocation.participants().len();
         trace.last_work_sequences = invocation.work_shape().immediate_sequences();
         if let Some(binding) = invocation.program_binding() {
@@ -1019,6 +1206,19 @@ impl OperationProvider<TestRuntime> for TestProvider {
             .map(|view| view.resource_id().clone())
             .collect();
         drop(trace);
+        if let Some(fill) = self.trace.lock().unwrap().controlled_cpu_fill.as_ref() {
+            assert_eq!(fill.rows, invocation.participants().len());
+            fill.bind_checkpoint_states(&invocation);
+            return Ok(EncodedDeviceOperation::compute(
+                TestCommand::ControlledCpuFill {
+                    id: fill.id,
+                    full_logits: fill.full_logits,
+                    layout: fill.layout,
+                    participants: invocation.participants().len() as u32,
+                    tokens: invocation.work_shape().immediate_tokens(),
+                },
+            ));
+        }
         let participant_count = u32::try_from(invocation.participants().len()).unwrap();
         let token_count = invocation.work_shape().immediate_tokens();
         match *self.behavior.lock().unwrap() {
@@ -1099,6 +1299,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
         }
         let mut trace = self.trace.lock().unwrap();
         trace.reusable_binding_encode_calls += 1;
+        trace
+            .binding_observation_template_requests
+            .push(invocation.observation_template_budget().is_some());
         for participant in invocation.participants() {
             let resources = participant
                 .views()
@@ -1424,6 +1627,8 @@ pub(crate) fn tail_node_values() -> Vec<ResolvedValueBinding> {
 #[derive(Debug)]
 pub(crate) struct TestBuffer {
     pub(crate) descriptor: BufferDescriptor,
+    /// Immutable alternative for a runtime that reports a changed descriptor.
+    tampered_descriptor: BufferDescriptor,
     pub(crate) memory: Option<memory_fixture::TestMemoryBuffer>,
 }
 
@@ -1432,6 +1637,13 @@ pub(crate) struct TestStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCommand {
+    ControlledCpuFill {
+        id: u64,
+        full_logits: bool,
+        layout: ControlledCpuFillLayout,
+        participants: u32,
+        tokens: u64,
+    },
     Provider,
     Memory(u64, bool),
     ScratchProvider,
@@ -1537,9 +1749,23 @@ pub(crate) enum FenceBehavior {
 
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) controlled_cpu_fill: Option<Arc<ControlledCpuFill>>,
+    pub(crate) structured_cost_capture_enabled: bool,
+    pub(crate) observation_template_budget: Option<Arc<DeviceObservationTemplateBudget>>,
+    pub(crate) reusable_observation_inputs: Vec<Option<FrozenObservationInput>>,
+    pub(crate) submitted_observation_demands: Vec<DeviceCostObservationDemand>,
+    /// The logical eager fixture opts into complete numerical projection only.
+    pub(crate) cost_route_projection_enabled: bool,
+    pub(crate) cost_direct_replay_projection_enabled: bool,
+    /// Explicit numeric stream/catalog evidence for controller adapter tests.
+    pub(crate) cost_graph_state: Option<DeviceCostGraphStreamState>,
+    pub(crate) submitted_graph_evidence: Option<DeviceSubmissionGraphEvidence>,
+    pub(crate) cost_graph_catalog: Option<DeviceCostGraphCatalog>,
+    pub(crate) reusable_catalog_programs: Vec<DeviceReusableExecutionProgram>,
     pub(crate) memory: Option<Arc<Mutex<memory_fixture::TestMemoryRegistry>>>,
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
+    pub(crate) submitted_timing_modes: Vec<DeviceTimingMode>,
     pub(crate) guarded_submit_calls: u64,
     pub(crate) guarded_missing_attribution: bool,
     pub(crate) submitted_command_counts: Vec<usize>,
@@ -1568,6 +1794,9 @@ pub(crate) struct RuntimeTrace {
     pub(crate) submission_readback_reads: u64,
     pub(crate) submission_readback_live: u64,
     pub(crate) tamper_buffer_descriptor: bool,
+    pub(crate) borrow_buffer_descriptors: bool,
+    pub(crate) owned_buffer_descriptor_reads: u64,
+    pub(crate) borrowed_buffer_descriptor_reads: u64,
     pub(crate) switch_descriptor_on_buffer: Option<BufferDescriptorRuntimeSwitch>,
     pub(crate) switched_descriptor_on_buffer: Option<BufferDescriptorRuntimeSwitch>,
     pub(crate) drift_on_submit: bool,
@@ -1617,6 +1846,37 @@ pub(crate) struct TestRuntime {
     pub(crate) trace: Arc<Mutex<RuntimeTrace>>,
 }
 
+impl TestRuntime {
+    fn current_fixture_buffer_descriptor<'buffer>(
+        &self,
+        buffer: &'buffer TestBuffer,
+        borrowed: bool,
+    ) -> &'buffer BufferDescriptor {
+        let mut trace = self.trace.lock().unwrap();
+        if borrowed {
+            trace.borrowed_buffer_descriptor_reads += 1;
+        } else {
+            trace.owned_buffer_descriptor_reads += 1;
+        }
+        if let Some(switch) = trace.switch_descriptor_on_buffer.take() {
+            match switch {
+                BufferDescriptorRuntimeSwitch::DifferentCapacity => self
+                    .use_different_capacity_descriptor
+                    .store(true, Ordering::Release),
+                BufferDescriptorRuntimeSwitch::EqualCopy => self
+                    .use_equal_descriptor_copy
+                    .store(true, Ordering::Release),
+            }
+            trace.switched_descriptor_on_buffer = Some(switch);
+        }
+        if trace.tamper_buffer_descriptor {
+            &buffer.tampered_descriptor
+        } else {
+            &buffer.descriptor
+        }
+    }
+}
+
 fn test_submission_attribution(
     timing_mode: DeviceTimingMode,
     requirement: DeviceSubmissionAttributionRequirement,
@@ -1637,6 +1897,17 @@ fn test_submission_attribution(
             .flatten();
         let (native_op_id, execution_path, compute_dispatch_count, transfer_command_count) =
             match entry.command() {
+                TestCommand::ControlledCpuFill {
+                    full_logits,
+                    layout,
+                    participants,
+                    ..
+                } => (
+                    layout.native_op_id(*full_logits),
+                    DeviceExecutionPath::Eager,
+                    layout.compute_dispatch_count(*participants as usize),
+                    0,
+                ),
                 TestCommand::Provider => ("test_provider", DeviceExecutionPath::Eager, 1, 0),
                 TestCommand::Memory(_, compute) => (
                     "test_memory",
@@ -1673,11 +1944,20 @@ fn test_submission_attribution(
                 TestCommand::Zero => ("test_zero", DeviceExecutionPath::Eager, 0, 1),
             };
         let logical_work = entry.logical_work();
-        let batching_form = invocation.as_ref().map_or_else(
-            || logical_work.map_or(DeviceBatchingForm::Scalar, |work| work.batching_form()),
-            |_| DeviceBatchingForm::ParticipantLoop,
-        );
+        let batching_form = if matches!(entry.command(), TestCommand::ControlledCpuFill { .. }) {
+            DeviceBatchingForm::Packed
+        } else {
+            invocation.as_ref().map_or_else(
+                || logical_work.map_or(DeviceBatchingForm::Scalar, |work| work.batching_form()),
+                |_| DeviceBatchingForm::ParticipantLoop,
+            )
+        };
         let encoded_work = match entry.command() {
+            TestCommand::ControlledCpuFill {
+                participants,
+                tokens,
+                ..
+            } => Some((*participants, *tokens)),
             TestCommand::ScratchProviderWork(participants, tokens) => {
                 Some((*participants, *tokens))
             }
@@ -1817,6 +2097,103 @@ impl StaticWeightImportSession<TestBuffer, TestRuntimeError> for TestStaticWeigh
 }
 
 impl DeviceRuntime for TestRuntime {
+    fn observation_template_budget(&self) -> Option<Arc<DeviceObservationTemplateBudget>> {
+        self.trace
+            .lock()
+            .unwrap()
+            .observation_template_budget
+            .clone()
+    }
+    fn reusable_execution_catalog(
+        &self,
+        _: &Self::Stream,
+    ) -> Result<Vec<DeviceReusableExecutionProgram>, Self::Error> {
+        Ok(self.trace.lock().unwrap().reusable_catalog_programs.clone())
+    }
+    fn cost_graph_capture_capability(&self) -> DeviceCostGraphCaptureCapability {
+        let trace = self.trace.lock().unwrap();
+        if trace.cost_graph_state.is_some() {
+            DeviceCostGraphCaptureCapability::Supported
+        } else if trace.cost_route_projection_enabled {
+            DeviceCostGraphCaptureCapability::Unsupported
+        } else {
+            DeviceCostGraphCaptureCapability::Unknown
+        }
+    }
+    fn cost_graph_stream_state(&self, _: &Self::Stream) -> Option<DeviceCostGraphStreamState> {
+        self.trace.lock().unwrap().cost_graph_state
+    }
+    fn cost_direct_graph_replay_operation(&self) -> Option<&'static str> {
+        // This is the same native operation returned by encode_reusable_execution
+        // and recorded by actual submission attribution for ReusableExecution.
+        // It declares no resident program; topology/catalog guards still decide
+        // whether the current wave is a replay or a configured eager boundary.
+        self.trace
+            .lock()
+            .unwrap()
+            .cost_direct_replay_projection_enabled
+            .then_some("test_reusable_execution")
+    }
+    fn cost_reusable_graph_catalog(
+        &self,
+        _: &Self::Stream,
+        limits: DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<DeviceCostGraphCatalog, Self::Error>> {
+        let trace = self.trace.lock().unwrap();
+        let catalog = trace.cost_graph_catalog.as_ref()?;
+        if poll().is_err() || !catalog.fits(limits) {
+            return Some(Err(TestRuntimeError("fixture graph catalog unavailable")));
+        }
+        Some(Ok(catalog.clone()))
+    }
+    fn cost_core_execution_capabilities(&self) -> Option<DeviceCoreCostCapabilities> {
+        self.trace
+            .lock()
+            .unwrap()
+            .cost_route_projection_enabled
+            .then_some(DeviceCoreCostCapabilities {
+                upload_native_operation: "fixture.upload",
+                zero_native_operation: "fixture.zero",
+                single_transfer_commands: true,
+                preserves_program_bindings: false,
+                staged_host_readback_without_commands: false,
+                staged_host_readback_native_operation: None,
+                fallback_readback:
+                    ferrum_interfaces::execution_cost::CoreReadbackRoute::HostSynchronized,
+            })
+    }
+    fn cost_core_transfer_evidence(
+        &self,
+        kind: ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
+        bytes: u64,
+        tokens: u64,
+    ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
+        use ferrum_interfaces::execution_cost::{
+            SelectedAlgorithmClassV1, SelectedCommandCostBuilderV1,
+        };
+        if !self.trace.lock().unwrap().cost_route_projection_enabled {
+            return None;
+        }
+        let mut builder = SelectedCommandCostBuilderV1::new_with_algorithm_work(tokens);
+        builder
+            .transfer(
+                SelectedAlgorithmClassV1::new("fixture.contiguous.transfer", 1, [8; 32], [9; 32])
+                    .ok()?,
+                kind,
+                bytes,
+            )
+            .ok()?;
+        builder.finish().ok()
+    }
+    fn structured_cost_capture(&self) -> ferrum_types::SloStructuredCostCapture {
+        if self.trace.lock().unwrap().structured_cost_capture_enabled {
+            ferrum_types::SloStructuredCostCapture::HostSettledV1
+        } else {
+            ferrum_types::SloStructuredCostCapture::Disabled
+        }
+    }
+
     type Buffer = TestBuffer;
     type Stream = TestStream;
     type Command = TestCommand;
@@ -1854,14 +2231,18 @@ impl DeviceRuntime for TestRuntime {
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error> {
         self.trace.lock().unwrap().allocation_calls += 1;
         let request = permit.into_request();
+        let descriptor = BufferDescriptor {
+            resource_id: request.resource_id().clone(),
+            size_bytes: request.size_bytes(),
+            alignment_bytes: request.alignment_bytes(),
+            usage: request.usage(),
+            element_type: request.element_type(),
+        };
+        let mut tampered_descriptor = descriptor.clone();
+        tampered_descriptor.size_bytes = tampered_descriptor.size_bytes.wrapping_add(1);
         Ok(TestBuffer {
-            descriptor: BufferDescriptor {
-                resource_id: request.resource_id().clone(),
-                size_bytes: request.size_bytes(),
-                alignment_bytes: request.alignment_bytes(),
-                usage: request.usage(),
-                element_type: request.element_type(),
-            },
+            descriptor,
+            tampered_descriptor,
             memory: self.trace.lock().unwrap().memory.clone().map(|registry| {
                 memory_fixture::TestMemoryBuffer::new(request.size_bytes(), registry)
             }),
@@ -1869,23 +2250,18 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
-        let mut descriptor = buffer.descriptor.clone();
-        let mut trace = self.trace.lock().unwrap();
-        if let Some(switch) = trace.switch_descriptor_on_buffer.take() {
-            match switch {
-                BufferDescriptorRuntimeSwitch::DifferentCapacity => self
-                    .use_different_capacity_descriptor
-                    .store(true, Ordering::Release),
-                BufferDescriptorRuntimeSwitch::EqualCopy => self
-                    .use_equal_descriptor_copy
-                    .store(true, Ordering::Release),
-            }
-            trace.switched_descriptor_on_buffer = Some(switch);
+        self.current_fixture_buffer_descriptor(buffer, false)
+            .clone()
+    }
+
+    fn borrowed_buffer_descriptor<'buffer>(
+        &self,
+        buffer: &'buffer Self::Buffer,
+    ) -> Option<&'buffer BufferDescriptor> {
+        if !self.trace.lock().unwrap().borrow_buffer_descriptors {
+            return None;
         }
-        if trace.tamper_buffer_descriptor {
-            descriptor.size_bytes += 1;
-        }
-        descriptor
+        Some(self.current_fixture_buffer_descriptor(buffer, true))
     }
 
     fn begin_static_weight_import(
@@ -1991,11 +2367,11 @@ impl DeviceRuntime for TestRuntime {
         &self,
         invocation: DeviceReusableExecutionInvocation,
     ) -> Result<Option<Self::Command>, Self::Error> {
-        self.trace
-            .lock()
-            .unwrap()
-            .pending_reusable_invocations
-            .push(invocation);
+        let mut trace = self.trace.lock().unwrap();
+        trace
+            .reusable_observation_inputs
+            .push(invocation.observation_input().cloned());
+        trace.pending_reusable_invocations.push(invocation);
         Ok(Some(TestCommand::ReusableExecution))
     }
 
@@ -2009,6 +2385,10 @@ impl DeviceRuntime for TestRuntime {
 
     fn supports_guarded_submission(&self) -> bool {
         true
+    }
+
+    fn supports_guarded_submission_with_timing(&self, mode: DeviceTimingMode) -> bool {
+        mode.guarded_completion_compatible()
     }
 
     fn submit_guarded(
@@ -2026,7 +2406,11 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
-        fence.2.clone()
+        let attribution = fence.2.clone()?;
+        match self.trace.lock().unwrap().submitted_graph_evidence {
+            Some(graph) => attribution.with_graph_evidence(graph),
+            None => Some(attribution),
+        }
     }
 
     fn submit_guarded_with_timing<S>(
@@ -2044,7 +2428,7 @@ impl DeviceRuntime for TestRuntime {
         }
         // This fixture measures its real guarded transaction. It does not
         // manufacture a device duration or report a successful enqueue on rejection.
-        assert_eq!(commands.timing_mode(), DeviceTimingMode::Off);
+        assert!(commands.timing_mode().guarded_completion_compatible());
         let started = Instant::now();
         let result = self.submit_guarded(stream, commands, guard);
         timing_sink

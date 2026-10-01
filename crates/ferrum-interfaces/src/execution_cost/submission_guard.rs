@@ -123,7 +123,7 @@ impl ExpectedExecutionCostWave {
 
 /// Rejecting an expired witness invalidates that proposed submission, not the
 /// request. Completion-first scheduling may obtain fresh bounded evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HostSubmissionRejection {
     WitnessExpired,
     CostModelChanged,
@@ -140,7 +140,7 @@ pub trait NonblockingHostSubmissionGuard: Send + Sync {
     fn check(&self) -> std::result::Result<(), HostSubmissionRejection>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GuardedNotSubmittedReason {
     ActualRouteMismatch,
     AttributionUnavailable,
@@ -154,11 +154,29 @@ pub enum GuardedNotSubmittedReason {
 #[derive(Debug)]
 pub struct GuardedNotSubmitted {
     reason: GuardedNotSubmittedReason,
+    pub(crate) observation: Option<GuardRollbackObservationBinding>,
+}
+
+/// Fixed-size binding issued only after the actual Step rollback succeeds.
+#[derive(Debug)]
+pub(crate) struct GuardRollbackObservationBinding {
+    pub batch_step: u64,
+    pub batch_invocation: u64,
+    pub lane_id: u64,
+    pub participant_count: usize,
+    pub participant_signature: [u8; 32],
 }
 
 impl GuardedNotSubmitted {
     pub(crate) fn reconciled(reason: GuardedNotSubmittedReason) -> Self {
-        Self { reason }
+        Self {
+            reason,
+            observation: None,
+        }
+    }
+    pub(crate) fn with_observation(mut self, binding: GuardRollbackObservationBinding) -> Self {
+        self.observation = Some(binding);
+        self
     }
     pub fn reason(&self) -> GuardedNotSubmittedReason {
         self.reason

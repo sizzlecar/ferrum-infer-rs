@@ -443,8 +443,10 @@ async fn completion_caller_drop_preserves_one_dispatch_and_one_commit() {
 }
 
 #[tokio::test]
-async fn completion_requires_enforce_and_complete_requests_policy() {
+async fn completion_requires_enforce_and_preserves_accepted_owner_in_strict_mode() {
     let (mut engine, _, executor) = fixture().await;
+    let (id, mut session) = request(&engine, 1, 2, None).await;
+    admit(&engine, 1).await;
     let hint = ferrum_interfaces::BatchHint::simple(1);
     let budget = ControllerBudget::new(slo_clock_now(), Duration::from_secs(30)).unwrap();
     assert!(matches!(
@@ -454,17 +456,35 @@ async fn completion_requires_enforce_and_complete_requests_policy() {
             .unwrap(),
         SloIterationPlan::Idle
     ));
+    assert_eq!(scheduled(&engine), 0);
+    assert_eq!(executor.physical.load(Ordering::Acquire), 0);
+    // This owner has already crossed the real transport acceptance boundary.
+    // Changing the fixture's policy must not remove its completion obligation;
+    // successful strict admission itself is covered by the real planner test.
+    assert!(!engine.inner.sequences.read()[&id]
+        .time_admission
+        .as_ref()
+        .unwrap()
+        .before_acceptance());
     let inner = Arc::get_mut(&mut engine.inner).unwrap();
     inner.config.scheduler.slo.mode = ferrum_types::SloMode::Enforce;
     inner.config.scheduler.slo.admission.time_policy =
         ferrum_types::SloTimeAdmissionPolicy::RequireSlo;
-    assert!(!inner.completion_allowed());
-    assert!(matches!(
-        inner
-            .prepare_completion_controller(&hint, &budget, CompletionOnlyReason::CostUnavailable)
-            .unwrap(),
-        SloIterationPlan::Idle
-    ));
-    assert_eq!(executor.physical.load(Ordering::Acquire), 0);
+    inner.cost_runtime = None;
+    assert!(inner.completion_allowed());
+    step(&engine, &executor, 1, 1).await;
+    consume(&engine, &id, &mut session).await;
+    step(&engine, &executor, 1, 1).await;
+    while let Some(frame) = bounded(session.frames.next()).await {
+        drop(frame);
+    }
+    let completed = bounded(session.completion).await.unwrap();
+    assert!(
+        matches!(completed.payload(), OutputCompletion::Succeeded { usage, .. } if usage.completion_tokens == 2)
+    );
+    drop(completed);
+    assert!(engine.inner.sequences.read().is_empty());
+    assert_eq!(executor.physical.load(Ordering::Acquire), 2);
+    assert_eq!(scheduled(&engine), 0);
     engine.shutdown().await.unwrap();
 }

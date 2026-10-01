@@ -52,9 +52,25 @@ pub(in crate::continuous_engine) enum PrefillReferenceLoadError {
 pub(in crate::continuous_engine) struct EnginePrefillReferenceRuntime {
     calibration: Arc<LoadedPrefillReference>,
     next_incarnation: AtomicU64,
+    // Original sealed bytes survive as long as an automatic reference does.
+    // File imports remain independently backed by their explicit source path.
+    startup_evidence: Option<(Arc<[u8]>, Arc<[u8]>)>,
 }
 
 impl EnginePrefillReferenceRuntime {
+    /// Only the private startup collector supplies a loader-verified immutable
+    /// reference. This creates no file configuration or renewed time anchor.
+    pub(in crate::continuous_engine::inner) fn from_verified(
+        calibration: Arc<LoadedPrefillReference>,
+        source: Arc<[u8]>,
+        artifact: Arc<[u8]>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            calibration,
+            next_incarnation: AtomicU64::new(1),
+            startup_evidence: Some((source, artifact)),
+        })
+    }
     /// Called once by the common run/serve engine constructor. An explicit
     /// invalid artifact fails construction even when no online model exists.
     pub fn load(
@@ -88,11 +104,18 @@ impl EnginePrefillReferenceRuntime {
         Ok(Some(Arc::new(Self {
             calibration,
             next_incarnation: AtomicU64::new(1),
+            startup_evidence: None,
         })))
     }
 
     pub fn calibration(&self) -> &Arc<LoadedPrefillReference> {
         &self.calibration
+    }
+
+    pub(in crate::continuous_engine) fn startup_evidence(&self) -> Option<(&[u8], &[u8])> {
+        self.startup_evidence
+            .as_ref()
+            .map(|(source, artifact)| (source.as_ref(), artifact.as_ref()))
     }
 
     fn bind(

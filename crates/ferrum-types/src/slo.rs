@@ -14,16 +14,30 @@ use std::{
 };
 
 mod cost;
+mod experiment;
+mod product_defaults;
+mod query_observation;
 mod reference;
 pub use cost::{
-    SloCostFeatureModel, SloCostModelConfig, SloCostObservationConfig, SloCostPredictor,
+    SloAutomaticCalibrationCacheLocationErrorV1, SloAutomaticCalibrationCacheLocationV1,
+    SloAutomaticCalibrationDiagnosticsV1, SloAutomaticCalibrationInputReadinessV1,
+    SloAutomaticCalibrationNumericalStrategyV1, SloAutomaticCalibrationPopulationScheduleV1,
+    SloAutomaticCalibrationPredictionMarginV1, SloAutomaticCalibrationPredictionValidityV1,
+    SloAutomaticCalibrationReuseLimitsV1, SloAutomaticCalibrationReuseV1,
+    SloAutomaticCalibrationSettingsV1, SloAutomaticCostProbeSamplingPresetV1,
+    SloAutomaticCostProbeSettingsV1, SloAutomaticPrefixTokenDiscoveryBudgetV1,
+    SloAutomaticReferenceProbeSettingsV1, SloCalibrationRoutePopulationV1, SloCostFeatureModel,
+    SloCostModelConfig, SloCostObservationConfig, SloCostPredictor, SloCostProfileClockBasis,
     SloCostProfileExportConfig, SloCostProfileImportConfig, SloCostProfileReceipt,
-    SloCostShapeLimits, SloProspectiveStructuredCapture, SloSelectedFeedbackPolicy,
-    SloSelectedFeedbackSettingsV1, SloSelectedFeedbackStorageV1, SloSelectedWholeWaveReceiptV1,
+    SloCostProfileStorage, SloCostShapeLimits, SloLiveStructuredCalibration,
+    SloProspectiveStructuredCapture, SloSelectedFeedbackPolicy, SloSelectedFeedbackSettingsV1,
+    SloSelectedFeedbackStorageV1, SloSelectedWholeWaveReceiptV1, SloStructuredActualCapturePolicy,
     SloStructuredCostCapture, SloStructuredFeedbackPolicy, SloStructuredPhaseReceiptV1,
     SloStructuredProfilePhaseV1, SloStructuredWholeWaveReceiptV1,
     SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY,
 };
+pub use experiment::*;
+pub use query_observation::*;
 pub use reference::*;
 
 /// Typed snapshot entries; none of these keys is an environment-variable alias.
@@ -441,9 +455,13 @@ impl SloOutputConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(from = "product_defaults::Input")]
 pub struct SloConfig {
     pub mode: SloMode,
+    /// Explicit same-operator controlled experiments. Omission preserves the
+    /// existing mode-dependent product path and serialized configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment_stage: Option<SloExperimentStageV1>,
     pub default_service_class: Option<String>,
     pub services: Vec<ServiceSloConfig>,
     /// Profile identity/content and execution fingerprint are verified when it
@@ -452,7 +470,10 @@ pub struct SloConfig {
     /// Independently frozen reference work and decode unit. Missing calibration
     /// is Unknown; it is never synthesized from online candidate estimates.
     pub prefill_reference: Option<SloPrefillReferenceConfig>,
+    #[serde(serialize_with = "product_defaults::serialize_cost")]
     pub cost_observation: SloCostObservationConfig,
+    #[serde(skip_serializing_if = "SloRequiredQueryObservationConfig::is_disabled")]
+    pub required_query_observation: SloRequiredQueryObservationConfig,
     pub planner: SloPlannerConfig,
     pub admission: SloAdmissionConfig,
     pub output: SloOutputConfig,
@@ -470,7 +491,39 @@ impl SloConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_experiment()?;
         self.cost_observation.validate()?;
+        if !self
+            .cost_observation
+            .live_structured_calibration
+            .is_disabled()
+            && (self.mode == SloMode::Off
+                || self.admission.time_policy != SloTimeAdmissionPolicy::CompleteRequests)
+        {
+            return Err(
+                "live structured calibration requires Observe/Enforce with CompleteRequests".into(),
+            );
+        }
+        self.required_query_observation.validate()?;
+        if self.required_query_observation.enabled()
+            && self.cost_observation.predictor != SloCostPredictor::StructuredWholeWaveV2
+        {
+            return Err("required-query observation requires the Structured V2 predictor".into());
+        }
+        if self.mode == SloMode::Off && self.required_query_observation.enabled() {
+            return Err("required-query observation requires Observe or Enforce mode".into());
+        }
+        if self.required_query_observation.is_uncalibrated() {
+            if self.mode != SloMode::Observe || self.cost_profile.is_some() {
+                return Err("uncalibrated required-query observation requires Observe mode without a cost_profile".into());
+            }
+            if self.prefill_reference.is_none() {
+                return Err(
+                    "uncalibrated required-query observation requires a real prefill reference"
+                        .into(),
+                );
+            }
+        }
         if let Some(reference) = &self.prefill_reference {
             reference.validate()?;
         }

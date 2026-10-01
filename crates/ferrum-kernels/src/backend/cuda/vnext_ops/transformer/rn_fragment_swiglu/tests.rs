@@ -173,7 +173,7 @@ fn rn_fragment_embedded_ptx_contains_the_production_entries() {
         .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
-    for entry in [ENTRY, "vnext_rn_fragment_coefficients"] {
+    for entry in [ENTRY, Q6_PREFETCH_ENTRY, "vnext_rn_fragment_coefficients"] {
         assert!(
             words.windows(2).any(|w| w == [".entry", entry]),
             "embedded PTX missing {entry}"
@@ -201,5 +201,49 @@ fn rn_fragment_requires_the_embedded_mma_target_not_just_a_new_device() {
         ".target sm_80oops",
     ] {
         assert!(!compiled_mma_target(ptx), "{ptx}");
+    }
+}
+
+#[test]
+fn rn_fragment_per_projection_selector_keeps_unmodified_formats_and_dense_boundary() {
+    use plan::FragmentKernel;
+    use RnF16FragmentSourceFormatV1::{Q4K, Q5K, Q6K};
+
+    assert_eq!(FragmentKernel::for_format(Q4K), FragmentKernel::GlobalV1);
+    assert_eq!(FragmentKernel::for_format(Q5K), FragmentKernel::GlobalV1);
+    assert_eq!(
+        FragmentKernel::for_format(Q6K),
+        FragmentKernel::Q6PacketPrefetchV1
+    );
+    assert_eq!(FragmentKernel::for_format(Q4K).entry(), ENTRY);
+    assert_eq!(FragmentKernel::for_format(Q5K).entry(), ENTRY);
+    assert_eq!(FragmentKernel::for_format(Q6K).entry(), Q6_PREFETCH_ENTRY);
+
+    let identity = CublasHandleApiIdentity::fixture_identity();
+    for gate_format in [Q4K, Q5K, Q6K] {
+        for down_format in [Q4K, Q5K, Q6K] {
+            for m in [1, 7, 8, 9] {
+                let shape = Shape::new(m, 256, 512, gate_format, down_format).unwrap();
+                let actual = shape
+                    .selected(SloStructuredCostCapture::HostSettledV1, Some(identity))
+                    .unwrap();
+                actual.validate_command(m, 3, 0).unwrap();
+                let projected = shape.project(m, Some(identity)).unwrap();
+                assert_eq!(actual, projected);
+                let template =
+                    SelectedReplayAlgorithmTemplateV1::from_selected(&actual, m, 3, 0).unwrap();
+                template.validate_binding(&projected).unwrap();
+
+                // The dense route uses the same original GemmEx plans, regardless
+                // of the source quantization used to materialize their F16 weights.
+                if m > 8 {
+                    let dense = Shape::new(m, 256, 512, Q4K, Q4K)
+                        .unwrap()
+                        .selected(SloStructuredCostCapture::HostSettledV1, Some(identity))
+                        .unwrap();
+                    assert_eq!(actual, dense);
+                }
+            }
+        }
     }
 }

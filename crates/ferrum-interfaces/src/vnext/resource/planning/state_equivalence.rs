@@ -34,6 +34,13 @@ impl ResourcePlanningState {
         poll(budget)?;
         if !Arc::ptr_eq(&self.fence, &other.fence)
             || self.waves != other.waves
+            || self.checkpoint_retained_bytes != other.checkpoint_retained_bytes
+            || self.checkpoint_tokens.len() != other.checkpoint_tokens.len()
+            || self
+                .checkpoint_tokens
+                .iter()
+                .zip(&other.checkpoint_tokens)
+                .any(|(a, b)| !Arc::ptr_eq(a, b))
             || self.pools.len() != other.pools.len()
             || self.sequence_ranges.len() != other.sequence_ranges.len()
         {

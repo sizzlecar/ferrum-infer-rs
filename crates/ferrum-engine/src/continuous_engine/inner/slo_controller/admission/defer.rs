@@ -17,17 +17,32 @@ pub(super) struct TimeAdmissionReview {
 
 impl TimeAdmissionReview {
     pub(super) fn pending(&self, captured: &ControllerSnapshot, now: Instant) -> bool {
+        self.pending_for(
+            &captured.queue,
+            captured.snapshot.requests.len(),
+            captured.model.model_version(),
+            now,
+        )
+    }
+
+    pub(super) fn pending_for(
+        &self,
+        queue: &PlanningQueueSnapshot,
+        obligations: usize,
+        model_version: u64,
+        now: Instant,
+    ) -> bool {
         self.review_at.is_some_and(|at| now < at)
-            && self.queue_iteration == captured.queue.iteration()
-            && self.wake_epochs == captured.queue.wake_epochs()
-            && self.obligations == captured.snapshot.requests.len()
-            && self.model_version == captured.model.model_version()
-            && self.capacity_availability == captured.queue.capacity_availability()
-            && self.queue_owners.len() == captured.queue.requests().len()
+            && self.queue_iteration == queue.iteration()
+            && self.wake_epochs == queue.wake_epochs()
+            && self.obligations == obligations
+            && self.model_version == model_version
+            && self.capacity_availability == queue.capacity_availability()
+            && self.queue_owners.len() == queue.requests().len()
             && self
                 .queue_owners
                 .iter()
-                .zip(captured.queue.requests())
+                .zip(queue.requests())
                 .all(|((key, queue), row)| *key == row.key && *queue == row.queue)
     }
 }
@@ -165,8 +180,11 @@ impl EngineInner {
         activation.held.clear();
         activation.review_at = None;
         let mut continuations = 0usize;
-        let overflow_available =
-            self.completion_allowed() && activation.overflow.is_none() && activated == active_limit;
+        let overflow_available = self.config.scheduler.slo.admission.time_policy
+            == ferrum_types::SloTimeAdmissionPolicy::CompleteRequests
+            && self.completion_allowed()
+            && activation.overflow.is_none()
+            && activated == active_limit;
         let mut overdue = false;
         for row in queue
             .requests()
@@ -288,11 +306,16 @@ impl EngineInner {
     /// Independent from transient controller backoff: waiting for a new time
     /// admission must never delay the currently active set's execution.
     pub(in crate::continuous_engine) async fn wait_for_slo_time_admission(&self) {
-        if self.config.scheduler.slo.mode != ferrum_types::SloMode::Enforce {
+        if self.config.scheduler.slo.mode != ferrum_types::SloMode::Enforce
+            || !self.config.scheduler.slo.execution_policy().time_admission
+        {
             return std::future::pending().await;
         }
         let mut at = self.slo_controller.lock().time_activation.review_at;
         for sequence in self.sequences.read().values() {
+            if let Some(expiry) = Self::strict_review_at(sequence) {
+                at = Some(at.map_or(expiry, |old| old.min(expiry)));
+            }
             if let Some(review) = sequence
                 .time_admission
                 .as_ref()

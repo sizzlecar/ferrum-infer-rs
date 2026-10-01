@@ -15,6 +15,33 @@ pub struct DeviceReplayCostWork {
     participant_ranges: Arc<[std::ops::Range<u64>]>,
 }
 impl DeviceReplayCostWork {
+    pub(super) fn from_observation(
+        tokens: u64,
+        participant_ranges: Arc<[std::ops::Range<u64>]>,
+    ) -> Option<Self> {
+        if participant_ranges.is_empty()
+            || participant_ranges.len() > crate::execution_cost::MAX_COST_ROWS
+        {
+            return None;
+        }
+        let mut end = 0;
+        for row in participant_ranges.iter() {
+            if row.start != end || row.end <= row.start {
+                return None;
+            }
+            end = row.end;
+        }
+        (end == tokens).then_some(Self {
+            tokens,
+            participant_ranges,
+        })
+    }
+    pub fn retained_payload_bytes(&self) -> Option<usize> {
+        self.participant_ranges
+            .len()
+            .checked_mul(std::mem::size_of::<std::ops::Range<u64>>())?
+            .checked_add(std::mem::size_of::<Self>())
+    }
     pub(crate) fn from_shape(shape: &BatchWorkShape) -> Option<Self> {
         let rows = shape.participant_token_ranges();
         if rows.is_empty() || rows.len() > crate::execution_cost::MAX_COST_ROWS {
@@ -176,6 +203,18 @@ impl PartialEq for DeviceReplayedLogicalCommandAttribution {
 impl Eq for DeviceReplayedLogicalCommandAttribution {}
 
 impl DeviceReplayedLogicalCommandAttribution {
+    /// Whether a sealed, passive catalog row may retain its existing metadata.
+    /// Unlike execution equality, this compares the entire captured template.
+    /// A row carrying current numeric work is never reusable by this predicate,
+    /// even against itself: sample equality is deliberately outside its scope.
+    /// This does not authorize execution or replace resident-program checks.
+    pub fn same_cost_catalog_metadata(&self, other: &Self) -> bool {
+        self.statistical_evidence.is_none()
+            && other.statistical_evidence.is_none()
+            && self == other
+            && self.replay_template == other.replay_template
+    }
+
     /// This must come from the command that actually entered a successful
     /// native graph capture, never a subsequent eager candidate with same key.
     /// No captured numeric work/table is retained.
@@ -292,6 +331,250 @@ mod tests {
             SelectedReplayAlgorithmTemplateV1::from_selected(selected, 3, 1, 0).unwrap(),
         ))
     }
+
+    fn shared_segment(
+        invocation: &DeviceReusableExecutionInvocation,
+        rows: Arc<[DeviceReplayedLogicalCommandAttribution]>,
+    ) -> DeviceReplayedSegmentAttribution {
+        DeviceReplayedSegmentAttribution::from_shared_logical_commands(
+            0,
+            invocation.program_id().clone(),
+            invocation.segment().clone(),
+            "e".repeat(64),
+            rows,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn same_cost_catalog_metadata_distinguishes_templates_from_execution_equality() {
+        let captured = evidence("a", 32, 64);
+        let current = evidence("a", 257, 64);
+        let original = sealed(0, &captured);
+        let resealed = sealed(0, &current);
+        // Different observed context is absent from a sealed template; fresh
+        // context remains accepted without retaining the earlier numeric work.
+        assert_ne!(captured.work(), current.work());
+        assert!(original.same_cost_catalog_metadata(&resealed));
+        assert!(resealed.same_cost_catalog_metadata(&original));
+        assert!(original
+            .bind_current_cost_evidence(Some(&current))
+            .is_some());
+        assert!(resealed
+            .bind_current_cost_evidence(Some(&current))
+            .is_some());
+
+        let missing = original.clone().with_captured_replay_template(None);
+        let changed_algorithm = sealed(0, &evidence("b", 32, 64));
+        let changed_fixed_launch = sealed(0, &evidence("a", 32, 65));
+        for changed in [missing, changed_algorithm, changed_fixed_launch] {
+            // Existing Eq and wire omit the private cost template. Neither is
+            // sufficient for deciding whether the numeric catalog is unchanged.
+            assert_eq!(original, changed);
+            assert_eq!(
+                serde_json::to_vec(&original).unwrap(),
+                serde_json::to_vec(&changed).unwrap()
+            );
+            assert!(!original.same_cost_catalog_metadata(&changed));
+            assert!(!changed.same_cost_catalog_metadata(&original));
+            assert!(changed.bind_current_cost_evidence(Some(&current)).is_none());
+        }
+        let mut changed_node = original.clone();
+        changed_node.node_index += 1;
+        assert!(!original.same_cost_catalog_metadata(&changed_node));
+        assert!(!changed_node.same_cost_catalog_metadata(&original));
+    }
+
+    #[test]
+    fn same_cost_catalog_metadata_rejects_actual_samples_even_for_equal_execution() {
+        let captured = [evidence("a", 32, 64), evidence("b", 32, 64)];
+        let rows = [sealed(0, &captured[0]), sealed(1, &captured[1])];
+        let current = [evidence("a", 257, 64), evidence("b", 513, 64)];
+        let invocation =
+            invocation().with_selected_replay_cost(current.iter().cloned().map(Some).collect());
+        let bound = invocation.bind_replayed_cost_evidence(&rows).unwrap();
+        for ((sealed, actual), expected) in rows.iter().zip(&bound).zip(&current) {
+            assert_eq!(sealed, actual);
+            assert_eq!(
+                actual.statistical_evidence().unwrap().work(),
+                expected.work()
+            );
+            assert!(!sealed.same_cost_catalog_metadata(actual));
+            assert!(!actual.same_cost_catalog_metadata(sealed));
+            assert!(!actual.same_cost_catalog_metadata(actual));
+            assert!(sealed.same_cost_catalog_metadata(&sealed.clone()));
+        }
+    }
+
+    #[test]
+    fn shared_replay_attribution_keeps_wire_and_constructor_rejections() {
+        let invocation = invocation();
+        let captured = [evidence("a", 32, 64), evidence("b", 32, 64)];
+        let rows = vec![sealed(0, &captured[0]), sealed(1, &captured[1])];
+        let legacy = DeviceReplayedSegmentAttribution::new(
+            0,
+            invocation.program_id().clone(),
+            invocation.segment().clone(),
+            "e".repeat(64),
+            rows.clone(),
+        )
+        .unwrap();
+        let shared = shared_segment(&invocation, Arc::from(rows.clone()));
+        assert_eq!(
+            serde_json::to_vec(&shared).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        let wire = serde_json::to_value(&shared).unwrap();
+        assert_eq!(wire["physical_command_index"], 0);
+        assert_eq!(wire["logical_commands"][0]["node_index"], 4);
+        assert_eq!(wire["logical_commands"][1]["node_index"], 5);
+        assert!(wire["logical_commands"][0]
+            .get("statistical_evidence")
+            .is_none());
+
+        let mut wrong_node = rows.clone();
+        wrong_node[1].node_index = 6;
+        let malformed = [
+            Vec::new(),
+            vec![rows[0].clone()],
+            vec![rows[1].clone(), rows[0].clone()],
+            vec![rows[0].clone(), rows[0].clone()],
+            wrong_node,
+        ];
+        for bad_rows in malformed {
+            assert!(DeviceReplayedSegmentAttribution::new(
+                0,
+                invocation.program_id().clone(),
+                invocation.segment().clone(),
+                "e".repeat(64),
+                bad_rows.clone(),
+            )
+            .is_none());
+            assert!(
+                DeviceReplayedSegmentAttribution::from_shared_logical_commands(
+                    0,
+                    invocation.program_id().clone(),
+                    invocation.segment().clone(),
+                    "e".repeat(64),
+                    Arc::from(bad_rows),
+                )
+                .is_none()
+            );
+        }
+        for fingerprint in ["e".repeat(63), "E".repeat(64), "g".repeat(64)] {
+            assert!(DeviceReplayedSegmentAttribution::new(
+                0,
+                invocation.program_id().clone(),
+                invocation.segment().clone(),
+                fingerprint.clone(),
+                rows.clone(),
+            )
+            .is_none());
+            assert!(
+                DeviceReplayedSegmentAttribution::from_shared_logical_commands(
+                    0,
+                    invocation.program_id().clone(),
+                    invocation.segment().clone(),
+                    fingerprint,
+                    Arc::from(rows.clone()),
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_replay_attribution_does_not_relax_physical_submission_binding() {
+        let invocation = invocation();
+        let selected = evidence("a", 32, 64);
+        let segment = shared_segment(
+            &invocation,
+            Arc::from([sealed(0, &selected), sealed(1, &selected)]),
+        );
+        for (path, node, participants, tokens, graphs, valid) in [
+            (DeviceExecutionPath::Replayed, 4, 2, 3, Some(2), true),
+            (DeviceExecutionPath::Eager, 4, 2, 3, None, false),
+            (DeviceExecutionPath::Replayed, 5, 2, 3, Some(2), false),
+            (DeviceExecutionPath::Replayed, 4, 1, 3, Some(2), false),
+            (DeviceExecutionPath::Replayed, 4, 2, 4, Some(2), false),
+            (DeviceExecutionPath::Replayed, 4, 2, 3, Some(3), false),
+        ] {
+            let physical = DeviceNativeWorkAttribution::new(
+                0,
+                Some(node),
+                DeviceCommandPhase::Compute,
+                DeviceNativeOperationId::new("vnext_reusable_execution").unwrap(),
+                path,
+                DeviceBatchingForm::Packed,
+                participants,
+                tokens,
+                1,
+                0,
+                graphs,
+            )
+            .unwrap();
+            assert_eq!(
+                DeviceSubmissionAttribution::with_replayed_segments(
+                    vec![physical],
+                    vec![segment.clone()],
+                )
+                .is_some(),
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn shared_replay_attribution_isolates_requested_omitted_and_renewed_work() {
+        let invocation = invocation();
+        let captured = [evidence("a", 32, 64), evidence("b", 32, 64)];
+        let sealed: Arc<[_]> = Arc::from([sealed(0, &captured[0]), sealed(1, &captured[1])]);
+        let first = [evidence("a", 257, 64), evidence("b", 513, 64)];
+        let renewed = [evidence("a", 1025, 64), evidence("b", 2049, 64)];
+        let requested = |values: &[SelectedCommandCostEvidenceV1; 2]| {
+            let current = invocation
+                .clone()
+                .with_selected_replay_cost(values.iter().cloned().map(Some).collect());
+            let bound = current.bind_replayed_cost_evidence(&sealed).unwrap();
+            shared_segment(&current, Arc::from(bound))
+        };
+        let first_segment = requested(&first);
+        let retained_first = first_segment.clone();
+        assert!(invocation.bind_replayed_cost_evidence(&sealed).is_none());
+        let omitted = shared_segment(&invocation, Arc::clone(&sealed));
+        let renewed_segment = requested(&renewed);
+        assert!(sealed
+            .iter()
+            .all(|row| row.statistical_evidence().is_none()));
+        drop(first_segment);
+        drop(sealed);
+        // Retained receipts still refer to their own original wave, even after
+        // the cache population and original first-wave receipt are dropped.
+        for (old, expected) in retained_first.logical_commands().iter().zip(&first) {
+            assert_eq!(old.statistical_evidence().unwrap().work(), expected.work());
+        }
+        assert!(omitted
+            .logical_commands()
+            .iter()
+            .all(|row| row.statistical_evidence().is_none()));
+        for ((new, expected), old) in renewed_segment
+            .logical_commands()
+            .iter()
+            .zip(&renewed)
+            .zip(&first)
+        {
+            let evidence = new.statistical_evidence().unwrap();
+            assert_eq!(evidence.work(), expected.work());
+            assert_ne!(evidence.work(), old.work());
+            evidence
+                .algorithm_work()
+                .unwrap()
+                .unwrap()
+                .validate_command(evidence)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn replay_current_work_preserves_population_and_uses_fresh_context() {
         let captured = [evidence("a", 32, 64), evidence("b", 32, 64)];
@@ -323,6 +606,42 @@ mod tests {
         assert!(bound[0].statistical_evidence().is_some());
         assert!(bound[1].statistical_evidence().is_none());
         assert_eq!(bound[1].node_index(), 5);
+    }
+
+    #[test]
+    fn omitted_actual_sample_keeps_cold_template_and_later_rebinds_fresh_work() {
+        let captured = [evidence("a", 32, 64), evidence("b", 32, 64)];
+        let rows = [sealed(0, &captured[0]), sealed(1, &captured[1])];
+        let before = rows.clone();
+        let mut projected = false;
+        assert!(invocation()
+            .bind_replayed_cost_evidence_with(&rows, |_, _| {
+                projected = true;
+                panic!("no actual sample must not project a captured recipe")
+            })
+            .is_none());
+        assert!(!projected);
+        assert_eq!(rows, before);
+        assert!(rows.iter().all(|row| row.statistical_evidence().is_none()));
+        // The same retained templates accept new exact work; the omitted wave
+        // cannot copy the old numerical coordinates into the renewed sample.
+        let current = [evidence("a", 257, 64), evidence("b", 513, 64)];
+        let renewed = invocation()
+            .with_selected_replay_cost(current.iter().cloned().map(Some).collect())
+            .bind_replayed_cost_evidence(&rows)
+            .unwrap();
+        for ((row, expected), original) in renewed.iter().zip(&current).zip(&captured) {
+            assert_eq!(row.statistical_evidence().unwrap().work(), expected.work());
+            assert_ne!(expected.work(), original.work());
+        }
+        let missing = invocation()
+            .with_selected_replay_cost(vec![None, Some(current[1].clone())])
+            .bind_replayed_cost_evidence(&rows)
+            .unwrap();
+        assert_eq!(missing.len(), rows.len());
+        assert!(missing[0].statistical_evidence().is_none());
+        assert!(missing[1].statistical_evidence().is_some());
+        assert_eq!(missing[0].node_index(), rows[0].node_index());
     }
     #[test]
     fn replay_current_work_rejects_swapped_or_changed_fixed_launch_evidence() {

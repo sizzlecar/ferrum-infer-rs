@@ -11,6 +11,7 @@ pub(crate) struct FrontierCursor {
     decode_sizes: Vec<usize>,
     prefill_sizes: Vec<usize>,
     chunks: Vec<NonZeroU32>,
+    goal_opening: Option<(usize, NonZeroU32)>,
     required: Option<RequestWorkKey>,
     stage: Stage,
     seen: Vec<Vec<CandidateWork>>,
@@ -81,6 +82,30 @@ impl FrontierCursor {
         remaining_waves: Option<std::num::NonZeroUsize>,
         poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
     ) -> Result<Self, PlanningUnknownReason> {
+        Self::with_prefill_goal(
+            snapshot,
+            requests,
+            now_ns,
+            limit,
+            protection,
+            remaining_waves,
+            None,
+            poll,
+        )
+    }
+
+    /// A declared trajectory goal only changes enumeration order. The same
+    /// full-queue deadlines, required recovery service and physical checks apply.
+    pub(crate) fn with_prefill_goal(
+        snapshot: &SchedulerSnapshot,
+        requests: &[RequestSchedulingView],
+        now_ns: u64,
+        limit: usize,
+        protection: Option<&PlanningObligationSet>,
+        remaining_waves: Option<std::num::NonZeroUsize>,
+        prefill_goal: Option<&RequestWorkKey>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Self, PlanningUnknownReason> {
         let mut decoders = Vec::new();
         let mut prefills = Vec::new();
         for (index, row) in requests.iter().enumerate() {
@@ -102,6 +127,16 @@ impl FrontierCursor {
         prefills.sort_by_key(|&index| priority(index));
         poll()?;
         let required = protection.and_then(|scope| scope.required_service(requests));
+        if required.is_none() {
+            if let Some(goal) = prefill_goal {
+                if let Some(position) = prefills
+                    .iter()
+                    .position(|&index| requests[index].key == *goal)
+                {
+                    prefills.rotate_left(position);
+                }
+            }
+        }
         if let Some(required) = required {
             for indices in [&mut decoders, &mut prefills] {
                 if let Some(position) = indices.iter().position(|&index| index == required) {
@@ -162,6 +197,21 @@ impl FrontierCursor {
         if let Some(goal) = goal {
             super::chunk_order::interleave(&mut chunks, &credits, goal.per_wave_work, poll)?;
         }
+        let goal_opening = if required.is_none() {
+            super::goal_order::opening(
+                snapshot,
+                requests,
+                &prefills,
+                &prefill_sizes,
+                &chunks,
+                prefill_goal,
+                remaining_waves,
+                protection,
+                poll,
+            )?
+        } else {
+            None
+        };
         Ok(Self {
             decoders,
             prefills,
@@ -170,6 +220,7 @@ impl FrontierCursor {
             decode_sizes,
             prefill_sizes,
             chunks,
+            goal_opening,
             required: required.map(|index| requests[index].key.clone()),
             stage: Stage::WholeDecode,
             seen: Vec::new(),
@@ -337,6 +388,13 @@ impl FrontierCursor {
                 }
                 Stage::OpeningPrefill => {
                     self.stage = Stage::RoundDecode(0);
+                    if let Some((size, chunk)) = self.goal_opening {
+                        return Ok(Some(Action::Prefill {
+                            size,
+                            chunk,
+                            fair: false,
+                        }));
+                    }
                     if !self.prefill_sizes.is_empty() {
                         if let Some(&chunk) = self.chunks.first() {
                             return Ok(Some(Action::Prefill {

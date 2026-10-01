@@ -20,6 +20,72 @@ fn params(tokens: u32, position: u32) -> CausalAttentionParams {
         rope_theta: 10_000_000.0,
     }
 }
+
+#[test]
+fn causal_declared_decode_boundaries_match_actual_selected_pso_classes_and_partition_work() {
+    let device = Device::system_default().expect("actual Metal causal pipeline catalog");
+    let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
+    let caps = cost_route::Capabilities::from(&pipelines);
+    let shape = CausalAttentionShape {
+        hidden_size: 2560,
+        query_heads: 16,
+        key_value_heads: 4,
+        head_dim: 256,
+        query_features: 4096,
+        query_projection_features: 8192,
+        kv_features: 1024,
+        rope_dim: 64,
+        maximum_context_tokens: 4096,
+        epsilon: 1e-6,
+        rope_theta: 10_000_000.0,
+        rope_interleaved: true,
+        output_gate: true,
+    };
+    let coverage = super::super::decode_context::coverage(shape, caps);
+    let evidence = |sequence| {
+        let params = cost_route::row_params(shape, 1, sequence - 1, sequence, caps).unwrap();
+        let mut builder = SelectedCommandCostBuilderV1::new(1);
+        attention(&mut builder, &pipelines, &params, 4096).unwrap();
+        builder.finish().unwrap()
+    };
+    assert!(!coverage.is_complete());
+    assert!(!coverage.known_boundaries().is_empty());
+    for boundary in coverage.known_boundaries() {
+        let sequence = boundary.first_sequence_tokens.get();
+        let (before, after) = (evidence(sequence - 1), evidence(sequence));
+        assert_eq!(
+            boundary.kind,
+            ferrum_interfaces::vnext::DecodeContextBoundaryKind::KernelFamily
+        );
+        assert_ne!(before.family_signature(), after.family_signature());
+    }
+    let mut partition_changes = 0;
+    for sequence in 2..=shape.maximum_context_tokens {
+        let before_params =
+            cost_route::row_params(shape, 1, sequence - 2, sequence - 1, caps).unwrap();
+        let after_params = cost_route::row_params(shape, 1, sequence - 1, sequence, caps).unwrap();
+        let (a, b) = (
+            pipelines.dispatch_plan(&before_params),
+            pipelines.dispatch_plan(&after_params),
+        );
+        if a.kind == AttentionDispatchKind::GroupedDecode
+            && b.kind == a.kind
+            && a.threadgroups != b.threadgroups
+        {
+            partition_changes += 1;
+            let (before, after) = (evidence(sequence - 1), evidence(sequence));
+            // A changed reduction partition is numeric launch work, not
+            // license to give the same PSO chain another statistical class.
+            assert_eq!(before.family_signature(), after.family_signature());
+            assert!(after.work().inner_work_units > before.work().inner_work_units);
+            assert!(!coverage
+                .known_boundaries()
+                .iter()
+                .any(|boundary| boundary.first_sequence_tokens.get() == sequence));
+        }
+    }
+    assert!(partition_changes > 0);
+}
 #[test]
 fn causal_statistical_pairs_include_the_retained_prefix_and_each_new_query() {
     assert_eq!(pairs(&params(1, 618)), Some(619 * 16));

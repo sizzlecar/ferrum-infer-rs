@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 mod catalog;
+mod population;
 pub use catalog::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -79,6 +80,9 @@ pub struct DeviceSubmissionGraphEvidence {
 }
 
 impl DeviceSubmissionGraphEvidence {
+    pub const fn before_state(self) -> DeviceCostGraphStreamState {
+        self.before
+    }
     pub const fn replayed_segments(self) -> u64 {
         self.replayed_segments
     }

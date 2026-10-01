@@ -151,7 +151,16 @@ pub(super) fn encode_embedding(
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
     let prepared = embedding::prepare(fingerprint, precision, &invocation)?;
-    let selected = prepared.selected(precision, structured_capture);
+    let observation_recipe = super::CudaReplayCostRecipe::native_embedding(
+        &invocation,
+        &prepared.part,
+        prepared.launches.iter().map(|row| row.2),
+        precision.element(),
+        prepared
+            .scratch
+            .map_or(0, |index| prepared.regions[index].length_bytes()),
+        structured_capture,
+    );
     let embedding::Prepared {
         part,
         regions,
@@ -216,7 +225,7 @@ pub(super) fn encode_embedding(
             0,
         )
     })
-    .map(|command| command.with_statistical_evidence(selected))
+    .map(|command| command.with_replay_cost_recipe(observation_recipe))
     .map_err(|error| error.to_string())
 }
 
@@ -499,7 +508,21 @@ pub(super) fn encode_projection(
         dispatches,
         key,
         selected,
-    } = prepare_projection(fingerprint, precision, capture, &invocation)?;
+    } = prepare_projection(
+        fingerprint,
+        precision,
+        ferrum_types::SloStructuredCostCapture::Disabled,
+        &invocation,
+    )?;
+    let observation_recipe = super::CudaReplayCostRecipe::native_head(
+        &invocation,
+        &parts,
+        launches.iter().map(|row| row.2),
+        stride,
+        precision.element(),
+        scratch.map_or(0, |index| regions[index].length_bytes()),
+        capture,
+    );
     let kernels = kernels.clone();
     CudaDeviceCommand::replayable_operation(
         "vnext_native_last_token_linear",
@@ -539,7 +562,7 @@ pub(super) fn encode_projection(
             0,
         )
     })
-    .map(|command| command.with_statistical_evidence(selected))
+    .map(|command| command.with_replay_cost_recipe(observation_recipe))
     .map_err(|error| error.to_string())
 }
 

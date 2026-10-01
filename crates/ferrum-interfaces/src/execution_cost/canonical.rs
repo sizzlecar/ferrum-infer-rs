@@ -203,6 +203,7 @@ pub struct CanonicalWaveCostShape {
 /// representation on the actual observation path. All errors are sticky.
 pub struct CanonicalWaveCostBuilder {
     statistical: super::statistical::StatisticalWaveAccumulator,
+    statistical_enabled: bool,
     structured_host: Option<super::statistical::StructuredHostAccumulator>,
     provider: Sha256,
     output: Sha256,
@@ -253,6 +254,12 @@ fn provider_identity(
     Ok(())
 }
 impl CanonicalWaveCostBuilder {
+    /// Execution commitment only. Never projects a passive statistical sidecar.
+    pub fn new_exact(retries: u32, product: CostProductOutput) -> Self {
+        let mut value = Self::new(retries, product);
+        value.statistical_enabled = false;
+        value
+    }
     pub fn new(retries: u32, product: CostProductOutput) -> Self {
         let mut provider = Sha256::new();
         bytes(&mut provider, b"ferrum.canonical-wave.providers.v1");
@@ -299,6 +306,7 @@ impl CanonicalWaveCostBuilder {
         );
         Self {
             statistical: super::statistical::StatisticalWaveAccumulator::new(),
+            statistical_enabled: true,
             structured_host: None,
             provider,
             output,
@@ -437,7 +445,9 @@ impl CanonicalWaveCostBuilder {
                 None => number(&mut this.provider, 0),
             }
             // Passive evidence never changes exact validation or authorization.
-            this.statistical.observe(command);
+            if this.statistical_enabled {
+                this.statistical.observe(command);
+            }
             this.commands += 1;
             this.last_command_index = Some(command.command_index);
             Ok(())
@@ -486,11 +496,13 @@ impl CanonicalWaveCostBuilder {
             this.expected_graph_nodes = expected_nodes;
             this.last_segment = Some(physical_command);
             this.segments += 1;
-            this.statistical.replay_segment(
-                physical_command,
-                executable_fingerprint,
-                logical_count,
-            );
+            if this.statistical_enabled {
+                this.statistical.replay_segment(
+                    physical_command,
+                    executable_fingerprint,
+                    logical_count,
+                );
+            }
             Ok(())
         })
     }
@@ -534,7 +546,9 @@ impl CanonicalWaveCostBuilder {
             {
                 return Err(CanonicalCostError::EvidenceMismatch);
             }
-            this.statistical.logical_command(command);
+            if this.statistical_enabled {
+                this.statistical.logical_command(command);
+            }
             Ok(())
         })
     }
@@ -582,7 +596,7 @@ impl CanonicalWaveCostBuilder {
                 } else {
                     this.row_multiset_rows = None;
                 }
-                if host.supports_empirical_plain_text_content() {
+                if host.supports_installed_plain_text_content() {
                     if let Some(hash) = &mut this.content_output {
                         number(hash, role.into());
                         bytes(hash, &host.policy.categorical_signature);

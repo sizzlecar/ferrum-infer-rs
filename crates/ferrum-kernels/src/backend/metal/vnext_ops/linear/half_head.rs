@@ -530,15 +530,7 @@ impl HalfHeadPipelines {
             Some((self.small.get(at)?, *entry))
         }
     }
-    pub(super) fn append_statistical(
-        &self,
-        b: &mut ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1,
-        launch: LinearLaunch,
-        scratch: u64,
-    ) -> Option<()> {
-        use ferrum_interfaces::execution_cost::{KernelNumericWorkV1, SelectedAlgorithmClassV1};
-        use sha2::{Digest, Sha256};
-        use std::sync::OnceLock;
+    pub(super) fn freeze_observation(&self, launch: LinearLaunch) -> Option<FrozenHalfHead> {
         LastTokenProjectionKind::Half
             .validate_part(PreparedLinearPart {
                 region: launch.weight_region,
@@ -551,6 +543,49 @@ impl HalfHeadPipelines {
         LastTokenProjectionKind::Half
             .validate_numeric_launch(launch)
             .ok()?;
+        let tiled = launch.params.rows >= 8;
+        let parts = if tiled {
+            [Some((0, launch.params.rows)), None]
+        } else {
+            small_parts(launch.params.rows)
+        };
+        let mut rows = [None, None];
+        for (at, (_, count)) in parts.into_iter().flatten().enumerate() {
+            let params = LinearParams {
+                rows: count,
+                ..launch.params
+            };
+            let (_, entry) = self.selected_pipeline(params)?;
+            rows[at] = Some((params, entry));
+        }
+        Some(FrozenHalfHead { rows, tiled })
+    }
+    pub(super) fn append_statistical(
+        &self,
+        b: &mut ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1,
+        launch: LinearLaunch,
+        scratch: u64,
+    ) -> Option<()> {
+        self.freeze_observation(launch)?.append(b, scratch)
+    }
+}
+/// Actual selector names and scalar parameters; contains no Metal handles.
+pub(super) struct FrozenHalfHead {
+    rows: [Option<(LinearParams, &'static str)>; 2],
+    tiled: bool,
+}
+impl FrozenHalfHead {
+    pub(super) fn occurrences(&self) -> u64 {
+        self.rows.iter().flatten().count() as u64
+    }
+    pub(super) fn append(
+        &self,
+        b: &mut ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1,
+        scratch: u64,
+    ) -> Option<()> {
+        use ferrum_interfaces::execution_cost::{KernelNumericWorkV1, SelectedAlgorithmClassV1};
+        use sha2::{Digest, Sha256};
+        use std::sync::OnceLock;
         static NUMERIC: OnceLock<[u8; 32]> = OnceLock::new();
         let numeric = *NUMERIC.get_or_init(|| {
             let mut h = Sha256::new();
@@ -560,18 +595,9 @@ impl HalfHeadPipelines {
             h.update(include_str!("half_head.rs").as_bytes());
             h.finalize().into()
         });
-        let tiled = launch.params.rows >= 8;
-        let parts = if tiled {
-            [Some((0, launch.params.rows)), None]
-        } else {
-            small_parts(launch.params.rows)
-        };
-        for (_, rows) in parts.into_iter().flatten() {
-            let params = LinearParams {
-                rows,
-                ..launch.params
-            };
-            let (_, entry) = self.selected_pipeline(params)?;
+        let tiled = self.tiled;
+        for &(params, entry) in self.rows.iter().flatten() {
+            let rows = params.rows;
             let (grid, padded, threads, shared) = if tiled {
                 let x = u64::from(rows).div_ceil(32);
                 let y = u64::from(params.out_features).div_ceil(64);

@@ -286,6 +286,7 @@ fn test_raw_config(state_profile: TestStateProfile) -> Value {
         ("token_scaled_state", state_profile.token_scaled_state),
         ("recurrent_state", state_profile.recurrent_state),
         ("token_io", state_profile.token_io),
+        ("checkpoint", state_profile.checkpoint),
     ] {
         if enabled {
             config[name] = json!(true);
@@ -884,6 +885,13 @@ pub(crate) fn fixture() -> Fixture {
 /// device before provisioning. Callers may isolate accounts or deliberately
 /// share one; this never edits a descriptor after the plan has been resolved.
 pub(crate) fn fixture_with_device_id(device_id: DeviceId) -> Fixture {
+    fixture_with_device_and_sequence_capacity(device_id, None)
+}
+
+pub(crate) fn fixture_with_device_and_sequence_capacity(
+    device_id: DeviceId,
+    maximum_active_sequences: Option<u32>,
+) -> Fixture {
     fixture_on_device(
         TestStateProfile::none(),
         ProviderBehavior::Success,
@@ -892,6 +900,21 @@ pub(crate) fn fixture_with_device_id(device_id: DeviceId) -> Fixture {
         false,
         ContractVersion::new(1, 0),
         device_id,
+        maximum_active_sequences,
+    )
+}
+
+/// Isolated CPU prefix fixture: one actual fixed boundary value per sequence.
+pub(crate) fn fixture_with_checkpoint(device_id: DeviceId) -> Fixture {
+    fixture_on_device(
+        TestStateProfile::checkpoint(),
+        ProviderBehavior::Success,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+        ContractVersion::new(1, 0),
+        device_id,
+        None,
     )
 }
 
@@ -1035,6 +1058,7 @@ fn fixture_with_provider_behavior_execution_semantics_retention_storage_and_oper
         retain_determinism_outputs,
         operation_version,
         id("device.device-operation.0"),
+        None,
     )
 }
 
@@ -1046,6 +1070,7 @@ fn fixture_on_device(
     retain_determinism_outputs: bool,
     operation_version: ContractVersion,
     device_id: DeviceId,
+    maximum_active_sequences: Option<u32>,
 ) -> Fixture {
     let scratch = if matches!(
         behavior,
@@ -1086,6 +1111,28 @@ fn fixture_on_device(
             ),
             None,
         )
+    };
+    let runtime_policy = if maximum_active_sequences.is_some() || state_profile.checkpoint {
+        let mut memory = runtime_policy.memory().clone();
+        if let Some(maximum) = maximum_active_sequences {
+            memory.maximum_active_sequences = maximum;
+        }
+        if state_profile.checkpoint {
+            memory.checkpoint_capacity = Some(CheckpointCapacityPolicy::new(4096).unwrap());
+        }
+        ResolvedRuntimePolicy::new(
+            runtime_policy.policy_id(),
+            runtime_policy.version(),
+            runtime_policy.scheduling(),
+            memory,
+            runtime_policy.admission().clone(),
+            runtime_policy.attention_execution(),
+            runtime_policy.execution_determinism(),
+            runtime_policy.reusable_execution().cloned(),
+        )
+        .unwrap()
+    } else {
+        runtime_policy
     };
     let provider_behavior = Arc::new(Mutex::new(behavior));
     let provider_trace = Arc::new(Mutex::new(ProviderTrace::default()));
@@ -1130,7 +1177,7 @@ fn fixture_on_device(
     .plan_hash()
     .clone();
     let (runtime, runtime_trace) = runtime(&catalog);
-    if state_profile.token_io {
+    if state_profile.token_io || state_profile.checkpoint {
         runtime_trace.lock().unwrap().memory = Some(Arc::new(Mutex::new(
             memory_fixture::TestMemoryRegistry::default(),
         )));

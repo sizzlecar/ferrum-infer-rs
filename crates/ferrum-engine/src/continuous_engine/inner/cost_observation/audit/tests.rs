@@ -152,7 +152,9 @@ fn queue_contention_and_capacity_losses_remain_in_the_offered_population() {
     .unwrap();
     sink.offer(sample(100)).unwrap();
     assert_eq!(sink.offer(sample(101)), Err(CostSampleDrop::Capacity));
-    sink.with_locked_queue(|| assert_eq!(sink.offer(sample(102)), Err(CostSampleDrop::Contended)));
+    sink.with_locked_producer(|| {
+        assert_eq!(sink.offer(sample(102)), Err(CostSampleDrop::Contended))
+    });
     let stats = sink.stats();
     assert_eq!(stats.offered, 3);
     assert_eq!(stats.offered_completed, 3);

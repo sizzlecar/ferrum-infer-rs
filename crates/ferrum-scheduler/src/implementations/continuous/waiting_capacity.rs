@@ -1,7 +1,7 @@
 //! Acceptance capacity derived from the actual waiting queue under its write
 //! lock. No second ledger can outlive a cancellation, admission or queue move.
 use super::*;
-use ferrum_types::{SloMode, SloTimeAdmissionPolicy};
+use ferrum_types::SloMode;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct WaitingPromptUsage {
@@ -52,8 +52,7 @@ pub(super) fn check(
     waiting: &DynamicAdmissionQueue<ContinuousBatchRequest>,
     incoming: &InferenceRequest,
 ) -> Result<()> {
-    let enabled = config.slo.mode == SloMode::Enforce
-        && config.slo.admission.time_policy == SloTimeAdmissionPolicy::CompleteRequests;
+    let enabled = config.slo.mode == SloMode::Enforce;
     if waiting.len() >= config.max_waiting_requests {
         return Err(if enabled {
             FerrumError::resource_exhausted("scheduler waiting request capacity exhausted")

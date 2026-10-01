@@ -1269,6 +1269,16 @@ impl ContinuousBatchScheduler {
     }
 
     /// Returns mutually exclusive admission phases from one authoritative map.
+    /// Passive bounded health read. Busy is observable, never a stale copy.
+    /// The callback receives no queue mutation or execution authority.
+    pub fn try_observe_admission_phases<T>(
+        &self,
+        observe: impl FnOnce(&HashMap<RequestId, RequestPhase>, std::time::Instant) -> T,
+    ) -> Option<T> {
+        let phases = self.request_index.try_read()?;
+        Some(observe(&phases, std::time::Instant::now()))
+    }
+
     pub fn admission_phase_counts(&self) -> ContinuousSchedulerAdmissionCounts {
         let request_index = self.request_index.read();
         let mut counts = ContinuousSchedulerAdmissionCounts {
@@ -1763,7 +1773,11 @@ impl ContinuousBatchScheduler {
         let mut remaining_tokens = hint.max_tokens;
         let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
         let prefill_queue = self.prefill_queue.read();
-        for request in prefill_queue.iter().take(hint.max_batch_size) {
+        for request in prefill_queue
+            .iter()
+            .filter(|request| !request.prefix_rendezvous.held())
+            .take(hint.max_batch_size)
+        {
             let tokens =
                 self.prefill_budget_tokens(request, None, prefill_step_chunk, remaining_tokens);
             if tokens == 0 || tokens > remaining_tokens {
@@ -3111,7 +3125,7 @@ impl ContinuousBatchScheduler {
         prefill_step_chunk: Option<usize>,
         step_tokens_remaining: usize,
     ) -> usize {
-        if step_tokens_remaining == 0 {
+        if step_tokens_remaining == 0 || req.prefix_rendezvous.held() {
             return 0;
         }
         if let Some(chunk) =
@@ -3277,7 +3291,7 @@ impl ContinuousBatchScheduler {
                 continue;
             }
             prefix_restore::release_orphaned_capacity_hold(req);
-            if req.prefix_restore.is_pending() {
+            if req.prefix_restore.is_pending() || req.prefix_rendezvous.held() {
                 continue;
             }
             if Self::execution_readiness_is_blocked(req) {
@@ -4218,7 +4232,9 @@ impl Scheduler for ContinuousBatchScheduler {
             if let Some(position) =
                 waiting.position(|request| request.inner.request.id == request_id)
             {
-                waiting.remove(position);
+                if let Some(request) = waiting.remove(position) {
+                    request.prefix_rendezvous.cancel_admitted_dependency();
+                }
                 self.request_index.write().remove(&request_id);
                 self.record_pressure_frontier_terminal(&request_id);
                 self.failed_counter.fetch_add(1, Ordering::Relaxed);
@@ -4229,6 +4245,7 @@ impl Scheduler for ContinuousBatchScheduler {
         // Remove from decode queue
         let mut decode_queue = self.decode_queue.write();
         if let Some(req) = decode_queue.remove(&request_id) {
+            req.prefix_rendezvous.cancel_admitted_dependency();
             // Record metrics
             self.metrics_tracker.record_completion(&req);
 
@@ -4261,7 +4278,9 @@ impl Scheduler for ContinuousBatchScheduler {
                 .iter()
                 .position(|r| r.inner.request.id == request_id)
             {
-                prefill_queue.remove(pos);
+                if let Some(request) = prefill_queue.remove(pos) {
+                    request.prefix_rendezvous.cancel_admitted_dependency();
+                }
                 self.request_index.write().remove(&request_id);
                 self.record_pressure_frontier_terminal(&request_id);
                 match response.finish_reason {
@@ -4311,7 +4330,9 @@ impl Scheduler for ContinuousBatchScheduler {
             let waiting_position =
                 waiting_queue.position(|request| request.inner.request.id == request_id);
             if let Some(pos) = waiting_position {
-                waiting_queue.remove(pos);
+                if let Some(request) = waiting_queue.remove(pos) {
+                    request.prefix_rendezvous.cancel_admitted_dependency();
+                }
                 self.request_index.write().remove(&request_id);
                 self.record_pressure_frontier_terminal(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
@@ -4327,7 +4348,9 @@ impl Scheduler for ContinuousBatchScheduler {
                 .iter()
                 .position(|r| r.inner.request.id == request_id)
             {
-                prefill_queue.remove(pos);
+                if let Some(request) = prefill_queue.remove(pos) {
+                    request.prefix_rendezvous.cancel_admitted_dependency();
+                }
                 self.request_index.write().remove(&request_id);
                 self.record_pressure_frontier_terminal(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
@@ -4340,7 +4363,8 @@ impl Scheduler for ContinuousBatchScheduler {
         // Check and remove from decode queue
         {
             let mut decode_queue = self.decode_queue.write();
-            if decode_queue.remove(&request_id).is_some() {
+            if let Some(request) = decode_queue.remove(&request_id) {
+                request.prefix_rendezvous.cancel_admitted_dependency();
                 self.request_index.write().remove(&request_id);
                 self.record_pressure_frontier_terminal(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
@@ -4639,12 +4663,22 @@ mod tests {
         ];
         {
             let mut request_index = scheduler.request_index.write();
+            assert!(scheduler.try_observe_admission_phases(|_, _| ()).is_none());
             for phase in phases {
                 request_index.insert(RequestId::new(), phase);
             }
         }
 
         let counts = scheduler.admission_phase_counts();
+        let observed = scheduler
+            .try_observe_admission_phases(|phases, _| {
+                phases
+                    .values()
+                    .filter(|p| **p == RequestPhase::Waiting)
+                    .count()
+            })
+            .unwrap();
+        assert_eq!(observed, counts.waiting_requests);
         assert_eq!(counts.waiting_requests, 1);
         assert_eq!(counts.active_prefill_sequences, 1);
         assert_eq!(counts.active_decode_sequences, 2);

@@ -31,6 +31,64 @@ impl TestCommand {
 }
 
 #[test]
+fn host_profile_validates_inherited_journals_without_a_frame_limit() {
+    let detail = ObservabilityProfileDetail::Host;
+    let empty = RuntimeConfigSnapshot::default();
+    assert!(validate_requested(None, detail, None, None, &empty).is_ok());
+    for key in [
+        "FERRUM_PROFILE_JSONL",
+        "FERRUM_SCHEDULER_TRACE_JSONL",
+        "FERRUM_LEGACY_SCHEDULER_TRACE_JSONL",
+    ] {
+        let environment = RuntimeConfigSnapshot::from_env_vars([(key, "journal.jsonl")]);
+        assert!(validate_requested(None, detail, None, None, &environment).is_err());
+    }
+    assert!(
+        validate_requested(None, detail, Some(Path::new("profile.jsonl")), None, &empty).is_err()
+    );
+    assert!(validate_requested(
+        None,
+        detail,
+        None,
+        Some(Path::new("scheduler.jsonl")),
+        &empty
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn host_profile_rejects_journal_for_run_and_serve_before_loading_model() {
+    for command in ["run", "serve"] {
+        for journal in [
+            "--profile-jsonl",
+            "--scheduler-trace-jsonl",
+            "--memory-profile-jsonl",
+            "--request-dump-dir",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("unexpected-journal.jsonl");
+            let parsed = TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "/missing-host-profile-model",
+                "--profile-detail",
+                "host",
+                journal,
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            let error = parsed
+                .command
+                .execute(crate::config::CliConfig::default())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, FerrumError::Config { .. }));
+            assert!(!path.exists());
+        }
+    }
+}
+
+#[test]
 fn frame_limit_cli_accepts_only_positive_u32_for_run_and_serve() {
     for command in ["run", "serve"] {
         assert!(TestCli::try_parse_from(["ferrum", command, "test-model"])

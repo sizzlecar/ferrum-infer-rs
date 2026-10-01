@@ -196,13 +196,22 @@ fn encode_with_policy(
         fingerprint,
         q8.map(Q8F32ScaleKernels::policy),
         mmq,
-        capture,
+        ferrum_types::SloStructuredCostCapture::Disabled,
         &invocation,
     )?;
     let recipe = if capture.is_disabled() {
         None
     } else {
-        replay_cost::Recipe::from_prepared(&prepared, q8.map(Q8F32ScaleKernels::policy), mmq)
+        invocation
+            .observation_template_budget()
+            .and_then(|budget| {
+                replay_cost::Recipe::from_prepared(
+                    &prepared,
+                    q8.map(Q8F32ScaleKernels::policy),
+                    mmq,
+                    budget,
+                )
+            })
             .and_then(|numeric| {
                 super::replay_cost::CudaReplayCostRecipe::native(&invocation, numeric)
             })

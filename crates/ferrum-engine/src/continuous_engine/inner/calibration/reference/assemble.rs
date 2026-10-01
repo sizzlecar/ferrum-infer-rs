@@ -20,6 +20,42 @@ pub struct CalibrationReferenceArtifact {
     pub reference_revision: NonZeroU64,
 }
 
+pub(in crate::continuous_engine::inner::calibration) struct MemoryReferenceArtifact {
+    pub loaded: Arc<LoadedPrefillReference>,
+    pub bytes: Vec<u8>,
+    pub plan_sha256: [u8; 32],
+    pub frozen_accepted_ordinal: u64,
+    pub training_accepted_ordinal: u64,
+    pub source_sha256: [u8; 32],
+    pub discovery_records: Vec<ReferenceRecordId>,
+}
+
+impl MemoryReferenceArtifact {
+    fn publish(self, destination: &Path) -> Result<CalibrationReferenceArtifact> {
+        let path = publish(destination, &self.bytes)?;
+        let identity = self.loaded.identity();
+        Ok(CalibrationReferenceArtifact {
+            schema_version: if self.loaded.piecewise_domain().is_some() {
+                PREFILL_REFERENCE_SCHEMA_V2
+            } else {
+                PREFILL_REFERENCE_SCHEMA_V1
+            },
+            reference_domain: self.loaded.piecewise_domain(),
+            path,
+            sha256: identity.artifact_sha256,
+            bytes: self.bytes.len() as u64,
+            protocol_sha256: identity.protocol_sha256,
+            plan_sha256: self.plan_sha256,
+            frozen_accepted_ordinal: self.frozen_accepted_ordinal,
+            training_accepted_ordinal: self.training_accepted_ordinal,
+            source_sha256: self.source_sha256,
+            discovery_records: self.discovery_records,
+            tau_ref_ns: self.loaded.tau_ref_ns().get(),
+            reference_revision: identity.revision,
+        })
+    }
+}
+
 impl CalibrationReferenceCollector {
     /// Cold-path original-source join. The immutable cut must precede heldout
     /// validation; do not pass the later shutdown export. Every required
@@ -29,6 +65,15 @@ impl CalibrationReferenceCollector {
         cut: &CalibrationProfileArtifact,
         destination: &Path,
     ) -> Result<CalibrationReferenceArtifact> {
+        let requested = self.requested_witnesses(cut.accepted_ordinal)?;
+        let joined = source::read(cut, &self.fingerprint, &requested)?;
+        self.assemble_from_joined(joined, cut.accepted_ordinal, cut.source_digest, destination)
+    }
+
+    pub(super) fn requested_witnesses(
+        &self,
+        accepted_ordinal: u64,
+    ) -> Result<BTreeMap<u64, &Witness>> {
         let required = self
             .plan
             .curves
@@ -38,7 +83,7 @@ impl CalibrationReferenceCollector {
             .ok_or_else(|| invalid("reference trial count overflow"))?;
         if self.trials.len() != required
             || self.trials.values().any(|trial| !trial.complete)
-            || cut.accepted_ordinal <= self.frozen_accepted_ordinal
+            || accepted_ordinal <= self.frozen_accepted_ordinal
         {
             return Err(invalid("reference trials/cut are incomplete"));
         }
@@ -49,7 +94,7 @@ impl CalibrationReferenceCollector {
             .map(|row| &row.witness)
             .chain(self.trials.values().flat_map(|trial| trial.samples.iter()))
         {
-            if witness.accepted > cut.accepted_ordinal
+            if witness.accepted > accepted_ordinal
                 || requested.insert(witness.accepted, witness).is_some()
             {
                 return Err(invalid(
@@ -57,14 +102,33 @@ impl CalibrationReferenceCollector {
                 ));
             }
         }
-        let joined = source::read(cut, &self.fingerprint, &requested)?;
+        Ok(requested)
+    }
+
+    pub(super) fn assemble_from_joined(
+        self,
+        joined: source::Joined,
+        accepted_ordinal: u64,
+        source_digest: [u8; 32],
+        destination: &Path,
+    ) -> Result<CalibrationReferenceArtifact> {
+        self.assemble_memory(joined, accepted_ordinal, source_digest)?
+            .publish(destination)
+    }
+
+    pub(super) fn assemble_memory(
+        self,
+        joined: source::Joined,
+        accepted_ordinal: u64,
+        source_digest: [u8; 32],
+    ) -> Result<MemoryReferenceArtifact> {
         let record = |witness: &Witness| -> Result<ReferenceRecordId> {
             let sample = joined
                 .samples
                 .get(&witness.accepted)
                 .ok_or_else(|| invalid("reference source join missing"))?;
             Ok(ReferenceRecordId {
-                source_sha256: cut.source_digest,
+                source_sha256: source_digest,
                 ordinal: sample.source_record,
             })
         };
@@ -185,30 +249,19 @@ impl CalibrationReferenceCollector {
             .iter()
             .map(|row| record(&row.witness))
             .collect::<Result<Vec<_>>>()?;
-        let path = publish(destination, &bytes)?;
-        Ok(CalibrationReferenceArtifact {
-            schema_version: if self.plan.piecewise.is_some() {
-                PREFILL_REFERENCE_SCHEMA_V2
-            } else {
-                PREFILL_REFERENCE_SCHEMA_V1
-            },
-            reference_domain: loaded.piecewise_domain(),
-            path,
-            sha256: Sha256::digest(&bytes).into(),
-            bytes: bytes.len() as u64,
-            protocol_sha256,
+        Ok(MemoryReferenceArtifact {
+            loaded,
+            bytes,
             plan_sha256: self.plan_sha256,
             frozen_accepted_ordinal: self.frozen_accepted_ordinal,
-            training_accepted_ordinal: cut.accepted_ordinal,
-            source_sha256: cut.source_digest,
+            training_accepted_ordinal: accepted_ordinal,
+            source_sha256: source_digest,
             discovery_records,
-            tau_ref_ns: loaded.tau_ref_ns().get(),
-            reference_revision: self.plan.reference_revision,
         })
     }
 }
 
-fn publish(destination: &Path, bytes: &[u8]) -> Result<PathBuf> {
+pub(super) fn publish(destination: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
