@@ -111,7 +111,6 @@ pub(in crate::continuous_engine::inner::calibration) enum ProbePrefixFallback {
 pub(in crate::continuous_engine::inner::calibration) struct AcquiredProbePrefix {
     plan: ProbePrefixAcquisitionPlan,
     tokens: Arc<[TokenId]>,
-    maximum_sequence_tokens: usize,
     lease: Arc<dyn PrefixCaptureLease>,
     deadline: std::time::Instant,
     acknowledged_capture: bool,
@@ -495,7 +494,6 @@ impl CalibrationSession {
         let acquired = AcquiredProbePrefix {
             plan,
             tokens,
-            maximum_sequence_tokens,
             lease,
             deadline: budget.deadline().into_std(),
             acknowledged_capture: true,
@@ -596,13 +594,14 @@ impl CalibrationSession {
                     "acquired prefix restore requires a fresh admitted owner",
                 ));
             }
-            if sequence.input_tokens.as_slice() != acquired.tokens.as_ref()
-                || sequence.model_maximum_sequence_tokens() != acquired.maximum_sequence_tokens
-            {
+            if sequence.input_tokens.as_slice() != acquired.tokens.as_ref() {
                 return Ok(ProbePrefixRestore::ColdFallback(
                     ProbePrefixFallback::PromptMismatch,
                 ));
             }
+            // A proper-prefix checkpoint contains no sampled output. Restore
+            // validates this target's own admission and physical capacity; its
+            // output allowance need not equal the retired producer's allowance.
             (
                 Arc::clone(&acquired.tokens),
                 sequence.model_maximum_sequence_tokens(),

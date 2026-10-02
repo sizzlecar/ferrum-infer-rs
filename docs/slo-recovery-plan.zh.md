@@ -4,6 +4,10 @@
 
 当前仍未交付完整的 SLO 自动闭环版本。首先验证原预算下的覆盖和规划可行性，再完成正常入口的自动闭环，随后进行双后端、完整性能和发布验收。每一步都必须产出可复现的行为证据；局部测试、成本快照数量和源码规模不作为完成度。
 
+下一份可运行检查点以同一条产品链路验收：正常 `run` / `serve` 从空成本状态自动完成准备和原独立资格阶段，发布有效成本模型，内容不同但处于支持范围内的普通请求在执行前得到预测，Enforce 实际采用，真实提交与回执配对，输出完整且资源可退役。用户无需手工训练、导入成本文件或设置隐藏环境组合。CPU 正例先约束组合行为，再以同一源码验证真实后端；该检查点通过后才进入完整性能验收，不把它标成最终发布完成。
+
+当前唯一实现主线是把已有 native 前缀准备接入共享自动启动。每个子修改必须说明它消除上述链路中的哪个阻断；与链路无关的优化单独登记，不能混进当前修改。如果失败推翻预算、支持域或生命周期假设，先修订对应合同与判别用例，再继续实现。没有新的原因证据，不重复昂贵测试，也不根据报错不断追加旁支设计。
+
 ## 目标与验收依据
 
 完整功能范围沿用 [原实施清单](slo-implementation-plan.zh.md) 和 [算法设计](slo-algorithm-design.zh.md)。这两份文档保存的是历史进度，其中相对 llama.cpp 的旧胜负硬门已被后续要求覆盖。
@@ -44,6 +48,7 @@ llama.cpp 继续作为同机、同模型、同负载的比较基线，但不再�
 | --- | --- |
 | 自动入口仍用 cold cohort | `prepared_owner/startup.rs` 调用 `run_probe_cohort`；两个正式声明仍为 `native_prefix_acquisition: None`。新恢复协议尚未带来正常启动的准备工作节省 |
 | 已有真实恢复协议测试 | capture、关闭 seed、fresh restore ACK 和后续执行有 CPU 证明；该测试有意不满足资格下限，不能证明发布与普通请求采用 |
+| 正式 cache-off 配置也关闭了校准 checkpoint 能力 | `vnext_executor.rs` 由普通 prefix cache 开关控制 `checkpoint_capacity`；现有 guarded capture 同时写共享缓存。单纯删除 engine 守卫既不够，也不能证明普通流仍保持 cache-off |
 | 已有受控 cold 发布和采用测试 | 已发布 4 个 epoch 并完成 2 次控制器 witness；多跨度测试给 1 秒规划预算，实测两次分别约 32.29ms、31.30ms，不是产品 2ms 证明 |
 | 已有产品预算探针 | `plan_e2e.rs` 两个 2ms wall-clock 探针为 ignored，需在优化构建和空闲主机上显式运行 |
 | 已有工作量对账 | `source_work.rs` 遍历真实 `series.requests_for` 核对请求、token、wave；原测试使用结构体 Default，与 Enforce 有效默认数值策略不同 |
@@ -106,6 +111,7 @@ llama.cpp 继续作为同机、同模型、同负载的比较基线，但不再�
 | 改动 | 保留的机制 | 必须新增的证明 |
 | --- | --- | --- |
 | checkpoint 与目标 admission 合同 | 模型、前缀、owner、scope、时间、真实容量校验 | 删除过强的 source/target maximum sequence 相等限制；短上限 seed 到长目标及反向合法恢复；目标自身不足仍零提交拒绝 |
+| 校准私有 checkpoint 用途 | 原物理 ledger、总内存上限、guard、completion 和 ACK | 普通 prefix cache 关闭时校准仍可使用有界私有 capture/restore；私有 capture 不插入共享缓存，普通请求不因此增加命中；最后一个真实 owner 退役后容量可回收 |
 | 准备工作与选择账本 | 已有实际支出/selection reservation 和 F/R/Q | 每 distinct acquisition key 一次 seed；不同合法 preset/max-output 可共享确定性前缀；ordinary ActualPrefill 保持 cold；token/actions/offers 对账 |
 | source 准备和冻结 | 已有 inventory、collector、source series | source 打开前绑定真实 scope；准备结果区分 native、cold、可解释跳过和致命错误；失败清理后其他可执行 source 能继续 |
 | cold 回退 | 原代表 cases、原资格规则和 cold layout | collector 打开前重建可执行 cohort plan、ranges、phase schedule、manifest/parent 绑定及额外预算；seed 已消费不退款；不挪用其他 source 预留；不足则保留 gap |
@@ -115,7 +121,7 @@ llama.cpp 继续作为同机、同模型、同负载的比较基线，但不再�
 
 已经冻结并开始收样的 native source 恢复失败时，保留现有共享 drain 后结束 series、保留此前有效 catalog 的路径，不能静默混入 cold 样本。现有 `retire_startup_owner_source` 只接受已完成并 checkpointed 的 source，不能拿它退役未完成源，更不能直接清 collector 字段。若确需失败源之后继续收样，先实现并验证显式 abort 与 worker barrier，再扩大继续执行范围。
 
-第一版采用 source 内复用、source 间顺序执行，沿用真实缓存 ledger 和 eviction。峰值考虑获取后续 key 时已有 checkpoint、seed 与 capture 目标共存，也考虑较窄但上下文/输出上限更长的 cohort；不能只用最大宽度代表最大驻留。生产 capture 当前同时进入共享 prefix cache；释放 `AcquiredProbePrefix` 的额外 Arc 不等于全部设备容量归零。若证据显示共享缓存无法表达正确隔离，再设计明确的 private capture 用途，不能先虚构一套主机字节数代替物理驻留。
+第一版采用 source 内复用、source 间顺序执行，沿用真实 checkpoint ledger 和既有 completion/reaper。峰值考虑获取后续 key 时已有 checkpoint、seed 与 capture 目标共存，也考虑较窄但上下文/输出上限更长的 cohort；不能只用最大宽度代表最大驻留。接线审查已确认必须区分校准私有 capture 与普通共享缓存用途：正式主表关闭普通 prefix cache，现有开关却同时移除底层 checkpoint capacity，而成功 capture 又同时进入共享 index。正确修复应保留同一总内存限制，使校准 lease 能独立拥有 checkpoint，私有 capture 正常完成 ACK 但不插共享 index；普通 lookup 和隐式 capture 仍遵守用户 cache 开关。不能直接打开共享缓存、更改基准配置或另造主机字节账本来替代物理容量，也不需要重写整个缓存框架。
 
 取消与 deadline 在提交边界处理：提交前检查，提交后等待真实 completion/ACK 并 drain。不得用外层 timeout 丢弃仍拥有设备事务的 future。保留主错误和清理结果；身份失配、未知提交状态或清理失败不允许假装可继续。
 
@@ -194,7 +200,15 @@ cargo check -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-page
 
 原始结果分别在本轮外部证据目录的 `g1-source-work-release.log`、`g1-product-2ms-basic-release.log`、`g1-product-2ms-forward-release.log`。构建使用仓库标准 release 配置，共享 target，首次优化构建 13 分钟，后续探针复用同一产物。2ms 探针保持原受控校准 fixture，只将其规划 allowance 设为产品默认；新增产品有效配置的检查仍只是输入工作账，两者不能拼成完整生产启动证明。
 
-新得到的限制是：当前 CPU 输入计划还有 1324 requests 和 13196 waves 的计划余量，但保留 1 个 UnknownPopulation 和 4 个 RetainedSourceCapacity(maximum_sources=4) gap。下一项判别检查是确定排除的 population 是否影响普通 Configured 请求，并核对 source 分组/保留语义；不增加上限来抹掉缺口。现有小场景的 2ms 证据已成立，暂不展开没有测量依据的规划器重写。其余关卡保持未验收，后续按证据和下一项判别检查更新，不给无验收依据的百分比或完成时间承诺。
+当前 CPU 输入计划还有 1324 requests 和 13196 waves 的计划余量，保留 1 个 UnknownPopulation 和 4 个 RetainedSourceCapacity(maximum_sources=4) gap。逐 batch 核对后，四个 source 容量 gap 全属于辅助 GreedyLength Decode；本 fixture 的 Configured FullLogits Prefill/Decode 已选入。maximum_sources 约束真实保留模型 origin，执行预算余量不能兑换这个容量；现有证据不支持提高上限或修改分组。这个结论仅适用于当前 fixture，不是所有用户采样配置的覆盖保证。
+
+UnknownPopulation 仍需定位到原 case 及真实 admission，区分正常越界负例和可执行的 Configured 覆盖缺口。已确认该聚合项也包含未 admission 的 WarmResidencyUnproven；日志中的 44 次资源拒绝则是已经建立 owner 后投影的未来工作超过 backing，不能表述成入口拒绝了长请求。后续完整链路必须用普通请求的真实查询检查支持范围，选入计划不等于完成资格和采用。现有小场景的 2ms 证据已成立，暂不展开没有测量依据的规划器重写。
+
+第二关的独立 admission 合同修复已通过最小检查：只删除 seed/target 最大序列长度相等的附加限制，保留目标自己的真实 admission 与容量检查。原同长生命周期及短 seed→长 target、长 seed→短 target、原 host-capacity 回退合计 4 项通过；真实 native request authority 的组级检查确认 seed 为 3/5/6、target 组最小值为 5，保留每个 cohort 的两个实际 restore ACK、完整输出、预算和原资格失败断言。它不证明完整资格或双后端运行。
+
+另有 3 项既有底层测试通过：恢复 extension 保持 request fit 且不能越界；错误 layout/超 backing 的恢复初始化拒绝；guard 拒绝时零提交并保留原 owner。格式和 diff 检查通过，workspace/backend 全量验收尚未完成。首轮新增测试错误地使用 native 路径不会调用的 observation hook，结果 1 pass / 3 fail；改用现有真实资源 authority 读取后重跑通过，原失败日志保留，没有修改生产行为或放宽断言来消除该失败。证据为 `g2-prefix-admission-dev.log`、`g2-prefix-admission-native-authority-dev.log`、`g2-restore-backing-boundary.log`、`g2-restore-guard-rejection.log` 和 `g2-restore-request-capacity.log`。
+
+下一项是校准私有 checkpoint 的用途隔离，然后接续准备账本和正常自动入口。其余关卡保持未验收，后续按用户流程和具体阻断更新，不给无验收依据的百分比或完成时间承诺。
 
 ## 来源位置
 

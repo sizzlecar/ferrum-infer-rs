@@ -54,9 +54,28 @@ fn configure_actual_executor(executor: &ControlledExecutor) {
 
 #[tokio::test]
 async fn source8_native_prefix_once_seed_close_fresh_restore_final_prefill_and_three_phases() {
+    check_native_prefix_three_phase_lifecycle(3).await;
+}
+
+#[tokio::test]
+async fn source8_native_prefix_shorter_seed_admission_restores_longer_fresh_targets() {
+    check_native_prefix_three_phase_lifecycle(1).await;
+}
+
+#[tokio::test]
+async fn source8_native_prefix_longer_seed_admission_restores_shorter_fresh_targets() {
+    check_native_prefix_three_phase_lifecycle(4).await;
+}
+
+async fn check_native_prefix_three_phase_lifecycle(seed_maximum_output: usize) {
     let (mut session, executor) = acquisition_session().await;
     configure_actual_executor(&executor);
-    let source = probes(&session).remove(0);
+    let original_native_fit = executor.native_request_fit_tokens().unwrap();
+    let mut source = probes(&session).remove(0);
+    // Only the producer's admitted maximum changes. All target requests keep
+    // the original three-token output and independent F/R/Q declarations.
+    // Capture stops before final Prefill, so setup work is unchanged.
+    source.request.sampling_params.max_tokens = seed_maximum_output;
     let source_id = source.request.id.clone();
     let expected_plan =
         crate::continuous_engine::inner::calibration::startup::ProbePrefixAcquisitionPlan::new(
@@ -94,7 +113,8 @@ async fn source8_native_prefix_once_seed_close_fresh_restore_final_prefill_and_t
         .clone();
     declared.maximum_offered_waves = 3 * cohort.inference_waves;
     declared.cohort_manifest_payload = serde_json::value::to_raw_value(&serde_json::json!({
-        "prompt":"test test test", "maximum_output":3, "prepared_prefix":"actual_native_p_minus_1", "acquisition_plan":expected_plan,
+        "prompt":"test test test", "maximum_output":3, "seed_maximum_output":seed_maximum_output,
+        "prepared_prefix":"actual_native_p_minus_1", "acquisition_plan":expected_plan,
         "acquisition_setup_work":setup, "restored_cohort_work":cohort,
         "outputs":["cli_text","completions_sse"]
     }))
@@ -119,6 +139,14 @@ async fn source8_native_prefix_once_seed_close_fresh_restore_final_prefill_and_t
     assert_eq!(
         executor.physical.load(Ordering::Acquire),
         setup.inference_waves
+    );
+    // Read the actual native request authority. The unused fixture slot has
+    // a larger fit, so the minimum here belongs to the admitted seed.
+    let seed_maximum_sequence_tokens = (3 + seed_maximum_output - 1) as u64;
+    assert!(original_native_fit > seed_maximum_sequence_tokens);
+    assert_eq!(
+        executor.native_request_fit_tokens(),
+        Some(seed_maximum_sequence_tokens)
     );
     assert!(!session
         .engine
@@ -152,6 +180,7 @@ async fn source8_native_prefix_once_seed_close_fresh_restore_final_prefill_and_t
         session.begin_prepared_owner_cohort(phase, 0).unwrap();
         let requests = probes(&session);
         for request in &requests {
+            assert_eq!(request.request.sampling_params.max_tokens, 3);
             assert!(!all_ids.contains(&request.request.id));
             all_ids.push(request.request.id.clone());
         }
@@ -176,6 +205,9 @@ async fn source8_native_prefix_once_seed_close_fresh_restore_final_prefill_and_t
             (2, 2, 0)
         );
         assert_eq!(summary.released_prefix_rows, 2);
+        // Both slots have now been replaced by this fresh cohort. Restore
+        // retains its original three-token output admission, not the seed's.
+        assert_eq!(executor.native_request_fit_tokens(), Some(3 + 3 - 1));
         session.end_prepared_owner_cohort().unwrap();
         session.completed_owner_boundary().unwrap();
         assert!(
