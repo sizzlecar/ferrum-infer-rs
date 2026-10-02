@@ -243,7 +243,9 @@ Metal 用例运行于本机 Apple M1 Max（24 GPU cores），采用测试中真�
 
 同一源码随后完成：计划组 147 项通过、62.83s（`g2-native-startup-plan-regression.log`）；正常共享 checkpoint 组 6 项通过、147.58s，包含 shared cache、自然 EOS、等待/恢复、普通 cache reuse、重新捕获及 cache-off（`g2-native-startup-shared-checkpoint-regression.log`）；自动计划与普通采用、原三阶段 acquisition、容量回退、预算和 prefix cost 组合回归 37 项通过、2 项原 wall-clock 探针 ignored、29.28s（`g2-native-startup-lifecycle-budget-regression.log`）。ignored 两项需在优化构建显式运行，旧源码结果不能充作本批验证。格式和 diff 检查通过，完整 workspace/backend 检查正在进行，第二关整体和产品可用版本仍未验收。
 
-当前集成源码的默认 `cargo check --workspace --all-targets` 已通过、1m31s；Metal 同范围 compile check 已通过、59.38s，均存在 warnings。证据为 `g2-native-startup-workspace-check.log`、`g2-native-startup-workspace-metal-check.log`。Clippy、完整 workspace tests、优化构建计时探针和 CUDA compile/runtime 尚未完成；本批可以作为上述范围已验证的集成检查点，不标记 PR 或完整目标已验收。
+当前集成源码已提交并 push 为 `b6e16ade`。默认 `cargo check --workspace --all-targets` 已通过、1m31s；Metal 同范围 compile check 已通过、59.38s，均存在 warnings；`cargo clippy --workspace --all-targets -- -A warnings` 已通过、2m19s。证据为 `g2-native-startup-workspace-check.log`、`g2-native-startup-workspace-metal-check.log` 和 `g2-native-startup-workspace-clippy.log`。Clippy 使用仓库规定的允许 warnings 配置，不能表述成零 warning。
+
+完整 workspace tests 第一次在编译阶段因磁盘余量降至 341MiB 被主动 SIGINT（exit 130），尚无全量测试结果；原始日志 `g2-native-startup-workspace-test.log` 保留。已用 Cargo dry-run 确认旧 CLI/server/devtools 的 dev 构建缓存，再只清理这些可重建产物，保留当前 engine 测试产物、release、模型与证据。完整 tests、优化构建计时探针和 CUDA compile/runtime 仍待完成；本批是上述范围已验证的集成检查点，不标记 PR 或完整目标已验收。
 
 ## 来源位置
 
