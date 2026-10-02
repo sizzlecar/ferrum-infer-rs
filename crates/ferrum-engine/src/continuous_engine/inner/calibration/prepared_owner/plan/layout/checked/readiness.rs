@@ -60,6 +60,7 @@ pub(super) fn longest(case: &Case, cases: &[Case], output_limits: &[NonZeroUsize
             OpportunityProduct::PrefillSpan { offset: 0, chunk }
         });
     readiness.prefix = PrefixKind::Ordinary;
+    readiness.acquisition = None;
     readiness.release_generated = 0;
     readiness.suffix_tokens = maximum.get();
     readiness.route = CalibrationDecodeRoute::Actual;

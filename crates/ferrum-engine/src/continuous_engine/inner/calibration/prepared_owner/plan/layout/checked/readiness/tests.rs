@@ -22,14 +22,45 @@ fn case(maximum_output: usize) -> Case {
 
 #[tokio::test]
 async fn readiness_output_groups_execute_one_original_longest_cohort() {
-    let (mut session, executor) = fixture(1).await;
-    let mut request = InferenceRequest::new("test", session.configuration().model.model_id.clone());
+    let (mut session, executor) = fixture(3).await;
+    let chunk = NonZeroU32::new(3).unwrap();
+    let mut request = InferenceRequest::new(
+        "test test test",
+        session.configuration().model.model_id.clone(),
+    );
     request.stream = true;
     request.sampling_params.temperature = 1.0;
     request.sampling_params.repetition_penalty = 1.0;
+    let prompt_tokens = session
+        .engine
+        .inner
+        .tokenizer
+        .encode(&request.prompt, true)
+        .unwrap()
+        .len();
+    assert_eq!(prompt_tokens, 3);
     let templates =
         [AutomaticCostProbeTemplate::new(request, AutomaticCostProbeOutput::CliText).unwrap()];
     let mut cases = [case(1), case(2), case(4)];
+    cases[1].prefix = PrefixKind::Pending;
+    cases[1].release_generated = 1;
+    cases[1].suffix_tokens = 1;
+    cases[1].reset = false;
+    cases[1].acquisition = work::declared_plan(
+        &cases[1],
+        work::PrefixBlueprint {
+            prompt_tokens,
+            boundary: 2,
+            span: ferrum_interfaces::vnext::CheckpointTokenSpanConstraint::any_positive(),
+            input_tokens_sha256: [3; 32],
+        },
+        chunk,
+        None,
+    )
+    .unwrap();
+    let original_acquisition = cases[1].acquisition.unwrap();
+    let original_work = cases[1].waves(prompt_tokens, chunk.get() as usize).unwrap();
+    assert_eq!(original_work, (2, 3));
     cases[2].prefix = PrefixKind::Pending;
     cases[2].release_generated = 3;
     cases[2].suffix_tokens = 1;
@@ -41,11 +72,18 @@ async fn readiness_output_groups_execute_one_original_longest_cohort() {
         NonZeroUsize::new(4).unwrap(),
     );
     let mut completed = 0;
-    for original in &cases {
+    // An on-demand route starts from the native case, but readiness executes
+    // the complete cold prompt with the longest original output allowance.
+    for original in [&cases[1], &cases[0], &cases[2]] {
         let readiness = longest(original, &cases, &[NonZeroUsize::new(4).unwrap()]).unwrap();
         assert_eq!(readiness.maximum_output.get(), 4);
         assert!(matches!(readiness.prefix, PrefixKind::Ordinary));
         assert!(!readiness.reset);
+        let (offers, actions) = readiness
+            .waves_with_row_ceiling(prompt_tokens, chunk.get() as usize, None)
+            .unwrap();
+        assert_eq!((offers, actions), (4, 4));
+        assert!(readiness.acquisition.is_none());
         if !attempts
             .claim(&readiness, CalibrationDecodeRoute::Actual)
             .unwrap()
@@ -53,7 +91,8 @@ async fn readiness_output_groups_execute_one_original_longest_cohort() {
             continue;
         }
         let (requests, settings) =
-            inventory::readiness_requests(&readiness, &templates, NonZeroU32::MIN).unwrap();
+            inventory::readiness_requests(&readiness, &templates, chunk).unwrap();
+        budget.reserve_readiness_waves(actions).unwrap();
         let summary = session
             .run_readiness_probe_cohort(requests, settings, &mut budget)
             .await
@@ -67,7 +106,15 @@ async fn readiness_output_groups_execute_one_original_longest_cohort() {
     assert_eq!(executor.physical.load(Ordering::Acquire), 4);
     assert_eq!(budget.requests_remaining(), 0);
     assert_eq!(budget.attempts_remaining(), 0);
+    assert_eq!(budget.selection_attempts_remaining(), 0);
     assert_eq!(budget.preflight_charge().admitted_requests, 1);
+    assert_eq!(cases[1].acquisition, Some(original_acquisition));
+    assert!(matches!(cases[1].prefix, PrefixKind::Pending));
+    assert_eq!(cases[1].maximum_output.get(), 2);
+    assert_eq!(
+        cases[1].waves(prompt_tokens, chunk.get() as usize).unwrap(),
+        original_work
+    );
     session.completed_owner_boundary().unwrap();
     assert!(session.prepared_owner_capture.is_none());
     session.shutdown().await.unwrap();
