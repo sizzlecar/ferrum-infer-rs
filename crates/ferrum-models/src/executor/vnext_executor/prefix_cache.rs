@@ -8,7 +8,9 @@ mod active_coverage;
 use active_coverage::{active_prefix_inputs, ActivePrefixInput, CaptureEviction};
 pub(super) mod rendezvous;
 mod restore_observation;
-use ferrum_interfaces::model_executor::{PrefixRestoreDecision, PrefixRestoreSource};
+use ferrum_interfaces::model_executor::{
+    PrefixCapturePurpose, PrefixRestoreDecision, PrefixRestoreSource,
+};
 use restore_observation::PrefixRestoreObserver;
 
 fn prefix_restore_extension_work(token_prefix: &[u32]) -> Result<ResourceWorkShape> {
@@ -147,7 +149,7 @@ impl<C> PrefixIndex<C> {
             "source": "vnext-native-sequence-checkpoint-cache",
             "position": "model-executor",
             "requested": requested,
-            "enabled": usable_layout(plan).is_some(),
+            "enabled": requested && usable_layout(plan).is_some(),
             "entries": self.entries.len(),
             "bytes": self.entries.iter().map(|entry| retained_bytes(&entry.checkpoint)).sum::<u64>(),
             "bytes_scope": "index-owned-allocator-aligned-checkpoint-extents",
@@ -820,7 +822,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         guard: Arc<dyn CheckpointTransferSubmissionGuard>,
     ) -> Result<bool> {
         let observation_start = CheckpointTransferObservationStart::now();
-        if !self.supports_guarded_prefix_maintenance() || Instant::now() >= input.expires_at {
+        if !self.supports_guarded_prefix_maintenance_for(input.purpose)
+            || Instant::now() >= input.expires_at
+        {
             return Ok(false);
         }
         let (slot, sequence) = self
@@ -851,7 +855,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence
             .explicit_checkpoint_maintenance
             .store(true, Ordering::Release);
-        let interests = rendezvous::interests_at(&sequence, input.boundary);
+        let interests = rendezvous::interests_for(&sequence, input.boundary, input.purpose);
+        if input.purpose == PrefixCapturePurpose::PrivateCalibration && interests.is_empty() {
+            execution.restore_ready()?;
+            return Ok(false);
+        }
         let result = self
             .retain_sequence_boundary_with_guard(
                 &sequence,
@@ -860,6 +868,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 None,
                 observation_start,
                 Some(guard),
+                input.purpose,
             )
             .await;
         rendezvous::finish(&interests);
@@ -877,14 +886,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> serde_json::Map<String, serde_json::Value> {
         self.prefix_cache.lock().snapshot(
             self.resolved_plan.execution_plan(),
-            self.policy.memory().checkpoint_capacity.is_some(),
+            self.prefix_state_cache_enabled,
             &self.metrics.prefix_cache,
             SequenceCheckpoint::retained_bytes,
         )
     }
 
     pub(super) fn prefix_restore_enabled(&self) -> bool {
-        usable_layout(self.resolved_plan.execution_plan()).is_some()
+        self.prefix_layout_for(PrefixCapturePurpose::SharedCache)
+            .is_some()
+    }
+
+    pub(super) fn prefix_layout_for(
+        &self,
+        purpose: PrefixCapturePurpose,
+    ) -> Option<&SequenceCheckpointLayout> {
+        let enabled = match purpose {
+            PrefixCapturePurpose::SharedCache => self.prefix_state_cache_enabled,
+            PrefixCapturePurpose::PrivateCalibration => self.private_calibration_prefix_enabled,
+        };
+        enabled
+            .then(|| usable_layout(self.resolved_plan.execution_plan()))
+            .flatten()
     }
 
     pub(super) fn evict_prefix_checkpoint(&self) -> bool {
@@ -1045,7 +1068,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         tokens: &[u32],
         chunk: PrefillChunk,
     ) -> Result<()> {
-        let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+        let Some(layout) = self.prefix_layout_for(PrefixCapturePurpose::SharedCache) else {
             return Ok(());
         };
         let interests = rendezvous::interests_at(sequence, chunk.end());
@@ -1073,7 +1096,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence: &Arc<VNextSequence<R>>,
         probe: Option<&Arc<completion_observation::CompletionProbe>>,
     ) -> Result<()> {
-        let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+        let Some(layout) = self.prefix_layout_for(PrefixCapturePurpose::SharedCache) else {
             return Ok(());
         };
         if sequence.request_origin != ExecutorRequestOrigin::Product
@@ -1111,6 +1134,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             probe,
             CheckpointTransferObservationStart::now(),
             None,
+            PrefixCapturePurpose::SharedCache,
         )
         .await
         .map(|_| ())
@@ -1124,6 +1148,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         probe: Option<&Arc<completion_observation::CompletionProbe>>,
         observation_start: CheckpointTransferObservationStart,
         submission_guard: Option<Arc<dyn CheckpointTransferSubmissionGuard>>,
+        capture_purpose: PrefixCapturePurpose,
     ) -> Result<bool> {
         if let Some(probe) = probe {
             probe.retention();
@@ -1275,7 +1300,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ?purpose,
                     "prefix checkpoint captured"
                 );
-                rendezvous::publish(sequence, &checkpoint);
+                let published_interests =
+                    rendezvous::publish_for(sequence, &checkpoint, capture_purpose);
+                if capture_purpose == PrefixCapturePurpose::PrivateCalibration {
+                    // Only matching live interests own this checkpoint. No index
+                    // entry or cross-request cache credit survives their release.
+                    if let (Some(observation), Some(owner)) = (observation, observation_owner) {
+                        observation
+                            .acknowledge(&owner)
+                            .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    }
+                    return Ok(published_interests != 0);
+                }
                 let inputs = active_prefix_inputs(&self.sequences, sequence);
                 let (removed, coalesced) = {
                     let mut index = self.prefix_cache.lock();
@@ -1355,7 +1391,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         submission_guard: Option<Arc<dyn CheckpointTransferSubmissionGuard>>,
     ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         let observation_start = CheckpointTransferObservationStart::now();
-        let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+        let source_lease = input
+            .retry
+            .map(|retry| retry.checkpoint().as_ref())
+            .or(input.checkpoint);
+        let purpose =
+            source_lease.map_or(PrefixCapturePurpose::SharedCache, |lease| lease.purpose());
+        let private = purpose == PrefixCapturePurpose::PrivateCalibration;
+        if private
+            && (submission_guard.is_none()
+                || source_lease.is_none()
+                || !self.supports_guarded_prefix_maintenance_for(purpose))
+        {
+            return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
+        }
+        if input
+            .checkpoint
+            .is_some_and(|lease| lease.purpose() != purpose)
+        {
+            return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
+        }
+        let Some(layout) = self.prefix_layout_for(purpose) else {
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
         let tokens = input
@@ -1401,15 +1457,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             selected
         };
         let observer = PrefixRestoreObserver::new(
-            self.event_sink.read().clone(),
+            if private {
+                None
+            } else {
+                self.event_sink.read().clone()
+            },
             input.request_id.clone(),
             source,
         );
         let Some(checkpoint) = checkpoint else {
-            self.metrics
-                .prefix_cache
-                .misses
-                .fetch_add(1, Ordering::Relaxed);
+            if !private {
+                self.metrics
+                    .prefix_cache
+                    .misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             observer.record(PrefixRestoreDecision::NoReusableEntry);
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
@@ -1441,7 +1503,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     PlanRuntimePrefixRestoreOutcome::Deferred(
                         PlanRuntimePrefixRestoreDeferral::new(
                             capacity,
-                            self.retain_restore_checkpoint(checkpoint),
+                            self.retain_restore_checkpoint(
+                                checkpoint,
+                                purpose,
+                                source_lease
+                                    .filter(|_| private)
+                                    .and_then(|lease| self.retained_checkpoint_deadline(lease)),
+                            ),
                             source,
                         ),
                     )
@@ -1532,7 +1600,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             restored_tokens,
             tokens.len(),
             self.cache_handle(&sequence, restored_tokens),
-            move || observer.acknowledge(&metrics, restored_tokens, || callback.acknowledge()),
+            move || {
+                if private {
+                    callback.acknowledge()
+                } else {
+                    observer.acknowledge(&metrics, restored_tokens, || callback.acknowledge())
+                }
+            },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)
     }

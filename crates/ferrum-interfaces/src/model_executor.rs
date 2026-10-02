@@ -33,8 +33,8 @@ pub use execution_maintenance::{
 };
 pub use planning_capture::{ExecutorCompletionPlanningCapture, ExecutorPlanningCapture};
 pub use prefix_capture::{
-    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
-    PrefixCaptureStatus, PrefixReadyRestoreRequest,
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCapturePurpose,
+    PrefixCaptureRequest, PrefixCaptureStatus, PrefixReadyRestoreRequest,
 };
 pub use prefix_restore::{
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
@@ -3194,6 +3194,19 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Plan within the requested publication scope. Executors must explicitly
+    /// opt into private calibration; ordinary sharing support does not imply it.
+    fn plan_prefix_capture_boundary_for(
+        &self,
+        purpose: PrefixCapturePurpose,
+        input: PrefixCaptureBoundary<'_>,
+    ) -> Option<PrefixCapturePlan> {
+        match purpose {
+            PrefixCapturePurpose::SharedCache => self.plan_prefix_capture_boundary(input),
+            PrefixCapturePurpose::PrivateCalibration => None,
+        }
+    }
+
     /// Arm interest only against an already-admitted, exact source incarnation.
     /// No device allocation, capacity reservation, provider encoding, or device
     /// submission is allowed here.
@@ -3565,6 +3578,15 @@ pub trait ModelExecutor: Send + Sync {
     /// executed only as independently planned maintenance turns.
     fn supports_guarded_prefix_maintenance(&self) -> bool {
         false
+    }
+
+    /// Guarded checkpoint support for this publication scope. Private support
+    /// must not enable ordinary cache capture, lookup, or implicit retention.
+    fn supports_guarded_prefix_maintenance_for(&self, purpose: PrefixCapturePurpose) -> bool {
+        match purpose {
+            PrefixCapturePurpose::SharedCache => self.supports_guarded_prefix_maintenance(),
+            PrefixCapturePurpose::PrivateCalibration => false,
+        }
     }
 
     /// Capture this already-retired source boundary in a separate maintenance

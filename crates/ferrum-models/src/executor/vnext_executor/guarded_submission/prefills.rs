@@ -100,7 +100,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.supports_guarded_work(expected)
             // Guarded waves suppress implicit retention. Checkpoint transfers
             // are separate controller actions with their own final guard.
-            && (self.resolved_plan.execution_plan().payload().memory().checkpoint_capacity().is_none()
+            && (!self.prefix_state_cache_enabled
+                || self.resolved_plan.execution_plan().payload().memory().checkpoint_capacity().is_none()
                 || self.supports_guarded_prefix_maintenance())
     }
 

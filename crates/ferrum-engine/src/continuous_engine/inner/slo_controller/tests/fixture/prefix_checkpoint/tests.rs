@@ -167,6 +167,7 @@ fn partial(
 }
 fn request(input: &PlanRuntimePrefillInput) -> PrefixCaptureRequest<'_> {
     PrefixCaptureRequest {
+        purpose: PrefixCapturePurpose::SharedCache,
         source_request_id: &input.request_id,
         source_tokens: &input.input_tokens,
         maximum_sequence_tokens: input.maximum_sequence_tokens,

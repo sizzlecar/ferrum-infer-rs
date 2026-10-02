@@ -2,7 +2,8 @@
 //! checkpoint leases alone own retained state through the existing ledger.
 use super::*;
 use ferrum_interfaces::model_executor::{
-    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCaptureRequest, PrefixCaptureStatus,
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePurpose, PrefixCaptureRequest,
+    PrefixCaptureStatus,
 };
 use ferrum_scheduler::implementations::continuous::{PrefixRendezvousHold, PrefixRequestKey};
 
@@ -187,6 +188,7 @@ impl EngineInner {
                 let capture =
                     self.model_executor
                         .retain_prefix_capture_interest(PrefixCaptureRequest {
+                            purpose: PrefixCapturePurpose::SharedCache,
                             source_request_id: cohort.hold.source().request_id(),
                             source_tokens: &cohort.source_tokens,
                             maximum_sequence_tokens: cohort.maximum_sequence_tokens,

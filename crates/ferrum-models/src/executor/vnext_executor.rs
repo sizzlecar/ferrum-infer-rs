@@ -36,7 +36,7 @@ use ferrum_interfaces::model_executor::{
     PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PlanRuntimeResourceSnapshot,
     PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease,
-    PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
+    PrefixCapturePlan, PrefixCapturePurpose, PrefixCaptureRequest, TypedSequenceStateMemory,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -588,6 +588,8 @@ pub struct VNextExecutorConfig {
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
+    prefix_state_cache_enabled: bool,
+    private_calibration_prefix_enabled: bool,
     pub device_reusable_execution_enabled: bool,
     pub workspace_preparation: ferrum_types::WorkspacePreparationMode,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
@@ -796,14 +798,28 @@ impl VNextExecutorConfig {
             runtime.attention_execution_policy(),
         )?;
 
+        let prefix_state_cache_enabled = engine.runtime.prefix_state_cache_enabled;
+        // Match automatic startup's effective typed policy. Checkpoint capacity
+        // also serves private calibration, without enabling the product cache.
+        let private_calibration_prefix_enabled = engine.scheduler.slo.mode
+            != ferrum_types::SloMode::Off
+            && engine.scheduler.slo.admission.time_policy
+                == ferrum_types::SloTimeAdmissionPolicy::CompleteRequests
+            && matches!(
+                engine
+                    .scheduler
+                    .slo
+                    .cost_observation
+                    .live_structured_calibration,
+                ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { .. }
+            );
         let runtime_policy = ResolvedRuntimePolicy::new(
             POLICY_ID,
             POLICY_VERSION,
             scheduling,
             RuntimeMemoryPolicy {
-                checkpoint_capacity: engine
-                    .runtime
-                    .prefix_state_cache_enabled
+                checkpoint_capacity: (prefix_state_cache_enabled
+                    || private_calibration_prefix_enabled)
                     .then(|| {
                         CheckpointCapacityPolicy::new(
                             memory_budget.capacity_bytes - memory_budget.reserve_bytes,
@@ -854,6 +870,8 @@ impl VNextExecutorConfig {
             startup_memory_plan: engine.runtime.startup_memory_plan.clone(),
             static_initialization,
             runtime_policy,
+            prefix_state_cache_enabled,
+            private_calibration_prefix_enabled,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             workspace_preparation: engine.backend.workspace_preparation,
             reusable_execution_prefill_chunks,
@@ -4785,6 +4803,8 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     >,
     startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
+    prefix_state_cache_enabled: bool,
+    private_calibration_prefix_enabled: bool,
     prefix_cache: Mutex<prefix_cache::PrefixIndex<SequenceCheckpoint<R>>>,
     prefix_capture_identity: Arc<()>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
@@ -5382,6 +5402,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             startup_reusable_programs: Mutex::new(BTreeMap::new()),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
+            prefix_state_cache_enabled: config.prefix_state_cache_enabled,
+            private_calibration_prefix_enabled: config.private_calibration_prefix_enabled,
             prefix_cache: Mutex::new(prefix_cache::PrefixIndex::default()),
             prefix_capture_identity: Arc::new(()),
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
@@ -8182,7 +8204,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn checkpoint_token_evidence_enabled(&self) -> bool {
-        self.prefix_restore_enabled()
+        self.prefix_layout_for(PrefixCapturePurpose::SharedCache)
+            .is_some()
+            || self
+                .prefix_layout_for(PrefixCapturePurpose::PrivateCalibration)
+                .is_some()
     }
 
     fn retain_checkpoint_token_evidence(
@@ -10746,7 +10772,15 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         input: PrefixCaptureBoundary<'_>,
     ) -> Option<PrefixCapturePlan> {
-        self.rendezvous_boundary(input)
+        self.rendezvous_boundary_for(PrefixCapturePurpose::SharedCache, input)
+    }
+
+    fn plan_prefix_capture_boundary_for(
+        &self,
+        purpose: PrefixCapturePurpose,
+        input: PrefixCaptureBoundary<'_>,
+    ) -> Option<PrefixCapturePlan> {
+        self.rendezvous_boundary_for(purpose, input)
     }
 
     fn retain_prefix_capture_interest(
@@ -10757,11 +10791,16 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
-        self.prefix_restore_enabled()
+        self.prefix_layout_for(PrefixCapturePurpose::SharedCache)
+            .is_some()
     }
 
     fn supports_guarded_prefix_maintenance(&self) -> bool {
-        self.prefix_restore_enabled() && self.supports_guarded_execution_policy()
+        self.supports_guarded_prefix_maintenance_for(PrefixCapturePurpose::SharedCache)
+    }
+
+    fn supports_guarded_prefix_maintenance_for(&self, purpose: PrefixCapturePurpose) -> bool {
+        self.prefix_layout_for(purpose).is_some() && self.supports_guarded_execution_policy()
     }
 
     async fn try_capture_plan_runtime_prefix_guarded(

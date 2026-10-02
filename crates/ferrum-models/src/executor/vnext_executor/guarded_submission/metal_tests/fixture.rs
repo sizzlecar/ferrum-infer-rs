@@ -8,6 +8,23 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub async fn new(maximum_batch_tokens: usize, prefix: bool) -> Self {
+        Self::with_private_calibration(maximum_batch_tokens, prefix, None).await
+    }
+
+    pub async fn private_calibration(maximum_batch_tokens: usize) -> Self {
+        Self::with_private_calibration(maximum_batch_tokens, false, Some("qwen3_5.f32-master"))
+            .await
+    }
+
+    pub async fn automatic_without_native_checkpoint(maximum_batch_tokens: usize) -> Self {
+        Self::with_private_calibration(maximum_batch_tokens, false, Some("qwen3_5.f16")).await
+    }
+
+    async fn with_private_calibration(
+        maximum_batch_tokens: usize,
+        prefix: bool,
+        automatic_profile: Option<&str>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         weights::write_config(directory.path());
         weights::write_weights(directory.path());
@@ -18,6 +35,32 @@ impl Fixture {
         engine.backend.device = Device::Metal;
         engine.backend.enable_reusable_execution = false;
         engine.runtime.prefix_state_cache_enabled = prefix;
+        if let Some(profile) = automatic_profile {
+            // The ordinary fixture intentionally selects F16, whose causal
+            // provider does not declare checkpoint support. Require the real
+            // F32-master profile rather than overriding any capability.
+            engine.numerical_execution = ferrum_types::NumericalExecutionPolicy::Require(
+                ferrum_types::NumericalProfileId::new(profile).unwrap(),
+            );
+            engine.scheduler.slo = serde_json::from_value(serde_json::json!({
+                "mode": "enforce",
+                "default_service_class": "interactive",
+                "services": [{
+                    "id": "interactive",
+                    "server_token_commit": { "ttft_ms": 500, "tpot_ms": 40, "itl_ms": 80 }
+                }]
+            }))
+            .unwrap();
+            engine.scheduler.slo.validate().unwrap();
+            assert!(matches!(
+                engine
+                    .scheduler
+                    .slo
+                    .cost_observation
+                    .live_structured_calibration,
+                ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { .. }
+            ));
+        }
         // Capacity preparation owns a separate cohort alongside the at-most
         // three product participants. It must not borrow their sequence frames.
         engine.scheduler.max_running_requests = 8;
@@ -34,8 +77,10 @@ impl Fixture {
             .unwrap();
         let prepared = defined.prepare(&profiles[0].id).unwrap();
         let (runtime, operations, materializers, materializer, catalog) =
-            MetalVNextComposition::create(
+            MetalVNextComposition::create_with_observation(
                 DeviceId::new(format!("device.guarded-product.{}", uuid::Uuid::new_v4())).unwrap(),
+                None,
+                engine.scheduler.slo.cost_observation.structured_capture,
             )
             .unwrap()
             .into_parts();

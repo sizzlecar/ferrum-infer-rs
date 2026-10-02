@@ -181,6 +181,7 @@ impl EngineInner {
             .model_executor
             .try_capture_plan_runtime_prefix_guarded(
                 PrefixCaptureRequest {
+                    purpose: PrefixCapturePurpose::SharedCache,
                     source_request_id: &plan.request_id,
                     source_tokens: &plan.tokens,
                     maximum_sequence_tokens: plan.maximum_sequence_tokens,
@@ -262,6 +263,7 @@ impl EngineInner {
                 self.model_executor
                     .try_capture_plan_runtime_prefix_guarded(
                         PrefixCaptureRequest {
+                            purpose: PrefixCapturePurpose::SharedCache,
                             source_request_id: cohort.hold.source().request_id(),
                             source_tokens: &cohort.source_tokens,
                             maximum_sequence_tokens: cohort.maximum_sequence_tokens,

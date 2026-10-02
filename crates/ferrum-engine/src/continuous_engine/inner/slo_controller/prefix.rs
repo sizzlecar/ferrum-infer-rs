@@ -2,7 +2,7 @@
 //! Every later turn replays the remaining trajectory; a comparison is no permit.
 use super::*;
 use ferrum_interfaces::model_executor::{
-    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCaptureRequest,
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePurpose, PrefixCaptureRequest,
 };
 use ferrum_scheduler::implementations::continuous::{PrefixRendezvousHold, PrefixRequestKey};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -615,6 +615,7 @@ impl EngineInner {
                 let Some(capture) =
                     self.model_executor
                         .retain_prefix_capture_interest(PrefixCaptureRequest {
+                            purpose: PrefixCapturePurpose::SharedCache,
                             source_request_id: source_key.request_id(),
                             source_tokens: &source_tokens,
                             maximum_sequence_tokens,

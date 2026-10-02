@@ -108,7 +108,8 @@ impl ControlledExecutor {
             if !budget.has_budget() {
                 return expired();
             }
-            if entry.boundary >= input.input_tokens.len()
+            if entry.purpose != PrefixCapturePurpose::SharedCache
+                || entry.boundary >= input.input_tokens.len()
                 || entry.boundary == 0
                 || selected
                     .as_ref()

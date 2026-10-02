@@ -221,6 +221,17 @@ impl ModelExecutor for ControlledExecutor {
     fn supports_guarded_prefix_maintenance(&self) -> bool {
         self.evidence.prefix.is_some()
     }
+    fn supports_guarded_prefix_maintenance_for(
+        &self,
+        purpose: ferrum_interfaces::model_executor::PrefixCapturePurpose,
+    ) -> bool {
+        match purpose {
+            ferrum_interfaces::model_executor::PrefixCapturePurpose::SharedCache
+            | ferrum_interfaces::model_executor::PrefixCapturePurpose::PrivateCalibration => {
+                self.evidence.prefix.is_some()
+            }
+        }
+    }
     fn install_checkpoint_observation_sink(
         &self,
         sink: std::sync::Weak<dyn vnext::NativeCheckpointObservationSink>,
@@ -236,6 +247,15 @@ impl ModelExecutor for ControlledExecutor {
         input: ferrum_interfaces::model_executor::PrefixCaptureBoundary<'_>,
     ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
         self.prefix_boundary(input)
+    }
+    fn plan_prefix_capture_boundary_for(
+        &self,
+        purpose: ferrum_interfaces::model_executor::PrefixCapturePurpose,
+        input: ferrum_interfaces::model_executor::PrefixCaptureBoundary<'_>,
+    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+        self.supports_guarded_prefix_maintenance_for(purpose)
+            .then(|| self.prefix_boundary(input))
+            .flatten()
     }
     fn plan_prompt_tail_capture_boundary(
         &self,

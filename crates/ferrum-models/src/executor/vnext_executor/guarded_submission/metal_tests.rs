@@ -10,6 +10,7 @@ use ferrum_types::ModelId;
 mod completion_work_tests;
 mod execution_maintenance_tests;
 mod fixture;
+mod private_prefix_tests;
 mod resolver;
 mod selection_mask_cost_tests;
 mod weights;

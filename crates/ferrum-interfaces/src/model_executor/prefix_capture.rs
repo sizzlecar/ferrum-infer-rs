@@ -20,10 +20,21 @@ pub enum PrefixCaptureStatus {
     Unavailable,
 }
 
+/// Publication scope of an explicitly retained checkpoint. Private calibration
+/// state is reachable only through its exact lease, never a shared cache lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixCapturePurpose {
+    SharedCache,
+    PrivateCalibration,
+}
+
 /// Executor-owned interest in one source incarnation. Ready retains immutable
 /// checkpoint ownership independently of cache-index membership. Implementations
 /// must not retain the source merely to keep a cancelled computation alive.
 pub trait PrefixCaptureLease: Debug + Send + Sync {
+    fn purpose(&self) -> PrefixCapturePurpose {
+        PrefixCapturePurpose::SharedCache
+    }
     fn boundary(&self) -> usize;
     fn status(&self) -> PrefixCaptureStatus;
     fn as_any(&self) -> &dyn Any;
@@ -31,6 +42,7 @@ pub trait PrefixCaptureLease: Debug + Send + Sync {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PrefixCaptureRequest<'a> {
+    pub purpose: PrefixCapturePurpose,
     pub source_request_id: &'a RequestId,
     pub source_tokens: &'a [TokenId],
     pub maximum_sequence_tokens: usize,

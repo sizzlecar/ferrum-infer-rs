@@ -438,6 +438,7 @@ impl EngineInner {
             self.model_executor
                 .try_capture_plan_runtime_prefix_guarded(
                     PrefixCaptureRequest {
+                        purpose: PrefixCapturePurpose::SharedCache,
                         source_request_id: &sample.source.id,
                         source_tokens: &sample.source_tokens,
                         maximum_sequence_tokens: sample.source.maximum_sequence_tokens,

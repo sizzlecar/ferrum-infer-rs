@@ -261,13 +261,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     pub(super) fn supports_slo_execution(&self) -> bool {
         self.supports_guarded_execution_policy()
-            && (self
-                .resolved_plan
-                .execution_plan()
-                .payload()
-                .memory()
-                .checkpoint_capacity()
-                .is_none()
+            && (!self.prefix_state_cache_enabled
+                || self
+                    .resolved_plan
+                    .execution_plan()
+                    .payload()
+                    .memory()
+                    .checkpoint_capacity()
+                    .is_none()
                 || self.supports_guarded_prefix_maintenance())
             && self.future_cost_policy().is_ok()
     }

@@ -130,6 +130,7 @@ impl AcquiredProbePrefix {
     pub fn ready(&self) -> bool {
         self.acknowledged_capture
             && std::time::Instant::now() < self.deadline
+            && self.lease.purpose() == PrefixCapturePurpose::PrivateCalibration
             && self.lease.status() == PrefixCaptureStatus::Ready
             && self.lease.boundary() == self.plan.boundary()
     }
@@ -273,8 +274,9 @@ impl CalibrationSession {
                 "prefix acquisition requires an unused automatic session",
             ));
         }
-        if !inner.config.runtime.prefix_state_cache_enabled
-            || !inner.model_executor.supports_guarded_prefix_maintenance()
+        if !inner
+            .model_executor
+            .supports_guarded_prefix_maintenance_for(PrefixCapturePurpose::PrivateCalibration)
         {
             return Ok(ProbePrefixAcquisition::ColdFallback(
                 ProbePrefixFallback::Unsupported,
@@ -352,12 +354,15 @@ impl CalibrationSession {
             .engine
             .inner
             .model_executor
-            .plan_prefix_capture_boundary(PrefixCaptureBoundary {
-                processed_tokens: 0,
-                source_prompt_tokens: tokens.len(),
-                common_prefix_tokens: common,
-                follower_prompt_tokens: &[tokens.len()],
-            })
+            .plan_prefix_capture_boundary_for(
+                PrefixCapturePurpose::PrivateCalibration,
+                PrefixCaptureBoundary {
+                    processed_tokens: 0,
+                    source_prompt_tokens: tokens.len(),
+                    common_prefix_tokens: common,
+                    follower_prompt_tokens: &[tokens.len()],
+                },
+            )
         else {
             return Ok(ProbePrefixAcquisition::ColdFallback(
                 ProbePrefixFallback::NoProperBoundary,
@@ -449,6 +454,7 @@ impl CalibrationSession {
             )
             .ok_or_else(|| invalid("native acquisition expiry overflow"))?;
         let capture = || PrefixCaptureRequest {
+            purpose: PrefixCapturePurpose::PrivateCalibration,
             source_request_id: source,
             source_tokens: &tokens,
             maximum_sequence_tokens,
@@ -465,6 +471,11 @@ impl CalibrationSession {
                 ProbePrefixFallback::InterestUnavailable,
             ));
         };
+        if lease.purpose() != PrefixCapturePurpose::PrivateCalibration {
+            return Ok(ProbePrefixAcquisition::ColdFallback(
+                ProbePrefixFallback::InterestUnavailable,
+            ));
+        }
         let guard = self.probe_prefix_guard(source, false, expires_at, None)?;
         charge.action(budget)?;
         if !self
@@ -478,7 +489,10 @@ impl CalibrationSession {
                 ProbePrefixFallback::CaptureUnavailable,
             ));
         }
-        if lease.status() != PrefixCaptureStatus::Ready || lease.boundary() != plan.boundary() {
+        if lease.purpose() != PrefixCapturePurpose::PrivateCalibration
+            || lease.status() != PrefixCaptureStatus::Ready
+            || lease.boundary() != plan.boundary()
+        {
             return Ok(ProbePrefixAcquisition::ColdFallback(
                 ProbePrefixFallback::LeaseUnavailable,
             ));

@@ -3,8 +3,8 @@
 use super::*;
 use ferrum_interfaces::model_executor::{
     PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
-    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
-    PrefixCaptureStatus,
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCapturePurpose,
+    PrefixCaptureRequest, PrefixCaptureStatus,
 };
 use std::{any::Any, time::Instant};
 use vnext::DeviceRuntime;
@@ -14,6 +14,7 @@ pub(super) struct NativePrefix {
     pub(super) cost_domain: std::sync::OnceLock<Arc<CostWorkloadDomainV1>>,
     pub(super) reaper: Arc<vnext::CompletionReaper<contract::TestRuntime>>,
     entries: Mutex<Vec<Arc<Lease>>>,
+    private_interests: Mutex<Vec<std::sync::Weak<Lease>>>,
     attempts: Mutex<std::collections::VecDeque<NativeAttempt>>,
     publications: Arc<Mutex<std::collections::VecDeque<NativePublishedCheckpoint>>>,
     observer: Mutex<Option<Arc<PublishedCheckpointObserver>>>,
@@ -26,6 +27,7 @@ impl NativePrefix {
             cost_domain: std::sync::OnceLock::new(),
             reaper: vnext::CompletionReaper::new(),
             entries: Mutex::new(Vec::new()),
+            private_interests: Mutex::new(Vec::new()),
             attempts: Mutex::new(Default::default()),
             publications: Arc::new(Mutex::new(Default::default())),
             observer: Mutex::new(None),
@@ -88,19 +90,37 @@ impl NativePrefix {
         }
         let mut entries = self.entries.lock();
         entries.retain(|entry| entry.status() != PrefixCaptureStatus::Unavailable);
-        if let Some(entry) = entries.iter().find(|entry| {
+        let mut private_interests = self.private_interests.lock();
+        private_interests.retain(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|entry| entry.status() != PrefixCaptureStatus::Unavailable)
+        });
+        let matches = |entry: &Lease| {
             entry.source == *input.source_request_id
+                && entry.purpose == input.purpose
                 && entry.boundary == input.boundary
                 && entry.tokens.as_ref() == input.source_tokens
-        }) {
-            return Some(entry.clone()); // Original expiry is never renewed.
+        };
+        let retained = match input.purpose {
+            PrefixCapturePurpose::SharedCache => {
+                entries.iter().find(|entry| matches(entry)).cloned()
+            }
+            PrefixCapturePurpose::PrivateCalibration => private_interests
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .find(|entry| matches(entry)),
+        };
+        if let Some(entry) = retained {
+            return Some(entry); // Original expiry is never renewed.
         }
         // Small declared fixture population; dropping the index never fabricates
         // success and external leases continue retaining their actual checkpoint.
-        if entries.len() >= 64 {
+        if entries.len() + private_interests.len() >= 64 {
             return None;
         }
         let entry = Arc::new(Lease {
+            purpose: input.purpose,
             source: input.source_request_id.clone(),
             tokens: Arc::from(input.source_tokens),
             boundary: input.boundary,
@@ -109,12 +129,27 @@ impl NativePrefix {
             checkpoint: Mutex::new(None),
             cancelled: AtomicBool::new(false),
         });
-        entries.push(entry.clone());
+        match input.purpose {
+            PrefixCapturePurpose::SharedCache => entries.push(entry.clone()),
+            PrefixCapturePurpose::PrivateCalibration => {
+                private_interests.push(Arc::downgrade(&entry));
+            }
+        }
         Some(entry)
     }
     pub(super) fn cancel_pending(&self, source: &RequestId) {
         self.cancelled_sources.lock().insert(source.clone());
         for entry in self.entries.lock().iter() {
+            if &entry.source == source && entry.checkpoint.lock().is_none() {
+                entry.cancelled.store(true, Ordering::Release);
+            }
+        }
+        for entry in self
+            .private_interests
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
             if &entry.source == source && entry.checkpoint.lock().is_none() {
                 entry.cancelled.store(true, Ordering::Release);
             }
@@ -174,6 +209,7 @@ enum NativeAttemptOutcome {
     GuardRejected(ferrum_interfaces::execution_cost::GuardedNotSubmittedReason),
 }
 struct Lease {
+    purpose: PrefixCapturePurpose,
     source: RequestId,
     tokens: Arc<[ferrum_types::TokenId]>,
     boundary: usize,
@@ -185,6 +221,7 @@ struct Lease {
 impl std::fmt::Debug for Lease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeCpuPrefixLease")
+            .field("purpose", &self.purpose)
             .field("source", &self.source)
             .field("boundary", &self.boundary)
             .field("status", &self.status())
@@ -192,6 +229,9 @@ impl std::fmt::Debug for Lease {
     }
 }
 impl PrefixCaptureLease for Lease {
+    fn purpose(&self) -> PrefixCapturePurpose {
+        self.purpose
+    }
     fn boundary(&self) -> usize {
         self.boundary
     }
@@ -534,7 +574,18 @@ impl ControlledExecutor {
         let Some(target) = self.prefix_session(input.request_id) else {
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
-        let checkpoint = if let Some(lease) = input.checkpoint {
+        // Retry retains the same purpose, expiry and checkpoint owner. A
+        // private miss cannot fall through to the shared ready index.
+        let exact = input
+            .retry
+            .map(|retry| retry.checkpoint().as_ref())
+            .or(input.checkpoint);
+        if let (Some(retry), Some(lease)) = (input.retry, input.checkpoint) {
+            if retry.checkpoint().purpose() != lease.purpose() {
+                return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
+            }
+        }
+        let checkpoint = if let Some(lease) = exact {
             self.prefix_checkpoint_from_lease(lease)
         } else {
             prefix
@@ -542,7 +593,8 @@ impl ControlledExecutor {
                 .lock()
                 .iter()
                 .filter(|lease| {
-                    lease.status() == PrefixCaptureStatus::Ready
+                    lease.purpose == PrefixCapturePurpose::SharedCache
+                        && lease.status() == PrefixCaptureStatus::Ready
                         && input
                             .input_tokens
                             .starts_with(&lease.tokens[..lease.boundary])

@@ -48,7 +48,7 @@ llama.cpp 继续作为同机、同模型、同负载的比较基线，但不再�
 | --- | --- |
 | 自动入口仍用 cold cohort | `prepared_owner/startup.rs` 调用 `run_probe_cohort`；两个正式声明仍为 `native_prefix_acquisition: None`。新恢复协议尚未带来正常启动的准备工作节省 |
 | 已有真实恢复协议测试 | capture、关闭 seed、fresh restore ACK 和后续执行有 CPU 证明；该测试有意不满足资格下限，不能证明发布与普通请求采用 |
-| 正式 cache-off 配置也关闭了校准 checkpoint 能力 | `vnext_executor.rs` 由普通 prefix cache 开关控制 `checkpoint_capacity`；现有 guarded capture 同时写共享缓存。单纯删除 engine 守卫既不够，也不能证明普通流仍保持 cache-off |
+| 交接时正式 cache-off 配置也关闭了校准 checkpoint 能力 | 原 `vnext_executor.rs` 由普通 prefix cache 开关控制 `checkpoint_capacity`，guarded capture 同时写共享缓存；本轮已分离用途并取得真实 Metal 生命周期证据，尚未接通完整自动启动 |
 | 已有受控 cold 发布和采用测试 | 已发布 4 个 epoch 并完成 2 次控制器 witness；多跨度测试给 1 秒规划预算，实测两次分别约 32.29ms、31.30ms，不是产品 2ms 证明 |
 | 已有产品预算探针 | `plan_e2e.rs` 两个 2ms wall-clock 探针为 ignored，需在优化构建和空闲主机上显式运行 |
 | 已有工作量对账 | `source_work.rs` 遍历真实 `series.requests_for` 核对请求、token、wave；原测试使用结构体 Default，与 Enforce 有效默认数值策略不同 |
@@ -189,7 +189,7 @@ cargo check -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-page
 
 本轮外部证据使用 `/private/tmp/ferrum-slo-recovery-20261002`。初始只保留当前计划、结果摘要、必要原始记录和对应源码身份；复用现有 Cargo/cache，不重复归档源码、依赖树和大 trace。当前磁盘容量紧张，构建前先检查并通过 Cargo 清理明确可再生的本任务构建产物，清理范围与结果留在外部记录。
 
-当前仍在第一关。2026 年 10 月 2 日，当前源码的优化构建与以下最小检查已完成：
+2026 年 10 月 2 日，第一关的 CPU 工作账和默认规划预算探针已完成，当前正在实施第二关。覆盖缺口与后端准备耗时仍须在完整链路验证，以下最小检查不能代表整个目标通过：
 
 | 检查 | 实际结果 | 证明边界 |
 | --- | --- | --- |
@@ -208,7 +208,20 @@ UnknownPopulation 仍需定位到原 case 及真实 admission，区分正常越�
 
 另有 3 项既有底层测试通过：恢复 extension 保持 request fit 且不能越界；错误 layout/超 backing 的恢复初始化拒绝；guard 拒绝时零提交并保留原 owner。格式和 diff 检查通过，workspace/backend 全量验收尚未完成。首轮新增测试错误地使用 native 路径不会调用的 observation hook，结果 1 pass / 3 fail；改用现有真实资源 authority 读取后重跑通过，原失败日志保留，没有修改生产行为或放宽断言来消除该失败。证据为 `g2-prefix-admission-dev.log`、`g2-prefix-admission-native-authority-dev.log`、`g2-restore-backing-boundary.log`、`g2-restore-guard-rejection.log` 和 `g2-restore-request-capacity.log`。
 
-下一项是校准私有 checkpoint 的用途隔离，然后接续准备账本和正常自动入口。其余关卡保持未验收，后续按用户流程和具体阻断更新，不给无验收依据的百分比或完成时间承诺。
+校准私有 checkpoint 已完成用途隔离。只有有效的 automatic、非 Off、CompleteRequests 配置启用私有能力；普通 prefix cache 仍遵守原开关，两者共享原物理容量。私有 capture 必须持有匹配的 live interest，完成真实 ACK 后由 lease 持有，不插共享索引。恢复要求原执行器签发的精确 lease 和 native guard；私有重试保留原到期时间。缺少原生 checkpoint 能力的 provider 仍可执行原有冷推理。
+
+| 私有用途改动的检查 | 实际结果 | 证明边界 |
+| --- | --- | --- |
+| 模型 prefix cache 单元测试 | 63 项通过 | 包括有效产品配置、原总容量和 cache 开关隔离；默认特性 CPU 测试，不是设备运行 |
+| 真实 Metal 私有 checkpoint | 3 项通过，2.43s | 捕获并关闭 seed、不同合法 target admission 下恢复、ACK 前后 frontier、相同分段冷计算 logits 有限且绝对差不超过 1e-5、共享 cache 无条目或命中、最后 lease 释放后 checkpoint claim/physical bytes 归零并可再次捕获；cache-off 下缺少 lease/guard 或 guard 拒绝时不提交 checkpoint copy；不支持 checkpoint 的 provider 冷推理可用 |
+| engine native acquisition | 4 项通过，4.02s | 原相同和不同 admission 生命周期、容量回退及预算/完整输出；保留原资格失败断言 |
+| 原 engine 共享 checkpoint 回归 | 12 项通过，145.66s | 包括 guard/ACK、取消/退役、普通共享前缀恢复、既有自动冷准备及普通请求执行；不证明新私有准备已进入自动路径 |
+| Metal workspace 全目标编译 | `cargo check --workspace --all-targets --features metal` 通过，2m07s，存在 warnings | 覆盖接口调用方的编译兼容；不是全量运行测试或 CUDA 证明 |
+| 格式与差异 | 通过 | 全 workspace/backend 验收仍另行执行 |
+
+Metal 用例运行于本机 Apple M1 Max（24 GPU cores），采用测试中真实支持 checkpoint 的 F32-master provider；它不是正式性能验收机器或主模型。首轮测试代码有 3 处类型错误；修正后 1 pass / 2 fail，揭示 seed 到达边界后登记私有 interest 被旧的未来区间校验拒绝。生产修复仅允许私有用途在恰好已完成边界登记 Pending interest；真实 native capture 仍以已完成区间验证合法性，然后才分配和提交。修复后 3 项通过，没有放宽 native 捕获规则。失败和最终日志分别保存在 `g2-private-prefix-metal.log`、`g2-private-prefix-metal-runtime.log`、`g2-private-prefix-metal-retired-boundary.log`；其余证据为 `g2-private-prefix-cache-unit.log`、`g2-private-prefix-engine.log`、`g2-private-prefix-engine-checkpoint.log` 和 `g2-private-prefix-workspace-metal-check.log`。此次有界修改未运行默认特性 workspace check、workspace 全量 tests、Clippy 或 CUDA 检查；完整自动闭环源码稳定后执行全套，当前提交不标记为 PR 已完成验收。
+
+剩余主线是准备工作账与 source 冻结：当前 cursor 在 acquisition 前已预留整个 series，而请求仍由父 execution plan 生成。接入前必须让一次 seed 的实际支出与 selection reservation 对账，并保证收样前 cold 回退重建真实计划、ranges、phase schedule 和 manifest；不能只更改声明。之后通过共享 automatic startup 的完整资格与普通请求采用正例，才算第二关通过。额外 token evidence 的运行成本、当前 source 全部 checkpoint 的真实峰值及双后端效果仍未证明。其余关卡保持未验收，不给无验收依据的百分比或完成时间承诺。
 
 ## 来源位置
 

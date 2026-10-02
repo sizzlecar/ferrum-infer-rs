@@ -325,8 +325,7 @@ fn actual_plan_policy_and_provider_contract_gate_token_evidence() {
     );
 }
 
-#[test]
-fn product_flag_resolves_to_existing_memory_budget_without_reserving_slots() {
+fn prefix_policy_config(engine: &EngineConfig) -> VNextExecutorConfig {
     use ferrum_kernels::backend::reference::ReferenceVNextComposition;
     use ferrum_types::{DataType, ModelType};
     let composition =
@@ -347,36 +346,141 @@ fn product_flag_resolves_to_existing_memory_budget_without_reserving_slots() {
         license: None,
         metadata: Default::default(),
     };
+    VNextExecutorConfig::from_engine_config(engine, &info, composition.runtime().as_ref()).unwrap()
+}
+
+fn automatic_prefix_slo_config() -> ferrum_types::SloConfig {
+    serde_json::from_value(serde_json::json!({
+        "mode": "enforce",
+        "default_service_class": "interactive",
+        "services": [{
+            "id": "interactive",
+            "server_token_commit": { "ttft_ms": 500, "tpot_ms": 40, "itl_ms": 80 }
+        }]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn product_flag_resolves_to_existing_memory_budget_without_reserving_slots() {
     let mut engine = EngineConfig::default();
     // Enabling the independent whole-prompt cache does not allocate vNext
     // sequence-state checkpoint capacity.
     engine.runtime.prefix_cache_enabled = true;
     engine.runtime.prefix_state_cache_enabled = false;
-    let disabled =
-        VNextExecutorConfig::from_engine_config(&engine, &info, composition.runtime().as_ref())
-            .unwrap();
+    let disabled = prefix_policy_config(&engine);
+    assert!(!disabled.prefix_state_cache_enabled);
+    assert!(!disabled.private_calibration_prefix_enabled);
     assert!(disabled
         .runtime_policy
         .memory()
         .checkpoint_capacity
         .is_none());
     engine.runtime.prefix_state_cache_enabled = true;
-    let enabled =
-        VNextExecutorConfig::from_engine_config(&engine, &info, composition.runtime().as_ref())
-            .unwrap();
+    let enabled = prefix_policy_config(&engine);
+    assert!(enabled.prefix_state_cache_enabled);
+    assert!(!enabled.private_calibration_prefix_enabled);
     let memory = enabled.runtime_policy.memory();
     assert_eq!(
         memory.checkpoint_capacity.unwrap().maximum_retained_bytes(),
         memory.capacity_bytes - memory.reserve_bytes
     );
-    assert_eq!(
-        memory.maximum_active_sequences,
-        disabled.runtime_policy.memory().maximum_active_sequences
-    );
+    let mut expected_memory = disabled.runtime_policy.memory().clone();
+    expected_memory.checkpoint_capacity = memory.checkpoint_capacity;
+    assert_eq!(memory, &expected_memory);
     assert_eq!(
         enabled.runtime_policy.admission(),
         disabled.runtime_policy.admission()
     );
+}
+
+#[test]
+fn automatic_calibration_checkpoint_capacity_preserves_product_cache_and_total_budget() {
+    use ferrum_types::{SloLiveStructuredCalibration, SloMode};
+    let mut engine = EngineConfig::default();
+    let disabled = prefix_policy_config(&engine);
+    // Use the same parsing boundary as the run/serve product preset. Merely
+    // assigning Enforce to an otherwise-default typed config remains disabled.
+    engine.scheduler.slo = automatic_prefix_slo_config();
+    assert!(matches!(
+        engine
+            .scheduler
+            .slo
+            .cost_observation
+            .live_structured_calibration,
+        SloLiveStructuredCalibration::AutomaticV1 { .. }
+    ));
+    for mode in [SloMode::Observe, SloMode::Enforce] {
+        engine.scheduler.slo.mode = mode;
+        engine.scheduler.slo.validate().unwrap();
+        for shared_cache in [false, true] {
+            engine.runtime.prefix_state_cache_enabled = shared_cache;
+            let automatic = prefix_policy_config(&engine);
+            assert_eq!(automatic.prefix_state_cache_enabled, shared_cache);
+            assert!(automatic.private_calibration_prefix_enabled);
+            let mut expected_memory = disabled.runtime_policy.memory().clone();
+            expected_memory.checkpoint_capacity = Some(
+                CheckpointCapacityPolicy::new(
+                    expected_memory.capacity_bytes - expected_memory.reserve_bytes,
+                )
+                .unwrap(),
+            );
+            assert_eq!(automatic.runtime_policy.memory(), &expected_memory);
+            assert_eq!(
+                automatic.runtime_policy.admission(),
+                disabled.runtime_policy.admission()
+            );
+        }
+    }
+}
+
+#[test]
+fn checkpoint_capacity_requires_automatic_complete_request_policy() {
+    use ferrum_types::{SloLiveStructuredCalibration, SloMode, SloTimeAdmissionPolicy};
+    use std::num::{NonZeroU64, NonZeroUsize};
+    let mut engine = EngineConfig::default();
+    let disabled = prefix_policy_config(&engine);
+    let assert_disabled = |engine: &EngineConfig| {
+        let config = prefix_policy_config(engine);
+        assert!(!config.prefix_state_cache_enabled);
+        assert!(!config.private_calibration_prefix_enabled);
+        assert_eq!(
+            config.runtime_policy.memory(),
+            disabled.runtime_policy.memory()
+        );
+    };
+    let automatic = automatic_prefix_slo_config();
+    engine.scheduler.slo.default_service_class = automatic.default_service_class.clone();
+    engine.scheduler.slo.services = automatic.services.clone();
+    for mode in [SloMode::Observe, SloMode::Enforce] {
+        engine.scheduler.slo.mode = mode;
+        engine.scheduler.slo.validate().unwrap();
+        assert_disabled(&engine);
+    }
+    engine.scheduler.slo = automatic.clone();
+    engine
+        .scheduler
+        .slo
+        .cost_observation
+        .live_structured_calibration = SloLiveStructuredCalibration::ServiceWindowsV1 {
+        declaration: "declared.json".into(),
+        evidence_directory: "new-evidence".into(),
+        maximum_generations: NonZeroUsize::new(4).unwrap(),
+        maximum_source_bytes: NonZeroU64::new(1 << 28).unwrap(),
+        maximum_retained_numeric_bytes: NonZeroUsize::new(1 << 26).unwrap(),
+    };
+    engine.scheduler.slo.validate().unwrap();
+    assert_disabled(&engine);
+    // These invalid combinations must not gain native capacity even if a
+    // caller constructs executor configuration before validating the SLO.
+    engine.scheduler.slo = automatic.clone();
+    engine.scheduler.slo.mode = SloMode::Off;
+    assert!(engine.scheduler.slo.validate().is_err());
+    assert_disabled(&engine);
+    engine.scheduler.slo = automatic;
+    engine.scheduler.slo.admission.time_policy = SloTimeAdmissionPolicy::RequireSlo;
+    assert!(engine.scheduler.slo.validate().is_err());
+    assert_disabled(&engine);
 }
 
 #[test]

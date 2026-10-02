@@ -7,7 +7,7 @@ use crate::automatic_cost_probe::AutomaticCostProbeTemplate;
 use ferrum_interfaces::execution_cost::{GuardedNotSubmittedReason, HostSubmissionRejection};
 use ferrum_interfaces::model_executor::{
     PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PrefixCaptureBoundary,
-    PrefixCaptureRequest,
+    PrefixCapturePurpose, PrefixCaptureRequest,
 };
 use ferrum_interfaces::vnext::{
     CheckpointTransferSubmissionGuard, NativeCheckpointTransferIdentity,
@@ -435,6 +435,7 @@ impl CalibrationSession {
             .model_executor
             .try_capture_plan_runtime_prefix_guarded(
                 PrefixCaptureRequest {
+                    purpose: PrefixCapturePurpose::SharedCache,
                     source_request_id: source,
                     source_tokens,
                     maximum_sequence_tokens: source_maximum,

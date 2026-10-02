@@ -1,13 +1,14 @@
 use super::*;
 use ferrum_interfaces::model_executor::{
-    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
-    PrefixCaptureStatus, PrefixReadyRestoreRequest,
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCapturePurpose,
+    PrefixCaptureRequest, PrefixCaptureStatus, PrefixReadyRestoreRequest,
 };
 
 pub(in super::super) struct NativePrefixCapture<R: DeviceRuntime> {
     source: std::sync::Weak<VNextSequence<R>>,
     owner: Arc<()>,
     boundary: usize,
+    purpose: PrefixCapturePurpose,
     expires_at: Instant,
     unavailable: AtomicBool,
     checkpoint: Mutex<Option<SequenceCheckpoint<R>>>,
@@ -22,6 +23,9 @@ impl<R: DeviceRuntime> std::fmt::Debug for NativePrefixCapture<R> {
 }
 
 impl<R: DeviceRuntime> PrefixCaptureLease for NativePrefixCapture<R> {
+    fn purpose(&self) -> PrefixCapturePurpose {
+        self.purpose
+    }
     fn boundary(&self) -> usize {
         self.boundary
     }
@@ -95,6 +99,8 @@ pub(super) fn select_prompt_tail_boundary(
 struct RetainedRestoreCheckpoint<R: DeviceRuntime> {
     owner: Arc<()>,
     checkpoint: SequenceCheckpoint<R>,
+    purpose: PrefixCapturePurpose,
+    expires_at: Option<Instant>,
 }
 
 impl<R: DeviceRuntime> std::fmt::Debug for RetainedRestoreCheckpoint<R> {
@@ -106,11 +112,21 @@ impl<R: DeviceRuntime> std::fmt::Debug for RetainedRestoreCheckpoint<R> {
 }
 
 impl<R: DeviceRuntime> PrefixCaptureLease for RetainedRestoreCheckpoint<R> {
+    fn purpose(&self) -> PrefixCapturePurpose {
+        self.purpose
+    }
     fn boundary(&self) -> usize {
         self.checkpoint.completed_tokens()
     }
     fn status(&self) -> PrefixCaptureStatus {
-        PrefixCaptureStatus::Ready
+        if self
+            .expires_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            PrefixCaptureStatus::Unavailable
+        } else {
+            PrefixCaptureStatus::Ready
+        }
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -127,7 +143,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             if !budget.has_budget() {
                 return Err(ExecutionCostRouteUnknown::BudgetExhausted);
             }
-            let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+            let Some(layout) = self.prefix_layout_for(PrefixCapturePurpose::SharedCache) else {
                 return Err(ExecutionCostRouteUnknown::Unsupported);
             };
             let busy =
@@ -187,7 +203,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             });
             drop(index);
             drop(tokens);
-            Ok(checkpoint.map(|checkpoint| self.retain_restore_checkpoint(checkpoint)))
+            Ok(checkpoint.map(|checkpoint| {
+                self.retain_restore_checkpoint(checkpoint, PrefixCapturePurpose::SharedCache, None)
+            }))
         })();
         match result {
             Ok(value) => ExecutionCostRouteAvailability::Known(value),
@@ -205,11 +223,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .as_any()
             .downcast_ref::<RetainedRestoreCheckpoint<R>>()
         {
-            return Arc::ptr_eq(&retained.owner, &self.prefix_capture_identity)
+            return (Arc::ptr_eq(&retained.owner, &self.prefix_capture_identity)
+                && retained.purpose == lease.purpose()
+                && retained.status() == PrefixCaptureStatus::Ready)
                 .then(|| retained.checkpoint.clone());
         }
         let native = lease.as_any().downcast_ref::<NativePrefixCapture<R>>()?;
         if !Arc::ptr_eq(&native.owner, &self.prefix_capture_identity)
+            || native.purpose != lease.purpose()
             || Instant::now() >= native.expires_at
             || native.unavailable.load(Ordering::Acquire)
         {
@@ -221,17 +242,41 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         chunk: PrefillChunk,
     ) -> Option<PrefixCapturePlan> {
-        select_prompt_tail_boundary(usable_layout(self.resolved_plan.execution_plan())?, chunk)
+        select_prompt_tail_boundary(
+            self.prefix_layout_for(PrefixCapturePurpose::SharedCache)?,
+            chunk,
+        )
     }
 
     pub(super) fn retain_restore_checkpoint(
         &self,
         checkpoint: SequenceCheckpoint<R>,
+        purpose: PrefixCapturePurpose,
+        expires_at: Option<Instant>,
     ) -> Arc<dyn PrefixCaptureLease> {
         Arc::new(RetainedRestoreCheckpoint {
             owner: Arc::clone(&self.prefix_capture_identity),
             checkpoint,
+            purpose,
+            expires_at,
         })
+    }
+
+    pub(super) fn retained_checkpoint_deadline(
+        &self,
+        lease: &dyn PrefixCaptureLease,
+    ) -> Option<Instant> {
+        if let Some(retained) = lease
+            .as_any()
+            .downcast_ref::<RetainedRestoreCheckpoint<R>>()
+        {
+            retained.expires_at
+        } else {
+            lease
+                .as_any()
+                .downcast_ref::<NativePrefixCapture<R>>()
+                .map(|lease| lease.expires_at)
+        }
     }
 
     pub(super) fn retained_restore_source(
@@ -249,14 +294,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         input: PrefixCaptureBoundary<'_>,
     ) -> Option<PrefixCapturePlan> {
-        select_boundary(usable_layout(self.resolved_plan.execution_plan())?, input)
+        self.rendezvous_boundary_for(PrefixCapturePurpose::SharedCache, input)
+    }
+
+    pub(in super::super) fn rendezvous_boundary_for(
+        &self,
+        purpose: PrefixCapturePurpose,
+        input: PrefixCaptureBoundary<'_>,
+    ) -> Option<PrefixCapturePlan> {
+        select_boundary(self.prefix_layout_for(purpose)?, input)
     }
 
     pub(in super::super) fn arm_prefix_capture(
         &self,
         input: PrefixCaptureRequest<'_>,
     ) -> Result<Option<Arc<dyn PrefixCaptureLease>>> {
-        let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+        let Some(layout) = self.prefix_layout_for(input.purpose) else {
             return Ok(None);
         };
         if layout.input_dependency() != CheckpointInputDependency::ExactTokenPrefix
@@ -279,6 +332,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         };
         let processed = sequence.prefill_tokens_processed.load(Ordering::Acquire);
+        let permitted_interest = if input.purpose == PrefixCapturePurpose::PrivateCalibration
+            && processed == input.boundary
+        {
+            // Calibration arms only after its seed has retired this boundary.
+            // This interest submits nothing. The native capture entry checks
+            // the actual completed boundary's capture_span_start, not a
+            // fabricated zero-length future span, before allocating or copying.
+            layout.permits_suffix(input.boundary as u64, input.source_tokens.len() as u64)
+        } else {
+            layout.permits_capture_from(
+                processed as u64,
+                input.boundary as u64,
+                input.source_tokens.len() as u64,
+            )
+        };
         if sequence.request_origin != ExecutorRequestOrigin::Product
             || !sequence.active.load(Ordering::Acquire)
             || sequence.maximum_tokens != input.maximum_sequence_tokens
@@ -288,11 +356,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .iter()
                 .copied()
                 .ne(input.source_tokens.iter().map(|token| token.get()))
-            || !layout.permits_capture_from(
-                processed as u64,
-                input.boundary as u64,
-                input.source_tokens.len() as u64,
-            )
+            || !permitted_interest
         {
             return Ok(None);
         }
@@ -300,6 +364,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             source: Arc::downgrade(&sequence),
             owner: Arc::clone(&self.prefix_capture_identity),
             boundary: input.boundary,
+            purpose: input.purpose,
             expires_at: input.expires_at,
             unavailable: AtomicBool::new(false),
             checkpoint: Mutex::new(None),
@@ -318,11 +383,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .as_any()
             .downcast_ref::<RetainedRestoreCheckpoint<R>>()
         {
-            return Arc::ptr_eq(&retained.owner, &self.prefix_capture_identity)
+            return (Arc::ptr_eq(&retained.owner, &self.prefix_capture_identity)
+                && retained.purpose == lease.purpose()
+                && retained.status() == PrefixCaptureStatus::Ready)
                 .then(|| retained.checkpoint.clone());
         }
         let native = lease.as_any().downcast_ref::<NativePrefixCapture<R>>()?;
         if !Arc::ptr_eq(&native.owner, &self.prefix_capture_identity)
+            || native.purpose != lease.purpose()
             || native.status() != PrefixCaptureStatus::Ready
         {
             return None;
@@ -335,24 +403,37 @@ pub(super) fn interests_at<R: DeviceRuntime>(
     sequence: &VNextSequence<R>,
     boundary: usize,
 ) -> Vec<Arc<NativePrefixCapture<R>>> {
+    interests_for(sequence, boundary, PrefixCapturePurpose::SharedCache)
+}
+
+pub(super) fn interests_for<R: DeviceRuntime>(
+    sequence: &VNextSequence<R>,
+    boundary: usize,
+    purpose: PrefixCapturePurpose,
+) -> Vec<Arc<NativePrefixCapture<R>>> {
     let mut interests = sequence.prefix_capture_interests.lock();
     interests.retain(|interest| interest.strong_count() > 0);
     interests
         .iter()
         .filter_map(std::sync::Weak::upgrade)
         .filter(|interest| {
-            interest.boundary == boundary && interest.status() == PrefixCaptureStatus::Pending
+            interest.boundary == boundary
+                && interest.purpose == purpose
+                && interest.status() == PrefixCaptureStatus::Pending
         })
         .collect()
 }
 
-pub(super) fn publish<R: DeviceRuntime>(
+pub(super) fn publish_for<R: DeviceRuntime>(
     sequence: &VNextSequence<R>,
     checkpoint: &SequenceCheckpoint<R>,
-) {
-    for interest in interests_at(sequence, checkpoint.completed_tokens()) {
+    purpose: PrefixCapturePurpose,
+) -> usize {
+    let interests = interests_for(sequence, checkpoint.completed_tokens(), purpose);
+    for interest in &interests {
         *interest.checkpoint.lock() = Some(checkpoint.clone());
     }
+    interests.len()
 }
 
 pub(super) fn finish<R: DeviceRuntime>(interests: &[Arc<NativePrefixCapture<R>>]) {
