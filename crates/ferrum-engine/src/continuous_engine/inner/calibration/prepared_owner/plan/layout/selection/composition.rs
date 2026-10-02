@@ -31,7 +31,13 @@ pub(super) fn extra_peak(
             mul(builder_limit(seed)?, 2)?,
             mul(vector_peak_bytes::<usize>(add(mentions, guaranteed)?)?, 6)?,
         )?,
-        vector_peak_bytes::<SelectionGap>(add(opportunities.len(), 1)?)?,
+        add(
+            vector_peak_bytes::<SelectionGap>(add(mul(opportunities.len(), 2)?, 1)?)?,
+            add(
+                vector_peak_bytes::<usize>(mentions)?,
+                mul(std::mem::size_of::<BatchCandidate>(), 2)?,
+            )?,
+        )?,
     )
 }
 
@@ -94,10 +100,99 @@ pub(super) fn scheduled_prefix_budget(
     Ok(used)
 }
 
+/// Freeze the original complete raw populations before journal coalescing
+/// frees source slots. Later auxiliary candidates cannot retroactively own
+/// those slots ahead of an earlier installed policy's independent combination.
+pub(super) fn protected_populations(
+    candidates: &[BatchCandidate],
+    capacity: SelectionCapacity,
+    priority: Option<u8>,
+    maximum_sources: Option<NonZeroUsize>,
+) -> Result<Vec<usize>> {
+    let count = candidates.iter().try_fold(0, |count, candidate| {
+        add(count, candidate.batch.population_indices.len())
+    })?;
+    let mut protected = Vec::new();
+    protected
+        .try_reserve_exact(count)
+        .map_err(|_| error("protected source population allocation capacity"))?;
+    let mut used = SelectionCapacity::default();
+    let mut sources = 0usize;
+    for candidate in candidates {
+        if priority.is_some_and(|selected| selected != candidate.input_priority)
+            || maximum_sources.is_some_and(|maximum| sources >= maximum.get())
+            || !can_schedule(&candidate.batch, capacity.remaining(used))
+        {
+            continue;
+        }
+        used.charge(&candidate.batch)?;
+        sources = add(sources, 1)?;
+        protected.extend_from_slice(&candidate.batch.population_indices);
+    }
+    protected.sort_unstable();
+    protected.dedup();
+    Ok(protected)
+}
+
+/// Simulate the exact final traversal. A combination is an additional source,
+/// never a substitute for its own raw basis or any protected raw population.
+/// The pre-coalesce inventory assigns each population to one raw journal.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insertion_preserves_raw(
+    candidates: &[BatchCandidate],
+    basis: usize,
+    insertion: usize,
+    combined: &SelectedBatch,
+    protected: &[usize],
+    capacity: SelectionCapacity,
+    priority: Option<u8>,
+    maximum_sources: Option<NonZeroUsize>,
+) -> Result<bool> {
+    debug_assert!(basis < insertion && insertion <= candidates.len());
+    let mut used = SelectionCapacity::default();
+    let mut sources = 0usize;
+    let mut remaining = protected.len();
+    let mut basis_scheduled = false;
+    for position in 0..=candidates.len() {
+        if position == insertion {
+            if !basis_scheduled
+                || maximum_sources.is_some_and(|maximum| sources >= maximum.get())
+                || !can_schedule(combined, capacity.remaining(used))
+            {
+                return Ok(false);
+            }
+            used.charge(combined)?;
+            sources = add(sources, 1)?;
+        }
+        let Some(candidate) = candidates.get(position) else {
+            break;
+        };
+        if priority.is_some_and(|selected| selected != candidate.input_priority)
+            || maximum_sources.is_some_and(|maximum| sources >= maximum.get())
+            || !can_schedule(&candidate.batch, capacity.remaining(used))
+        {
+            continue;
+        }
+        used.charge(&candidate.batch)?;
+        sources = add(sources, 1)?;
+        basis_scheduled |= position == basis;
+        let retained = candidate
+            .batch
+            .population_indices
+            .iter()
+            .filter(|index| protected.binary_search(index).is_ok())
+            .count();
+        remaining = remaining
+            .checked_sub(retained)
+            .ok_or_else(|| error("protected raw population occurs in multiple journals"))?;
+    }
+    Ok(basis_scheduled && remaining == 0)
+}
+
 fn facts<'a>(
     batch: &'a SelectedBatch,
     inputs: &'a [Vec<CheckedInputFacts>],
-) -> impl Iterator<Item = &'a CheckedInputFacts> {
+) -> impl Iterator<Item = &'a CheckedInputFacts> + Clone {
     batch
         .representative_case_indices
         .iter()
@@ -116,6 +211,98 @@ fn same_requirement(left: &CheckedInputFacts, right: &CheckedInputFacts) -> bool
         && left.homogeneous_host_policy == right.homogeneous_host_policy
 }
 
+fn local_universe<'a>(
+    facts: impl Iterator<Item = &'a CheckedInputFacts> + Clone,
+    population: &StructuredServiceDeclarationV7,
+    seed: &DeclaredAlgorithmUniverseV1,
+) -> Result<Option<DeclaredAlgorithmUniverseV1>> {
+    if population
+        .nonnegative_envelope
+        .as_ref()
+        .is_none_or(|contract| {
+            contract.population_policy != StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1
+                || contract.template_policy
+                    != StructuredCostTemplatePolicyV1::InstalledAlgorithmSetV1
+        })
+    {
+        return Ok(None);
+    }
+    let Some(first) = facts.clone().next() else {
+        return Ok(None);
+    };
+    if facts
+        .clone()
+        .any(|fact| !same_requirement(first, fact) || fact.original.is_none())
+        || !facts.clone().any(|fact| fact.family != first.family)
+    {
+        return Ok(None);
+    }
+    let mut builder =
+        DeclaredAlgorithmUniverseBuilderV1::new(population.settings.max_axes, builder_limit(seed)?)
+            .map_err(|reason| error(format!("combination declaration builder: {reason:?}")))?;
+    for fact in facts.clone() {
+        if builder.observe(fact.original.as_deref().unwrap()).is_err() {
+            return Ok(None);
+        }
+    }
+    let local = match builder.finish() {
+        Ok(local) if seed.contains_universe(&local) => local,
+        _ => return Ok(None),
+    };
+    let mut common = None;
+    for fact in facts {
+        match fact
+            .original
+            .as_deref()
+            .unwrap()
+            .numerical_family_key_for_universe(&local)
+        {
+            Ok(key) if common.is_none_or(|old| old == key) => common = Some(key),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(local))
+}
+
+/// A coalesced journal still has separate raw families. Its optional local
+/// scope must collect a second complete source, with fresh requests and its
+/// own original Fit, Residual and Qualification horizon.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn coalesced_candidate(
+    raw: &SelectedBatch,
+    populations: &[SelectedPopulation],
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    prompts: &[usize],
+    chunk: usize,
+    row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    seed: &DeclaredAlgorithmUniverseV1,
+) -> Result<Option<SelectedBatch>> {
+    if raw.algorithm_universe.is_some() || raw.population_indices.len() < 2 {
+        return Ok(None);
+    }
+    let Some(local) = local_universe(facts(raw, inputs), population, seed)? else {
+        return Ok(None);
+    };
+    if local.algorithm_count() < 2 {
+        return Ok(None);
+    }
+    let mut combined = batch_plan(
+        &raw.population_indices,
+        populations,
+        cases,
+        opportunities,
+        prompts,
+        chunk,
+        row_ceiling,
+        population,
+    )?;
+    combined.algorithm_universe = Some(local);
+    Ok(Some(combined))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn candidate(
     current: &SelectedBatch,
@@ -130,17 +317,6 @@ pub(super) fn candidate(
     population: &StructuredServiceDeclarationV7,
     seed: &DeclaredAlgorithmUniverseV1,
 ) -> Result<Option<SelectedBatch>> {
-    if population
-        .nonnegative_envelope
-        .as_ref()
-        .is_none_or(|contract| {
-            contract.population_policy != StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1
-                || contract.template_policy
-                    != StructuredCostTemplatePolicyV1::InstalledAlgorithmSetV1
-        })
-    {
-        return Ok(None);
-    }
     let Some(first) = facts(current, inputs).next() else {
         return Ok(None);
     };
@@ -168,46 +344,14 @@ pub(super) fn candidate(
         {
             continue;
         }
-        let mut builder = DeclaredAlgorithmUniverseBuilderV1::new(
-            population.settings.max_axes,
-            builder_limit(seed)?,
-        )
-        .map_err(|reason| error(format!("combination declaration builder: {reason:?}")))?;
-        let mut valid = true;
-        for fact in facts(prior, inputs).chain(facts(current, inputs)) {
-            if builder.observe(fact.original.as_deref().unwrap()).is_err() {
-                valid = false;
-                break;
-            }
-        }
-        if !valid {
+        let Some(local) = local_universe(
+            facts(prior, inputs).chain(facts(current, inputs)),
+            population,
+            seed,
+        )?
+        else {
             continue;
-        }
-        let local = match builder.finish() {
-            Ok(local) => local,
-            Err(_) => continue,
         };
-        if !seed.contains_universe(&local) {
-            continue;
-        }
-        let mut common = None;
-        for fact in facts(prior, inputs).chain(facts(current, inputs)) {
-            match fact
-                .original
-                .as_deref()
-                .unwrap()
-                .numerical_family_key_for_universe(&local)
-            {
-                Ok(key) if common.is_none_or(|old| old == key) => common = Some(key),
-                _ => {
-                    valid = false;
-                    break;
-                }
-            }
-        }
-        if !valid || common.is_none() {
-            continue;
-        }
         let mut members = Vec::new();
         members
             .try_reserve_exact(add(

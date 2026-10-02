@@ -410,8 +410,14 @@ fn local_combination_peak_authorization_preserves_raw_path_on_capacity_denial() 
     );
 }
 
-#[test]
-fn local_combination_declares_only_checked_compatible_sources_before_collection() {
+fn algorithm_pair_inventory(
+    width_scales: [usize; 2],
+) -> (
+    Vec<Case>,
+    Vec<CaseOpportunity>,
+    Vec<Vec<CheckedInputFacts>>,
+    StructuredServiceDeclarationV7,
+) {
     let (original_cases, _, _, population) = inventory();
     let mut cases = Vec::new();
     let mut opportunities = Vec::new();
@@ -420,11 +426,9 @@ fn local_combination_declares_only_checked_compatible_sources_before_collection(
         (0, "fixture.selection.a", [7; 32]),
         (1, "fixture.selection.b", [8; 32]),
     ] {
-        // Different complete width sets deliberately remain separate raw
-        // journals. Same-width context/algorithm families now share a journal.
         for old in &original_cases[..2] {
             let mut case = old.clone();
-            case.width *= template + 1;
+            case.width *= width_scales[template];
             case.template = template;
             case.release_generated = 0;
             case.suffix_tokens = case.maximum_output.get();
@@ -449,6 +453,14 @@ fn local_combination_declares_only_checked_compatible_sources_before_collection(
             cases.push(case);
         }
     }
+    (cases, opportunities, inputs, population)
+}
+
+#[test]
+fn local_combination_declares_only_checked_compatible_sources_before_collection() {
+    // Different complete width sets deliberately remain separate raw
+    // journals. Same-width context/algorithm families now share a journal.
+    let (cases, opportunities, inputs, population) = algorithm_pair_inventory([1, 2]);
     let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
         DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
             .map(|f| f.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
@@ -582,4 +594,391 @@ fn local_combination_declares_only_checked_compatible_sources_before_collection(
         .batches
         .iter()
         .all(|b| b.algorithm_universe.is_none()));
+}
+
+#[test]
+fn same_width_algorithm_families_keep_raw_sources_and_complete_combination_plan() {
+    let (cases, opportunities, inputs, population) = algorithm_pair_inventory([1, 1]);
+    assert!(cases.iter().all(|case| case.acquisition.is_none()));
+    assert!(inputs[0][0].family.is_some());
+    assert!(inputs[2][0].family.is_some());
+    assert_ne!(inputs[0][0].family, inputs[2][0].family);
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    assert_eq!(seed.algorithm_count(), 2);
+    let raw = select_with_local_composition(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        100_000,
+        10_000_000,
+        usize::MAX,
+        None,
+        None,
+        None,
+        NonZeroUsize::new(2),
+        None,
+    )
+    .unwrap();
+    assert_eq!(raw.populations.len(), 2);
+    assert_ne!(raw.populations[0].key, raw.populations[1].key);
+    assert!(raw.populations.iter().all(|member| member.scheduled));
+    assert_eq!(raw.batches.len(), 1);
+    assert!(raw.batches[0].scheduled);
+    assert!(raw.batches[0].algorithm_universe.is_none());
+    assert_eq!(raw.batches[0].population_indices.len(), 2);
+
+    // Two complete executions fit the same two-source cap: the original raw
+    // families and a separate A+B scope. Neither scope borrows fitted samples.
+    let capacity = SelectionCapacity {
+        requests: raw.requests.checked_mul(2).unwrap(),
+        execution_actions: raw.serial_wave_upper_bound.checked_mul(2).unwrap(),
+        declared_offer_rows: raw.declared_offer_row_bound.checked_mul(2).unwrap(),
+    };
+    let selected = select_with_capacity(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        capacity,
+        usize::MAX,
+        None,
+        None,
+        None,
+        NonZeroUsize::new(2),
+        Some(&seed),
+    )
+    .unwrap();
+    let scheduled: Vec<_> = selected
+        .batches
+        .iter()
+        .filter(|batch| batch.scheduled)
+        .collect();
+    for member in &selected.populations {
+        assert!(member.scheduled);
+        assert!(
+            scheduled.iter().any(|batch| {
+                batch.algorithm_universe.is_none()
+                    && member
+                        .representative_case_indices
+                        .iter()
+                        .all(|index| batch.representative_case_indices.contains(index))
+            }),
+            "each original family retains its own raw numerical scope"
+        );
+    }
+    let combination = scheduled
+        .iter()
+        .find(|batch| batch.algorithm_universe.is_some())
+        .expect("same-width journal coalescing must retain a separate A+B collection plan");
+    let local = combination.algorithm_universe.as_ref().unwrap();
+    assert!(seed.contains_universe(local));
+    assert_eq!(local.algorithm_count(), 2);
+    assert_eq!(combination.population_indices.len(), 2);
+    assert!(selected.populations.iter().all(|member| {
+        member
+            .representative_case_indices
+            .iter()
+            .all(|index| combination.representative_case_indices.contains(index))
+    }));
+    assert_eq!(scheduled.len(), 2);
+    assert!(selected.requests <= capacity.requests);
+    assert!(selected.serial_wave_upper_bound <= capacity.execution_actions);
+    assert!(selected.declared_offer_row_bound <= capacity.declared_offer_rows);
+
+    // These are input opportunities for all three numerical phases, not
+    // qualification evidence. Each planned source still executes fresh cohorts.
+    let fit_members = population
+        .settings
+        .min_phase_samples
+        .max(population.settings.max_rank + population.settings.min_fit_redundancy);
+    let mut cursor = 0;
+    for batch in scheduled {
+        assert!(batch.schedule_within_capacity);
+        assert!(batch.schedule.min_members[0] >= fit_members);
+        for phase in 0..3 {
+            assert!(batch.schedule.min_members[phase] >= population.settings.min_phase_samples);
+            assert!(batch.input_opportunities.phase_cycles[phase] > 0);
+            assert!(
+                batch.input_opportunities.phase_original_offer_bounds[phase]
+                    >= batch.input_opportunities.maximum_fresh_member_span[phase]
+                        .max(batch.schedule.phase_min_offered[phase])
+            );
+        }
+        assert!(
+            batch.maximum_anchor_span <= *batch.schedule.phase_min_offered.iter().min().unwrap()
+        );
+        assert!(batch.planned_cycles >= batch.input_opportunities.planned_cycles);
+        let count = batch.representative_case_indices.len() * batch.planned_cycles;
+        let execution = &selected.execution_case_indices[cursor..cursor + count];
+        for cycle in execution.chunks_exact(batch.representative_case_indices.len()) {
+            assert_eq!(cycle, batch.representative_case_indices);
+        }
+        cursor += count;
+    }
+    assert_eq!(cursor, selected.execution_case_indices.len());
+    assert!(selected.requests > raw.requests);
+    assert!(selected.serial_wave_upper_bound > raw.serial_wave_upper_bound);
+    assert!(selected.declared_offer_row_bound > raw.declared_offer_row_bound);
+
+    let complete = SelectionCapacity {
+        requests: selected.requests,
+        execution_actions: selected.serial_wave_upper_bound,
+        declared_offer_rows: selected.declared_offer_row_bound,
+    };
+    let incomplete = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs[..2].iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    for (reason, capacity, sources, seed) in [
+        (
+            "request",
+            SelectionCapacity {
+                requests: complete.requests - 1,
+                ..complete
+            },
+            2,
+            &seed,
+        ),
+        (
+            "action",
+            SelectionCapacity {
+                execution_actions: complete.execution_actions - 1,
+                ..complete
+            },
+            2,
+            &seed,
+        ),
+        (
+            "row",
+            SelectionCapacity {
+                declared_offer_rows: complete.declared_offer_rows - 1,
+                ..complete
+            },
+            2,
+            &seed,
+        ),
+        ("source", complete, 1, &seed),
+        ("seed", complete, 2, &incomplete),
+    ] {
+        let denied = select_with_capacity(
+            &cases,
+            &opportunities,
+            &inputs,
+            &[61, 61],
+            8,
+            None,
+            &population,
+            capacity,
+            usize::MAX,
+            None,
+            None,
+            None,
+            NonZeroUsize::new(sources),
+            Some(seed),
+        )
+        .unwrap();
+        assert!(
+            denied
+                .batches
+                .iter()
+                .all(|batch| batch.algorithm_universe.is_none()),
+            "{reason}"
+        );
+        assert!(
+            denied.populations.iter().all(|member| member.scheduled),
+            "{reason}"
+        );
+        assert_eq!(
+            denied.execution_case_indices, raw.execution_case_indices,
+            "{reason}"
+        );
+        assert_eq!(denied.requests, raw.requests, "{reason}");
+        assert_eq!(
+            denied.serial_wave_upper_bound, raw.serial_wave_upper_bound,
+            "{reason}"
+        );
+        assert_eq!(
+            denied.declared_offer_row_bound, raw.declared_offer_row_bound,
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn same_width_combination_preserves_later_original_source_at_same_or_lower_policy() {
+    use SloAutomaticCostProbeSamplingPresetV1::{Configured, GreedyLength};
+
+    for preset in [Configured, GreedyLength] {
+        let (mut cases, mut opportunities, mut inputs, population) =
+            algorithm_pair_inventory([1, 1]);
+        let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+            DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+                .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+        // The original A/B/C opportunities fit the three-source cap. A/B
+        // coalescing saves a slot for a separate union; C keeps its complete
+        // raw source at either the same policy or GreedyLength's later policy.
+        for mut case in cases[..2].to_vec() {
+            case.template = 2;
+            case.width *= 4;
+            case.preset = preset;
+            let input = natural_termination_input_with_algorithm_and_eos(
+                case.width as u32,
+                CostProductOutput::GreedyToken,
+                false,
+                64,
+                "fixture.selection.c",
+                [9; 32],
+                preset == Configured,
+            );
+            opportunities.push(CaseOpportunity {
+                population: classify_alternatives(
+                    std::slice::from_ref(&input),
+                    population.population_policy(),
+                    true,
+                )
+                .unwrap(),
+                minimum_fresh_members: 1,
+            });
+            inputs.push(vec![input_facts(&StructuredQueryV2::exact(input)).unwrap()]);
+            cases.push(case);
+        }
+        let run = |capacity, seed| {
+            select_with_capacity(
+                &cases,
+                &opportunities,
+                &inputs,
+                &[61, 61, 61],
+                8,
+                None,
+                &population,
+                capacity,
+                usize::MAX,
+                None,
+                None,
+                None,
+                NonZeroUsize::new(3),
+                seed,
+            )
+            .unwrap()
+        };
+        let capacity = SelectionCapacity::legacy(100_000, 10_000_000);
+        let raw = run(capacity, None);
+        assert_eq!(raw.populations.len(), 3);
+        assert!(raw.populations.iter().all(|member| member.scheduled));
+        let scheduled: Vec<_> = raw.batches.iter().filter(|batch| batch.scheduled).collect();
+        assert_eq!(scheduled.len(), 2);
+        assert!(scheduled
+            .last()
+            .unwrap()
+            .representative_case_indices
+            .iter()
+            .all(|&index| cases[index].template == 2));
+
+        let selected = run(capacity, Some(&seed));
+        assert!(
+            selected.populations.iter().all(|member| member.scheduled),
+            "{preset:?}"
+        );
+        let selected_sources: Vec<_> = selected
+            .batches
+            .iter()
+            .filter(|batch| batch.scheduled)
+            .collect();
+        assert_eq!(selected_sources.len(), 3);
+        let combination_index = selected_sources
+            .iter()
+            .position(|batch| batch.algorithm_universe.is_some())
+            .expect("the saved source slot must collect a separate A+B scope");
+        let combination = selected_sources[combination_index];
+        let local = combination.algorithm_universe.as_ref().unwrap();
+        assert_eq!(local.algorithm_count(), 2);
+        assert!(seed.contains_universe(local));
+        assert!(combination
+            .representative_case_indices
+            .iter()
+            .all(|&index| cases[index].template < 2));
+        for original in &scheduled {
+            let retained = selected_sources
+                .iter()
+                .find(|batch| {
+                    batch.algorithm_universe.is_none()
+                        && batch.representative_case_indices == original.representative_case_indices
+                })
+                .expect("composition must retain each original raw source");
+            assert_eq!(retained.planned_cycles, original.planned_cycles);
+            assert_eq!(retained.requests, original.requests);
+            assert_eq!(
+                retained.serial_wave_upper_bound,
+                original.serial_wave_upper_bound
+            );
+            assert_eq!(
+                retained.declared_offer_row_bound,
+                original.declared_offer_row_bound
+            );
+        }
+        let later_index = selected_sources
+            .iter()
+            .position(|batch| {
+                batch.algorithm_universe.is_none()
+                    && batch
+                        .representative_case_indices
+                        .iter()
+                        .all(|&index| cases[index].template == 2)
+            })
+            .unwrap();
+        assert_eq!(later_index < combination_index, preset == Configured);
+        assert_eq!(selected.requests, raw.requests + combination.requests);
+        assert_eq!(
+            selected.serial_wave_upper_bound,
+            raw.serial_wave_upper_bound + combination.serial_wave_upper_bound
+        );
+        assert_eq!(
+            selected.declared_offer_row_bound,
+            raw.declared_offer_row_bound + combination.declared_offer_row_bound
+        );
+        assert!(selected.execution_case_indices.len() > raw.execution_case_indices.len());
+
+        // The extra union's work cannot borrow C's originally affordable
+        // request allowance, even when its source slot is available.
+        let denied = run(
+            SelectionCapacity {
+                requests: selected.requests - 1,
+                execution_actions: selected.serial_wave_upper_bound,
+                declared_offer_rows: selected.declared_offer_row_bound,
+            },
+            Some(&seed),
+        );
+        assert!(
+            denied
+                .batches
+                .iter()
+                .all(|batch| batch.algorithm_universe.is_none()),
+            "{preset:?}"
+        );
+        assert!(
+            denied.populations.iter().all(|member| member.scheduled),
+            "{preset:?}"
+        );
+        assert_eq!(
+            denied.execution_case_indices, raw.execution_case_indices,
+            "{preset:?}"
+        );
+        assert_eq!(denied.requests, raw.requests, "{preset:?}");
+        assert_eq!(
+            denied.serial_wave_upper_bound, raw.serial_wave_upper_bound,
+            "{preset:?}"
+        );
+        assert_eq!(
+            denied.declared_offer_row_bound, raw.declared_offer_row_bound,
+            "{preset:?}"
+        );
+    }
 }

@@ -8,7 +8,7 @@
 
 当前唯一实现主线是把已有 native 前缀准备接入共享自动启动。每个子修改必须说明它消除上述链路中的哪个阻断；与链路无关的优化单独登记，不能混进当前修改。如果失败推翻预算、支持域或生命周期假设，先修订对应合同与判别用例，再继续实现。没有新的原因证据，不重复昂贵测试，也不根据报错不断追加旁支设计。
 
-2026 年 10 月 3 日进度：正常共享 engine builder 的 CPU cache-off 场景已通过，四个 source 完成资格并激活，普通不同内容请求取得执行前预测、实际采用并完整输出，校准结束后的额外私有与共享 lease 均为零。当前正在回归原有共享缓存路径与预算边界；第二关整体、真实 `run` / `serve`、双后端及性能仍未验收。此后先固定这一批源码和证据，再进入产品入口验证，不将后续发现的无关优化并入本批。
+2026 年 10 月 3 日进度：正常共享 engine builder 的 CPU cache-off 场景已通过，普通不同内容请求取得执行前预测、实际采用并完整输出，校准结束后的额外私有与共享 lease 均为零。该检查点为 `b6e16ade`。随后全量测试发现一项组合 source 选择失败；本次已用 typed 选择测试复现并局部修复，原端到端断言保持不变并通过，计划组 149 项回归通过。第二关整体、真实 `run` / `serve`、双后端及性能仍未验收，正式性能为 0/224。原 Metal mini 的 SSH 当前超时，已询问可用访问方式；本地验证继续进行。
 
 收敛以三个可交付结果推进：先得到可重复的正常自动链路检查点，再得到同一源码的 Metal/CUDA `run` / `serve` 可用版本，最后完成原性能范围。每个结果都列明失败和未测项。新失败必须落到具体触发、被否定的假设和最小修改；若它推翻原容量、资格或执行合同，则先停止依赖该假设的扩大验证，重新判定该方案的可行性。不能以修改数量、通过率或更多重跑替代这一判定。
 
@@ -245,7 +245,17 @@ Metal 用例运行于本机 Apple M1 Max（24 GPU cores），采用测试中真�
 
 当前集成源码已提交并 push 为 `b6e16ade`。默认 `cargo check --workspace --all-targets` 已通过、1m31s；Metal 同范围 compile check 已通过、59.38s，均存在 warnings；`cargo clippy --workspace --all-targets -- -A warnings` 已通过、2m19s。证据为 `g2-native-startup-workspace-check.log`、`g2-native-startup-workspace-metal-check.log` 和 `g2-native-startup-workspace-clippy.log`。Clippy 使用仓库规定的允许 warnings 配置，不能表述成零 warning。
 
-完整 workspace tests 第一次在编译阶段因磁盘余量降至 341MiB 被主动 SIGINT（exit 130），尚无全量测试结果；原始日志 `g2-native-startup-workspace-test.log` 保留。已用 Cargo dry-run 确认旧 CLI/server/devtools 的 dev 构建缓存，再只清理这些可重建产物，保留当前 engine 测试产物、release、模型与证据。完整 tests、优化构建计时探针和 CUDA compile/runtime 仍待完成；本批是上述范围已验证的集成检查点，不标记 PR 或完整目标已验收。
+完整 workspace tests 首次在编译阶段因磁盘余量降至 341MiB 被主动 SIGINT（exit 130）；只清理旧 CLI/server/devtools 缓存后第二次仍因 linker/query-cache 的 ENOSPC 退出 101。这两次都不是测试语义通过。随后用 Cargo dry-run 确认并清理共享 target 的整个 dev profile（53.8GiB），保留 release、registry、模型、源码与证据，按原构建选项重建。新编译完成用时 11m21s；engine lib 为 1518 pass、1 fail、6 ignored、505.87s，后续 workspace targets 因 engine 失败未执行。日志为 `g2-native-startup-workspace-test-fresh-debug.log`。部分 engine 父测试启动子进程，不能累加所有 `test result` 行充作唯一测试数。
+
+失败为原 `source8_checked_algorithm_subset_executes_unobserved_mixed_rows_with_real_witness`，独立复跑在同一断言失败、13.19s（`g2-combination-source-isolated.log`）。其四个 raw source 都已实际收集和导入，但不存在独立的 A+B 组合 child。该 fixture 没有 native checkpoint 能力，因此不是本轮 capture/restore 失败。最小 typed 同宽 A/B 选择用例在 0.06s 复现：同宽 raw journal 合并发生在组合候选选择之前，合并后只剩一份纯 Decode journal，旧算法要求的另一份已安排、不同 family 的 journal 已消失。原不同宽正例避开了这个场景；不能据静态比较认定该缺口由 `b6e16ade` 引入。
+
+修复范围限定为原选择器：保留独立 raw A/B 的完整资格计划，再从原 checked inputs 声明一份另外执行完整 F/R/Q 的组合源。遵守既有 Configured 优先于辅助 GreedyLength 的顺序，保护合并前原遍历在三类预算和 source cap 内已经能安排的全部 population，新增组合还需通过完整工作量和源名额检查。当前反例合并前的前四份原候选全部是 Configured；合并后可用的名额不能自动全部归入低优先级辅助采样。辅助源仍保留完整声明，放不下时显式报告 gap，不缩短阶段或抬高 cap。
+
+选择器的两项新增回归通过、0.03s（`g2-combination-same-width-fixed.log`）：同宽两 raw families 及独立组合执行；三账各少一单位、source cap 不足、seed 不完整时原 raw 不受影响；同策略和较低策略的原后续 source 保留且组合另算完整工作。原 `context_family` 端到端测试未修改，重跑通过、13.92s（`g2-combination-source-fixed.log`），覆盖独立 raw A/B 和组合的资格、未采集过的混合 A+B 查询、真实 witness 采用及完整输出。实际四份 source 为 Configured Prefill raw、Configured Decode raw、Configured Decode union、首份 Greedy raw；原后续 Greedy Decode 成为显式容量 gap。修复只证明该 CPU 场景闭合，不是双后端性能或全量 workspace 通过。
+
+同一选择器修复的整个 `prepared_owner::plan::` CPU/default 回归为 149 pass、0 fail、0 ignored、21.79s（`g2-combination-plan-regression.log`），包含原不同宽组合、native 静态工作账、覆盖顺序与容量规则。格式和 diff 检查通过；不把该组结果替代整个 workspace 或正常产品入口的验收。
+
+完整 tests、当前源码优化构建计时探针和 CUDA compile/runtime 仍待完成；本批不标记 PR 或完整目标已验收。原 2ms 探针、真实模型/GPU/服务、环境依赖及父测试专用 helper 的 ignored 含义不同，不能统称已验证或全部未执行。
 
 ## 来源位置
 

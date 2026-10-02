@@ -800,6 +800,16 @@ pub(super) fn select_with_capacity(
     // journal retains its earliest source position; the bounded merge check
     // preserves every source that this exact original traversal can schedule.
     priority::order_batches(&mut batch_candidates, inputs);
+    let protected = if combination_seed.is_some() {
+        composition::protected_populations(
+            &batch_candidates,
+            capacity,
+            selected_priority,
+            maximum_sources,
+        )?
+    } else {
+        Vec::new()
+    };
     coalesce_related_batches(
         &mut batch_candidates,
         &out.populations,
@@ -820,8 +830,91 @@ pub(super) fn select_with_capacity(
         selected_priority,
         maximum_sources,
     )?;
-    let mut scheduled_sources = 0_usize;
     let mut combined_once = false;
+    if let Some(seed) = combination_seed {
+        for basis in 0..batch_candidates.len() {
+            let raw = &batch_candidates[basis];
+            if selected_priority.is_some_and(|selected| selected != raw.input_priority) {
+                continue;
+            }
+            let Some(combined) = composition::coalesced_candidate(
+                &raw.batch,
+                &out.populations,
+                cases,
+                opportunities,
+                inputs,
+                prompts,
+                chunk,
+                prefill_row_ceiling,
+                population,
+                seed,
+            )?
+            else {
+                continue;
+            };
+            // Keep every raw journal. The new complete source follows all
+            // original candidates of its installed policy and precedes only
+            // lower-priority policies. Its full work is additional, including
+            // any source-local native acquisition; no raw setup is refunded.
+            let insertion = batch_candidates
+                .partition_point(|candidate| candidate.coverage.policy <= raw.coverage.policy);
+            let work_fits = original_budget
+                .requests
+                .checked_add(combined.requests)
+                .is_some_and(|total| total <= capacity.requests)
+                && original_budget
+                    .execution_actions
+                    .checked_add(combined.serial_wave_upper_bound)
+                    .is_some_and(|total| total <= capacity.execution_actions)
+                && original_budget
+                    .declared_offer_rows
+                    .checked_add(combined.declared_offer_row_bound)
+                    .is_some_and(|total| total <= capacity.declared_offer_rows);
+            let preserves = |maximum_sources| {
+                composition::insertion_preserves_raw(
+                    &batch_candidates,
+                    basis,
+                    insertion,
+                    &combined,
+                    &protected,
+                    capacity,
+                    selected_priority,
+                    maximum_sources,
+                )
+            };
+            if work_fits && preserves(maximum_sources)? {
+                let candidate = BatchCandidate {
+                    input_priority: raw.input_priority,
+                    coverage: raw.coverage,
+                    coverage_round: add(raw.coverage_round, 1)?,
+                    decode_width_tier: raw.decode_width_tier,
+                    original_population_index: raw.original_population_index,
+                    batch: combined,
+                };
+                // At least two original populations coalesced into the raw
+                // basis, so the original candidate backing has one free slot.
+                if batch_candidates.len() == batch_candidates.capacity() {
+                    return Err(error("coalesced combination candidate capacity differs"));
+                }
+                batch_candidates.insert(insertion, candidate);
+                combined_once = true;
+                break;
+            }
+            let reason = if work_fits && maximum_sources.is_some() && preserves(None)? {
+                SelectionGapReason::RetainedSourceCapacity {
+                    maximum_sources: maximum_sources.unwrap().get(),
+                }
+            } else {
+                SelectionGapReason::CombinationWorkCapacity
+            };
+            out.gaps.push(SelectionGap {
+                population: None,
+                reason,
+            });
+        }
+    }
+    drop(protected);
+    let mut scheduled_sources = 0_usize;
     for mut candidate in batch_candidates {
         let deferred = selected_priority
             .filter(|&selected| selected != candidate.input_priority)
