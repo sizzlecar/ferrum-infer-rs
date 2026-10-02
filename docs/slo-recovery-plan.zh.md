@@ -8,7 +8,7 @@
 
 当前唯一实现主线是把已有 native 前缀准备接入共享自动启动。每个子修改必须说明它消除上述链路中的哪个阻断；与链路无关的优化单独登记，不能混进当前修改。如果失败推翻预算、支持域或生命周期假设，先修订对应合同与判别用例，再继续实现。没有新的原因证据，不重复昂贵测试，也不根据报错不断追加旁支设计。
 
-2026 年 10 月 3 日进度：正常共享 engine builder 的 CPU cache-off 场景已通过，普通不同内容请求取得执行前预测、实际采用并完整输出，校准结束后的额外私有与共享 lease 均为零。该检查点为 `b6e16ade`。随后全量测试发现一项组合 source 选择失败；本次已用 typed 选择测试复现并局部修复，原端到端断言保持不变并通过，计划组 149 项回归通过。第二关整体、真实 `run` / `serve`、双后端及性能仍未验收，正式性能为 0/224。原 Metal mini 的 SSH 当前超时，已询问可用访问方式；本地验证继续进行。
+2026 年 10 月 3 日进度：正常共享 engine builder 的 CPU cache-off 场景已通过，普通不同内容请求取得执行前预测、实际采用并完整输出，校准结束后的额外私有与共享 lease 均为零。生产源码为 `87cd94c7`，之后仅补测试诊断和部分 capture 成功后的容量失败清理用例。本轮完整 workspace tests 已 exit 0，engine 为 1522 pass、0 fail、6 ignored；当前生产源码的两个默认 2ms 优化构建探针及两项容量清理用例均通过。fmt、workspace check、Clippy 和 Metal compile check 也已通过。前一次全量运行曾发生 Decode 资格欠估，本轮未复现，仍保留原负结果，不声称数值根因已消除。真实 `run` / `serve`、双后端及性能仍未验收，正式性能为 0/224。原 Metal mini 当前仍无法连接，已询问可用访问方式；保存 CPU 检查点后推进实机验证，不继续扩张功能。
 
 收敛以三个可交付结果推进：先得到可重复的正常自动链路检查点，再得到同一源码的 Metal/CUDA `run` / `serve` 可用版本，最后完成原性能范围。每个结果都列明失败和未测项。新失败必须落到具体触发、被否定的假设和最小修改；若它推翻原容量、资格或执行合同，则先停止依赖该假设的扩大验证，重新判定该方案的可行性。不能以修改数量、通过率或更多重跑替代这一判定。
 
@@ -255,7 +255,21 @@ Metal 用例运行于本机 Apple M1 Max（24 GPU cores），采用测试中真�
 
 同一选择器修复的整个 `prepared_owner::plan::` CPU/default 回归为 149 pass、0 fail、0 ignored、21.79s（`g2-combination-plan-regression.log`），包含原不同宽组合、native 静态工作账、覆盖顺序与容量规则。格式和 diff 检查通过；不把该组结果替代整个 workspace 或正常产品入口的验收。
 
-完整 tests、当前源码优化构建计时探针和 CUDA compile/runtime 仍待完成；本批不标记 PR 或完整目标已验收。原 2ms 探针、真实模型/GPU/服务、环境依赖及父测试专用 helper 的 ignored 含义不同，不能统称已验证或全部未执行。
+`87cd94c7` 的完整 workspace tests 为 exit 101：engine 1520 pass、1 fail、6 ignored、510.00s，后续 targets 未执行（`g2-combination-workspace-test.log`）。原组合端到端已在此次全量运行通过。唯一失败是 `native_prefix_cpu_ordinary_qualified_hold_restore_and_first_commit`：Configured 与 Greedy 两份 Decode source 的首轮均发生 `QualificationUnderestimate`，后续独立阶段未在原 source horizon 内形成有效 child，普通请求因 Decode 为 WrongDomain 无法取得有限时间 witness；失败在 follower 提交及 hold/restore 之前。该 fixture 的四份计划、工作量与此前通过的正常启动一致，且不满足新增组合路径的条件。空 child 导入产生的 `profile frozen child inventory differs` 是后续报错，不能据此认定持久化元数据损坏。
+
+同一 workspace 二进制单独运行原失败项通过、30.48s，四个 source 均导入（`g2-qualified-hold-workspace-isolated.log`）。这只说明资格结果受运行条件影响；没有失败成员的实际耗时和冻结预测数值，不能断言是环境噪声，也不能用单独通过覆盖全量失败。当前仅在测试夹具接入既有 WARN 诊断，输出原 qualification 成员的 wall、fitted upper、residual、margin、planning 和 excess；不改样本、预算或资格规则。使用全局测试 subscriber 才能接收既有工作线程事件，保留已安装的 subscriber；日志扫描、格式化和 stderr 本身有观察开销。
+
+曾尝试只运行尚未到达的 workspace packages，但排除前面 packages 改变了 Cargo feature unification，引发额外构建，磁盘余量降至约 3.1GiB；编译阶段主动中断、exit 130，没有得到测试结果（`g2-combination-workspace-remaining.log`）。确认无 Cargo/rustc 后，只清理共享 target 的 `debug/incremental`，保留依赖对象、可执行文件、release 缓存及证据，磁盘余量恢复约 16GiB。后续沿用完整 workspace package 集合并加 `--no-fail-fast`，一次记录全部 targets 的实际结果，不再用改变依赖组合的方式补测。
+
+当前生产源码 `87cd94c7` 的两个默认 2ms 优化构建探针通过：2 pass、0 fail、0 ignored、0.85s，构建 12m45s（`g1-current-product-budget-release.log`）。前瞻场景实际决定、提交和配对均为 4 次、共 7 waves，包含 3 次非空 tail，4 次规划累计 0.942ms；基本场景为 1 次、1 wave，规划 0.199ms。两者均完成原请求输出。这是未启用 native checkpoint 的受控 CPU 小场景，不能替代正常 native builder 的默认预算或真实设备结果。二进制含测试诊断的初版，后续仅调整诊断级别上限；探针不安装该 subscriber。
+
+私有准备的后续 key 容量失败边界已补齐，无生产修改。原第一 key 容量失败测试保留，新增真实 2/3-token 模板经原 cursor 形成多 key source；先填满真实 interest 容量再释放一个槽，要求实际完成 1 次 capture 后第二 key 被拒绝。检查全部已获取 private lease 退役、shared lease 为零、已花费 seed/capture 不退款、原预约与 deadline 不重置，以及释放压力后原后继 source 能真实准备。两项均通过、4.96s（`g2-native-later-key-capacity-workspace-filter.log`）；命令保持完整 workspace feature graph，其他测试仅被过滤，不能算全量通过。它覆盖后续 interest 容量失败，不冒充 capture 已提交后的失败或 partial restore ACK 故障证明。
+
+带上述测试诊断和容量补测的完整 `cargo test --workspace --all-targets --no-fail-fast` 已 exit 0（`g2-current-workspace-test-diagnostics.log`），不再因首个 target 失败而提前停止。engine library 为 1522 pass、0 fail、6 ignored、509.61s；interfaces 为 936/0/3，scheduler 为 1013/0/28，models 为 586/0/6，CLI 为 542/0/0，server 为 418/0/0。这里分别列 library 终态，不把父测试启动的子进程结果重复累加成全仓总数。原 hold/restore 断言本次通过；生产算法未为此前资格失败作修改，因此不能将本次通过写成已修复数值欠估，也不据此追加无新证据的重跑。
+
+Ignored 包括父测试专用 helper、真实模型或外部服务、GPU/算子依赖、优化构建计时，以及原始归档/settings 诊断。两项 2ms 探针引用其独立 release 结果；未启用后端 feature 导致的 0 tests 也不算设备验证。CUDA compile/runtime、真实双后端正常入口和正式性能仍待完成，本批不标记 PR 或完整目标已验收。
+
+同一源码已完成规定的本地检查：fmt/diff 通过；workspace 全目标 check 通过、3m40s（`g2-current-workspace-check.log`）；Clippy 按 `-A warnings` 通过、2m22s（`g2-current-workspace-clippy.log`）；Metal 全目标 compile check 通过、1m21s（`g2-current-workspace-metal-check.log`）。构建仍有 warnings，Clippy 不是零 warning 证明；Metal 编译也不是 Metal 运行或 CUDA 兼容证明。下一项实机工作使用固定的当前检查点、原正常入口和模型，不再用新增 CPU 大场景延后真实链路验收。
 
 ## 来源位置
 

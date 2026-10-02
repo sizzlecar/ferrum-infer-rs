@@ -5,6 +5,7 @@ use crate::{AutomaticCostProbeOutput, AutomaticCostProbeTemplate};
 use ferrum_interfaces::engine::InferenceEngine;
 use ferrum_interfaces::output_flow::{CreditedOutputSession, OutputCompletion};
 use futures::StreamExt;
+mod diagnostics;
 mod ready;
 
 const PROMPT: usize = 24;
@@ -121,6 +122,7 @@ async fn startup_with_wait_and_natural_eos(
     natural_eos: bool,
     prefix_enabled: bool,
 ) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
+    diagnostics::install();
     // Use the product tokenizer's source-config parser. The original helper
     // has no EOS vocabulary declaration; removing ignore-EOS alone would not
     // exercise an EOS-enabled installed policy.

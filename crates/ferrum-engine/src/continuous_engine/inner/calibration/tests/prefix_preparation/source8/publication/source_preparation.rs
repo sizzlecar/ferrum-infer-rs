@@ -31,6 +31,15 @@ fn assert_no_source_owners(session: &CalibrationSession) {
 
 #[tokio::test]
 async fn source8_native_interest_capacity_before_collection_keeps_spent_seed_and_next_source() {
+    check_interest_capacity_fallback(&[3], 0).await;
+}
+
+#[tokio::test]
+async fn source8_native_interest_capacity_after_capture_retires_all_keys_and_keeps_next_source() {
+    check_interest_capacity_fallback(&[2, 3], 1).await;
+}
+
+async fn check_interest_capacity_fallback(prompt_lengths: &[usize], successful_captures: usize) {
     let (mut session, executor) = automatic_checkpoint_session(2).await;
     {
         let inner = Arc::get_mut(&mut session.engine.inner).unwrap();
@@ -47,20 +56,35 @@ async fn source8_native_interest_capacity_before_collection_keeps_spent_seed_and
     executor
         .project_structured_cpu_fill
         .store(true, Ordering::Release);
-    let mut request = request(&session, 3);
-    request.prompt = "test test test".into();
-    if let Some(ferrum_types::ApiRequest::Completion(api)) = &mut request.api_request {
-        api.prompt = request.prompt.clone();
+    let mut templates = Vec::new();
+    for &length in prompt_lengths {
+        let mut request = request(&session, 3);
+        request.prompt = vec!["test"; length].join(" ");
+        if let Some(ferrum_types::ApiRequest::Completion(api)) = &mut request.api_request {
+            api.prompt = request.prompt.clone();
+        }
+        assert_eq!(
+            session
+                .engine
+                .inner
+                .tokenizer
+                .encode(&request.prompt, true)
+                .unwrap()
+                .len(),
+            length,
+            "templates must have their declared real token lengths"
+        );
+        request.sampling_params.top_k = Some(executor.info().vocab_size);
+        request.sampling_params.stop_sequences.clear();
+        templates.push(
+            AutomaticCostProbeTemplate::new(request, AutomaticCostProbeOutput::CliText).unwrap(),
+        );
     }
-    request.sampling_params.top_k = Some(executor.info().vocab_size);
-    request.sampling_params.stop_sequences.clear();
-    let template =
-        AutomaticCostProbeTemplate::new(request, AutomaticCostProbeOutput::CliText).unwrap();
     let settings = ferrum_types::SloAutomaticCalibrationSettingsV1::default();
     let inputs = Box::pin(PreparedProbeInputs::new(
         &mut session,
         &settings,
-        &[template],
+        &templates,
     ))
     .await
     .unwrap();
@@ -88,13 +112,28 @@ async fn source8_native_interest_capacity_before_collection_keeps_spent_seed_and
         .filter(|&index| !series.source(index).unwrap().acquisitions().is_empty())
         .collect();
     let mut native_sources = native_sources.into_iter();
-    let first = native_sources.next().expect("a declared native source");
+    let first = native_sources
+        .find(|&index| series.source(index).unwrap().acquisitions().len() > successful_captures)
+        .expect("the actual input plan must declare enough distinct acquisition keys");
     let next = native_sources
         .next()
         .expect("an independently reserved native successor");
-    let failed_setup = series.source(first).unwrap().acquisitions()[0]
+    let source = series.source(first).unwrap();
+    assert!(source.acquisitions().len() > successful_captures);
+    let completed_setup = source.acquisitions()[..successful_captures]
+        .iter()
+        .map(|key| key.plan().setup_work())
+        .fold((0, 0, 0), |(requests, waves, actions), work| {
+            (
+                requests + work.requests,
+                waves + work.inference_waves,
+                actions + work.actions().unwrap(),
+            )
+        });
+    let failed_setup = source.acquisitions()[successful_captures]
         .plan()
         .setup_work();
+    drop(source);
 
     // An independently admitted native owner supplies real interest pressure.
     // No interest runs a transfer or enters the engine's numerical collector.
@@ -140,6 +179,11 @@ async fn source8_native_interest_capacity_before_collection_keeps_spent_seed_and
         denied && !interests.is_empty(),
         "the existing interest capacity must actually be full"
     );
+    // Leave exactly enough real capacity for the first key's capture. Its
+    // acquired lease must survive seed retirement and block the next key.
+    for _ in 0..successful_captures {
+        drop(interests.pop().expect("a real blocker slot to release"));
+    }
     assert_eq!(
         executor.native_prefix_live_lease_counts(),
         (interests.len(), 0)
@@ -175,21 +219,29 @@ async fn source8_native_interest_capacity_before_collection_keeps_spent_seed_and
             panic!("capacity fallback failed to retire its seed: {error}")
         }
     }
-    // Interest is armed after the real boundary Prefills. The denied capture
-    // was never submitted, but those original owners/actions are not refunded.
+    // Interest is armed after the real boundary Prefills. All earlier captures
+    // and the denied key's Prefills remain charged; no denied transfer is issued.
     assert_eq!(
         original_requests - budget.requests_remaining(),
-        failed_setup.requests
+        completed_setup.0 + failed_setup.requests
     );
     assert_eq!(
         original_actions - budget.attempts_remaining(),
-        failed_setup.inference_waves
+        completed_setup.2 + failed_setup.inference_waves
     );
     assert_eq!(
         executor.physical.load(Ordering::Acquire) - physical,
-        failed_setup.inference_waves
+        completed_setup.1 + failed_setup.inference_waves
     );
-    assert_eq!(executor.native_prefix_terminal_totals(), transfers);
+    assert_eq!(
+        executor.native_prefix_terminal_totals(),
+        (transfers.0 + successful_captures, transfers.1)
+    );
+    assert_eq!(
+        executor.native_prefix_live_lease_counts(),
+        (interests.len(), 0),
+        "every acquired private owner must retire before cold work or Skip"
+    );
     assert_eq!(budget.selection_requests_remaining(), reserved_requests);
     assert!(budget.selection_attempts_remaining() <= reserved_actions);
     assert!(extra_rows <= original_extra_rows);
