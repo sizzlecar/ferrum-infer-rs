@@ -12,6 +12,7 @@ mod catalog;
 mod domain;
 mod installation_diagnostic;
 mod publication;
+mod query_diagnostic;
 mod receipt;
 mod restart;
 pub(in crate::continuous_engine::inner::cost_observation) use restart::VerifiedRestartCatalog;
@@ -339,9 +340,21 @@ pub(super) fn predict_query_detailed(
     {
         return Err(QueryFailure::Invalid(Unknown::RuntimeValidity));
     }
-    let child = snapshot.select(query)?;
-    let (value, model_now) =
-        child.predict_query_local_with_clock_detailed(fingerprint, query, local_now)?;
+    let child = snapshot.select(query).map_err(|failure| {
+        query_diagnostic::failure("catalog_select", failure, query, None, local_now, version)
+    })?;
+    let (value, model_now) = child
+        .predict_query_local_with_clock_detailed(fingerprint, query, local_now)
+        .map_err(|failure| {
+            query_diagnostic::failure(
+                "child_prediction",
+                failure,
+                query,
+                Some(child),
+                local_now,
+                version,
+            )
+        })?;
     let planning_ns = value
         .planning_ns
         .checked_add(
