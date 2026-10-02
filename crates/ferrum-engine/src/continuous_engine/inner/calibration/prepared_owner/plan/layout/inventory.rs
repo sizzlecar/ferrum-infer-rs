@@ -6,6 +6,7 @@ use super::*;
 use crate::continuous_engine::inner::calibration::geometry_projection::{
     GeometryInputScenario, GeometryInputTarget, GeometryPrefixConstraint, GeometryProjectionCharge,
     GeometryProjectionLimits, GeometryProjectionPoint, GeometryProjectionUnknown,
+    GeometryReadinessReport,
 };
 use ferrum_interfaces::execution_cost::{ActualWaveGraphState, PreparedCostRouteClassV1};
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
@@ -15,7 +16,9 @@ use std::sync::Arc;
 use tokio::time::Instant;
 
 mod readiness;
-pub(super) use readiness::{collect_charged, probe_readiness, ReadinessProgress};
+pub(super) use readiness::{
+    collect_charged, probe_readiness, ReadinessCapture, ReadinessCursor, ReadinessProgress,
+};
 
 #[cfg(test)]
 async fn collect(
@@ -493,11 +496,10 @@ async fn collect_inner(
     policy: StructuredPopulationPolicyV1,
     decode_boundaries: &[u32],
     limits: InventoryLimits,
-    readiness_start: Option<usize>,
-    readiness_progress: &mut Option<ReadinessProgress>,
+    readiness_cursor: Option<ReadinessCursor>,
     charge: &mut ProbePreflightCharge,
     can_act: Option<&(dyn Fn(usize, &GeometryProjectionUnknown) -> bool + Sync)>,
-) -> Result<CheckedCaseInventory> {
+) -> Result<ReadinessCapture> {
     if cases.is_empty() || templates.len() != prompts.len() {
         return Err(error(
             "checked inventory requires original case/template alignment",
@@ -758,7 +760,8 @@ async fn collect_inner(
             .iter()
             .try_fold(targets.len(), |n, targets| n.checked_add(targets.len()))
             .ok_or_else(|| error("algorithm outcome capacity overflow"))?;
-        if let Some(first_target) = readiness_start {
+        let report = if let Some(cursor) = readiness_cursor {
+            let first_target = cursor.first_target;
             let can_act = can_act.ok_or_else(|| error("readiness action predicate absent"))?;
             let stop =
                 |scenario: usize, _: GeometryInputTarget, reason: &GeometryProjectionUnknown| {
@@ -783,6 +786,7 @@ async fn collect_inner(
                         prefill_row_ceiling: projection_row_ceiling,
                     },
                     first_target,
+                    cursor.retain_complete,
                     &stop,
                     &mut attempted,
                 )
@@ -794,82 +798,97 @@ async fn collect_inner(
                 attempted.projection_attempts,
                 &limits,
             )?;
-            let report = report?;
-            if report.admitted_requests != attempted.admitted_requests
-                || report.projection_attempts != attempted.projection_attempts
-            {
-                return Err(error("readiness charge differs from its completed receipt"));
-            }
-            let next_target = first_target
-                .checked_add(report.visited_targets)
-                .filter(|next| *next > first_target && *next <= expected_outcomes)
-                .ok_or_else(|| error("readiness did not visit an original target"))?;
-            let gap = report
-                .gap
-                .map(|(scenario, target, reason)| -> Result<InventoryGap> {
-                    tracing::info!(
-                        first_target,
-                        next_target,
-                        total_targets = expected_outcomes,
-                        scenario,
-                        ?target,
-                        ?reason,
-                        projection_attempts = report.projection_attempts,
-                        projection_remaining,
-                        "Automatic readiness projection stopped at original gap"
-                    );
-                    let case_index = if scenario < targets.len() {
-                        scenario_cases.get(scenario)
-                    } else {
-                        algorithm_cases.get(scenario - targets.len())
+            match report? {
+                GeometryReadinessReport::Complete(report) => {
+                    if report.admitted_requests != attempted.admitted_requests
+                        || report.projection_attempts != attempted.projection_attempts
+                    {
+                        return Err(error("readiness charge differs from its completed receipt"));
                     }
-                    .copied()
-                    .ok_or_else(|| error("readiness gap has no original case"))?;
-                    readiness::require_nonfatal(
-                        &reason,
-                        "readiness",
-                        scenario,
-                        target,
-                        report.projection_attempts,
-                        projection_remaining,
-                    )?;
-                    Ok(InventoryGap {
-                        case_index,
-                        reason: InventoryGapReason::Projection(reason),
-                    })
-                })
-                .transpose()?;
-            *readiness_progress = Some(ReadinessProgress {
-                next_target,
-                total_targets: expected_outcomes,
-                gap,
-            });
-            return Ok(inventory);
-        }
-        let mut attempted = GeometryProjectionCharge::default();
-        let report = session
-            .project_geometry_input_scenarios_charged(
-                requests,
-                &scenarios,
-                GeometryProjectionLimits {
-                    deadline: limits.deadline,
-                    maximum_projections: projection_remaining,
-                    maximum_route_states: limits.maximum_route_states,
-                    maximum_retained_bytes: report_limit,
-                    prefill_chunk: limits.prefill_chunk,
-                    prefill_row_ceiling: projection_row_ceiling,
-                },
-                &mut attempted,
-            )
-            .await;
-        readiness::record_charge(
-            &mut inventory.charge,
-            charge,
-            attempted.admitted_requests,
-            attempted.projection_attempts,
-            &limits,
-        )?;
-        let report = report?;
+                    report
+                }
+                GeometryReadinessReport::Progress {
+                    visited_targets,
+                    gap,
+                    admitted_requests,
+                    projection_attempts,
+                } => {
+                    if admitted_requests != attempted.admitted_requests
+                        || projection_attempts != attempted.projection_attempts
+                    {
+                        return Err(error("readiness charge differs from its completed receipt"));
+                    }
+                    let next_target = first_target
+                        .checked_add(visited_targets)
+                        .filter(|next| *next > first_target && *next <= expected_outcomes)
+                        .ok_or_else(|| error("readiness did not visit an original target"))?;
+                    let gap = gap
+                        .map(|(scenario, target, reason)| -> Result<InventoryGap> {
+                            tracing::info!(
+                                first_target,
+                                next_target,
+                                total_targets = expected_outcomes,
+                                scenario,
+                                ?target,
+                                ?reason,
+                                projection_attempts,
+                                projection_remaining,
+                                "Automatic readiness projection stopped at original gap"
+                            );
+                            let case_index = if scenario < targets.len() {
+                                scenario_cases.get(scenario)
+                            } else {
+                                algorithm_cases.get(scenario - targets.len())
+                            }
+                            .copied()
+                            .ok_or_else(|| error("readiness gap has no original case"))?;
+                            readiness::require_nonfatal(
+                                &reason,
+                                "readiness",
+                                scenario,
+                                target,
+                                projection_attempts,
+                                projection_remaining,
+                            )?;
+                            Ok(InventoryGap {
+                                case_index,
+                                reason: InventoryGapReason::Projection(reason),
+                            })
+                        })
+                        .transpose()?;
+                    return Ok(ReadinessCapture::Progress(ReadinessProgress {
+                        next_target,
+                        total_targets: expected_outcomes,
+                        gap,
+                    }));
+                }
+            }
+        } else {
+            let mut attempted = GeometryProjectionCharge::default();
+            let report = session
+                .project_geometry_input_scenarios_charged(
+                    requests,
+                    &scenarios,
+                    GeometryProjectionLimits {
+                        deadline: limits.deadline,
+                        maximum_projections: projection_remaining,
+                        maximum_route_states: limits.maximum_route_states,
+                        maximum_retained_bytes: report_limit,
+                        prefill_chunk: limits.prefill_chunk,
+                        prefill_row_ceiling: projection_row_ceiling,
+                    },
+                    &mut attempted,
+                )
+                .await;
+            readiness::record_charge(
+                &mut inventory.charge,
+                charge,
+                attempted.admitted_requests,
+                attempted.projection_attempts,
+                &limits,
+            )?;
+            report?
+        };
         if report.admitted_requests != width || report.outcomes.len() != expected_outcomes {
             return Err(error(format!(
                 "checked inventory incomplete real owner group: admitted={}/{width}, outcomes={}/{}, first_unknown={:?}",
@@ -1083,7 +1102,7 @@ async fn collect_inner(
         inventory.retained_payload_bytes(),
         limits.maximum_retained_bytes,
     )?;
-    Ok(inventory)
+    Ok(ReadinessCapture::Complete(inventory))
 }
 
 #[cfg(test)]

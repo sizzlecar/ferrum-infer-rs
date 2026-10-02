@@ -553,7 +553,7 @@ async fn collect_ready(
             )
             .filter(|n| *n > 0)
             .ok_or_else(|| error("checked inventory retained exhausted"))?;
-        readiness_projection::prepare(
+        let prepared = readiness_projection::prepare(
             session,
             input,
             &group,
@@ -563,9 +563,12 @@ async fn collect_ready(
             &mut readiness_attempts,
         )
         .await?;
-        // Every input is recomputed after the last real preparation action.
-        // No earlier readiness result supplies Known authority.
-        let captured = capture(session, input, &group, budget, remaining_bytes).await?;
+        // An uninterrupted first traversal already captured every input.
+        // Any preparation action still requires a fresh complete inventory.
+        let captured = match prepared {
+            Some(inventory) => inventory,
+            None => capture(session, input, &group, budget, remaining_bytes).await?,
+        };
         for gap in &captured.gaps {
             tracing::debug!(case = indices[gap.case_index], rows = cases[indices[gap.case_index]].width,
                 reason = ?gap.reason, "Automatic checked input remains unavailable");

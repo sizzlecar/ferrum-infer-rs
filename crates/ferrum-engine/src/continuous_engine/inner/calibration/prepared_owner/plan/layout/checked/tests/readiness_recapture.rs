@@ -1,7 +1,132 @@
-//! Readiness is an ordinary CPU execution followed by a fresh pure capture.
-//! Injected missing-route reasons never supply a Known input or numeric sample.
+//! Readiness actions use ordinary CPU execution followed by a fresh capture.
+//! An uninterrupted initial traversal may complete the checked inventory;
+//! injected missing-route reasons never supply Known inputs or numeric samples.
 use super::*;
 use std::num::NonZeroUsize;
+
+#[tokio::test]
+async fn readiness_uninterrupted_capture_matches_final_inventory_with_one_projection_allowance() {
+    for permanent_gap in [false, true] {
+        let width = 2;
+        let (mut session, executor) = fixture(width).await;
+        executor
+            .recycle_completed_bindings
+            .store(true, Ordering::Release);
+        let mut input = inputs(&mut session, false).await;
+        let cases: Vec<_> = (1..=width).map(case).collect();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        *executor.projection_readiness_fault.lock() = Some(Box::new(move |rows, submitted| {
+            observed.lock().unwrap().push((rows, submitted));
+            (permanent_gap && rows == width).then_some(ExecutionCostRouteUnknown::Resource(
+                ResourcePlanningUnknown::LogicalCapacity,
+            ))
+        }));
+        // Use the existing terminal capture as the reference, including the
+        // ordinary decode trajectories and any permanently unavailable row.
+        let mut reference_budget = budget(width);
+        let reference = Box::pin(capture(
+            &mut session,
+            &input,
+            &cases,
+            &mut reference_budget,
+            8 * 1024 * 1024,
+        ))
+        .await
+        .unwrap();
+        let reference_calls = std::mem::take(&mut *calls.lock().unwrap());
+        let projections = reference_budget.preflight_charge().projection_attempts;
+        assert_eq!(reference_calls.len(), projections);
+        assert!(projections > 1 && !reference.algorithm_inputs.is_empty());
+        assert_eq!(reference.gaps.is_empty(), !permanent_gap);
+        session.completed_owner_boundary().unwrap();
+
+        // A second full traversal cannot fit this same allowance. There is
+        // room for another owner admission, so failure would expose repeated
+        // projections rather than an unrelated request-limit rejection.
+        input.settings.maximum_offered_waves = NonZeroUsize::new(projections).unwrap();
+        let mut actual_budget = budget(2 * width);
+        let deadline = actual_budget.deadline();
+        let actual = Box::pin(collect_ready(
+            &mut session,
+            &input,
+            &cases,
+            &mut actual_budget,
+            8 * 1024 * 1024,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), reference_calls);
+        assert_eq!(actual.inputs, reference.inputs);
+        assert_eq!(actual.algorithm_inputs, reference.algorithm_inputs);
+        assert_eq!(actual.opportunities.len(), reference.opportunities.len());
+        for (actual, reference) in actual.opportunities.iter().zip(&reference.opportunities) {
+            assert_eq!(actual.population, reference.population);
+            assert_eq!(
+                actual.minimum_fresh_members,
+                reference.minimum_fresh_members
+            );
+        }
+        assert_eq!(actual.gaps.len(), reference.gaps.len());
+        for (actual, reference) in actual.gaps.iter().zip(&reference.gaps) {
+            assert_eq!(actual.case_index, reference.case_index);
+            let (InventoryGapReason::Projection(actual), InventoryGapReason::Projection(reference)) =
+                (&actual.reason, &reference.reason)
+            else {
+                panic!("the unchanged unavailable row must retain its projection gap");
+            };
+            assert_eq!(actual, reference);
+        }
+        assert_eq!(actual.charge, actual_budget.preflight_charge());
+        assert_eq!(actual.charge.projection_attempts, projections);
+        assert_eq!(actual.charge.planning_admitted_requests, width);
+        assert_eq!(actual.charge.planning_reserved_requests, width);
+        assert_eq!(actual.charge.readiness_admitted_requests, 0);
+        assert_eq!(actual_budget.input_projection_requests_remaining(), width);
+        assert_eq!(actual_budget.requests_remaining(), 2);
+        assert_eq!(actual_budget.attempts_remaining(), 16);
+        assert_eq!(actual_budget.deadline(), deadline);
+        assert_eq!(executor.physical.load(Ordering::Acquire), 0);
+        session.completed_owner_boundary().unwrap();
+
+        calls.lock().unwrap().clear();
+        input.settings.maximum_offered_waves = NonZeroUsize::new(projections - 1).unwrap();
+        let mut bounded_budget = budget(2 * width);
+        let error = Box::pin(collect_ready(
+            &mut session,
+            &input,
+            &cases,
+            &mut bounded_budget,
+            8 * 1024 * 1024,
+        ))
+        .await
+        .err()
+        .expect("one fewer real projection cannot complete the original inventory");
+        assert!(error.to_string().contains("BudgetExhausted"));
+        assert_eq!(calls.lock().unwrap().len(), projections - 1);
+        assert_eq!(
+            bounded_budget.preflight_charge().projection_attempts,
+            projections - 1
+        );
+        assert_eq!(
+            bounded_budget.preflight_charge().planning_admitted_requests,
+            width
+        );
+        assert_eq!(
+            bounded_budget.preflight_charge().planning_reserved_requests,
+            width
+        );
+        assert_eq!(
+            bounded_budget
+                .preflight_charge()
+                .readiness_admitted_requests,
+            0
+        );
+        assert_eq!(executor.physical.load(Ordering::Acquire), 0);
+        session.completed_owner_boundary().unwrap();
+        session.shutdown().await.unwrap();
+    }
+}
 
 #[tokio::test]
 async fn readiness_cursor_avoids_full_rescans_but_final_capture_rechecks_old_successes() {
@@ -389,6 +514,8 @@ async fn readiness_recapture_cannot_renew_original_planning_request_budget() {
 async fn readiness_permanent_execution_policy_gap_executes_no_cpu_cohort() {
     let (mut session, executor) = fixture(2).await;
     let input = inputs(&mut session, false).await;
+    let cases = [case(1), case(2)];
+    let owner_width = cases.iter().map(|case| case.width).max().unwrap();
     *executor.projection_readiness_fault.lock() = Some(Box::new(|_, _| {
         Some(ExecutionCostRouteUnknown::ExecutionPolicy)
     }));
@@ -396,7 +523,7 @@ async fn readiness_permanent_execution_policy_gap_executes_no_cpu_cohort() {
     let inventory = Box::pin(collect_ready(
         &mut session,
         &input,
-        &[case(1), case(2)],
+        &cases,
         &mut budget,
         8 * 1024 * 1024,
     ))
@@ -404,7 +531,16 @@ async fn readiness_permanent_execution_policy_gap_executes_no_cpu_cohort() {
     .unwrap();
     assert_eq!(executor.physical.load(Ordering::Acquire), 0);
     assert_eq!(budget.preflight_charge().readiness_reserved_requests, 0);
-    assert_eq!(budget.preflight_charge().planning_reserved_requests, 4);
+    // No preparation can repair ExecutionPolicy. The initial complete
+    // traversal retains its gaps and admits the maximum-width owner group once.
+    assert_eq!(
+        budget.preflight_charge().planning_reserved_requests,
+        owner_width
+    );
+    assert_eq!(
+        budget.preflight_charge().planning_admitted_requests,
+        owner_width
+    );
     assert!(inventory
         .opportunities
         .iter()

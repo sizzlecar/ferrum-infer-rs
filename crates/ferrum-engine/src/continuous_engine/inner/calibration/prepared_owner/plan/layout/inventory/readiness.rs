@@ -1,11 +1,22 @@
-//! Disposable readiness traversal. Only the final complete collection may
-//! retain numerical input authority or establish a conditional member floor.
+//! An uninterrupted first traversal may complete the inventory. After any
+//! preparation, only a fresh final capture may retain checked input authority.
 use super::*;
+
+#[derive(Clone, Copy)]
+pub(in super::super) struct ReadinessCursor {
+    pub first_target: usize,
+    pub retain_complete: bool,
+}
 
 pub(in super::super) struct ReadinessProgress {
     pub next_target: usize,
     pub total_targets: usize,
     pub gap: Option<InventoryGap>,
+}
+
+pub(in super::super) enum ReadinessCapture {
+    Complete(CheckedCaseInventory),
+    Progress(ReadinessProgress),
 }
 
 pub(in super::super) async fn collect_charged(
@@ -19,7 +30,7 @@ pub(in super::super) async fn collect_charged(
     limits: InventoryLimits,
     charge: &mut ProbePreflightCharge,
 ) -> Result<CheckedCaseInventory> {
-    collect_inner(
+    match collect_inner(
         session,
         cases,
         templates,
@@ -29,11 +40,16 @@ pub(in super::super) async fn collect_charged(
         decode_boundaries,
         limits,
         None,
-        &mut None,
         charge,
         None,
     )
-    .await
+    .await?
+    {
+        ReadinessCapture::Complete(inventory) => Ok(inventory),
+        ReadinessCapture::Progress(_) => {
+            Err(error("complete inventory returned a readiness cursor"))
+        }
+    }
 }
 
 pub(in super::super) async fn probe_readiness(
@@ -45,20 +61,17 @@ pub(in super::super) async fn probe_readiness(
     policy: StructuredPopulationPolicyV1,
     decode_boundaries: &[u32],
     limits: InventoryLimits,
-    first_target: usize,
+    cursor: ReadinessCursor,
     charge: &mut ProbePreflightCharge,
     can_act: &(dyn Fn(usize, &GeometryProjectionUnknown) -> bool + Sync),
-) -> Result<ReadinessProgress> {
+) -> Result<ReadinessCapture> {
     let first = cases
         .first()
         .ok_or_else(|| error("readiness group is empty"))?;
     if cases.iter().any(|case| !same_group(first, case)) {
         return Err(error("readiness cursor cannot cross original owner groups"));
     }
-    let mut progress = None;
-    // The temporary inventory has no populated facts in readiness mode and is
-    // dropped here. In particular, no Known from an older view is exported.
-    let _ = collect_inner(
+    collect_inner(
         session,
         cases,
         templates,
@@ -67,13 +80,11 @@ pub(in super::super) async fn probe_readiness(
         policy,
         decode_boundaries,
         limits,
-        Some(first_target),
-        &mut progress,
+        Some(cursor),
         charge,
         Some(can_act),
     )
-    .await?;
-    progress.ok_or_else(|| error("readiness traversal produced no receipt"))
+    .await
 }
 
 pub(super) fn record_charge(

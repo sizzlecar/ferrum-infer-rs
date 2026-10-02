@@ -84,13 +84,16 @@ pub(in crate::continuous_engine::inner::calibration) struct GeometryInputReport 
     pub projection_attempts: usize,
 }
 
-/// Readiness is only a traversal receipt. It cannot supply numerical inputs,
-/// a member floor, or an opaque state to a subsequent resource capture.
-pub(in crate::continuous_engine::inner::calibration) struct GeometryReadinessReport {
-    pub visited_targets: usize,
-    pub gap: Option<(usize, GeometryInputTarget, GeometryProjectionUnknown)>,
-    pub admitted_requests: usize,
-    pub projection_attempts: usize,
+/// Only an uninterrupted initial traversal may retain complete checked inputs.
+/// Partial traversals retain positions, never authority across a preparation.
+pub(in crate::continuous_engine::inner::calibration) enum GeometryReadinessReport {
+    Complete(GeometryInputReport),
+    Progress {
+        visited_targets: usize,
+        gap: Option<(usize, GeometryInputTarget, GeometryProjectionUnknown)>,
+        admitted_requests: usize,
+        projection_attempts: usize,
+    },
 }
 
 #[derive(Default)]
@@ -317,6 +320,7 @@ impl CalibrationSession {
             legacy_overlap,
             prefill_reuse,
             None,
+            false,
             None,
             None,
         )
@@ -329,10 +333,16 @@ impl CalibrationSession {
         scenarios: &[GeometryInputScenario<'_>],
         limits: GeometryProjectionLimits,
         first_target: usize,
+        retain_complete: bool,
         should_stop: &(dyn Fn(usize, GeometryInputTarget, &GeometryProjectionUnknown) -> bool
               + Sync),
         charge: &mut GeometryProjectionCharge,
     ) -> Result<GeometryReadinessReport> {
+        if retain_complete && first_target != 0 {
+            return Err(FerrumError::invalid_request(
+                "only an initial readiness traversal can retain complete inputs",
+            ));
+        }
         let mut report = self
             .project_geometry_inputs_mode(
                 requests,
@@ -341,11 +351,23 @@ impl CalibrationSession {
                 0,
                 PrefillReuse::Share,
                 Some(first_target),
+                retain_complete,
                 Some(should_stop),
                 Some(charge),
             )
             .await?;
-        Ok(GeometryReadinessReport {
+        if retain_complete
+            && report.outcomes.len() == scenarios.iter().map(|s| s.targets.len()).sum::<usize>()
+            && !report.outcomes.iter().any(|outcome| {
+                outcome.unknown.as_ref().is_some_and(|reason| {
+                    readiness_fatal(reason)
+                        || should_stop(outcome.scenario_index, outcome.target, reason)
+                })
+            })
+        {
+            return Ok(GeometryReadinessReport::Complete(report));
+        }
+        Ok(GeometryReadinessReport::Progress {
             visited_targets: report.outcomes.len(),
             gap: report.outcomes.pop().and_then(|outcome| {
                 outcome
@@ -371,6 +393,7 @@ impl CalibrationSession {
             0,
             PrefillReuse::Share,
             None,
+            false,
             None,
             Some(charge),
         )
@@ -385,6 +408,7 @@ impl CalibrationSession {
         legacy_overlap: usize,
         prefill_reuse: PrefillReuse,
         readiness_start: Option<usize>,
+        retain_complete: bool,
         readiness_stop: Option<
             &(dyn Fn(usize, GeometryInputTarget, &GeometryProjectionUnknown) -> bool + Sync),
         >,
@@ -601,9 +625,9 @@ impl CalibrationSession {
                     });
                     let (branches, unknown) = match projected {
                         Ok((branches, bytes)) => {
-                            if readiness_start.is_some() {
-                                // Drop query authority immediately. The final full inventory
-                                // reconstructs every input from a new real capture.
+                            if readiness_start.is_some() && !retain_complete {
+                                // A resumed traversal carries no input authority across
+                                // preparation. The final inventory uses a fresh capture.
                                 (Vec::new(), None)
                             } else {
                                 retained += bytes;

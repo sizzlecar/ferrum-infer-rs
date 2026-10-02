@@ -1,5 +1,5 @@
-//! Only positions survive a preparation action. Numerical authority is rebuilt
-//! once, in the terminal complete inventory, from a fresh real owner group.
+//! An uninterrupted initial projection can complete the inventory. Only
+//! positions survive a preparation action; its final capture uses fresh owners.
 use super::*;
 
 pub(super) async fn prepare(
@@ -10,8 +10,9 @@ pub(super) async fn prepare(
     budget: &mut ProbeExecutionBudget,
     maximum_retained_bytes: usize,
     attempts: &mut readiness::Attempts,
-) -> Result<()> {
+) -> Result<Option<CheckedCaseInventory>> {
     let mut first_target = 0;
+    let mut retain_complete = true;
     loop {
         let projection_remaining = input
             .settings
@@ -46,7 +47,10 @@ pub(super) async fn prepare(
                 prefill_chunk: input.chunk,
                 prefill_row_ceiling: input.prefill_row_ceiling,
             },
-            first_target,
+            inventory::ReadinessCursor {
+                first_target,
+                retain_complete,
+            },
             &mut charge,
             &can_act,
         )
@@ -59,7 +63,13 @@ pub(super) async fn prepare(
             ?charge,
             "Automatic short readiness projection completed"
         );
-        let progress = progress?;
+        let progress = match progress? {
+            inventory::ReadinessCapture::Complete(inventory) => return Ok(Some(inventory)),
+            inventory::ReadinessCapture::Progress(progress) => progress,
+        };
+        // Once the initial traversal stopped, no later view may promote its
+        // successful prefix into complete input authority, even at target 0.
+        retain_complete = false;
         if let Some(gap) = &progress.gap {
             if let Some(action) =
                 readiness::next_action(std::slice::from_ref(gap), group, cases, input, attempts)?
@@ -77,7 +87,7 @@ pub(super) async fn prepare(
         }
         first_target = progress.next_target;
         if first_target == progress.total_targets {
-            return Ok(());
+            return Ok(None);
         }
     }
 }
