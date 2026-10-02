@@ -100,6 +100,7 @@ impl Inventory {
                         CalibrationDecodeRoute::Actual
                     },
                     reset: false,
+                    acquisition: None,
                 });
             }
         }

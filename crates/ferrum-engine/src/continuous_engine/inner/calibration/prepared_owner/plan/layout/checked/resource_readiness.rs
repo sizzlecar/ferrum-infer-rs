@@ -143,6 +143,7 @@ mod tests {
             prefix: PrefixKind::Ordinary,
             route: CalibrationDecodeRoute::Actual,
             reset: false,
+            acquisition: None,
         };
         let requests = requests_with_row_ceiling(&case, 3, 2, Some(NonZeroU32::MIN)).unwrap();
         assert_eq!(requests.len(), 2);
@@ -179,6 +180,7 @@ mod tests {
                 prefix: PrefixKind::Ordinary,
                 route: CalibrationDecodeRoute::Actual,
                 reset: false,
+                acquisition: None,
             };
             let shapes = requests(&case, prompt, whole_chunk).unwrap();
             let tail = prompt % expected_chunk;

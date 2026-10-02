@@ -118,6 +118,7 @@ fn unequal_prefill_work_inventory() -> (
                     prefix: PrefixKind::Ordinary,
                     route: CalibrationDecodeRoute::Actual,
                     reset: true,
+                    acquisition: None,
                 });
             }
         }

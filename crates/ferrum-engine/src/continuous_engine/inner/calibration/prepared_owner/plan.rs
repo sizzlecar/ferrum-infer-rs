@@ -79,9 +79,12 @@ pub(in crate::continuous_engine::inner::calibration) struct PreparedProbePlanAud
     pub selected_widths: Vec<usize>,
     pub planned_cohorts: usize,
     pub planned_requests: usize,
-    /// No-retry serial work bound; natural terminals may perform less work.
+    /// No-retry serial action bound, including checkpoint setup and restores;
+    /// natural terminals may perform less work.
     /// This is neither an observed population nor a promise of a complete block.
     pub serial_wave_bound: usize,
+    /// Inference rows only. Native transfers do not become numerical samples.
+    pub declared_offer_row_bound: usize,
     pub original_block_offered: usize,
     pub token_policy_invalidation: TokenPolicyResidencyInvalidation,
     pub skipped_endpoint_presets: usize,

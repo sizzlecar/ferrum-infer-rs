@@ -307,6 +307,7 @@ pub(super) fn prefill_inventory(
                         prefix: PrefixKind::Ordinary,
                         route: CalibrationDecodeRoute::Actual,
                         reset: true,
+                        acquisition: None,
                     });
                 }
             }

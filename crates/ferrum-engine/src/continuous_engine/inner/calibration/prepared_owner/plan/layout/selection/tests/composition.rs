@@ -1,5 +1,176 @@
 use super::*;
 
+fn native_source_inventory() -> (
+    Vec<Case>,
+    Vec<CaseOpportunity>,
+    Vec<Vec<CheckedInputFacts>>,
+    StructuredServiceDeclarationV7,
+) {
+    use ferrum_interfaces::vnext::CheckpointTokenSpanConstraint;
+    use std::num::NonZeroU64;
+
+    let (mut cases, opportunities, inputs, population) = journal_grouping::same_product_families();
+    let blueprint = work::PrefixBlueprint {
+        prompt_tokens: 61,
+        boundary: 60,
+        span: CheckpointTokenSpanConstraint::new(
+            NonZeroU64::new(2).unwrap(),
+            NonZeroU64::new(2).unwrap(),
+        )
+        .unwrap(),
+        input_tokens_sha256: [7; 32],
+    };
+    for case in &mut cases {
+        case.acquisition = work::declared_plan(
+            case,
+            blueprint,
+            NonZeroU32::new(8).unwrap(),
+            NonZeroU32::new(2),
+        )
+        .unwrap();
+        assert!(case.acquisition.is_some());
+    }
+    (cases, opportunities, inputs, population)
+}
+
+fn select_native_source(
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    population: &StructuredServiceDeclarationV7,
+) -> CheckedSelection {
+    select_changed_with_geometry_and_source_limit(
+        cases,
+        opportunities,
+        inputs,
+        &[61],
+        8,
+        NonZeroU32::new(2),
+        population,
+        100_000,
+        10_000_000,
+        usize::MAX,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn native_source_coalescing_charges_one_setup_without_advancing_offered_clock() {
+    let (cases, opportunities, inputs, population) = native_source_inventory();
+    let selected = select_native_source(&cases, &opportunities, &inputs, &population);
+    assert!(selected.gaps.is_empty());
+    assert_eq!(selected.batches.len(), 1);
+    let combined = &selected.batches[0];
+    assert!(combined.scheduled);
+    assert_eq!(combined.population_indices.len(), 2);
+    assert_eq!(combined.representative_case_indices, [0, 2, 4, 6]);
+
+    // Each family executes width-one and width-four cohorts: one suffix
+    // token per row, twenty decode waves, and one restore per fresh request.
+    // The sixty-token seed has thirty two-token prefills and one capture.
+    assert_eq!(combined.schedule.block_offered, 2 * (21 + 24));
+    assert_eq!(
+        combined
+            .input_opportunities
+            .successful_cycle_wave_upper_bound,
+        90
+    );
+    assert_eq!(
+        combined
+            .input_opportunities
+            .minimum_original_offers_per_completed_cycle,
+        2 * (4 + 7)
+    );
+    let cycles = combined.planned_cycles;
+    assert_eq!(combined.requests, 10 * cycles + 1);
+    assert_eq!(combined.serial_wave_upper_bound, 220 * cycles + 31);
+    assert_eq!(combined.serial_token_work, 210 * cycles + 60);
+    assert_eq!(selected.requests, combined.requests);
+    assert_eq!(
+        selected.serial_wave_upper_bound,
+        combined.serial_wave_upper_bound
+    );
+
+    // Before coalescing, each complete source owns its own seed. The merged
+    // plan must recalculate the source-local keys, not sum these setup charges.
+    for &index in &combined.population_indices {
+        let separate = batch_plan(
+            &[index],
+            &selected.populations,
+            &cases,
+            &opportunities,
+            &[61],
+            8,
+            NonZeroU32::new(2),
+            &population,
+        )
+        .unwrap();
+        assert_eq!(separate.requests, 5 * separate.planned_cycles + 1);
+        assert_eq!(
+            separate.serial_wave_upper_bound,
+            110 * separate.planned_cycles + 31
+        );
+        assert_eq!(
+            separate.serial_token_work,
+            105 * separate.planned_cycles + 60
+        );
+    }
+}
+
+#[test]
+fn native_source_requires_complete_setup_and_restore_budget_before_selection() {
+    let (cases, opportunities, inputs, population) = native_source_inventory();
+    let selected = select_native_source(&cases, &opportunities, &inputs, &population);
+    let batch = &selected.batches[0];
+    assert!(batch.scheduled);
+    let offered_only = batch.schedule.block_offered * batch.planned_cycles;
+    assert!(offered_only < batch.serial_wave_upper_bound);
+    for (requests, actions, fits) in [
+        (batch.requests, batch.serial_wave_upper_bound, true),
+        (batch.requests - 1, batch.serial_wave_upper_bound, false),
+        (batch.requests, batch.serial_wave_upper_bound - 1, false),
+        (batch.requests, offered_only, false),
+    ] {
+        let mut out = CheckedSelection {
+            populations: selected.populations.clone(),
+            ..CheckedSelection::default()
+        };
+        for member in &mut out.populations {
+            member.scheduled = false;
+            member.batch_index = None;
+        }
+        append_batch(&mut out, batch.clone(), requests, actions, None).unwrap();
+        assert_eq!(out.batches[0].scheduled, fits);
+        if fits {
+            assert!(out.gaps.is_empty());
+            assert_eq!(out.requests, requests);
+            assert_eq!(out.serial_wave_upper_bound, actions);
+            assert_eq!(
+                out.execution_case_indices.len(),
+                batch.representative_case_indices.len() * batch.planned_cycles
+            );
+        } else {
+            assert_eq!((out.requests, out.serial_wave_upper_bound), (0, 0));
+            assert!(out.execution_case_indices.is_empty());
+            assert!(out.gaps.iter().any(|gap| match gap.reason {
+                SelectionGapReason::RemainingRequests {
+                    required,
+                    remaining,
+                } => required == batch.requests && remaining == requests,
+                SelectionGapReason::RemainingWaves {
+                    required,
+                    remaining,
+                } => required == batch.serial_wave_upper_bound && remaining == actions,
+                _ => false,
+            }));
+        }
+    }
+}
+
 fn original_batches() -> (Vec<BatchCandidate>, Vec<Case>, Vec<Vec<CheckedInputFacts>>) {
     let (cases, opportunities, inputs, population) = inventory();
     let mut selected = select(

@@ -213,9 +213,11 @@ pub(in crate::continuous_engine::inner::calibration) struct SelectedBatch {
     pub planned_cycles: usize,
     pub maximum_anchor_span: usize,
     pub requests: usize,
-    /// Original prompt and decode input tokens across the complete batch.
+    /// Seed, target prefill and decode input tokens across the complete batch.
     /// This declared upper bound is neither a timing sample nor a latency estimate.
     pub serial_token_work: usize,
+    /// Execution actions, including source setup and per-request restores.
+    /// Maintenance actions do not advance the schedule's offered clock.
     pub serial_wave_upper_bound: usize,
     pub scheduled: bool,
     /// Input-only local scope, qualified only by this source's real F/R/Q.
@@ -1089,18 +1091,14 @@ fn batch_plan(
         let prompt = *prompts
             .get(case.template)
             .ok_or_else(|| error("checked case prompt missing"))?;
-        let (waves, serial) = case.waves_with_row_ceiling(prompt, chunk, prefill_row_ceiling)?;
+        let work = work::case_work(case, prompt, chunk, prefill_row_ceiling)?;
         starts.push(cycle_waves);
-        cycle_waves = add(cycle_waves, waves)?;
+        cycle_waves = add(cycle_waves, work.declared_offers_upper)?;
         ends.push(cycle_waves);
-        cycle_serial = add(cycle_serial, serial)?;
-        cycle_requests = add(cycle_requests, case.width)?;
-        cycle_tokens = add(
-            cycle_tokens,
-            mul(case.width, add(prompt, case.maximum_output.get() - 1)?)?,
-        )?;
-        let minimum = minimum_case_offers(case, waves)?;
-        minimum_cycle = add(minimum_cycle, minimum)?;
+        cycle_serial = add(cycle_serial, work.execution_actions)?;
+        cycle_requests = add(cycle_requests, work.requests)?;
+        cycle_tokens = add(cycle_tokens, work.serial_token_work)?;
+        minimum_cycle = add(minimum_cycle, work.declared_offers_minimum)?;
     }
     let (mut schedule, maximum_anchor_span) =
         budget::startup_schedule(&starts, &ends, &population.settings)?;
@@ -1122,6 +1120,9 @@ fn batch_plan(
         schedule.block_offered,
     )?
     .div_ceil(minimum_cycle);
+    // Recompute on the complete source, including after source coalescing.
+    // Equal keys share one seed, never one setup per numerical phase/cycle.
+    let setup = work::setup_for_indices(cases, &representative_case_indices)?;
     Ok(SelectedBatch {
         population_indices: population_indices.to_vec(),
         representative_case_indices,
@@ -1130,26 +1131,12 @@ fn batch_plan(
         schedule_within_capacity,
         planned_cycles,
         maximum_anchor_span,
-        requests: mul(cycle_requests, planned_cycles)?,
-        serial_token_work: mul(cycle_tokens, planned_cycles)?,
-        serial_wave_upper_bound: mul(cycle_serial, planned_cycles)?,
+        requests: add(mul(cycle_requests, planned_cycles)?, setup.requests)?,
+        serial_token_work: add(mul(cycle_tokens, planned_cycles)?, setup.serial_token_work)?,
+        serial_wave_upper_bound: add(mul(cycle_serial, planned_cycles)?, setup.execution_actions)?,
         scheduled: false,
         algorithm_universe: None,
     })
-}
-
-fn minimum_case_offers(case: &Case, successful_waves: usize) -> Result<usize> {
-    if case.preset == SloAutomaticCostProbeSamplingPresetV1::GreedyLength {
-        return Ok(successful_waves);
-    }
-    // Every completed cohort executes all of its prefill chunks. Prefill
-    // produces token one; a prepared release r therefore needs r additional
-    // waves to include its first ordinary suffix input. An ordinary request
-    // has release zero and may terminate at the first produced token.
-    let prefill = successful_waves
-        .checked_sub(case.maximum_output.get() - 1)
-        .ok_or_else(|| error("checked selection prefill offer count differs"))?;
-    add(prefill, case.release_generated)
 }
 
 fn append_batch(
@@ -1304,15 +1291,14 @@ fn representatives_with_row_ceiling(
             let prompt = *prompts
                 .get(case.template)
                 .ok_or_else(|| error("checked case prompt missing"))?;
-            let waves = case
-                .waves_with_row_ceiling(prompt, chunk, prefill_row_ceiling)?
-                .1;
+            let work = work::case_work(case, prompt, chunk, prefill_row_ceiling)?;
             if best.is_none_or(|(old_gain, old_requests, old_waves, old_index)| {
                 gain > old_gain
                     || (gain == old_gain
-                        && (case.width, waves, index) < (old_requests, old_waves, old_index))
+                        && (work.requests, work.execution_actions, index)
+                            < (old_requests, old_waves, old_index))
             }) {
-                best = Some((gain, case.width, waves, index));
+                best = Some((gain, work.requests, work.execution_actions, index));
             }
         }
         let index = best
@@ -1561,6 +1547,7 @@ mod tests {
                 prefix: PrefixKind::Clean,
                 route: CalibrationDecodeRoute::Actual,
                 reset: false,
+                acquisition: None,
             });
         }
         let population = population::declaration(&Default::default(), fixture::domain()).unwrap();
@@ -2261,17 +2248,23 @@ mod tests {
         );
         for (index, chunks) in [(0, 8), (2, 31)] {
             let mut case = cases[index].clone();
-            let waves = case.waves(61, 8).unwrap().0;
             assert_eq!(
-                minimum_case_offers(&case, waves).unwrap(),
+                work::case_work(&case, 61, 8, None)
+                    .unwrap()
+                    .declared_offers_minimum,
                 chunks * case.width + 3
             );
             case.release_generated = 0;
             case.prefix = PrefixKind::Ordinary;
-            let waves = case.waves(61, 8).unwrap().0;
-            assert_eq!(minimum_case_offers(&case, waves).unwrap(), chunks);
+            assert_eq!(
+                work::case_work(&case, 61, 8, None)
+                    .unwrap()
+                    .declared_offers_minimum,
+                chunks
+            );
             case.preset = SloAutomaticCostProbeSamplingPresetV1::GreedyLength;
-            assert_eq!(minimum_case_offers(&case, waves).unwrap(), waves);
+            let work = work::case_work(&case, 61, 8, None).unwrap();
+            assert_eq!(work.declared_offers_minimum, work.declared_offers_upper);
         }
     }
 }

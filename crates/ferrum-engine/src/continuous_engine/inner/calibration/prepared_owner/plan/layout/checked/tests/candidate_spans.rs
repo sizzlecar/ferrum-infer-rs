@@ -202,6 +202,7 @@ fn checked_scheduler_prefill_candidate_readiness_keeps_distinct_chunk_identity()
         prefix: PrefixKind::Ordinary,
         route: CalibrationDecodeRoute::Actual,
         reset: true,
+        acquisition: None,
     };
     let mut attempts = readiness::Attempts::new(2, 4096).unwrap();
     assert!(attempts

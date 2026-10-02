@@ -7,6 +7,7 @@ mod populations;
 #[cfg(test)]
 mod row_capacity_tests;
 pub(super) mod selection;
+mod work;
 pub(super) use checked::build as build_checked;
 pub(in crate::continuous_engine::inner::calibration) use checked::CheckedInputCursor;
 
@@ -37,6 +38,8 @@ pub(super) struct Case {
     prefix: PrefixKind,
     route: CalibrationDecodeRoute,
     reset: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquisition: Option<work::PreparedProbeAcquisition>,
 }
 impl Case {
     fn explicit_prefill_chunk(&self) -> Option<NonZeroU32> {
@@ -72,28 +75,8 @@ impl Case {
         whole_chunk: usize,
         prefill_row_ceiling: Option<NonZeroU32>,
     ) -> Result<(usize, usize)> {
-        let whole_chunk = u32::try_from(whole_chunk)
-            .ok()
-            .and_then(NonZeroU32::new)
-            .ok_or_else(|| error("probe whole-wave token capacity is invalid"))?;
-        let chunk = self
-            .prefill_chunk(whole_chunk, prefill_row_ceiling, self.width)?
-            .get() as usize;
-        let serial = prompt
-            .div_ceil(chunk)
-            .checked_add(self.maximum_output.get() - 1)
-            .and_then(|n| n.checked_mul(self.width))
-            .ok_or_else(|| error("probe serial work overflow"))?;
-        let preparation = if matches!(self.prefix, PrefixKind::Ordinary) {
-            crate::continuous_engine::inner::calibration::cohort_driver::ProbePrefillPlan::Joint
-        } else {
-            crate::continuous_engine::inner::calibration::cohort_driver::ProbePrefillPlan::PreparedSequentialV1
-        };
-        let batch = preparation
-            .waves(prompt.div_ceil(chunk), self.width)
-            .and_then(|n| n.checked_add(self.maximum_output.get() - 1))
-            .ok_or_else(|| error("probe successful batch work overflow"))?;
-        Ok((batch, serial))
+        let work = work::case_work(self, prompt, whole_chunk, prefill_row_ceiling)?;
+        Ok((work.declared_offers_upper, work.execution_actions))
     }
 }
 
@@ -165,6 +148,7 @@ pub(super) fn cases(
                         prefix: PrefixKind::Ordinary,
                         route: CalibrationDecodeRoute::Actual,
                         reset: reset && cold,
+                        acquisition: None,
                     });
                 }
                 if prefix_unavailable.is_some() {
@@ -215,6 +199,7 @@ pub(super) fn cases(
                             // cycle; do not multiply all input branches by an
                             // unnecessary cold/warm Cartesian product.
                             reset: reset && suffix_tokens == 1,
+                            acquisition: None,
                         });
                     }
                 }
@@ -349,6 +334,7 @@ fn append_scheduler_prefill_cases(
                     prefix: PrefixKind::Ordinary,
                     route: CalibrationDecodeRoute::Actual,
                     reset: true,
+                    acquisition: None,
                 });
             }
         }
@@ -460,39 +446,35 @@ fn repetitions(
     prompts: &[usize],
     chunk: usize,
     p: &StructuredServiceDeclarationV7,
-) -> Result<([usize; 3], usize, usize, ProbeInputOpportunityBudget)> {
+) -> Result<([usize; 3], usize, usize, usize, ProbeInputOpportunityBudget)> {
     let mut minimum_cycle_offers = 0usize;
     let mut cycle_serial = 0usize;
+    let mut cycle_offer_rows = 0usize;
     let mut cycle_requests = 0usize;
     for c in cases {
-        let (waves, serial) = c.waves(prompts[c.template], chunk)?;
+        let work = work::case_work(c, prompts[c.template], chunk, None)?;
         // A completed GreedyLength cohort really reaches its original output
         // budget. A Configured prefix must finish preparation and then at
         // least one original suffix wave; ordinary Configured may end at its
         // first token. Failed cohorts do not satisfy any of these bounds.
-        let minimum = if c.preset == SloAutomaticCostProbeSamplingPresetV1::GreedyLength {
-            waves
-        } else if matches!(c.prefix, PrefixKind::Ordinary) {
-            waves - (c.maximum_output.get() - 1)
-        } else {
-            (waves - (c.maximum_output.get() - 1))
-                .checked_add(c.release_generated)
-                .ok_or_else(|| error("probe minimum completed work overflow"))?
-        };
         minimum_cycle_offers = minimum_cycle_offers
-            .checked_add(minimum)
+            .checked_add(work.declared_offers_minimum)
             .ok_or_else(|| error("probe cycle work overflow"))?;
         cycle_serial = cycle_serial
-            .checked_add(serial)
+            .checked_add(work.execution_actions)
             .ok_or_else(|| error("probe cycle work overflow"))?;
+        cycle_offer_rows = cycle_offer_rows
+            .checked_add(work.serial_declared_offer_rows)
+            .ok_or_else(|| error("probe cycle offered rows overflow"))?;
         cycle_requests = cycle_requests
-            .checked_add(c.width)
+            .checked_add(work.requests)
             .ok_or_else(|| error("probe request count overflow"))?;
     }
     let input_opportunities = budget::plan(cases, prompts, chunk, p, minimum_cycle_offers)?;
     let rounds = input_opportunities.planned_cycles;
     let repetitions: [usize; 3] =
         std::array::from_fn(|phase| rounds / 3 + usize::from(phase < rounds % 3));
+    let setup = work::setup_for_cases(cases)?;
     if repetitions
         .iter()
         .any(|n| n.checked_mul(cases.len()).is_none_or(|count| count > 4096))
@@ -503,10 +485,15 @@ fn repetitions(
         repetitions,
         cycle_requests
             .checked_mul(rounds)
+            .and_then(|n| n.checked_add(setup.requests))
             .ok_or_else(|| error("probe requests overflow"))?,
         cycle_serial
             .checked_mul(rounds)
+            .and_then(|n| n.checked_add(setup.execution_actions))
             .ok_or_else(|| error("probe serial work overflow"))?,
+        cycle_offer_rows
+            .checked_mul(rounds)
+            .ok_or_else(|| error("probe offered rows overflow"))?,
         input_opportunities,
     ))
 }
@@ -627,7 +614,7 @@ pub(super) fn build(
             .get(),
     )
     .map_err(|_| error("probe vocabulary does not fit host"))?;
-    let (cases, skipped, unavailable, repeats, _requests, _serial, input_opportunities) = loop {
+    let (cases, skipped, unavailable, repeats, input_opportunities) = loop {
         if widths.is_empty() {
             return Err(error(
                 "complete probe scenarios exceed the shared request/work budget",
@@ -644,27 +631,19 @@ pub(super) fn build(
             &original_indices,
             population.maximum_retained_numeric_bytes,
         )?;
-        let (repeats, requests, serial, input_opportunities) =
+        let (repeats, requests, serial, offered_rows, input_opportunities) =
             repetitions(&cases, prompts, chunk.get() as usize, &population)?;
         if requests <= settings.maximum_probe_requests.get()
             && serial <= settings.maximum_offered_waves.get()
-            && serial <= limits.max_samples.get()
-            && serial <= limits.max_total_shape_rows.get()
+            && offered_rows <= limits.max_samples.get()
+            && offered_rows <= limits.max_total_shape_rows.get()
             // All declared input branches must be able to enter the original
             // first discovery block; otherwise a rare branch can arrive only
             // after this owner's catalogue has already frozen.
             && input_opportunities.successful_cycle_wave_upper_bound
                 <= population.schedule.block_offered
         {
-            break (
-                cases,
-                skipped,
-                unavailable,
-                repeats,
-                requests,
-                serial,
-                input_opportunities,
-            );
+            break (cases, skipped, unavailable, repeats, input_opportunities);
         }
         // Input-budget admission only, before any measured cohort. Never remove
         // an already selected formal trial in response to its outcome/timing.
@@ -761,27 +740,53 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
     let templates = templates.as_slice();
     let prompts = prompts.as_slice();
     let context_coverage = &context_coverage;
-    let (requests, serial) = order
-        .iter()
-        .flatten()
-        .try_fold((0usize, 0usize), |(r, w), &i| {
-            let c = cases
-                .get(i)
-                .ok_or_else(|| error("selected case index differs"))?;
-            let waves = c
-                .waves_with_row_ceiling(
+    let (mut requests, mut serial, offered_rows) =
+        order
+            .iter()
+            .flatten()
+            .try_fold((0usize, 0usize, 0usize), |(r, w, o), &i| {
+                let c = cases
+                    .get(i)
+                    .ok_or_else(|| error("selected case index differs"))?;
+                let work = work::case_work(
+                    c,
                     prompts[c.template],
                     chunk.get() as usize,
                     prefill_row_ceiling,
-                )?
-                .1;
-            Ok::<_, FerrumError>((
-                r.checked_add(c.width)
-                    .ok_or_else(|| error("request bound overflow"))?,
-                w.checked_add(waves)
-                    .ok_or_else(|| error("wave bound overflow"))?,
-            ))
-        })?;
+                )?;
+                Ok::<_, FerrumError>((
+                    r.checked_add(work.requests)
+                        .ok_or_else(|| error("request bound overflow"))?,
+                    w.checked_add(work.execution_actions)
+                        .ok_or_else(|| error("action bound overflow"))?,
+                    o.checked_add(work.serial_declared_offer_rows)
+                        .ok_or_else(|| error("offered row bound overflow"))?,
+                ))
+            })?;
+    let mut add_setup = |setup: work::CaseWork| -> Result<()> {
+        requests = requests
+            .checked_add(setup.requests)
+            .ok_or_else(|| error("setup request bound overflow"))?;
+        serial = serial
+            .checked_add(setup.execution_actions)
+            .ok_or_else(|| error("setup action bound overflow"))?;
+        Ok(())
+    };
+    if let Some(selection) = &checked_selection {
+        for batch in selection.batches.iter().filter(|batch| batch.scheduled) {
+            add_setup(work::setup_for_indices(
+                &cases,
+                &batch.representative_case_indices,
+            )?)?;
+        }
+        if requests != selection.requests || serial != selection.serial_wave_upper_bound {
+            return Err(error(
+                "frozen source work differs from original selection reservation",
+            ));
+        }
+    } else {
+        add_setup(work::setup_for_cases(&cases)?)?;
+    }
     if order.iter().any(|p| p.len() > 4096)
         || requests
             .checked_add(preflight_charge.readiness_reserved_requests)
@@ -789,8 +794,8 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
         || preflight_charge.planning_reserved_requests
             > settings.maximum_input_projection_requests.get()
         || serial > settings.maximum_offered_waves.get()
-        || serial > limits.max_samples.get()
-        || serial > limits.max_total_shape_rows.get()
+        || offered_rows > limits.max_samples.get()
+        || offered_rows > limits.max_total_shape_rows.get()
     {
         return Err(error(
             "selected probe plan exceeds the original shared budget",
@@ -931,6 +936,7 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
         planned_cohorts: cohorts.len(),
         planned_requests: requests,
         serial_wave_bound: serial,
+        declared_offer_row_bound: offered_rows,
         original_block_offered: declaration.population.schedule.block_offered,
         token_policy_invalidation: invalidation,
         skipped_endpoint_presets: skipped,

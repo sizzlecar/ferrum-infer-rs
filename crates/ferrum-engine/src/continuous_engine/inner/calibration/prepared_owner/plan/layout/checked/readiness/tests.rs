@@ -16,6 +16,7 @@ fn case(maximum_output: usize) -> Case {
         prefix: PrefixKind::Ordinary,
         route: CalibrationDecodeRoute::Actual,
         reset: true,
+        acquisition: None,
     }
 }
 

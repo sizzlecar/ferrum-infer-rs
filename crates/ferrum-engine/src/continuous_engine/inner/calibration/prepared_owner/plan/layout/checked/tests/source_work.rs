@@ -99,6 +99,7 @@ async fn check_source_work(
     let effective_maximum_rows = plan.audit().effective_maximum_rows;
     let expected_requests = plan.audit().planned_requests;
     let expected_waves = plan.audit().serial_wave_bound;
+    let expected_offer_rows = plan.audit().declared_offer_row_bound;
     assert_eq!(plan.preflight_charge(), budget.preflight_charge());
     let selection = plan.audit().checked_selection.as_ref().unwrap().clone();
     let series = plan.into_series().unwrap();
@@ -226,6 +227,10 @@ async fn check_source_work(
     assert_eq!(source_index, series.len());
     assert_eq!(total_requests, expected_requests);
     assert_eq!(total_waves, expected_waves);
+    assert_eq!(
+        total_waves, expected_offer_rows,
+        "cold declared inference rows must match the original instantiated requests"
+    );
     assert_eq!(budget.deadline(), deadline);
     let preflight = budget.preflight_charge();
     assert_eq!(
@@ -262,6 +267,7 @@ async fn check_source_work(
                 "populations": selection.populations.iter().filter(|p| p.scheduled).count(),
                 "requests": total_requests,
                 "serial_waves": total_waves,
+                "declared_offer_row_bound": expected_offer_rows,
                 "token_work": total_tokens,
             },
             "remaining_after_preflight": {

@@ -26,6 +26,7 @@ fn inventory() -> (
             prefix: PrefixKind::Ordinary,
             route: CalibrationDecodeRoute::Actual,
             reset: true,
+            acquisition: None,
         });
         inputs.push(related::prefill_input_phase(
             1, 3, 3, maximum, Configured, true,
@@ -44,6 +45,7 @@ fn inventory() -> (
             prefix: PrefixKind::Clean,
             route: CalibrationDecodeRoute::Actual,
             reset: at_length_boundary,
+            acquisition: None,
         });
         // The original short prompt has three tokens and the original
         // validated prefix releases after three generated tokens: frontier 6.
@@ -68,6 +70,7 @@ fn inventory() -> (
             prefix: PrefixKind::Ordinary,
             route: CalibrationDecodeRoute::Actual,
             reset: true,
+            acquisition: None,
         });
         inputs.push(related::prefill_input_phase(
             1, 8, 1017, maximum, Configured, true,

@@ -114,10 +114,12 @@ llama.cpp 继续作为同机、同模型、同负载的比较基线，但不再�
 | 校准私有 checkpoint 用途 | 原物理 ledger、总内存上限、guard、completion 和 ACK | 普通 prefix cache 关闭时校准仍可使用有界私有 capture/restore；私有 capture 不插入共享缓存，普通请求不因此增加命中；最后一个真实 owner 退役后容量可回收 |
 | 准备工作与选择账本 | 已有实际支出/selection reservation 和 F/R/Q | 每 distinct acquisition key 一次 seed；不同合法 preset/max-output 可共享确定性前缀；ordinary ActualPrefill 保持 cold；token/actions/offers 对账 |
 | source 准备和冻结 | 已有 inventory、collector、source series | source 打开前绑定真实 scope；准备结果区分 native、cold、可解释跳过和致命错误；失败清理后其他可执行 source 能继续 |
-| cold 回退 | 原代表 cases、原资格规则和 cold layout | collector 打开前重建可执行 cohort plan、ranges、phase schedule、manifest/parent 绑定及额外预算；seed 已消费不退款；不挪用其他 source 预留；不足则保留 gap |
+| cold 回退 | 原代表 cases、请求成员与顺序、原资格规则 | collector 打开前重算 cold 工作与 schedule，验证原 cycles 足够，再冻结当前 source 的执行选择、manifest/parent 绑定及额外预算；原 members/ranges 不变；seed 已消费不退款；不足则保留 gap |
 | 驻留与清理 | 真实后端 ledger、现有缓存 eviction 和 completion fence | 当前 source 全部驻留 checkpoint，加各 cohort 和 transfer 阶段的真实峰值；部分准备或恢复失败的安全 drain；额外 pins 释放后 cache 残留可归因，下一 source 可进入 |
 
-外部草稿 A 的 offered/actions 分账和一次 setup、草稿 B 的 source 前 acquisition 可参考。必须纠正 B 把所有收样前 `ColdFallback` 变成错误并终止后续 series 的做法。现有 cursor 已对整个 series 预留，series 已保存 cohort ranges 和 parent 身份；因此 cold 回退必须更新真实可执行计划及其绑定，不能只改 source header。
+外部草稿 A 的 offered/actions 分账和一次 setup、草稿 B 的 source 前 acquisition 可参考。必须纠正 B 把所有收样前 `ColdFallback` 变成错误并终止后续 series 的做法。现有 cursor 已对整个 series 预留，series 已保存 cohort ranges 和 parent 身份；因此 cold 回退必须更新当前 source 的真实可执行选择及绑定，不能只改 source header。第一版固定原 representative cases、cohort 成员、顺序、cycles 和 seed，重算 cold schedule 与资格输入义务；原 cycles 不足则在收样前 Skip，避免重新选择或重排兄弟 source。
+
+重算必须保留原 `CaseOpportunity.minimum_fresh_members`，不能从“该 case 已选中”反推它必然贡献一个资格成员。沿用现有 `batch_plan` 的条件：`original_cycles × cold_minimum_cycle >= cold_required_original_offers + cold_schedule.block_offered`，包括最后一个原保护 block，以及 schedule/numerical/sample/shape 容量检查。固定成员使父 ranges 保持准确；当前 source 应持有最终 cohort Vec 与父 series/range 的不可变借用，通过自身 cohort 指针校验后再调用原父 execution plan 的真实请求生成。cold 额外执行预约只取 collection 动作的正增量，原 setup 全部预约和已消费费用保留；若未来改变成员，这个单维增量规则不再适用。
 
 已经冻结并开始收样的 native source 恢复失败时，保留现有共享 drain 后结束 series、保留此前有效 catalog 的路径，不能静默混入 cold 样本。现有 `retire_startup_owner_source` 只接受已完成并 checkpointed 的 source，不能拿它退役未完成源，更不能直接清 collector 字段。若确需失败源之后继续收样，先实现并验证显式 abort 与 worker barrier，再扩大继续执行范围。
 
@@ -221,7 +223,11 @@ UnknownPopulation 仍需定位到原 case 及真实 admission，区分正常越�
 
 Metal 用例运行于本机 Apple M1 Max（24 GPU cores），采用测试中真实支持 checkpoint 的 F32-master provider；它不是正式性能验收机器或主模型。首轮测试代码有 3 处类型错误；修正后 1 pass / 2 fail，揭示 seed 到达边界后登记私有 interest 被旧的未来区间校验拒绝。生产修复仅允许私有用途在恰好已完成边界登记 Pending interest；真实 native capture 仍以已完成区间验证合法性，然后才分配和提交。修复后 3 项通过，没有放宽 native 捕获规则。失败和最终日志分别保存在 `g2-private-prefix-metal.log`、`g2-private-prefix-metal-runtime.log`、`g2-private-prefix-metal-retired-boundary.log`；其余证据为 `g2-private-prefix-cache-unit.log`、`g2-private-prefix-engine.log`、`g2-private-prefix-engine-checkpoint.log` 和 `g2-private-prefix-workspace-metal-check.log`。此次有界修改未运行默认特性 workspace check、workspace 全量 tests、Clippy 或 CUDA 检查；完整自动闭环源码稳定后执行全套，当前提交不标记为 PR 已完成验收。
 
-剩余主线是准备工作账与 source 冻结：当前 cursor 在 acquisition 前已预留整个 series，而请求仍由父 execution plan 生成。接入前必须让一次 seed 的实际支出与 selection reservation 对账，并保证收样前 cold 回退重建真实计划、ranges、phase schedule 和 manifest；不能只更改声明。之后通过共享 automatic startup 的完整资格与普通请求采用正例，才算第二关通过。额外 token evidence 的运行成本、当前 source 全部 checkpoint 的真实峰值及双后端效果仍未证明。其余关卡保持未验收，不给无验收依据的百分比或完成时间承诺。
+准备工作账的第一批代码已接入共享计划计算：候选选择、schedule 输入、legacy build 和最终冻结共用 `case_work`；源内 distinct acquisition key 只加一次 seed/setup，合并 source 后重新去重。source offered clock、serial inference rows 和 execution actions 分开，setup/capture/restore 不增加数值资格成员；冻结时重新核对实际 order 总账与 selection reservation。不同未来 sampling preset/max-output 不改变 proper prefix key，但每个 case 的原策略绑定仍单独校验。生产 Case 当前仍为 `acquisition: None`，尚未启用私有 native 自动准备。
+
+此批先运行 7 个工作账单测，再运行整个 `prepared_owner::plan::` 范围：144 项通过、0 fail、0 ignored，61.44s，包含这 7 项及 2 个新的 selector/coalesce 与预算边界用例。两个实际 `series.requests_for` 生成并重新分词的 cold 对账场景仍为 724 requests、3188 serial inference rows/actions、3524 token work；原资格规则、剩余预算和 gaps 保留。新 audit 的 `declared_offer_row_bound` 与实际生成请求的行数一致。证据为 `g2-native-accounting-work-tests.log` 和 `g2-native-accounting-plan-tests.log`，均为带 Metal 特性的 debug engine CPU 测试，不能视为设备计时或自动 native 执行证明。格式/diff 检查通过，未重复 workspace/backend 全量检查。
+
+下一批接入前有三个明确依赖：`checked.rs::freeze_inventory` 仍将 action 余量与 sample/shape 上限合并，需要拆开；冻结 inventory 前须保留各 source 的原 representative `Case + CaseOpportunity` 用于合法 cold 重算，并计入 retained budget；当前 source 的真实 lease/执行选择必须在 collector 打开前绑定，执行循环通过它生成请求。之后通过共享 automatic startup 的完整资格与普通请求采用正例，才算第二关通过。额外 token evidence 的运行成本、当前 source 全部 checkpoint 的真实峰值及双后端效果仍未证明。其余关卡保持未验收，不给无验收依据的百分比或完成时间承诺。
 
 ## 来源位置
 

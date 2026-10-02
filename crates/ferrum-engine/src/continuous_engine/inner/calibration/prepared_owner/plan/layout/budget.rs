@@ -185,8 +185,7 @@ fn plan_groups<'a>(
             .ok_or_else(|| error("probe case template is outside prompt inventory"))?;
         cycle_upper = cycle_upper
             .checked_add(
-                case.waves_with_row_ceiling(prompt, chunk, prefill_row_ceiling)?
-                    .0,
+                work::case_work(case, prompt, chunk, prefill_row_ceiling)?.declared_offers_upper,
             )
             .ok_or_else(|| error("probe opportunity cycle overflow"))?;
         ends.push(cycle_upper);
@@ -295,6 +294,7 @@ mod tests {
                 prefix: PrefixKind::Clean,
                 route: CalibrationDecodeRoute::Actual,
                 reset: false,
+                acquisition: None,
             })
             .collect();
         let mut population =

@@ -18,6 +18,7 @@ fn case(width: usize) -> Case {
         prefix: PrefixKind::Ordinary,
         route: CalibrationDecodeRoute::Actual,
         reset: false,
+        acquisition: None,
     }
 }
 

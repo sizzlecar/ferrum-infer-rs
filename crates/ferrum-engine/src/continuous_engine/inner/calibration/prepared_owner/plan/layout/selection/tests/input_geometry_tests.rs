@@ -37,6 +37,7 @@ fn cross_inventory() -> (
             prefix: PrefixKind::Clean,
             route: CalibrationDecodeRoute::Actual,
             reset: false,
+            acquisition: None,
         });
     }
     (cases, opportunities, facts, population)
