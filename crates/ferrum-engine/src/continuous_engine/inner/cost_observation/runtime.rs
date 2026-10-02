@@ -74,6 +74,20 @@ impl EngineCostRuntime {
         self.try_prefix_cost_snapshot().flatten()
     }
 
+    /// Consume only the original maintenance enqueue receipt for this exact
+    /// private transfer authority. A global FIFO watermark is not a substitute.
+    pub(in crate::continuous_engine) fn take_prefix_fifo_receipt(
+        &self,
+        identity: &ferrum_interfaces::vnext::NativeCheckpointTransferIdentity,
+    ) -> Option<u64> {
+        if self.identity_only
+            || !matches!(&self.identity, ExecutorCostIdentityAvailability::Known(value) if value.schema_version == EXECUTOR_COST_IDENTITY_SCHEMA)
+        {
+            return None;
+        }
+        self.training.prefix.as_ref()?.take_fifo_receipt(identity)
+    }
+
     /// Outer None is contention/unsupported; inner None is absent evidence.
     pub(in crate::continuous_engine) fn try_prefix_cost_snapshot(
         &self,

@@ -184,6 +184,10 @@ pub(in crate::continuous_engine::inner::calibration) enum SelectionGapReason {
         required: usize,
         remaining: usize,
     },
+    RemainingOfferRows {
+        required: usize,
+        remaining: usize,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -219,6 +223,8 @@ pub(in crate::continuous_engine::inner::calibration) struct SelectedBatch {
     /// Execution actions, including source setup and per-request restores.
     /// Maintenance actions do not advance the schedule's offered clock.
     pub serial_wave_upper_bound: usize,
+    /// Source inference rows only; setup inference and transfers are excluded.
+    pub declared_offer_row_bound: usize,
     pub scheduled: bool,
     /// Input-only local scope, qualified only by this source's real F/R/Q.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,8 +241,49 @@ pub(in crate::continuous_engine::inner::calibration) struct CheckedSelection {
     pub gaps: Vec<SelectionGap>,
     pub requests: usize,
     pub serial_wave_upper_bound: usize,
+    pub declared_offer_row_bound: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_geometry: Option<InputGeometryCharge>,
+}
+
+/// Independent startup ledgers. Execution maintenance spends actions without
+/// creating source inference rows or advancing the numerical offered clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SelectionCapacity {
+    pub requests: usize,
+    pub execution_actions: usize,
+    pub declared_offer_rows: usize,
+}
+
+impl SelectionCapacity {
+    fn legacy(requests: usize, waves: usize) -> Self {
+        Self {
+            requests,
+            execution_actions: waves,
+            declared_offer_rows: waves,
+        }
+    }
+
+    fn remaining(self, used: Self) -> Self {
+        Self {
+            requests: self.requests.saturating_sub(used.requests),
+            execution_actions: self
+                .execution_actions
+                .saturating_sub(used.execution_actions),
+            declared_offer_rows: self
+                .declared_offer_rows
+                .saturating_sub(used.declared_offer_rows),
+        }
+    }
+
+    fn charge(&mut self, batch: &SelectedBatch) -> Result<()> {
+        *self = Self {
+            requests: add(self.requests, batch.requests)?,
+            execution_actions: add(self.execution_actions, batch.serial_wave_upper_bound)?,
+            declared_offer_rows: add(self.declared_offer_rows, batch.declared_offer_row_bound)?,
+        };
+        Ok(())
+    }
 }
 
 struct BatchCandidate {
@@ -496,6 +543,41 @@ pub(super) fn select_with_local_composition(
     maximum_retained_bytes: usize,
     changed: Option<&[CheckedPopulationKey]>,
     selected_priority: Option<u8>,
+    geometry_work: Option<&mut StructuredInputGeometryWorkV1>,
+    maximum_sources: Option<NonZeroUsize>,
+    combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
+) -> Result<CheckedSelection> {
+    select_with_capacity(
+        cases,
+        opportunities,
+        inputs,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        population,
+        SelectionCapacity::legacy(remaining_requests, remaining_waves),
+        maximum_retained_bytes,
+        changed,
+        selected_priority,
+        geometry_work,
+        maximum_sources,
+        combination_seed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_with_capacity(
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    capacity: SelectionCapacity,
+    maximum_retained_bytes: usize,
+    changed: Option<&[CheckedPopulationKey]>,
+    selected_priority: Option<u8>,
     mut geometry_work: Option<&mut StructuredInputGeometryWorkV1>,
     maximum_sources: Option<NonZeroUsize>,
     combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
@@ -519,7 +601,7 @@ pub(super) fn select_with_local_composition(
         &groups,
         opportunities,
         inputs,
-        remaining_requests,
+        capacity.requests,
         geometry_work.as_ref().map(|_| &population.settings),
     )?;
     tracing::info!(
@@ -728,15 +810,13 @@ pub(super) fn select_with_local_composition(
         chunk,
         prefill_row_ceiling,
         population,
-        remaining_requests,
-        remaining_waves,
+        capacity,
         selected_priority,
         maximum_sources,
     )?;
     let original_budget = composition::scheduled_prefix_budget(
         &batch_candidates,
-        remaining_requests,
-        remaining_waves,
+        capacity,
         selected_priority,
         maximum_sources,
     )?;
@@ -760,8 +840,11 @@ pub(super) fn select_with_local_composition(
             && !combined_once
             && composition::can_schedule(
                 &candidate.batch,
-                remaining_requests.saturating_sub(out.requests),
-                remaining_waves.saturating_sub(out.serial_wave_upper_bound),
+                capacity.remaining(SelectionCapacity {
+                    requests: out.requests,
+                    execution_actions: out.serial_wave_upper_bound,
+                    declared_offer_rows: out.declared_offer_row_bound,
+                }),
             )
         {
             if let Some(seed) = combination_seed {
@@ -786,16 +869,24 @@ pub(super) fn select_with_local_composition(
                     let additional_waves = combined
                         .serial_wave_upper_bound
                         .checked_sub(candidate.batch.serial_wave_upper_bound);
+                    let additional_rows = combined
+                        .declared_offer_row_bound
+                        .checked_sub(candidate.batch.declared_offer_row_bound);
                     if additional_requests.is_some_and(|extra| {
                         original_budget
-                            .0
+                            .requests
                             .checked_add(extra)
-                            .is_some_and(|total| total <= remaining_requests)
+                            .is_some_and(|total| total <= capacity.requests)
                     }) && additional_waves.is_some_and(|extra| {
                         original_budget
-                            .1
+                            .execution_actions
                             .checked_add(extra)
-                            .is_some_and(|total| total <= remaining_waves)
+                            .is_some_and(|total| total <= capacity.execution_actions)
+                    }) && additional_rows.is_some_and(|extra| {
+                        original_budget
+                            .declared_offer_rows
+                            .checked_add(extra)
+                            .is_some_and(|total| total <= capacity.declared_offer_rows)
                     }) && combined.schedule_within_capacity
                         && combined.maximum_anchor_span
                             <= *combined.schedule.phase_min_offered.iter().min().unwrap()
@@ -811,13 +902,7 @@ pub(super) fn select_with_local_composition(
                 }
             }
         }
-        append_batch(
-            &mut out,
-            candidate.batch,
-            remaining_requests,
-            remaining_waves,
-            deferred,
-        )?;
+        append_batch(&mut out, candidate.batch, capacity, deferred)?;
         scheduled_sources += usize::from(out.batches.last().unwrap().scheduled);
     }
     out.input_geometry = geometry_work.map(|work| InputGeometryCharge {
@@ -860,8 +945,7 @@ fn coalesce_related_batches(
     chunk: usize,
     prefill_row_ceiling: Option<NonZeroU32>,
     population: &StructuredServiceDeclarationV7,
-    remaining_requests: usize,
-    remaining_waves: usize,
+    capacity: SelectionCapacity,
     selected_priority: Option<u8>,
     maximum_sources: Option<NonZeroUsize>,
 ) -> Result<()> {
@@ -891,11 +975,7 @@ fn coalesce_related_batches(
             // Recompute the whole source, including every fresh-member phase
             // fence. Relatedness never supplies a qualification or capacity
             // exemption, and sharing must not increase declared token work.
-            if !combined.schedule_within_capacity
-                || combined.maximum_anchor_span
-                    > *combined.schedule.phase_min_offered.iter().min().unwrap()
-                || combined.requests > remaining_requests
-                || combined.serial_wave_upper_bound > remaining_waves
+            if !composition::can_schedule(&combined, capacity)
                 || combined.serial_token_work
                     > add(a.batch.serial_token_work, b.batch.serial_token_work)?
             {
@@ -904,15 +984,14 @@ fn coalesce_related_batches(
             }
             // A globally affordable union may still steal the allowance of
             // an earlier or later complete source. Simulate the original and
-            // replacement traversals under the same three ledgers before
+            // replacement traversals under the same work and source limits before
             // dropping either raw candidate.
             if !grouping::preserves_scheduled(
                 candidates,
                 index,
                 next,
                 &combined,
-                remaining_requests,
-                remaining_waves,
+                capacity,
                 selected_priority,
                 maximum_sources,
             )? {
@@ -1008,7 +1087,7 @@ fn legacy_selection_peak_payload_bound(
     charge(mul(vector_peak_bytes::<usize>(mul(n, 9)?)?, 3)?)?;
     charge(vector_peak_bytes::<SelectionGap>(add(
         key_mentions,
-        add(mul(n, 7)?, 1)?,
+        add(mul(n, 8)?, 1)?,
     )?)?)?;
     charge(vector_peak_bytes::<usize>(remaining_requests)?)?;
 
@@ -1031,7 +1110,7 @@ fn legacy_selection_peak_payload_bound(
     charge(mul(vector_peak_bytes::<f64>(axes)?, 2)?)?;
     charge(vector_peak_bytes::<bool>(add(mul(axes, 2)?, 14)?)?)?;
     charge(mul(vector_peak_bytes::<usize>(n)?, 2)?)?;
-    charge(vector_peak_bytes::<SelectionGapReason>(5)?)?;
+    charge(vector_peak_bytes::<SelectionGapReason>(6)?)?;
     Ok(bytes)
 }
 
@@ -1086,7 +1165,8 @@ fn batch_plan(
         mut cycle_requests,
         mut cycle_serial,
         mut cycle_tokens,
-    ) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        mut cycle_offer_rows,
+    ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for case in &selected_cases {
         let prompt = *prompts
             .get(case.template)
@@ -1096,6 +1176,7 @@ fn batch_plan(
         cycle_waves = add(cycle_waves, work.declared_offers_upper)?;
         ends.push(cycle_waves);
         cycle_serial = add(cycle_serial, work.execution_actions)?;
+        cycle_offer_rows = add(cycle_offer_rows, work.serial_declared_offer_rows)?;
         cycle_requests = add(cycle_requests, work.requests)?;
         cycle_tokens = add(cycle_tokens, work.serial_token_work)?;
         minimum_cycle = add(minimum_cycle, work.declared_offers_minimum)?;
@@ -1134,6 +1215,7 @@ fn batch_plan(
         requests: add(mul(cycle_requests, planned_cycles)?, setup.requests)?,
         serial_token_work: add(mul(cycle_tokens, planned_cycles)?, setup.serial_token_work)?,
         serial_wave_upper_bound: add(mul(cycle_serial, planned_cycles)?, setup.execution_actions)?,
+        declared_offer_row_bound: mul(cycle_offer_rows, planned_cycles)?,
         scheduled: false,
         algorithm_universe: None,
     })
@@ -1142,12 +1224,14 @@ fn batch_plan(
 fn append_batch(
     out: &mut CheckedSelection,
     mut batch: SelectedBatch,
-    remaining_requests: usize,
-    remaining_waves: usize,
+    capacity: SelectionCapacity,
     deferred: Option<SelectionGapReason>,
 ) -> Result<()> {
-    let requests_left = remaining_requests.saturating_sub(out.requests);
-    let waves_left = remaining_waves.saturating_sub(out.serial_wave_upper_bound);
+    let remaining = capacity.remaining(SelectionCapacity {
+        requests: out.requests,
+        execution_actions: out.serial_wave_upper_bound,
+        declared_offer_rows: out.declared_offer_row_bound,
+    });
     let mut reasons: Vec<_> = deferred.into_iter().collect();
     if !batch.schedule_within_capacity {
         reasons.push(SelectionGapReason::SourceScheduleCapacity);
@@ -1159,16 +1243,22 @@ fn append_batch(
             minimum_offers: minimum_phase,
         });
     }
-    if batch.requests > requests_left {
+    if batch.requests > remaining.requests {
         reasons.push(SelectionGapReason::RemainingRequests {
             required: batch.requests,
-            remaining: requests_left,
+            remaining: remaining.requests,
         });
     }
-    if batch.serial_wave_upper_bound > waves_left {
+    if batch.serial_wave_upper_bound > remaining.execution_actions {
         reasons.push(SelectionGapReason::RemainingWaves {
             required: batch.serial_wave_upper_bound,
-            remaining: waves_left,
+            remaining: remaining.execution_actions,
+        });
+    }
+    if batch.declared_offer_row_bound > remaining.declared_offer_rows {
+        reasons.push(SelectionGapReason::RemainingOfferRows {
+            required: batch.declared_offer_row_bound,
+            remaining: remaining.declared_offer_rows,
         });
     }
     batch.scheduled = reasons.is_empty();
@@ -1200,6 +1290,8 @@ fn append_batch(
         out.requests = add(out.requests, batch.requests)?;
         out.serial_wave_upper_bound =
             add(out.serial_wave_upper_bound, batch.serial_wave_upper_bound)?;
+        out.declared_offer_row_bound =
+            add(out.declared_offer_row_bound, batch.declared_offer_row_bound)?;
     }
     out.batches.push(batch);
     Ok(())

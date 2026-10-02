@@ -79,6 +79,24 @@ pub(super) fn freeze(
     encode(&manifest, maximum_bytes)
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SourcePreparationChoice {
+    Cold,
+    NativePrivate,
+    ColdFallback,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(super) struct SourceWork {
+    pub planned_cycles: usize,
+    pub maximum_anchor_span: Option<usize>,
+    pub requests: usize,
+    pub execution_actions: usize,
+    pub declared_offer_row_bound: usize,
+    pub serial_token_work: Option<usize>,
+}
+
 pub(super) fn freeze_source(
     parent: &serde_json::value::RawValue,
     parent_sha256: [u8; 32],
@@ -86,8 +104,12 @@ pub(super) fn freeze_source(
     sources: usize,
     original_range: std::ops::Range<usize>,
     cohorts: &[PreparedProbeCohort],
+    choice: SourcePreparationChoice,
+    work: SourceWork,
+    population: &StructuredServiceDeclarationV7,
+    input_opportunities: Option<&ProbeInputOpportunityBudget>,
     maximum_bytes: usize,
-) -> Result<Box<serde_json::value::RawValue>> {
+) -> Result<Option<Box<serde_json::value::RawValue>>> {
     #[derive(Serialize)]
     struct Source<'a> {
         protocol: &'static str,
@@ -97,19 +119,36 @@ pub(super) fn freeze_source(
         sources: usize,
         original_range: std::ops::Range<usize>,
         cohorts: &'a [PreparedProbeCohort],
+        preparation_choice: SourcePreparationChoice,
+        work: SourceWork,
+        schedule: &'a ferrum_scheduler::implementations::continuous::cost_model::structured_v2::OwnerBlockScheduleV1,
+        input_opportunities: Option<&'a ProbeInputOpportunityBudget>,
     }
-    encode(
-        &Source {
-            protocol: "ferrum.automatic-prepared-probe-series-source.v1",
-            parent,
-            parent_sha256,
-            source,
-            sources,
-            original_range,
-            cohorts,
-        },
-        maximum_bytes,
-    )
+    let source = Source {
+        protocol: "ferrum.automatic-prepared-probe-series-source.v2",
+        parent,
+        parent_sha256,
+        source,
+        sources,
+        original_range,
+        cohorts,
+        preparation_choice: choice,
+        work,
+        schedule: &population.schedule,
+        input_opportunities,
+    };
+    // Count without allocating, so a pre-source capacity miss remains typed
+    // rather than being confused with an invalid identity/serialization error.
+    let mut count = Count {
+        bytes: 0,
+        limit: usize::MAX,
+    };
+    serde_json::to_writer(&mut count, &source)
+        .map_err(|e| error(format!("source manifest size: {e}")))?;
+    if count.bytes > maximum_bytes {
+        return Ok(None);
+    }
+    encode(&source, maximum_bytes).map(Some)
 }
 
 /// Immutable input universe, fixed before any live inventory or numerical

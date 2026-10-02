@@ -380,6 +380,7 @@ mod future;
 mod numerical_family;
 mod plan_e2e;
 mod snapshot_universe;
+mod source_preparation;
 
 mod startup_series;
 

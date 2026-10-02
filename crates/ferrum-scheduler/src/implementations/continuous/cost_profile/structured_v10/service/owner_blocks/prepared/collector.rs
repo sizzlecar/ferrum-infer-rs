@@ -298,7 +298,13 @@ impl StructuredPreparedOwnerBlockCollectorV8 {
         &mut self,
         record: &StructuredPreparedOwnerBlockRecordV8,
     ) -> Result<(), CostProfileError> {
-        let result = self.push_inner(record).and_then(|()| self.check_retained());
+        let result = self.push_inner(record).and_then(|maintenance_fifo| {
+            self.check_retained()?;
+            if let Some(fifo) = maintenance_fifo {
+                self.population.preparation_maintenance(fifo)?;
+            }
+            Ok(())
+        });
         if result.is_err() {
             self.population.poison();
         }
@@ -307,8 +313,9 @@ impl StructuredPreparedOwnerBlockCollectorV8 {
     fn push_inner(
         &mut self,
         record: &StructuredPreparedOwnerBlockRecordV8,
-    ) -> Result<(), CostProfileError> {
+    ) -> Result<Option<u64>, CostProfileError> {
         use StructuredPreparedOwnerBlockRecordV8 as R;
+        let mut maintenance_fifo = None;
         if !matches!(
             record,
             R::Population(
@@ -376,7 +383,7 @@ impl StructuredPreparedOwnerBlockCollectorV8 {
                 } else {
                     self.header.opening.monotonic_ns
                 };
-                let settled = self.lifecycle.prepare(
+                let (settled, accepted_fifo) = self.lifecycle.prepare(
                     e,
                     self.offered(),
                     self.header.declaration.maximum_offered_waves as u64,
@@ -399,6 +406,9 @@ impl StructuredPreparedOwnerBlockCollectorV8 {
                             ))?;
                 }
                 self.population.append(record)?;
+                if !settled && accepted_fifo != self.last_fifo() {
+                    maintenance_fifo = Some(accepted_fifo);
+                }
             }
             R::Population(StructuredServiceRecordV7::Completed { wave }) => {
                 if wave.ticket > self.header.declaration.maximum_offered_waves as u64 {
@@ -514,7 +524,7 @@ impl StructuredPreparedOwnerBlockCollectorV8 {
                 }
             }
         }
-        Ok(())
+        Ok(maintenance_fifo)
     }
 }
 

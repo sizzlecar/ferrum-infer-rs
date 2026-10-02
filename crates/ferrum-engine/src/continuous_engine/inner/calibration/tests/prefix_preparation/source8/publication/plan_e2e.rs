@@ -130,6 +130,27 @@ async fn check_probe_and_witness_with_prompt(
     );
     request.sampling_params.top_k = Some(session.engine.inner.model_executor.info().vocab_size);
     request.sampling_params.stop_sequences.clear();
+    // The ordinary request shares supported geometry but not the startup seed
+    // content. A retained startup prefix must not supply the adoption proof.
+    let mut ordinary_request = request.clone();
+    ordinary_request.prompt = vec!["ok"; prompt_tokens].join(" ");
+    if let Some(ferrum_types::ApiRequest::Completion(api)) = &mut ordinary_request.api_request {
+        api.prompt = ordinary_request.prompt.clone();
+    }
+    assert_ne!(ordinary_request.prompt, request.prompt);
+    assert_eq!(
+        session
+            .engine
+            .inner
+            .tokenizer
+            .encode(&ordinary_request.prompt, true)
+            .unwrap()
+            .len(),
+        prompt_tokens,
+    );
+    let ordinary_template =
+        AutomaticCostProbeTemplate::new(ordinary_request, AutomaticCostProbeOutput::CliText)
+            .unwrap();
     let template =
         AutomaticCostProbeTemplate::new(request, AutomaticCostProbeOutput::CliText).unwrap();
     let settings = ferrum_types::SloAutomaticCalibrationSettingsV1::default();
@@ -184,14 +205,44 @@ async fn check_probe_and_witness_with_prompt(
     }
     assert!(installed.offered_samples > 0);
     assert!(runtime.snapshot().is_some());
+    let prepared_prefix_totals = executor.native_prefix_terminal_totals();
+    if prompt_tokens > 1 {
+        assert!(
+            !session
+                .engine
+                .inner
+                .config
+                .runtime
+                .prefix_state_cache_enabled
+        );
+        let (captures, restores) = prepared_prefix_totals;
+        assert!(
+            captures > 0,
+            "automatic source must acquire actual private checkpoints"
+        );
+        assert!(
+            restores > captures,
+            "fresh independent cohort owners must reuse those checkpoints"
+        );
+        assert_eq!(
+            executor.native_prefix_live_lease_counts(),
+            (0, 0),
+            "completed sources release private checkpoints without populating the shared index"
+        );
+        eprintln!(
+            "automatic qualified private preparation: captures={captures} restores={restores}"
+        );
+    }
     let (submitted, commands) = executor.native_structured_counts();
+    let inference_waves = executor.physical.load(Ordering::Acquire);
     assert_eq!(
         submitted as usize,
-        executor.physical.load(Ordering::Acquire)
+        inference_waves + prepared_prefix_totals.0 + prepared_prefix_totals.1,
+        "every native submission is an inference wave, capture, or restore"
     );
     assert_eq!(
         commands,
-        submitted as usize * 2,
+        inference_waves * 2,
         "each observed CPU fill ran inside actual core submission"
     );
     assert!(session.frontiers().unwrap().is_empty());
@@ -235,7 +286,7 @@ async fn check_probe_and_witness_with_prompt(
     let mut ids = Vec::new();
     let mut consumers = Vec::new();
     for seed in 0..2 {
-        let (request, contract) = template
+        let (request, contract) = ordinary_template
             .instantiate(
                 NonZeroUsize::new(3).unwrap(),
                 seed,
@@ -517,6 +568,14 @@ async fn check_probe_and_witness_with_prompt(
         installed.source_observation_artifact_sha256
     );
     assert_eq!(receipt_after.loaded_unix_ns, installed.loaded_unix_ns);
+    if prompt_tokens > 1 {
+        assert_eq!(
+            executor.native_prefix_terminal_totals(),
+            prepared_prefix_totals,
+            "ordinary different-content requests must not inherit private startup checkpoints"
+        );
+        assert_eq!(executor.native_prefix_live_lease_counts(), (0, 0));
+    }
     drop(inner);
     session.shutdown().await.unwrap();
     if let Some((writer, path)) = query_journal {

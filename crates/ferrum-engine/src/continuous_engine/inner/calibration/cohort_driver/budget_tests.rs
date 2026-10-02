@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn cold_source_extension_preserves_spent_setup_and_later_source_reservations() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut budget = ProbeExecutionBudget::new(
+        deadline,
+        NonZeroUsize::new(6).unwrap(),
+        NonZeroUsize::new(20).unwrap(),
+    );
+    budget.reserve_selected_source(2, 6).unwrap();
+    budget.reserve_selected_source(4, 8).unwrap();
+    // Partial preparation consumed an owner and two actions. Neither those
+    // actions nor unspent sibling reservations become cold fallback credit.
+    budget.claim_reserved_checkpoint_owner().unwrap();
+    budget.claim_reserved_checkpoint_action().unwrap();
+    budget.claim_reserved_checkpoint_action().unwrap();
+    assert_eq!(budget.selection_attempts_remaining(), 6);
+    assert_eq!(budget.attempts_remaining(), 18);
+    assert!(!budget.try_reserve_additional_source_actions(7).unwrap());
+    assert_eq!(budget.selection_attempts_remaining(), 6);
+    assert_eq!(budget.attempts_remaining(), 18);
+    assert!(budget.try_reserve_additional_source_actions(6).unwrap());
+    assert!(budget.try_reserve_additional_source_actions(0).unwrap());
+    assert!(!budget.try_reserve_additional_source_actions(1).unwrap());
+    assert_eq!(budget.selection_attempts_remaining(), 0);
+    assert_eq!(budget.attempts_remaining(), 18);
+    assert_eq!(budget.selection_requests_remaining(), 0);
+    assert_eq!(budget.requests_remaining(), 5);
+    assert_eq!(budget.deadline(), deadline);
+    // Actual work is charged once when executed, independently of reservation.
+    budget.claim_requests(5).unwrap();
+    for _ in 0..18 {
+        budget.claim_attempt().unwrap();
+    }
+    assert!(budget.claim_attempt().is_err());
+    assert_eq!(budget.requests_remaining(), 0);
+}
+
+#[test]
+fn expired_cold_extension_cannot_renew_or_spend_the_original_allowance() {
+    let deadline = Instant::now();
+    let mut budget = ProbeExecutionBudget::new(deadline, NonZeroUsize::MIN, NonZeroUsize::MIN);
+    assert!(budget.try_reserve_additional_source_actions(1).is_err());
+    assert!(budget.try_reserve_additional_source_actions(0).is_err());
+    assert_eq!(budget.selection_attempts_remaining(), 1);
+    assert_eq!(budget.attempts_remaining(), 1);
+    assert_eq!(budget.deadline(), deadline);
+}
+
+#[test]
 fn checkpoint_population_spends_the_original_source_owner_and_action_allowance() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut budget = ProbeExecutionBudget::new(

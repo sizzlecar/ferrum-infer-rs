@@ -9,6 +9,10 @@ use ferrum_scheduler::implementations::continuous::cost_profile::{
 
 mod plan;
 mod startup;
+#[cfg(test)]
+pub(super) use plan::PreparedProbeInputs;
+#[cfg(test)]
+pub(super) use startup::StartupSourcePreparation;
 
 pub(super) struct StartupOwnerSeries {
     authority: super::super::cost_observation::StartupOwnerSeries,

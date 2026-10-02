@@ -7,6 +7,9 @@ use crate::automatic_cost_probe::AutomaticCostProbeTemplate;
 use ferrum_types::SloAutomaticCalibrationSettingsV1;
 use std::{future::Future, pin::Pin, time::Duration};
 
+mod acquisition;
+pub(in crate::continuous_engine::inner::calibration) use acquisition::StartupSourcePreparation;
+
 pub(in crate::continuous_engine::inner::calibration) struct PreparedStartupCost {
     inputs: super::plan::PreparedProbeInputs,
     preparation_elapsed: Duration,
@@ -128,6 +131,7 @@ impl CalibrationSession {
         let mut planned_cohorts = 0usize;
         let mut source_index = 0usize;
         let mut inventory_elapsed = Duration::ZERO;
+        let mut interrupted_prefixes = Vec::new();
         'units: while cursor.pending_input_units() > 0 {
             if tokio::time::Instant::now() >= deadline {
                 last_error = Some(FerrumError::resource_exhausted(
@@ -182,6 +186,13 @@ impl CalibrationSession {
                 input_preparation_ms = inventory_elapsed.as_secs_f64() * 1_000.0,
                 "Frozen automatic input-unit source series"
             );
+            let mut extra_offer_rows = match series.cold_offer_row_headroom() {
+                Ok(rows) => rows,
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            };
             for local_source in 0..series.len() {
                 if tokio::time::Instant::now() >= deadline {
                     last_error = Some(FerrumError::resource_exhausted(
@@ -189,23 +200,65 @@ impl CalibrationSession {
                     ));
                     break 'units;
                 }
+                let (source, acquired) = match self
+                    .prepare_startup_source(
+                        &series,
+                        local_source,
+                        &mut budget,
+                        &mut extra_offer_rows,
+                    )
+                    .await
+                {
+                    Ok(StartupSourcePreparation::Ready { source, acquired }) => (source, acquired),
+                    Ok(StartupSourcePreparation::Skipped) => {
+                        source_index += 1;
+                        continue;
+                    }
+                    Ok(StartupSourcePreparation::Interrupted { error, acquired }) => {
+                        last_error = Some(error);
+                        interrupted_prefixes = acquired;
+                        break 'units;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        break 'units;
+                    }
+                };
                 let mut active_cohort = None;
                 let collect = async {
-                    let source = series.source(local_source)?;
-                    self.begin_prepared_owner_source(source.declaration, source.limits)
+                    if acquired.iter().any(|prefix| !prefix.ready()) {
+                        return Err(FerrumError::invalid_request(
+                            "automatic source prefix expired before collector admission",
+                        ));
+                    }
+                    let (declaration, limits, execution) = source.into_parts()?;
+                    self.begin_prepared_owner_source(declaration, limits)
                         .await?;
                     self.prepared_owner_capture
                         .as_mut()
                         .ok_or_else(|| {
                             FerrumError::internal("automatic cost probe collector absent")
                         })?
-                        .retain_execution_plan(source.external_retained_bytes)?;
-                    for (local, cohort) in source.cohorts.iter().enumerate() {
+                        .retain_execution_plan(execution.external_retained_bytes())?;
+                    for cohort in execution.cohorts() {
                         active_cohort = Some((cohort.pass, cohort.ordinal));
                         self.begin_prepared_owner_cohort(cohort.pass, cohort.ordinal)?;
-                        let (requests, options) = series.requests_for(local_source, local)?;
-                        self.run_probe_cohort(requests, options, &mut budget)
+                        let (requests, options) = execution.requests_for(cohort)?;
+                        if let Some(key) = execution.acquisition_key(cohort)? {
+                            let prefix = acquired.get(key).ok_or_else(|| {
+                                FerrumError::internal("automatic source lost its acquired prefix")
+                            })?;
+                            self.run_acquired_prefix_probe_cohort(
+                                requests,
+                                options,
+                                &mut budget,
+                                prefix,
+                            )
                             .await?;
+                        } else {
+                            self.run_probe_cohort(requests, options, &mut budget)
+                                .await?;
+                        }
                         self.end_prepared_owner_cohort()?;
                         completed_cohorts += 1;
                         active_cohort = None;
@@ -220,6 +273,17 @@ impl CalibrationSession {
                 // its original host settlement is mandatory retirement, even when
                 // it crosses the deadline. Activation retains its own strict gate.
                 let collected = Box::pin(collect).await;
+                // Extra checkpoint pins outlive every submitted target wave,
+                // including interrupted cohorts. Do not release them merely
+                // because the collector or activation returned an error.
+                if let Err(error) = self.drain_startup_geometry().await {
+                    last_error = Some(FerrumError::internal(format!(
+                        "automatic source drain failed: collection={:?}; drain={error}",
+                        collected.as_ref().err()
+                    )));
+                    interrupted_prefixes = acquired;
+                    break 'units;
+                }
                 #[cfg(test)]
                 if let Some(capture) = self.prepared_owner_capture.as_ref() {
                     eprintln!(
@@ -279,6 +343,7 @@ impl CalibrationSession {
                         break 'units;
                     }
                 }
+                drop(acquired);
                 source_index += 1;
             }
         }
@@ -291,6 +356,10 @@ impl CalibrationSession {
         // installed its source. Revoke first, then cross that worker's barrier
         // and read only this series' success receipt, never an arbitrary model.
         let settled = self.freeze_cost_model().await;
+        // These are additional source pins. If retirement failed, submitted
+        // native operations retain their own checkpoint/backing ownership in
+        // the existing completion reaper until terminal drain or quarantine.
+        drop(interrupted_prefixes);
         last_epoch = self.startup_owner_series_installed_epoch().or(last_epoch);
         drained?;
         finished?;

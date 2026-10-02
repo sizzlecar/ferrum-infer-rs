@@ -31,6 +31,9 @@ mod manifest;
 mod population;
 mod prefixes;
 mod series;
+pub(in crate::continuous_engine::inner::calibration) use series::{
+    ColdSourceRebuild, PreparedProbeSeries, PreparedProbeSource,
+};
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -59,6 +62,10 @@ pub(in crate::continuous_engine::inner::calibration) struct PreparedProbeCohort 
     reset_token_policy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_chunk: Option<NonZeroU32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_acquisition: Option<layout::work::PreparedProbeAcquisition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquisition_key: Option<usize>,
     seed: u64,
 }
 
@@ -126,6 +133,7 @@ pub(in crate::continuous_engine::inner::calibration) struct PreparedProbePlan {
 pub(in crate::continuous_engine::inner::calibration) struct PreparedProbeExecutionPlan {
     pub cohorts: Vec<PreparedProbeCohort>,
     pub audit: PreparedProbePlanAudit,
+    source_inputs: Vec<layout::source_inputs::PreparedProbeSourceInputs>,
     templates: Vec<AutomaticCostProbeTemplate>,
     prefill_chunk: NonZeroU32,
     prefill_row_ceiling: Option<NonZeroU32>,
@@ -179,6 +187,7 @@ pub(in crate::continuous_engine::inner::calibration) struct PreparedProbeInputs 
     base_template_count: usize,
     prefill_candidate_chunks: Vec<NonZeroU32>,
     continuation_windows: Vec<PrefillCandidateWindow>,
+    prefix_acquisitions: Vec<Option<layout::work::PrefixBlueprint>>,
     reset: bool,
     invalidation: TokenPolicyResidencyInvalidation,
     discovery: CalibrationPrefixTokenDiscoveryAuditV1,
@@ -246,6 +255,11 @@ impl PreparedProbeInputs {
                 self.continuation_windows
                     .capacity()
                     .checked_mul(std::mem::size_of::<PrefillCandidateWindow>())?,
+            )?
+            .checked_add(
+                self.prefix_acquisitions
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Option<layout::work::PrefixBlueprint>>())?,
             )?;
         if let Some(universe) = self
             .population
@@ -504,6 +518,7 @@ impl PreparedProbeInputs {
             base_template_count,
             prefill_candidate_chunks,
             continuation_windows: Vec::new(),
+            prefix_acquisitions: Vec::new(),
             reset,
             invalidation,
             discovery,
@@ -531,7 +546,88 @@ impl PreparedProbeInputs {
             },
         };
         context_variants::expand(&mut prepared, tokenizer)?;
+        prepared.prepare_native_prefix_inputs(session)?;
         Ok(prepared)
+    }
+
+    fn prepare_native_prefix_inputs(&mut self, session: &CalibrationSession) -> Result<()> {
+        use ferrum_interfaces::model_executor::{PrefixCaptureBoundary, PrefixCapturePurpose};
+        let inner = &session.engine.inner;
+        if !inner
+            .model_executor
+            .supports_guarded_prefix_maintenance_for(PrefixCapturePurpose::PrivateCalibration)
+        {
+            return Ok(());
+        }
+        let headers = self
+            .templates
+            .len()
+            .checked_mul(std::mem::size_of::<Option<layout::work::PrefixBlueprint>>())
+            .ok_or_else(|| error("prefix input plan capacity overflow"))?;
+        self.retained_payload_bytes()
+            .and_then(|n| n.checked_add(headers))
+            .filter(|n| *n <= self.population.maximum_retained_numeric_bytes)
+            .ok_or_else(|| error("prefix input plan exceeds original retained capacity"))?;
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(self.templates.len())
+            .map_err(|_| error("prefix input plan allocation failed"))?;
+        let retained = self
+            .retained_payload_bytes()
+            .and_then(|n| {
+                n.checked_add(
+                    plans
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<Option<layout::work::PrefixBlueprint>>())?,
+                )
+            })
+            .filter(|n| *n <= self.population.maximum_retained_numeric_bytes)
+            .ok_or_else(|| error("prefix input plan allocated capacity exhausted"))?;
+        for (index, (template, &prompt)) in self.templates.iter().zip(&self.prompts).enumerate() {
+            // Additional rendered windows are ordinary ActualPrefill only.
+            if index >= self.base_template_count {
+                plans.push(None);
+                continue;
+            }
+            let selected = prompt.checked_sub(1).filter(|n| *n > 0).and_then(|common| {
+                inner.model_executor.plan_prefix_capture_boundary_for(
+                    PrefixCapturePurpose::PrivateCalibration,
+                    PrefixCaptureBoundary {
+                        processed_tokens: 0,
+                        source_prompt_tokens: prompt,
+                        common_prefix_tokens: common,
+                        follower_prompt_tokens: &[prompt],
+                    },
+                )
+            });
+            let Some(selected) = selected.filter(|v| v.boundary > 0 && v.boundary < prompt) else {
+                plans.push(None);
+                continue;
+            };
+            retained
+                .checked_add(
+                    prompt
+                        .checked_mul(std::mem::size_of::<ferrum_types::TokenId>())
+                        .ok_or_else(|| error("prefix token buffer overflow"))?,
+                )
+                .filter(|n| *n <= self.population.maximum_retained_numeric_bytes)
+                .ok_or_else(|| error("prefix token buffer exceeds original retained capacity"))?;
+            let tokens = inner.tokenizer.encode(template.prompt(), true)?;
+            if tokens.len() != prompt {
+                return Err(error("prefix input tokenization changed"));
+            }
+            plans.push(Some(layout::work::PrefixBlueprint {
+                prompt_tokens: prompt,
+                boundary: selected.boundary,
+                span: selected.span,
+                input_tokens_sha256: crate::continuous_engine::token_ids_digest(&tokens).into(),
+            }));
+        }
+        self.prefix_acquisitions = plans;
+        self.retained_payload_bytes()
+            .filter(|n| *n <= self.population.maximum_retained_numeric_bytes)
+            .ok_or_else(|| error("prefix input plan retained capacity exhausted"))?;
+        Ok(())
     }
 
     pub(in crate::continuous_engine::inner::calibration) async fn finish(
@@ -613,6 +709,9 @@ impl PreparedProbeExecutionPlan {
     }
     pub fn retained_payload_bytes(&self) -> Option<usize> {
         let mut n = std::mem::size_of::<Self>()
+            .checked_add(layout::source_inputs::retained_sources_bytes(
+                &self.source_inputs,
+            )?)?
             .checked_add(
                 self.cohorts
                     .capacity()

@@ -3,6 +3,11 @@
 //! outcomes never select, trim or reorder a source's members.
 use super::*;
 use std::ops::Range;
+mod acquisitions;
+mod execution;
+mod fallback;
+pub(in crate::continuous_engine::inner::calibration) use execution::PreparedProbeSourceExecution;
+pub(in crate::continuous_engine::inner::calibration) use fallback::ColdSourceRebuild;
 
 pub(in crate::continuous_engine::inner::calibration) struct PreparedProbeSeries {
     plan: PreparedProbePlan,
@@ -11,13 +16,21 @@ pub(in crate::continuous_engine::inner::calibration) struct PreparedProbeSeries 
     retained_bytes: usize,
 }
 
-pub(in crate::continuous_engine::inner::calibration) struct PreparedProbeSource {
+pub(in crate::continuous_engine::inner::calibration) struct PreparedProbeSource<'a> {
+    series: &'a PreparedProbeSeries,
+    index: usize,
     pub declaration: StructuredPreparedOwnerBlockDeclarationV8,
     pub limits: CostProfileLoadLimits,
     pub cohorts: Vec<PreparedProbeCohort>,
     /// Parent remains alive while this source is collected. The declaration
     /// is charged separately by the collector that takes ownership of it.
     pub external_retained_bytes: usize,
+    acquisitions: Vec<layout::work::PreparedProbeAcquisition>,
+    bound_acquisitions: Vec<bool>,
+    bound_acquisition_payload_bytes: usize,
+    lease_vec_bytes: usize,
+    work: manifest::SourceWork,
+    collection_ready: bool,
 }
 
 impl PreparedProbePlan {
@@ -103,6 +116,16 @@ impl PreparedProbeSeries {
         self.plan.audit().planned_cohorts
     }
 
+    pub fn cold_offer_row_headroom(&self) -> Result<usize> {
+        self.plan
+            .limits
+            .max_samples
+            .get()
+            .min(self.plan.limits.max_total_shape_rows.get())
+            .checked_sub(self.plan.audit().declared_offer_row_bound)
+            .ok_or_else(|| error("original source offer rows exceed retained limits"))
+    }
+
     pub fn requests_for(
         &self,
         source: usize,
@@ -122,7 +145,7 @@ impl PreparedProbeSeries {
 
     /// Encode only the current source. This bounds simultaneous storage while
     /// retaining the frozen parent manifest, including all unscheduled gaps.
-    pub fn source(&self, index: usize) -> Result<PreparedProbeSource> {
+    pub fn source(&self, index: usize) -> Result<PreparedProbeSource<'_>> {
         let range = self
             .ranges
             .get(index)
@@ -165,6 +188,17 @@ impl PreparedProbeSeries {
             .and_then(|batch| batch.algorithm_universe.as_ref())
             .map_or(Some(0), |universe| universe.retained_payload_bytes())
             .ok_or_else(|| error("startup source algorithm universe retained size overflow"))?;
+        let acquisition_count = self.plan.execution.cohorts[range.clone()]
+            .iter()
+            .enumerate()
+            .filter(|(position, cohort)| {
+                cohort.native_acquisition.is_some_and(|key| {
+                    !self.plan.execution.cohorts[range.start..range.start + *position]
+                        .iter()
+                        .any(|old| old.native_acquisition == Some(key))
+                })
+            })
+            .count();
         let external_retained_bytes = self
             .retained_bytes
             .checked_add(
@@ -172,6 +206,18 @@ impl PreparedProbeSeries {
                     .checked_mul(std::mem::size_of::<PreparedProbeCohort>())
                     .ok_or_else(|| error("startup source retained count overflow"))?,
             )
+            .and_then(|n| n.checked_add(std::mem::size_of::<PreparedProbeSource<'_>>()))
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<
+                    Vec<crate::continuous_engine::inner::calibration::startup::AcquiredProbePrefix>,
+                >())
+            })
+            .and_then(|n| {
+                n.checked_add(acquisition_count.checked_mul(
+                    std::mem::size_of::<layout::work::PreparedProbeAcquisition>()
+                        + std::mem::size_of::<bool>(),
+                )?)
+            })
             .ok_or_else(|| error("startup source retained count overflow"))?;
         // Exact capacities below prevent Vec growth. The full original owns
         // at least the population, every selected request and prefix slot.
@@ -184,6 +230,7 @@ impl PreparedProbeSeries {
         // Three independent phase labels are protocol identities. Numeric
         // phases still advance only at the original block/qualification gates.
         let mut cohorts = Vec::with_capacity(count);
+        let mut acquisitions = Vec::with_capacity(acquisition_count);
         let mut counts = [0; 3];
         for position in 0..count {
             counts[(position * 3 / count).min(2)] += 1;
@@ -206,17 +253,18 @@ impl PreparedProbeSeries {
             let mut cohort = old.clone();
             cohort.pass = pass;
             cohort.ordinal = ordinal;
+            cohort.acquisition_key = match cohort.native_acquisition {
+                Some(key) => Some(match acquisitions.iter().position(|old| *old == key) {
+                    Some(index) => index,
+                    None => {
+                        acquisitions.push(key);
+                        acquisitions.len() - 1
+                    }
+                }),
+                None => None,
+            };
             cohorts.push(cohort);
         }
-        let payload = manifest::freeze_source(
-            &original.cohort_manifest_payload,
-            self.parent_sha256,
-            index,
-            self.len(),
-            range,
-            &cohorts,
-            payload_limit,
-        )?;
         let mut population = original.population.clone();
         if let Some(batch) = batch {
             if let Some(contract) = population.nonnegative_envelope.as_mut() {
@@ -237,6 +285,51 @@ impl PreparedProbeSeries {
                 .validate(&population.settings)
                 .map_err(|reason| error(format!("startup source schedule: {reason:?}")))?;
         }
+        let work = batch.map_or_else(
+            || manifest::SourceWork {
+                planned_cycles: self
+                    .plan
+                    .audit()
+                    .input_opportunities
+                    .as_ref()
+                    .map_or(0, |v| v.planned_cycles),
+                maximum_anchor_span: None,
+                requests: self.plan.audit().planned_requests,
+                execution_actions: self.plan.audit().serial_wave_bound,
+                declared_offer_row_bound: self.plan.audit().declared_offer_row_bound,
+                serial_token_work: None,
+            },
+            |batch| manifest::SourceWork {
+                planned_cycles: batch.planned_cycles,
+                maximum_anchor_span: Some(batch.maximum_anchor_span),
+                requests: batch.requests,
+                execution_actions: batch.serial_wave_upper_bound,
+                declared_offer_row_bound: batch.declared_offer_row_bound,
+                serial_token_work: Some(batch.serial_token_work),
+            },
+        );
+        let payload = manifest::freeze_source(
+            &original.cohort_manifest_payload,
+            self.parent_sha256,
+            index,
+            self.len(),
+            range,
+            &cohorts,
+            if acquisitions.is_empty() {
+                manifest::SourcePreparationChoice::Cold
+            } else {
+                manifest::SourcePreparationChoice::NativePrivate
+            },
+            work,
+            &population,
+            batch.map(|b| &b.input_opportunities).or(self
+                .plan
+                .audit()
+                .input_opportunities
+                .as_ref()),
+            payload_limit,
+        )?
+        .ok_or_else(|| error("startup source manifest retained capacity exhausted"))?;
         let declaration = StructuredPreparedOwnerBlockDeclarationV8 {
             population,
             cohort_plan: CohortPlanV2 { phases },
@@ -254,10 +347,20 @@ impl PreparedProbeSeries {
             .filter(|n| *n <= maximum)
             .ok_or_else(|| error("startup source exceeds shared retained capacity"))?;
         Ok(PreparedProbeSource {
+            series: self,
+            index,
             declaration,
             limits: self.plan.limits.clone(),
             cohorts,
             external_retained_bytes,
+            bound_acquisitions: vec![false; acquisitions.len()],
+            acquisitions,
+            bound_acquisition_payload_bytes: 0,
+            lease_vec_bytes: std::mem::size_of::<
+                Vec<crate::continuous_engine::inner::calibration::startup::AcquiredProbePrefix>,
+            >(),
+            work,
+            collection_ready: acquisition_count == 0,
         })
     }
 }

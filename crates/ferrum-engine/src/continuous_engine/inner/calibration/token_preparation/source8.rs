@@ -4,6 +4,41 @@ use super::super::structured::capture_error;
 use super::*;
 
 impl CalibrationSession {
+    /// A real maintenance observation shares the original FIFO but contributes
+    /// no inference call or numerical member. Consume only its exact ACK receipt.
+    pub(in crate::continuous_engine::inner::calibration) fn accept_prepared_owner_native_restore(
+        &mut self,
+        receipt: &crate::continuous_engine::inner::calibration::startup::AcknowledgedProbePrefixRestore,
+    ) -> Result<()> {
+        let run = self
+            .prefix_preparation
+            .as_mut()
+            .ok_or_else(|| invalid("native restore has no original prefix preparation"))?;
+        if !self.prefix_source8
+            || self.pending.is_some()
+            || self.indeterminate
+            || run.failure.is_some()
+            || run.pending_offer.is_some()
+            || run.pending_wave.is_some()
+            || run.records.values().any(|record| record.last_call != 0)
+            || receipt
+                .maintenance_fifo()
+                .is_some_and(|fifo| Some(fifo) != run.last_fifo.checked_add(1))
+        {
+            return Err(invalid(
+                "native restore lost original preparation FIFO order",
+            ));
+        }
+        self.prepared_owner_capture
+            .as_mut()
+            .ok_or_else(|| invalid("native restore ACK has no original source8 collector"))?
+            .native_prefix_restored(receipt)?;
+        if let Some(fifo) = receipt.maintenance_fifo() {
+            run.last_fifo = fifo;
+        }
+        Ok(())
+    }
+
     pub(in crate::continuous_engine::inner::calibration) async fn add_declared_prepared_owner_request(
         &mut self,
         request: ferrum_types::InferenceRequest,

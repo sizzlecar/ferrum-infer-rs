@@ -27,6 +27,14 @@ fn setup(native: bool) -> StructuredPreparedOwnerBlockCollectorV8 {
 }
 
 fn setup_width(native: bool, width: usize) -> StructuredPreparedOwnerBlockCollectorV8 {
+    setup_width_at_fifo(native, width, 0)
+}
+
+fn setup_width_at_fifo(
+    native: bool,
+    width: usize,
+    fifo: u64,
+) -> StructuredPreparedOwnerBlockCollectorV8 {
     let mut h = header();
     for phase in 0..3 {
         let request = h.declaration.cohort_plan.phases[phase][0].requests[0].clone();
@@ -49,7 +57,7 @@ fn setup_width(native: bool, width: usize) -> StructuredPreparedOwnerBlockCollec
     .unwrap();
     let mut c =
         StructuredPreparedOwnerBlockCollectorV8::new(h, CostProfileLoadLimits::default()).unwrap();
-    c.open_block(2, 0).unwrap();
+    c.open_block(2, fifo).unwrap();
     let mut events = vec![serde_json::json!({"kind":"cohort_begin","phase":"fit",
         "cohort":0,"manifest_case":0,"repetition":0})];
     for slot in 0..width {
@@ -96,6 +104,20 @@ fn restored() -> serde_json::Value {
         "input_tokens_sha256":INPUT,"capture":transfer(true),"restore":transfer(false),
         "captured_at_ns":3,"acknowledged_at_ns":4,"expires_at_ns":10,
         "acknowledged":true})
+}
+
+fn restored_slot(slot: usize, fifo: u64) -> serde_json::Value {
+    let mut value = restored();
+    value["maintenance_fifo"] = fifo.into();
+    if slot != 0 {
+        value["slot"] = slot.into();
+        value["before"]["request_id"] = format!("target-{slot}").into();
+        value["after"]["request_id"] = format!("target-{slot}").into();
+        value["restore"]["slot"] = (10 + slot).into();
+        value["restore"]["sequence_sparse"] = (2 + slot).into();
+        value["restore"]["request_sparse"] = (2 + slot).into();
+    }
+    value
 }
 
 fn preparation(value: serde_json::Value) -> StructuredPreparedOwnerBlockRecordV8 {
@@ -279,4 +301,91 @@ fn source8_native_prefix_ack_clock_cannot_regress_between_real_slots() {
             (0, 0, 0, 0)
         );
     }
+}
+
+#[test]
+fn source8_native_prefix_maintenance_fifo_consumes_contiguous_acks_without_offers() {
+    let opening_fifo = 7;
+    let mut c = setup_width_at_fifo(true, 2, opening_fifo);
+    let block = c.audit().block;
+    for slot in 0..2 {
+        let fifo = opening_fifo + slot as u64 + 1;
+        let record = preparation(restored_slot(slot, fifo));
+        let bytes = record_bytes_v7(&record).unwrap();
+        let replayed: StructuredPreparedOwnerBlockRecordV8 =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&replayed).unwrap()["maintenance_fifo"],
+            fifo
+        );
+        c.push(&replayed).unwrap();
+        assert_eq!(
+            c.last_fifo(),
+            fifo,
+            "the population core retains each maintenance position"
+        );
+        assert_eq!(
+            c.audit().block,
+            block,
+            "maintenance cannot reset the original cut"
+        );
+        assert_eq!(
+            (
+                c.offered(),
+                c.audit().block_offered,
+                c.preparation_attempts(),
+                c.qualified_children()
+            ),
+            (0, 0, 0, 0),
+            "native maintenance creates no inference offer or qualified sample"
+        );
+        assert!(c.audit().owners.is_empty());
+    }
+    c.push(&offer(true)).unwrap();
+    assert_eq!(c.last_fifo(), opening_fifo + 2);
+}
+
+#[test]
+fn source8_native_prefix_maintenance_fifo_rejects_gaps_duplicates_and_failed_acks_atomically() {
+    for invalid_fifo in [0, 2] {
+        let mut c = setup(true);
+        let before = c.source_receipt();
+        assert!(c
+            .push(&preparation(restored_slot(0, invalid_fifo)))
+            .is_err());
+        assert_eq!(c.last_fifo(), 0);
+        assert_eq!(c.source_receipt(), before);
+        assert!(c.audit().poisoned);
+    }
+    for invalid_fifo in [1, 3] {
+        let mut c = setup_width(true, 2);
+        c.push(&preparation(restored_slot(0, 1))).unwrap();
+        let before = c.source_receipt();
+        // A fresh target and transfer isolate FIFO rejection from duplicate
+        // slot/owner/restore checks.
+        assert!(c
+            .push(&preparation(restored_slot(1, invalid_fifo)))
+            .is_err());
+        assert_eq!(c.last_fifo(), 1);
+        assert_eq!(c.source_receipt(), before);
+        assert_eq!(
+            (
+                c.offered(),
+                c.preparation_attempts(),
+                c.qualified_children()
+            ),
+            (0, 0, 0)
+        );
+        assert!(c.audit().poisoned);
+    }
+    let mut c = setup(true);
+    let mut unacknowledged = restored_slot(0, 1);
+    unacknowledged["acknowledged"] = false.into();
+    assert!(c.push(&preparation(unacknowledged)).is_err());
+    assert_eq!(
+        c.last_fifo(),
+        0,
+        "a failed event cannot consume even the expected FIFO"
+    );
+    assert!(c.audit().poisoned);
 }

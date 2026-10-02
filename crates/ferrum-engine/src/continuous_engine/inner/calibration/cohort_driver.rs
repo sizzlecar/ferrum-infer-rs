@@ -264,6 +264,19 @@ impl ProbeExecutionBudget {
         Ok(())
     }
 
+    /// Before a source collector opens, fixed original members may require
+    /// more work on the cold path. Keep every setup and sibling reservation;
+    /// only unused selection credit can cover the additional collection work.
+    /// Refusal does not mutate either ledger, and actual execution pays later.
+    pub fn try_reserve_additional_source_actions(&mut self, actions: usize) -> Result<bool> {
+        self.require_time()?;
+        let Some(remaining) = self.selection_attempts_remaining.checked_sub(actions) else {
+            return Ok(false);
+        };
+        self.selection_attempts_remaining = remaining;
+        Ok(true)
+    }
+
     pub fn preflight_charge(&self) -> ProbePreflightCharge {
         self.preflight
     }

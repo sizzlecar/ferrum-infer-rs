@@ -113,12 +113,13 @@ fn failure_state(
 async fn startup_with_wait(
     wait: Option<NonZeroU64>,
 ) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
-    startup_with_wait_and_natural_eos(wait, false).await
+    startup_with_wait_and_natural_eos(wait, false, true).await
 }
 
 async fn startup_with_wait_and_natural_eos(
     wait: Option<NonZeroU64>,
     natural_eos: bool,
+    prefix_enabled: bool,
 ) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
     // Use the product tokenizer's source-config parser. The original helper
     // has no EOS vocabulary declaration; removing ignore-EOS alone would not
@@ -184,7 +185,7 @@ async fn startup_with_wait_and_natural_eos(
     config.batching.max_batch_size = 2;
     config.batching.max_num_batched_tokens = 4;
     config.runtime.max_model_len = Some(64);
-    config.runtime.prefix_state_cache_enabled = true;
+    config.runtime.prefix_state_cache_enabled = prefix_enabled;
     config.runtime.profile_detail = ferrum_types::ObservabilityProfileDetail::Resource;
     config.runtime.profile_jsonl = Some(std::env::temp_dir().join(format!(
         "ferrum-native-prefix-{}-{}-{}.jsonl",
@@ -192,6 +193,7 @@ async fn startup_with_wait_and_natural_eos(
         if wait.is_some() { "wait" } else { "no-wait" },
         RequestId::new()
     )));
+    config.scheduler.slo.validate().unwrap();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
@@ -227,19 +229,39 @@ async fn startup_with_wait_and_natural_eos(
         runtime.prefix_cost_snapshot().map(|model| (model.model_version(), model.current())),
         executor.evidence.prefix.as_ref().unwrap().attempts.lock(),
         executor.evidence.prefix.as_ref().unwrap().publications.lock());
-    assert_startup_maintenance_known(
-        &runtime,
-        &executor,
-        engine
-            .inner
-            .config
-            .scheduler
-            .slo
-            .cost_observation
-            .model
-            .min_samples
-            .get(),
+    assert_eq!(
+        engine.inner.config.runtime.prefix_state_cache_enabled,
+        prefix_enabled
     );
+    if prefix_enabled {
+        assert_startup_maintenance_known(
+            &runtime,
+            &executor,
+            engine
+                .inner
+                .config
+                .scheduler
+                .slo
+                .cost_observation
+                .model
+                .min_samples
+                .get(),
+        );
+    } else {
+        // collect_startup_prefix_cost skips shared maintenance sampling when
+        // the cache is off. Private source ACKs still must exist, but cannot
+        // establish that every shared maintenance domain has been qualified.
+        let (captures, restores) = executor.native_prefix_terminal_totals();
+        assert!(
+            captures > 0 && restores > 0,
+            "automatic private checkpoint work is missing"
+        );
+        assert_eq!(
+            executor.native_prefix_live_lease_counts(),
+            (0, 0),
+            "completed startup must retire private leases without shared index entries"
+        );
+    }
     assert!(
         runtime.snapshot().is_some(),
         "actual startup did not qualify inference: {:?}",
@@ -263,28 +285,51 @@ fn assert_startup_maintenance_known(
     executor: &ControlledExecutor,
     minimum: usize,
 ) {
-    let published = executor
-        .evidence
-        .prefix
-        .as_ref()
-        .unwrap()
-        .publications
-        .lock()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut domains = Vec::new();
+    use ferrum_scheduler::implementations::continuous::cost_model::CostPrediction;
+
+    let (published, incomplete) = executor.native_prefix_publication_summary();
+    assert!(
+        !incomplete,
+        "actual publication summary lost a receipt or domain"
+    );
+    let mut totals = (0usize, 0usize);
     for receipt in &published {
-        let work = (receipt.domain.clone(), receipt.host_work);
-        if !domains.contains(&work) {
-            domains.push(work);
-        }
+        let total = match receipt.domain.kind() {
+            Kind::Capture => &mut totals.0,
+            Kind::Restore => &mut totals.1,
+        };
+        *total = total.checked_add(receipt.published).unwrap();
     }
+    assert_eq!(
+        totals,
+        executor.native_prefix_terminal_totals(),
+        "every terminal startup transfer must have its actual publication receipt"
+    );
+    // The original shared maintenance probe declares this exact input and
+    // boundary. Additional private sources may publish other host lengths;
+    // their presence cannot substitute for either original shared domain.
+    let domains: Vec<_> = published
+        .iter()
+        .filter(|receipt| {
+            receipt.host_work.is_some_and(|work| {
+                work.prefix_tokens() == BOUNDARY as u64 && work.full_input_tokens() == PROMPT as u64
+            })
+        })
+        .collect();
     assert_eq!(
         domains.len(),
         2,
-        "startup must publish actual Capture and Restore domains: {published:?}"
+        "startup must publish the original Capture and Restore domains: {published:?}"
     );
+    for kind in [Kind::Capture, Kind::Restore] {
+        assert_eq!(
+            domains
+                .iter()
+                .filter(|receipt| receipt.domain.kind() == kind)
+                .count(),
+            1
+        );
+    }
     let snapshot = runtime
         .prefix_cost_snapshot()
         .expect("actual startup maintenance model");
@@ -293,16 +338,19 @@ fn assert_startup_maintenance_known(
     offer.boundary_tokens = NonZeroU32::new(BOUNDARY as u32).unwrap();
     offer.expires_at_ns = 1_000_000_000;
     let anchored = snapshot.anchored(PlanningCostClockAnchor::exact(0, now), &offer);
-    for (domain, host_work) in domains {
-        let count = published
-            .iter()
-            .filter(|receipt| receipt.domain == domain && receipt.host_work == host_work)
-            .count();
+    for receipt in domains {
+        let (domain, host_work, count) = (&receipt.domain, receipt.host_work, receipt.published);
         assert!(
             count >= minimum,
             "actual fullack count {count}/{minimum}: {domain:?}"
         );
-        let shape = prefix_cost_shape(&domain, host_work.as_ref()).unwrap();
+        let shape = prefix_cost_shape(domain, host_work.as_ref()).unwrap();
+        let actual_prediction = snapshot.diagnostic_prediction(&fingerprint(executor), &shape, now);
+        let CostPrediction::Known(known) = &actual_prediction else {
+            panic!("original maintenance domain did not qualify: {actual_prediction:?}, domain={domain:?}");
+        };
+        assert!(known.sample_count >= minimum && known.sample_count <= count,
+            "model must retain the original minimum from actual published receipts: retained={} published={count} minimum={minimum}", known.sample_count);
         let prediction = anchored.predict(
             &fingerprint(executor),
             &offer,
@@ -445,22 +493,31 @@ async fn native_prefix_cpu_guarded_recapture_is_new_full_ack() {
 
 #[tokio::test]
 async fn native_prefix_cpu_automatic_startup_qualifies_inference() {
-    assert_original_policy_startup(false).await;
+    assert_original_policy_startup(false, true).await;
 }
 
 #[tokio::test]
 async fn native_prefix_cpu_automatic_startup_natural_eos_qualifies_before_user_prefill() {
-    assert_original_policy_startup(true).await;
+    assert_original_policy_startup(true, true).await;
 }
 
-async fn assert_original_policy_startup(natural_eos: bool) {
+#[tokio::test]
+async fn native_prefix_cpu_automatic_startup_cache_off_releases_private_checkpoints_before_user_prefill(
+) {
+    assert_original_policy_startup(false, false).await;
+}
+
+async fn assert_original_policy_startup(natural_eos: bool, prefix_enabled: bool) {
     let (engine, executor) =
-        startup_with_wait_and_natural_eos(NonZeroU64::new(30_000), natural_eos).await;
+        startup_with_wait_and_natural_eos(NonZeroU64::new(30_000), natural_eos, prefix_enabled)
+            .await;
+    let startup_native_totals = executor.native_prefix_terminal_totals();
     // The original Configured request policy must be usable after the real
     // collector qualifies startup. A published auxiliary GreedyLength model
     // alone is insufficient: execute ordinary admission and require its real
     // finite time witness before the first completed user prefill.
     let mut user_request = request(&engine, false);
+    assert_eq!(user_request.prompt, vec!["ok"; PROMPT].join(" "));
     if natural_eos {
         user_request.metadata.remove("ferrum_ignore_eos");
         assert!(!user_request.metadata.contains_key("ferrum_ignore_eos"));
@@ -493,6 +550,18 @@ async fn assert_original_policy_startup(natural_eos: bool) {
         failure_state(&engine, &executor, &source)
     );
     output.await.unwrap();
+    if !prefix_enabled {
+        assert_eq!(
+            executor.native_prefix_terminal_totals(),
+            startup_native_totals,
+            "ordinary cache-off inference must not capture or restore startup checkpoints"
+        );
+        assert_eq!(
+            executor.native_prefix_live_lease_counts(),
+            (0, 0),
+            "ordinary cache-off inference must leave private and shared ownership empty"
+        );
+    }
     engine.shutdown().await.unwrap();
 }
 

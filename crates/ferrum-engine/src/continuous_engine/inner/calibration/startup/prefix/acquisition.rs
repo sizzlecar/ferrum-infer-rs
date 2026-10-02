@@ -127,6 +127,9 @@ impl AcquiredProbePrefix {
     pub fn plan(&self) -> ProbePrefixAcquisitionPlan {
         self.plan
     }
+    pub fn input_tokens_sha256(&self) -> [u8; 32] {
+        self.input_tokens_sha256
+    }
     pub fn ready(&self) -> bool {
         self.acknowledged_capture
             && std::time::Instant::now() < self.deadline
@@ -632,6 +635,13 @@ impl CalibrationSession {
                 ProbePrefixFallback::RestoreAdmissionUnavailable,
             ));
         };
+        // The original source block owns the FIFO cut and opening clock. Open
+        // it before this maintenance action; doing so after ACK would move the
+        // opening clock past the evidence it is meant to validate.
+        self.prepared_owner_capture
+            .as_mut()
+            .ok_or_else(|| invalid("native restore has no original source8 collector"))?
+            .prepare_native_prefix_restore()?;
         let guard = self.probe_prefix_guard(
             target,
             true,
@@ -691,11 +701,15 @@ impl CalibrationSession {
                     acknowledged_at_ns,
                     expires_at_ns: acquired.expires_at_ns,
                     acknowledged: true,
+                    maintenance_fifo: self
+                        .engine
+                        .inner
+                        .cost_runtime
+                        .as_ref()
+                        .ok_or_else(|| invalid("native restore cost runtime disappeared"))?
+                        .take_prefix_fifo_receipt(&restore_identity),
                 };
-                self.prepared_owner_capture
-                    .as_mut()
-                    .ok_or_else(|| invalid("native restore ACK has no original source8 collector"))?
-                    .native_prefix_restored(&receipt)?;
+                self.accept_prepared_owner_native_restore(&receipt)?;
                 Ok(ProbePrefixRestore::Acknowledged {
                     restored_tokens: acquired.plan.boundary(),
                 })
@@ -786,10 +800,14 @@ pub(in crate::continuous_engine::inner) struct AcknowledgedProbePrefixRestore {
     acknowledged_at_ns: u64,
     expires_at_ns: u64,
     acknowledged: bool,
+    maintenance_fifo: Option<u64>,
 }
 impl AcknowledgedProbePrefixRestore {
     pub fn before(&self) -> &PrefixFrontierV1 {
         &self.before
+    }
+    pub fn maintenance_fifo(&self) -> Option<u64> {
+        self.maintenance_fifo
     }
     pub fn matches_declaration(&self, plan: &StructuredNativePrefixAcquisitionCohortV1) -> bool {
         self.input_tokens_sha256 == plan.input_tokens_sha256

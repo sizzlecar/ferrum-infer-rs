@@ -1,5 +1,6 @@
 //! A declared acknowledged restore establishes the initial preparation
-//! frontier. It never advances numerical offers, inference calls or FIFO.
+//! frontier. An observed maintenance ordinal advances only its original FIFO;
+//! it never advances numerical offers, inference calls or shape/sample counts.
 use super::*;
 impl Preparation {
     pub(in super::super::super) fn with_native_acquisition(
@@ -26,6 +27,7 @@ impl Preparation {
         acknowledged_at_ns: u64,
         expires_at_ns: u64,
         acknowledged: bool,
+        maintenance_fifo: Option<u64>,
         progress: &mut Progress<'_>,
     ) -> Result<bool, CostProfileError> {
         progress.lifecycle.active(progress.phase, cohort)?;
@@ -43,6 +45,7 @@ impl Preparation {
             || self.pending.is_some()
             || active.slots.iter().any(|slot| slot.id.is_none())
             || !acknowledged
+            || maintenance_fifo.is_some_and(|fifo| progress.last_fifo.checked_add(1) != Some(fifo))
             || captured_at_ns == 0
             || captured_at_ns > acknowledged_at_ns
             || acknowledged_at_ns >= expires_at_ns
@@ -131,6 +134,9 @@ impl Preparation {
         slot.native_restore_slot = Some(restore.slot);
         active.native_capture.get_or_insert(capture);
         *progress.last_finalized = acknowledged_at_ns;
+        if let Some(fifo) = maintenance_fifo {
+            *progress.last_fifo = fifo;
+        }
         Ok(false)
     }
 }

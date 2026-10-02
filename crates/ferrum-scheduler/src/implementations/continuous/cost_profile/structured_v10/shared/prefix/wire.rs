@@ -152,6 +152,8 @@ pub(super) enum PreparationRecord {
         acknowledged_at_ns: u64,
         expires_at_ns: u64,
         acknowledged: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maintenance_fifo: Option<u64>,
     },
     PreparationOffered {
         offered: u64,

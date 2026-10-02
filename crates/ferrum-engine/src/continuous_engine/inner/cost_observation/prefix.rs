@@ -4,7 +4,8 @@
 use super::memory::ObservationBytePermit;
 use super::*;
 use ferrum_interfaces::vnext::{
-    NativeCheckpointObservationSink, NativeCheckpointTransferObservation,
+    NativeCheckpointObservationSink, NativeCheckpointTransferIdentity,
+    NativeCheckpointTransferObservation, WeakNativeCheckpointTransferIdentity,
 };
 use ferrum_scheduler::implementations::continuous::cost_model as model;
 use parking_lot::{Mutex, RwLock};
@@ -75,7 +76,28 @@ struct PrefixSink {
     fingerprint: model::ExecutionFingerprint,
     clock: Arc<dyn CostObservationClock>,
     epoch: Arc<Epoch>,
+    last_accepted: Mutex<Option<PrefixFifoReceipt>>,
 }
+
+struct PrefixFifoReceipt {
+    transfer: WeakNativeCheckpointTransferIdentity,
+    ordinal: u64,
+}
+
+impl PrefixSink {
+    fn take_fifo_receipt(&self, identity: &NativeCheckpointTransferIdentity) -> Option<u64> {
+        let mut last = self.last_accepted.try_lock()?;
+        if last
+            .as_ref()
+            .is_some_and(|receipt| receipt.transfer.matches(identity))
+        {
+            last.take().map(|receipt| receipt.ordinal)
+        } else {
+            None
+        }
+    }
+}
+
 impl NativeCheckpointObservationSink for PrefixSink {
     fn try_record(&self, observation: NativeCheckpointTransferObservation) -> bool {
         // M2 emits Capture only after actual model cache/rendezvous publication
@@ -106,9 +128,25 @@ impl NativeCheckpointObservationSink for PrefixSink {
                 },
             })
         })();
-        let accepted = converted
-            .and_then(|sample| self.queue.upgrade()?.offer_prefix(sample).ok())
-            .is_some();
+        let accepted_ordinal =
+            converted.and_then(|sample| self.queue.upgrade()?.offer_prefix(sample).ok());
+        if let Some(ordinal) = accepted_ordinal {
+            // This optional proof must never block native acknowledgement or
+            // change the existing enqueue/loss outcome. A missing proof leaves
+            // the source's strict FIFO validation unable to cross this entry.
+            if let Some(mut last) = self.last_accepted.try_lock() {
+                if last
+                    .as_ref()
+                    .is_none_or(|receipt| ordinal > receipt.ordinal)
+                {
+                    *last = Some(PrefixFifoReceipt {
+                        transfer: observation.identity().downgrade(),
+                        ordinal,
+                    });
+                }
+            }
+        }
+        let accepted = accepted_ordinal.is_some();
         if !accepted {
             // Lost maintenance evidence cannot silently leave an older
             // permission current; a later successful publication may recover.
@@ -143,6 +181,7 @@ impl PrefixCostTraining {
     ) -> Option<Self> {
         let base_bytes = std::mem::size_of::<Self>()
             .checked_add(std::mem::size_of::<PrefixSink>())?
+            .checked_add(WeakNativeCheckpointTransferIdentity::retained_allocation_bytes())?
             .checked_add(std::mem::size_of::<Epoch>())?
             .checked_add(6 * std::mem::size_of::<usize>())?;
         let base_memory = Arc::new(queue.reserve_prefix_working_bytes(base_bytes.checked_add(
@@ -160,6 +199,7 @@ impl PrefixCostTraining {
             fingerprint,
             clock,
             epoch: epoch.clone(),
+            last_accepted: Mutex::new(None),
         });
         Some(Self {
             sink,
@@ -177,6 +217,13 @@ impl PrefixCostTraining {
 
     pub(super) fn sink(&self) -> Arc<dyn NativeCheckpointObservationSink> {
         self.sink.clone()
+    }
+
+    pub(super) fn take_fifo_receipt(
+        &self,
+        identity: &NativeCheckpointTransferIdentity,
+    ) -> Option<u64> {
+        self.sink.take_fifo_receipt(identity)
     }
 
     pub(super) fn snapshot(&self) -> Option<Arc<PrefixCostSnapshot>> {

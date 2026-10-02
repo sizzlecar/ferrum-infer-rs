@@ -371,8 +371,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         1,
         2,
         combined,
-        requests,
-        usize::MAX,
+        SelectionCapacity::legacy(requests, usize::MAX),
         None,
         None,
     )
@@ -382,8 +381,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         1,
         2,
         combined,
-        usize::MAX,
-        waves,
+        SelectionCapacity::legacy(usize::MAX, waves),
         None,
         None,
     )
@@ -398,8 +396,21 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         0,
         2,
         combined,
-        requests,
-        usize::MAX,
+        SelectionCapacity {
+            requests: usize::MAX,
+            execution_actions: usize::MAX,
+            declared_offer_rows: waves,
+        },
+        None,
+        None,
+    )
+    .unwrap());
+    assert!(!grouping::preserves_scheduled(
+        &later,
+        0,
+        2,
+        combined,
+        SelectionCapacity::legacy(requests, usize::MAX),
         None,
         None,
     )
@@ -409,8 +420,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         0,
         2,
         combined,
-        usize::MAX,
-        usize::MAX,
+        SelectionCapacity::legacy(usize::MAX, usize::MAX),
         None,
         None,
     )
@@ -420,8 +430,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         0,
         2,
         combined,
-        usize::MAX,
-        usize::MAX,
+        SelectionCapacity::legacy(usize::MAX, usize::MAX),
         None,
         NonZeroUsize::new(1),
     )

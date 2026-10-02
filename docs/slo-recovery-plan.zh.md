@@ -8,6 +8,10 @@
 
 当前唯一实现主线是把已有 native 前缀准备接入共享自动启动。每个子修改必须说明它消除上述链路中的哪个阻断；与链路无关的优化单独登记，不能混进当前修改。如果失败推翻预算、支持域或生命周期假设，先修订对应合同与判别用例，再继续实现。没有新的原因证据，不重复昂贵测试，也不根据报错不断追加旁支设计。
 
+2026 年 10 月 3 日进度：正常共享 engine builder 的 CPU cache-off 场景已通过，四个 source 完成资格并激活，普通不同内容请求取得执行前预测、实际采用并完整输出，校准结束后的额外私有与共享 lease 均为零。当前正在回归原有共享缓存路径与预算边界；第二关整体、真实 `run` / `serve`、双后端及性能仍未验收。此后先固定这一批源码和证据，再进入产品入口验证，不将后续发现的无关优化并入本批。
+
+收敛以三个可交付结果推进：先得到可重复的正常自动链路检查点，再得到同一源码的 Metal/CUDA `run` / `serve` 可用版本，最后完成原性能范围。每个结果都列明失败和未测项。新失败必须落到具体触发、被否定的假设和最小修改；若它推翻原容量、资格或执行合同，则先停止依赖该假设的扩大验证，重新判定该方案的可行性。不能以修改数量、通过率或更多重跑替代这一判定。
+
 ## 目标与验收依据
 
 完整功能范围沿用 [原实施清单](slo-implementation-plan.zh.md) 和 [算法设计](slo-algorithm-design.zh.md)。这两份文档保存的是历史进度，其中相对 llama.cpp 的旧胜负硬门已被后续要求覆盖。
@@ -227,7 +231,19 @@ Metal 用例运行于本机 Apple M1 Max（24 GPU cores），采用测试中真�
 
 此批先运行 7 个工作账单测，再运行整个 `prepared_owner::plan::` 范围：144 项通过、0 fail、0 ignored，61.44s，包含这 7 项及 2 个新的 selector/coalesce 与预算边界用例。两个实际 `series.requests_for` 生成并重新分词的 cold 对账场景仍为 724 requests、3188 serial inference rows/actions、3524 token work；原资格规则、剩余预算和 gaps 保留。新 audit 的 `declared_offer_row_bound` 与实际生成请求的行数一致。证据为 `g2-native-accounting-work-tests.log` 和 `g2-native-accounting-plan-tests.log`，均为带 Metal 特性的 debug engine CPU 测试，不能视为设备计时或自动 native 执行证明。格式/diff 检查通过，未重复 workspace/backend 全量检查。
 
-下一批接入前有三个明确依赖：`checked.rs::freeze_inventory` 仍将 action 余量与 sample/shape 上限合并，需要拆开；冻结 inventory 前须保留各 source 的原 representative `Case + CaseOpportunity` 用于合法 cold 重算，并计入 retained budget；当前 source 的真实 lease/执行选择必须在 collector 打开前绑定，执行循环通过它生成请求。之后通过共享 automatic startup 的完整资格与普通请求采用正例，才算第二关通过。额外 token evidence 的运行成本、当前 source 全部 checkpoint 的真实峰值及双后端效果仍未证明。其余关卡保持未验收，不给无验收依据的百分比或完成时间承诺。
+上述已提交的工作账检查点之后，自动入口接入正在验证：`checked.rs::freeze_inventory` 已分别限制 action 与 sample/shape rows；冻结 inventory 前保留各 source 的原 representative `Case + CaseOpportunity`，并计入 retained budget；当前 source 的真实 lease/执行选择在 collector 打开前绑定，执行循环通过最终选择生成原请求。冷回退保持原成员和 cycles，保留已花费 setup 与后续 source 的原预约，不能满足资格或容量时在收样前 Skip。额外 token evidence 的运行成本、当前 source 全部 checkpoint 的真实峰值及双后端效果仍未证明。其余关卡保持未验收，不给无验收依据的百分比或完成时间承诺。
+
+本轮先通过了真实 seed 执行后 interest 容量不足的组合负例：花费未退款、collector 未打开、owner 清理完毕，释放容量后原后继 source 仍能准备，1 项通过、4.30s（`g2-native-startup-interest-fallback.log`）。该用例仅覆盖第一个 key 的 seed 已执行后失败，不代表多个成功 checkpoint 同时驻留后的失败。受控 session 的自动计划也完成原资格、2 次实际 capture、258 次 restore、普通不同内容请求的 Known/witness/提交/配对与完整输出，1 项通过、15.18s（`g2-native-startup-qualified-adoption-reconciled.log`）。结束后的私有与共享 lease 数均为零；普通请求没有继承 startup checkpoint。前两次正例检查分别因误用仅保留最近 32 条的诊断计数、沿用“所有提交都是推理”的旧断言失败；改为累计真实完成数并分别核对推理/capture/restore，保留失败日志。
+
+随后正常 `finish_automatic_startup_with_probes`、有效 Enforce、共享 cache 关闭的 CPU 正例失败，不能用上述受控 session 的通过替代它。原始日志 `g2-native-startup-shared-builder-cache-off.log` 显示 source 0 发布 epoch 1，source 1 第一次 restore 后发生 `prefix actual settlement/FIFO coverage is incomplete`；普通请求 Decode 为 WrongDomain，采用失败。根因已定位：真实产品维护观测和推理观测共用 FIFO，restore 的维护记录已占用 ordinal，但 native ACK 没有推进 prefix preparation、source collector 和回放 ledger 的对应位置。它与 chunk 本身无关。
+
+该修复从原 `offer_prefix` 返回值取得 exact transfer authority 对应的 ordinal，以一个有界 weak receipt 传给原 native ACK；每层继续严格要求 `last_fifo + 1`。维护记录不增加 inference offer、call、shape 或资格成员；缺失证据不能用全局 cutoff 补齐。真实 authority 的 clone/foreign/过期检查 1 项通过、0.04s（`g2-native-startup-weak-receipt-authority.log`）；scheduler native acquisition 组 7 项通过、0.20s，包含连续维护 FIFO 正例和跳号、重复、未 ACK 的拒绝（`g2-native-startup-maintenance-fifo-protocol.log`）。
+
+首次接线后仍失败：维护 ACK 到来时，原 block 尚未由第一条推理打开，scheduler 还未继承源的 FIFO cut（`g2-native-startup-shared-builder-cache-off-fifo.log`）。最终修复在物理 restore 提交前调用原 block 打开机制，保留原 cutoff，保证 opening clock 早于 ACK；已打开的 block 不重开。没有重置时钟、扩大样本或放松顺序断言。正常 builder cache-off 重跑 1 项通过、30.48s，四个 source 依次激活 epoch 1–4（`g2-native-startup-shared-builder-cache-off-block.log`）。这是 ControlledExecutor CPU 协议证据，fixture 仍使用 1s 规划 allowance、24-token 输入、3-token 输出及最大并发 2，不能称为产品 2ms 或设备性能证明。
+
+同一源码随后完成：计划组 147 项通过、62.83s（`g2-native-startup-plan-regression.log`）；正常共享 checkpoint 组 6 项通过、147.58s，包含 shared cache、自然 EOS、等待/恢复、普通 cache reuse、重新捕获及 cache-off（`g2-native-startup-shared-checkpoint-regression.log`）；自动计划与普通采用、原三阶段 acquisition、容量回退、预算和 prefix cost 组合回归 37 项通过、2 项原 wall-clock 探针 ignored、29.28s（`g2-native-startup-lifecycle-budget-regression.log`）。ignored 两项需在优化构建显式运行，旧源码结果不能充作本批验证。格式和 diff 检查通过，完整 workspace/backend 检查正在进行，第二关整体和产品可用版本仍未验收。
+
+当前集成源码的默认 `cargo check --workspace --all-targets` 已通过、1m31s；Metal 同范围 compile check 已通过、59.38s，均存在 warnings。证据为 `g2-native-startup-workspace-check.log`、`g2-native-startup-workspace-metal-check.log`。Clippy、完整 workspace tests、优化构建计时探针和 CUDA compile/runtime 尚未完成；本批可以作为上述范围已验证的集成检查点，不标记 PR 或完整目标已验收。
 
 ## 来源位置
 

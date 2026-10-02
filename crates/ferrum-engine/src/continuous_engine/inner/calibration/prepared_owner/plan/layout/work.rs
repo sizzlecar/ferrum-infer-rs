@@ -45,6 +45,32 @@ impl PreparedProbeAcquisition {
         self.plan.prefill_chunk()
     }
 
+    pub(in crate::continuous_engine::inner::calibration::prepared_owner::plan) fn input_tokens_sha256(
+        &self,
+    ) -> [u8; 32] {
+        self.input_tokens_sha256
+    }
+
+    pub(in crate::continuous_engine::inner::calibration::prepared_owner::plan) fn request(
+        &self,
+        templates: &[AutomaticCostProbeTemplate],
+    ) -> Result<ProbeRequest> {
+        let template = templates
+            .get(self.template)
+            .ok_or_else(|| error("acquisition template outside frozen inputs"))?;
+        let (request, contract) = template.instantiate(self.maximum_output, 0, self.preset)?;
+        Ok(ProbeRequest { request, contract })
+    }
+
+    pub(in crate::continuous_engine::inner::calibration::prepared_owner::plan) fn matches_declaration(
+        &self,
+        declaration: &ferrum_scheduler::implementations::continuous::cost_profile::StructuredNativePrefixAcquisitionCohortV1,
+    ) -> bool {
+        declaration.prompt_tokens == self.plan.prompt_tokens() as u64
+            && declaration.boundary_tokens == self.plan.boundary() as u64
+            && declaration.input_tokens_sha256 == self.input_tokens_sha256
+    }
+
     fn validate_case_binding(&self, case: &Case) -> Result<()> {
         if matches!(case.prefix, PrefixKind::Ordinary)
             || self.template != case.template
@@ -144,6 +170,21 @@ pub(super) fn declared_plan(
         plan,
         input_tokens_sha256: blueprint.input_tokens_sha256,
     }))
+}
+
+pub(super) fn bind_cases(input: &PreparedProbeInputs, cases: &mut [Case]) -> Result<()> {
+    for case in cases {
+        let Some(blueprint) = input
+            .prefix_acquisitions
+            .get(case.template)
+            .copied()
+            .flatten()
+        else {
+            continue;
+        };
+        case.acquisition = declared_plan(case, blueprint, input.chunk, input.prefill_row_ceiling)?;
+    }
+    Ok(())
 }
 
 /// Each call describes one source. Selection and freezing use the same

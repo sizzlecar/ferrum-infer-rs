@@ -23,6 +23,8 @@ fn cohort(
         prefix,
         route: CalibrationDecodeRoute::Actual,
         prefill_chunk: None,
+        native_acquisition: None,
+        acquisition_key: None,
         reset_token_policy: false,
         seed: 0,
     }

@@ -322,7 +322,40 @@ pub struct NativeCheckpointTransferIdentity {
     slot_id: CompletionSlotId,
     inner: Arc<StateTransferIdentity>,
 }
+
+/// Non-owning comparison authority for one transfer. This keeps only the
+/// fixed Arc allocation alive; expired identity strings and native resources
+/// are never retained by an observation receipt.
+#[derive(Debug)]
+pub struct WeakNativeCheckpointTransferIdentity {
+    slot_id: CompletionSlotId,
+    inner: Weak<StateTransferIdentity>,
+}
+
+impl WeakNativeCheckpointTransferIdentity {
+    pub fn matches(&self, identity: &NativeCheckpointTransferIdentity) -> bool {
+        self.slot_id == identity.slot_id && self.inner.as_ptr() == Arc::as_ptr(&identity.inner)
+    }
+
+    /// Additional fixed allocation pinned by this weak owner, excluding the
+    /// Weak handle itself and all heap fields dropped with the last strong Arc.
+    pub const fn retained_allocation_bytes() -> usize {
+        std::mem::size_of::<StateTransferIdentity>() + 2 * std::mem::size_of::<usize>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_expired(&self) -> bool {
+        self.inner.strong_count() == 0
+    }
+}
+
 impl NativeCheckpointTransferIdentity {
+    pub fn downgrade(&self) -> WeakNativeCheckpointTransferIdentity {
+        WeakNativeCheckpointTransferIdentity {
+            slot_id: self.slot_id,
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
     pub fn slot_id(&self) -> CompletionSlotId {
         self.slot_id
     }

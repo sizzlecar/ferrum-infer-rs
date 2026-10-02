@@ -29,6 +29,17 @@ async fn check_source_work(
     product_cost: Option<ferrum_types::SloCostObservationConfig>,
 ) {
     let (mut session, executor) = fixture(2).await;
+    let private_prefix_capability = session
+        .engine
+        .inner
+        .model_executor
+        .supports_guarded_prefix_maintenance_for(
+            ferrum_interfaces::model_executor::PrefixCapturePurpose::PrivateCalibration,
+        );
+    assert!(
+        !private_prefix_capability,
+        "this input-only CPU fixture has no native checkpoint capability"
+    );
     let settings = if let Some(cost) = product_cost {
         let ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { settings } =
             &cost.live_structured_calibration
@@ -81,7 +92,9 @@ async fn check_source_work(
     let inputs = Box::pin(PreparedProbeInputs::new(&mut session, &settings, &[root]))
         .await
         .unwrap();
+    assert!(inputs.prefix_acquisitions.iter().all(Option::is_none));
     let (cases, _, _, _) = prepare_cases(&inputs).unwrap();
+    assert!(cases.iter().all(|case| case.acquisition.is_none()));
     let chunk = inputs.chunk;
     let prefill_row_ceiling = inputs.prefill_row_ceiling;
     let before = executor.native_structured_counts();
@@ -135,9 +148,11 @@ async fn check_source_work(
             .collect();
         eprintln!("automatic checked source work: {}", serde_json::to_string(&serde_json::json!({
             "scenario":scenario,
+            "preparation":"cold",
             "batch":batch_index, "source":batch.scheduled.then_some(source_index),
             "scheduled":batch.scheduled, "raw_populations":populations,
             "requests":batch.requests, "serial_waves":batch.serial_wave_upper_bound,
+            "declared_offer_row_bound":batch.declared_offer_row_bound,
             "token_work":batch.serial_token_work, "cycles":batch.planned_cycles,
             "phase_min_members":batch.schedule.min_members,
             "effective_context":effective_context, "effective_maximum_rows":effective_maximum_rows,
@@ -148,19 +163,31 @@ async fn check_source_work(
             continue;
         }
         let source = series.source(source_index).unwrap();
-        source.declaration.validate().unwrap();
-        assert!(source
-            .declaration
+        assert!(source.acquisitions().is_empty());
+        let (declaration, _limits, execution) = source.into_parts().unwrap();
+        declaration.validate().unwrap();
+        assert!(declaration.native_prefix_acquisition.is_none());
+        assert!(declaration
             .population
             .nonnegative_envelope
             .as_ref()
             .unwrap()
             .algorithm_universe
             .is_none());
-        assert_eq!(source.declaration.population.schedule, batch.schedule);
+        assert_eq!(declaration.population.schedule, batch.schedule);
+        let first = execution.cohorts().first().unwrap();
+        assert!(execution.requests_for(first).is_ok());
+        assert_eq!(execution.acquisition_key(first).unwrap(), None);
+        // Identical values cannot substitute for a member of the final
+        // execution Vec, including a cold cohort with no acquisition key.
+        let copied = first.clone();
+        assert!(execution.requests_for(&copied).is_err());
+        assert!(execution.acquisition_key(&copied).is_err());
         let (mut requests, mut waves, mut tokens) = (0usize, 0usize, 0usize);
-        for ordinal in 0..source.cohorts.len() {
-            let (original, execution) = series.requests_for(source_index, ordinal).unwrap();
+        for cohort in execution.cohorts() {
+            assert_eq!(execution.acquisition_key(cohort).unwrap(), None);
+            assert!(cohort.native_acquisition.is_none());
+            let (original, settings) = execution.requests_for(cohort).unwrap();
             let width = original.len();
             let maximum_per_row_chunk = usize::try_from(
                 crate::continuous_engine::inner::calibration::geometry_projection::prefill_chunk_for_width(
@@ -172,11 +199,11 @@ async fn check_source_work(
                 .get(),
             )
             .unwrap();
-            let per_row_chunk = execution.prefill_chunk.get() as usize;
+            let per_row_chunk = settings.prefill_chunk.get() as usize;
             assert!(per_row_chunk <= maximum_per_row_chunk);
             assert_eq!(
                 per_row_chunk,
-                source.cohorts[ordinal]
+                cohort
                     .prefill_chunk
                     .map_or(maximum_per_row_chunk, |chunk| chunk.get() as usize)
             );
@@ -219,6 +246,10 @@ async fn check_source_work(
             waves, batch.serial_wave_upper_bound,
             "source {source_index}: serialized actual input upper bound"
         );
+        assert_eq!(
+            waves, batch.declared_offer_row_bound,
+            "source {source_index}: cold inference rows exclude native setup and restores"
+        );
         total_requests = total_requests.checked_add(requests).unwrap();
         total_waves = total_waves.checked_add(waves).unwrap();
         total_tokens = total_tokens.checked_add(tokens).unwrap();
@@ -245,6 +276,8 @@ async fn check_source_work(
         "automatic checked source summary: {}",
         serde_json::to_string(&serde_json::json!({
             "scenario": scenario,
+            "preparation": "cold",
+            "private_prefix_capability": private_prefix_capability,
             "fixture_mode": session.configuration().scheduler.slo.mode,
             "population_schedule": settings.population_schedule,
             "numerical_strategy": settings.numerical_strategy,

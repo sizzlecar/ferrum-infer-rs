@@ -38,8 +38,9 @@ fn select_native_source(
     opportunities: &[CaseOpportunity],
     inputs: &[Vec<CheckedInputFacts>],
     population: &StructuredServiceDeclarationV7,
+    capacity: SelectionCapacity,
 ) -> CheckedSelection {
-    select_changed_with_geometry_and_source_limit(
+    select_with_capacity(
         cases,
         opportunities,
         inputs,
@@ -47,9 +48,9 @@ fn select_native_source(
         8,
         NonZeroU32::new(2),
         population,
-        100_000,
-        10_000_000,
+        capacity,
         usize::MAX,
+        None,
         None,
         None,
         None,
@@ -61,7 +62,13 @@ fn select_native_source(
 #[test]
 fn native_source_coalescing_charges_one_setup_without_advancing_offered_clock() {
     let (cases, opportunities, inputs, population) = native_source_inventory();
-    let selected = select_native_source(&cases, &opportunities, &inputs, &population);
+    let selected = select_native_source(
+        &cases,
+        &opportunities,
+        &inputs,
+        &population,
+        SelectionCapacity::legacy(100_000, 10_000_000),
+    );
     assert!(selected.gaps.is_empty());
     assert_eq!(selected.batches.len(), 1);
     let combined = &selected.batches[0];
@@ -88,8 +95,13 @@ fn native_source_coalescing_charges_one_setup_without_advancing_offered_clock() 
     let cycles = combined.planned_cycles;
     assert_eq!(combined.requests, 10 * cycles + 1);
     assert_eq!(combined.serial_wave_upper_bound, 220 * cycles + 31);
+    assert_eq!(combined.declared_offer_row_bound, 210 * cycles);
     assert_eq!(combined.serial_token_work, 210 * cycles + 60);
     assert_eq!(selected.requests, combined.requests);
+    assert_eq!(
+        selected.declared_offer_row_bound,
+        combined.declared_offer_row_bound
+    );
     assert_eq!(
         selected.serial_wave_upper_bound,
         combined.serial_wave_upper_bound
@@ -124,7 +136,13 @@ fn native_source_coalescing_charges_one_setup_without_advancing_offered_clock() 
 #[test]
 fn native_source_requires_complete_setup_and_restore_budget_before_selection() {
     let (cases, opportunities, inputs, population) = native_source_inventory();
-    let selected = select_native_source(&cases, &opportunities, &inputs, &population);
+    let selected = select_native_source(
+        &cases,
+        &opportunities,
+        &inputs,
+        &population,
+        SelectionCapacity::legacy(100_000, 10_000_000),
+    );
     let batch = &selected.batches[0];
     assert!(batch.scheduled);
     let offered_only = batch.schedule.block_offered * batch.planned_cycles;
@@ -143,7 +161,13 @@ fn native_source_requires_complete_setup_and_restore_budget_before_selection() {
             member.scheduled = false;
             member.batch_index = None;
         }
-        append_batch(&mut out, batch.clone(), requests, actions, None).unwrap();
+        append_batch(
+            &mut out,
+            batch.clone(),
+            SelectionCapacity::legacy(requests, actions),
+            None,
+        )
+        .unwrap();
         assert_eq!(out.batches[0].scheduled, fits);
         if fits {
             assert!(out.gaps.is_empty());
@@ -167,6 +191,61 @@ fn native_source_requires_complete_setup_and_restore_budget_before_selection() {
                 } => required == batch.serial_wave_upper_bound && remaining == actions,
                 _ => false,
             }));
+        }
+    }
+}
+
+#[test]
+fn native_source_selection_separates_inference_row_capacity_from_execution_actions() {
+    let (cases, opportunities, inputs, population) = native_source_inventory();
+    // Check both an independent source and the source coalesced from two
+    // numerical families. Capture/restore must not consume the row allowance.
+    for count in [4, 8] {
+        let run = |capacity| {
+            select_native_source(
+                &cases[..count],
+                &opportunities[..count],
+                &inputs[..count],
+                &population,
+                capacity,
+            )
+        };
+        let full = run(SelectionCapacity::legacy(100_000, 10_000_000));
+        assert_eq!(full.batches.len(), 1);
+        let row_bound = full.declared_offer_row_bound;
+        assert!(full.serial_wave_upper_bound > row_bound);
+        assert!(row_bound > 0);
+        for rows in [row_bound, row_bound - 1] {
+            let capacity = SelectionCapacity {
+                requests: 100_000,
+                execution_actions: 10_000_000,
+                declared_offer_rows: rows,
+            };
+            let selected = run(capacity);
+            assert!(selected.declared_offer_row_bound <= rows);
+            assert!(selected.serial_wave_upper_bound <= capacity.execution_actions);
+            assert!(selected.requests <= capacity.requests);
+            if rows == row_bound {
+                assert_eq!(selected.execution_case_indices, full.execution_case_indices);
+                assert_eq!(selected.declared_offer_row_bound, row_bound);
+                assert_eq!(
+                    selected.serial_wave_upper_bound,
+                    full.serial_wave_upper_bound
+                );
+                assert!(selected.populations.iter().all(|member| member.scheduled));
+                assert!(selected.gaps.is_empty());
+            } else {
+                assert!(selected.populations.iter().any(|member| !member.scheduled));
+                assert!(selected.gaps.iter().any(|gap| matches!(
+                    gap.reason, SelectionGapReason::RemainingOfferRows { required, remaining }
+                        if required > remaining
+                )));
+                assert!(!selected.gaps.iter().any(|gap| matches!(
+                    gap.reason,
+                    SelectionGapReason::RemainingRequests { .. }
+                        | SelectionGapReason::RemainingWaves { .. }
+                )));
+            }
         }
     }
 }
@@ -208,37 +287,51 @@ fn original_batches() -> (Vec<BatchCandidate>, Vec<Case>, Vec<Vec<CheckedInputFa
 #[test]
 fn local_combination_reserves_later_original_sources_and_counts_complete_work() {
     let (batches, _, _) = original_batches();
-    let single = (
-        batches[0].batch.requests,
-        batches[0].batch.serial_wave_upper_bound,
-    );
+    let mut single = SelectionCapacity::default();
+    single.charge(&batches[0].batch).unwrap();
     let planned = super::super::composition::scheduled_prefix_budget(
         &batches,
-        100_000,
-        10_000_000,
+        SelectionCapacity::legacy(100_000, 10_000_000),
         None,
         NonZeroUsize::new(2),
     )
     .unwrap();
-    assert_eq!(planned, (2 * single.0, 2 * single.1));
+    assert_eq!(
+        planned,
+        SelectionCapacity {
+            requests: 2 * single.requests,
+            execution_actions: 2 * single.execution_actions,
+            declared_offer_rows: 2 * single.declared_offer_rows,
+        }
+    );
     let work_limited = super::super::composition::scheduled_prefix_budget(
         &batches,
-        single.0,
-        single.1,
+        single,
         None,
         NonZeroUsize::new(3),
     )
     .unwrap();
     assert_eq!(work_limited, single);
+    let row_limited = super::super::composition::scheduled_prefix_budget(
+        &batches,
+        SelectionCapacity {
+            requests: 100_000,
+            execution_actions: 10_000_000,
+            declared_offer_rows: 2 * single.declared_offer_rows - 1,
+        },
+        None,
+        NonZeroUsize::new(3),
+    )
+    .unwrap();
+    assert_eq!(row_limited, single);
     let deferred = super::super::composition::scheduled_prefix_budget(
         &batches,
-        100_000,
-        10_000_000,
+        SelectionCapacity::legacy(100_000, 10_000_000),
         Some(1),
         NonZeroUsize::new(3),
     )
     .unwrap();
-    assert_eq!(deferred, (0, 0));
+    assert_eq!(deferred, SelectionCapacity::default());
 }
 
 #[test]
@@ -247,8 +340,7 @@ fn local_combination_cannot_promote_an_invalid_raw_source_into_a_reserved_slot()
     batches[0].batch.schedule_within_capacity = false;
     assert!(!super::super::composition::can_schedule(
         &batches[0].batch,
-        usize::MAX,
-        usize::MAX
+        SelectionCapacity::legacy(usize::MAX, usize::MAX)
     ));
     batches[1].batch.maximum_anchor_span = batches[1]
         .batch
@@ -261,18 +353,14 @@ fn local_combination_cannot_promote_an_invalid_raw_source_into_a_reserved_slot()
         .unwrap();
     assert!(!super::super::composition::can_schedule(
         &batches[1].batch,
-        usize::MAX,
-        usize::MAX
+        SelectionCapacity::legacy(usize::MAX, usize::MAX)
     ));
-    let expected = (
-        batches[2].batch.requests,
-        batches[2].batch.serial_wave_upper_bound,
-    );
+    let mut expected = SelectionCapacity::default();
+    expected.charge(&batches[2].batch).unwrap();
     assert_eq!(
         super::super::composition::scheduled_prefix_budget(
             &batches,
-            usize::MAX,
-            usize::MAX,
+            SelectionCapacity::legacy(usize::MAX, usize::MAX),
             None,
             NonZeroUsize::new(1)
         )
@@ -410,6 +498,65 @@ fn local_combination_declares_only_checked_compatible_sources_before_collection(
         .sum();
     assert_eq!(selected.requests, actual_requests);
     assert_eq!(selected.serial_wave_upper_bound, actual_waves);
+    assert_eq!(selected.declared_offer_row_bound, actual_waves);
+    let raw = select_with_local_composition(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        100_000,
+        10_000_000,
+        usize::MAX,
+        None,
+        None,
+        None,
+        NonZeroUsize::new(2),
+        None,
+    )
+    .unwrap();
+    assert!(selected.declared_offer_row_bound > raw.declared_offer_row_bound);
+    // Only the inference-row allowance is tight. Optional extra scope cannot
+    // displace either raw source even when requests and actions still fit.
+    let row_limited = select_with_capacity(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        SelectionCapacity {
+            requests: 100_000,
+            execution_actions: 10_000_000,
+            declared_offer_rows: raw.declared_offer_row_bound,
+        },
+        usize::MAX,
+        None,
+        None,
+        None,
+        NonZeroUsize::new(2),
+        Some(&seed),
+    )
+    .unwrap();
+    assert_eq!(
+        row_limited.execution_case_indices,
+        raw.execution_case_indices
+    );
+    assert_eq!(
+        row_limited.declared_offer_row_bound,
+        raw.declared_offer_row_bound
+    );
+    assert!(row_limited
+        .batches
+        .iter()
+        .all(|batch| batch.algorithm_universe.is_none()));
+    assert!(row_limited
+        .gaps
+        .iter()
+        .any(|gap| matches!(gap.reason, SelectionGapReason::CombinationWorkCapacity)));
     let incomplete = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
         DeclaredAlgorithmUniverseV1::from_inputs(inputs[..2].iter().flatten()
             .map(|f| f.original.as_deref().unwrap()), population.settings.max_axes).unwrap();

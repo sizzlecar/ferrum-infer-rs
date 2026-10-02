@@ -15,8 +15,11 @@ pub(super) struct NativePrefix {
     pub(super) reaper: Arc<vnext::CompletionReaper<contract::TestRuntime>>,
     entries: Mutex<Vec<Arc<Lease>>>,
     private_interests: Mutex<Vec<std::sync::Weak<Lease>>>,
+    terminal_captures: AtomicUsize,
+    terminal_restores: AtomicUsize,
     attempts: Mutex<std::collections::VecDeque<NativeAttempt>>,
     publications: Arc<Mutex<std::collections::VecDeque<NativePublishedCheckpoint>>>,
+    publication_summary: Arc<PublishedCheckpointSummary>,
     observer: Mutex<Option<Arc<PublishedCheckpointObserver>>>,
     cancelled_sources: Mutex<std::collections::HashSet<RequestId>>,
     pub(super) admitted: Mutex<std::collections::HashMap<RequestId, vnext::TokenSpanWork>>,
@@ -28,8 +31,11 @@ impl NativePrefix {
             reaper: vnext::CompletionReaper::new(),
             entries: Mutex::new(Vec::new()),
             private_interests: Mutex::new(Vec::new()),
+            terminal_captures: AtomicUsize::new(0),
+            terminal_restores: AtomicUsize::new(0),
             attempts: Mutex::new(Default::default()),
             publications: Arc::new(Mutex::new(Default::default())),
+            publication_summary: Arc::new(PublishedCheckpointSummary::default()),
             observer: Mutex::new(None),
             cancelled_sources: Mutex::new(Default::default()),
             admitted: Mutex::new(Default::default()),
@@ -52,6 +58,7 @@ impl NativePrefix {
         let observer = Arc::new(PublishedCheckpointObserver {
             destination: sink,
             publications: Arc::clone(&self.publications),
+            summary: Arc::clone(&self.publication_summary),
         });
         let erased: Arc<dyn vnext::NativeCheckpointObservationSink> = observer.clone();
         self.reaper
@@ -66,6 +73,13 @@ impl NativePrefix {
         kind: vnext::NativeCheckpointTransferKind,
         outcome: NativeAttemptOutcome,
     ) {
+        if matches!(outcome, NativeAttemptOutcome::TerminalReady) {
+            let total = match kind {
+                vnext::NativeCheckpointTransferKind::Capture => &self.terminal_captures,
+                vnext::NativeCheckpointTransferKind::Restore => &self.terminal_restores,
+            };
+            total.fetch_add(1, Ordering::Release);
+        }
         let mut attempts = self.attempts.lock();
         // Diagnostic-only ring: discarded history never affects work or samples.
         if attempts.len() == 32 {
@@ -166,9 +180,54 @@ struct NativePublishedCheckpoint {
     domain: vnext::NativeCheckpointTransferCostDomain,
     host_work: Option<vnext::NativeCheckpointTransferHostWork>,
 }
+
+#[derive(Debug, Clone)]
+pub(in crate::continuous_engine::inner) struct NativePublishedDomainCount {
+    pub domain: vnext::NativeCheckpointTransferCostDomain,
+    pub host_work: Option<vnext::NativeCheckpointTransferHostWork>,
+    pub published: usize,
+}
+
+#[derive(Default)]
+struct PublishedCheckpointSummary {
+    domains: Mutex<Vec<NativePublishedDomainCount>>,
+    incomplete: AtomicBool,
+}
+
+impl PublishedCheckpointSummary {
+    fn record(&self, receipt: &NativePublishedCheckpoint) {
+        // Bound distinct statistical domains, not receipt history. Never
+        // evict an earlier domain to make a later one look fully accounted.
+        const MAX_DOMAINS: usize = 32;
+        let Some(mut domains) = self.domains.try_lock() else {
+            self.incomplete.store(true, Ordering::Release);
+            return;
+        };
+        if let Some(domain) = domains
+            .iter_mut()
+            .find(|value| value.domain == receipt.domain && value.host_work == receipt.host_work)
+        {
+            if let Some(count) = domain.published.checked_add(1) {
+                domain.published = count;
+            } else {
+                self.incomplete.store(true, Ordering::Release);
+            }
+        } else if domains.len() < MAX_DOMAINS {
+            domains.push(NativePublishedDomainCount {
+                domain: receipt.domain.clone(),
+                host_work: receipt.host_work,
+                published: 1,
+            });
+        } else {
+            self.incomplete.store(true, Ordering::Release);
+        }
+    }
+}
+
 struct PublishedCheckpointObserver {
     destination: std::sync::Weak<dyn vnext::NativeCheckpointObservationSink>,
     publications: Arc<Mutex<std::collections::VecDeque<NativePublishedCheckpoint>>>,
+    summary: Arc<PublishedCheckpointSummary>,
 }
 impl vnext::NativeCheckpointObservationSink for PublishedCheckpointObserver {
     fn try_record(&self, observation: vnext::NativeCheckpointTransferObservation) -> bool {
@@ -178,6 +237,7 @@ impl vnext::NativeCheckpointObservationSink for PublishedCheckpointObserver {
             domain: observation.cost_domain().clone(),
             host_work: observation.host_work().copied(),
         };
+        self.summary.record(&record);
         // Metadata owns no device lease and cannot grant execution or training.
         // Diagnostic contention never changes the original queue's outcome.
         if let Some(mut published) = self.publications.try_lock() {
@@ -300,8 +360,60 @@ fn terminal(
     Ok(result)
 }
 impl ControlledExecutor {
+    /// Cumulative actual publication receipts by exact statistical domain.
+    /// The flag rejects incomplete diagnostics; counts never replace model
+    /// sample minima/currentness or acknowledge a rejected training receipt.
+    pub(in crate::continuous_engine::inner) fn native_prefix_publication_summary(
+        &self,
+    ) -> (Vec<NativePublishedDomainCount>, bool) {
+        self.evidence.prefix.as_ref().map_or_else(
+            || (Vec::new(), false),
+            |prefix| {
+                let domains = prefix.publication_summary.domains.lock().clone();
+                let incomplete = prefix
+                    .publication_summary
+                    .incomplete
+                    .load(Ordering::Acquire);
+                (domains, incomplete)
+            },
+        )
+    }
+
+    /// Cumulative terminal captures/restores, including operations older than
+    /// the diagnostic ring. Only an actual ready result increments these totals.
+    pub(in crate::continuous_engine::inner) fn native_prefix_terminal_totals(
+        &self,
+    ) -> (usize, usize) {
+        self.evidence.prefix.as_ref().map_or((0, 0), |prefix| {
+            (
+                prefix.terminal_captures.load(Ordering::Acquire),
+                prefix.terminal_restores.load(Ordering::Acquire),
+            )
+        })
+    }
+
+    /// Retained private handles and shared index entries, in that order.
+    /// Expired or pending strong handles still count; dead Weak entries do not.
+    /// This bounded read neither upgrades leases nor cleans either collection.
+    pub(in crate::continuous_engine::inner) fn native_prefix_live_lease_counts(
+        &self,
+    ) -> (usize, usize) {
+        let Some(prefix) = self.evidence.prefix.as_ref() else {
+            return (0, 0);
+        };
+        let shared = prefix.entries.lock().len();
+        let private = prefix
+            .private_interests
+            .lock()
+            .iter()
+            .filter(|entry| entry.strong_count() != 0)
+            .count();
+        (private, shared)
+    }
+
     /// Actual native terminal operations, independent of observation queue
-    /// availability. The proof separately checks engine/native full ACK.
+    /// availability, limited to the retained diagnostic ring. The proof
+    /// separately checks engine/native full ACK.
     pub(in crate::continuous_engine::inner) fn native_prefix_terminal_counts(
         &self,
     ) -> (usize, usize) {

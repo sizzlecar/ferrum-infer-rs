@@ -104,6 +104,7 @@ fn prepare_cases(
         })
         .ok_or_else(|| error("prefill candidate retained capacity exhausted"))?;
     append_scheduler_prefill_cases(&mut cases, input, candidate_case_budget)?;
+    work::bind_cases(input, &mut cases)?;
     let retained_inputs = input
         .retained_payload_bytes()
         .and_then(|n| n.checked_add(cases.capacity().checked_mul(std::mem::size_of::<Case>())?))
@@ -195,9 +196,11 @@ fn freeze_inventory(
         .ok_or_else(|| error("frozen algorithm seed exceeds retained capacity"))?;
 
     let requests_remaining = budget.selection_requests_remaining();
-    let waves_remaining = budget
-        .selection_attempts_remaining()
-        .min(input.limits.max_samples.get())
+    let waves_remaining = budget.selection_attempts_remaining();
+    let offer_rows_remaining = input
+        .limits
+        .max_samples
+        .get()
         .min(input.limits.max_total_shape_rows.get());
     let seed = retained_seed.as_deref().and_then(|slot| slot.as_ref());
     let with_composition = if let Some(seed) = seed {
@@ -225,7 +228,7 @@ fn freeze_inventory(
         inventory.release_original_inputs();
     }
     let geometry_work = budget.input_geometry_work(input.input_geometry_visit_limit)?;
-    let mut selection = selection::select_with_local_composition(
+    let mut selection = selection::select_with_capacity(
         &cases,
         &inventory.opportunities,
         &inventory.inputs,
@@ -233,8 +236,11 @@ fn freeze_inventory(
         input.chunk.get() as usize,
         input.prefill_row_ceiling,
         &input.population,
-        requests_remaining,
-        waves_remaining,
+        selection::SelectionCapacity {
+            requests: requests_remaining,
+            execution_actions: waves_remaining,
+            declared_offer_rows: offer_rows_remaining,
+        },
         inventory_limit
             .checked_sub(
                 inventory
@@ -398,6 +404,35 @@ fn freeze_inventory(
         }
     }
     selected_widths.sort_unstable();
+    let source_input_allowance = inventory_limit
+        .checked_sub(
+            inventory
+                .retained_payload_bytes()
+                .ok_or_else(|| error("source input inventory capacity overflow"))?,
+        )
+        .and_then(|n| n.checked_sub(selection.retained_payload_bytes()?))
+        .and_then(|n| {
+            n.checked_sub(
+                selected_widths
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<usize>())?,
+            )
+        })
+        .and_then(|n| {
+            order.iter().try_fold(n, |remaining, pass| {
+                remaining.checked_sub(pass.capacity().checked_mul(std::mem::size_of::<usize>())?)
+            })
+        })
+        .ok_or_else(|| error("source inputs have no shared retained allowance"))?;
+    let source_inputs = source_inputs::freeze_sources(
+        &cases,
+        &inventory.opportunities,
+        &input.prompts,
+        &selection,
+        input.chunk,
+        input.prefill_row_ceiling,
+        source_input_allowance,
+    )?;
     drop(inventory);
     let plan = freeze(
         input,
@@ -409,6 +444,7 @@ fn freeze_inventory(
             unavailable,
             input_opportunities: None,
             checked_selection: Some(selection),
+            source_inputs,
             preflight_charge: budget.preflight_charge(),
         },
     )?;

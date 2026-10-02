@@ -221,7 +221,7 @@ impl PreparedCohortLedgerV8 {
         source_opened_at_ns: u64,
         earliest: u64,
         limits: &CostProfileLoadLimits,
-    ) -> Result<bool, CostProfileError> {
+    ) -> Result<(bool, u64), CostProfileError> {
         let (phase, _) = self.cohort()?;
         if e.offered().is_some() {
             self.preparation_offered = offered;
@@ -231,7 +231,7 @@ impl PreparedCohortLedgerV8 {
         // this local validation and commits the same call only after success.
         let mut calls = HashSet::new();
         let mut rows = 0;
-        self.preparation.handle(
+        let settled = self.preparation.handle(
             serde_json::to_value(&e.0)?,
             &mut Progress {
                 phase,
@@ -247,7 +247,8 @@ impl PreparedCohortLedgerV8 {
                 limits,
                 lifecycle: &mut self.lifecycle,
             },
-        )
+        )?;
+        Ok((settled, last_fifo))
     }
     pub(in super::super::super) fn ordinary(
         &mut self,

@@ -53,6 +53,7 @@ pub use checkpoint_observation::{
     NativeCheckpointTransferCostDomain, NativeCheckpointTransferGeometry,
     NativeCheckpointTransferHostWork, NativeCheckpointTransferIdentity,
     NativeCheckpointTransferKind, NativeCheckpointTransferObservation,
+    WeakNativeCheckpointTransferIdentity,
 };
 pub use checkpoint_timings::{
     CheckpointCacheTimingPhase, CheckpointCacheTimings, CheckpointCopyMeasurements,

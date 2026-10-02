@@ -27,10 +27,14 @@ fn checkpoint_statistical_domain_is_reusable_without_reusing_receipt_authority()
     let sink = observe_transfers(&reaper, 2);
     let first = observed_capture(&harness, &lane, &reaper);
     let second = observed_capture(&harness, &lane, &reaper);
-    {
+    let (weak, foreign) = {
         let samples = sink.samples.lock().unwrap();
         assert_eq!(samples.len(), 2);
         assert!(!samples[0].identity().same_transfer(samples[1].identity()));
+        let weak = samples[0].identity().downgrade();
+        assert!(weak.matches(&samples[0].identity().clone()));
+        assert!(!weak.matches(samples[1].identity()));
+        assert!(!weak.is_expired());
         assert_eq!(samples[0].cost_domain(), samples[1].cost_domain());
         let mut changed = lane.descriptor().clone();
         changed
@@ -48,10 +52,18 @@ fn checkpoint_statistical_domain_is_reusable_without_reusing_receipt_authority()
             *samples[0].geometry(),
         );
         assert_ne!(samples[0].cost_domain(), &projected);
-    }
+        (weak, samples[1].identity().clone())
+    };
     drop(first);
-    drop(second);
     drop(sink);
+    assert!(
+        weak.is_expired(),
+        "a weak receipt must not retain the original transfer identity"
+    );
+    assert!(!weak.matches(&foreign));
+    drop(weak);
+    drop(foreign);
+    drop(second);
     drop(reaper);
     drop(lane);
     harness.close();

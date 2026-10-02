@@ -315,6 +315,7 @@ impl Preparation {
                 acknowledged_at_ns,
                 expires_at_ns,
                 acknowledged,
+                maintenance_fifo,
             } => self.native_restored(
                 phase,
                 cohort,
@@ -328,6 +329,7 @@ impl Preparation {
                 acknowledged_at_ns,
                 expires_at_ns,
                 acknowledged,
+                maintenance_fifo,
                 p,
             ),
             PreparationRecord::PreparationOffered {

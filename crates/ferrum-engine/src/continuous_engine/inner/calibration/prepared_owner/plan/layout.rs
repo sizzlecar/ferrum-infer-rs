@@ -7,7 +7,8 @@ mod populations;
 #[cfg(test)]
 mod row_capacity_tests;
 pub(super) mod selection;
-mod work;
+pub(super) mod source_inputs;
+pub(super) mod work;
 pub(super) use checked::build as build_checked;
 pub(in crate::continuous_engine::inner::calibration) use checked::CheckedInputCursor;
 
@@ -668,6 +669,7 @@ pub(super) fn build(
             base_template_count: templates.len(),
             prefill_candidate_chunks: Vec::new(),
             continuation_windows: Vec::new(),
+            prefix_acquisitions: Vec::new(),
             reset,
             invalidation,
             discovery,
@@ -689,6 +691,7 @@ pub(super) fn build(
             unavailable,
             input_opportunities: Some(input_opportunities),
             checked_selection: None,
+            source_inputs: Vec::new(),
             preflight_charge: ProbePreflightCharge::default(),
         },
     )
@@ -702,6 +705,7 @@ struct FrozenCases {
     unavailable: Vec<PreparedPrefixUnavailable>,
     input_opportunities: Option<ProbeInputOpportunityBudget>,
     checked_selection: Option<selection::CheckedSelection>,
+    source_inputs: Vec<source_inputs::PreparedProbeSourceInputs>,
     preflight_charge: ProbePreflightCharge,
 }
 
@@ -735,6 +739,7 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
         unavailable,
         input_opportunities,
         checked_selection,
+        source_inputs,
         preflight_charge,
     } = selected;
     let templates = templates.as_slice();
@@ -779,7 +784,10 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
                 &batch.representative_case_indices,
             )?)?;
         }
-        if requests != selection.requests || serial != selection.serial_wave_upper_bound {
+        if requests != selection.requests
+            || serial != selection.serial_wave_upper_bound
+            || offered_rows != selection.declared_offer_row_bound
+        {
             return Err(error(
                 "frozen source work differs from original selection reservation",
             ));
@@ -804,6 +812,11 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
     let planned_cohorts = order.iter().map(Vec::len).sum::<usize>();
     let preallocated_payload =
         payload_bound(&cases, &order, &pair, templates, unavailable.capacity())?
+            .checked_add(
+                source_inputs::retained_sources_bytes(&source_inputs)
+                    .ok_or_else(|| error("source input retained capacity overflow"))?,
+            )
+            .ok_or_else(|| error("source input retained capacity overflow"))?
             .checked_add(
                 checked_selection
                     .as_ref()
@@ -886,6 +899,8 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
                 route: case.route,
                 reset_token_policy: case.reset,
                 prefill_chunk: case.explicit_prefill_chunk(),
+                native_acquisition: case.acquisition,
+                acquisition_key: None,
                 seed: next_seed,
             });
             next_seed = next_seed
@@ -948,6 +963,7 @@ fn freeze(input: PreparedProbeInputs, selected: FrozenCases) -> Result<PreparedP
     let execution = PreparedProbeExecutionPlan {
         cohorts,
         audit,
+        source_inputs,
         templates: templates.to_vec(),
         prefill_chunk: chunk,
         prefill_row_ceiling,

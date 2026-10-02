@@ -61,41 +61,37 @@ pub(super) fn authorized(
 
 /// Exactly the capacity predicate used by original append_batch, before any
 /// optional scope is added. Invalid raw plans cannot acquire a new source slot.
-pub(super) fn can_schedule(batch: &SelectedBatch, requests: usize, waves: usize) -> bool {
+pub(super) fn can_schedule(batch: &SelectedBatch, capacity: SelectionCapacity) -> bool {
     batch.schedule_within_capacity
         && batch.maximum_anchor_span <= *batch.schedule.phase_min_offered.iter().min().unwrap()
-        && batch.requests <= requests
-        && batch.serial_wave_upper_bound <= waves
+        && batch.requests <= capacity.requests
+        && batch.serial_wave_upper_bound <= capacity.execution_actions
+        && batch.declared_offer_row_bound <= capacity.declared_offer_rows
 }
 
 /// Reserve the entire original executable source prefix before increasing a
 /// later source's work. A local combination cannot spend a later first role or
-/// installed policy source's original request/wave allowance.
+/// installed policy source's original request/action/inference-row allowance.
 pub(super) fn scheduled_prefix_budget(
     candidates: &[BatchCandidate],
-    requests: usize,
-    waves: usize,
+    capacity: SelectionCapacity,
     priority: Option<u8>,
     maximum_sources: Option<NonZeroUsize>,
-) -> Result<(usize, usize)> {
-    let (mut used_requests, mut used_waves, mut sources) = (0usize, 0usize, 0usize);
+) -> Result<SelectionCapacity> {
+    let mut used = SelectionCapacity::default();
+    let mut sources = 0usize;
     for candidate in candidates {
         let batch = &candidate.batch;
         if priority.is_some_and(|selected| selected != candidate.input_priority)
             || maximum_sources.is_some_and(|maximum| sources >= maximum.get())
-            || !can_schedule(
-                batch,
-                requests.saturating_sub(used_requests),
-                waves.saturating_sub(used_waves),
-            )
+            || !can_schedule(batch, capacity.remaining(used))
         {
             continue;
         }
-        used_requests = add(used_requests, batch.requests)?;
-        used_waves = add(used_waves, batch.serial_wave_upper_bound)?;
+        used.charge(batch)?;
         sources = add(sources, 1)?;
     }
-    Ok((used_requests, used_waves))
+    Ok(used)
 }
 
 fn facts<'a>(

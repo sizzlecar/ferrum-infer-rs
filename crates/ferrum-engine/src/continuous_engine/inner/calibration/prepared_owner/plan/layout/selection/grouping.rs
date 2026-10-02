@@ -86,25 +86,20 @@ pub(super) fn related(
 fn reserve(
     batch: &SelectedBatch,
     priority: u8,
-    requests: usize,
-    waves: usize,
+    capacity: SelectionCapacity,
     selected_priority: Option<u8>,
     maximum_sources: Option<NonZeroUsize>,
-    used: &mut (usize, usize, usize),
+    used: &mut SelectionCapacity,
+    sources: &mut usize,
 ) -> Result<bool> {
     if selected_priority.is_some_and(|selected| selected != priority)
-        || maximum_sources.is_some_and(|maximum| used.2 >= maximum.get())
-        || !composition::can_schedule(
-            batch,
-            requests.saturating_sub(used.0),
-            waves.saturating_sub(used.1),
-        )
+        || maximum_sources.is_some_and(|maximum| *sources >= maximum.get())
+        || !composition::can_schedule(batch, capacity.remaining(*used))
     {
         return Ok(false);
     }
-    used.0 = add(used.0, batch.requests)?;
-    used.1 = add(used.1, batch.serial_wave_upper_bound)?;
-    used.2 = add(used.2, 1)?;
+    used.charge(batch)?;
+    *sources = add(*sources, 1)?;
     Ok(true)
 }
 
@@ -118,23 +113,23 @@ pub(super) fn preserves_scheduled(
     first: usize,
     second: usize,
     combined: &SelectedBatch,
-    requests: usize,
-    waves: usize,
+    capacity: SelectionCapacity,
     selected_priority: Option<u8>,
     maximum_sources: Option<NonZeroUsize>,
 ) -> Result<bool> {
     debug_assert!(first < second && second < candidates.len());
-    let (mut original, mut proposed) = ((0, 0, 0), (0, 0, 0));
+    let (mut original, mut proposed) = (SelectionCapacity::default(), SelectionCapacity::default());
+    let (mut original_sources, mut proposed_sources) = (0, 0);
     let mut union_scheduled = false;
     for (index, candidate) in candidates.iter().enumerate() {
         let before = reserve(
             &candidate.batch,
             candidate.input_priority,
-            requests,
-            waves,
+            capacity,
             selected_priority,
             maximum_sources,
             &mut original,
+            &mut original_sources,
         )?;
         let after = if index == second {
             union_scheduled
@@ -146,11 +141,11 @@ pub(super) fn preserves_scheduled(
                     &candidate.batch
                 },
                 candidate.input_priority,
-                requests,
-                waves,
+                capacity,
                 selected_priority,
                 maximum_sources,
                 &mut proposed,
+                &mut proposed_sources,
             )?;
             if index == first {
                 union_scheduled = accepted;

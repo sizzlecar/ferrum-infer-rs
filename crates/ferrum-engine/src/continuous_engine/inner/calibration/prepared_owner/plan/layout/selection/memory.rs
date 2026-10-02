@@ -119,7 +119,7 @@ pub(super) fn plan(
         vector_peak_bytes::<usize>(add(n, mul(p, 4)?)?)?,
         vector_peak_bytes::<SelectedBatch>(p)?,
         mul(vector_peak_bytes::<usize>(add(n, mul(p, 8)?)?)?, 3)?,
-        vector_peak_bytes::<SelectionGap>(add(g, add(mul(p, 7)?, 2)?)?)?,
+        vector_peak_bytes::<SelectionGap>(add(g, add(mul(p, 8)?, 2)?)?)?,
         vector_peak_bytes::<usize>(remaining_requests)?,
     ] {
         output = add(output, extra)?;
@@ -162,7 +162,7 @@ pub(super) fn plan(
                 .max(batch_scratch),
         )?,
     )?;
-    let append_peak_bytes = add(output, vector_peak_bytes::<SelectionGapReason>(5)?)?;
+    let append_peak_bytes = add(output, vector_peak_bytes::<SelectionGapReason>(6)?)?;
     let required_peak_bytes = grouping_peak_bytes
         .max(grouped_selection_peak_bytes)
         .max(append_peak_bytes);

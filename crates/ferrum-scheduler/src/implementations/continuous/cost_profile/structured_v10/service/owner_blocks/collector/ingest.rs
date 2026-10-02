@@ -1,6 +1,23 @@
 use super::*;
 use crate::implementations::continuous::cost_model::structured_v2::OwnerOpeningFrontierPolicyV1;
 impl StructuredServiceCollectorV7 {
+    /// A source8 restore ACK consumes its already published maintenance FIFO
+    /// position without becoming an inference offer or changing block cuts.
+    pub(in super::super) fn preparation_maintenance(
+        &mut self,
+        fifo: u64,
+    ) -> Result<(), CostProfileError> {
+        if self.header.source_kind != PopulationSource::PreparedOwnerBlocksV8
+            || self.last_fifo.checked_add(1) != Some(fifo)
+        {
+            return Err(invalid(
+                "source8 maintenance FIFO is missing, duplicate or reordered",
+            ));
+        }
+        self.last_fifo = fifo;
+        Ok(())
+    }
+
     pub(in super::super) fn position(
         &mut self,
         ticket: u64,
