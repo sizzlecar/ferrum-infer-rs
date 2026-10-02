@@ -4,7 +4,69 @@ use super::*;
 
 #[tokio::test]
 async fn checked_raw_domain_source_work_matches_frozen_original_requests() {
+    check_source_work("historical_settings_default", None).await;
+}
+
+#[tokio::test]
+async fn checked_enforce_product_source_work_matches_frozen_original_requests() {
+    let config: ferrum_types::SloConfig = serde_json::from_value(serde_json::json!({
+        "mode": "enforce",
+        "default_service_class": "plan-audit",
+        "services": [{
+            "id": "plan-audit",
+            "server_token_commit": {
+                "ttft_ms": 10_000, "tpot_ms": 10_000, "itl_ms": 10_000
+            }
+        }]
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    check_source_work("enforce_effective_settings", Some(config.cost_observation)).await;
+}
+
+async fn check_source_work(
+    scenario: &str,
+    product_cost: Option<ferrum_types::SloCostObservationConfig>,
+) {
     let (mut session, executor) = fixture(2).await;
+    let settings = if let Some(cost) = product_cost {
+        let ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { settings } =
+            &cost.live_structured_calibration
+        else {
+            panic!("minimal Enforce configuration must select automatic calibration");
+        };
+        let settings = settings.clone();
+        let inner = Arc::get_mut(&mut session.engine.inner).unwrap();
+        let runtime = inner.cost_runtime.as_ref().unwrap();
+        // Keep the CPU fixture's Observe/manual-driver isolation. Rebuild its
+        // cost runtime with the same effective settings used by the plan, the
+        // original physical domain and clock, and no background worker/cache.
+        // This audits product calibration inputs, not normal Enforce startup.
+        let runtime = crate::continuous_engine::inner::cost_observation::EngineCostRuntime::build_with_clock_and_domain(
+            runtime.identity.clone(),
+            runtime.clock.clone(),
+            &cost,
+            false,
+            runtime.workload_domain().unwrap().clone(),
+        )
+        .unwrap();
+        inner.config.scheduler.slo.cost_observation = cost;
+        inner.cost_runtime = Some(Arc::new(runtime));
+        assert_eq!(
+            inner
+                .config
+                .scheduler
+                .slo
+                .cost_observation
+                .live_structured_calibration,
+            ferrum_types::SloLiveStructuredCalibration::AutomaticV1 {
+                settings: settings.clone()
+            }
+        );
+        settings
+    } else {
+        SloAutomaticCalibrationSettingsV1::default()
+    };
     executor
         .recycle_completed_bindings
         .store(true, Ordering::Release);
@@ -16,7 +78,6 @@ async fn checked_raw_domain_source_work_matches_frozen_original_requests() {
     let root = template("test", &model)
         .unwrap()
         .with_prompt_renderer(Arc::new(PlainRenderer { model }));
-    let settings = SloAutomaticCalibrationSettingsV1::default();
     let inputs = Box::pin(PreparedProbeInputs::new(&mut session, &settings, &[root]))
         .await
         .unwrap();
@@ -38,10 +99,11 @@ async fn checked_raw_domain_source_work_matches_frozen_original_requests() {
     let effective_maximum_rows = plan.audit().effective_maximum_rows;
     let expected_requests = plan.audit().planned_requests;
     let expected_waves = plan.audit().serial_wave_bound;
+    assert_eq!(plan.preflight_charge(), budget.preflight_charge());
     let selection = plan.audit().checked_selection.as_ref().unwrap().clone();
     let series = plan.into_series().unwrap();
     let mut source_index = 0;
-    let (mut total_requests, mut total_waves) = (0usize, 0usize);
+    let (mut total_requests, mut total_waves, mut total_tokens) = (0usize, 0usize, 0usize);
     for (batch_index, batch) in selection.batches.iter().enumerate() {
         let populations: Vec<_> = batch
             .population_indices
@@ -71,6 +133,7 @@ async fn checked_raw_domain_source_work_matches_frozen_original_requests() {
             .map(|gap| &gap.reason)
             .collect();
         eprintln!("automatic checked source work: {}", serde_json::to_string(&serde_json::json!({
+            "scenario":scenario,
             "batch":batch_index, "source":batch.scheduled.then_some(source_index),
             "scheduled":batch.scheduled, "raw_populations":populations,
             "requests":batch.requests, "serial_waves":batch.serial_wave_upper_bound,
@@ -157,12 +220,69 @@ async fn checked_raw_domain_source_work_matches_frozen_original_requests() {
         );
         total_requests = total_requests.checked_add(requests).unwrap();
         total_waves = total_waves.checked_add(waves).unwrap();
+        total_tokens = total_tokens.checked_add(tokens).unwrap();
         source_index += 1;
     }
     assert_eq!(source_index, series.len());
     assert_eq!(total_requests, expected_requests);
     assert_eq!(total_waves, expected_waves);
     assert_eq!(budget.deadline(), deadline);
+    let preflight = budget.preflight_charge();
+    assert_eq!(
+        budget.requests_remaining() + preflight.readiness_reserved_requests,
+        settings.cost_probe.maximum_probe_requests.get()
+    );
+    assert_eq!(
+        budget.input_projection_requests_remaining() + preflight.planning_reserved_requests,
+        settings.cost_probe.maximum_input_projection_requests.get()
+    );
+    eprintln!(
+        "automatic checked source summary: {}",
+        serde_json::to_string(&serde_json::json!({
+            "scenario": scenario,
+            "fixture_mode": session.configuration().scheduler.slo.mode,
+            "population_schedule": settings.population_schedule,
+            "numerical_strategy": settings.numerical_strategy,
+            "limits": {
+                "duration_ms": settings.cost_probe.maximum_duration_ms,
+                "execution_requests": settings.cost_probe.maximum_probe_requests,
+                "input_projection_requests": settings.cost_probe.maximum_input_projection_requests,
+                "offered_waves": settings.cost_probe.maximum_offered_waves,
+            },
+            "preflight": {
+                "admitted_requests": preflight.admitted_requests,
+                "planning_admitted_requests": preflight.planning_admitted_requests,
+                "readiness_admitted_requests": preflight.readiness_admitted_requests,
+                "planning_reserved_requests": preflight.planning_reserved_requests,
+                "readiness_reserved_requests": preflight.readiness_reserved_requests,
+                "projection_attempts": preflight.projection_attempts,
+            },
+            "selected": {
+                "sources": source_index,
+                "populations": selection.populations.iter().filter(|p| p.scheduled).count(),
+                "requests": total_requests,
+                "serial_waves": total_waves,
+                "token_work": total_tokens,
+            },
+            "remaining_after_preflight": {
+                "execution_requests": budget.requests_remaining(),
+                "input_projection_requests": budget.input_projection_requests_remaining(),
+                "offered_waves": budget.attempts_remaining(),
+                "selection_requests": budget.selection_requests_remaining(),
+                "selection_waves": budget.selection_attempts_remaining(),
+            },
+            // Collection has not run or reserved these sources. This is only
+            // headroom after their independently reconciled declared work.
+            "headroom_after_planned_collection": {
+                "requests": budget.requests_remaining().checked_sub(total_requests)
+                    .expect("selected source requests exceed the remaining allowance"),
+                "offered_waves": budget.attempts_remaining().checked_sub(total_waves)
+                    .expect("selected source waves exceed the remaining allowance"),
+            },
+            "gaps": &selection.gaps,
+        }))
+        .unwrap()
+    );
     assert_eq!(
         executor.native_structured_counts(),
         before,

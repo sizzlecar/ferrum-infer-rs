@@ -183,7 +183,18 @@ cargo check -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-page
 
 本轮外部证据使用 `/private/tmp/ferrum-slo-recovery-20261002`。初始只保留当前计划、结果摘要、必要原始记录和对应源码身份；复用现有 Cargo/cache，不重复归档源码、依赖树和大 trace。当前磁盘容量紧张，构建前先检查并通过 Cargo 清理明确可再生的本任务构建产物，清理范围与结果留在外部记录。
 
-当前正在第一关：重建目标已完成；生产有效配置的工作账验证正在补齐；默认 2ms 的当前源码实测尚未发生。其余关卡保持未验收。后续进度按当前关卡、得到的证据、失败原因和下一项判别检查更新，不给无验收依据的百分比或完成时间承诺。
+当前仍在第一关。2026 年 10 月 2 日，当前源码的优化构建与以下最小检查已完成：
+
+| 检查 | 实际结果 | 证明边界 |
+| --- | --- | --- |
+| 历史 Default 与 Enforce 有效配置的工作账 | 2 项通过，合计 0.26s；均为 4 sources、6 populations、724 requests、3188 serial waves、3524 token work | 真正实例化的请求与计划账一致，且纯输入检查未执行设备波；不证明数值资格或后端 120s 可完成 |
+| 默认 2ms 基本探针 | 1 项通过，0.41s | 现有受控 CPU 校准/普通控制器场景在默认规划预算下完成 witness、提交与 reconcile |
+| 默认 2ms 前瞻探针 | 1 项通过，0.42s；三次规划约 0.298/0.225/0.135ms | 同一受控场景的非空前瞻序列实际采用；不是 Metal/CUDA 或并发尾延迟保证 |
+| fmt 和差异检查 | 通过 | 仅格式/差异检查，不替代 workspace/backend 最终验证 |
+
+原始结果分别在本轮外部证据目录的 `g1-source-work-release.log`、`g1-product-2ms-basic-release.log`、`g1-product-2ms-forward-release.log`。构建使用仓库标准 release 配置，共享 target，首次优化构建 13 分钟，后续探针复用同一产物。2ms 探针保持原受控校准 fixture，只将其规划 allowance 设为产品默认；新增产品有效配置的检查仍只是输入工作账，两者不能拼成完整生产启动证明。
+
+新得到的限制是：当前 CPU 输入计划还有 1324 requests 和 13196 waves 的计划余量，但保留 1 个 UnknownPopulation 和 4 个 RetainedSourceCapacity(maximum_sources=4) gap。下一项判别检查是确定排除的 population 是否影响普通 Configured 请求，并核对 source 分组/保留语义；不增加上限来抹掉缺口。现有小场景的 2ms 证据已成立，暂不展开没有测量依据的规划器重写。其余关卡保持未验收，后续按证据和下一项判别检查更新，不给无验收依据的百分比或完成时间承诺。
 
 ## 来源位置
 
