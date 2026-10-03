@@ -75,14 +75,14 @@ async fn checked_inventory_reuses_maximum_width_and_keeps_warm_prefill_condition
     .await
     .unwrap();
     assert_eq!(inventory.charge.admitted_requests, 2);
-    // Each ordinary width has one initial-prefill projection. Each decode
-    // trajectory then prepares every original row separately before its one
-    // joint decode; width two therefore needs two real preparation edges.
+    // Each width still projects its initial prefill and its own decode query.
+    // The completed width-one joint prefill is also its exact serial prefix;
+    // width two reuses that owner and prepares only the newly added owner.
     let projected_widths = [1usize, 2];
-    let expected_attempts = projected_widths.len()
+    let expected_attempts = 2 * projected_widths.len()
         + projected_widths
-            .iter()
-            .map(|width| width + 1)
+            .windows(2)
+            .map(|widths| widths[1] - widths[0])
             .sum::<usize>();
     assert_eq!(inventory.charge.projection_attempts, expected_attempts);
     assert!(!inventory.algorithm_inputs.is_empty());
@@ -418,7 +418,10 @@ async fn checked_continuation_prefill_floor_comes_from_mandatory_real_prompt_spa
     .await
     .unwrap();
     assert_eq!(inventory.charge.admitted_requests, 2);
-    assert_eq!(inventory.charge.projection_attempts, 1 + 2 + 3);
+    // Each distinct mandatory span projects its own wave, reusing the prior
+    // successful joint successor. With maximum_output=1 there is no decode
+    // trajectory, and no earlier prompt span needs another projection.
+    assert_eq!(inventory.charge.projection_attempts, cases.len());
     assert_eq!(inventory.opportunities.len(), cases.len());
     assert!(inventory.opportunities.iter().all(|opportunity| matches!(
         opportunity.population,

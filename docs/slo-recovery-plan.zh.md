@@ -18,6 +18,8 @@ G9 当前候选将实际物理工作凭据与数值 graph 资格分开：只有�
 
 真实安装→Core selector/submission→采样→FIFO→source8 collector 的受控 CPU 回归，修复前因缺少 prefix host settlement 失败，最终修复后 1 pass、3.18s；两个请求完整输出并释放，仍无成本快照。最小前缀正反例 2 pass，模型物理投影边界 3 pass，记录器边界 6 pass，scheduler prefix 组 7 pass。这些组含重叠检查，不累计成完成度。中间夹具失败（缺少后台 worker、误拒合法参数绑定、错误历史触发 builder sticky error）及模型测试的私有 API 编译失败均保留日志；最终只修正夹具，未放宽生产接受条件。完整 workspace、后端编译和这份候选的实机结果仍待完成，不能把 CPU 协议通过写成 CUDA 实际前缀复制或完整 F/R/Q 成功。
 
+业务修复冻结于 `88e298de`，默认全目标 workspace check 通过（1m32s）。首次 workspace test 在 engine 取得 1531 pass、2 fail、6 ignored 后停止；两项失败均是 inventory 的旧精确投影账：跨宽度复用后实际为 5、旧断言为 7，三个 continuation span 复用前驱后实际为 3、旧断言为 6。按原每次必要查询和新增 owner 准备动作重新推导，仅更新两个测试计数及说明，生产源码不变。随后 inventory 全组 8 pass、0 fail、0 ignored（0.26s），原资格、gaps、未提交和清理断言均保留并执行。首次失败原始日志保留；全仓复测、Clippy、后端编译和实机仍待完成。
+
 G9 CUDA guard/product 均退出 0，服务恢复记录为 `restored_verified`；独立检查确认 PID 4147753、服务 active、健康响应正常。原 1536-token 输出与 G8 字节一致，但仍在计数任务中途达到上限，不能称完整任务完成。原始证据及独立审核位于外部 `g9-cuda-route-evidence/`；Metal 计费证明及 after 审核分别为 `g9-metal-composition-memory-proof.json`、`g9-metal-composition-memory-after-review.json`。
 
 ## G8 已冻结的实机结果与当时判断
