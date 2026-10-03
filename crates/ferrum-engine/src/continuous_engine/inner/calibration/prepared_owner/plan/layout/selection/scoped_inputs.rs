@@ -1,11 +1,14 @@
-//! Freeze one local physical algorithm declaration before selecting numerical
-//! representatives. Original recipes remain raw; only this temporary view is
-//! projected, and every host/product/route family keeps its own member floor.
+//! Fixed-scope lookup and test-only scope-first experiments. Product selection
+//! keeps its original raw inventory; experimental projections retain raw
+//! recipes and every host/product/route family's own member floor.
 use super::*;
+use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1;
+#[cfg(test)]
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
-    DeclaredAlgorithmUniverseBuilderV1, DeclaredAlgorithmUniverseV1, StructuredCostTemplatePolicyV1,
+    DeclaredAlgorithmUniverseBuilderV1, StructuredCostTemplatePolicyV1,
 };
 
+#[cfg(test)]
 pub(super) struct PreparedInputs {
     pub inputs: Vec<Vec<CheckedInputFacts>>,
     pub opportunities: Vec<CaseOpportunity>,
@@ -14,6 +17,7 @@ pub(super) struct PreparedInputs {
     pub reserved_bytes: usize,
 }
 
+#[cfg(test)]
 fn eligible(
     index: usize,
     opportunities: &[CaseOpportunity],
@@ -31,6 +35,7 @@ fn eligible(
         })
 }
 
+#[cfg(test)]
 fn same_class(a: usize, b: usize, cases: &[Case], inputs: &[Vec<CheckedInputFacts>]) -> bool {
     let first = &inputs[a][0];
     cases[a].route == cases[b].route
@@ -69,6 +74,76 @@ pub(super) fn for_indices<'a>(
     Ok(scope)
 }
 
+/// Explicit experiment only. Product selection keeps its original single pass;
+/// this path cannot establish preservation of the raw plan's scheduled support.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_for_test(
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    capacity: SelectionCapacity,
+    maximum_retained_bytes: usize,
+    changed: Option<&[CheckedPopulationKey]>,
+    selected_priority: Option<u8>,
+    geometry_work: Option<&mut StructuredInputGeometryWorkV1>,
+    maximum_sources: Option<NonZeroUsize>,
+    combination_seed: Option<&DeclaredAlgorithmUniverseV1>,
+    trajectories: Option<&inventory::CheckedCaseInventory>,
+) -> Result<CheckedSelection> {
+    let prepared = if geometry_work.is_some() && changed.is_none() {
+        combination_seed
+            .map(|seed| {
+                prepare(
+                    cases,
+                    opportunities,
+                    inputs,
+                    trajectories,
+                    population,
+                    seed,
+                    capacity.requests,
+                    maximum_retained_bytes,
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let (opportunities, inputs, scopes, retained) = match &prepared {
+        Some(view) => (
+            view.opportunities.as_slice(),
+            view.inputs.as_slice(),
+            Some(view.scopes.as_slice()),
+            view.reserved_bytes,
+        ),
+        None => (opportunities, inputs, None, 0),
+    };
+    select_prepared_inputs(
+        cases,
+        opportunities,
+        inputs,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        population,
+        capacity,
+        maximum_retained_bytes - retained,
+        changed,
+        selected_priority,
+        geometry_work,
+        maximum_sources,
+        combination_seed,
+        trajectories,
+        scopes,
+    )
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare(
     cases: &[Case],

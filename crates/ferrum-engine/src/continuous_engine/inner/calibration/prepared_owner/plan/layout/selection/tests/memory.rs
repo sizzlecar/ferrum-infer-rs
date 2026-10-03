@@ -560,8 +560,11 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
                 )
                 .unwrap();
             assert!(projected_peak < tight, "this fixture must exercise genuinely smaller admission, not a bypass of the old bound");
-            let public_run = |maximum, work: &mut StructuredInputGeometryWorkV1| {
-                select_with_capacity(
+            // The broad projected path is now an explicit experiment. Its
+            // distinct memory gate must still reject before geometry; it is
+            // not the product entrypoint's raw-plan preservation contract.
+            let experimental_run = |maximum, work: &mut StructuredInputGeometryWorkV1| {
+                super::super::scoped_inputs::select_for_test(
                     &cases,
                     &opportunities,
                     &facts,
@@ -576,12 +579,13 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
                     Some(work),
                     None,
                     Some(&seed),
+                    None,
                 )
             };
             let mut wide_work = StructuredInputGeometryWorkV1::new(work_limit);
-            let wide = public_run(usize::MAX, &mut wide_work).unwrap();
+            let wide = experimental_run(usize::MAX, &mut wide_work).unwrap();
             let mut tight_work = StructuredInputGeometryWorkV1::new(work_limit);
-            let scoped = public_run(projected_peak, &mut tight_work).unwrap();
+            let scoped = experimental_run(projected_peak, &mut tight_work).unwrap();
             assert_eq!(
                 serde_json::to_value(&scoped).unwrap(),
                 serde_json::to_value(&wide).unwrap()
@@ -603,7 +607,7 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
             // Here the projected cap is strictly below the raw cap. One byte
             // less admits neither path: fallback must not start geometry.
             let mut denied = StructuredInputGeometryWorkV1::new(work_limit);
-            assert!(public_run(projected_peak - 1, &mut denied).is_err());
+            assert!(experimental_run(projected_peak - 1, &mut denied).is_err());
             assert_eq!(denied.visits(), 0);
             eprintln!("distinct selection admission: raw_peak={tight} projected_peak={projected_peak} raw_groups={} projected_groups={}",
                 memory.guaranteed_groups, projected.guaranteed_groups);

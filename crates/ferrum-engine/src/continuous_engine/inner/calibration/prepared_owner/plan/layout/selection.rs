@@ -658,37 +658,10 @@ pub(super) fn select_with_capacity_and_trajectories(
     }
     #[cfg(any(test, feature = "test-support"))]
     crate::geometry_capture::selection_inputs(cases, prompts, chunk, prefill_row_ceiling);
-    // Freeze the complete declaration before selecting anchors. Optional
-    // incremental scans retain their original raw keys; the final inventory
-    // selection owns one shared geometry ledger and can use the projected view.
-    let prepared = if geometry_work.is_some() && changed.is_none() {
-        combination_seed
-            .map(|seed| {
-                scoped_inputs::prepare(
-                    cases,
-                    opportunities,
-                    inputs,
-                    trajectories,
-                    population,
-                    seed,
-                    capacity.requests,
-                    maximum_retained_bytes,
-                )
-            })
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
-    let (opportunities, inputs, scopes, retained) = match &prepared {
-        Some(view) => (
-            view.opportunities.as_slice(),
-            view.inputs.as_slice(),
-            Some(view.scopes.as_slice()),
-            view.reserved_bytes,
-        ),
-        None => (opportunities, inputs, None, 0),
-    };
+    // Preserve the original single-pass plan and its checked numerical scopes.
+    // Replacing the inventory with a broad scope before budgeting can discard
+    // a schedulable narrow source. Scope-first experiments remain test-only
+    // until a joint plan can preserve coverage within these same ledgers.
     select_prepared_inputs(
         cases,
         opportunities,
@@ -698,14 +671,14 @@ pub(super) fn select_with_capacity_and_trajectories(
         prefill_row_ceiling,
         population,
         capacity,
-        maximum_retained_bytes - retained,
+        maximum_retained_bytes,
         changed,
         selected_priority,
         geometry_work,
         maximum_sources,
         combination_seed,
         trajectories,
-        scopes,
+        None,
     )
 }
 

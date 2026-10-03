@@ -17,7 +17,7 @@ fn seed(
 }
 
 #[test]
-fn scope_first_selection_preserves_positive_endpoints_linked_scope_and_all_three_budgets() {
+fn scope_first_experiment_preserves_positive_endpoints_linked_scope_and_all_three_budgets() {
     let (cases, opportunities, inputs, population) = composition::algorithm_pair_inventory([1, 2]);
     let linked = natural_termination_input_with_algorithm(
         1,
@@ -67,7 +67,7 @@ fn scope_first_selection_preserves_positive_endpoints_linked_scope_and_all_three
         charge: ProbePreflightCharge::default(),
     };
     let run = |capacity, work: &mut StructuredInputGeometryWorkV1| {
-        select_with_capacity_and_trajectories(
+        super::super::scoped_inputs::select_for_test(
             &cases,
             &opportunities,
             &inputs,
@@ -201,7 +201,7 @@ fn scope_first_selection_preserves_positive_endpoints_linked_scope_and_all_three
 }
 
 #[test]
-fn scope_first_view_preserves_original_recipes_and_independent_host_floors() {
+fn scope_first_experiment_preserves_original_recipes_and_independent_host_floors() {
     let (mut cases, mut opportunities, mut inputs, population) =
         composition::algorithm_pair_inventory([1, 1]);
     // Both policies retain their real narrow and wider endpoint. A single
@@ -374,7 +374,7 @@ fn scope_first_view_preserves_original_recipes_and_independent_host_floors() {
         }
     ));
     let mut work = StructuredInputGeometryWorkV1::new(NonZeroU64::new(32_000_000).unwrap());
-    let selection = select_with_capacity(
+    let selection = super::super::scoped_inputs::select_for_test(
         &cases,
         &opportunities,
         &inputs,
@@ -393,6 +393,7 @@ fn scope_first_view_preserves_original_recipes_and_independent_host_floors() {
         Some(&mut work),
         NonZeroUsize::new(1),
         Some(&universe),
+        None,
     )
     .unwrap();
     let selected: Vec<_> = selection
@@ -460,7 +461,7 @@ fn scope_first_view_preserves_original_recipes_and_independent_host_floors() {
 }
 
 #[test]
-fn scope_first_c8_keeps_complete_geometry_and_rejects_unaffordable_cold_horizon() {
+fn scope_first_experiment_c8_keeps_complete_geometry_and_rejects_unaffordable_cold_horizon() {
     let (cases, opportunities, inputs, population) = composition::algorithm_pair_inventory([1, 4]);
     assert_eq!(
         cases.iter().map(|case| case.width).collect::<Vec<_>>(),
@@ -468,7 +469,9 @@ fn scope_first_c8_keeps_complete_geometry_and_rejects_unaffordable_cold_horizon(
     );
     let universe = seed(&inputs, &population);
     let mut work = StructuredInputGeometryWorkV1::new(NonZeroU64::new(32_000_000).unwrap());
-    let selection = select_with_capacity(
+    // Keep this rejected broad plan as an explicit experiment. Product
+    // selection must not replace its schedulable narrow sources with it.
+    let selection = super::super::scoped_inputs::select_for_test(
         &cases,
         &opportunities,
         &inputs,
@@ -487,6 +490,7 @@ fn scope_first_c8_keeps_complete_geometry_and_rejects_unaffordable_cold_horizon(
         Some(&mut work),
         NonZeroUsize::new(1),
         Some(&universe),
+        None,
     )
     .unwrap();
     assert_eq!(selection.populations.len(), 1);
@@ -513,4 +517,140 @@ fn scope_first_c8_keeps_complete_geometry_and_rejects_unaffordable_cold_horizon(
         batch.planned_cycles,
         work.visits()
     );
+}
+
+#[test]
+fn scope_first_preserves_schedulable_narrow_inputs_when_complete_c8_horizon_does_not_fit() {
+    let (cases, opportunities, inputs, population) = composition::algorithm_pair_inventory([1, 4]);
+    let universe = seed(&inputs, &population);
+    let capacity = SelectionCapacity {
+        requests: 2048,
+        execution_actions: 16384,
+        declared_offer_rows: 16384,
+    };
+    // Independent reference invocation of the original raw selector, with the
+    // same inventory, source limit, geometry allowance and complete F/R/Q.
+    // This is not a second production pass or a refunded geometry ledger.
+    let mut original_work =
+        StructuredInputGeometryWorkV1::new(NonZeroU64::new(32_000_000).unwrap());
+    let original = select_prepared_inputs(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        capacity,
+        usize::MAX,
+        None,
+        None,
+        Some(&mut original_work),
+        NonZeroUsize::new(1),
+        Some(&universe),
+        None,
+        None,
+    )
+    .unwrap();
+    let original_batch = original
+        .batches
+        .iter()
+        .find(|batch| batch.scheduled)
+        .expect("the original narrow family must have a complete schedulable source");
+    assert_eq!(
+        original_batch
+            .representative_case_indices
+            .iter()
+            .map(|&index| cases[index].width)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert!(original_batch.algorithm_universe.is_none());
+    assert!(original_batch.schedule_within_capacity);
+    assert!(
+        original_batch.maximum_anchor_span
+            <= *original_batch
+                .schedule
+                .phase_min_offered
+                .iter()
+                .min()
+                .unwrap()
+    );
+    for &index in &original_batch.population_indices {
+        assert!(
+            original.populations[index]
+                .input_geometry
+                .as_ref()
+                .unwrap()
+                .complete
+        );
+    }
+    for phase in 0..3 {
+        assert!(original_batch.input_opportunities.phase_cycles[phase] > 0);
+        assert!(
+            original_batch
+                .input_opportunities
+                .phase_original_offer_bounds[phase]
+                >= original_batch.input_opportunities.maximum_fresh_member_span[phase]
+        );
+    }
+    let mut actual = SelectionCapacity::default();
+    for &index in &original.execution_case_indices {
+        let work = work::case_work(&cases[index], 61, 8, None).unwrap();
+        actual.requests += work.requests;
+        actual.execution_actions += work.execution_actions;
+        actual.declared_offer_rows += work.serial_declared_offer_rows;
+    }
+    assert_eq!(actual.requests, original.requests);
+    assert_eq!(actual.execution_actions, original.serial_wave_upper_bound);
+    assert_eq!(
+        actual.declared_offer_rows,
+        original.declared_offer_row_bound
+    );
+    assert!(actual.requests <= capacity.requests);
+    assert!(actual.execution_actions <= capacity.execution_actions);
+    assert!(actual.declared_offer_rows <= capacity.declared_offer_rows);
+
+    let mut candidate_work =
+        StructuredInputGeometryWorkV1::new(NonZeroU64::new(32_000_000).unwrap());
+    let candidate = select_with_capacity(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        capacity,
+        usize::MAX,
+        None,
+        None,
+        Some(&mut candidate_work),
+        NonZeroUsize::new(1),
+        Some(&universe),
+    )
+    .unwrap();
+    eprintln!("original narrow reservation: requests={} actions={} rows={} cycles={}; candidate reservations={:?}",
+        original.requests, original.serial_wave_upper_bound, original.declared_offer_row_bound,
+        original_batch.planned_cycles,
+        candidate.batches.iter().map(|batch| (batch.scheduled, batch.requests, batch.serial_wave_upper_bound, batch.declared_offer_row_bound)).collect::<Vec<_>>());
+    // These are the two real positive endpoints of algorithm A. A wider
+    // declaration may retain them in a different numerical scope, but merely
+    // listing them in an unscheduled all-width candidate loses prior support.
+    assert!(candidate.batches.iter().filter(|batch| batch.scheduled).any(|batch| {
+        original_batch.representative_case_indices.iter().all(|index| batch.representative_case_indices.contains(index))
+            && batch.schedule.min_members == original_batch.schedule.min_members
+            && batch.population_indices.iter().all(|&index| candidate.populations[index].input_geometry.as_ref().is_some_and(|geometry| geometry.complete))
+    }), "scope-first selection must retain the original schedulable numerical endpoints and complete independent F/R/Q within the unchanged budgets");
+    assert_eq!(
+        serde_json::to_value(&candidate).unwrap(),
+        serde_json::to_value(&original).unwrap(),
+        "product selection retains the original scopes, complete phase horizons, capacity gaps and executed case occurrences"
+    );
+    assert_eq!(
+        candidate_work.visits(),
+        original_work.visits(),
+        "restoring the raw plan performs exactly one geometry pass; no broad trial is refunded or hidden"
+    );
+    assert_eq!(candidate_work.exhausted(), original_work.exhausted());
 }
