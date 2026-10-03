@@ -8,20 +8,22 @@
 
 下一份可运行检查点以同一条产品链路验收：正常 `run` / `serve` 从空成本状态自动完成准备和原独立资格阶段，发布有效成本模型，内容不同但处于支持范围内的普通请求在执行前得到预测，Enforce 实际采用，真实提交与回执配对，输出完整且资源可退役。用户无需手工训练、导入成本文件或设置隐藏环境组合。CPU 正例先约束组合行为，再以同一源码验证真实后端；该检查点通过后才进入完整性能验收，不把它标成最终发布完成。
 
-## 当前收敛计划：先关闭联动缺口，再冻结实机检查点
+## 当前收敛计划：同源开关配对已完成，两端均未通过推广门
 
 此前虽有分阶段计划，实际仍过多依赖完整实机运行寻找组合故障。局部选源、维护、发布与调度测试分别通过，没有证明它们在同一真实计划和原预算下共同成立。G15 首版通过 123 项 layout 测试却破坏原普通查询，就是这类验收缺口；后续以原端到端失败和撤回对照定位，不能把补回两个测试当作整条产品链路已经完整。
 
-当前生产检查点为 `f1c6ccac`：在 `5ace3e72` 的联动修复基础上，G19 减少冷几何的重复正交化计算。真实 CUDA 输入的全部几何结果已在本地保持原 32M 和 scratch 上限通过对照；完整回归及同源码正常后端入口仍须验证。验收义务来自原目标、声明的模型能力和目标负载，沿用现有 typed 输入、选择账与回执，不新增另一套运行框架。只统计能支持具体行为的证据，不以源码规模、来源数、测试数量或非零 witness 判定完成。
+当前生产检查点为 `f1c6ccac`：在 `5ace3e72` 的联动修复基础上，G19 减少冷几何的重复正交化计算。原 32M 和 scratch 上限下的真实输入对照、规定本地检查及两后端正常产品构建均已通过。同源码两端正常 serve 的 Off/Enforce 各两次独立运行已全部结束：CUDA 吞吐和双轮延迟退化门失败；Metal 吞吐比例门通过，但双轮 TTFT P50 退化门失败。两端 Enforce 均未满足绝对 SLO，Metal 启动也仍未在原时间预算内收齐。CUDA 随后的独立 Required 诊断已完成，确认部分新 GL 模型实际采用并定位一段规划开销，尚未形成性能修复。验收义务来自原目标、声明的模型能力和目标负载，沿用现有 typed 输入、选择账与回执，不新增另一套运行框架。
 
 | 关口 | 当前已知状态 | 本关完成条件 |
 | --- | --- | --- |
-| 必要策略与几何覆盖 | G19 对 G18 实际输入的 162 项几何全部完成，使用 26,627,160 / 32,000,000 visits，秩、枢轴和最终 case 与完整原核一致；新后端选源、独立资格和普通采用仍缺 | 将必要普通请求的可执行路径对应到原 family、选源、独立 F/R/Q 和最终 catalog；列出未覆盖项及原因，明确 C8 的可行路径和支持边界。C8 不等于要求所有 rows8 或所有声明成为 Known，选择成功也不等于数值资格成功 |
-| 准备、容量与工作预算 | G16 已有原冻结预算内维护、受影响来源完整收样及普通采用的 CPU 联动证明；真实 Metal 仍只有修复前 78/815 cohorts 的失败记录 | 从真实冻结计划核对 seed、维护、restore、F/R/Q 的请求、动作、offer rows、owner 和存活内存；证明原 reservation 可完成相关维护并继续完整收样。120s 的实际耗时仍由后端测量判定 |
-| 数值支持到普通采用 | 原 basic/forward E2E 已恢复；新增 GreedyLength 联动严格绑定最终采用的 IndependentReplay，维护联动严格绑定受影响来源和普通实际 Matched 收据，两项 CPU 用例已通过 | 新保留的策略必须由原 catalog 查询成功并产生普通执行 witness；私有维护必须与真实计划、完整 F/R/Q、发布和后续采用连成一条测试路径。保留原断言、数值解释和所有预算 |
-| 默认规划时间 | 普通逻辑 E2E 使用宽松测试时限；当前优化构建的两个原 2ms 探针另已通过 | 实机再核普通事务的预算、合法选择、实际提交与配对，解释预算耗尽；两个受控 CPU 场景不证明真实模型或并发负载可行 |
-| 正常入口和资源生命周期 | 旧硬件记录跨不同源码，部分 run 输出被 token 上限截断 | 同一冻结源码在两后端的 run/serve 完成必要自动准备、普通采用、完整输出及清理；取消、过期、漂移、能力降级等原义务各自有适用证据 |
-| SLO 与收益 | CUDA TPOT、Metal 三项 P99 仍失败，无当前同构建 Off 配对 | 固定原选样和配置，先验证同构建 Off/Enforce 的绝对 SLO、自身吞吐和延迟退化门，再完成原 224 单元及原功能场景；全过程保留错误和未完成请求 |
+| 必要策略与几何覆盖 | 原 162 项离线对照保持秩、枢轴和最终 case 等价；G19 CUDA 实机使用 26,546,520 / 32M visits，GreedyLength 的 GreedyToken、FullLogits 已各有独立 F/R/Q 子模型。Metal 四个选中来源均为 Configured，GL 未合入的具体原因仍未知 | 将必要普通请求的可执行路径对应到原 family、选源、独立 F/R/Q 和最终 catalog；列出未覆盖项及原因，明确 C8 的可行路径和支持边界。C8 不等于要求所有 rows8 或所有声明成为 Known，选择成功也不等于数值资格成功 |
+| 准备、容量与工作预算 | 原预算维护联动 CPU 用例已通过；G19 CUDA 两轮均完成 4/4 来源、1273 cohorts，cost series 分别 109.708/110.711s。Metal 两轮均在 2/4、418/815 cohorts 后 duration-expired，series 为 123.180/124.750s，尚有请求和波额度 | 从真实冻结计划核对 seed、维护、restore、F/R/Q 的请求、动作、offer rows、owner 和存活内存；证明原 reservation 可完成相关维护并继续完整收样。120s 的实际耗时仍由后端测量判定 |
+| 数值支持到普通采用 | CPU 联动已通过。CUDA 正常两轮实际 witness 提交/结算为 304/304、87/87，聚合记录不提供逐模型身份；独立 Required 运行将 96 次实际提交/结算的集合绑定到新 GreedyToken GL child。FullLogits GL 实际采用及剩余多行 WrongDomain 仍未闭合 | 新保留的策略必须由原 catalog 查询成功并产生普通执行 witness；私有维护必须与真实计划、完整 F/R/Q、发布和后续采用连成一条测试路径。保留原断言、数值解释和所有预算 |
+| 默认规划时间 | 原优化构建 2ms 探针已通过；CUDA 正常两轮 planner phase/hard 耗尽分别 2444/467、1906/320，实际 witness 均无 tail。独立 Required 示例显示 provider-route 构造占较大部分，但没有测得默认关闭 observer 时的细分开销或可实现节省 | 实机再核普通事务的预算、合法选择、实际提交与配对，解释预算耗尽；两个受控 CPU 场景不证明真实模型或并发负载可行。Unknown、可选阶段耗尽和 hard 耗尽分别报告 |
+| 正常入口和资源生命周期 | G19 八次普通 serve 的 guard/server/client 均退出 0，输出和清理已核；CUDA Required 为另一次诊断。同源码完整 run 输出仍未证 | 同一冻结源码在两后端的 run/serve 完成必要自动准备、普通采用、完整输出及清理；取消、过期、漂移、能力降级等原义务各自有适用证据 |
+| SLO 与收益 | 八次普通运行对照已锁定。CUDA 两轮吞吐均低于 Off 的 95%，三项 P50 均双轮退化超过 10%；Metal 吞吐比例过门，但 TTFT P50 双轮退化超过 10%。两端均不满足绝对 SLO，不能推广默认开启 | 保留同构建 Off/Enforce 的绝对 SLO、自身吞吐和延迟退化门；机制修复须重新冻结并验证其影响，再完成原 224 单元及原功能场景；全过程保留错误和未完成请求 |
+
+用户要求的同源开关对照已完成，八次普通运行结果不再以诊断重跑替换。CUDA Required 在该后端两对普通运行完成后独立执行，其观察开销不计入性能表，也不反推普通运行的逐事务身份。当前仍无完整可交付版本：同源码正常 `run` 的完整输出未证明，历史 512/1536-token 计数请求截断及独立“42”自然结束正例都不能替代完整输出义务，正式验收仍为 **0/224**。[最终配对报告](/private/tmp/ferrum-slo-recovery-20261002/g19-slo-paired-results.json)、[独立 Required 结论](/private/tmp/ferrum-slo-recovery-20261002/g19-cuda-required-query-findings.json)
 
 推进顺序如下，下面各关的详细合同继续有效：
 
@@ -53,7 +55,49 @@ G19 改为在单次冷几何调用内复用原正交化的**第一遍前缀残�
 
 `f1c6ccac` 的定向测试 **13 pass / 0 fail / 1 ignored**，覆盖 anchor 转换、相同残差的原顺序、依赖与病态边界、精确预算、差一单位失败及持续耗尽。另以原真实捕获执行显式 Rust 对照 **1 pass / 0 fail、6.86s**：先复现原共享账，再用未改原 core 取得完整参考，最后让生产公开 API 按原顺序共用原 32M。新实现 **162/162 完成、26,627,160 visits、exhausted=false**，与工作量预测完全一致；每项 rank、anchor rank、pivot 和最终 case 均匹配原完整参考，原 scratch 限制不变。减少的 11,566,568 visits 是计算工作，不是实测吞吐或延迟收益。真实后端 Source8、普通采用、完整输出和 SLO 尚未因本项对照而通过，正式验收仍 **0/224**。[独立重放审计](/private/tmp/ferrum-slo-recovery-20261002/g19-first-pass-replay-audit.json)、[当前检查状态](/private/tmp/ferrum-slo-recovery-20261002/g19-first-pass-status.json)
 
-G19 的 fmt、workspace check（56.37s）、完整 workspace test、Clippy `-A warnings`（54.66s）和 Metal 全目标编译（38.56s）均退出 0。全仓按顶层 harness 去重为 **7897 pass / 0 fail / 110 ignored**，另有 16 项 Criterion smoke，不作性能成绩。新增四项优化测试、G17 联动、原 basic/forward/multispan E2E 均通过；显式实机输入重放在全仓仍计 ignored，其单独运行结果不重复累加。上述生产提交已 push。同源码正常产品的 CUDA/Metal 构建材料已准备，CUDA pinned 编译和两后端实际入口验证尚待完成。[全仓审计](/private/tmp/ferrum-slo-recovery-20261002/g19-workspace-audit.json)
+G19 的 fmt、workspace check（56.37s）、完整 workspace test、Clippy `-A warnings`（54.66s）和 Metal 全目标编译（38.56s）均退出 0。全仓按顶层 harness 去重为 **7897 pass / 0 fail / 110 ignored**，另有 16 项 Criterion smoke，不作性能成绩。新增四项优化测试、G17 联动、原 basic/forward/multispan E2E 均通过；显式实机输入重放在全仓仍计 ignored，其单独运行结果不重复累加。上述生产提交已 push；同源码正常产品的 pinned CUDA CLI 检查、CUDA/Metal release 构建及产物身份核对均已完成。[全仓审计](/private/tmp/ferrum-slo-recovery-20261002/g19-workspace-audit.json)、[后端构建身份审计](/private/tmp/ferrum-slo-recovery-20261002/g19-backend-build-identity-audit.json)
+
+G19 CUDA 正常 serve Enforce r1 在原预算内完成 4/4 来源、**1273 cohorts、109.708s**，其中 input preparation 为 38.345s；计划 1319 requests 包含 46 次 setup，不能写成 1319 cohorts。Source8 为 GreedyToken 和 FullLogits 各安装两个 PlainTextGreedyV1 categorical child，其独立 F/R/Q 分别为 **42/28/28** 和 **36/18/18**，保留 Configured 的独立模型。普通窗口 64 个请求成功，candidate Known 为 946；witness decision 309、实际提交及 host 结算各 304，issued 为 305（Matched 304、Abandoned 1），欠估 0。五个未提交 decision 与一个 Abandoned 不能直接等同。窗口中还安装了 Source7 的 rows8 GL child，现有聚合指标不能唯一确定新 Source8 GL child 被哪条普通事务采用。保持原 2ms 后，planner phase/hard budget 耗尽分别为 2444/467，实际 witness 全为单波、无非空 tail；不能据此宣称前瞻调度已生效。[普通窗口与终态原记录](/private/tmp/ferrum-slo-recovery-20261002/g19-cuda-serve-poll-4.txt)、[完整 stderr](/private/tmp/ferrum-slo-recovery-20261002/g19-cuda-serve-evidence-r1/serve-guard/product-serve-c8-once/rust-fixture.stderr)
+
+G19 Metal 正常 serve Enforce r1 的几何账为 **20,291,212 / 32M、未耗尽**，四个选中来源仍全为 Configured；已完成来源的独立资格不能代替 GL 覆盖。启动在 source2 以原 duration-expired 结束：**2/4 来源、418/815 cohorts**，input preparation 8.385s，series 结束耗时 123.180s。实际请求/波剩余 1415/14987，声明请求/波剩余 1018/13647，时间门未因余额而通过。最终缓存仅保留 Source7，现成材料未保留可确认的完整 Source8 selection，GL 未合并的具体原因仍未知。r2 同样停于 418/815，series 为 124.750s；参考探测另耗 62.620s，总 startup 为 187.541s，不能混写成 cost-probe 的 120s 内完成。[Metal r1 完整 stderr](/private/tmp/ferrum-slo-recovery-20261002/g19-metal-serve-evidence-r1/serve-guard/product-serve-c8-once/rust-fixture.stderr)、[r1 最终缓存 manifest](/private/tmp/ferrum-slo-recovery-20261002/g19-metal-serve-cache-manifest.json)、[r2 终态审计](/private/tmp/ferrum-slo-recovery-20261002/g19-metal-enforce-r2-identity-audit.json)
+
+### G19 八次普通 serve：同源 Off/Enforce 最终对照
+
+两端均为同一 `f1c6ccac`、Qwen3.5-9B Q4_K_M、KV fp16、原 pinned ShareGPT、C8；CUDA RTX 5090 与 Metal Apple M4 各自保持原资源、服务端和客户端配置。每个模式运行两次独立进程，每次 32 warmup + 32 measured、seed42，不跨重复合并样本。每次均 **64 成功、0 错误**，32 条 measured 输出逐项满足原请求长度、共 9210 usage tokens；完整选样在同后端四次严格一致，跨后端仅数据文件本机路径不同。各次均有 9179 个非空可见 SSE 文本事件、9147 个间隔；两条 event/usage 不一致请求仍纳入可见停顿，无传输合并。下表 TPOT 终点为最后可见输出，ITL 为可见 SSE 文本间隔，均取原 `client-slo.jsonl`，不使用 screen 的终态 TPOT 或零值 strict-token ITL。
+
+| 后端 / 重复 / 模式 | TTFT P50/P99 ms | last-visible TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | successful output tokens/s | native 峰值 B |
+| --- | --- | --- | --- | --- | --- |
+| CUDA / 1 / Off | 49.462 / 116.817 | 16.226 / 19.107 | 15.441 / 37.675 | 392.521 | 21,475,006,374 |
+| CUDA / 1 / Enforce | 67.809 / 118.411 | 18.938 / 20.990 | 17.683 / 39.452 | 339.851 | 23,454,669,740 |
+| CUDA / 2 / Off | 49.579 / 114.329 | 16.453 / 18.494 | 15.545 / 37.846 | 389.793 | 21,475,006,374 |
+| CUDA / 2 / Enforce | 68.723 / 128.521 | 18.536 / 21.922 | 17.456 / 40.642 | 352.051 | 23,454,669,740 |
+| Metal / 1 / Off | 588.743 / 4781.451 | 191.531 / 244.430 | 174.073 / 935.262 | 37.378 | 8,603,238,400 |
+| Metal / 1 / Enforce | 983.029 / 4989.528 | 192.606 / 215.994 | 174.965 / 871.222 | 36.961 | 8,598,831,104 |
+| Metal / 2 / Off | 595.400 / 4808.719 | 193.526 / 246.812 | 175.795 / 940.442 | 37.041 | 8,594,063,360 |
+| Metal / 2 / Enforce | 973.761 / 5048.535 | 195.728 / 223.494 | 178.746 / 885.749 | 36.383 | 8,598,831,104 |
+
+CUDA Enforce 相对同轮 Off 的吞吐分别下降 **13.418% / 9.682%**，均未过原 ≥95% 门。TTFT P50、TPOT P50、ITL P50 分别退化 **37.093%/38.612%、16.710%/12.658%、14.524%/12.295%**，均触发“同一分位两轮 >10%”规则；TTFT、TPOT P99 仅第二轮超过 10%，不能写成双轮失败。Metal 吞吐下降 **1.115% / 1.776%**，比例门通过；但 TTFT P50 退化 **66.971% / 63.547%**，触发双轮延迟门。Metal TPOT P99 改善 11.634%/9.448%、ITL P99 改善 6.847%/5.816%，是局部权衡，不构成整体成功。绝对门方面，CUDA 四次均超 TPOT 15ms P99，TTFT/ITL 的 200/50ms 通过；Metal 四次均超 3400/212/359ms P99。CUDA Off 两轮 joint 为 6/32、5/32，Enforce 均 0/32；Metal Off 均 0/32，Enforce 均 3/32，均低于 99%。**这两个固定 cell 均不能推广默认开启。**[CUDA 两对完整结果](/private/tmp/ferrum-slo-recovery-20261002/g19-cuda-slo-paired-final-results.json)、[Metal 两对完整结果](/private/tmp/ferrum-slo-recovery-20261002/g19-metal-slo-paired-final-results.json)
+
+内存覆盖冷加载至 shutdown，不是普通窗口的净增量。上表 CUDA native 为 runtime requested allocations，Metal 为 `MTLDevice.currentAllocatedSize`；独立 OS/NVML 峰值如下，口径不相加，采样可能漏过瞬时峰值，WSL 的 per-process NVML 不可用。
+
+| 后端 / 重复 | OS RSS 峰值 Off → Enforce B | 其他独立峰值 Off → Enforce |
+| --- | --- | --- |
+| CUDA / 1 | 6,304,129,024 → 6,853,140,480 | NVML 整卡 21,972 → 23,904 MiB |
+| CUDA / 2 | 6,303,727,616 → 6,842,925,056 | NVML 整卡 21,968 → 23,927 MiB |
+| Metal / 1 | 380,502,016 → 578,994,176 | host physical footprint 1,812,187,704 → 2,784,709,176 B |
+| Metal / 2 | 385,220,608 → 561,545,216 | host physical footprint 1,805,077,024 → 2,773,142,192 B |
+
+Off 沿原 r5 合同显式配置 `mode=off`，不运行 automatic cost startup；客户端 SLO 评估、模型能力、输出及资源不变。Enforce 保留原 guard 的窄 automatic audit 日志，Off 沿原 Off guard 的日志路径，两者均关闭 Required、profile JSONL 和 projection timing。该有意差异已披露，不能把总性能差额直接归于某个函数。原 5%/10% 是工程门槛，不是统计显著性；两次重复也不替代正式矩阵。[八次最终审计与全部输入 pins](/private/tmp/ferrum-slo-recovery-20261002/g19-slo-paired-results.json)
+
+### G19 CUDA Required：采用已绑定，规划热点仍需机制验证
+
+同产品的独立 Required 诊断已结束，原 2ms 未改。health-before 仅 identity、事务数为 0；health-after 为 3167，故 **175242 个事件、3167 个完整事务**属于 32 warmup + 32 measured 普通窗口。原 Rust audit 为 0 issues、八类 loss 均 0；footer 不能独自证明 flush/sync，`successful_close_attested=false` 保留，终态 guard/server/client 回执另均为 0。观察器的 query/frontier 保留、队列和后台写入有成本，以下墙钟不替代上方普通开关对照。
+
+原 selected replay、IndependentReplay attempt、query 身份和 lookup 与 epoch4 的唯一适用 GL child 对上：99 条 selected replay Known 均为 rows1、GreedyToken、PlainTextGreedyV1、depth0，来源保留独立 F/R/Q **42/28/28**；其中 98 条成为最终 witness decision，**96 次真实 backend submit 和 host reconcile 的集合**归属该新 GL child。不能只凭 transaction-end 的 submitted 标签当后端证明，也未确定两条未提交 decision 的事务 ID；额外一条 selected replay 没有成为最终 witness。FullLogits GL 已有资格，但本次没有 selected ordinary replay 使用它，Full 实际采用仍未证。此归属不回填成正常八次运行的逐事务身份。
+
+98 个成功 decision 均只枚举、生成并扩展一个候选，深度为 1，随后真实 replay 测量触发原 replay-reserve soft stop；这批记录没有隐藏的失败未来 projection，但其他失败事务确实包含 projection/Unknown。同事务 1274 的原相邻 checkpoint 显示：Search projection **599.195µs**，其中 provider-route 区间 315.331µs；IndependentReplay projection **522.771µs**，其中 provider-route 266.665µs；publication **317.812µs**，总 planning 1.676471ms。replay work 634.315µs，加原 publication reserve 400µs 后为 1.034315ms 的 replay reserve。这里支持优先检查预测前的 provider/resource/逻辑命令构造；不支持把 inclusive 阶段相加、相减边际分位、宣称最小必需成本或可实现加速，provider 内部也未分项计时。
+
+剩余 313 次 lookup WrongDomain 均在 epoch4、rows3–8；已构造输入没有 input/demand 错误，host categorical、physical domain 和 route 已与新 GL 相同，但实际 algorithm roster 签名不同。原 G13“没有相同 host policy”已不足以解释它们。数值 family 支持跨宽度，不能仅凭已装 owner 为 rows1 就判 rows8 缺域；记录缺少实际算法条目及 catalog-select/child-prediction 的错误阶段，尚不能唯一指出缺失算法或把全部拒绝归为同一 U-membership。另 242 个 epoch5 事务无 lookup，不能据此推断新覆盖失败。planner phase/hard 耗尽为 1961/337，可能重叠；它们与 Unknown 不同分母，tail0 也不能全部归预算。下一候选是消除 Native/Q8 在同一次 query 中为 dispatch count 和 selected evidence 重复构建同输入 MatrixPlan 的工作，并评估不可变 recipe 预编译；独立 replay 仍重新 query，原身份、数值资格、动态状态失效和最终提交检查不变。算法缺口则拟在现 Required 后台借用导出 algorithm axes，与同 epoch 的 U 作 Rust 比较，不根据 hash 猜测。两项均尚未实现或测量，不能预报能通过 2ms 或修复 Off/Enforce 退化。[原记录、热点与采用边界审计](/private/tmp/ferrum-slo-recovery-20261002/g19-cuda-required-query-findings.json)
 
 新增 GreedyLength 联动测试 r3 为 **1 pass / 0 fail、11.59s**。真实 fresh Prefill 通过原 time-admission，最终采用的 replay 为 transaction1/replay1，其后续 attempt19/alternative1 对新 FullLogits/PlainTextGreedyV1 child 返回 Known；普通后续实际 Decode 仍提交 GreedyToken。独立 F/R/Q、原 numerical scope、输出与清理断言保留，协议测试沿用原宽松规划时限，不是实机或默认 2ms 性能证据。r1 的四次普通采用成功，但目标 child 只出现在 Search，最终绑定断言失败，不能计通过；r2 因新增维护测试访问 calibration 私有方法而编译失败，没有执行测试。两次失败原日志保留。[r1](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r1.log)、[r2](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r2.log)、[r3](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r3.log)
 
