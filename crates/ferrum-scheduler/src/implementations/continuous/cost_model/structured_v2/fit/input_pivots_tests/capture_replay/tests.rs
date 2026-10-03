@@ -4,9 +4,15 @@ use super::*;
 use serde_json::{json, Value};
 
 fn fixture(limit: u64) -> Vec<Value> {
+    fixture_using(limit, StructuredSettingsV2::default())
+}
+
+fn fixture_using(limit: u64, settings: StructuredSettingsV2) -> Vec<Value> {
     let mut config = ferrum_types::EngineConfig::default();
     config.scheduler.slo = serde_json::from_value(json!({"mode":"enforce"})).unwrap();
-    let ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { settings } = &mut config
+    let ferrum_types::SloLiveStructuredCalibration::AutomaticV1 {
+        settings: automatic,
+    } = &mut config
         .scheduler
         .slo
         .cost_observation
@@ -15,7 +21,7 @@ fn fixture(limit: u64) -> Vec<Value> {
         unreachable!()
     };
     use ferrum_types::SloAutomaticCalibrationInputReadinessV1 as R;
-    match &mut settings.input_readiness {
+    match &mut automatic.input_readiness {
         R::WorkAxesAndBranchesV1 {
             maximum_geometry_visits,
             ..
@@ -48,7 +54,6 @@ fn fixture(limit: u64) -> Vec<Value> {
         json!({"kind":"actual_startup_inputs", "config":config, "templates":[{"output":"fixture","request_bytes":[]}]}),
         json!({"kind":"original_cases", "cases":cases, "prompts":[61], "chunk":8,"prefill_row_ceiling":2}),
     ];
-    let settings = StructuredSettingsV2::default();
     let scratch = input_geometry_pivot_scratch_bytes_v1(3, 4, settings.max_rank).unwrap();
     let mut work = StructuredInputGeometryWorkV1::new(NonZeroU64::new(limit).unwrap());
     for ordinal in 0..3 {
@@ -217,5 +222,107 @@ fn capture_replay_tagged_retirement_preserves_u64_nanoseconds_and_rejects_overfl
     let overflow = (u128::from(u64::MAX) + 1).to_string();
     for invalid in [overflow.as_str(), "-1", "1.5", "\"120\"", "null"] {
         assert!(serde_json::from_str::<Record>(&wire(invalid)).is_err());
+    }
+}
+
+#[test]
+fn capture_reference_measures_complete_demand_without_changing_shared_baseline() {
+    let complete = fixture(32_000_000);
+    let first_charge = complete[5]["visits_after"].as_u64().unwrap();
+    let (bytes, report) = artifact(&fixture(first_charge + 1));
+    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let before = (verified.limit, verified.visits, verified.exhausted);
+    let measurement = reference::measure(&verified).unwrap();
+    let wire = serde_json::to_value(&measurement).unwrap();
+    assert_eq!(wire["successful_calls"], 3);
+    assert_eq!(wire["failed_calls"], 0);
+    assert_eq!(
+        wire["full_required_visits"].as_u64(),
+        first_charge.checked_mul(3)
+    );
+    assert_eq!(
+        wire["full_requirement_minus_original_charge"].as_u64(),
+        first_charge.checked_mul(2)
+    );
+    assert_eq!(
+        wire["originally_incomplete_calls_full_reference_visits"].as_u64(),
+        first_charge.checked_mul(2)
+    );
+    assert_eq!(wire["extra_original_core_passes"], 3);
+    assert!(wire["extra_original_core_visits"].as_u64().unwrap() > 0);
+    assert_eq!(
+        before,
+        (verified.limit, verified.visits, verified.exhausted)
+    );
+    for call in wire["calls"].as_array().unwrap() {
+        assert_eq!(call["rank"], 3);
+        assert_eq!(call["anchor_rank"], 1);
+        assert_eq!(call["pivot_indices"].as_array().unwrap().len(), 3);
+        assert_eq!(call["final_selected_cases"], json!([0, 1, 2]));
+    }
+}
+
+#[test]
+fn capture_reference_groups_only_original_core_bit_equal_normalized_calls() {
+    let mut records = fixture(32_000_000);
+    // Power-of-two rescaling changes the full raw input, not its original
+    // normalized rows. Baseline replay must independently verify all outcomes.
+    for row in records[7]["axis_bits"].as_array_mut().unwrap() {
+        for bits in row.as_array_mut().unwrap() {
+            let value = f64::from_bits(bits.as_u64().unwrap());
+            *bits = json!((value * 2.).to_bits());
+        }
+    }
+    let (bytes, report) = artifact(&records);
+    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    assert!(statistics(&verified)
+        .unwrap()
+        .strict_duplicate_groups
+        .is_empty());
+    let measurement = reference::measure(&verified).unwrap();
+    let wire = serde_json::to_value(&measurement).unwrap();
+    let groups = wire["normalized_bit_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["ordinals"], json!([0, 1]));
+    assert_eq!(groups[0]["raw_different_from_first"], json!([1]));
+    // The separate signed-zero call must not join a bit-exact group.
+    assert_eq!(
+        wire["calls"][0]["normalized_call_sha256"],
+        wire["calls"][1]["normalized_call_sha256"]
+    );
+    assert_ne!(
+        wire["calls"][0]["normalized_call_sha256"],
+        wire["calls"][2]["normalized_call_sha256"]
+    );
+    assert_ne!(
+        wire["calls"][0]["normalization_scale_bits"],
+        wire["calls"][1]["normalization_scale_bits"]
+    );
+    for (ordinal, call) in wire["calls"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(call["population_index"], ordinal);
+        assert_eq!(call["original_case_indices"], json!([0, 1, 2]));
+    }
+}
+
+#[test]
+fn capture_reference_does_not_call_partial_rank_rejection_complete_demand() {
+    let settings = StructuredSettingsV2 {
+        max_rank: 1,
+        ..Default::default()
+    };
+    let (bytes, report) = artifact(&fixture_using(32_000_000, settings));
+    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let measurement = reference::measure(&verified).unwrap();
+    let wire = serde_json::to_value(&measurement).unwrap();
+    assert_eq!(wire["successful_calls"], 0);
+    assert_eq!(wire["failed_calls"], 3);
+    assert!(wire["full_required_visits"].is_null());
+    assert!(wire["full_requirement_minus_original_charge"].is_null());
+    assert_eq!(wire["extra_original_core_passes"], 0);
+    assert!(wire["normalized_bit_groups"].as_array().unwrap().is_empty());
+    for call in wire["calls"].as_array().unwrap() {
+        assert_eq!(call["error"], "Capacity");
+        assert_eq!(call["reference_exhausted"], false);
+        assert!(call["rank"].is_null());
     }
 }

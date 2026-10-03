@@ -675,6 +675,9 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
     // Do not create an apparently successful audit before every original call
     // has passed. Statistics never execute an alternative kernel or ledger.
     let stats = statistics(&verified)?;
+    // Independent diagnostic references follow the unchanged shared-ledger
+    // proof. They never mutate or replace its allowance or outcomes.
+    let reference = reference::measure(&verified)?;
     let output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -688,6 +691,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
         capture_original_path: &'a std::path::Path,
         capture_elapsed_ns_diagnostic_only: u128,
         audit: Statistics<'a>,
+        independent_reference: reference::Measurement<'a>,
     }
     serde_json::to_writer_pretty(
         output,
@@ -699,10 +703,14 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
             capture_original_path: &report.path,
             capture_elapsed_ns_diagnostic_only: report.elapsed_ns,
             audit: stats,
+            independent_reference: reference,
         },
     )?;
     Ok(())
 }
+
+#[path = "capture_replay/reference.rs"]
+mod reference;
 
 #[path = "capture_replay/tests.rs"]
 mod tests;
