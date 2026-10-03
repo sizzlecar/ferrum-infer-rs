@@ -101,6 +101,70 @@ pub(super) fn related_scope(
     }
 }
 
+/// Complete Decode families may share a journal while retaining distinct
+/// host identities and phase members. This does not make them one model.
+pub(super) fn independent_families(
+    a: &BatchCandidate,
+    b: &BatchCandidate,
+    populations: &[SelectedPopulation],
+    cases: &[Case],
+    inputs: &[Vec<CheckedInputFacts>],
+    selected_priority: Option<u8>,
+) -> bool {
+    // In a priority-limited selection every previous merge passed this same
+    // test, so the anchor's priority represents all its constituents. With
+    // no priority filter the original anchor order is retained, never reranked.
+    if selected_priority
+        .is_some_and(|selected| a.input_priority != selected || b.input_priority != selected)
+        || a.batch
+            .population_indices
+            .iter()
+            .chain(&b.batch.population_indices)
+            .any(|&index| {
+                populations[index]
+                    .input_geometry
+                    .as_ref()
+                    .is_some_and(|audit| !audit.complete)
+            })
+    {
+        return false;
+    }
+    let Some(&first_index) = a.batch.representative_case_indices.first() else {
+        return false;
+    };
+    let Some(first) = inputs[first_index].first() else {
+        return false;
+    };
+    let Some(first_family) = first.family else {
+        return false;
+    };
+    let mut distinct_host = false;
+    for &index in a
+        .batch
+        .representative_case_indices
+        .iter()
+        .chain(&b.batch.representative_case_indices)
+    {
+        if cases[index].route != cases[first_index].route || inputs[index].is_empty() {
+            return false;
+        }
+        for fact in &inputs[index] {
+            if fact.owner.role != first.owner.role
+                || fact.owner.product != first.owner.product
+                || fact.owner.readback != first.owner.readback
+                || fact.homogeneous_host_policy.is_none()
+                || fact.family.is_none_or(|family| {
+                    family.workload_domain_signature() != first_family.workload_domain_signature()
+                })
+            {
+                return false;
+            }
+            distinct_host |= fact.homogeneous_host_policy != first.homogeneous_host_policy;
+        }
+    }
+    distinct_host
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reserve(
     batch: &SelectedBatch,
@@ -136,11 +200,13 @@ pub(super) fn preserves_scheduled(
     selected_priority: Option<u8>,
     maximum_sources: Option<NonZeroUsize>,
     require_both: bool,
+    require_combined: bool,
 ) -> Result<bool> {
     debug_assert!(first < second && second < candidates.len());
     let (mut original, mut proposed) = (SelectionCapacity::default(), SelectionCapacity::default());
     let (mut original_sources, mut proposed_sources) = (0, 0);
     let mut union_scheduled = false;
+    let mut coverage_gained = false;
     for (index, candidate) in candidates.iter().enumerate() {
         let before = reserve(
             &candidate.batch,
@@ -181,6 +247,10 @@ pub(super) fn preserves_scheduled(
         if before && !after {
             return Ok(false);
         }
+        coverage_gained |= !before && after;
     }
-    Ok(true)
+    // Independent-family packing is useful only if this same traversal
+    // admits an additional original population, including a later source
+    // that can now use the released journal slot.
+    Ok(!require_combined || union_scheduled && coverage_gained)
 }

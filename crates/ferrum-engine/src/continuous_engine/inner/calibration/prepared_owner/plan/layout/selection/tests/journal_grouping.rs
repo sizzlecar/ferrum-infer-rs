@@ -409,6 +409,21 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         candidate(left.clone(), 1),
         candidate(right.clone(), 2),
     ];
+    // The independent-family packing pass additionally requires the new
+    // journal to be scheduled. It still cannot spend an earlier source's
+    // reserved request allowance to make that happen.
+    assert!(!grouping::preserves_scheduled(
+        &candidates,
+        1,
+        2,
+        combined,
+        SelectionCapacity::legacy(requests, usize::MAX),
+        None,
+        NonZeroUsize::new(2),
+        false,
+        true,
+    )
+    .unwrap());
     assert!(!grouping::preserves_scheduled(
         &candidates,
         1,
@@ -417,6 +432,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(requests, usize::MAX),
         None,
         None,
+        false,
         false,
     )
     .unwrap());
@@ -428,6 +444,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(usize::MAX, waves),
         None,
         None,
+        false,
         false,
     )
     .unwrap());
@@ -449,6 +466,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         None,
         None,
         false,
+        false,
     )
     .unwrap());
     assert!(!grouping::preserves_scheduled(
@@ -460,6 +478,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         None,
         None,
         false,
+        false,
     )
     .unwrap());
     assert!(grouping::preserves_scheduled(
@@ -470,6 +489,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(usize::MAX, usize::MAX),
         None,
         None,
+        false,
         false,
     )
     .unwrap());
@@ -482,6 +502,31 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         None,
         NonZeroUsize::new(1),
         false,
+        false,
     )
     .unwrap());
+    let freeing = [
+        candidate(later[0].batch.clone(), 0),
+        candidate(later[2].batch.clone(), 1),
+        candidate(later[1].batch.clone(), 2),
+    ];
+    // Two already schedulable journals may share a slot only when that
+    // admits another original source in the same complete traversal.
+    for (sources, gain) in [(freeing.len() - 1, true), (freeing.len(), false)] {
+        assert_eq!(
+            grouping::preserves_scheduled(
+                &freeing,
+                0,
+                1,
+                combined,
+                SelectionCapacity::legacy(usize::MAX, usize::MAX),
+                None,
+                NonZeroUsize::new(sources),
+                false,
+                true,
+            )
+            .unwrap(),
+            gain
+        );
+    }
 }

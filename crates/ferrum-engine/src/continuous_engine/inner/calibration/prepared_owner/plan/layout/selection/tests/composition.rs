@@ -1,5 +1,415 @@
 use super::*;
 
+#[test]
+fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_capacity() {
+    use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1;
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use SloAutomaticCostProbeSamplingPresetV1::{Configured, GreedyLength};
+
+    for product in [
+        CostProductOutput::GreedyToken,
+        CostProductOutput::FullLogits,
+    ] {
+        let population = population::declaration(&Default::default(), fixture::domain()).unwrap();
+        let mut cases = vec![Case {
+            product: OpportunityProduct::Prefill,
+            template: 0,
+            width: 1,
+            maximum_output: NonZeroUsize::MIN,
+            release_generated: 0,
+            suffix_tokens: 1,
+            preset: Configured,
+            prefix: PrefixKind::Ordinary,
+            route: CalibrationDecodeRoute::Actual,
+            reset: true,
+            acquisition: None,
+        }];
+        let originals = vec![
+            // The first chunk obeys the original eight-token wave limit.
+            // This planning fixture makes no claim about final-Prefill coverage.
+            related::prefill_input_phase(1, 8, 61, 1, Configured, true),
+            natural_termination_input_with_algorithm_and_eos(
+                1,
+                product,
+                false,
+                64,
+                "fixture.selection.configured",
+                [7; 32],
+                true,
+            ),
+            fixture::input_with_context(1, 3, 64, product, false, true),
+            // A different original template's host categorical identity is
+            // independent even when both templates use GreedyLength. With
+            // one row this is a homogeneous, checked family, not mixed rows.
+            fixture::input_with_context(1, 3, 64, product, true, true),
+        ];
+        for (template, preset) in [(0, Configured), (0, GreedyLength), (1, GreedyLength)] {
+            cases.push(Case {
+                product: if product == CostProductOutput::FullLogits {
+                    OpportunityProduct::Full
+                } else {
+                    OpportunityProduct::Greedy
+                },
+                template,
+                width: 1,
+                maximum_output: NonZeroUsize::new(21).unwrap(),
+                release_generated: 3,
+                suffix_tokens: 18,
+                preset,
+                prefix: PrefixKind::Clean,
+                route: if product == CostProductOutput::FullLogits {
+                    CalibrationDecodeRoute::FullLogits
+                } else {
+                    CalibrationDecodeRoute::Actual
+                },
+                reset: false,
+                acquisition: None,
+            });
+        }
+        let opportunities: Vec<_> = originals
+            .iter()
+            .map(|input| CaseOpportunity {
+                population: classify_alternatives(
+                    std::slice::from_ref(input),
+                    population.population_policy(),
+                    true,
+                )
+                .unwrap(),
+                minimum_fresh_members: 1,
+            })
+            .collect();
+        let inputs: Vec<_> = originals
+            .iter()
+            .cloned()
+            .map(|input| vec![input_facts(&StructuredQueryV2::exact(input)).unwrap()])
+            .collect();
+        let inventory = inventory::CheckedCaseInventory {
+            opportunities: opportunities.clone(),
+            inputs: inputs.clone(),
+            original_inputs: inputs
+                .iter()
+                .flatten()
+                .filter_map(|fact| fact.original.clone())
+                .collect(),
+            algorithm_inputs: originals[1..].iter().cloned().map(Arc::new).collect(),
+            algorithm_case_inputs: std::iter::once(Vec::new())
+                .chain((0..originals.len() - 1).map(|index| vec![index]))
+                .collect(),
+            gaps: Vec::new(),
+            charge: ProbePreflightCharge::default(),
+        };
+        // Match inventory::retain_algorithm_input: Prefill remains an exact-owner
+        // opportunity and is outside the ordinary-decode algorithm universe.
+        assert_eq!(
+            originals[0].numerical_family_key(),
+            Err(StructuredUnknownV2::UnsupportedScope)
+        );
+        for input in &originals[1..] {
+            input.numerical_family_key().unwrap();
+        }
+        let unrelated = natural_termination_input_with_algorithm(
+            1,
+            product,
+            false,
+            257,
+            "fixture.selection.unlinked",
+            [9; 32],
+        );
+        let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+            DeclaredAlgorithmUniverseV1::from_inputs(
+                inventory.algorithm_inputs.iter().map(Arc::as_ref).chain(std::iter::once(&unrelated)),
+                population.settings.max_axes,
+            ).unwrap();
+        let local = DeclaredAlgorithmUniverseV1::from_inputs(
+            inventory.algorithm_inputs.iter().map(Arc::as_ref),
+            population.settings.max_axes,
+        )
+        .unwrap();
+        let groups = member_groups(&opportunities).unwrap();
+        assert_eq!(groups.len(), cases.len());
+        let populations: Vec<_> = groups
+            .iter()
+            .map(|group| SelectedPopulation {
+                key: group.key.clone(),
+                representative_case_indices: group.guaranteed_case_indices.clone(),
+                maximum_anchor_span: 0,
+                scheduled: false,
+                batch_index: None,
+                input_geometry: None,
+            })
+            .collect();
+        let decode_indices: Vec<_> = (1..populations.len()).collect();
+        let prefill = batch_plan(
+            &[0],
+            &populations,
+            &cases,
+            &opportunities,
+            &[61, 61],
+            8,
+            None,
+            &population,
+        )
+        .unwrap();
+        let packed = batch_plan_with_scope(
+            &decode_indices,
+            &populations,
+            &cases,
+            &opportunities,
+            &[61, 61],
+            8,
+            None,
+            &population,
+            Some((&inputs, &local)),
+        )
+        .unwrap();
+        let independent = member_groups(packed.scoped_opportunities.as_ref().unwrap()).unwrap();
+        assert_eq!(independent.len(), decode_indices.len());
+        for group in &independent {
+            assert_eq!(group.guaranteed_case_indices.len(), 1);
+        }
+        assert_ne!(
+            inputs[2][0].homogeneous_host_policy,
+            inputs[3][0].homogeneous_host_policy
+        );
+        assert!(
+            packed.planned_cycles
+                * packed
+                    .input_opportunities
+                    .minimum_original_offers_per_completed_cycle
+                >= packed.input_opportunities.required_original_offers
+                    + packed.schedule.block_offered
+        );
+        let capacity = SelectionCapacity {
+            requests: prefill.requests + packed.requests,
+            execution_actions: prefill.serial_wave_upper_bound + packed.serial_wave_upper_bound,
+            declared_offer_rows: prefill.declared_offer_row_bound + packed.declared_offer_row_bound,
+        };
+        assert!(super::super::composition::can_schedule(&prefill, capacity));
+        assert!(super::super::composition::can_schedule(
+            &packed,
+            capacity.remaining(SelectionCapacity {
+                requests: prefill.requests,
+                execution_actions: prefill.serial_wave_upper_bound,
+                declared_offer_rows: prefill.declared_offer_row_bound,
+            })
+        ));
+        let select = |capacity,
+                      selected_priority,
+                      population: &StructuredServiceDeclarationV7,
+                      seed: Option<&DeclaredAlgorithmUniverseV1>,
+                      geometry: Option<&mut StructuredInputGeometryWorkV1>,
+                      retained_bytes| {
+            select_with_capacity_and_trajectories(
+                &cases,
+                &opportunities,
+                &inputs,
+                &[61, 61],
+                8,
+                None,
+                population,
+                capacity,
+                retained_bytes,
+                None,
+                selected_priority,
+                geometry,
+                NonZeroUsize::new(2),
+                seed,
+                Some(&inventory),
+            )
+        };
+        let selected = select(capacity, None, &population, Some(&seed), None, usize::MAX).unwrap();
+        assert!(selected.populations.iter().all(|population| population.scheduled),
+            "complete Prefill and distinct original host families fit two journals without sharing F/R/Q members: {:?}", selected.gaps);
+        assert_eq!(
+            selected
+                .batches
+                .iter()
+                .filter(|batch| batch.scheduled)
+                .count(),
+            2
+        );
+        let actual = selected
+            .batches
+            .iter()
+            .find(|batch| batch.scheduled && batch.population_indices.contains(&1))
+            .unwrap();
+        assert_eq!(actual.algorithm_universe.as_ref(), Some(&local));
+        assert!(
+            unrelated.numerical_family_key_for_universe(&local).is_err(),
+            "the shared journal cannot copy an unrelated global seed algorithm"
+        );
+        assert_eq!(
+            actual.representative_case_indices,
+            packed.representative_case_indices
+        );
+        assert_eq!(
+            member_groups(actual.scoped_opportunities.as_ref().unwrap())
+                .unwrap()
+                .len(),
+            independent.len()
+        );
+        assert_eq!(selected.requests, capacity.requests);
+        assert_eq!(selected.serial_wave_upper_bound, capacity.execution_actions);
+        assert_eq!(
+            selected.declared_offer_row_bound,
+            capacity.declared_offer_rows
+        );
+        assert_eq!(
+            selected
+                .execution_case_indices
+                .iter()
+                .filter(|&&index| index == 0)
+                .count(),
+            prefill.planned_cycles
+        );
+        let frozen = source_inputs::freeze_sources(
+            &cases,
+            &opportunities,
+            &[61, 61],
+            &selected,
+            NonZeroU32::new(8).unwrap(),
+            None,
+            usize::MAX,
+        )
+        .unwrap();
+        let decode_source = selected
+            .batches
+            .iter()
+            .filter(|batch| batch.scheduled)
+            .position(|batch| batch.population_indices.contains(&1))
+            .unwrap();
+        let mut declared = population.clone();
+        declared
+            .nonnegative_envelope
+            .as_mut()
+            .unwrap()
+            .algorithm_universe = Some(local.clone());
+        let source_inputs::ColdSourceRebuild::Ready(cold) = frozen[decode_source]
+            .cold_plan(&declared, NonZeroU32::new(8).unwrap(), None, usize::MAX)
+            .unwrap()
+        else {
+            panic!("unchanged cold work must retain all independent family horizons");
+        };
+        assert_eq!(cold.cycles, actual.planned_cycles);
+        assert_eq!(cold.requests, actual.requests);
+        assert_eq!(cold.execution_actions, actual.serial_wave_upper_bound);
+        assert_eq!(
+            cold.input_opportunities
+                .minimum_input_family_opportunities_per_cycle,
+            actual
+                .input_opportunities
+                .minimum_input_family_opportunities_per_cycle
+        );
+        assert_eq!(
+            cold.input_opportunities.maximum_fresh_member_span,
+            actual.input_opportunities.maximum_fresh_member_span
+        );
+
+        // Every original constituent must pass a partial priority filter,
+        // including a later host family after an earlier merge succeeded.
+        for wanted in [input_priority(true, true), input_priority(false, false)] {
+            let partial = select(
+                capacity,
+                Some(wanted),
+                &population,
+                Some(&seed),
+                None,
+                usize::MAX,
+            )
+            .unwrap();
+            for (index, member) in partial.populations.iter().enumerate() {
+                let fact = &inputs[index][0];
+                assert_eq!(
+                    member.scheduled,
+                    input_priority(fact.branches[4], fact.branches[5]) == wanted
+                );
+            }
+        }
+        // The successful plan above consumes these exact independent ledgers.
+        // A missing unit cannot be borrowed from another ledger or source.
+        for short in [
+            SelectionCapacity {
+                requests: capacity.requests - 1,
+                ..capacity
+            },
+            SelectionCapacity {
+                execution_actions: capacity.execution_actions - 1,
+                ..capacity
+            },
+            SelectionCapacity {
+                declared_offer_rows: capacity.declared_offer_rows - 1,
+                ..capacity
+            },
+        ] {
+            let denied = select(short, None, &population, Some(&seed), None, usize::MAX).unwrap();
+            assert!(!denied.populations.iter().all(|member| member.scheduled));
+            assert!(
+                denied.populations[0].scheduled && denied.populations[1].scheduled,
+                "packing must preserve the original complete Configured sources"
+            );
+            assert!(denied.requests <= short.requests);
+            assert!(denied.serial_wave_upper_bound <= short.execution_actions);
+            assert!(denied.declared_offer_row_bound <= short.declared_offer_rows);
+        }
+        let mut owner_limited = population.clone();
+        owner_limited.maximum_owners = independent.len() - 1;
+        let denied = select(
+            capacity,
+            None,
+            &owner_limited,
+            Some(&seed),
+            None,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(!denied.populations.iter().all(|member| member.scheduled));
+        assert!(denied.populations[0].scheduled && denied.populations[1].scheduled);
+        for batch in denied.batches.iter().filter(|batch| batch.scheduled) {
+            if let Some(opportunities) = &batch.scoped_opportunities {
+                assert!(
+                    member_groups(opportunities).unwrap().len() <= owner_limited.maximum_owners
+                );
+            }
+        }
+        let mut geometry = StructuredInputGeometryWorkV1::new(NonZeroU64::MIN);
+        let incomplete = select(
+            capacity,
+            None,
+            &population,
+            Some(&seed),
+            Some(&mut geometry),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(geometry.exhausted());
+        assert!(!incomplete.populations.iter().all(|member| member.scheduled));
+        for member in &incomplete.populations[2..] {
+            assert!(!member.input_geometry.as_ref().unwrap().complete);
+            assert!(!member.scheduled);
+            assert!(incomplete
+                .gaps
+                .iter()
+                .any(|gap| gap.population.as_ref() == Some(&member.key)
+                    && matches!(
+                        gap.reason,
+                        SelectionGapReason::InputGeometryUnavailable { .. }
+                    )));
+        }
+        let missing_algorithm = DeclaredAlgorithmUniverseV1::from_inputs(
+            std::slice::from_ref(&originals[1]),
+            population.settings.max_axes,
+        )
+        .unwrap();
+        for unavailable in [None, Some(&missing_algorithm)] {
+            let raw = select(capacity, None, &population, unavailable, None, usize::MAX).unwrap();
+            assert!(!raw.populations.iter().all(|member| member.scheduled));
+            assert!(raw.populations[0].scheduled && raw.populations[1].scheduled);
+        }
+        assert!(select(capacity, None, &population, Some(&seed), None, 0).is_err());
+    }
+}
+
 fn native_source_inventory() -> (
     Vec<Case>,
     Vec<CaseOpportunity>,

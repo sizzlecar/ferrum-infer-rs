@@ -139,6 +139,40 @@ fn same_requirement(left: &CheckedInputFacts, right: &CheckedInputFacts) -> bool
         && left.homogeneous_host_policy == right.homogeneous_host_policy
 }
 
+fn supports_local_scope(population: &StructuredServiceDeclarationV7) -> bool {
+    population
+        .nonnegative_envelope
+        .as_ref()
+        .is_some_and(|contract| {
+            contract.population_policy == StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1
+                && contract.template_policy
+                    == StructuredCostTemplatePolicyV1::InstalledAlgorithmSetV1
+        })
+}
+
+fn declare_linked_universe(
+    batch: &SelectedBatch,
+    inputs: &[Vec<CheckedInputFacts>],
+    trajectories: Option<&inventory::CheckedCaseInventory>,
+    population: &StructuredServiceDeclarationV7,
+    seed: &DeclaredAlgorithmUniverseV1,
+) -> Result<Option<DeclaredAlgorithmUniverseV1>> {
+    let mut builder =
+        DeclaredAlgorithmUniverseBuilderV1::new(population.settings.max_axes, builder_limit(seed)?)
+            .map_err(|reason| error(format!("combination declaration builder: {reason:?}")))?;
+    // Physical replay precedes membership. Include every linked original
+    // recipe without granting its host/product family numerical membership.
+    for input in recipes(batch, inputs, trajectories) {
+        if builder.observe(input).is_err() {
+            return Ok(None);
+        }
+    }
+    Ok(match builder.finish() {
+        Ok(local) if seed.contains_universe(&local) => Some(local),
+        _ => None,
+    })
+}
+
 fn local_universe(
     batch: &SelectedBatch,
     inputs: &[Vec<CheckedInputFacts>],
@@ -146,15 +180,7 @@ fn local_universe(
     population: &StructuredServiceDeclarationV7,
     seed: &DeclaredAlgorithmUniverseV1,
 ) -> Result<Option<DeclaredAlgorithmUniverseV1>> {
-    if population
-        .nonnegative_envelope
-        .as_ref()
-        .is_none_or(|contract| {
-            contract.population_policy != StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1
-                || contract.template_policy
-                    != StructuredCostTemplatePolicyV1::InstalledAlgorithmSetV1
-        })
-    {
+    if !supports_local_scope(population) {
         return Ok(None);
     }
     let Some(first) = facts(batch, inputs).next() else {
@@ -185,22 +211,9 @@ fn local_universe(
     if !compatible().any(|input| input.numerical_family_key().ok() != first.family) {
         return Ok(None);
     }
-    let mut builder =
-        DeclaredAlgorithmUniverseBuilderV1::new(population.settings.max_axes, builder_limit(seed)?)
-            .map_err(|reason| error(format!("combination declaration builder: {reason:?}")))?;
-    // The physical envelope is replayed before numerical-family membership.
-    // A complete original cohort can therefore need an associated algorithm
-    // from another host/product family without making that wave a member of
-    // this family's fit. Declare all linked original work, then keep the
-    // original compatible-family checks and independent qualification below.
-    for input in recipes(batch, inputs, trajectories) {
-        if builder.observe(input).is_err() {
-            return Ok(None);
-        }
-    }
-    let local = match builder.finish() {
-        Ok(local) if seed.contains_universe(&local) => local,
-        _ => return Ok(None),
+    let Some(local) = declare_linked_universe(batch, inputs, trajectories, population, seed)?
+    else {
+        return Ok(None);
     };
     let mut projected = None;
     for input in compatible() {
@@ -210,6 +223,79 @@ fn local_universe(
         }
     }
     Ok(Some(local))
+}
+
+/// A shared physical declaration does not merge host/product families. Each
+/// complete original case must still project to its own unambiguous family;
+/// batch_plan_with_scope then budgets all resulting groups independently.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn packed_candidate(
+    raw: &SelectedBatch,
+    populations: &[SelectedPopulation],
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    trajectories: Option<&inventory::CheckedCaseInventory>,
+    prompts: &[usize],
+    chunk: usize,
+    row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    seed: &DeclaredAlgorithmUniverseV1,
+) -> Result<Option<SelectedBatch>> {
+    if !supports_local_scope(population) {
+        return Ok(None);
+    }
+    let Some(local) = declare_linked_universe(raw, inputs, trajectories, population, seed)? else {
+        return Ok(None);
+    };
+    let mut families = 0usize;
+    for (position, &index) in raw.representative_case_indices.iter().enumerate() {
+        let mut family = None;
+        if inputs[index].is_empty() {
+            return Ok(None);
+        }
+        for fact in &inputs[index] {
+            let Some(input) = fact.original.as_deref() else {
+                return Ok(None);
+            };
+            let Ok(key) = input.numerical_family_key_for_universe(&local) else {
+                return Ok(None);
+            };
+            if family.is_some_and(|previous| previous != key) {
+                return Ok(None);
+            }
+            family = Some(key);
+        }
+        // Count the declared family lower bound without another retained key
+        // vector. A journal cannot erase an independent owner's capacity cost.
+        let key = family.unwrap();
+        let seen = raw.representative_case_indices[..position]
+            .iter()
+            .any(|&earlier| {
+                inputs[earlier][0]
+                    .original
+                    .as_deref()
+                    .is_some_and(|input| input.numerical_family_key_for_universe(&local) == Ok(key))
+            });
+        if !seen {
+            families = add(families, 1)?;
+            if families > population.maximum_owners {
+                return Ok(None);
+            }
+        }
+    }
+    batch_plan_with_scope(
+        &raw.population_indices,
+        populations,
+        cases,
+        opportunities,
+        prompts,
+        chunk,
+        row_ceiling,
+        population,
+        Some((inputs, &local)),
+    )
+    .map(Some)
 }
 
 /// Project one original opportunity without inventing reachability or a fresh

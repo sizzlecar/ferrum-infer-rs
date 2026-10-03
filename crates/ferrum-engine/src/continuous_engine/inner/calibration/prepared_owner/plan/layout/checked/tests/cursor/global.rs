@@ -290,36 +290,59 @@ async fn global_cursor_short_and_long_inputs_share_one_final_family_selection() 
         budget.input_projection_requests_remaining() + expected_admissions,
         settings.cost_probe.maximum_input_projection_requests.get()
     );
-    let universe = first
-        .declaration
-        .population
-        .nonnegative_envelope
-        .as_ref()
+    assert!(
+        first
+            .declaration
+            .population
+            .nonnegative_envelope
+            .as_ref()
+            .unwrap()
+            .algorithm_universe
+            .is_none(),
+        "the first exact Prefill source does not claim a decode scope"
+    );
+    let seed = cursor
+        .take_algorithm_seed()
+        .expect("all checked algorithms remain available to online discovery");
+    let scheduled: Vec<_> = selection["batches"]
+        .as_array()
         .unwrap()
-        .algorithm_universe
-        .clone();
-    for source_index in 0..series.len() {
+        .iter()
+        .filter(|batch| batch["scheduled"] == true)
+        .collect();
+    assert_eq!(scheduled.len(), series.len());
+    for (source_index, batch) in scheduled.iter().enumerate() {
         let source = series.source(source_index).unwrap();
         source.declaration.validate().unwrap();
+        let universe = &source
+            .declaration
+            .population
+            .nonnegative_envelope
+            .as_ref()
+            .unwrap()
+            .algorithm_universe;
         assert_eq!(
-            source
-                .declaration
-                .population
-                .nonnegative_envelope
-                .as_ref()
-                .unwrap()
-                .algorithm_universe,
-            universe
+            serde_json::to_value(universe).unwrap(),
+            batch
+                .get("algorithm_universe")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "each source freezes its own checked local declaration, not the first source's scope"
         );
+        if let Some(local) = universe {
+            assert!(seed.contains_universe(local));
+            assert!(batch["representative_case_indices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|index| {
+                    matches!(
+                        cases[index.as_u64().unwrap() as usize].product,
+                        OpportunityProduct::Greedy | OpportunityProduct::Full
+                    )
+                }));
+        }
     }
-    assert!(
-        universe.is_none(),
-        "source qualification does not claim the global seed"
-    );
-    assert!(
-        cursor.take_algorithm_seed().is_some(),
-        "all checked algorithms remain available to online discovery"
-    );
     assert!(cursor.take_algorithm_seed().is_none());
     let before = ledger(&budget);
     assert!(Box::pin(cursor.next(&mut session, &mut budget))

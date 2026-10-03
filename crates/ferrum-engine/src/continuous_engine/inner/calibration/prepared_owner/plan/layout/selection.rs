@@ -964,96 +964,125 @@ fn coalesce_related_batches(
     combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
     trajectories: Option<&inventory::CheckedCaseInventory>,
 ) -> Result<()> {
-    let mut index = 0;
-    while index < candidates.len() {
-        let mut next = index + 1;
-        while next < candidates.len() {
-            let a = &candidates[index];
-            let b = &candidates[next];
-            let raw_related = grouping::related(a, b, cases, inputs);
-            if a.input_priority != b.input_priority
-                || !(raw_related
-                    || combination_seed.is_some() && grouping::related_scope(a, b, inputs))
-            {
-                next += 1;
-                continue;
-            }
-            let mut members = a.batch.population_indices.clone();
-            members.extend_from_slice(&b.batch.population_indices);
-            members.sort_unstable();
-            let mut combined = batch_plan(
-                &members,
-                populations,
-                cases,
-                opportunities,
-                prompts,
-                chunk,
-                prefill_row_ceiling,
-                population,
-            )?;
-            if let Some(seed) = combination_seed {
-                if let Some(scoped) = composition::scoped_candidate(
-                    &combined,
+    // First preserve the existing same-policy journal choices. Only then
+    // use their already checked representatives to pack independent host
+    // families under the same finite source limit. No geometry is revisited.
+    for independent_families in [false, true] {
+        if independent_families && (combination_seed.is_none() || maximum_sources.is_none()) {
+            continue;
+        }
+        let mut index = 0;
+        while index < candidates.len() {
+            let mut next = index + 1;
+            while next < candidates.len() {
+                let a = &candidates[index];
+                let b = &candidates[next];
+                let raw_related = grouping::related(a, b, cases, inputs);
+                let related = if independent_families {
+                    grouping::independent_families(
+                        a,
+                        b,
+                        populations,
+                        cases,
+                        inputs,
+                        selected_priority,
+                    )
+                } else {
+                    a.input_priority == b.input_priority
+                        && (raw_related
+                            || combination_seed.is_some() && grouping::related_scope(a, b, inputs))
+                };
+                if !related {
+                    next += 1;
+                    continue;
+                }
+                let mut members = a.batch.population_indices.clone();
+                members.extend_from_slice(&b.batch.population_indices);
+                members.sort_unstable();
+                let mut combined = batch_plan(
+                    &members,
                     populations,
                     cases,
                     opportunities,
-                    inputs,
-                    trajectories,
                     prompts,
                     chunk,
                     prefill_row_ceiling,
                     population,
-                    seed,
-                )? {
-                    combined = scoped;
-                } else if !raw_related
-                    || a.batch.algorithm_universe.is_some()
-                    || b.batch.algorithm_universe.is_some()
+                )?;
+                if let Some(seed) = combination_seed {
+                    let scope = if independent_families {
+                        composition::packed_candidate
+                    } else {
+                        composition::scoped_candidate
+                    };
+                    if let Some(scoped) = scope(
+                        &combined,
+                        populations,
+                        cases,
+                        opportunities,
+                        inputs,
+                        trajectories,
+                        prompts,
+                        chunk,
+                        prefill_row_ceiling,
+                        population,
+                        seed,
+                    )? {
+                        combined = scoped;
+                    } else if independent_families
+                        || !raw_related
+                        || a.batch.algorithm_universe.is_some()
+                        || b.batch.algorithm_universe.is_some()
+                    {
+                        // A failed wider declaration cannot silently replace a
+                        // previously selected valid scope with its raw fallback.
+                        next += 1;
+                        continue;
+                    }
+                }
+                // Recompute the whole source, including every fresh-member phase
+                // fence. Relatedness never supplies a qualification or capacity
+                // exemption. The old same-family sharing rule also keeps its
+                // original non-increasing token-work condition. New independent
+                // families charge their entire recomputed horizon below.
+                if !composition::can_schedule(&combined, capacity)
+                    || (!independent_families
+                        && combined.serial_token_work
+                            > add(a.batch.serial_token_work, b.batch.serial_token_work)?)
                 {
-                    // A failed wider declaration cannot silently replace a
-                    // previously selected valid scope with its raw fallback.
                     next += 1;
                     continue;
                 }
+                // A globally affordable union may still steal the allowance of
+                // an earlier or later complete source. Simulate the original and
+                // replacement traversals under the same work and source limits before
+                // dropping either raw candidate.
+                if !grouping::preserves_scheduled(
+                    candidates,
+                    index,
+                    next,
+                    &combined,
+                    capacity,
+                    selected_priority,
+                    maximum_sources,
+                    !independent_families && !raw_related,
+                    independent_families,
+                )? {
+                    next += 1;
+                    continue;
+                }
+                let first = a.original_population_index.min(b.original_population_index);
+                let width = a.decode_width_tier.max(b.decode_width_tier);
+                candidates[index].batch = combined;
+                candidates[index].original_population_index = first;
+                candidates[index].decode_width_tier = width;
+                candidates.remove(next);
+                // Additional guaranteed offers can make an earlier, otherwise
+                // unaffordable combination fit. Recheck it with this exact plan.
+                next = index + 1;
             }
-            // Recompute the whole source, including every fresh-member phase
-            // fence. Relatedness never supplies a qualification or capacity
-            // exemption, and sharing must not increase declared token work.
-            if !composition::can_schedule(&combined, capacity)
-                || combined.serial_token_work
-                    > add(a.batch.serial_token_work, b.batch.serial_token_work)?
-            {
-                next += 1;
-                continue;
-            }
-            // A globally affordable union may still steal the allowance of
-            // an earlier or later complete source. Simulate the original and
-            // replacement traversals under the same work and source limits before
-            // dropping either raw candidate.
-            if !grouping::preserves_scheduled(
-                candidates,
-                index,
-                next,
-                &combined,
-                capacity,
-                selected_priority,
-                maximum_sources,
-                !raw_related,
-            )? {
-                next += 1;
-                continue;
-            }
-            let first = a.original_population_index.min(b.original_population_index);
-            let width = a.decode_width_tier.max(b.decode_width_tier);
-            candidates[index].batch = combined;
-            candidates[index].original_population_index = first;
-            candidates[index].decode_width_tier = width;
-            candidates.remove(next);
-            // Additional guaranteed offers can make an earlier, otherwise
-            // unaffordable combination fit. Recheck it with this exact plan.
-            next = index + 1;
+            index += 1;
         }
-        index += 1;
     }
     Ok(())
 }
