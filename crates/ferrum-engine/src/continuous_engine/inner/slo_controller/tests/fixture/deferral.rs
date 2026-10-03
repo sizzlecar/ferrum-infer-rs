@@ -5,6 +5,11 @@ use super::*;
 #[derive(Default)]
 pub(in crate::continuous_engine) struct ControlledDeferrals {
     pending: Mutex<Option<GuardedDispatchOutcome<()>>>,
+    /// A test-owned probe at the actual prefill entry. It may observe later
+    /// retries, but may request the original typed backing deferral only once.
+    pub private_seed_arm:
+        Mutex<Option<Box<dyn Fn(&[PlanRuntimePrefillInput]) -> bool + Send + Sync>>>,
+    private_seed_deferred: AtomicBool,
     origin: Arc<()>,
     pub capacity_epoch: AtomicU64,
     pub planning_captures: AtomicUsize,
@@ -17,6 +22,20 @@ struct Maintenance {
 }
 
 impl ControlledDeferrals {
+    pub(super) fn before_prefill(&self, inputs: &[PlanRuntimePrefillInput]) {
+        let arm = self.private_seed_arm.lock();
+        if !arm.as_ref().is_some_and(|ready| ready(inputs)) {
+            return;
+        }
+        assert!(!self.private_seed_deferred.swap(true, Ordering::AcqRel));
+        drop(arm);
+        let ids: Vec<_> = inputs
+            .iter()
+            .map(|input| input.request_id.clone())
+            .collect();
+        self.capacity(&ids, Some(true));
+    }
+
     pub(super) fn take_plain(&self, entries: &AtomicUsize) -> Option<ExecutorExecutionDeferral> {
         let value = self.pending.lock().take()?;
         entries.fetch_add(1, Ordering::AcqRel);

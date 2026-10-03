@@ -703,6 +703,7 @@ impl ModelExecutor for ControlledExecutor {
         mut observation: GuardedCostObservation<'_, '_>,
     ) -> GuardedDispatchOutcome<Vec<PlanRuntimePrefillCompletion>> {
         let _work = self.token_policy_work();
+        self.deferrals.before_prefill(inputs);
         if let Some(deferred) =
             self.deferrals
                 .take_observed(guard, &self.entries, observation.as_deref_mut())

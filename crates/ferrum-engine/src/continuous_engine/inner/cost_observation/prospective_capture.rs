@@ -167,6 +167,15 @@ pub(in crate::continuous_engine::inner) struct ProspectiveCapture {
     before_finish: parking_lot::Mutex<Option<Box<dyn FnOnce(ProspectiveCaptureOutcomeV1) + Send>>>,
 }
 impl ProspectiveCapture {
+    /// Read an already produced normal-execution receipt. This never reconciles
+    /// a call, creates a receipt or changes the original once-only outcome.
+    #[cfg(test)]
+    pub(in crate::continuous_engine::inner) fn settled_receipt_for_test(
+        &self,
+    ) -> Option<&ProspectiveCaptureReceiptV1> {
+        self.receipt.get()
+    }
+
     pub(super) fn retained_bytes(&self) -> Option<usize> {
         std::mem::size_of::<Self>()
             .checked_add(std::mem::size_of::<CaptureAudit>())?

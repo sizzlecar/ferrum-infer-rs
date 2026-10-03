@@ -3,6 +3,8 @@ use super::*;
 use crate::continuous_engine::inner::slo_controller::calibration::CalibrationPreparation;
 use crate::{AutomaticCostProbeOutput, AutomaticCostProbeTemplate};
 
+mod greedy_length;
+
 #[tokio::test]
 async fn source8_automatic_probe_plan_installs_known_and_executes_controller_witness() {
     check_probe_and_witness(None, false).await;
@@ -11,6 +13,17 @@ async fn source8_automatic_probe_plan_installs_known_and_executes_controller_wit
 #[tokio::test]
 async fn source8_automatic_probe_plan_executes_nonterminal_forward_witness() {
     check_probe_and_witness(None, true).await;
+}
+
+#[tokio::test]
+async fn source8_packed_greedy_length_family_supports_adopted_forward_witness() {
+    check_probe_and_witness_with_preset(
+        None,
+        true,
+        1,
+        ferrum_types::SloAutomaticCostProbeSamplingPresetV1::GreedyLength,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -49,6 +62,21 @@ async fn check_probe_and_witness_with_prompt(
     planning_us: Option<NonZeroU64>,
     lookahead: bool,
     prompt_tokens: usize,
+) {
+    check_probe_and_witness_with_preset(
+        planning_us,
+        lookahead,
+        prompt_tokens,
+        ferrum_types::SloAutomaticCostProbeSamplingPresetV1::Configured,
+    )
+    .await;
+}
+
+async fn check_probe_and_witness_with_preset(
+    planning_us: Option<NonZeroU64>,
+    lookahead: bool,
+    prompt_tokens: usize,
+    ordinary_preset: ferrum_types::SloAutomaticCostProbeSamplingPresetV1,
 ) {
     let (mut session, executor) = if prompt_tokens > 1 {
         automatic_checkpoint_session(2).await
@@ -203,6 +231,9 @@ async fn check_probe_and_witness_with_prompt(
             .iter()
             .all(|phase| phase.members >= numerical.min_phase_samples));
     }
+    let packed_greedy = (ordinary_preset
+        == ferrum_types::SloAutomaticCostProbeSamplingPresetV1::GreedyLength)
+        .then(|| greedy_length::PackedFamily::from_children(&children));
     assert!(installed.offered_samples > 0);
     assert!(runtime.snapshot().is_some());
     let prepared_prefix_totals = executor.native_prefix_terminal_totals();
@@ -287,11 +318,7 @@ async fn check_probe_and_witness_with_prompt(
     let mut consumers = Vec::new();
     for seed in 0..2 {
         let (request, contract) = ordinary_template
-            .instantiate(
-                NonZeroUsize::new(3).unwrap(),
-                seed,
-                ferrum_types::SloAutomaticCostProbeSamplingPresetV1::Configured,
-            )
+            .instantiate(NonZeroUsize::new(3).unwrap(), seed, ordinary_preset)
             .unwrap();
         ids.push(request.id.clone());
         let mut output = session
@@ -346,6 +373,7 @@ async fn check_probe_and_witness_with_prompt(
         }
     }
     let manual_timing = inner.controller_timing_snapshot().unwrap_or_default();
+    let mut adopted_transactions = Vec::new();
     // The declared per-row step limit and original B2 whole-wave capacity
     // permit both requests to advance one prompt token. Audit every actual
     // successor, including middle and final spans, before Decode below.
@@ -449,7 +477,7 @@ async fn check_probe_and_witness_with_prompt(
         assert!(known.planning_ns > 0 && known.valid_for_ns > 0);
         assert_eq!(executor.physical.load(Ordering::Acquire), before);
         let timing_before = inner.controller_timing_snapshot().unwrap_or_default();
-        if prompt_tokens > 1 && is_prefill {
+        if (prompt_tokens > 1 || packed_greedy.is_some()) && is_prefill {
             let frontiers_before = ids
                 .iter()
                 .map(|id| frontier(&session, id))
@@ -486,14 +514,49 @@ async fn check_probe_and_witness_with_prompt(
                 assert_eq!(after.kv_tokens(), before.kv_tokens());
                 assert_eq!(after.request_evidence(), before.request_evidence());
             }
-            future::submit_nonterminal_witness(&session, &executor, &ids, step < prompt_tokens)
-                .await;
+            let transaction_before = packed_greedy.as_ref().map(|_| {
+                query_journal.as_ref().unwrap().0.snapshot()["statistics"]["transactions"]
+                    .as_u64()
+                    .unwrap()
+            });
+            // Start the GreedyLength request through normal time admission.
+            // Its original goal requires the new target's second output,
+            // so the selected tail must revisit that request after Prefill.
+            // Servicing a different decoder once does not prove this goal.
+            future::submit_nonterminal_witness(
+                &session,
+                &executor,
+                &ids,
+                step < prompt_tokens || packed_greedy.is_some(),
+            )
+            .await;
+            if let Some(before) = transaction_before {
+                let after = query_journal.as_ref().unwrap().0.snapshot()["statistics"]
+                    ["transactions"]
+                    .as_u64()
+                    .unwrap();
+                assert_eq!(after, before + 1);
+                adopted_transactions.push(after);
+                assert!(
+                    ids.iter().any(|id| {
+                        inner.sequences.read()[id]
+                            .time_admission
+                            .as_ref()
+                            .is_some_and(|state| {
+                                state.has_current_time_witness(
+                                    crate::continuous_engine::inner::slo_clock_now(),
+                                )
+                            })
+                    }),
+                    "ordinary Prefill must start its actual admission witness"
+                );
+            }
             for id in &ids {
                 let after = frontier(&session, id);
                 assert_eq!(
                     after.prefill_progress(),
                     (step < prompt_tokens).then_some((step, prompt_tokens)),
-                    "the adopted native wave must advance exactly the audited Prefill span"
+                    "the adopted wave must advance exactly the audited Prefill span"
                 );
                 assert_eq!(after.kv_tokens(), step);
                 assert_eq!(after.generated_tokens(), usize::from(step == prompt_tokens));
@@ -528,7 +591,7 @@ async fn check_probe_and_witness_with_prompt(
         assert!(stages.rows.iter().all(|row| row.terminal.is_none()));
     }
     let after_spans = inner.controller_timing_snapshot().unwrap().witnesses;
-    if prompt_tokens > 1 {
+    if prompt_tokens > 1 || packed_greedy.is_some() {
         let adopted_prefills = u64::try_from(prompt_tokens).unwrap();
         assert_eq!(
             after_spans.decisions.samples,
@@ -565,7 +628,28 @@ async fn check_probe_and_witness_with_prompt(
             for id in &active {
                 ready(&session, id, false).await;
             }
-            future::submit_capacity_limited_witness(&session, &executor, &active).await;
+            if packed_greedy.is_some() {
+                let writer = &query_journal.as_ref().unwrap().0;
+                let before = writer.snapshot()["statistics"]["transactions"]
+                    .as_u64()
+                    .unwrap();
+                // Clean ordinary GreedyLength rows really submit GreedyToken.
+                // The first admission's selected tail is checked separately:
+                // a later capacity-limited witness may serve each decoder only
+                // once, and therefore need no changed-content FullLogits query.
+                future::submit_capacity_limited_greedy_witness(&session, &executor, &active).await;
+                let after = writer.snapshot()["statistics"]["transactions"]
+                    .as_u64()
+                    .unwrap();
+                assert_eq!(
+                    after,
+                    before + 1,
+                    "one original controller transaction per adopted wave"
+                );
+                adopted_transactions.push(after);
+            } else {
+                future::submit_capacity_limited_witness(&session, &executor, &active).await;
+            }
         }
         assert_eq!(
             executor.physical.load(Ordering::Acquire),
@@ -608,6 +692,10 @@ async fn check_probe_and_witness_with_prompt(
     session.shutdown().await.unwrap();
     if let Some((writer, path)) = query_journal {
         writer.close().unwrap();
+        if let Some(packed) = packed_greedy {
+            assert_eq!(writer.snapshot()["recording_complete"], true);
+            packed.assert_selected_replay(&path, &adopted_transactions);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

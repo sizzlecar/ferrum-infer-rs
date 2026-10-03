@@ -77,6 +77,8 @@ pub(in crate::continuous_engine) use trainer::structured_v2::structured_capture_
 mod presubmit;
 mod prospective_capture;
 pub(in crate::continuous_engine::inner) use prospective_capture::ProspectiveCapture;
+#[cfg(test)]
+pub(in crate::continuous_engine::inner) use prospective_capture::ProspectiveCaptureOutcomeV1;
 mod memory;
 mod prefix;
 pub(in crate::continuous_engine) use prefix::{prefix_cost_shape, PrefixCostSnapshot};

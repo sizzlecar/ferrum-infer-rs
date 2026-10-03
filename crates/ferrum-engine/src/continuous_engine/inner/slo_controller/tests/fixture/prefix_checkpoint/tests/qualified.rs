@@ -6,6 +6,7 @@ use ferrum_interfaces::engine::InferenceEngine;
 use ferrum_interfaces::output_flow::{CreditedOutputSession, OutputCompletion};
 use futures::StreamExt;
 mod diagnostics;
+mod maintenance;
 mod ready;
 
 const PROMPT: usize = 24;
@@ -122,6 +123,25 @@ async fn startup_with_wait_and_natural_eos(
     natural_eos: bool,
     prefix_enabled: bool,
 ) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
+    startup_with_probes(
+        wait,
+        natural_eos,
+        prefix_enabled,
+        &[PROMPT],
+        ferrum_types::SloAutomaticCalibrationDiagnosticsV1::MemoryOnly,
+        |_, _| {},
+    )
+    .await
+}
+
+async fn startup_with_probes(
+    wait: Option<NonZeroU64>,
+    natural_eos: bool,
+    prefix_enabled: bool,
+    prompt_lengths: &[usize],
+    diagnostics: ferrum_types::SloAutomaticCalibrationDiagnosticsV1,
+    configure: impl FnOnce(&ContinuousBatchEngine, &Arc<ControlledExecutor>),
+) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
     diagnostics::install();
     // Use the product tokenizer's source-config parser. The original helper
     // has no EOS vocabulary declaration; removing ignore-EOS alone would not
@@ -164,6 +184,7 @@ async fn startup_with_wait_and_natural_eos(
         unreachable!()
     };
     settings.reuse = ferrum_types::SloAutomaticCalibrationReuseV1::Disabled {};
+    settings.diagnostics = diagnostics;
     settings.cost_probe.maximum_concurrent_requests = NonZeroUsize::new(2).unwrap();
     // Original sample/rank/population/qualification requirements stay default.
     slo.default_service_class = Some("native-prefix-qualified".into());
@@ -209,6 +230,7 @@ async fn startup_with_wait_and_natural_eos(
     let runtime = engine.inner.cost_runtime.as_ref().unwrap().clone();
     assert!(runtime.snapshot().is_none());
     assert!(runtime.prefix_cost_snapshot().is_none());
+    configure(&engine, &executor);
     let mut probe = request(&engine, false);
     if natural_eos {
         probe.metadata.remove("ferrum_ignore_eos");
@@ -216,12 +238,18 @@ async fn startup_with_wait_and_natural_eos(
     }
     // Same declared program/geometry, different contents: users cannot inherit
     // the startup source's checkpoint by matching its cached token prefix.
-    probe.prompt = vec!["test"; PROMPT].join(" ");
-    let template =
-        AutomaticCostProbeTemplate::new(probe, AutomaticCostProbeOutput::CliText).unwrap();
+    let templates = prompt_lengths
+        .iter()
+        .map(|&length| {
+            let mut probe = probe.clone();
+            probe.id = RequestId::new();
+            probe.prompt = vec!["test"; length].join(" ");
+            AutomaticCostProbeTemplate::new(probe, AutomaticCostProbeOutput::CliText).unwrap()
+        })
+        .collect();
     let engine = tokio::time::timeout(
         Duration::from_secs(180),
-        engine.finish_automatic_startup_with_probes(vec![template]),
+        engine.finish_automatic_startup_with_probes(templates),
     )
     .await
     .expect("original automatic startup exceeded its declared probe bounds")

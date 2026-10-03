@@ -8,7 +8,7 @@ pub(super) async fn submit(
     executor: &ControlledExecutor,
     ids: &[RequestId],
 ) {
-    submit_checked(session, executor, ids, ids.len(), false, None).await;
+    submit_checked(session, executor, ids, ids.len(), false, None, None).await;
     assert!(session.frontiers().unwrap().is_empty());
 }
 
@@ -42,6 +42,7 @@ pub(super) async fn submit_nonterminal(
         ids.len(),
         requires_forward_tail,
         Some(maximum_tokens),
+        None,
     )
     .await;
     let frontiers = session.frontiers().unwrap();
@@ -57,7 +58,24 @@ pub(super) async fn submit_capacity_limited(
     // Every ready decoder needs service in the common witness. With one row
     // per wave, multiple decoders require a genuine, independently replayed
     // tail even though only its first wave may execute.
-    submit_checked(session, executor, ids, 1, false, None).await;
+    submit_checked(session, executor, ids, 1, false, None, None).await;
+}
+
+pub(super) async fn submit_capacity_limited_greedy(
+    session: &CalibrationSession,
+    executor: &ControlledExecutor,
+    ids: &[RequestId],
+) {
+    submit_checked(
+        session,
+        executor,
+        ids,
+        1,
+        false,
+        None,
+        Some(StructuredProductV2::GreedyToken),
+    )
+    .await;
 }
 
 async fn submit_checked(
@@ -67,6 +85,7 @@ async fn submit_checked(
     maximum_rows: usize,
     requires_forward_tail: bool,
     maximum_tokens: Option<usize>,
+    actual_product: Option<StructuredProductV2>,
 ) {
     let inner = session.test_engine_inner();
     let runtime = inner.cost_runtime.as_ref().unwrap();
@@ -98,6 +117,7 @@ async fn submit_checked(
         }
     };
     assert_eq!(executor.physical.load(Ordering::Acquire), physical_before);
+    let actual_receipt = actual_product.map(|_| prepared.calibration_receipt().unwrap());
     // A Selected result alone could be a safe CompleteRequests fallback.
     // Only the original once-only witness audit proves cost-guided execution.
     inner.execute_slo_controller_wave(prepared).await.unwrap();
@@ -126,6 +146,20 @@ async fn submit_checked(
         after.hard_budget_exhaustions,
         before.hard_budget_exhaustions
     );
+    if let Some(receipt) = actual_receipt {
+        receipt.wait_observation().await;
+        let report = receipt.report(None);
+        assert!(report.error.is_none(), "{report:?}");
+        assert_eq!(
+            report.submission,
+            CalibrationSubmissionState::HostReconciled
+        );
+        assert_eq!(
+            report.structured_cost_input_v2().unwrap().owner().product,
+            actual_product.unwrap(),
+            "the actually submitted clean GreedyLength wave remains GreedyToken"
+        );
+    }
     if ids.len() <= maximum_rows && !requires_forward_tail {
         assert_eq!(
             after.witnesses.decisions.waves_total,

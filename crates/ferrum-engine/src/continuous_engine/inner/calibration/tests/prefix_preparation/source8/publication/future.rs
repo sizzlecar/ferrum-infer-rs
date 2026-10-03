@@ -13,6 +13,14 @@ pub(super) async fn submit_capacity_limited_witness(
     witness::submit_capacity_limited(session, executor, ids).await;
 }
 
+pub(super) async fn submit_capacity_limited_greedy_witness(
+    session: &CalibrationSession,
+    executor: &ControlledExecutor,
+    ids: &[RequestId],
+) {
+    witness::submit_capacity_limited_greedy(session, executor, ids).await;
+}
+
 pub(super) async fn submit_nonterminal_witness(
     session: &CalibrationSession,
     executor: &ControlledExecutor,
