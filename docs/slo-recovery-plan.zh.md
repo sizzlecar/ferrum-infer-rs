@@ -6,7 +6,37 @@
 
 下一份可运行检查点以同一条产品链路验收：正常 `run` / `serve` 从空成本状态自动完成准备和原独立资格阶段，发布有效成本模型，内容不同但处于支持范围内的普通请求在执行前得到预测，Enforce 实际采用，真实提交与回执配对，输出完整且资源可退役。用户无需手工训练、导入成本文件或设置隐藏环境组合。CPU 正例先约束组合行为，再以同一源码验证真实后端；该检查点通过后才进入完整性能验收，不把它标成最终发布完成。
 
-## 同一候选的四入口实机结果
+## G10：同一候选的四入口实机结果
+
+2026 年 10 月 3 日，`39eebad8` 的 Metal/CUDA 正常 `run`、`serve` 已全部结束。仍无完整可交付版本，正式验收 **0/224**。本次包含两项修复：同一次 captured outcome 的原始配方共享，以及区分保留全部 native commands 的 adaptive replay 与 sealed direct invocation。前者保持完整配方存活期和引用计账，后者仅恢复原物理凭据，不把 GraphPath Unknown 改成数值合格。两项分别有修复前失败与修复后通过的 Rust 反例，真实 CUDA cold graph 及取消后 fence 生命周期检查也通过。
+
+规定的 fmt、workspace check/test、Clippy（`-A warnings`）、Metal 全目标编译、CUDA pinned native lock 下的 CLI check 均通过。全仓测试为 7870 pass、0 fail、109 ignored；两个 release 默认 2ms 受控 CPU 探针通过。两端 release 实际产物与同一份 3352 文件源码清单已独立核对。上述检查不证明真实并发规划满足 2ms，也不替代完整功能和 SLO 验收。
+
+| 入口 | 冻结候选的实机结果 | 未通过的条件 |
+| --- | --- | --- |
+| Metal `run` | 合并候选获授权；完成 286/448 cohorts，两份来源发布 | 原成本校准序列用尽约 120s；独立 reference probe 另耗约 62s，整个 bootstrap 约 182s；原 512-token 计数输出仍被上限截断 |
+| Metal `serve` | 完成 714/1773 cohorts，首份来源发布；普通窗口实际提交、配对各增加 85 | 合并需 42,333,242 bytes、可用 34,195,039，仍未获授权；source1 出现一次 700,296ns qualification underestimate，随后临近期限发生 restore unavailable，底层拒绝原因未记录；三项延迟 P99 失败 |
+| CUDA `run` | 首份来源完成 132 cohorts、F/R/Q 为 48/32/32，发布 epoch1；已跨过旧 physical settlement 阻断 | source1 第二个 cohort 出现 `invalid structured numerical replay`，最终 133/621 cohorts、一份来源；不是预算耗尽；原 1536-token 计数输出仍被上限截断 |
+| CUDA `serve` | 输入清单完成；两份来源、170/353 cohorts、epoch2；普通窗口实际提交、配对各增加 21，上一版为 0 | source2 第二个 cohort 在序列约 50.59s 时同样出现数值回放拒绝；必要域覆盖和真实规划预算仍未证明，TPOT P99 失败 |
+
+来源数量仅用于描述选中计划的执行状态，不是独立验收门槛或覆盖率。普通窗口由 health-before/after 差值确定，覆盖各 32 warmup + 32 measured 请求：Metal witness decision/submitted/reconciled 为 131/85/85，CUDA 为 25/21/21；不能用启动与 live 的累计 issued/actual 替换此窗口，也不能把非零采用写成完整覆盖。CUDA startup 有 14 次实际 capture、114 次 restore；普通窗口两者没有增长，健康截点的临时 checkpoint 占用和清理队列为 0。
+
+两端服务保持 Qwen3.5-9B Q4_K_M / KV fp16、同机、同配置、固定 C8、原 pinned ShareGPT 64 条选样与输出长度策略，1 次重复，各 64 请求完成且错误为 0。主口径取原 Rust SLO sidecar；TPOT 终点为最后可见输出，ITL 为相邻非空可见 SSE 文本事件间隔。
+
+| 后端 | TTFT P50/P99 ms | TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | successful output tokens/s | 峰值内存 | 原 SLO |
+| --- | --- | --- | --- | --- | --- | --- |
+| Metal | 972.894 / 4869.827 | 193.295 / 219.297 | 176.316 / 873.740 | 36.748 | MTL 8,598,831,104 B；host RSS 651,296,768 B、footprint 2,101,611,184 B | 三项 P99 失败，joint 3/32 |
+| CUDA | 69.468 / 113.617 | 19.045 / 20.896 | 17.839 / 42.406 | 338.596 | runtime requested 23,216,118,580 B；NVML 整卡 23,651 MiB；host max RSS 6,686,984 KiB | TTFT、pooled ITL P99 通过，TPOT 失败；joint 0/32 |
+
+每端 measured 均为 9210 usage tokens、9179 可见文本事件、9147 间隔；两条 event/usage 不一致请求仍计入可见停顿，没有观察到传输合并。角色、空与结束消息不计入 ITL。内存峰值覆盖启动到退出，采样可能漏过瞬时高点；口径重叠不相加，WSL per-process NVML 不可用。单轮诊断没有重复间置信区间或同构建 Off 配对，不能据此认定性能收益或正式矩阵通过。
+
+两端另以既有算术任务 `What is 17 + 25? Reply with only the number.` 验证正常 CLI 的单次完整输出：stdout 均恰为 `42`，usage 为 28 prompt / 3 completion tokens，terminal `finish_reason=stop`，guard/product 均退出 0。该任务增加了 `--profile-jsonl` 以取得终态证据；即使 detail 为 off，也写入约 0.95GB 的启动与执行事件。完整文件保留在原主机，外部证据包保存末条 terminal record 及全文件 hash/size 收据。本项只证明该任务语义和自然终态，不作为性能、完整模型质量或相同校准轨迹证明。CUDA 原服务恢复并健康，最后 PID 436776。
+
+本轮没有满足“正常自动链路检查点”。下一步先取数值拒绝的 typed reason、触发位置与原事件身份，不根据固定 universe 的静态可达路径猜测失败算法，也不把 WrongDomain 全部改成非成员；同时拆解 Metal 合并峰值与必要工作量，重判原预算下的覆盖可行性。四入口完整闭环未通过前，不启动 224 单元正式矩阵。
+
+独立结果位于外部证据目录 `/private/tmp/ferrum-slo-recovery-20261002`：`g10-backend-build-identity-audit.json`、四份 `g10-final-{metal,cuda}-{run,serve}-results.json`、`g10-basic-output-results.json` 和各原始 evidence archive；状态汇总为 `g10-validation-status.json`。源码已 push，原 dirty 工作区未改。
+
+## G9：同一候选的四入口实机结果（历史）
 
 2026 年 10 月 3 日，冻结候选 `c00a0b30` 的 Metal/CUDA 正常 `run` 与 `serve` 均已结束。业务代码对应 `88e298de`，后续差异只有两个 inventory 测试计账和文档。当前仍无完整可交付版本，正式验收为 **0/224**。完整校准计划成功、普通请求实际采用和客户端 SLO 分别判定；来源数量不是独立的 4/4 门槛。
 
