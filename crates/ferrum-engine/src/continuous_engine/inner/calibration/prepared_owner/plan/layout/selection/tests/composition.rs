@@ -343,7 +343,8 @@ fn local_combination_peak_authorization_preserves_raw_path_on_capacity_denial() 
     // A declaration consumes additional retained bytes even when this one-
     // algorithm fixture cannot benefit from a wider local source.
     assert!(
-        super::super::composition::extra_peak(&opportunities, &seed).unwrap()
+        super::super::composition::extra_peak(&opportunities, &seed, raw.populations.len())
+            .unwrap()
             > seed.retained_payload_bytes().unwrap()
     );
 }
@@ -392,6 +393,124 @@ fn algorithm_pair_inventory(
         }
     }
     (cases, opportunities, inputs, population)
+}
+
+#[test]
+fn local_combination_repeated_groups_charge_one_retained_scope_per_candidate() {
+    use std::num::NonZeroU64;
+
+    let (mut cases, mut opportunities, mut inputs, population) = algorithm_pair_inventory([1, 1]);
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    let requests = 2048;
+    let before_groups = member_groups(&opportunities).unwrap();
+    let before = super::super::memory::plan(
+        &before_groups,
+        &opportunities,
+        &inputs,
+        requests,
+        Some(&population.settings),
+    )
+    .unwrap();
+    let originals = (cases.clone(), opportunities.clone(), inputs.clone());
+    // More original requests in the same checked families grow case vectors,
+    // but cannot create another simultaneously retained candidate universe.
+    for _ in 0..population.settings.max_rank {
+        cases.extend(originals.0.iter().cloned());
+        opportunities.extend(originals.1.iter().cloned());
+        inputs.extend(originals.2.iter().cloned());
+    }
+    let groups = member_groups(&opportunities).unwrap();
+    let memory = super::super::memory::plan(
+        &groups,
+        &opportunities,
+        &inputs,
+        requests,
+        Some(&population.settings),
+    )
+    .unwrap();
+    assert_eq!(memory.guaranteed_groups, before.guaranteed_groups);
+    assert!(memory.guaranteed_cases > before.guaranteed_cases);
+    assert!(memory.batch_scratch_bytes > before.batch_scratch_bytes);
+    // The original inventory-sized bound remains a conservative reference;
+    // only its nonexistent per-mention scopes are removed from the tight cap.
+    let full_inventory_extra =
+        super::super::composition::extra_peak(&opportunities, &seed, memory.key_mentions).unwrap();
+    let duplicate_scope_charge = super::super::composition::builder_limit(&seed).unwrap()
+        * (memory.key_mentions - memory.guaranteed_groups);
+    let full_inventory_peak = memory.required_peak_bytes + full_inventory_extra;
+    let candidate_peak = full_inventory_peak - duplicate_scope_charge;
+    assert!(candidate_peak < full_inventory_peak);
+    assert!(candidate_peak > memory.required_peak_bytes);
+    eprintln!(
+        "local scope memory: mentions={} groups={} full_inventory_peak={} candidate_peak={}",
+        memory.key_mentions, memory.guaranteed_groups, full_inventory_peak, candidate_peak
+    );
+    assert!(composition_authorized(
+        &opportunities,
+        &inputs,
+        requests,
+        &population,
+        true,
+        candidate_peak,
+        &seed,
+    )
+    .unwrap());
+    assert!(!composition_authorized(
+        &opportunities,
+        &inputs,
+        requests,
+        &population,
+        true,
+        candidate_peak - 1,
+        &seed,
+    )
+    .unwrap());
+
+    let run = |maximum, work: &mut StructuredInputGeometryWorkV1| {
+        select_with_capacity(
+            &cases,
+            &opportunities,
+            &inputs,
+            &[61, 61],
+            8,
+            None,
+            &population,
+            SelectionCapacity::legacy(requests, 10_000_000),
+            maximum,
+            None,
+            None,
+            Some(work),
+            NonZeroUsize::new(1),
+            Some(&seed),
+        )
+    };
+    let work_limit = NonZeroU64::new(32_000_000).unwrap();
+    let mut rejected_work = StructuredInputGeometryWorkV1::new(work_limit);
+    assert!(run(candidate_peak - 1, &mut rejected_work).is_err());
+    assert_eq!(rejected_work.visits(), 0);
+    let mut expected_work = StructuredInputGeometryWorkV1::new(work_limit);
+    let expected = run(full_inventory_peak, &mut expected_work).unwrap();
+    let mut actual_work = StructuredInputGeometryWorkV1::new(work_limit);
+    let actual = run(candidate_peak, &mut actual_work).unwrap();
+    assert_eq!(actual_work.visits(), expected_work.visits());
+    assert_eq!(
+        serde_json::to_value(&actual).unwrap(),
+        serde_json::to_value(&expected).unwrap(),
+        "the complete plan, member floors, work ledgers and typed gaps are unchanged"
+    );
+    let scheduled: Vec<_> = actual
+        .batches
+        .iter()
+        .filter(|batch| batch.scheduled)
+        .collect();
+    assert_eq!(scheduled.len(), 1);
+    assert!(scheduled[0].algorithm_universe.is_some());
+    assert!(actual.populations.iter().all(|member| member.scheduled));
+    assert!(
+        memory.retained_groups_bytes + actual.retained_payload_bytes().unwrap() <= candidate_peak
+    );
 }
 
 #[test]

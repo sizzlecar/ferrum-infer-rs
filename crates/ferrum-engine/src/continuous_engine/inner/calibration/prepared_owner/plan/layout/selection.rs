@@ -672,7 +672,7 @@ pub(super) fn select_with_capacity_and_trajectories(
         "Automatic input selection retained memory stages"
     );
     let combination_charge = combination_seed
-        .map(|seed| composition::extra_peak(opportunities, seed))
+        .map(|seed| composition::extra_peak(opportunities, seed, memory.guaranteed_groups))
         .transpose()?
         .unwrap_or(0);
     let peak = add(memory.required_peak_bytes, combination_charge)?;

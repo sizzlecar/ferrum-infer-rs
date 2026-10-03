@@ -17,17 +17,21 @@ pub(super) fn builder_limit(seed: &DeclaredAlgorithmUniverseV1) -> Result<usize>
     )
 }
 
-/// Each candidate may retain one local declaration. Charge all surviving
-/// scopes plus the builder/replacement and source-local opportunity arrays.
-/// Raw and projected facts never share a numerical sample or member floor.
+/// Each guaranteed group creates at most one candidate/local declaration.
+/// Coalescing only removes candidates, and append moves them into output.
+/// Repeated case mentions grow vectors, not the number of retained scopes.
+/// Keep two additional builder/replacement slots beside every possible scope
+/// and the complete source-local opportunity arrays. Raw and projected facts
+/// never share a numerical sample or member floor.
 pub(super) fn extra_peak(
     opportunities: &[CaseOpportunity],
     seed: &DeclaredAlgorithmUniverseV1,
+    retained_group_count: usize,
 ) -> Result<usize> {
     let (mentions, guaranteed) = selection_inventory_cardinality(opportunities)?;
     add(
         add(
-            mul(builder_limit(seed)?, add(mentions, 2)?)?,
+            mul(builder_limit(seed)?, add(retained_group_count, 2)?)?,
             add(
                 mul(vector_peak_bytes::<usize>(add(mentions, guaranteed)?)?, 6)?,
                 mul(vector_peak_bytes::<CaseOpportunity>(guaranteed)?, 2)?,
@@ -64,7 +68,23 @@ pub(super) fn authorized(
         remaining_requests,
         geometry_enabled.then_some(&population.settings),
     )?;
-    Ok(add(memory.required_peak_bytes, extra_peak(opportunities, seed)?)? <= maximum_bytes)
+    let extra_peak = extra_peak(opportunities, seed, memory.guaranteed_groups)?;
+    let required_peak = add(memory.required_peak_bytes, extra_peak)?;
+    let authorized = required_peak <= maximum_bytes;
+    let seed_bytes = seed
+        .retained_payload_bytes()
+        .ok_or_else(|| error("combination seed capacity overflow"))?;
+    tracing::info!(
+        seed_algorithms = seed.algorithm_count(),
+        seed_bytes,
+        retained_group_count = memory.guaranteed_groups,
+        required_peak,
+        extra_peak,
+        remaining = maximum_bytes,
+        authorized,
+        "Automatic local composition retained memory authorization"
+    );
+    Ok(authorized)
 }
 
 /// Exactly the capacity predicate used by original append_batch, before any
