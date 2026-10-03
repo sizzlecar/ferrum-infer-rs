@@ -6,7 +6,41 @@
 
 下一份可运行检查点以同一条产品链路验收：正常 `run` / `serve` 从空成本状态自动完成准备和原独立资格阶段，发布有效成本模型，内容不同但处于支持范围内的普通请求在执行前得到预测，Enforce 实际采用，真实提交与回执配对，输出完整且资源可退役。用户无需手工训练、导入成本文件或设置隐藏环境组合。CPU 正例先约束组合行为，再以同一源码验证真实后端；该检查点通过后才进入完整性能验收，不把它标成最终发布完成。
 
-native 前缀准备现已接入共享自动启动，但当前实机结果仍未满足可用版本验收。G8 四入口证据固定对应 `8307ffec`；后续候选只处理已定位原因，不扩大硬件矩阵。局部修复和下面的诊断均不计正式进度，仍为 **0/224**。
+## 同一候选的四入口实机结果
+
+2026 年 10 月 3 日，冻结候选 `c00a0b30` 的 Metal/CUDA 正常 `run` 与 `serve` 均已结束。业务代码对应 `88e298de`，后续差异只有两个 inventory 测试计账和文档。当前仍无完整可交付版本，正式验收为 **0/224**。完整校准计划成功、普通请求实际采用和客户端 SLO 分别判定；来源数量不是独立的 4/4 门槛。
+
+规定的本地 fmt、workspace check/test、Clippy（`-A warnings`）和 Metal 全目标编译均通过；全仓测试为 7863 pass、0 fail、109 ignored，未重复累计子进程测试。另有两个 release 默认 2ms 受控 CPU 探针通过；它们不证明真实并发规划可行。配置好的 CUDA 主机完成 pinned H39 lock 下的规定 CLI check 与 release 构建，两端实际 Cargo artifact、冻结二进制和同一份 3351 文件源码清单已核对。
+
+| 入口 | 本次实机结果 | 结论边界 |
+| --- | --- | --- |
+| Metal `run` | 120s 内完成 271/448 cohorts，保留两份已发布来源；原 512-token 作业结束 | 来源数不作为覆盖率，达到原输出上限不算完整计数任务；不能替代 serving SLO |
+| Metal `serve` | 120s 内仍为 705/1773 cohorts、一份已发布来源；普通窗口 witness 实际提交和回执均增加 108 | 三项延迟 P99 仍失败；合并候选在保留原始输入时的容量门仍不通过 |
+| CUDA `run` | 9 次实际 private acquisition ACK；在 source 0 的 cohort 9、call 521 停止，启动未发布；原 1536-token 输出与 G8、先前 G9 逐字节一致 | 原主机结算完整，但物理凭据为空，报 `incomplete original source5 preparation settlement`；随后 live 发布不能补成启动成功 |
+| CUDA `serve` | 完整 inventory 消耗 16156 次投影，55.22s 完成选定的 297 cohorts，并发布四份来源 | 准备复用首次在原 16384 上限内通过这条实机路径；普通窗口 witness decision/submitted/reconciled 均为 0，尚无实际采用闭环，TPOT P99 失败 |
+
+两端 serving 都是原 pinned ShareGPT、固定 C8、32 warmup + 32 measured、1 次重复、Qwen3.5-9B Q4_K_M / KV fp16；各 64 请求完成且错误为 0。measured 均为 9210 usage tokens、9179 非空可见 SSE 文本事件、9147 可见间隔，32 条输出长度均匹配原 reference policy。两条 event/usage 不一致请求仍计入可见停顿。以下仅为因果诊断，不是正式主表或自身 Off 对比。
+
+| 后端 | TTFT P50/P99 ms | TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | 输出 tokens/s | 峰值内存 | 原 SLO |
+| --- | --- | --- | --- | --- | --- | --- |
+| Metal | 967.888 / 4835.555 | 192.967 / 235.942 | 174.600 / 872.762 | 37.083 | MTL 8.008 GiB；host RSS 0.536 GiB、footprint 1.980 GiB | 三项 P99 失败，joint 3/32 |
+| CUDA | 69.362 / 138.113 | 18.975 / 20.523 | 18.013 / 39.315 | 344.629 | runtime requested 21.622 GiB；NVML 整卡 23.121 GiB；host max RSS 6.366 GiB | TTFT、pooled ITL P99 通过，TPOT 失败；joint 1/32 |
+
+峰值覆盖进程启动至退出；采样可能漏过瞬时高点。内存口径重叠、不相加；WSL 的 NVML per-process accounting 不可用，整卡占用不能称产品进程独占。单轮不提供重复间置信区间；pooled ITL 达标不等于逐请求联合达标。CUDA 普通候选查询仅 1 Known、439 WrongDomain，且发生大量规划预算耗尽；现有计数不含逐请求/family/shape 关联，不能据此断言唯一原因或宣称必要域已覆盖。
+
+本轮纠正了一个关键推断：Metal 实际 composition 需要 42,333,242 bytes，可用 28,278,996；先前引用的 55,717,403 是拒绝 composition 并释放原始输入后的 raw selection 额度。二者不能互换。局部 CPU 回归没有证明真实释放前的容量门可行，27,438,407 bytes 差额也不是新增 geometry cache 的持久占用。下一步针对同一真实 outcome 被各 case 深复制的原配方，在完整存活期和引用账下验证共享，先取得最小反例，不提高预算或提前丢弃 scope 投影所需输入。CUDA serving 同一 composition 容量门也未通过，尚不能把四份 raw 来源视作完整合并支持域。
+
+CUDA `run` 的失败已沿原凭据链定位：实际 adaptive graph capture/replay 保留全部原 native commands 并标为 Replayed，而 direct invocation 使用单条物理调用及 sealed logical expansion；当前投影把两种表示都要求完整 direct replay segments。真实日志显示 capture/upload/replay 各一次、原主机行完整，但 physical evidence 为 None。后续最小验证保留 GraphPath Unknown、direct 缺账拒绝和原 FIFO/时钟边界，核实 runtime 已声明的 direct replay operation 能否让物理投影正确区分两种表示；不伪造 Known shape 或放宽最终 collector。
+
+Metal 首次 serve 在产品启动前因新增 `RUST_LOG` 与原 guard 的自有过滤器冲突退出，已保留失败并用移除该覆盖的独立 r2 目录运行。CUDA 首次 release 因原容器 `sleep 21600` 到期中断，既有缓存下重新构建通过；这两项不混算成产品回归或成功运行。四入口工作结束后 CUDA 原服务已恢复，最终 PID 197273、健康正常。原 dirty 工作区未改。
+
+本轮证据在 `/private/tmp/ferrum-slo-recovery-20261002`：`g9-final-local-test-audit.json`、`g9-c00-backend-build-identity-audit.json`、`g9-final-metal-run-results.json`、`g9-final-cuda-run-results.json`、`g9-final-metal-serve-results.json`、`g9-final-cuda-serve-results.json`，以及四个 `g9-final-*-evidence/` 原始目录。`g9-metal-composition-pre-release-audit.json` 和 `g9-c00-normal-workload-coverage-checklist.json` 分别记录容量推断纠正和验收边界。原 300 条计数 prompt 是历史 CLI 因果诊断，不是另加的最终业务门槛；自然终态与完整输出合同另用已有明确语义任务核验。
+
+随后仅新增最小 Rust 反例，未修改生产：真实 `collect_ready → freeze_inventory` 在释放前因同 outcome 原配方深复制而拒绝合并，0 pass / 1 fail、0.32s；完整原 replay commands 的 typed projector 仍无物理凭据，0 pass / 1 fail、0.06s。日志为 `g10-shared-recipe-before.log` 和 `g10-adaptive-replay-physical-before.log`。新增真实 CUDA cold graph 结构断言尚未执行；CPU 失败不冒充该 GPU 证明。下一轮改动与验证另记，不覆盖本轮冻结负结果。
+
+## G9 局部检查与先前诊断（历史）
+
+native 前缀准备已接入共享自动启动。以下记录早于上面的 `c00a0b30` 四入口结果；其中的待验证状态不得当作当前结论。G8 四入口证据固定对应 `8307ffec`，先前 G9 诊断对应 `186c0008`。
 
 G9 当前已完成两项局部修复：`38e8b069` 将 Metal 合并候选的 retained scope 预留从重复 key 引用数改为实际存活候选上界；原失败回归修复后通过，selection 全组 54 pass。`196c8df3` 在同一次 captured view 内复用已验证的 prefill 路径；完整小场景从 33 次实际投影降为 23 次，保留 Share/Replay 全部输出、Unknown、分支和容量检查，geometry 全组 29 pass。首次全组的旧 eviction 计费断言失败已保留：单槽复用使合法准备从 14 次降为 13 次，按逐动作账更新后通过。两项修复均未扩大预算；尚未完成这份候选的 workspace 和实机验证。
 
