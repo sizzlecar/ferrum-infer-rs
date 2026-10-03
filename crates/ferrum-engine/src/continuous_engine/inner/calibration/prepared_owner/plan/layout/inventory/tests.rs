@@ -298,6 +298,15 @@ async fn checked_inventory_captures_later_cpu_algorithm_without_inventing_member
         2,
         "the endpoint must capture the actual second CPU primitive beyond the first frontier"
     );
+    assert_eq!(inventory.algorithm_case_inputs.len(), 1);
+    let linked = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(
+            inventory.algorithm_case_inputs[0].iter().map(|&index| inventory.algorithm_inputs[index].as_ref()), 4096,
+        ).unwrap();
+    assert_eq!(
+        linked, universe,
+        "later real trajectory recipes retain their original case provenance"
+    );
     assert_eq!(inventory.opportunities[0].minimum_fresh_members, 0);
     assert!(session
         .engine

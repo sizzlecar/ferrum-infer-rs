@@ -43,7 +43,7 @@ pub(in crate::continuous_engine::inner::calibration) enum ColdSourceRebuild {
     Skip(ColdSourceSkip),
 }
 
-fn opportunity_heap_bytes(opportunity: &CaseOpportunity) -> Option<usize> {
+pub(super) fn opportunity_heap_bytes(opportunity: &CaseOpportunity) -> Option<usize> {
     let capacity = match &opportunity.population {
         CasePopulation::Unique(_) => 0,
         CasePopulation::Alternatives(keys) => keys.capacity(),
@@ -83,6 +83,15 @@ pub(super) fn freeze_sources(
         if batch.planned_cycles == 0 || batch.representative_case_indices.is_empty() {
             return Err(error("source input reservation has no original cycle"));
         }
+        if batch
+            .scoped_opportunities
+            .as_ref()
+            .is_some_and(|items| items.len() != batch.representative_case_indices.len())
+        {
+            return Err(error(
+                "source scope opportunities differ from original cases",
+            ));
+        }
         bound = add(
             bound,
             mul(
@@ -92,10 +101,17 @@ pub(super) fn freeze_sources(
                     + std::mem::size_of::<usize>(),
             )?,
         )?;
-        for &index in &batch.representative_case_indices {
-            let opportunity = opportunities
+        for (position, &index) in batch.representative_case_indices.iter().enumerate() {
+            let original = opportunities
                 .get(index)
                 .ok_or_else(|| error("source opportunity outside original inventory"))?;
+            let opportunity = batch
+                .scoped_opportunities
+                .as_ref()
+                .map_or(original, |items| &items[position]);
+            if opportunity.minimum_fresh_members != original.minimum_fresh_members {
+                return Err(error("source scope changed original fresh member floor"));
+            }
             bound = add(
                 bound,
                 opportunity_heap_bytes(opportunity)
@@ -140,7 +156,7 @@ pub(super) fn freeze_sources(
             .prompts
             .try_reserve_exact(count)
             .map_err(|_| error("source prompt allocation failed"))?;
-        for &index in &batch.representative_case_indices {
+        for (position, &index) in batch.representative_case_indices.iter().enumerate() {
             let case = &cases[index];
             let prompt = prompts[case.template];
             let work = work::case_work(case, prompt, chunk.get() as usize, row_ceiling)?;
@@ -148,7 +164,13 @@ pub(super) fn freeze_sources(
             source.declared_offer_rows =
                 add(source.declared_offer_rows, work.serial_declared_offer_rows)?;
             source.cases.push(case.clone());
-            source.opportunities.push(opportunities[index].clone());
+            source.opportunities.push(
+                batch
+                    .scoped_opportunities
+                    .as_ref()
+                    .map_or(&opportunities[index], |items| &items[position])
+                    .clone(),
+            );
             source.prompts.push(prompt);
         }
         source.collection_actions = mul(source.collection_actions, source.original_cycles)?;

@@ -232,6 +232,49 @@ fn checked_decode_journal_covers_context_families_before_wider_auxiliary_sources
         original,
         serde_json::to_value((&input.cases, &input.opportunities, &input.facts)).unwrap()
     );
+    let population = population::declaration(&Default::default(), fixture::domain()).unwrap();
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(input.facts.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    let scoped = select_with_local_composition(
+        &input.cases,
+        &input.opportunities,
+        &input.facts,
+        &input.prompts,
+        8,
+        None,
+        &population,
+        100_000,
+        10_000_000,
+        usize::MAX,
+        None,
+        None,
+        None,
+        NonZeroUsize::new(1),
+        Some(&seed),
+    )
+    .unwrap();
+    let union = scoped.batches.iter().find(|batch| batch.scheduled).unwrap();
+    let local = union.algorithm_universe.as_ref().unwrap();
+    assert_eq!(
+        union.representative_case_indices, batch.representative_case_indices,
+        "one source retains both real context families and their raw endpoints"
+    );
+    for &index in &batch.representative_case_indices {
+        assert!(input.facts[index][0]
+            .original
+            .as_ref()
+            .unwrap()
+            .numerical_family_key_for_universe(local)
+            .is_ok());
+    }
+    assert!(union.planned_cycles < batch.planned_cycles);
+    assert!(scoped.requests < selected.requests);
+    assert_eq!(
+        local.algorithm_count(),
+        2,
+        "unselected wider and different-product recipes remain outside local scope"
+    );
 }
 
 #[test]
@@ -374,6 +417,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(requests, usize::MAX),
         None,
         None,
+        false,
     )
     .unwrap());
     assert!(!grouping::preserves_scheduled(
@@ -384,6 +428,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(usize::MAX, waves),
         None,
         None,
+        false,
     )
     .unwrap());
     let later = [
@@ -403,6 +448,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         },
         None,
         None,
+        false,
     )
     .unwrap());
     assert!(!grouping::preserves_scheduled(
@@ -413,6 +459,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(requests, usize::MAX),
         None,
         None,
+        false,
     )
     .unwrap());
     assert!(grouping::preserves_scheduled(
@@ -423,6 +470,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(usize::MAX, usize::MAX),
         None,
         None,
+        false,
     )
     .unwrap());
     assert!(grouping::preserves_scheduled(
@@ -433,6 +481,7 @@ fn checked_decode_journal_preserves_prior_and_later_complete_source_reservations
         SelectionCapacity::legacy(usize::MAX, usize::MAX),
         None,
         NonZeroUsize::new(1),
+        false,
     )
     .unwrap());
 }

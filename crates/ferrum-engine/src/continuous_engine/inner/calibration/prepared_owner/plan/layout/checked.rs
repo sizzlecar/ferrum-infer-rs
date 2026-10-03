@@ -228,7 +228,7 @@ fn freeze_inventory(
         inventory.release_original_inputs();
     }
     let geometry_work = budget.input_geometry_work(input.input_geometry_visit_limit)?;
-    let mut selection = selection::select_with_capacity(
+    let mut selection = selection::select_with_capacity_and_trajectories(
         &cases,
         &inventory.opportunities,
         &inventory.inputs,
@@ -253,6 +253,7 @@ fn freeze_inventory(
         geometry_work,
         Some(input.maximum_retained_sources),
         seed.filter(|_| with_composition),
+        with_composition.then_some(&inventory),
     )?;
     inventory.release_original_inputs();
     if seed.is_some_and(|seed| seed.algorithm_count() >= 2) && !with_composition {
@@ -479,6 +480,7 @@ async fn collect_ready(
         .checked_mul(
             std::mem::size_of::<CaseOpportunity>()
                 + std::mem::size_of::<Vec<selection::CheckedInputFacts>>()
+                + std::mem::size_of::<Vec<usize>>()
                 + std::mem::size_of::<inventory::InventoryGap>()
                 + std::mem::size_of::<bool>()
                 + 2 * std::mem::size_of::<usize>()
@@ -508,6 +510,7 @@ async fn collect_ready(
             .collect(),
         inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
         algorithm_inputs: Vec::new(),
+        algorithm_case_inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
         gaps: Vec::with_capacity(cases.len()),
         charge: ProbePreflightCharge::default(),
     };
@@ -580,10 +583,9 @@ async fn collect_ready(
                     .ok_or_else(|| error("algorithm capture retained overflow"))?,
             )
             .ok_or_else(|| error("algorithm capture retained overflow"))?;
-        for input in &captured.algorithm_inputs {
-            out.retain_algorithm_input(input, maximum_bytes, external)?;
-        }
+        out.merge_algorithms(&captured, &indices, maximum_bytes, external)?;
         drop(captured.algorithm_inputs);
+        drop(captured.algorithm_case_inputs);
         for ((&global, opportunity), facts) in indices
             .iter()
             .zip(captured.opportunities.into_iter())

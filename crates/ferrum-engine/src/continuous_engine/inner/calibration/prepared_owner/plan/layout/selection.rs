@@ -229,6 +229,10 @@ pub(in crate::continuous_engine::inner::calibration) struct SelectedBatch {
     /// Input-only local scope, qualified only by this source's real F/R/Q.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub algorithm_universe: Option<ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
+    /// Original member floors with the final declared numerical family. Cold
+    /// preparation must retain this scope rather than restoring raw phase counts.
+    #[serde(skip)]
+    pub(super) scoped_opportunities: Option<Vec<CaseOpportunity>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -360,6 +364,17 @@ impl CheckedSelection {
             )?;
         }
         for batch in &self.batches {
+            if let Some(opportunities) = &batch.scoped_opportunities {
+                bytes = bytes.checked_add(
+                    opportunities
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<CaseOpportunity>())?,
+                )?;
+                for opportunity in opportunities {
+                    bytes =
+                        bytes.checked_add(source_inputs::opportunity_heap_bytes(opportunity)?)?;
+                }
+            }
             bytes = bytes.checked_add(
                 batch
                     .algorithm_universe
@@ -582,8 +597,55 @@ pub(super) fn select_with_capacity(
     maximum_sources: Option<NonZeroUsize>,
     combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
 ) -> Result<CheckedSelection> {
+    select_with_capacity_and_trajectories(
+        cases,
+        opportunities,
+        inputs,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        population,
+        capacity,
+        maximum_retained_bytes,
+        changed,
+        selected_priority,
+        geometry_work,
+        maximum_sources,
+        combination_seed,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_with_capacity_and_trajectories(
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    capacity: SelectionCapacity,
+    maximum_retained_bytes: usize,
+    changed: Option<&[CheckedPopulationKey]>,
+    selected_priority: Option<u8>,
+    mut geometry_work: Option<&mut StructuredInputGeometryWorkV1>,
+    maximum_sources: Option<NonZeroUsize>,
+    combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
+    trajectories: Option<&inventory::CheckedCaseInventory>,
+) -> Result<CheckedSelection> {
     if cases.len() != opportunities.len() || cases.len() != inputs.len() {
         return Err(error("checked selection inventory length differs"));
+    }
+    if trajectories.is_some_and(|inventory| {
+        inventory.algorithm_case_inputs.len() != cases.len()
+            || inventory
+                .algorithm_case_inputs
+                .iter()
+                .flatten()
+                .any(|&i| i >= inventory.algorithm_inputs.len())
+    }) {
+        return Err(error("checked trajectory inventory alignment differs"));
     }
     if cases.iter().any(|case| case.width == 0) {
         return Err(error("checked selection case has no original requests"));
@@ -796,20 +858,29 @@ pub(super) fn select_with_capacity(
             batch,
         });
     }
-    // Freeze the original opportunity order before coalescing. A grouped
-    // journal retains its earliest source position; the bounded merge check
-    // preserves every source that this exact original traversal can schedule.
+    // Raw representative selection protects each algorithm's positive range,
+    // branch and width endpoints. Choose the source scope before its final
+    // work order and source reservation; no raw observations have been taken.
+    if let Some(seed) = combination_seed {
+        for candidate in &mut batch_candidates {
+            if let Some(scoped) = composition::scoped_candidate(
+                &candidate.batch,
+                &out.populations,
+                cases,
+                opportunities,
+                inputs,
+                trajectories,
+                prompts,
+                chunk,
+                prefill_row_ceiling,
+                population,
+                seed,
+            )? {
+                candidate.batch = scoped;
+            }
+        }
+    }
     priority::order_batches(&mut batch_candidates, inputs);
-    let protected = if combination_seed.is_some() {
-        composition::protected_populations(
-            &batch_candidates,
-            capacity,
-            selected_priority,
-            maximum_sources,
-        )?
-    } else {
-        Vec::new()
-    };
     coalesce_related_batches(
         &mut batch_candidates,
         &out.populations,
@@ -823,99 +894,11 @@ pub(super) fn select_with_capacity(
         capacity,
         selected_priority,
         maximum_sources,
+        combination_seed,
+        trajectories,
     )?;
-    let original_budget = composition::scheduled_prefix_budget(
-        &batch_candidates,
-        capacity,
-        selected_priority,
-        maximum_sources,
-    )?;
-    let mut combined_once = false;
-    if let Some(seed) = combination_seed {
-        for basis in 0..batch_candidates.len() {
-            let raw = &batch_candidates[basis];
-            if selected_priority.is_some_and(|selected| selected != raw.input_priority) {
-                continue;
-            }
-            let Some(combined) = composition::coalesced_candidate(
-                &raw.batch,
-                &out.populations,
-                cases,
-                opportunities,
-                inputs,
-                prompts,
-                chunk,
-                prefill_row_ceiling,
-                population,
-                seed,
-            )?
-            else {
-                continue;
-            };
-            // Keep every raw journal. The new complete source follows all
-            // original candidates of its installed policy and precedes only
-            // lower-priority policies. Its full work is additional, including
-            // any source-local native acquisition; no raw setup is refunded.
-            let insertion = batch_candidates
-                .partition_point(|candidate| candidate.coverage.policy <= raw.coverage.policy);
-            let work_fits = original_budget
-                .requests
-                .checked_add(combined.requests)
-                .is_some_and(|total| total <= capacity.requests)
-                && original_budget
-                    .execution_actions
-                    .checked_add(combined.serial_wave_upper_bound)
-                    .is_some_and(|total| total <= capacity.execution_actions)
-                && original_budget
-                    .declared_offer_rows
-                    .checked_add(combined.declared_offer_row_bound)
-                    .is_some_and(|total| total <= capacity.declared_offer_rows);
-            let preserves = |maximum_sources| {
-                composition::insertion_preserves_raw(
-                    &batch_candidates,
-                    basis,
-                    insertion,
-                    &combined,
-                    &protected,
-                    capacity,
-                    selected_priority,
-                    maximum_sources,
-                )
-            };
-            if work_fits && preserves(maximum_sources)? {
-                let candidate = BatchCandidate {
-                    input_priority: raw.input_priority,
-                    coverage: raw.coverage,
-                    coverage_round: add(raw.coverage_round, 1)?,
-                    decode_width_tier: raw.decode_width_tier,
-                    original_population_index: raw.original_population_index,
-                    batch: combined,
-                };
-                // At least two original populations coalesced into the raw
-                // basis, so the original candidate backing has one free slot.
-                if batch_candidates.len() == batch_candidates.capacity() {
-                    return Err(error("coalesced combination candidate capacity differs"));
-                }
-                batch_candidates.insert(insertion, candidate);
-                combined_once = true;
-                break;
-            }
-            let reason = if work_fits && maximum_sources.is_some() && preserves(None)? {
-                SelectionGapReason::RetainedSourceCapacity {
-                    maximum_sources: maximum_sources.unwrap().get(),
-                }
-            } else {
-                SelectionGapReason::CombinationWorkCapacity
-            };
-            out.gaps.push(SelectionGap {
-                population: None,
-                reason,
-            });
-        }
-    }
-    drop(protected);
     let mut scheduled_sources = 0_usize;
-    for mut candidate in batch_candidates {
+    for candidate in batch_candidates {
         let deferred = selected_priority
             .filter(|&selected| selected != candidate.input_priority)
             .map(|selected| SelectionGapReason::DeferredInputPriority {
@@ -929,72 +912,6 @@ pub(super) fn select_with_capacity(
                         maximum_sources: maximum.get(),
                     })
             });
-        if deferred.is_none()
-            && !combined_once
-            && composition::can_schedule(
-                &candidate.batch,
-                capacity.remaining(SelectionCapacity {
-                    requests: out.requests,
-                    execution_actions: out.serial_wave_upper_bound,
-                    declared_offer_rows: out.declared_offer_row_bound,
-                }),
-            )
-        {
-            if let Some(seed) = combination_seed {
-                let combined = composition::candidate(
-                    &candidate.batch,
-                    &out.batches,
-                    &out.populations,
-                    cases,
-                    opportunities,
-                    inputs,
-                    prompts,
-                    chunk,
-                    prefill_row_ceiling,
-                    population,
-                    seed,
-                )?;
-                if let Some(combined) = combined {
-                    // A source horizon that cannot retain at least the replaced
-                    // raw source's full declared work stays an optional gap.
-                    let additional_requests =
-                        combined.requests.checked_sub(candidate.batch.requests);
-                    let additional_waves = combined
-                        .serial_wave_upper_bound
-                        .checked_sub(candidate.batch.serial_wave_upper_bound);
-                    let additional_rows = combined
-                        .declared_offer_row_bound
-                        .checked_sub(candidate.batch.declared_offer_row_bound);
-                    if additional_requests.is_some_and(|extra| {
-                        original_budget
-                            .requests
-                            .checked_add(extra)
-                            .is_some_and(|total| total <= capacity.requests)
-                    }) && additional_waves.is_some_and(|extra| {
-                        original_budget
-                            .execution_actions
-                            .checked_add(extra)
-                            .is_some_and(|total| total <= capacity.execution_actions)
-                    }) && additional_rows.is_some_and(|extra| {
-                        original_budget
-                            .declared_offer_rows
-                            .checked_add(extra)
-                            .is_some_and(|total| total <= capacity.declared_offer_rows)
-                    }) && combined.schedule_within_capacity
-                        && combined.maximum_anchor_span
-                            <= *combined.schedule.phase_min_offered.iter().min().unwrap()
-                    {
-                        candidate.batch = combined;
-                        combined_once = true;
-                    } else {
-                        out.gaps.push(SelectionGap {
-                            population: None,
-                            reason: SelectionGapReason::CombinationWorkCapacity,
-                        });
-                    }
-                }
-            }
-        }
         append_batch(&mut out, candidate.batch, capacity, deferred)?;
         scheduled_sources += usize::from(out.batches.last().unwrap().scheduled);
     }
@@ -1041,6 +958,8 @@ fn coalesce_related_batches(
     capacity: SelectionCapacity,
     selected_priority: Option<u8>,
     maximum_sources: Option<NonZeroUsize>,
+    combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
+    trajectories: Option<&inventory::CheckedCaseInventory>,
 ) -> Result<()> {
     let mut index = 0;
     while index < candidates.len() {
@@ -1048,14 +967,18 @@ fn coalesce_related_batches(
         while next < candidates.len() {
             let a = &candidates[index];
             let b = &candidates[next];
-            if a.input_priority != b.input_priority || !grouping::related(a, b, cases, inputs) {
+            let raw_related = grouping::related(a, b, cases, inputs);
+            if a.input_priority != b.input_priority
+                || !(raw_related
+                    || combination_seed.is_some() && grouping::related_scope(a, b, inputs))
+            {
                 next += 1;
                 continue;
             }
             let mut members = a.batch.population_indices.clone();
             members.extend_from_slice(&b.batch.population_indices);
             members.sort_unstable();
-            let combined = batch_plan(
+            let mut combined = batch_plan(
                 &members,
                 populations,
                 cases,
@@ -1065,6 +988,31 @@ fn coalesce_related_batches(
                 prefill_row_ceiling,
                 population,
             )?;
+            if let Some(seed) = combination_seed {
+                if let Some(scoped) = composition::scoped_candidate(
+                    &combined,
+                    populations,
+                    cases,
+                    opportunities,
+                    inputs,
+                    trajectories,
+                    prompts,
+                    chunk,
+                    prefill_row_ceiling,
+                    population,
+                    seed,
+                )? {
+                    combined = scoped;
+                } else if !raw_related
+                    || a.batch.algorithm_universe.is_some()
+                    || b.batch.algorithm_universe.is_some()
+                {
+                    // A failed wider declaration cannot silently replace a
+                    // previously selected valid scope with its raw fallback.
+                    next += 1;
+                    continue;
+                }
+            }
             // Recompute the whole source, including every fresh-member phase
             // fence. Relatedness never supplies a qualification or capacity
             // exemption, and sharing must not increase declared token work.
@@ -1087,13 +1035,16 @@ fn coalesce_related_batches(
                 capacity,
                 selected_priority,
                 maximum_sources,
+                !raw_related,
             )? {
                 next += 1;
                 continue;
             }
             let first = a.original_population_index.min(b.original_population_index);
+            let width = a.decode_width_tier.max(b.decode_width_tier);
             candidates[index].batch = combined;
             candidates[index].original_population_index = first;
+            candidates[index].decode_width_tier = width;
             candidates.remove(next);
             // Additional guaranteed offers can make an earlier, otherwise
             // unaffordable combination fit. Recheck it with this exact plan.
@@ -1238,6 +1189,31 @@ fn batch_plan(
     prefill_row_ceiling: Option<NonZeroU32>,
     population: &StructuredServiceDeclarationV7,
 ) -> Result<SelectedBatch> {
+    batch_plan_with_scope(
+        population_indices,
+        populations,
+        cases,
+        opportunities,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        population,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_plan_with_scope(
+    population_indices: &[usize],
+    populations: &[SelectedPopulation],
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    scope: Option<(&[Vec<CheckedInputFacts>], &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1)>,
+) -> Result<SelectedBatch> {
     let representative_case_indices: Vec<_> = population_indices
         .iter()
         .flat_map(|&i| populations[i].representative_case_indices.iter().copied())
@@ -1248,8 +1224,13 @@ fn batch_plan(
         .collect();
     let selected_opportunities: Vec<_> = representative_case_indices
         .iter()
-        .map(|&i| opportunities[i].clone())
-        .collect();
+        .map(|&i| match scope {
+            Some((inputs, universe)) => {
+                composition::project_opportunity(&opportunities[i], &inputs[i], universe)
+            }
+            None => Ok(opportunities[i].clone()),
+        })
+        .collect::<Result<_>>()?;
     let mut starts = Vec::new();
     let mut ends = Vec::new();
     let (
@@ -1310,7 +1291,8 @@ fn batch_plan(
         serial_wave_upper_bound: add(mul(cycle_serial, planned_cycles)?, setup.execution_actions)?,
         declared_offer_row_bound: mul(cycle_offer_rows, planned_cycles)?,
         scheduled: false,
-        algorithm_universe: None,
+        algorithm_universe: scope.map(|(_, universe)| universe.clone()),
+        scoped_opportunities: scope.map(|_| selected_opportunities),
     })
 }
 

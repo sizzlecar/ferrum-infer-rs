@@ -82,6 +82,25 @@ pub(super) fn related(
     }
 }
 
+/// A predeclared union may retain different complete width sets. It keeps
+/// every original representative; only checked common numerical scope can
+/// authorize this broader grouping, never ordinary raw journal relatedness.
+pub(super) fn related_scope(
+    a: &BatchCandidate,
+    b: &BatchCandidate,
+    inputs: &[Vec<CheckedInputFacts>],
+) -> bool {
+    match (
+        homogeneous_decode(&a.batch.representative_case_indices, inputs),
+        homogeneous_decode(&b.batch.representative_case_indices, inputs),
+    ) {
+        (Some(left), Some(right)) => {
+            a.coverage.same_policy_route(b.coverage) && same_requirement(left, right)
+        }
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reserve(
     batch: &SelectedBatch,
@@ -116,6 +135,7 @@ pub(super) fn preserves_scheduled(
     capacity: SelectionCapacity,
     selected_priority: Option<u8>,
     maximum_sources: Option<NonZeroUsize>,
+    require_both: bool,
 ) -> Result<bool> {
     debug_assert!(first < second && second < candidates.len());
     let (mut original, mut proposed) = (SelectionCapacity::default(), SelectionCapacity::default());
@@ -131,6 +151,12 @@ pub(super) fn preserves_scheduled(
             &mut original,
             &mut original_sources,
         )?;
+        // Cross-width scope may replace two already affordable complete
+        // sources. It must not pull an unselected wide frontier into the
+        // first source merely because a larger global ledger still exists.
+        if require_both && (index == first || index == second) && !before {
+            return Ok(false);
+        }
         let after = if index == second {
             union_scheduled
         } else {

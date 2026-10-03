@@ -77,29 +77,10 @@ async fn source8_checked_algorithm_subset_executes_unobserved_mixed_rows_with_re
             .is_current_local(runtime.clock.now_ns().unwrap())
             .unwrap();
     }
-    let ordinary = children
-        .iter()
-        .filter(|child| child.algorithm_universe().is_none())
-        .filter(|child| {
-            child.owner().role
-                == ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredWaveRoleV2::OrdinaryDecode
-                && child.owner().product
-                    == ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredProductV2::FullLogits
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        ordinary.iter().enumerate().any(|(index, left)| {
-            let Some(left_key) = left.numerical_family_key() else {
-                return false;
-            };
-            ordinary[index + 1..].iter().any(|right| {
-                right
-                    .numerical_family_key()
-                    .is_some_and(|right_key| left_key != right_key)
-            })
-        }),
-        "A and B must each retain an independently qualified original numerical source"
-    );
+    // The source declares its compatible algorithm scope before collecting
+    // any observations. Its own complete independent phases above qualify A
+    // and B; separate raw-source copies are not a prerequisite. The mixed
+    // request below must still obtain a real prediction and adopted witness.
     // All training cohorts instantiate a single original template. The mixed
     // A+B CPU primitive roster has never actually executed at this boundary.
     assert_eq!(executor.native_structured_mixed_row_commands(), 0);

@@ -146,6 +146,7 @@ fn checked_selection_frozen_facts_release_raw_inputs_without_changing_selection(
         opportunities,
         inputs: facts,
         algorithm_inputs: vec![Arc::new(original)],
+        algorithm_case_inputs: Vec::new(),
         gaps: Vec::new(),
         charge: ProbePreflightCharge::default(),
     };

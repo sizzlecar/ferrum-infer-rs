@@ -84,6 +84,9 @@ pub(super) struct CheckedCaseInventory {
     /// Additional checked raw inputs declare finite algorithm support only.
     /// They never supply a numerical sample or increase a case's member floor.
     pub algorithm_inputs: Vec<Arc<StructuredInputV2>>,
+    /// Original case to checked trajectory recipes. These input-only links
+    /// neither grant a member floor nor borrow algorithms from another case.
+    pub algorithm_case_inputs: Vec<Vec<usize>>,
     pub gaps: Vec<InventoryGap>,
     pub charge: ProbePreflightCharge,
 }
@@ -94,6 +97,7 @@ impl CheckedCaseInventory {
     /// frozen universe, exact keys, numerical axes and typed gaps remain.
     pub(super) fn release_original_inputs(&mut self) {
         self.algorithm_inputs = Vec::new();
+        self.algorithm_case_inputs = Vec::new();
         for facts in self.inputs.iter_mut().flatten() {
             facts.original = None;
         }
@@ -120,7 +124,19 @@ impl CheckedCaseInventory {
                 self.algorithm_inputs
                     .capacity()
                     .checked_mul(std::mem::size_of::<Arc<StructuredInputV2>>())?,
+            )?
+            .checked_add(
+                self.algorithm_case_inputs
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Vec<usize>>())?,
             )?;
+        for indices in &self.algorithm_case_inputs {
+            bytes = bytes.checked_add(
+                indices
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<usize>())?,
+            )?;
+        }
         for input in &self.algorithm_inputs {
             bytes = bytes
                 .checked_add(input.retained_payload_bytes()?)?
@@ -160,10 +176,10 @@ impl CheckedCaseInventory {
         input: &StructuredInputV2,
         maximum_retained_bytes: usize,
         external_bytes: usize,
-    ) -> Result<()> {
+    ) -> Result<Option<usize>> {
         let key = match input.numerical_family_key() {
             Ok(key) => key,
-            Err(StructuredUnknownV2::UnsupportedScope) => return Ok(()),
+            Err(StructuredUnknownV2::UnsupportedScope) => return Ok(None),
             Err(reason) => return Err(error(format!("algorithm inventory input: {reason:?}"))),
         };
         if input.algorithm_universe_signature().is_some() {
@@ -176,12 +192,12 @@ impl CheckedCaseInventory {
                 .and_then(|n| n.checked_add(external_bytes)),
             maximum_retained_bytes,
         )?;
-        for existing in &self.algorithm_inputs {
+        for (index, existing) in self.algorithm_inputs.iter().enumerate() {
             let existing_key = existing
                 .numerical_family_key()
                 .map_err(|reason| error(format!("retained algorithm input: {reason:?}")))?;
             if existing_key == key {
-                return Ok(());
+                return Ok(Some(index));
             }
         }
         let incoming = input
@@ -218,6 +234,82 @@ impl CheckedCaseInventory {
             maximum_retained_bytes,
         )?;
         self.algorithm_inputs.push(Arc::new(input.clone()));
+        Ok(Some(self.algorithm_inputs.len() - 1))
+    }
+
+    fn link_algorithm_input(
+        &mut self,
+        case: usize,
+        input: usize,
+        maximum_retained_bytes: usize,
+        external_bytes: usize,
+    ) -> Result<()> {
+        let indices = self
+            .algorithm_case_inputs
+            .get(case)
+            .ok_or_else(|| error("algorithm trajectory case outside inventory"))?;
+        if input >= self.algorithm_inputs.len() {
+            return Err(error("algorithm trajectory input outside checked pool"));
+        }
+        if indices.contains(&input) {
+            return Ok(());
+        }
+        let growth = if indices.len() == indices.capacity() {
+            indices
+                .len()
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<usize>()))
+                .ok_or_else(|| error("algorithm trajectory link capacity overflow"))?
+        } else {
+            0
+        };
+        require_capacity(
+            self.retained_payload_bytes()
+                .and_then(|n| n.checked_add(external_bytes))
+                .and_then(|n| n.checked_add(growth)),
+            maximum_retained_bytes,
+        )?;
+        if growth != 0 {
+            self.algorithm_case_inputs[case]
+                .try_reserve_exact(1)
+                .map_err(|_| error("algorithm trajectory link allocation failed"))?;
+        }
+        require_capacity(
+            self.retained_payload_bytes()
+                .and_then(|n| n.checked_add(external_bytes)),
+            maximum_retained_bytes,
+        )?;
+        self.algorithm_case_inputs[case].push(input);
+        Ok(())
+    }
+
+    /// Remap a completed capture's bounded links into the destination pool.
+    /// Both inventories and the caller's scratch remain charged during merge.
+    pub(super) fn merge_algorithms(
+        &mut self,
+        captured: &Self,
+        cases: &[usize],
+        maximum_retained_bytes: usize,
+        external_bytes: usize,
+    ) -> Result<()> {
+        if cases.len() != captured.algorithm_case_inputs.len() {
+            return Err(error("algorithm trajectory merge case alignment differs"));
+        }
+        for input in &captured.algorithm_inputs {
+            self.retain_algorithm_input(input, maximum_retained_bytes, external_bytes)?;
+        }
+        for (&case, inputs) in cases.iter().zip(&captured.algorithm_case_inputs) {
+            for &index in inputs {
+                let original = captured
+                    .algorithm_inputs
+                    .get(index)
+                    .ok_or_else(|| error("captured trajectory has no checked input"))?;
+                let index = self
+                    .retain_algorithm_input(original, maximum_retained_bytes, external_bytes)?
+                    .ok_or_else(|| error("captured trajectory lost its numerical scope"))?;
+                self.link_algorithm_input(case, index, maximum_retained_bytes, external_bytes)?;
+            }
+        }
         Ok(())
     }
 }
@@ -233,6 +325,7 @@ mod algorithm_pool_tests {
             opportunities: Vec::new(),
             inputs: Vec::new(),
             algorithm_inputs: Vec::new(),
+            algorithm_case_inputs: Vec::new(),
             gaps: Vec::new(),
             charge: ProbePreflightCharge::default(),
         }
@@ -527,6 +620,7 @@ async fn collect_inner(
             n.checked_add(cases.len().checked_mul(
                 std::mem::size_of::<CaseOpportunity>()
                     + std::mem::size_of::<Vec<CheckedInputFacts>>()
+                    + std::mem::size_of::<Vec<usize>>()
                     + std::mem::size_of::<InventoryGap>()
                     + std::mem::size_of::<bool>()
                     + 2 * std::mem::size_of::<usize>()
@@ -545,6 +639,7 @@ async fn collect_inner(
             .collect(),
         inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
         algorithm_inputs: Vec::new(),
+        algorithm_case_inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
         gaps: Vec::with_capacity(cases.len()),
         charge: ProbePreflightCharge::default(),
     };
@@ -918,11 +1013,27 @@ async fn collect_inner(
                 .and_then(|n| n.checked_add(report_limit))
                 .ok_or_else(|| error("algorithm trajectory retained capacity overflow"))?;
             for branch in &outcome.branches {
-                inventory.retain_algorithm_input(
+                let Some(input) = inventory.retain_algorithm_input(
                     branch.query.input(),
                     limits.maximum_retained_bytes,
                     external,
-                )?;
+                )?
+                else {
+                    continue;
+                };
+                let trajectory = *algorithm_cases
+                    .get(outcome.scenario_index - targets.len())
+                    .ok_or_else(|| error("algorithm trajectory lost its original case"))?;
+                for &member in &members {
+                    if cases[member].width == cases[trajectory].width {
+                        inventory.link_algorithm_input(
+                            member,
+                            input,
+                            limits.maximum_retained_bytes,
+                            external,
+                        )?;
+                    }
+                }
             }
         }
         for &member in &members {

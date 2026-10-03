@@ -97,6 +97,7 @@ impl CheckedInputCursor {
             .checked_mul(
                 std::mem::size_of::<CaseOpportunity>()
                     + std::mem::size_of::<Vec<selection::CheckedInputFacts>>()
+                    + std::mem::size_of::<Vec<usize>>()
                     + std::mem::size_of::<inventory::InventoryGap>(),
             )
             .and_then(|n| {
@@ -161,6 +162,7 @@ impl CheckedInputCursor {
                 .collect(),
             inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
             algorithm_inputs: Vec::new(),
+            algorithm_case_inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
             gaps: Vec::with_capacity(cases.len()),
             charge: ProbePreflightCharge::default(),
         };
@@ -320,14 +322,14 @@ impl CheckedInputCursor {
                 .and_then(|n| n.checked_add(captured.retained_payload_bytes()?))
                 .and_then(|n| n.checked_add(scratch))
                 .ok_or_else(|| error("input algorithm pool merge capacity overflow"))?;
-            for input in &captured.algorithm_inputs {
-                self.inventory.retain_algorithm_input(
-                    input,
-                    self.maximum_retained_bytes,
-                    pool_external,
-                )?;
-            }
+            self.inventory.merge_algorithms(
+                &captured,
+                &indices,
+                self.maximum_retained_bytes,
+                pool_external,
+            )?;
             drop(captured.algorithm_inputs);
+            drop(captured.algorithm_case_inputs);
             if self
                 .inventory
                 .gaps
@@ -425,6 +427,7 @@ impl CheckedInputCursor {
                 opportunities: Vec::new(),
                 inputs: Vec::new(),
                 algorithm_inputs: Vec::new(),
+                algorithm_case_inputs: Vec::new(),
                 gaps: Vec::new(),
                 charge: budget.preflight_charge(),
             },

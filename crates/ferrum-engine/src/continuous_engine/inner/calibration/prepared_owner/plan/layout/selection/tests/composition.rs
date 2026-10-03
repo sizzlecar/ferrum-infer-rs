@@ -285,56 +285,6 @@ fn original_batches() -> (Vec<BatchCandidate>, Vec<Case>, Vec<Vec<CheckedInputFa
 }
 
 #[test]
-fn local_combination_reserves_later_original_sources_and_counts_complete_work() {
-    let (batches, _, _) = original_batches();
-    let mut single = SelectionCapacity::default();
-    single.charge(&batches[0].batch).unwrap();
-    let planned = super::super::composition::scheduled_prefix_budget(
-        &batches,
-        SelectionCapacity::legacy(100_000, 10_000_000),
-        None,
-        NonZeroUsize::new(2),
-    )
-    .unwrap();
-    assert_eq!(
-        planned,
-        SelectionCapacity {
-            requests: 2 * single.requests,
-            execution_actions: 2 * single.execution_actions,
-            declared_offer_rows: 2 * single.declared_offer_rows,
-        }
-    );
-    let work_limited = super::super::composition::scheduled_prefix_budget(
-        &batches,
-        single,
-        None,
-        NonZeroUsize::new(3),
-    )
-    .unwrap();
-    assert_eq!(work_limited, single);
-    let row_limited = super::super::composition::scheduled_prefix_budget(
-        &batches,
-        SelectionCapacity {
-            requests: 100_000,
-            execution_actions: 10_000_000,
-            declared_offer_rows: 2 * single.declared_offer_rows - 1,
-        },
-        None,
-        NonZeroUsize::new(3),
-    )
-    .unwrap();
-    assert_eq!(row_limited, single);
-    let deferred = super::super::composition::scheduled_prefix_budget(
-        &batches,
-        SelectionCapacity::legacy(100_000, 10_000_000),
-        Some(1),
-        NonZeroUsize::new(3),
-    )
-    .unwrap();
-    assert_eq!(deferred, SelectionCapacity::default());
-}
-
-#[test]
 fn local_combination_cannot_promote_an_invalid_raw_source_into_a_reserved_slot() {
     let (mut batches, _, _) = original_batches();
     batches[0].batch.schedule_within_capacity = false;
@@ -355,18 +305,6 @@ fn local_combination_cannot_promote_an_invalid_raw_source_into_a_reserved_slot()
         &batches[1].batch,
         SelectionCapacity::legacy(usize::MAX, usize::MAX)
     ));
-    let mut expected = SelectionCapacity::default();
-    expected.charge(&batches[2].batch).unwrap();
-    assert_eq!(
-        super::super::composition::scheduled_prefix_budget(
-            &batches,
-            SelectionCapacity::legacy(usize::MAX, usize::MAX),
-            None,
-            NonZeroUsize::new(1)
-        )
-        .unwrap(),
-        expected
-    );
 }
 
 #[test]
@@ -457,13 +395,313 @@ fn algorithm_pair_inventory(
 }
 
 #[test]
-fn local_combination_declares_only_checked_compatible_sources_before_collection() {
-    // Different complete width sets deliberately remain separate raw
-    // journals. Same-width context/algorithm families now share a journal.
+fn local_combination_preserves_different_complete_width_endpoints() {
     let (cases, opportunities, inputs, population) = algorithm_pair_inventory([1, 2]);
     let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
         DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
             .map(|f| f.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    let run = |seed| {
+        select_with_local_composition(
+            &cases,
+            &opportunities,
+            &inputs,
+            &[61, 61],
+            8,
+            None,
+            &population,
+            100_000,
+            10_000_000,
+            usize::MAX,
+            None,
+            None,
+            None,
+            NonZeroUsize::new(2),
+            seed,
+        )
+        .unwrap()
+    };
+    let raw = run(None);
+    let selected = run(Some(&seed));
+    let scheduled: Vec<_> = selected
+        .batches
+        .iter()
+        .filter(|batch| batch.scheduled)
+        .collect();
+    assert_eq!(scheduled.len(), 1);
+    assert!(scheduled[0].algorithm_universe.is_some());
+    for member in &raw.populations {
+        assert!(member
+            .representative_case_indices
+            .iter()
+            .all(|index| scheduled[0].representative_case_indices.contains(index)));
+    }
+    for facts in inputs.iter().flatten() {
+        assert!(facts
+            .original
+            .as_ref()
+            .unwrap()
+            .numerical_family_key_for_universe(scheduled[0].algorithm_universe.as_ref().unwrap())
+            .is_ok());
+    }
+    assert!(selected.populations.iter().all(|member| member.scheduled));
+    let limited = select_with_local_composition(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        100_000,
+        10_000_000,
+        usize::MAX,
+        None,
+        None,
+        None,
+        NonZeroUsize::new(1),
+        Some(&seed),
+    )
+    .unwrap();
+    let scheduled: Vec<_> = limited
+        .batches
+        .iter()
+        .filter(|batch| batch.scheduled)
+        .collect();
+    assert_eq!(scheduled.len(), 1);
+    assert!(
+        scheduled[0].algorithm_universe.is_none(),
+        "a deferred complete width set must not be pulled into the first source"
+    );
+    assert!(limited.populations.iter().any(|member| !member.scheduled));
+}
+
+#[test]
+fn same_width_algorithm_families_share_one_complete_union_source() {
+    let (cases, opportunities, inputs, population) = algorithm_pair_inventory([1, 1]);
+    let original = serde_json::to_value((&cases, &opportunities, &inputs)).unwrap();
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    let run = |capacity, seed| {
+        select_with_capacity(
+            &cases,
+            &opportunities,
+            &inputs,
+            &[61, 61],
+            8,
+            None,
+            &population,
+            capacity,
+            usize::MAX,
+            None,
+            None,
+            None,
+            NonZeroUsize::new(1),
+            seed,
+        )
+        .unwrap()
+    };
+    let raw = run(SelectionCapacity::legacy(100_000, 10_000_000), None);
+    let capacity = SelectionCapacity {
+        requests: raw.requests,
+        execution_actions: raw.serial_wave_upper_bound,
+        declared_offer_rows: raw.declared_offer_row_bound,
+    };
+    let selected = run(capacity, Some(&seed));
+    let scheduled: Vec<_> = selected
+        .batches
+        .iter()
+        .filter(|batch| batch.scheduled)
+        .collect();
+    assert_eq!(
+        scheduled.len(),
+        1,
+        "one source slot never requires a prior raw qualification"
+    );
+    let combined = scheduled[0];
+    let local = combined.algorithm_universe.as_ref().unwrap();
+    assert!(seed.contains_universe(local));
+    assert_eq!(local.algorithm_count(), 2);
+    assert_eq!(
+        combined.representative_case_indices,
+        raw.batches[0].representative_case_indices
+    );
+    let projected: Vec<_> = inputs
+        .iter()
+        .map(|facts| {
+            facts[0]
+                .original
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .clone()
+                .with_algorithm_universe(local)
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        (0..projected[0].regression_axes().len()).any(|axis| {
+            let value = |index: usize| projected[index].regression_axes()[axis];
+            value(0) > 0. && value(0) < value(1) && value(2) == 0. && value(3) == 0.
+        }),
+        "the other algorithm's zeros must not erase the first algorithm's positive lower endpoint"
+    );
+    assert!(selected.populations.iter().all(|member| member.scheduled));
+    assert_eq!(
+        combined.population_indices,
+        raw.batches[0].population_indices
+    );
+    let scoped = combined.scoped_opportunities.as_ref().unwrap();
+    assert_eq!(member_groups(scoped).unwrap().len(), 1);
+    for (&index, opportunity) in combined.representative_case_indices.iter().zip(scoped) {
+        assert_eq!(
+            opportunity.minimum_fresh_members,
+            opportunities[index].minimum_fresh_members
+        );
+    }
+    assert_eq!(
+        combined.schedule.min_members,
+        raw.batches[0].schedule.min_members
+    );
+    for phase in 0..3 {
+        assert!(combined.input_opportunities.phase_cycles[phase] > 0);
+        assert!(
+            combined.input_opportunities.phase_original_offer_bounds[phase]
+                >= combined.input_opportunities.maximum_fresh_member_span[phase]
+                    .max(combined.schedule.phase_min_offered[phase])
+        );
+    }
+    assert!(combined.planned_cycles < raw.batches[0].planned_cycles);
+    assert!(selected.requests < raw.requests);
+    assert!(selected.serial_wave_upper_bound < raw.serial_wave_upper_bound);
+    assert!(selected.declared_offer_row_bound < raw.declared_offer_row_bound);
+    assert_eq!(
+        selected.execution_case_indices,
+        combined
+            .representative_case_indices
+            .repeat(combined.planned_cycles)
+    );
+    assert_eq!(
+        selected.requests,
+        selected
+            .execution_case_indices
+            .iter()
+            .map(|&i| cases[i].width)
+            .sum::<usize>()
+    );
+    assert_eq!(
+        selected.serial_wave_upper_bound,
+        selected
+            .execution_case_indices
+            .iter()
+            .map(|&i| cases[i].waves(61, 8).unwrap().1)
+            .sum::<usize>()
+    );
+    assert_eq!(
+        original,
+        serde_json::to_value((&cases, &opportunities, &inputs)).unwrap()
+    );
+
+    // Native preparation may fall back to cold work. Its fixed membership
+    // must retain the same union phase floor, without restoring raw groups.
+    let frozen = source_inputs::freeze_sources(
+        &cases,
+        &opportunities,
+        &[61, 61],
+        &selected,
+        NonZeroU32::new(8).unwrap(),
+        None,
+        usize::MAX,
+    )
+    .unwrap();
+    let source_inputs::ColdSourceRebuild::Ready(cold) = frozen[0]
+        .cold_plan(&population, NonZeroU32::new(8).unwrap(), None, usize::MAX)
+        .unwrap()
+    else {
+        panic!("unchanged cold work must fit the original union horizon");
+    };
+    assert_eq!(cold.cycles, combined.planned_cycles);
+    assert_eq!(
+        cold.input_opportunities
+            .minimum_input_family_opportunities_per_cycle,
+        combined
+            .input_opportunities
+            .minimum_input_family_opportunities_per_cycle
+    );
+
+    let complete = SelectionCapacity {
+        requests: selected.requests,
+        execution_actions: selected.serial_wave_upper_bound,
+        declared_offer_rows: selected.declared_offer_row_bound,
+    };
+    let exact = run(complete, Some(&seed));
+    assert_eq!(
+        exact.execution_case_indices,
+        selected.execution_case_indices
+    );
+    assert!(exact.populations.iter().all(|member| member.scheduled));
+    assert_eq!(exact.requests, complete.requests);
+    assert_eq!(exact.serial_wave_upper_bound, complete.execution_actions);
+    assert_eq!(exact.declared_offer_row_bound, complete.declared_offer_rows);
+    for capacity in [
+        SelectionCapacity {
+            requests: complete.requests - 1,
+            ..complete
+        },
+        SelectionCapacity {
+            execution_actions: complete.execution_actions - 1,
+            ..complete
+        },
+        SelectionCapacity {
+            declared_offer_rows: complete.declared_offer_rows - 1,
+            ..complete
+        },
+    ] {
+        let denied = run(capacity, Some(&seed));
+        assert!(denied.requests <= capacity.requests);
+        assert!(denied.serial_wave_upper_bound <= capacity.execution_actions);
+        assert!(denied.declared_offer_row_bound <= capacity.declared_offer_rows);
+        assert!(denied.populations.iter().any(|member| !member.scheduled));
+    }
+    let incomplete = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs[..2].iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    let unchanged = run(capacity, Some(&incomplete));
+    assert!(unchanged
+        .batches
+        .iter()
+        .all(|batch| batch.algorithm_universe.is_none()));
+    assert_eq!(unchanged.execution_case_indices, raw.execution_case_indices);
+}
+
+#[test]
+fn local_scope_rejects_different_real_installed_host_policies() {
+    let (cases, mut opportunities, mut inputs, population) = algorithm_pair_inventory([1, 1]);
+    for index in 2..cases.len() {
+        let input = natural_termination_input_with_algorithm_and_eos(
+            cases[index].width as u32,
+            CostProductOutput::GreedyToken,
+            false,
+            64,
+            "fixture.selection.b",
+            [8; 32],
+            false,
+        );
+        opportunities[index].population = classify_alternatives(
+            std::slice::from_ref(&input),
+            population.population_policy(),
+            true,
+        )
+        .unwrap();
+        inputs[index] = vec![input_facts(&StructuredQueryV2::exact(input)).unwrap()];
+    }
+    assert_ne!(
+        inputs[0][0].homogeneous_host_policy,
+        inputs[2][0].homogeneous_host_policy
+    );
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
     let selected = select_with_local_composition(
         &cases,
         &opportunities,
@@ -482,349 +720,172 @@ fn local_combination_declares_only_checked_compatible_sources_before_collection(
         Some(&seed),
     )
     .unwrap();
-    let scheduled: Vec<_> = selected.batches.iter().filter(|b| b.scheduled).collect();
-    assert_eq!(scheduled.len(), 2);
-    assert!(scheduled[0].algorithm_universe.is_none());
-    let local = scheduled[1].algorithm_universe.as_ref().unwrap();
-    assert!(seed.contains_universe(local));
-    assert_eq!(local.algorithm_count(), 2);
-    assert_eq!(scheduled[1].population_indices.len(), 2);
-    for member in &selected.populations {
-        assert!(member.scheduled);
-        assert!(member
-            .representative_case_indices
+    assert!(selected.populations.iter().all(|member| member.scheduled));
+    assert_eq!(
+        selected
+            .batches
             .iter()
-            .all(|index| scheduled[1].representative_case_indices.contains(index)));
-    }
-    // The source is a declared acquisition plan. It carries no fitted model,
-    // observed timing, or imported qualification and must execute both families.
-    let actual_requests: usize = selected
-        .execution_case_indices
-        .iter()
-        .map(|&index| cases[index].width)
-        .sum();
-    let actual_waves: usize = selected
-        .execution_case_indices
-        .iter()
-        .map(|&index| cases[index].waves(61, 8).unwrap().1)
-        .sum();
-    assert_eq!(selected.requests, actual_requests);
-    assert_eq!(selected.serial_wave_upper_bound, actual_waves);
-    assert_eq!(selected.declared_offer_row_bound, actual_waves);
-    let raw = select_with_local_composition(
-        &cases,
-        &opportunities,
-        &inputs,
-        &[61, 61],
-        8,
-        None,
-        &population,
-        100_000,
-        10_000_000,
-        usize::MAX,
-        None,
-        None,
-        None,
-        NonZeroUsize::new(2),
-        None,
-    )
-    .unwrap();
-    assert!(selected.declared_offer_row_bound > raw.declared_offer_row_bound);
-    // Only the inference-row allowance is tight. Optional extra scope cannot
-    // displace either raw source even when requests and actions still fit.
-    let row_limited = select_with_capacity(
-        &cases,
-        &opportunities,
-        &inputs,
-        &[61, 61],
-        8,
-        None,
-        &population,
-        SelectionCapacity {
-            requests: 100_000,
-            execution_actions: 10_000_000,
-            declared_offer_rows: raw.declared_offer_row_bound,
-        },
-        usize::MAX,
-        None,
-        None,
-        None,
-        NonZeroUsize::new(2),
-        Some(&seed),
-    )
-    .unwrap();
-    assert_eq!(
-        row_limited.execution_case_indices,
-        raw.execution_case_indices
+            .filter(|batch| batch.scheduled)
+            .count(),
+        2
     );
-    assert_eq!(
-        row_limited.declared_offer_row_bound,
-        raw.declared_offer_row_bound
-    );
-    assert!(row_limited
+    assert!(selected
         .batches
         .iter()
         .all(|batch| batch.algorithm_universe.is_none()));
-    assert!(row_limited
-        .gaps
-        .iter()
-        .any(|gap| matches!(gap.reason, SelectionGapReason::CombinationWorkCapacity)));
-    let incomplete = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
-        DeclaredAlgorithmUniverseV1::from_inputs(inputs[..2].iter().flatten()
-            .map(|f| f.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
-    let excluded = select_with_local_composition(
+    // Exercise the scope gate directly as well: policy-priority ordering must
+    // not be the only reason these independently valid sources stay separate.
+    let members: Vec<_> = (0..selected.populations.len()).collect();
+    let candidate = batch_plan(
+        &members,
+        &selected.populations,
         &cases,
         &opportunities,
-        &inputs,
         &[61, 61],
         8,
         None,
         &population,
-        100_000,
-        10_000_000,
-        usize::MAX,
-        None,
-        None,
-        None,
-        NonZeroUsize::new(2),
-        Some(&incomplete),
     )
     .unwrap();
-    assert!(excluded
-        .batches
-        .iter()
-        .all(|b| b.algorithm_universe.is_none()));
+    assert!(super::super::composition::scoped_candidate(
+        &candidate,
+        &selected.populations,
+        &cases,
+        &opportunities,
+        &inputs,
+        None,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        &seed
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[test]
-fn same_width_algorithm_families_keep_raw_sources_and_complete_combination_plan() {
-    let (cases, opportunities, inputs, population) = algorithm_pair_inventory([1, 1]);
-    assert!(cases.iter().all(|case| case.acquisition.is_none()));
-    assert!(inputs[0][0].family.is_some());
-    assert!(inputs[2][0].family.is_some());
-    assert_ne!(inputs[0][0].family, inputs[2][0].family);
+fn local_scope_uses_only_original_cases_checked_trajectory_algorithms() {
+    use std::sync::Arc;
+    let (mut cases, mut opportunities, mut inputs, population) = algorithm_pair_inventory([1, 1]);
+    cases.truncate(2);
+    opportunities.truncate(2);
+    inputs.truncate(2);
+    let later = natural_termination_input_with_algorithm(
+        1,
+        CostProductOutput::GreedyToken,
+        false,
+        65,
+        "fixture.selection.later",
+        [10; 32],
+    );
+    let unrelated = natural_termination_input_with_algorithm(
+        1,
+        CostProductOutput::GreedyToken,
+        false,
+        257,
+        "fixture.selection.unselected",
+        [11; 32],
+    );
+    let inventory = inventory::CheckedCaseInventory {
+        opportunities: opportunities.clone(),
+        inputs: inputs.clone(),
+        algorithm_inputs: vec![Arc::new(later.clone()), Arc::new(unrelated.clone())],
+        algorithm_case_inputs: vec![vec![0], vec![0]],
+        gaps: Vec::new(),
+        charge: ProbePreflightCharge::default(),
+    };
     let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
         DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
-            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
-    assert_eq!(seed.algorithm_count(), 2);
-    let raw = select_with_local_composition(
+            .map(|fact| fact.original.as_deref().unwrap())
+            .chain(inventory.algorithm_inputs.iter().map(Arc::as_ref)), population.settings.max_axes).unwrap();
+    let selected = select_with_capacity_and_trajectories(
         &cases,
         &opportunities,
         &inputs,
-        &[61, 61],
+        &[61],
         8,
         None,
         &population,
-        100_000,
-        10_000_000,
+        SelectionCapacity::legacy(100_000, 10_000_000),
         usize::MAX,
         None,
         None,
         None,
-        NonZeroUsize::new(2),
-        None,
-    )
-    .unwrap();
-    assert_eq!(raw.populations.len(), 2);
-    assert_ne!(raw.populations[0].key, raw.populations[1].key);
-    assert!(raw.populations.iter().all(|member| member.scheduled));
-    assert_eq!(raw.batches.len(), 1);
-    assert!(raw.batches[0].scheduled);
-    assert!(raw.batches[0].algorithm_universe.is_none());
-    assert_eq!(raw.batches[0].population_indices.len(), 2);
-
-    // Two complete executions fit the same two-source cap: the original raw
-    // families and a separate A+B scope. Neither scope borrows fitted samples.
-    let capacity = SelectionCapacity {
-        requests: raw.requests.checked_mul(2).unwrap(),
-        execution_actions: raw.serial_wave_upper_bound.checked_mul(2).unwrap(),
-        declared_offer_rows: raw.declared_offer_row_bound.checked_mul(2).unwrap(),
-    };
-    let selected = select_with_capacity(
-        &cases,
-        &opportunities,
-        &inputs,
-        &[61, 61],
-        8,
-        None,
-        &population,
-        capacity,
-        usize::MAX,
-        None,
-        None,
-        None,
-        NonZeroUsize::new(2),
+        NonZeroUsize::new(1),
         Some(&seed),
+        Some(&inventory),
     )
     .unwrap();
-    let scheduled: Vec<_> = selected
+    let batch = selected
         .batches
         .iter()
-        .filter(|batch| batch.scheduled)
-        .collect();
-    for member in &selected.populations {
-        assert!(member.scheduled);
-        assert!(
-            scheduled.iter().any(|batch| {
-                batch.algorithm_universe.is_none()
-                    && member
-                        .representative_case_indices
-                        .iter()
-                        .all(|index| batch.representative_case_indices.contains(index))
-            }),
-            "each original family retains its own raw numerical scope"
-        );
-    }
-    let combination = scheduled
-        .iter()
-        .find(|batch| batch.algorithm_universe.is_some())
-        .expect("same-width journal coalescing must retain a separate A+B collection plan");
-    let local = combination.algorithm_universe.as_ref().unwrap();
-    assert!(seed.contains_universe(local));
-    assert_eq!(local.algorithm_count(), 2);
-    assert_eq!(combination.population_indices.len(), 2);
-    assert!(selected.populations.iter().all(|member| {
-        member
-            .representative_case_indices
-            .iter()
-            .all(|index| combination.representative_case_indices.contains(index))
-    }));
-    assert_eq!(scheduled.len(), 2);
-    assert!(selected.requests <= capacity.requests);
-    assert!(selected.serial_wave_upper_bound <= capacity.execution_actions);
-    assert!(selected.declared_offer_row_bound <= capacity.declared_offer_rows);
-
-    // These are input opportunities for all three numerical phases, not
-    // qualification evidence. Each planned source still executes fresh cohorts.
-    let fit_members = population
-        .settings
-        .min_phase_samples
-        .max(population.settings.max_rank + population.settings.min_fit_redundancy);
-    let mut cursor = 0;
-    for batch in scheduled {
-        assert!(batch.schedule_within_capacity);
-        assert!(batch.schedule.min_members[0] >= fit_members);
-        for phase in 0..3 {
-            assert!(batch.schedule.min_members[phase] >= population.settings.min_phase_samples);
-            assert!(batch.input_opportunities.phase_cycles[phase] > 0);
-            assert!(
-                batch.input_opportunities.phase_original_offer_bounds[phase]
-                    >= batch.input_opportunities.maximum_fresh_member_span[phase]
-                        .max(batch.schedule.phase_min_offered[phase])
-            );
-        }
-        assert!(
-            batch.maximum_anchor_span <= *batch.schedule.phase_min_offered.iter().min().unwrap()
-        );
-        assert!(batch.planned_cycles >= batch.input_opportunities.planned_cycles);
-        let count = batch.representative_case_indices.len() * batch.planned_cycles;
-        let execution = &selected.execution_case_indices[cursor..cursor + count];
-        for cycle in execution.chunks_exact(batch.representative_case_indices.len()) {
-            assert_eq!(cycle, batch.representative_case_indices);
-        }
-        cursor += count;
-    }
-    assert_eq!(cursor, selected.execution_case_indices.len());
-    assert!(selected.requests > raw.requests);
-    assert!(selected.serial_wave_upper_bound > raw.serial_wave_upper_bound);
-    assert!(selected.declared_offer_row_bound > raw.declared_offer_row_bound);
-
-    let complete = SelectionCapacity {
-        requests: selected.requests,
-        execution_actions: selected.serial_wave_upper_bound,
-        declared_offer_rows: selected.declared_offer_row_bound,
-    };
-    let incomplete = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
-        DeclaredAlgorithmUniverseV1::from_inputs(inputs[..2].iter().flatten()
-            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
-    for (reason, capacity, sources, seed) in [
-        (
-            "request",
-            SelectionCapacity {
-                requests: complete.requests - 1,
-                ..complete
-            },
-            2,
-            &seed,
-        ),
-        (
-            "action",
-            SelectionCapacity {
-                execution_actions: complete.execution_actions - 1,
-                ..complete
-            },
-            2,
-            &seed,
-        ),
-        (
-            "row",
-            SelectionCapacity {
-                declared_offer_rows: complete.declared_offer_rows - 1,
-                ..complete
-            },
-            2,
-            &seed,
-        ),
-        ("source", complete, 1, &seed),
-        ("seed", complete, 2, &incomplete),
-    ] {
-        let denied = select_with_capacity(
-            &cases,
-            &opportunities,
-            &inputs,
-            &[61, 61],
-            8,
-            None,
-            &population,
-            capacity,
-            usize::MAX,
-            None,
-            None,
-            None,
-            NonZeroUsize::new(sources),
-            Some(seed),
-        )
+        .find(|batch| batch.scheduled)
         .unwrap();
-        assert!(
-            denied
-                .batches
-                .iter()
-                .all(|batch| batch.algorithm_universe.is_none()),
-            "{reason}"
-        );
-        assert!(
-            denied.populations.iter().all(|member| member.scheduled),
-            "{reason}"
-        );
+    let local = batch.algorithm_universe.as_ref().unwrap();
+    assert!(later.numerical_family_key_for_universe(local).is_ok());
+    assert!(
+        unrelated.numerical_family_key_for_universe(local).is_err(),
+        "the discovery seed cannot grant an unselected case's algorithm scope"
+    );
+    assert!(seed.contains_universe(local));
+    assert!(local.algorithm_count() < seed.algorithm_count());
+    assert_eq!(
+        member_groups(batch.scoped_opportunities.as_ref().unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn local_scope_keeps_unknown_and_unreachable_member_floors() {
+    let (_, opportunities, inputs, population) = algorithm_pair_inventory([1, 1]);
+    let universe = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    for original in [
+        CaseOpportunity {
+            population: opportunities[0].population.clone(),
+            minimum_fresh_members: 0,
+        },
+        CaseOpportunity {
+            population: CasePopulation::Unknown {
+                known_alternatives: vec![inputs[0][0].key(population.population_policy())],
+            },
+            minimum_fresh_members: 0,
+        },
+        CaseOpportunity {
+            population: CasePopulation::Alternatives(vec![
+                inputs[0][0].key(population.population_policy())
+            ]),
+            minimum_fresh_members: 0,
+        },
+    ] {
+        let projected =
+            super::super::composition::project_opportunity(&original, &inputs[0], &universe)
+                .unwrap();
+        assert_eq!(projected.minimum_fresh_members, 0);
+        assert!(member_groups(std::slice::from_ref(&projected))
+            .unwrap()
+            .iter()
+            .all(|group| group.guaranteed_case_indices.is_empty()));
         assert_eq!(
-            denied.execution_case_indices, raw.execution_case_indices,
-            "{reason}"
-        );
-        assert_eq!(denied.requests, raw.requests, "{reason}");
-        assert_eq!(
-            denied.serial_wave_upper_bound, raw.serial_wave_upper_bound,
-            "{reason}"
-        );
-        assert_eq!(
-            denied.declared_offer_row_bound, raw.declared_offer_row_bound,
-            "{reason}"
+            std::mem::discriminant(&projected.population),
+            std::mem::discriminant(&original.population)
         );
     }
 }
 
 #[test]
-fn same_width_combination_preserves_later_original_source_at_same_or_lower_policy() {
+fn same_width_union_preserves_later_original_source_at_same_or_lower_policy() {
     use SloAutomaticCostProbeSamplingPresetV1::{Configured, GreedyLength};
-
     for preset in [Configured, GreedyLength] {
         let (mut cases, mut opportunities, mut inputs, population) =
             algorithm_pair_inventory([1, 1]);
         let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
             DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
                 .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
-        // The original A/B/C opportunities fit the three-source cap. A/B
-        // coalescing saves a slot for a separate union; C keeps its complete
-        // raw source at either the same policy or GreedyLength's later policy.
         for mut case in cases[..2].to_vec() {
             case.template = 2;
             case.width *= 4;
@@ -850,7 +911,7 @@ fn same_width_combination_preserves_later_original_source_at_same_or_lower_polic
             inputs.push(vec![input_facts(&StructuredQueryV2::exact(input)).unwrap()]);
             cases.push(case);
         }
-        let run = |capacity, seed| {
+        let run = |seed| {
             select_with_capacity(
                 &cases,
                 &opportunities,
@@ -859,126 +920,63 @@ fn same_width_combination_preserves_later_original_source_at_same_or_lower_polic
                 8,
                 None,
                 &population,
-                capacity,
+                SelectionCapacity::legacy(100_000, 10_000_000),
                 usize::MAX,
                 None,
                 None,
                 None,
-                NonZeroUsize::new(3),
+                NonZeroUsize::new(2),
                 seed,
             )
             .unwrap()
         };
-        let capacity = SelectionCapacity::legacy(100_000, 10_000_000);
-        let raw = run(capacity, None);
-        assert_eq!(raw.populations.len(), 3);
-        assert!(raw.populations.iter().all(|member| member.scheduled));
-        let scheduled: Vec<_> = raw.batches.iter().filter(|batch| batch.scheduled).collect();
-        assert_eq!(scheduled.len(), 2);
-        assert!(scheduled
-            .last()
-            .unwrap()
-            .representative_case_indices
-            .iter()
-            .all(|&index| cases[index].template == 2));
-
-        let selected = run(capacity, Some(&seed));
-        assert!(
-            selected.populations.iter().all(|member| member.scheduled),
-            "{preset:?}"
-        );
-        let selected_sources: Vec<_> = selected
-            .batches
-            .iter()
-            .filter(|batch| batch.scheduled)
-            .collect();
-        assert_eq!(selected_sources.len(), 3);
-        let combination_index = selected_sources
-            .iter()
-            .position(|batch| batch.algorithm_universe.is_some())
-            .expect("the saved source slot must collect a separate A+B scope");
-        let combination = selected_sources[combination_index];
-        let local = combination.algorithm_universe.as_ref().unwrap();
-        assert_eq!(local.algorithm_count(), 2);
-        assert!(seed.contains_universe(local));
-        assert!(combination
-            .representative_case_indices
-            .iter()
-            .all(|&index| cases[index].template < 2));
-        for original in &scheduled {
-            let retained = selected_sources
-                .iter()
-                .find(|batch| {
-                    batch.algorithm_universe.is_none()
-                        && batch.representative_case_indices == original.representative_case_indices
-                })
-                .expect("composition must retain each original raw source");
-            assert_eq!(retained.planned_cycles, original.planned_cycles);
-            assert_eq!(retained.requests, original.requests);
-            assert_eq!(
-                retained.serial_wave_upper_bound,
-                original.serial_wave_upper_bound
-            );
-            assert_eq!(
-                retained.declared_offer_row_bound,
-                original.declared_offer_row_bound
-            );
-        }
-        let later_index = selected_sources
-            .iter()
-            .position(|batch| {
-                batch.algorithm_universe.is_none()
-                    && batch
-                        .representative_case_indices
-                        .iter()
-                        .all(|&index| cases[index].template == 2)
-            })
-            .unwrap();
-        assert_eq!(later_index < combination_index, preset == Configured);
-        assert_eq!(selected.requests, raw.requests + combination.requests);
+        let raw = run(None);
+        let selected = run(Some(&seed));
+        assert!(selected.populations.iter().all(|member| member.scheduled));
         assert_eq!(
-            selected.serial_wave_upper_bound,
-            raw.serial_wave_upper_bound + combination.serial_wave_upper_bound
-        );
-        assert_eq!(
-            selected.declared_offer_row_bound,
-            raw.declared_offer_row_bound + combination.declared_offer_row_bound
-        );
-        assert!(selected.execution_case_indices.len() > raw.execution_case_indices.len());
-
-        // The extra union's work cannot borrow C's originally affordable
-        // request allowance, even when its source slot is available.
-        let denied = run(
-            SelectionCapacity {
-                requests: selected.requests - 1,
-                execution_actions: selected.serial_wave_upper_bound,
-                declared_offer_rows: selected.declared_offer_row_bound,
-            },
-            Some(&seed),
-        );
-        assert!(
-            denied
+            selected
                 .batches
                 .iter()
-                .all(|batch| batch.algorithm_universe.is_none()),
-            "{preset:?}"
+                .filter(|batch| batch.scheduled)
+                .count(),
+            2
         );
-        assert!(
-            denied.populations.iter().all(|member| member.scheduled),
-            "{preset:?}"
-        );
+        let union = selected
+            .batches
+            .iter()
+            .find(|batch| batch.algorithm_universe.is_some())
+            .unwrap();
+        assert!(union
+            .representative_case_indices
+            .iter()
+            .all(|&i| cases[i].template < 2));
+        let later = |selection: &CheckedSelection| {
+            selection
+                .batches
+                .iter()
+                .find(|batch| {
+                    batch.scheduled
+                        && batch
+                            .representative_case_indices
+                            .iter()
+                            .all(|&i| cases[i].template == 2)
+                })
+                .unwrap()
+                .clone()
+        };
+        let original = later(&raw);
+        let retained = later(&selected);
+        assert!(retained.algorithm_universe.is_none());
         assert_eq!(
-            denied.execution_case_indices, raw.execution_case_indices,
-            "{preset:?}"
+            retained.representative_case_indices,
+            original.representative_case_indices
         );
-        assert_eq!(denied.requests, raw.requests, "{preset:?}");
+        assert_eq!(retained.planned_cycles, original.planned_cycles);
+        assert_eq!(retained.requests, original.requests);
         assert_eq!(
-            denied.serial_wave_upper_bound, raw.serial_wave_upper_bound,
-            "{preset:?}"
+            retained.serial_wave_upper_bound,
+            original.serial_wave_upper_bound
         );
-        assert_eq!(
-            denied.declared_offer_row_bound, raw.declared_offer_row_bound,
-            "{preset:?}"
-        );
+        assert!(selected.requests < raw.requests);
     }
 }
