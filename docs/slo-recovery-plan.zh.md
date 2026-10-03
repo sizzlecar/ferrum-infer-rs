@@ -56,6 +56,12 @@ G11 正常 CUDA run 已在 10 月 3 日 08:47 UTC 前结束，guard/product 均�
 
 此外，只读审查确认 Source8 可在一次真实 capture 中保留多个独立 host/product family，各自完成 F/R/Q。当前 selector 的分组、优先级和单一 universe 限制了打包。减少来源槽可能因共同采样周期反增执行工作，必须先重算请求、动作、行数、owner 和内存账；没有证据证明该方向能在 120s/2048 内覆盖必要策略，尚未实现。外部记录为 `g10-multi-family-capture-design-audit.json`。G11/G12 的局部结果分别存于 `g11-validation-status.json`、`g12-validation-status.json`，不覆盖上面的 G10 冻结负结果。
 
+G13 修复声明前的一处已复现遗漏：`local_universe` 曾先按目标 numerical family 过滤关联配方，再构建固定算法集合；同一 case 的合法后继轨迹若属于另一 host/product family，其算法也被一起删除。但完整 cohort 的物理投影早于 numerical family 成员判定，因此不能用训练族筛选代替原物理轨迹的声明。现在 builder 读取所选原 case 的全部已关联配方，仍保留原 facts 的统一 family、代表、成员下限及独立 F/R/Q；未关联算法不引入，seed 不包含后继算法或 builder 越界时仍放弃整个 scoped candidate，原 raw 计划保留。collector、数值接受规则及各预算未改。
+
+最小 typed Rust 反例保留目标 A/B、同 case 关联的另一 product C，以及仅在 global seed 中的无关 D。旧代码在 C 的声明成员检查处失败，0 pass/1 fail、0.06s；修复后 C 可物理投影但仍不同于目标 family，D 仍被排除。seed 缺 C 时的回归保持原代表、成员、cycles 和三项工作量。相关 `local_scope_` 六项通过，整个 layout 组 122 pass、0 fail、0 ignored。另一个完整独立 F/R/Q 与证书重放回归同时覆盖旧 FittedResidual 和生产 IdentifiedFitGlobalResidual：仅测 A 可以资格并预测 A，已声明但未测的 B 严格拒绝为 QualificationCoverage。首轮测试曾错误地要求更后的 UnidentifiedDirection，失败已保留；查明 phase coverage 先于数值求值后修正断言，生产门未改。输入 readiness V3 与 envelope challenge 是两个不同字段，本回归不声称覆盖整个输入准备流程。
+
+G13 仍未实机验证，也未完成组合候选的全仓检查。上述反例证明真实选择逻辑遗漏，但 G11 日志没有具体 CUDA C，尚不能断言已修复该次设备拒绝；新维度仍可能增加容量或资格工作。下一步先用同原配置 CUDA run 检验该假设，再依结果推进同一候选的四入口，不直接启动正式矩阵。局部证据存于 `g13-validation-status.json`。
+
 ## G9：同一候选的四入口实机结果（历史）
 
 2026 年 10 月 3 日，冻结候选 `c00a0b30` 的 Metal/CUDA 正常 `run` 与 `serve` 均已结束。业务代码对应 `88e298de`，后续差异只有两个 inventory 测试计账和文档。当前仍无完整可交付版本，正式验收为 **0/224**。完整校准计划成功、普通请求实际采用和客户端 SLO 分别判定；来源数量不是独立的 4/4 门槛。

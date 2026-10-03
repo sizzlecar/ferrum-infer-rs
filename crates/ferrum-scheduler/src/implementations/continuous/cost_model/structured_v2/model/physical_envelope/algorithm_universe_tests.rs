@@ -88,6 +88,15 @@ fn fit(
     u: &DeclaredAlgorithmUniverseV1,
     samples: &[StructuredNumericObservationV2],
 ) -> Result<FittedStructuredModelV2> {
+    fit_using(u, samples, NonNegativePlanningEstimatorV1::FittedResidualV1)
+}
+fn fit_using(
+    u: &DeclaredAlgorithmUniverseV1,
+    samples: &[StructuredNumericObservationV2],
+    estimator: NonNegativePlanningEstimatorV1,
+) -> Result<FittedStructuredModelV2> {
+    let mut envelope = contract(u);
+    envelope.planning_estimator = estimator;
     FittedStructuredModelV2::fit_service_window(
         samples[0].fingerprint.clone(),
         StructuredSettingsV2 {
@@ -103,7 +112,7 @@ fn fit(
             window_declaration: [13; 32],
             phase_offered: [24; 3],
             domain_policy: StructuredServiceDomainPolicyV1::NonNegativePhysicalEnvelopeV1,
-            nonnegative_envelope: Some(contract(u)),
+            nonnegative_envelope: Some(envelope),
         },
         close(StructuredPhaseV2::Fit, samples),
         samples,
@@ -246,6 +255,102 @@ fn algorithm_universe_known_composition_uses_independent_residual_and_qualificat
         ),
         Err(StructuredUnknown::QualificationUnderestimate)
     ));
+}
+
+#[test]
+fn algorithm_universe_unobserved_declared_axis_keeps_qualified_subset_and_replays() {
+    let u = universe();
+    let phases = [
+        StructuredPhaseV2::Fit,
+        StructuredPhaseV2::Residual,
+        StructuredPhaseV2::Qualification,
+    ]
+    .map(|phase| {
+        let mut out = samples(phase, &u, false, false);
+        for sample in &mut out {
+            // Keep the original fresh phase/call/offer identities and synthetic
+            // one-algorithm cost law; every actual canonical wave executes A.
+            sample.input = original(&["A"], sample.input.owner().rows, false)
+                .with_cost_template_policy(StructuredCostTemplatePolicyV1::InstalledAlgorithmSetV1)
+                .unwrap()
+                .with_algorithm_universe(&u)
+                .unwrap();
+        }
+        out
+    });
+    for pair in phases.windows(2) {
+        assert!(pair[0].last().unwrap().ordinal < pair[1][0].ordinal);
+        assert!(pair[0].last().unwrap().call_id < pair[1][0].call_id);
+        assert!(pair[0].last().unwrap().observed_at_ns < pair[1][0].observed_at_ns);
+    }
+    let [fitting, residual, heldout] = &phases;
+    let maximum_observed_cost = fitting.iter().map(|s| s.wall_ns).max().unwrap();
+    let finish = |candidate: FittedStructuredModelV2| {
+        candidate
+            .calibrate_service_window(close(StructuredPhaseV2::Residual, residual), residual, 480)
+            .unwrap()
+            .qualify_service_window(
+                close(StructuredPhaseV2::Qualification, heldout),
+                heldout,
+                720,
+            )
+            .unwrap()
+    };
+    let a = StructuredQueryV2::exact(original(&["A"], 3, false));
+    let b = StructuredQueryV2::exact(original(&["B"], 3, false));
+    assert_eq!(u.contains_checked_algorithms(b.input()), Ok(true));
+    assert_eq!(
+        b.input().numerical_family_key_for_universe(&u),
+        fitting[0].input.numerical_family_key(),
+        "B is declared in the same numerical family, but declaration is not support"
+    );
+    for estimator in [
+        NonNegativePlanningEstimatorV1::FittedResidualV1,
+        NonNegativePlanningEstimatorV1::IdentifiedFitGlobalResidualV1,
+    ] {
+        let fitted = fit_using(&u, fitting, estimator).unwrap();
+        let static_margin = fitted.settings.static_margin_ns;
+        let replay_fitted = FittedStructuredModelV2::fit_service_window_from_certificate(
+            fitting[0].fingerprint.clone(),
+            fitted.settings.clone(),
+            scope(&fitting[0].input),
+            fitted.service_window.as_ref().unwrap().contract.clone(),
+            close(StructuredPhaseV2::Fit, fitting),
+            fitting,
+            240,
+            fitted.nonnegative_fit_certificate().unwrap().clone(),
+        )
+        .unwrap();
+        let model = finish(fitted);
+        let replay = finish(replay_fitted);
+        assert_eq!(model.parameters_signature(), replay.parameters_signature());
+        assert_eq!(
+            model.source_contract().phase_members,
+            [fitting.len(), residual.len(), heldout.len()]
+        );
+        let mut original_prediction = None;
+        for candidate in [&model, &replay] {
+            let prediction = candidate
+                .predict_query(&fitting[0].fingerprint, &a, 730)
+                .unwrap();
+            assert!(prediction.planning_ns >= 1000 + 3 * 10);
+            assert!(prediction.planning_ns <= maximum_observed_cost + static_margin);
+            assert_eq!(prediction.fit_samples, fitting.len());
+            assert_eq!(prediction.residual_samples, residual.len());
+            if let Some(expected) = original_prediction {
+                assert_eq!(prediction.planning_ns, expected);
+            } else {
+                original_prediction = Some(prediction.planning_ns);
+            }
+            // Qualified queries check each phase's positive-axis coverage
+            // before numerical prediction can report UnidentifiedDirection.
+            let rejected = candidate.predict_query(&fitting[0].fingerprint, &b, 730);
+            assert!(
+                matches!(&rejected, Err(StructuredUnknown::QualificationCoverage)),
+                "{estimator:?} declared but unobserved B: {rejected:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -188,7 +188,12 @@ fn local_universe(
     let mut builder =
         DeclaredAlgorithmUniverseBuilderV1::new(population.settings.max_axes, builder_limit(seed)?)
             .map_err(|reason| error(format!("combination declaration builder: {reason:?}")))?;
-    for input in compatible() {
+    // The physical envelope is replayed before numerical-family membership.
+    // A complete original cohort can therefore need an associated algorithm
+    // from another host/product family without making that wave a member of
+    // this family's fit. Declare all linked original work, then keep the
+    // original compatible-family checks and independent qualification below.
+    for input in recipes(batch, inputs, trajectories) {
         if builder.observe(input).is_err() {
             return Ok(None);
         }

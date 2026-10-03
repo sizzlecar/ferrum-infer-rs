@@ -963,6 +963,203 @@ fn local_scope_uses_only_original_cases_checked_trajectory_algorithms() {
 }
 
 #[test]
+fn local_scope_keeps_linked_other_product_trajectory_without_merging_members() {
+    use std::sync::Arc;
+
+    let (cases, opportunities, inputs, population) = algorithm_pair_inventory([1, 1]);
+    // These use the existing typed canonical-command fixture. C is a lawful
+    // FullLogits host branch linked to an original case, not another formal
+    // Greedy member. D exists only in the discovery seed.
+    let later = natural_termination_input_with_algorithm(
+        1,
+        CostProductOutput::FullLogits,
+        false,
+        65,
+        "fixture.selection.linked-full",
+        [10; 32],
+    );
+    let unrelated = natural_termination_input_with_algorithm(
+        1,
+        CostProductOutput::GreedyToken,
+        false,
+        257,
+        "fixture.selection.unselected",
+        [11; 32],
+    );
+    let mut links = vec![Vec::new(); cases.len()];
+    links[0].push(0);
+    let inventory = inventory::CheckedCaseInventory {
+        opportunities: opportunities.clone(),
+        inputs: inputs.clone(),
+        original_inputs: inputs
+            .iter()
+            .flatten()
+            .filter_map(|facts| facts.original.clone())
+            .collect(),
+        algorithm_inputs: vec![Arc::new(later.clone()), Arc::new(unrelated.clone())],
+        algorithm_case_inputs: links,
+        gaps: Vec::new(),
+        charge: ProbePreflightCharge::default(),
+    };
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap())
+            .chain(inventory.algorithm_inputs.iter().map(Arc::as_ref)), population.settings.max_axes).unwrap();
+    let formal = inputs[0][0].original.as_deref().unwrap();
+    assert_eq!(seed.contains_checked_algorithms(&later), Ok(true));
+    assert_ne!(
+        later.numerical_family_key_for_universe(&seed).unwrap(),
+        formal.numerical_family_key_for_universe(&seed).unwrap(),
+        "algorithm declaration must not merge distinct product/host families"
+    );
+    let run = |seed| {
+        select_with_capacity_and_trajectories(
+            &cases,
+            &opportunities,
+            &inputs,
+            &[61, 61],
+            8,
+            None,
+            &population,
+            SelectionCapacity::legacy(100_000, 10_000_000),
+            usize::MAX,
+            None,
+            None,
+            None,
+            NonZeroUsize::new(1),
+            seed,
+            Some(&inventory),
+        )
+        .unwrap()
+    };
+    let raw = run(None);
+    let selected = run(Some(&seed));
+    let batch = selected
+        .batches
+        .iter()
+        .find(|batch| batch.scheduled)
+        .unwrap();
+    let raw = raw.batches.iter().find(|batch| batch.scheduled).unwrap();
+    assert_eq!(
+        batch.representative_case_indices,
+        raw.representative_case_indices
+    );
+    assert!(batch.representative_case_indices.contains(&0));
+    assert_eq!(batch.population_indices, raw.population_indices);
+    assert_eq!(batch.schedule.min_members, raw.schedule.min_members);
+    let scoped = batch.scoped_opportunities.as_ref().unwrap();
+    assert_eq!(member_groups(scoped).unwrap().len(), 1);
+    for (&index, opportunity) in batch.representative_case_indices.iter().zip(scoped) {
+        assert_eq!(
+            opportunity.minimum_fresh_members,
+            opportunities[index].minimum_fresh_members
+        );
+    }
+    let local = batch.algorithm_universe.as_ref().unwrap();
+    assert!(seed.contains_universe(local));
+    assert_eq!(local.contains_checked_algorithms(&unrelated), Ok(false));
+    assert_eq!(
+        local.contains_checked_algorithms(&later),
+        Ok(true),
+        "a linked physical trajectory must remain projectable before formal-family membership"
+    );
+    let mut contract = population.nonnegative_envelope.clone().unwrap();
+    contract.algorithm_universe = Some(local.clone());
+    let projected = contract.project_input(later).unwrap();
+    assert_ne!(
+        projected.numerical_family_key().unwrap(),
+        formal.numerical_family_key_for_universe(local).unwrap(),
+        "including C's algorithms grants no formal family membership or qualification"
+    );
+}
+
+#[test]
+fn local_scope_missing_linked_trajectory_seed_preserves_raw_budget_and_members() {
+    use std::sync::Arc;
+
+    let (cases, opportunities, inputs, population) = algorithm_pair_inventory([1, 1]);
+    let later = natural_termination_input_with_algorithm(
+        1,
+        CostProductOutput::FullLogits,
+        false,
+        65,
+        "fixture.selection.linked-full",
+        [10; 32],
+    );
+    let mut links = vec![Vec::new(); cases.len()];
+    links[0].push(0);
+    let inventory = inventory::CheckedCaseInventory {
+        opportunities: opportunities.clone(),
+        inputs: inputs.clone(),
+        original_inputs: inputs
+            .iter()
+            .flatten()
+            .filter_map(|facts| facts.original.clone())
+            .collect(),
+        algorithm_inputs: vec![Arc::new(later.clone())],
+        algorithm_case_inputs: links,
+        gaps: Vec::new(),
+        charge: ProbePreflightCharge::default(),
+    };
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(inputs.iter().flatten()
+            .map(|fact| fact.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    assert_eq!(seed.contains_checked_algorithms(&later), Ok(false));
+    let run = |capacity, seed| {
+        select_with_capacity_and_trajectories(
+            &cases,
+            &opportunities,
+            &inputs,
+            &[61, 61],
+            8,
+            None,
+            &population,
+            capacity,
+            usize::MAX,
+            None,
+            None,
+            None,
+            NonZeroUsize::new(1),
+            seed,
+            Some(&inventory),
+        )
+        .unwrap()
+    };
+    let generous = run(SelectionCapacity::legacy(100_000, 10_000_000), None);
+    let capacity = SelectionCapacity {
+        requests: generous.requests,
+        execution_actions: generous.serial_wave_upper_bound,
+        declared_offer_rows: generous.declared_offer_row_bound,
+    };
+    let raw = run(capacity, None);
+    let selected = run(capacity, Some(&seed));
+    assert!(!selected.execution_case_indices.is_empty());
+    assert_eq!(selected.execution_case_indices, raw.execution_case_indices);
+    assert_eq!(selected.requests, raw.requests);
+    assert_eq!(
+        selected.serial_wave_upper_bound,
+        raw.serial_wave_upper_bound
+    );
+    assert_eq!(
+        selected.declared_offer_row_bound,
+        raw.declared_offer_row_bound
+    );
+    assert_eq!(selected.batches.len(), raw.batches.len());
+    for (selected, raw) in selected.batches.iter().zip(&raw.batches) {
+        assert!(selected.algorithm_universe.is_none());
+        assert!(selected.scoped_opportunities.is_none());
+        assert_eq!(selected.scheduled, raw.scheduled);
+        assert_eq!(selected.population_indices, raw.population_indices);
+        assert_eq!(
+            selected.representative_case_indices,
+            raw.representative_case_indices
+        );
+        assert_eq!(selected.planned_cycles, raw.planned_cycles);
+        assert_eq!(selected.schedule.min_members, raw.schedule.min_members);
+    }
+}
+
+#[test]
 fn local_scope_keeps_unknown_and_unreachable_member_floors() {
     let (_, opportunities, inputs, population) = algorithm_pair_inventory([1, 1]);
     let universe = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
