@@ -9,6 +9,7 @@ enum GeometryPlan {
     #[default]
     CurrentFull,
     AnchoredReadinessV2WidthCostV1,
+    AnchoredReadinessV2WidthCostSubsetV1,
 }
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,12 +17,21 @@ enum SchedulePlan {
     CompleteCycle,
     EachOffer,
 }
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CycleOrder {
+    #[default]
+    Concat,
+    RoundRobin,
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Options {
     #[serde(default)]
     geometry_plan: GeometryPlan,
     schedule: SchedulePlan,
+    #[serde(default)]
+    cycle_order: CycleOrder,
     /// Explicit original population indices; each group is one hypothetical
     /// new journal. Existing captured source files/models are never relabelled.
     population_groups: Vec<Vec<usize>>,
@@ -171,6 +181,7 @@ fn planned_group(
     opportunities: &[CaseOpportunity],
     target: usize,
     schedule: SchedulePlan,
+    cycle_order: CycleOrder,
 ) -> AuditResult<(SelectedBatch, Vec<usize>)> {
     let mut populations = Vec::new();
     let mut filler_counts = Vec::new();
@@ -204,9 +215,9 @@ fn planned_group(
         SchedulePlan::CompleteCycle => budget::startup_schedule,
         SchedulePlan::EachOffer => each_offer_schedule,
     };
-    let mut batch = batch_plan_with_schedule(
+    let mut batch = batch_plan_for_cycle(
         &indices,
-        &populations,
+        ordered_cycle(&populations, cycle_order)?,
         &capture.cases,
         opportunities,
         &capture.prompts,
@@ -219,6 +230,32 @@ fn planned_group(
     batch.population_indices = group.iter().map(|p| p.original_index).collect();
     batch.algorithm_universe = group[0].universe.clone();
     Ok((batch, filler_counts))
+}
+
+fn ordered_cycle(populations: &[SelectedPopulation], order: CycleOrder) -> Result<Vec<usize>> {
+    if order == CycleOrder::Concat {
+        return Ok(populations
+            .iter()
+            .flat_map(|p| p.representative_case_indices.iter().copied())
+            .collect());
+    }
+    let mut count = 0;
+    let mut longest = 0;
+    for family in populations {
+        count = add(count, family.representative_case_indices.len())?;
+        longest = longest.max(family.representative_case_indices.len());
+    }
+    let mut cycle = Vec::with_capacity(count);
+    for occurrence in 0..longest {
+        for family in populations {
+            if let Some(&case) = family.representative_case_indices.get(occurrence) {
+                cycle.push(case);
+            }
+        }
+    }
+    // Each list already contains its original representatives followed by
+    // fresh filler occurrences. Interleave without sorting or deduplicating.
+    Ok(cycle)
 }
 
 fn selected_calls<'a>(
@@ -257,7 +294,140 @@ fn selected_calls<'a>(
                 "scope":"Only certified independent MAX final cases enter plan arithmetic; shared-budget outcome remains separate."}),
             ))
         }
+        GeometryPlan::AnchoredReadinessV2WidthCostSubsetV1 => {
+            let candidate = field(reference, "narrow_extension_candidate")?;
+            ensure!(
+                field(candidate, "geometry_kernel")?.as_str()
+                    == Some("anchored_readiness_v2_width_cost_subset_v1")
+                    && decode::<bool>(candidate, "all_case_and_key_bindings_verified")?
+                    && decode::<Vec<usize>>(candidate, "widths")? == [1, 4],
+                "subset candidate kind or original identity binding differs"
+            );
+            let bindings = field(candidate, "source_bindings")?;
+            for name in ["g18_capture", "g20_header", "g21_capture", "anchor_audit"] {
+                let binding = field(bindings, name)?;
+                let sha = field(binding, "sha256")?
+                    .as_str()
+                    .context("subset source hash not string")?;
+                ensure!(
+                    field(binding, "path")?
+                        .as_str()
+                        .is_some_and(|p| !p.is_empty())
+                        && sha.len() == 64
+                        && sha
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "subset source binding incomplete"
+                );
+            }
+            ensure!(
+                bindings.pointer("/g21_capture/sha256") == reference.get("capture_sha256"),
+                "subset candidate binds a different current capture"
+            );
+            let calls = candidate
+                .pointer("/independent_max/calls")
+                .and_then(Value::as_array)
+                .context("subset independent calls absent")?;
+            Ok((
+                calls,
+                json!({
+                    "kind":"anchored_readiness_v2_width_cost_subset_v1",
+                    "widths":[1,4], "source_bindings":bindings,
+                    "shared_original_budget":field(candidate,"shared_original_budget")?,
+                    "scope":"Certified current subset span and historical branch witnesses only. All original narrow candidates remain, but old pivot indices need not be selected. This is not full-matrix/C8 support or actual F/R/Q qualification."
+                }),
+            ))
+        }
     }
+}
+
+/// A subset owns its own mandatory row offsets. Full-matrix anchors must not
+/// silently be cropped, or required here as if the subset promised full scope.
+fn checked_subset_cases(
+    captured: &CapturedPopulation,
+    call: &Value,
+    cases: &[Case],
+) -> AuditResult<(Vec<usize>, Vec<usize>)> {
+    ensure!(
+        field(call, "source_original_case_indices")? == field(&captured.matrix, "cases")?
+            && field(call, "population_key")? == &serde_json::to_value(&captured.key)?,
+        "subset original case/key identity differs"
+    );
+    let candidates = decode::<Vec<usize>>(call, "original_case_indices")?;
+    let anchors = decode::<Vec<usize>>(call, "mandatory_anchor_indices")?;
+    let selected = decode::<Vec<usize>>(call, "final_selected_cases")?;
+    let full = decode::<Vec<usize>>(&captured.matrix, "cases")?;
+    ensure!(
+        full.iter().all(|&index| index < cases.len())
+            && anchors.windows(2).all(|pair| pair[0] < pair[1]),
+        "subset source cases or anchor order invalid"
+    );
+    let subset = decode::<bool>(call, "subset_applied")?;
+    if !subset {
+        ensure!(
+            !matches!(&captured.key, CheckedPopulationKey::NumericalFamily(_))
+                && candidates == full
+                && field(call, "mandatory_anchor_indices")?
+                    == field(&captured.matrix, "mandatory_anchors")?,
+            "unmodified population must retain its entire original scope"
+        );
+        checked_cases(&selected, &captured.matrix, cases.len())?;
+        return Ok((candidates, selected));
+    }
+    ensure!(
+        matches!(&captured.key, CheckedPopulationKey::NumericalFamily(_))
+            && decode::<Vec<usize>>(call, "widths")? == [1, 4],
+        "subset applies only to the declared Decode numerical families"
+    );
+    let expected: Vec<_> = full
+        .iter()
+        .copied()
+        .filter(|&index| matches!(cases[index].width, 1 | 4))
+        .collect();
+    ensure!(
+        !expected.is_empty() && candidates == expected,
+        "subset omitted or added an original width-1/4 candidate"
+    );
+    let narrow: Vec<_> = full
+        .iter()
+        .copied()
+        .filter(|&index| cases[index].width == 1)
+        .collect();
+    ensure!(
+        !narrow.is_empty() && decode::<Vec<usize>>(call, "original_narrow_case_indices")? == narrow,
+        "subset must retain all original narrow candidates"
+    );
+    let old = decode::<Vec<usize>>(call, "old_narrow_representative_case_indices")?;
+    ensure!(
+        !old.is_empty()
+            && old.windows(2).all(|pair| pair[0] < pair[1])
+            && old.iter().all(|index| narrow.contains(index)),
+        "old narrow representatives must remain in the candidate scope"
+    );
+    let mandatory_cases = anchors
+        .iter()
+        .map(|&offset| {
+            candidates
+                .get(offset)
+                .copied()
+                .context("subset anchor outside rows")
+        })
+        .collect::<AuditResult<Vec<_>>>()?;
+    for field_name in [
+        "historical_mandatory_case_indices",
+        "numeric_endpoint_case_indices",
+    ] {
+        let required = decode::<Vec<usize>>(call, field_name)?;
+        ensure!(
+            !required.is_empty()
+                && required.windows(2).all(|pair| pair[0] < pair[1])
+                && required.iter().all(|index| mandatory_cases.contains(index)),
+            "subset lost a historical mandatory witness or current numeric endpoint"
+        );
+    }
+    let matrix = json!({"cases":candidates,"mandatory_anchors":anchors});
+    checked_cases(&selected, &matrix, cases.len())?;
+    Ok((candidates, selected))
 }
 
 pub(super) fn evaluate(
@@ -299,6 +469,15 @@ pub(super) fn evaluate(
             mentioned.push(index);
         }
     }
+    if matches!(
+        options.geometry_plan,
+        GeometryPlan::AnchoredReadinessV2WidthCostSubsetV1
+    ) {
+        ensure!(
+            mentioned.len() == capture.populations.len(),
+            "symmetric subset experiment must retain every original host/product and Prefill population"
+        );
+    }
     let mut plans = Vec::new();
     let mut opportunities = vec![
         CaseOpportunity {
@@ -312,12 +491,21 @@ pub(super) fn evaluate(
     for (ordinal, (captured, call)) in capture.populations.iter().zip(calls).enumerate() {
         ensure!(
             decode::<usize>(call, "ordinal")? == ordinal
-                && decode::<usize>(call, "population_index")? == captured.index
-                && field(call, "original_case_indices")? == field(&captured.matrix, "cases")?
-                && field(call, "mandatory_anchor_indices")?
-                    == field(&captured.matrix, "mandatory_anchors")?,
+                && decode::<usize>(call, "population_index")? == captured.index,
             "candidate original matrix identity differs"
         );
+        let subset = matches!(
+            options.geometry_plan,
+            GeometryPlan::AnchoredReadinessV2WidthCostSubsetV1
+        );
+        if !subset {
+            ensure!(
+                field(call, "original_case_indices")? == field(&captured.matrix, "cases")?
+                    && field(call, "mandatory_anchor_indices")?
+                        == field(&captured.matrix, "mandatory_anchors")?,
+                "candidate original matrix scope differs"
+            );
+        }
         // An unselected candidate need not become complete. The explicit
         // joint plan, not the size of the captured inventory, defines this audit.
         if !mentioned.contains(&captured.index) {
@@ -331,14 +519,20 @@ pub(super) fn evaluate(
         if matches!(
             options.geometry_plan,
             GeometryPlan::AnchoredReadinessV2WidthCostV1
+                | GeometryPlan::AnchoredReadinessV2WidthCostSubsetV1
         ) {
             ensure!(
                 decode::<bool>(call, "span_verified")?,
-                "selected candidate lacks original full-matrix span certification"
+                "selected candidate lacks its declared matrix span certification"
             );
         }
-        let ids = decode::<Vec<usize>>(call, "final_selected_cases")?;
-        checked_cases(&ids, &captured.matrix, capture.cases.len())?;
+        let (candidate_cases, ids) = if subset {
+            checked_subset_cases(captured, call, &capture.cases)?
+        } else {
+            let ids = decode::<Vec<usize>>(call, "final_selected_cases")?;
+            checked_cases(&ids, &captured.matrix, capture.cases.len())?;
+            (decode::<Vec<usize>>(&captured.matrix, "cases")?, ids)
+        };
         let expected: Vec<_> = original_batches
             .iter()
             .filter(|b| {
@@ -346,7 +540,7 @@ pub(super) fn evaluate(
             })
             .collect();
         ensure!(expected.len() == 1, "candidate original batch not unique");
-        for index in decode::<Vec<usize>>(&captured.matrix, "cases")? {
+        for index in candidate_cases {
             let opportunity = opportunities
                 .get_mut(index)
                 .context("candidate case outside original table")?;
@@ -439,8 +633,14 @@ pub(super) fn evaluate(
         let mut schedule_fits = true;
         let mut sources = Vec::new();
         for group in &groups {
-            let (batch, filler_counts) =
-                planned_group(capture, group, &opportunities, target, options.schedule)?;
+            let (batch, filler_counts) = planned_group(
+                capture,
+                group,
+                &opportunities,
+                target,
+                options.schedule,
+                options.cycle_order,
+            )?;
             total.charge(&batch)?;
             schedule_fits &= batch.schedule_within_capacity
                 && batch.maximum_anchor_span
@@ -468,6 +668,7 @@ pub(super) fn evaluate(
             "Each filler occurrence is a newly declared cohort. It retains the original floor and identity; setup is deduplicated only by the production acquisition key.",
             "Source8 block closure, serialized bytes, retained memory, actual F/R/Q, 120-second runtime and ordinary adoption are not measured.",
             "Cold fallback currently rebuilds the original complete-cycle schedule and is not validated by these candidate costs.",
+            "Subset mode preserves historical branch witnesses and certifies current subset span; it does not revalidate unrecorded per-row branch flags, old catalog support or full C8 coverage.",
             "The original full-geometry, complete-cycle independent plans remain above as the unchanged control."]}),
     )
 }
@@ -475,6 +676,273 @@ pub(super) fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_plan_round_robin_preserves_each_family_order_and_fresh_duplicates() {
+        use ferrum_interfaces::execution_cost::CostProductOutput;
+        let keys: Vec<_> = [
+            CostProductOutput::GreedyToken,
+            CostProductOutput::FullLogits,
+        ]
+        .into_iter()
+        .map(|product| {
+            CheckedPopulationKey::NumericalFamily(
+                populations::tests::input(1, 3, product, false, true)
+                    .numerical_family_key()
+                    .unwrap(),
+            )
+        })
+        .collect();
+        assert_ne!(keys[0], keys[1]);
+        let members: Vec<_> = [vec![0, 1, 0, 0], vec![2, 3, 2]]
+            .into_iter()
+            .zip(&keys)
+            .map(|(cycle, key)| SelectedPopulation {
+                key: key.clone(),
+                representative_case_indices: cycle,
+                maximum_anchor_span: 0,
+                scheduled: false,
+                batch_index: None,
+                input_geometry: None,
+            })
+            .collect();
+        let concat = ordered_cycle(&members, CycleOrder::default()).unwrap();
+        let interleaved = ordered_cycle(&members, CycleOrder::RoundRobin).unwrap();
+        assert_eq!(concat, [0, 1, 0, 0, 2, 3, 2]);
+        assert_eq!(interleaved, [0, 2, 1, 3, 0, 2, 0]);
+        for member in &members {
+            let retained: Vec<_> = interleaved
+                .iter()
+                .copied()
+                .filter(|case| member.representative_case_indices.contains(case))
+                .collect();
+            assert_eq!(
+                retained, member.representative_case_indices,
+                "each exact family retains its ordered original and repeated fresh occurrences"
+            );
+        }
+        let cases: Vec<_> = [1, 4, 1, 4]
+            .into_iter()
+            .enumerate()
+            .map(|(i, width)| Case {
+                product: if i < 2 {
+                    OpportunityProduct::Greedy
+                } else {
+                    OpportunityProduct::Full
+                },
+                template: 0,
+                width,
+                maximum_output: NonZeroUsize::new(4).unwrap(),
+                release_generated: 2,
+                suffix_tokens: 2,
+                preset: SloAutomaticCostProbeSamplingPresetV1::Configured,
+                prefix: PrefixKind::Ordinary,
+                route: CalibrationDecodeRoute::Actual,
+                reset: false,
+                acquisition: None,
+            })
+            .collect();
+        let opportunities: Vec<_> = (0..cases.len())
+            .map(|i| CaseOpportunity {
+                population: CasePopulation::Unique(keys[i / 2].clone()),
+                minimum_fresh_members: 1,
+            })
+            .collect();
+        let declaration =
+            population::declaration(&Default::default(), populations::tests::domain()).unwrap();
+        let original = batch_plan_with_schedule(
+            &[0, 1],
+            &members,
+            &cases,
+            &opportunities,
+            &[7],
+            16,
+            None,
+            &declaration,
+            None,
+            budget::startup_schedule,
+        )
+        .unwrap();
+        let explicit = batch_plan_for_cycle(
+            &[0, 1],
+            concat,
+            &cases,
+            &opportunities,
+            &[7],
+            16,
+            None,
+            &declaration,
+            None,
+            budget::startup_schedule,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&explicit).unwrap(),
+            serde_json::to_value(&original).unwrap(),
+            "default concat preserves the unchanged production batch contract"
+        );
+        let interleaved = batch_plan_for_cycle(
+            &[0, 1],
+            interleaved,
+            &cases,
+            &opportunities,
+            &[7],
+            16,
+            None,
+            &declaration,
+            None,
+            each_offer_schedule,
+        )
+        .unwrap();
+        assert_eq!(
+            interleaved.schedule.min_members,
+            original.schedule.min_members
+        );
+        let mut cycle = SelectionCapacity::default();
+        for &case in &interleaved.representative_case_indices {
+            let actual = work::case_work(&cases[case], 7, 16, None).unwrap();
+            cycle.requests += actual.requests;
+            cycle.execution_actions += actual.execution_actions;
+            cycle.declared_offer_rows += actual.serial_declared_offer_rows;
+        }
+        let setup =
+            work::setup_for_indices(&cases, &interleaved.representative_case_indices).unwrap();
+        assert_eq!(
+            interleaved.requests,
+            cycle.requests * interleaved.planned_cycles + setup.requests
+        );
+        assert_eq!(
+            interleaved.serial_wave_upper_bound,
+            cycle.execution_actions * interleaved.planned_cycles + setup.execution_actions
+        );
+        assert_eq!(
+            interleaved.declared_offer_row_bound,
+            cycle.declared_offer_rows * interleaved.planned_cycles
+        );
+        for phase in 0..3 {
+            assert!(
+                interleaved.input_opportunities.phase_original_offer_bounds[phase]
+                    >= interleaved.input_opportunities.maximum_fresh_member_span[phase]
+            );
+        }
+        assert!(serde_json::from_value::<CycleOrder>(json!("round_robin")).is_ok());
+        assert!(serde_json::from_value::<CycleOrder>(json!("arbitrary_permutation")).is_err());
+    }
+
+    #[test]
+    fn capture_plan_subset_keeps_real_anchors_without_requiring_old_pivot_indices() {
+        use ferrum_interfaces::execution_cost::CostProductOutput;
+        let input = populations::tests::input(1, 3, CostProductOutput::GreedyToken, false, true);
+        let other = populations::tests::input(1, 3, CostProductOutput::FullLogits, false, true);
+        let key = CheckedPopulationKey::NumericalFamily(input.numerical_family_key().unwrap());
+        let cases: Vec<_> = [1, 1, 4, 8]
+            .into_iter()
+            .map(|width| Case {
+                product: OpportunityProduct::Greedy,
+                template: 0,
+                width,
+                maximum_output: NonZeroUsize::new(4).unwrap(),
+                release_generated: 2,
+                suffix_tokens: 2,
+                preset: SloAutomaticCostProbeSamplingPresetV1::Configured,
+                prefix: PrefixKind::Ordinary,
+                route: CalibrationDecodeRoute::Actual,
+                reset: false,
+                acquisition: None,
+            })
+            .collect();
+        let captured = CapturedPopulation {
+            index: 0,
+            key: key.clone(),
+            matrix: json!({"cases":[0,1,2,3],"mandatory_anchors":[0,3]}),
+            result: Value::Null,
+        };
+        let call = json!({
+            "source_original_case_indices":[0,1,2,3], "population_key":key,
+            "subset_applied":true,"widths":[1,4],
+            "original_case_indices":[0,1,2], "mandatory_anchor_indices":[0,2],
+            "original_narrow_case_indices":[0,1],
+            "old_narrow_representative_case_indices":[0,1],
+            "historical_mandatory_case_indices":[0], "numeric_endpoint_case_indices":[2],
+            "final_selected_cases":[0,2]
+        });
+        assert_eq!(
+            checked_subset_cases(&captured, &call, &cases).unwrap(),
+            (vec![0, 1, 2], vec![0, 2])
+        );
+        // Old pivot 1 remains an input to the separately certified subset, but
+        // the new decomposition may span it without selecting it. Full-width
+        // anchor 3 is outside this declared experiment, not silently revalidated.
+        assert!(checked_cases(&[0, 2], &captured.matrix, cases.len()).is_err());
+        for (name, value) in [
+            ("source_original_case_indices", json!([0, 1, 2])),
+            (
+                "population_key",
+                serde_json::to_value(CheckedPopulationKey::NumericalFamily(
+                    other.numerical_family_key().unwrap(),
+                ))
+                .unwrap(),
+            ),
+            ("original_case_indices", json!([0, 2])),
+            ("original_narrow_case_indices", json!([0])),
+            ("old_narrow_representative_case_indices", json!([3])),
+            ("historical_mandatory_case_indices", json!([1])),
+            ("numeric_endpoint_case_indices", json!([1])),
+            ("mandatory_anchor_indices", json!([0])),
+            ("final_selected_cases", json!([0])),
+            ("final_selected_cases", json!([0, 2, 3])),
+            ("widths", json!([1, 8])),
+            ("subset_applied", json!(false)),
+        ] {
+            let mut invalid = call.clone();
+            invalid[name] = value;
+            assert!(
+                checked_subset_cases(&captured, &invalid, &cases).is_err(),
+                "accepted {name}"
+            );
+        }
+        let unmodified = CapturedPopulation {
+            index: 1,
+            key: CheckedPopulationKey::ExactOwner(input.owner().clone()),
+            matrix: captured.matrix.clone(),
+            result: Value::Null,
+        };
+        let mut untouched = call;
+        untouched["population_key"] = serde_json::to_value(&unmodified.key).unwrap();
+        untouched["subset_applied"] = json!(false);
+        untouched["original_case_indices"] = json!([0, 1, 2, 3]);
+        untouched["mandatory_anchor_indices"] = json!([0, 3]);
+        untouched["final_selected_cases"] = json!([0, 3]);
+        assert!(checked_subset_cases(&unmodified, &untouched, &cases).is_ok());
+        untouched["original_case_indices"] = json!([0, 1, 2]);
+        assert!(checked_subset_cases(&unmodified, &untouched, &cases).is_err());
+    }
+
+    #[test]
+    fn capture_plan_subset_requires_bound_current_capture_and_verified_original_identities() {
+        let sha = "12".repeat(32);
+        let source = json!({"path":"original-input","sha256":sha});
+        let reference = json!({"capture_sha256":sha,"narrow_extension_candidate":{
+            "geometry_kernel":"anchored_readiness_v2_width_cost_subset_v1",
+            "all_case_and_key_bindings_verified":true,"widths":[1,4],
+            "source_bindings":{"g18_capture":source,"g20_header":source,"g21_capture":source,"anchor_audit":source},
+            "independent_max":{"calls":[]}, "shared_original_budget":{"complete":false,"exhausted":true}
+        }});
+        let choice = GeometryPlan::AnchoredReadinessV2WidthCostSubsetV1;
+        let (_, metadata) = selected_calls(&reference, choice).unwrap();
+        assert_eq!(
+            metadata.pointer("/shared_original_budget/complete"),
+            Some(&json!(false)),
+            "independent candidate arithmetic cannot turn exhausted shared geometry into success"
+        );
+        let mut wrong = reference.clone();
+        wrong["narrow_extension_candidate"]["source_bindings"]["g21_capture"]["sha256"] =
+            json!("34".repeat(32));
+        assert!(selected_calls(&wrong, choice).is_err());
+        let mut wrong = reference;
+        wrong["narrow_extension_candidate"]["all_case_and_key_bindings_verified"] = json!(false);
+        assert!(selected_calls(&wrong, choice).is_err());
+    }
 
     #[test]
     fn capture_plan_each_offer_preserves_fresh_floors_and_recomputes_member_capacity() {

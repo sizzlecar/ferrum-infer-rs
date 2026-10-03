@@ -163,6 +163,27 @@ fn geometry(
     work: &mut GeometryWork,
     maximum_scratch_bytes: usize,
 ) -> Result<Geometry> {
+    geometry_mapped(
+        matrix,
+        rows,
+        widths,
+        None,
+        &matrix.mandatory_anchors,
+        work,
+        maximum_scratch_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn geometry_mapped(
+    matrix: &Matrix,
+    rows: &[&[f64]],
+    widths: &[usize],
+    source_rows: Option<&[usize]>,
+    mandatory_anchors: &[usize],
+    work: &mut GeometryWork,
+    maximum_scratch_bytes: usize,
+) -> Result<Geometry> {
     if work.exhausted {
         return Err(StructuredUnknown::Capacity);
     }
@@ -175,13 +196,20 @@ fn geometry(
     if d == 0 || d > matrix.settings.max_axes {
         return Err(StructuredUnknown::Capacity);
     }
-    if widths.len() != n || matrix.axis_bits.len() != n {
+    if widths.len() != n
+        || source_rows.map_or(matrix.axis_bits.len() != n, |indices| {
+            indices.len() != n
+                || indices.windows(2).any(|p| p[0] >= p[1])
+                || indices.last().is_some_and(|&i| i >= matrix.axis_bits.len())
+        })
+    {
         return Err(StructuredUnknown::InvalidInput);
     }
+    let bits = |i: usize| matrix.axis_bits[source_rows.map_or(i, |indices| indices[i])].as_slice();
     if index_bytes(n)? > maximum_scratch_bytes {
         return Err(StructuredUnknown::Capacity);
     }
-    work.charge(add(mul(n, d)?, add(n, matrix.mandatory_anchors.len())?)?)?;
+    work.charge(add(mul(n, d)?, add(n, mandatory_anchors.len())?)?)?;
     if widths.contains(&0)
         || rows.iter().any(|row| {
             row.len() != d
@@ -189,9 +217,9 @@ fn geometry(
                     .iter()
                     .any(|v| !v.is_finite() || *v < 0. || *v > (1u64 << 53) as f64)
         })
-        || matrix.axis_bits.iter().any(|row| row.len() != d)
-        || matrix.mandatory_anchors.windows(2).any(|p| p[0] >= p[1])
-        || matrix.mandatory_anchors.last().is_some_and(|&a| a >= n)
+        || (0..n).any(|i| bits(i).len() != d)
+        || mandatory_anchors.windows(2).any(|p| p[0] >= p[1])
+        || mandatory_anchors.last().is_some_and(|&a| a >= n)
     {
         return Err(StructuredUnknown::InvalidInput);
     }
@@ -204,18 +232,18 @@ fn geometry(
         scale: Vec::new(),
         pivots: Vec::new(),
     };
-    for &anchor in &matrix.mandatory_anchors {
+    for &anchor in mandatory_anchors {
         s.anchor_mask[anchor] = 1;
     }
     for i in 0..n {
-        let hash = hash_row(&matrix.axis_bits[i], work)?;
+        let hash = hash_row(bits(i), work)?;
         let anchor = s.anchor_mask[i] != 0;
         let mut found = None;
         for (j, group) in s.groups.iter().enumerate() {
             work.charge(2)?;
             if group.hash == hash
                 && group.anchor == anchor
-                && equal_row(&matrix.axis_bits[group.row], &matrix.axis_bits[i], work)?
+                && equal_row(bits(group.row), bits(i), work)?
             {
                 found = Some(j);
                 break;
@@ -270,7 +298,7 @@ fn geometry(
     if largest_norm == 0. {
         return Err(StructuredUnknown::Numerical);
     }
-    let mut anchors = !matrix.mandatory_anchors.is_empty();
+    let mut anchors = !mandatory_anchors.is_empty();
     let mut anchor_rank = 0;
     let final_maximum_residual;
     loop {
@@ -359,27 +387,60 @@ fn geometry(
 
 #[derive(Serialize)]
 pub(super) struct Call {
-    ordinal: usize,
-    population_index: usize,
+    pub(super) ordinal: usize,
+    pub(super) population_index: usize,
     original_case_indices: Vec<usize>,
     mandatory_anchor_indices: Vec<usize>,
-    complete: bool,
-    span_verified: bool,
-    rank: Option<usize>,
-    anchor_rank: Option<usize>,
-    pivot_indices: Vec<usize>,
-    final_selected_cases: Vec<usize>,
-    visits: u64,
-    visits_before: u64,
-    visits_after: u64,
-    exhausted: bool,
-    error: Option<String>,
+    pub(super) complete: bool,
+    pub(super) span_verified: bool,
+    pub(super) rank: Option<usize>,
+    pub(super) anchor_rank: Option<usize>,
+    pub(super) pivot_indices: Vec<usize>,
+    pub(super) final_selected_cases: Vec<usize>,
+    pub(super) visits: u64,
+    pub(super) visits_before: u64,
+    pub(super) visits_after: u64,
+    pub(super) exhausted: bool,
+    pub(super) error: Option<String>,
     scratch_bytes: Option<usize>,
     unique_rows: Option<usize>,
     final_maximum_residual: Option<f64>,
     largest_original_norm: Option<f64>,
     independent_span_visits: u64,
     independent_span_error: Option<String>,
+}
+impl Call {
+    pub(super) fn not_run(
+        original: &super::Call,
+        cases: &[usize],
+        before: u64,
+        work: &GeometryWork,
+        error: StructuredUnknown,
+    ) -> Self {
+        Self {
+            ordinal: original.matrix.ordinal,
+            population_index: original.population.population_index,
+            original_case_indices: cases.to_vec(),
+            mandatory_anchor_indices: Vec::new(),
+            complete: false,
+            span_verified: false,
+            rank: None,
+            anchor_rank: None,
+            pivot_indices: Vec::new(),
+            final_selected_cases: Vec::new(),
+            visits: work.used - before,
+            visits_before: before,
+            visits_after: work.used,
+            exhausted: work.exhausted,
+            error: Some(format!("{error:?}")),
+            scratch_bytes: None,
+            unique_rows: None,
+            final_maximum_residual: None,
+            largest_original_norm: None,
+            independent_span_visits: 0,
+            independent_span_error: None,
+        }
+    }
 }
 #[derive(Serialize)]
 pub(super) struct Runs {
@@ -461,42 +522,63 @@ fn span_certificate(
     }
 }
 
-fn call(
+pub(super) fn call(
     verified: &Verified,
     call: &super::Call,
     work: &mut GeometryWork,
     certificate: bool,
 ) -> AuditResult<Call> {
+    call_mapped(
+        verified,
+        call,
+        None,
+        &call.matrix.mandatory_anchors,
+        0,
+        work,
+        certificate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn call_mapped(
+    verified: &Verified,
+    call: &super::Call,
+    source_rows: Option<&[usize]>,
+    anchors: &[usize],
+    metadata_bytes: usize,
+    work: &mut GeometryWork,
+    certificate: bool,
+) -> AuditResult<Call> {
     let matrix = &call.matrix;
-    let decoded: Vec<Vec<f64>> = matrix
-        .axis_bits
-        .iter()
+    let n = source_rows.map_or(matrix.cases.len(), <[usize]>::len);
+    let source = |i: usize| source_rows.map_or(i, |indices| indices[i]);
+    let decoded: Vec<Vec<f64>> = (0..n)
+        .map(|i| &matrix.axis_bits[source(i)])
         .map(|r| r.iter().map(|&b| f64::from_bits(b)).collect())
         .collect();
     let rows: Vec<_> = decoded.iter().map(Vec::as_slice).collect();
     let before = work.used;
     // The width vector is candidate-owned metadata, not free caller scratch.
-    let external = matrix
-        .cases
-        .len()
+    let external = n
         .checked_mul(size_of::<usize>())
         .and_then(|b| b.checked_add(size_of::<Vec<usize>>()))
+        .and_then(|b| b.checked_add(metadata_bytes))
         .context("width scratch overflow")?;
     let result = if work.exhausted || external > matrix.maximum_scratch_bytes {
         Err(StructuredUnknown::Capacity)
     } else {
-        match work.charge(matrix.cases.len()) {
+        match work.charge(n) {
             Err(error) => Err(error),
             Ok(()) => {
-                let widths: Vec<_> = matrix
-                    .cases
-                    .iter()
-                    .map(|&i| verified.cases.cases[i].width)
+                let widths: Vec<_> = (0..n)
+                    .map(|i| verified.cases.cases[matrix.cases[source(i)]].width)
                     .collect();
-                geometry(
+                geometry_mapped(
                     matrix,
                     &rows,
                     &widths,
+                    source_rows,
+                    anchors,
                     work,
                     matrix.maximum_scratch_bytes - external,
                 )
@@ -506,8 +588,8 @@ fn call(
     let mut record = Call {
         ordinal: matrix.ordinal,
         population_index: call.population.population_index,
-        original_case_indices: matrix.cases.clone(),
-        mandatory_anchor_indices: matrix.mandatory_anchors.clone(),
+        original_case_indices: (0..n).map(|i| matrix.cases[source(i)]).collect(),
+        mandatory_anchor_indices: anchors.to_vec(),
         complete: result.is_ok(),
         span_verified: false,
         rank: None,
@@ -536,7 +618,8 @@ fn call(
             record.final_maximum_residual = Some(geometry.final_maximum_residual);
             record.largest_original_norm = Some(geometry.largest_norm);
             let selected = geometry.selected_rows;
-            record.final_selected_cases = selected.iter().map(|&i| matrix.cases[i]).collect();
+            record.final_selected_cases =
+                selected.iter().map(|&i| matrix.cases[source(i)]).collect();
             record.pivot_indices = geometry.pivots;
             if certificate {
                 (

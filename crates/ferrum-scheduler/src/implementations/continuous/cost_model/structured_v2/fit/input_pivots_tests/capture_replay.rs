@@ -37,6 +37,8 @@ struct ReplayCase {
     captured_geometry_kernel: CapturedGeometryKernel,
     #[serde(default)]
     cold_geometry_candidate: cold_candidate::Mode,
+    #[serde(default)]
+    narrow_extension_candidate: Option<narrow_extension::Options>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,7 +55,7 @@ struct CaptureReport {
     diagnostic_retained_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 enum Product {
     Prefill,
     ContinuationPrefill {
@@ -66,7 +68,7 @@ enum Product {
     Greedy,
     Full,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct OriginalCase {
     product: Product,
@@ -81,7 +83,7 @@ struct OriginalCase {
     reset: bool,
     acquisition: Option<serde_json::Value>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CaseTable {
     cases: Vec<OriginalCase>,
@@ -198,6 +200,8 @@ struct Verified {
     exhausted: bool,
     retirement: Retirement,
     selection: Option<serde_json::Value>,
+    startup_config: Box<ferrum_types::EngineConfig>,
+    startup_templates: Vec<serde_json::Value>,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -381,6 +385,8 @@ fn verify_capture(
         exhausted: work.exhausted(),
         retirement,
         selection,
+        startup_config: config,
+        startup_templates: templates,
     })
 }
 
@@ -759,6 +765,11 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
     let candidate = reference::evaluate_candidate(&verified, &reference)?;
     let cold_geometry_candidate =
         cold_candidate::evaluate(&verified, case.cold_geometry_candidate)?;
+    let narrow_extension_candidate = case
+        .narrow_extension_candidate
+        .as_ref()
+        .map(|options| narrow_extension::evaluate(&verified, &case.capture, &case.output, options))
+        .transpose()?;
     let output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -779,6 +790,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
         #[serde(flatten)]
         candidate_evaluation: reference::CandidateEvaluation,
         cold_geometry_candidate: Option<cold_candidate::Measurement>,
+        narrow_extension_candidate: Option<narrow_extension::Measurement>,
     }
     serde_json::to_writer_pretty(
         output,
@@ -796,6 +808,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
             candidate_geometry_kernel: CapturedGeometryKernel::FirstPassPrefixV1,
             candidate_evaluation: candidate,
             cold_geometry_candidate,
+            narrow_extension_candidate,
         },
     )?;
     Ok(())
@@ -806,6 +819,9 @@ mod reference;
 
 #[path = "capture_replay/cold_candidate.rs"]
 mod cold_candidate;
+
+#[path = "capture_replay/narrow_extension.rs"]
+mod narrow_extension;
 
 #[path = "capture_replay/tests.rs"]
 mod tests;

@@ -1386,6 +1386,38 @@ fn batch_plan_with_schedule(
         .iter()
         .flat_map(|&i| populations[i].representative_case_indices.iter().copied())
         .collect();
+    batch_plan_for_cycle(
+        population_indices,
+        representative_case_indices,
+        cases,
+        opportunities,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        population,
+        scope,
+        schedule_for,
+    )
+}
+
+/// One work calculation for an explicitly ordered original occurrence cycle.
+/// Product callers above retain their original concatenated family order.
+#[allow(clippy::too_many_arguments)]
+fn batch_plan_for_cycle(
+    population_indices: &[usize],
+    representative_case_indices: Vec<usize>,
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    scope: Option<(&[Vec<CheckedInputFacts>], &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1)>,
+    schedule_for: impl FnOnce(
+        &[usize], &[usize],
+        &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredSettingsV2,
+    ) -> Result<(OwnerBlockScheduleV1, usize)>,
+) -> Result<SelectedBatch> {
     let selected_cases: Vec<_> = representative_case_indices
         .iter()
         .map(|&i| cases[i].clone())
