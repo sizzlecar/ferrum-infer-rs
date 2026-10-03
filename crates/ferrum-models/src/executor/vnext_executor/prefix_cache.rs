@@ -698,7 +698,13 @@ fn finish_transfer<R: DeviceRuntime>(
     start: NativeCheckpointStart<R>,
 ) -> Result<Option<NativeCheckpointResult<R>>> {
     let (mut transfer, contract_error) = match start {
-        NativeCheckpointStart::GuardRejected(_) => return Ok(None),
+        NativeCheckpointStart::GuardRejected(reason) => {
+            tracing::debug!(
+                ?reason,
+                "prefix checkpoint transfer rejected before submission"
+            );
+            return Ok(None);
+        }
         NativeCheckpointStart::Skipped(_) => return Ok(None),
         NativeCheckpointStart::CapacityMaintenance { .. } => {
             return Err(FerrumError::internal(
@@ -825,6 +831,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if !self.supports_guarded_prefix_maintenance_for(input.purpose)
             || Instant::now() >= input.expires_at
         {
+            tracing::debug!(
+                stage = "unsupported_or_expired",
+                purpose = ?input.purpose,
+                boundary = input.boundary,
+                maximum_sequence_tokens = input.maximum_sequence_tokens,
+                "guarded prefix capture unavailable before transfer"
+            );
             return Ok(false);
         }
         let (slot, sequence) = self
@@ -850,6 +863,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             || Instant::now() >= input.expires_at
         {
             execution.restore_ready()?;
+            tracing::debug!(
+                stage = "source_boundary_changed_or_cancelled",
+                purpose = ?input.purpose,
+                boundary = input.boundary,
+                maximum_sequence_tokens = input.maximum_sequence_tokens,
+                "guarded prefix capture unavailable before transfer"
+            );
             return Ok(false);
         }
         sequence
@@ -858,6 +878,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let interests = rendezvous::interests_for(&sequence, input.boundary, input.purpose);
         if input.purpose == PrefixCapturePurpose::PrivateCalibration && interests.is_empty() {
             execution.restore_ready()?;
+            tracing::debug!(
+                stage = "no_private_interest",
+                purpose = ?input.purpose,
+                boundary = input.boundary,
+                maximum_sequence_tokens = input.maximum_sequence_tokens,
+                "guarded prefix capture unavailable before transfer"
+            );
             return Ok(false);
         }
         let result = self
