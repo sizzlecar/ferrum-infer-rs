@@ -46,6 +46,15 @@ where
 }
 
 #[test]
+fn guarded_native_checkpoint_capture_restore_retries_with_logical_attribution() {
+    for timing in [DeviceTimingMode::Off, DeviceTimingMode::Completion] {
+        for configured in [false, true] {
+            runtime::guarded_checkpoint_transfer::verify(timing, configured);
+        }
+    }
+}
+
+#[test]
 fn causal_int8_kv_q4k_provider_resumes_payload_and_scales_across_a_page_boundary() {
     verify(
         AttentionKind::CausalInt8,

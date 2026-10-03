@@ -617,7 +617,13 @@ impl DeviceRuntime for TestRuntime {
     ) -> Result<Self::Fence, crate::vnext::GuardedDeviceSubmissionError<Self::Error>> {
         use crate::execution_cost::GuardedNotSubmittedReason;
         use crate::vnext::GuardedDeviceSubmissionError as Error;
-        if !self.supports_guarded_submission_with_timing(commands.timing_mode()) {
+        // Match a native backend that requires explicit logical attribution;
+        // checkpoint copy chains must request it without enabling profiling.
+        if !self.supports_guarded_submission_with_timing(commands.timing_mode())
+            || !commands
+                .attribution_requirement()
+                .logical_execution_path_required()
+        {
             return Err(Error::Rejected(
                 GuardedNotSubmittedReason::AttributionUnavailable,
             ));

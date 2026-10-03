@@ -606,11 +606,16 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .checkpoint_observation_sink
             .get()
             .filter(|sink| sink.strong_count() != 0);
-        let (commands, geometry, cost_geometry) = resources.encode(
+        let (mut commands, geometry, cost_geometry) = resources.encode(
             &lane,
             timing_mode,
             observation_sink.is_some() || submission_guard.is_some(),
         )?;
+        if submission_guard.is_some() {
+            // The final native guard requires the actual transfer chain's
+            // logical attribution even with completion timing disabled.
+            commands.require_logical_execution_path_attribution();
+        }
         reservation.observation =
             observation_sink
                 .zip(cost_geometry)

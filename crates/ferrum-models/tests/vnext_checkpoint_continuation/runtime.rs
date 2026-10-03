@@ -18,6 +18,10 @@ impl SubmissionWaveDispatchTimingSink for ActualSampleGateNoTiming {
 #[path = "guarded_cost_route.rs"]
 mod guarded_cost_route;
 
+#[cfg(feature = "cuda")]
+#[path = "guarded_checkpoint_transfer.rs"]
+pub(super) mod guarded_checkpoint_transfer;
+
 pub type Composition = (
     Arc<Runtime>,
     OperationRuntimeRegistry<Runtime>,
