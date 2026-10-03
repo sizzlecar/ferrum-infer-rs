@@ -1,5 +1,5 @@
-//! An uninterrupted initial projection can complete the inventory. Only
-//! positions survive a preparation action; its final capture uses fresh owners.
+//! An uninterrupted traversal from zero can complete the inventory. Only
+//! positions survive a preparation action; each traversal uses fresh owners.
 use super::*;
 
 pub(super) async fn prepare(
@@ -12,7 +12,6 @@ pub(super) async fn prepare(
     attempts: &mut readiness::Attempts,
 ) -> Result<Option<CheckedCaseInventory>> {
     let mut first_target = 0;
-    let mut retain_complete = true;
     loop {
         let projection_remaining = input
             .settings
@@ -49,7 +48,9 @@ pub(super) async fn prepare(
             },
             inventory::ReadinessCursor {
                 first_target,
-                retain_complete,
+                // A retry at zero captures every original target under this
+                // new owner/view. Nonzero resumes still carry positions only.
+                retain_complete: first_target == 0,
             },
             &mut charge,
             &can_act,
@@ -67,9 +68,6 @@ pub(super) async fn prepare(
             inventory::ReadinessCapture::Complete(inventory) => return Ok(Some(inventory)),
             inventory::ReadinessCapture::Progress(progress) => progress,
         };
-        // Once the initial traversal stopped, no later view may promote its
-        // successful prefix into complete input authority, even at target 0.
-        retain_complete = false;
         if let Some(gap) = &progress.gap {
             if let Some(action) =
                 readiness::next_action(std::slice::from_ref(gap), group, cases, input, attempts)?

@@ -313,7 +313,11 @@ async fn readiness_allocator_unsupported_keeps_gap_and_spends_no_model_waves() {
         ))
     )));
     let charge = budget.preflight_charge();
-    assert_eq!(charge.planning_reserved_requests, 3);
+    // The new traversal from zero retains the still-unavailable result after
+    // the sole resource action, without admitting a redundant third owner.
+    assert_eq!(charge.planning_reserved_requests, 2);
+    assert_eq!(charge.planning_admitted_requests, 2);
+    assert_eq!(budget.input_projection_requests_remaining(), 1);
     assert_eq!(charge.readiness_reserved_requests, 2);
     assert_eq!(charge.readiness_admitted_requests, 0);
     assert_eq!(budget.attempts_remaining(), 16);
@@ -412,14 +416,32 @@ async fn assert_multiple_obsolete_width_actions(greedy: bool) {
     executor
         .recycle_completed_bindings
         .store(true, Ordering::Release);
-    let input = inputs(&mut session, greedy).await;
+    let mut input = inputs(&mut session, greedy).await;
+    let cases = [case(1), case(2)];
+    let owner_width = cases.iter().map(|case| case.width).max().unwrap();
+    let mut reference_budget = budget(owner_width);
+    let reference = Box::pin(capture(
+        &mut session,
+        &input,
+        &cases,
+        &mut reference_budget,
+        8 * 1024 * 1024,
+    ))
+    .await
+    .unwrap();
+    let full_projection_work = reference_budget.preflight_charge().projection_attempts;
+    assert!(full_projection_work > 1);
+    session.completed_owner_boundary().unwrap();
+    // One failed first query plus one fresh full traversal. Repeating that
+    // full traversal after preparation cannot fit this original allowance.
+    let projection_allowance = 1 + full_projection_work;
+    input.settings.maximum_offered_waves = NonZeroUsize::new(projection_allowance).unwrap();
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed = calls.clone();
     *executor.projection_readiness_fault.lock() = Some(Box::new(move |rows, submitted| {
         observed.lock().unwrap().push((rows, submitted));
         (submitted == 0).then_some(ExecutionCostRouteUnknown::OnDemandResidentProgram)
     }));
-    let cases = [case(1), case(2)];
     let mut budget = budget(6);
     let original_deadline = budget.deadline();
     let inventory = Box::pin(collect_ready(
@@ -438,7 +460,22 @@ async fn assert_multiple_obsolete_width_actions(greedy: bool) {
         .opportunities
         .iter()
         .all(|o| matches!(o.population, CasePopulation::Unique(_))));
+    assert_eq!(inventory.inputs, reference.inputs);
+    assert_eq!(inventory.algorithm_inputs, reference.algorithm_inputs);
+    assert_eq!(
+        inventory.algorithm_case_inputs,
+        reference.algorithm_case_inputs
+    );
+    for (actual, reference) in inventory.opportunities.iter().zip(&reference.opportunities) {
+        assert_eq!(actual.population, reference.population);
+        assert_eq!(
+            actual.minimum_fresh_members,
+            reference.minimum_fresh_members
+        );
+    }
     let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), projection_allowance);
+    assert_eq!(calls.first(), Some(&(1, 0)));
     assert!(calls.contains(&(1, 0)));
     assert!(!calls.contains(&(2, 0)), "stop at the first actionable gap");
     for width in [1, 2] {
@@ -452,12 +489,15 @@ async fn assert_multiple_obsolete_width_actions(greedy: bool) {
         .all(|(_, submissions)| *submissions == 0 || *submissions == 2));
     drop(calls);
     let charge = budget.preflight_charge();
-    // Initial short probe, fresh continuation, and final full validation.
-    assert_eq!(charge.planning_reserved_requests, 6);
-    assert_eq!(charge.planning_admitted_requests, 6);
+    // The first failed query and real action stay charged. Only the duplicate
+    // final traversal is removed: 1 + 2*full becomes 1 + full, with two fresh
+    // owner groups rather than three; no old input authority is carried over.
+    assert_eq!(charge.projection_attempts, projection_allowance);
+    assert_eq!(charge.planning_reserved_requests, 2 * owner_width);
+    assert_eq!(charge.planning_admitted_requests, 2 * owner_width);
     assert_eq!(charge.readiness_reserved_requests, 1);
     assert_eq!(charge.readiness_admitted_requests, 1);
-    assert_eq!(budget.input_projection_requests_remaining(), 0);
+    assert_eq!(budget.input_projection_requests_remaining(), owner_width);
     assert_eq!(budget.requests_remaining(), 1);
     assert_eq!(budget.attempts_remaining(), 14);
     assert_eq!(budget.selection_attempts_remaining(), 14);
@@ -681,9 +721,12 @@ async fn readiness_remaining_gap_is_recaptured_after_each_original_cpu_route() {
             );
         }
         drop(calls);
-        assert_eq!(budget.preflight_charge().planning_reserved_requests, 4);
+        // Both actual routes are settled before the third, fresh traversal
+        // from zero. Its complete Known/Unknown report is the final inventory.
+        assert_eq!(budget.preflight_charge().planning_reserved_requests, 3);
+        assert_eq!(budget.preflight_charge().planning_admitted_requests, 3);
         assert_eq!(budget.preflight_charge().readiness_admitted_requests, 2);
-        assert_eq!(budget.input_projection_requests_remaining(), 0);
+        assert_eq!(budget.input_projection_requests_remaining(), 1);
         assert_eq!(budget.requests_remaining(), 0);
         assert_eq!(budget.attempts_remaining(), 12);
         assert_eq!(budget.selection_attempts_remaining(), 12);
