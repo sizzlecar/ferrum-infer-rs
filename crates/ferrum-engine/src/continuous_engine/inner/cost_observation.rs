@@ -43,6 +43,8 @@ pub(in crate::continuous_engine::inner) use prepared_calibration::{
     PreparedSourceJournal, PreparedSourceJournalFailure, PreparedSourceJournalLimits,
     PreparedSourceJournalObserver, PreparedSourceJournalStage, PreparedSourceJournalStatus,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub mod geometry_capture;
 mod profile;
 mod profile_export;
 pub(in crate::continuous_engine::inner) use profile_export::selected::SelectedCalibrationCapture;

@@ -155,6 +155,23 @@ impl CalibrationSession {
                 closed?;
                 Ok(plan)
             });
+            // A diagnostic stop is distinct from an ordinary unavailable source.
+            // Both cleanup operations above ran before reaching this boundary.
+            #[cfg(any(test, feature = "test-support"))]
+            if crate::geometry_capture::armed() {
+                match planned {
+                    Ok(_) => crate::geometry_capture::inventory_retired(
+                        cursor.pending_input_units() == 0,
+                        deadline,
+                        budget.requests_remaining(),
+                        budget.attempts_remaining(),
+                        budget.selection_requests_remaining(),
+                        budget.selection_attempts_remaining(),
+                    ),
+                    Err(error) => last_error = Some(error),
+                }
+                break 'units;
+            }
             let series = match planned {
                 Ok(Some(series)) => series,
                 Ok(None) => break,
@@ -380,6 +397,15 @@ impl CalibrationSession {
         drained?;
         finished?;
         settled?;
+        #[cfg(any(test, feature = "test-support"))]
+        if crate::geometry_capture::armed() {
+            crate::geometry_capture::series_retired(
+                last_error.is_none() && self.prepared_owner_capture.is_none(),
+            );
+            return Err(FerrumError::invalid_request(
+                "test geometry capture stopped before source8 sampling",
+            ));
+        }
         let live_state = self
             .engine
             .inner

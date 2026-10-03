@@ -76,6 +76,17 @@ pub(super) fn extend(
                     .map_err(|_| StructuredUnknownV2::InvalidInput)?,
             );
         }
+        // Observe even calls made after the shared work ledger is exhausted.
+        // This borrows actual coordinates; it never retries the geometry kernel.
+        #[cfg(any(test, feature = "test-support"))]
+        crate::geometry_capture::matrix(
+            candidates,
+            &rows,
+            &anchors,
+            settings,
+            work,
+            maximum_scratch_bytes,
+        );
         // The required endpoint/branch anchors seed one basis. Extend that
         // basis over remaining original inputs without repeated decompositions.
         let geometry =
@@ -100,6 +111,8 @@ pub(super) fn extend(
             reason,
             work_exhausted: work.exhausted(),
         });
+    #[cfg(any(test, feature = "test-support"))]
+    crate::geometry_capture::matrix_result(&audit, &gap, selected, work);
     (audit, gap)
 }
 

@@ -46,6 +46,8 @@
 //! registry.register_backend_factory("my_backend", Arc::new(MyBackendFactory));
 //! ```
 
+#[cfg(any(test, feature = "test-support"))]
+pub use continuous_engine::geometry_capture;
 pub mod builder;
 pub mod continuous_engine;
 pub mod embedding_engine;

@@ -51,6 +51,13 @@ impl ContinuousBatchEngine {
         probes: Vec<crate::automatic_cost_probe::AutomaticCostProbeTemplate>,
     ) -> Result<Self> {
         if !crate::continuous_engine::slo_startup::automatic_reference_enabled(&self.inner.config) {
+            #[cfg(any(test, feature = "test-support"))]
+            if crate::geometry_capture::armed() {
+                let _ = self.shutdown().await;
+                return Err(invalid(
+                    "geometry capture requires original automatic startup",
+                ));
+            }
             return Ok(self);
         }
         let SloLiveStructuredCalibration::AutomaticV1 { settings } = &self
@@ -72,6 +79,19 @@ impl ContinuousBatchEngine {
         let reused_cost = self.inner.cost_runtime.as_ref().is_some_and(|runtime| {
             runtime.reused_cost_is_fresh() && runtime.startup_algorithm_seed().is_some()
         });
+        #[cfg(any(test, feature = "test-support"))]
+        if crate::geometry_capture::armed() {
+            if reused_cost
+                || probes.is_empty()
+                || self.inner.config.scheduler.slo.mode != ferrum_types::SloMode::Enforce
+            {
+                let _ = self.shutdown().await;
+                return Err(invalid(
+                    "geometry capture requires fresh Enforce product templates",
+                ));
+            }
+            crate::geometry_capture::startup_inputs(&self.inner.config, &probes);
+        }
         if reference_loaded && probes.is_empty() {
             if let Err(error) = self.begin_automatic_collection() {
                 let _ = self.shutdown().await;
@@ -203,6 +223,19 @@ impl ContinuousBatchEngine {
                 }
                 Err(error) => Err(error),
             };
+            #[cfg(any(test, feature = "test-support"))]
+            if crate::geometry_capture::armed() {
+                // Ordinary collection errors are normally swallowed below.
+                // The explicit private stop must instead retire the engine.
+                let drained = session.drain_startup_tracked(None).await;
+                let shutdown = session.shutdown().await;
+                crate::geometry_capture::shutdown_finished(drained.is_ok() && shutdown.is_ok());
+                drained?;
+                shutdown?;
+                return Err(invalid(
+                    "test geometry capture finished without exposing an engine",
+                ));
+            }
             match collected {
                 Ok(epoch) => cost_epoch = Some(epoch),
                 Err(error) => {
@@ -242,6 +275,17 @@ impl ContinuousBatchEngine {
                 let _ = session.shutdown().await;
                 return Err(error);
             }
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if crate::geometry_capture::armed() {
+            let drained = session.drain_startup_tracked(None).await;
+            let shutdown = session.shutdown().await;
+            crate::geometry_capture::shutdown_finished(drained.is_ok() && shutdown.is_ok());
+            drained?;
+            shutdown?;
+            return Err(invalid(
+                "geometry capture did not complete the original inventory",
+            ));
         }
         let mut engine = session.engine;
         let Some(inner) = Arc::get_mut(&mut engine.inner) else {

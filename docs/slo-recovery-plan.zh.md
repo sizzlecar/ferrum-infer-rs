@@ -4,6 +4,8 @@
 
 当前仍未交付完整的 SLO 自动闭环版本。首先验证原预算下的覆盖和规划可行性，再完成正常入口的自动闭环，随后进行双后端、完整性能和发布验收。每一步都必须产出可复现的行为证据；局部测试、成本快照数量和源码规模不作为完成度。
 
+最终容量目标继续沿用[原算法设计中的 C*](slo-algorithm-design.zh.md)：固定请求到达与长度分布族、模型质量、硬件和资源，在完整完成请求的合法策略中，寻找同时满足 TTFT、TPOT、可见文本 ITL、成功率及队列稳定条件的最高可持续请求到达率。实际 successful output tokens/s、原请求级联合达标以及本文件声明的最新配对门槛另行验收；到达率与输出吞吐分别计量。有限窗口只提供持续容量证据，不证明所有策略中的全局最优或无限时间的队列稳定。自动校准、成本模型、有限规划和干预都是实现该目标的手段。
+
 下一份可运行检查点以同一条产品链路验收：正常 `run` / `serve` 从空成本状态自动完成准备和原独立资格阶段，发布有效成本模型，内容不同但处于支持范围内的普通请求在执行前得到预测，Enforce 实际采用，真实提交与回执配对，输出完整且资源可退役。用户无需手工训练、导入成本文件或设置隐藏环境组合。CPU 正例先约束组合行为，再以同一源码验证真实后端；该检查点通过后才进入完整性能验收，不把它标成最终发布完成。
 
 ## 当前收敛计划：先关闭联动缺口，再冻结实机检查点
@@ -35,7 +37,11 @@
 
 G13 CUDA 原正常 inventory 的几何预算账已补核：原 32,000,000 visits 中使用 31,998,248，余 1,752，但下一项原子计费已无法支付；98 个 Configured population 完整计算，使用 23,351,472，64 个 GreedyLength population 中 39 个完整、25 个不完整，使用 8,646,776。耗尽发生在一个 width5 FullLogits population，之后 width6/7/8 的 24 个 population 均为零访问。对应 rows8 候选未开始计算，不能把它们说成“各自需要超过 32M”，也不能因 packing 修复就认为其几何缺口已消失。[原几何预算审计](/private/tmp/ferrum-slo-recovery-20261002/g16-c8-input-geometry-feasibility-audit.json)
 
-下一项几何诊断仅为取得缺失的原始矩阵：复用真实 CLI serve 模板与 Enforce builder，在原 selection 借用写出全部有序轴、anchor、settings 和前后账；inventory 清理后、Source8 收样前，经原 series finalization 和 engine shutdown 退出。使用显式测试编译支持和有界输出，保留原 120s/32M，不运行客户端负载。当前只是已审查的实现设计，尚未写入产品或运行后端。候选的重复矩阵复用、全零轴压缩仍是待这些输入核算的假设，不能报告任何已证明节省。[最小采集设计](/private/tmp/ferrum-slo-recovery-20261002/g16-real-input-geometry-capture-design.json)
+G18 几何采集已实现为显式测试构建支持：复用真实 CLI serve 模板与 Enforce builder，在原 selection 借用写出全部有序轴的原始 f64 bits、anchor、settings 和前后账；inventory 清理后、Source8 收样前，经原 series finalization 和 engine shutdown 退出。普通非测试构建未开启该支持时不包含新增逻辑。采集保留原 120s/32M，不运行客户端负载，不建立数值资格或性能结论。输出使用原 StagedFile 和 64KiB 缓冲，有独立文件硬上限；不足时保留部分文件并报告不完整，原清理仍须执行。同步写入不能强制逐行受 120s 中断，因此另记录实际到期状态，采集完整不等于启动时间可行。[采集合同](/private/tmp/ferrum-slo-recovery-20261002/g18-geometry-capture-draft/CONTRACT.json)
+
+实机前补齐了同次 `original_cases` 元数据：原 Case、模板 prompt 长度、chunk 和 row ceiling 均借用序列化，矩阵行的 case 索引可以对应真实批宽、上下文和执行域。仅凭 family key 和旧 G13 索引不能识别本次 C8。正常启动正例检查该映射实际存在且索引有效；空间不足负例检查原 owner、backing、lease 和 scheduler 状态清空，后台 trainer 的结束依据仍是原 awaited shutdown 合同。映射前 G18 全仓 **7886 pass / 0 fail / 109 ignored**；映射补充后六项采集测试 **6/0、7.02s**，fmt/diff 通过。最终源码的完整 workspace/backend 检查和真实后端采集尚待完成，不能用前一轮结果替代。[映射前全仓审计](/private/tmp/ferrum-slo-recovery-20261002/g18-workspace-before-case-mapping-audit.json)、[映射后定向测试](/private/tmp/ferrum-slo-recovery-20261002/g18-case-mapping-focused.log)、[清理独立审查](/private/tmp/ferrum-slo-recovery-20261002/g18-normal-startup-independent-review.json)
+
+取得完整同次输入后，先在 Rust 中按原顺序重放共享 32M 账本，核对每项原结果、最终 case 集和全部前后计费，再判断严格重复矩阵复用或全原始行零轴压缩是否值得实施。新增扫描、比对、缓存或压缩的工作和共存内存必须计入；重放不一致或计费后仍不足即不能以该方案进入完整负载。当前两个机制都没有已证明的节省，几何通过也不代替后续 selection、独立 F/R/Q、普通采用及最终容量验收。[离线核算设计](/private/tmp/ferrum-slo-recovery-20261002/g18-offline-geometry-audit-design.json)
 
 新增 GreedyLength 联动测试 r3 为 **1 pass / 0 fail、11.59s**。真实 fresh Prefill 通过原 time-admission，最终采用的 replay 为 transaction1/replay1，其后续 attempt19/alternative1 对新 FullLogits/PlainTextGreedyV1 child 返回 Known；普通后续实际 Decode 仍提交 GreedyToken。独立 F/R/Q、原 numerical scope、输出与清理断言保留，协议测试沿用原宽松规划时限，不是实机或默认 2ms 性能证据。r1 的四次普通采用成功，但目标 child 只出现在 Search，最终绑定断言失败，不能计通过；r2 因新增维护测试访问 calibration 私有方法而编译失败，没有执行测试。两次失败原日志保留。[r1](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r1.log)、[r2](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r2.log)、[r3](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r3.log)
 

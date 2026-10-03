@@ -2602,6 +2602,10 @@ fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candl
     }
 }
 
+#[cfg(all(test, feature = "geometry-capture-test"))]
+#[path = "serve/geometry_capture_test.rs"]
+mod geometry_capture_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;

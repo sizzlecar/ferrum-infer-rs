@@ -90,6 +90,8 @@ name = "engine_bench"
 harness = false
 
 [features]
+# Explicit diagnostic libtest support; never enabled by product defaults.
+test-support = []
 default = []
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "ferrum-models/accelerate"]
 cuda = [

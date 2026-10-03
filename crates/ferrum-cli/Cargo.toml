@@ -101,6 +101,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 rexpect = "0.6"
 
 [features]
+# Only the ignored real-startup geometry diagnostic uses this interface.
+geometry-capture-test = ["ferrum-engine/test-support"]
 default = []
 benchmark = []  # Enable benchmarking utilities
 dev-tools = []  # Enable development tools

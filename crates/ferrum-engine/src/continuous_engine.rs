@@ -2698,6 +2698,8 @@ use profile::*;
 
 mod credited_output;
 mod inner;
+#[cfg(any(test, feature = "test-support"))]
+pub use inner::cost_observation::geometry_capture;
 mod output_flow_runtime;
 mod slo_startup;
 mod utf8_constraints;

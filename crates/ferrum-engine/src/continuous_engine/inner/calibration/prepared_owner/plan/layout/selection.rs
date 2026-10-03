@@ -653,6 +653,8 @@ pub(super) fn select_with_capacity_and_trajectories(
     if cases.iter().any(|case| case.width == 0) {
         return Err(error("checked selection case has no original requests"));
     }
+    #[cfg(any(test, feature = "test-support"))]
+    crate::geometry_capture::selection_inputs(cases, prompts, chunk, prefill_row_ceiling);
     // Grouping is authorized separately before it allocates. Then its exact
     // identities/capacities bound headers and sequential scratch stages; no
     // representative or geometry algorithm runs before the second check.
@@ -814,12 +816,24 @@ pub(super) fn select_with_capacity_and_trajectories(
     // geometry ledger. Sorting only the final execution list would leave the
     // required policy's basis work behind already exhausted auxiliary work.
     priority::order_populations(&mut population_candidates, inputs);
+    #[cfg(any(test, feature = "test-support"))]
+    crate::geometry_capture::begin_selection(
+        population_candidates
+            .iter()
+            .filter(|candidate| {
+                geometry_work.is_some()
+                    && selected_priority.is_none_or(|p| p == candidate.input_priority)
+            })
+            .count(),
+    );
     for candidate in population_candidates {
         let original_population_index = candidate.population_index;
         let member = &mut out.populations[original_population_index];
         if let Some(work) = geometry_work.as_deref_mut().filter(|_| {
             selected_priority.is_none_or(|selected| selected == candidate.input_priority)
         }) {
+            #[cfg(any(test, feature = "test-support"))]
+            crate::geometry_capture::population(original_population_index, &member.key);
             let (audit, gap) = input_geometry::extend(
                 &candidate.candidates,
                 inputs,
@@ -861,6 +875,8 @@ pub(super) fn select_with_capacity_and_trajectories(
             batch,
         });
     }
+    #[cfg(any(test, feature = "test-support"))]
+    crate::geometry_capture::end_selection();
     // Raw representative selection protects each algorithm's positive range,
     // branch and width endpoints. Choose the source scope before its final
     // work order and source reservation; no raw observations have been taken.

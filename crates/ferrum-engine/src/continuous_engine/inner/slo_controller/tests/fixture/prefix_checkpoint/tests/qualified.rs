@@ -6,6 +6,7 @@ use ferrum_interfaces::engine::InferenceEngine;
 use ferrum_interfaces::output_flow::{CreditedOutputSession, OutputCompletion};
 use futures::StreamExt;
 mod diagnostics;
+mod geometry_capture;
 mod maintenance;
 mod ready;
 
@@ -142,6 +143,93 @@ async fn startup_with_probes(
     diagnostics: ferrum_types::SloAutomaticCalibrationDiagnosticsV1,
     configure: impl FnOnce(&ContinuousBatchEngine, &Arc<ControlledExecutor>),
 ) -> (ContinuousBatchEngine, Arc<ControlledExecutor>) {
+    let (engine, executor, templates) = fresh_startup_with_probes(
+        wait,
+        natural_eos,
+        prefix_enabled,
+        prompt_lengths,
+        diagnostics,
+        configure,
+    )
+    .await;
+    let runtime = engine.inner.cost_runtime.as_ref().unwrap().clone();
+    let engine = tokio::time::timeout(
+        Duration::from_secs(180),
+        engine.finish_automatic_startup_with_probes(templates),
+    )
+    .await
+    .expect("original automatic startup exceeded its declared probe bounds")
+    .unwrap();
+    eprintln!("startup native evidence: counts={:?}, copies={}, prefix_epoch={:?}, attempts={:?}, full_publications={:?}",
+        executor.native_structured_counts(), copies(&executor).len(),
+        runtime.prefix_cost_snapshot().map(|model| (model.model_version(), model.current())),
+        executor.evidence.prefix.as_ref().unwrap().attempts.lock(),
+        executor.evidence.prefix.as_ref().unwrap().publications.lock());
+    assert_eq!(
+        engine.inner.config.runtime.prefix_state_cache_enabled,
+        prefix_enabled
+    );
+    if prefix_enabled {
+        assert_startup_maintenance_known(
+            &runtime,
+            &executor,
+            engine
+                .inner
+                .config
+                .scheduler
+                .slo
+                .cost_observation
+                .model
+                .min_samples
+                .get(),
+        );
+    } else {
+        // collect_startup_prefix_cost skips shared maintenance sampling when
+        // the cache is off. Private source ACKs still must exist, but cannot
+        // establish that every shared maintenance domain has been qualified.
+        let (captures, restores) = executor.native_prefix_terminal_totals();
+        assert!(
+            captures > 0 && restores > 0,
+            "automatic private checkpoint work is missing"
+        );
+        assert_eq!(
+            executor.native_prefix_live_lease_counts(),
+            (0, 0),
+            "completed startup must retire private leases without shared index entries"
+        );
+    }
+    assert!(
+        runtime.snapshot().is_some(),
+        "actual startup did not qualify inference: {:?}",
+        runtime.audit_snapshot()
+    );
+    assert!(
+        engine.inner.prefill_reference_runtime.is_some(),
+        "actual reference startup remained unknown"
+    );
+    let receipt = runtime.profile_receipt().unwrap();
+    assert!(receipt.path.is_none());
+    assert_eq!(receipt.storage, ferrum_types::SloCostProfileStorage::Memory);
+    assert!(receipt.offered_samples > 0);
+    assert!(executor.native_structured_counts().1 > 0);
+    engine.inner.bg_loop_spawned.store(true, Ordering::Release);
+    (engine, executor)
+}
+
+// Keep the original builder and prepared product inputs available to tests that
+// intentionally consume startup without exposing its resulting engine.
+async fn fresh_startup_with_probes(
+    wait: Option<NonZeroU64>,
+    natural_eos: bool,
+    prefix_enabled: bool,
+    prompt_lengths: &[usize],
+    diagnostics: ferrum_types::SloAutomaticCalibrationDiagnosticsV1,
+    configure: impl FnOnce(&ContinuousBatchEngine, &Arc<ControlledExecutor>),
+) -> (
+    ContinuousBatchEngine,
+    Arc<ControlledExecutor>,
+    Vec<AutomaticCostProbeTemplate>,
+) {
     diagnostics::install();
     // Use the product tokenizer's source-config parser. The original helper
     // has no EOS vocabulary declaration; removing ignore-EOS alone would not
@@ -238,7 +326,7 @@ async fn startup_with_probes(
     }
     // Same declared program/geometry, different contents: users cannot inherit
     // the startup source's checkpoint by matching its cached token prefix.
-    let templates = prompt_lengths
+    let templates: Vec<_> = prompt_lengths
         .iter()
         .map(|&length| {
             let mut probe = probe.clone();
@@ -247,67 +335,7 @@ async fn startup_with_probes(
             AutomaticCostProbeTemplate::new(probe, AutomaticCostProbeOutput::CliText).unwrap()
         })
         .collect();
-    let engine = tokio::time::timeout(
-        Duration::from_secs(180),
-        engine.finish_automatic_startup_with_probes(templates),
-    )
-    .await
-    .expect("original automatic startup exceeded its declared probe bounds")
-    .unwrap();
-    eprintln!("startup native evidence: counts={:?}, copies={}, prefix_epoch={:?}, attempts={:?}, full_publications={:?}",
-        executor.native_structured_counts(), copies(&executor).len(),
-        runtime.prefix_cost_snapshot().map(|model| (model.model_version(), model.current())),
-        executor.evidence.prefix.as_ref().unwrap().attempts.lock(),
-        executor.evidence.prefix.as_ref().unwrap().publications.lock());
-    assert_eq!(
-        engine.inner.config.runtime.prefix_state_cache_enabled,
-        prefix_enabled
-    );
-    if prefix_enabled {
-        assert_startup_maintenance_known(
-            &runtime,
-            &executor,
-            engine
-                .inner
-                .config
-                .scheduler
-                .slo
-                .cost_observation
-                .model
-                .min_samples
-                .get(),
-        );
-    } else {
-        // collect_startup_prefix_cost skips shared maintenance sampling when
-        // the cache is off. Private source ACKs still must exist, but cannot
-        // establish that every shared maintenance domain has been qualified.
-        let (captures, restores) = executor.native_prefix_terminal_totals();
-        assert!(
-            captures > 0 && restores > 0,
-            "automatic private checkpoint work is missing"
-        );
-        assert_eq!(
-            executor.native_prefix_live_lease_counts(),
-            (0, 0),
-            "completed startup must retire private leases without shared index entries"
-        );
-    }
-    assert!(
-        runtime.snapshot().is_some(),
-        "actual startup did not qualify inference: {:?}",
-        runtime.audit_snapshot()
-    );
-    assert!(
-        engine.inner.prefill_reference_runtime.is_some(),
-        "actual reference startup remained unknown"
-    );
-    let receipt = runtime.profile_receipt().unwrap();
-    assert!(receipt.path.is_none());
-    assert_eq!(receipt.storage, ferrum_types::SloCostProfileStorage::Memory);
-    assert!(receipt.offered_samples > 0);
-    assert!(executor.native_structured_counts().1 > 0);
-    engine.inner.bg_loop_spawned.store(true, Ordering::Release);
-    (engine, executor)
+    (engine, executor, templates)
 }
 
 fn assert_startup_maintenance_known(
