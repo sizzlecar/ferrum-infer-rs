@@ -2,6 +2,7 @@
 //! create a cost model, scheduler witness, successful close receipt or SLO claim.
 mod metrics;
 mod transaction;
+mod universe;
 mod wire;
 pub use metrics::Distribution;
 use metrics::{count, value};
@@ -12,6 +13,10 @@ use std::{
     io::{self, BufRead},
 };
 use transaction::Transaction;
+pub use universe::{
+    compare_query_universes, read_universe_comparison_input, UniverseComparison,
+    UniverseComparisonInput,
+};
 use wire::*;
 
 #[derive(Clone, Debug, Serialize)]
@@ -90,6 +95,30 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn read_bounded_line(reader: &mut impl BufRead, maximum: usize) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let take = available
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(available.len(), |i| i + 1);
+        if line.len().checked_add(take).is_none_or(|n| n > maximum) {
+            return Err(invalid("trace line exceeds audit byte bound"));
+        }
+        let newline = available[take - 1] == b'\n';
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline {
+            break;
+        }
+    }
+    Ok(line)
+}
+
 /// Reads each bounded line once. All distributions use nearest-rank quantiles
 /// over original paired values; snapshots absent from a failed transaction are
 /// never relabeled as model-unavailable query results.
@@ -136,32 +165,9 @@ pub fn audit_required_queries(
     let mut metrics = BTreeMap::new();
     let mut pair_examples = Vec::new();
     loop {
-        let mut line = Vec::new();
+        let line = read_bounded_line(&mut reader, options.maximum_line_bytes)?;
         // read_until alone has no bound. Consume chunks only up to a declared
         // maximum, including a newline, so a malformed line cannot grow memory.
-        loop {
-            let available = reader.fill_buf()?;
-            if available.is_empty() {
-                break;
-            }
-            let take = available
-                .iter()
-                .position(|b| *b == b'\n')
-                .map_or(available.len(), |i| i + 1);
-            if line
-                .len()
-                .checked_add(take)
-                .is_none_or(|n| n > options.maximum_line_bytes)
-            {
-                return Err(invalid("trace line exceeds audit byte bound"));
-            }
-            let newline = available[take - 1] == b'\n';
-            line.extend_from_slice(&available[..take]);
-            reader.consume(take);
-            if newline {
-                break;
-            }
-        }
         if line.is_empty() {
             break;
         }

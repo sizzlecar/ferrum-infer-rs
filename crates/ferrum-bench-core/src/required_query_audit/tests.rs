@@ -410,3 +410,5 @@ fn offered_order_can_differ_from_retained_order_but_gaps_cannot() {
     trace.records[3]["retained_ordinal"] = json!(4);
     assert!(!trace.audit().integrity.trace_content_complete);
 }
+
+mod universe;
