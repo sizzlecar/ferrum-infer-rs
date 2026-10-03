@@ -552,3 +552,102 @@ fn capture_candidate_exhaustion_is_explicit_output_without_hiding_baseline_error
     );
     assert_eq!(wire["candidate"]["used_visits"], complete.visits);
 }
+
+#[test]
+fn capture_cold_candidate_requires_explicit_mode_and_preserves_separate_ledgers() {
+    let mut descriptor = json!({
+        "capture":{"path":"capture.jsonl","sha256":"capture"},
+        "report":{"path":"report.json","sha256":"report"},
+        "input_sha256":vec![7u8;32], "output":"audit.json"
+    });
+    assert_eq!(
+        serde_json::from_value::<ReplayCase>(descriptor.clone())
+            .unwrap()
+            .cold_geometry_candidate,
+        cold_candidate::Mode::Disabled
+    );
+    descriptor["cold_geometry_candidate"] = json!("anchored_readiness_v2_width_cost_v1");
+    assert_eq!(
+        serde_json::from_value::<ReplayCase>(descriptor.clone())
+            .unwrap()
+            .cold_geometry_candidate,
+        cold_candidate::Mode::AnchoredReadinessV2WidthCostV1
+    );
+    descriptor["cold_geometry_candidate"] = json!("automatic");
+    assert!(serde_json::from_value::<ReplayCase>(descriptor).is_err());
+
+    fn fixture_with_scratch(limit: u64) -> Vec<Value> {
+        let mut records =
+            fixture_for_kernel(limit, StructuredSettingsV2::default(), FirstPassPrefixV1);
+        for record in &mut records {
+            if record["kind"] == "original_matrix" {
+                record["maximum_scratch_bytes"] = json!(1 << 20);
+            }
+        }
+        records
+    }
+    let (bytes, report) = artifact(&fixture_with_scratch(32_000_000));
+    let verified = verify_capture(&bytes, &report, [7; 32], FirstPassPrefixV1).unwrap();
+    assert!(
+        cold_candidate::evaluate(&verified, cold_candidate::Mode::Disabled)
+            .unwrap()
+            .is_none()
+    );
+    let before = (verified.visits, verified.limit, verified.exhausted);
+    let wire = serde_json::to_value(
+        cold_candidate::evaluate(
+            &verified,
+            cold_candidate::Mode::AnchoredReadinessV2WidthCostV1,
+        )
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        wire["geometry_kernel"],
+        "anchored_readiness_v2_width_cost_v1"
+    );
+    assert_eq!(wire["independent_max"]["complete"], true);
+    assert_eq!(wire["independent_max"]["span_verified"], true);
+    assert_eq!(wire["shared_original_budget"]["complete"], true);
+    assert_eq!(wire["shared_original_budget"]["span_verified"], true);
+    for call in wire["independent_max"]["calls"].as_array().unwrap() {
+        assert_eq!(call["final_selected_cases"], json!([0, 1, 2]));
+        assert_eq!(call["mandatory_anchor_indices"], json!([0]));
+        assert!(call["independent_span_visits"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(
+        before,
+        (verified.visits, verified.limit, verified.exhausted)
+    );
+
+    let first = wire["independent_max"]["calls"][0]["visits"]
+        .as_u64()
+        .unwrap();
+    let (bytes, report) = artifact(&fixture_with_scratch(first + 1));
+    let bounded = verify_capture(&bytes, &report, [7; 32], FirstPassPrefixV1).unwrap();
+    let wire = serde_json::to_value(
+        cold_candidate::evaluate(
+            &bounded,
+            cold_candidate::Mode::AnchoredReadinessV2WidthCostV1,
+        )
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wire["independent_max"]["complete"], true);
+    assert_eq!(wire["shared_original_budget"]["complete"], false);
+    assert_eq!(wire["shared_original_budget"]["exhausted"], true);
+    assert_eq!(
+        wire["shared_original_budget"]["calls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        wire["shared_original_budget"]["calls"][1]["error"],
+        "Capacity"
+    );
+    assert_eq!(wire["shared_original_budget"]["calls"][2]["visits"], 0);
+}

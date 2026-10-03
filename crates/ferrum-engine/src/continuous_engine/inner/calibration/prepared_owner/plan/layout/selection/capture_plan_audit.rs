@@ -14,6 +14,7 @@ use std::{fs, io::Read, path::PathBuf};
 type AuditResult<T> = anyhow::Result<T>;
 const CAPTURE_LIMIT: u64 = 256 * 1024 * 1024;
 const REFERENCE_LIMIT: u64 = 64 * 1024 * 1024;
+mod candidates;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +28,8 @@ struct AuditCase {
     capture: BoundFile,
     reference: BoundFile,
     output: PathBuf,
+    #[serde(default)]
+    candidates: Option<candidates::Options>,
 }
 
 fn read_bounded(path: &std::path::Path, limit: u64) -> AuditResult<Vec<u8>> {
@@ -332,7 +335,41 @@ fn compare_original(actual: &SelectedBatch, expected: &Value) -> AuditResult<()>
     Ok(())
 }
 
-fn audit(capture: &Capture, reference: &Value) -> AuditResult<Value> {
+fn declaration_for(
+    capture: &Capture,
+    captured: &CapturedPopulation,
+    expected: &Value,
+) -> AuditResult<StructuredServiceDeclarationV7> {
+    let automatic = match &capture
+        .config
+        .scheduler
+        .slo
+        .cost_observation
+        .live_structured_calibration
+    {
+        ferrum_types::SloLiveStructuredCalibration::AutomaticV1 { settings } => settings,
+        _ => anyhow::bail!("capture is not explicit automatic calibration"),
+    };
+    // batch_plan reads ONLY settings and schedule.prediction_validity. No
+    // physical-domain or executable declaration is reconstructed here.
+    Ok(StructuredServiceDeclarationV7 {
+        schedule: decode(expected, "schedule")?,
+        settings: decode(&captured.matrix, "settings")?,
+        route_population: automatic.route_population,
+        domain_policy: Default::default(),
+        nonnegative_envelope: None,
+        maximum_window_ns: automatic.maximum_window_ns.get(),
+        maximum_owners: automatic.maximum_owners.get(),
+        maximum_retained_numeric_bytes: automatic.maximum_retained_numeric_bytes.get(),
+        maximum_discovery_bytes: automatic.maximum_discovery_bytes.get(),
+    })
+}
+
+fn audit(
+    capture: &Capture,
+    reference: &Value,
+    candidate_options: Option<&candidates::Options>,
+) -> AuditResult<Value> {
     ensure!(
         field(reference, "input_sha256")? == &capture.input_sha256,
         "input SHA differs"
@@ -454,22 +491,7 @@ fn audit(capture: &Capture, reference: &Value) -> AuditResult<Value> {
             "original population batch is not unique"
         );
         let expected = expected[0];
-        let schedule: OwnerBlockScheduleV1 = decode(expected, "schedule")?;
-        let settings: StructuredSettingsV2 = decode(&captured.matrix, "settings")?;
-        // batch_plan reads ONLY settings and schedule.prediction_validity from
-        // this container. Remaining fields are inert accounting metadata, not
-        // a physical-domain declaration or a source that may be executed.
-        let declaration = StructuredServiceDeclarationV7 {
-            schedule,
-            settings,
-            route_population: automatic.route_population,
-            domain_policy: Default::default(),
-            nonnegative_envelope: None,
-            maximum_window_ns: automatic.maximum_window_ns.get(),
-            maximum_owners: automatic.maximum_owners.get(),
-            maximum_retained_numeric_bytes: automatic.maximum_retained_numeric_bytes.get(),
-            maximum_discovery_bytes: automatic.maximum_discovery_bytes.get(),
-        };
+        let declaration = declaration_for(capture, captured, expected)?;
         let candidates: Vec<usize> = decode(&captured.matrix, "cases")?;
         // Capture.matrix receives only member_groups' Unique/floor=1 cases,
         // after every checked alternative agrees in both axes and branches.
@@ -555,7 +577,7 @@ fn audit(capture: &Capture, reference: &Value) -> AuditResult<Value> {
                 "declared_offer_rows": fits_rows, "schedule_and_anchor_span": fits_schedule },
             "complete_input_plan": complete }));
     }
-    Ok(json!({
+    let mut output = json!({
         "scope": "Independent captured populations only; original current-kernel MAX final cases; no reselection, recipe authority, source merge or measured F/R/Q.",
         "all_original_batch_accounting_matched": true,
         "original_available_selection_capacity": {"requests": available.requests, "execution_actions": available.execution_actions, "declared_offer_rows": available.declared_offer_rows},
@@ -569,7 +591,13 @@ fn audit(capture: &Capture, reference: &Value) -> AuditResult<Value> {
             "No global sorting/coalescing/preservation proof: original raw recipes and linked trajectories are absent.",
             "Input floors are conditional on fresh cohort completion; no F/R/Q samples, Known query, witness, deadline or native lease is established.",
             "MAX geometry work is a diagnostic demand; the original spent geometry ledger is never reset or refunded."]
-    }))
+    });
+    if let Some(options) = candidate_options {
+        // Baseline accounting must succeed before any candidate is evaluated.
+        output["schedule_candidates"] =
+            candidates::evaluate(capture, reference, options, available)?;
+    }
+    Ok(output)
 }
 
 #[test]
@@ -592,7 +620,7 @@ fn captured_complete_geometry_reuses_original_source_work_and_phase_budget() -> 
         "reference binds a different capture"
     );
     let capture = parse_capture(&capture_bytes)?;
-    let result = audit(&capture, &reference)?;
+    let result = audit(&capture, &reference, descriptor.candidates.as_ref())?;
     let output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

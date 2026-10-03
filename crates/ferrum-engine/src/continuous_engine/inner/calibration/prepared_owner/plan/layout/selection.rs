@@ -1377,6 +1377,38 @@ fn batch_plan_with_scope(
     population: &StructuredServiceDeclarationV7,
     scope: Option<(&[Vec<CheckedInputFacts>], &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1)>,
 ) -> Result<SelectedBatch> {
+    batch_plan_with_schedule(
+        population_indices,
+        populations,
+        cases,
+        opportunities,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        population,
+        scope,
+        budget::startup_schedule,
+    )
+}
+
+/// Keep the complete work calculation shared with offline schedule experiments.
+/// Product callers always use the original `startup_schedule` above.
+#[allow(clippy::too_many_arguments)]
+fn batch_plan_with_schedule(
+    population_indices: &[usize],
+    populations: &[SelectedPopulation],
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    scope: Option<(&[Vec<CheckedInputFacts>], &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1)>,
+    schedule_for: impl FnOnce(
+        &[usize], &[usize],
+        &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredSettingsV2,
+    ) -> Result<(OwnerBlockScheduleV1, usize)>,
+) -> Result<SelectedBatch> {
     let representative_case_indices: Vec<_> = population_indices
         .iter()
         .flat_map(|&i| populations[i].representative_case_indices.iter().copied())
@@ -1418,8 +1450,7 @@ fn batch_plan_with_scope(
         cycle_tokens = add(cycle_tokens, work.serial_token_work)?;
         minimum_cycle = add(minimum_cycle, work.declared_offers_minimum)?;
     }
-    let (mut schedule, maximum_anchor_span) =
-        budget::startup_schedule(&starts, &ends, &population.settings)?;
+    let (mut schedule, maximum_anchor_span) = schedule_for(&starts, &ends, &population.settings)?;
     schedule.prediction_validity = population.schedule.prediction_validity;
     let mut numerical = population.settings.clone();
     numerical.max_phase_samples = *schedule.maximum_phase_members.iter().max().unwrap();

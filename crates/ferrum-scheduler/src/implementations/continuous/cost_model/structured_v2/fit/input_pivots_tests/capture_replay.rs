@@ -35,6 +35,8 @@ struct ReplayCase {
     /// Older descriptors bind captures made by the original two-pass kernel.
     #[serde(default)]
     captured_geometry_kernel: CapturedGeometryKernel,
+    #[serde(default)]
+    cold_geometry_candidate: cold_candidate::Mode,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -755,6 +757,8 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
     let reference = reference::measure(&verified)?;
     let current_demand = reference::measure_current(&verified, &reference)?;
     let candidate = reference::evaluate_candidate(&verified, &reference)?;
+    let cold_geometry_candidate =
+        cold_candidate::evaluate(&verified, case.cold_geometry_candidate)?;
     let output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -774,6 +778,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
         candidate_geometry_kernel: CapturedGeometryKernel,
         #[serde(flatten)]
         candidate_evaluation: reference::CandidateEvaluation,
+        cold_geometry_candidate: Option<cold_candidate::Measurement>,
     }
     serde_json::to_writer_pretty(
         output,
@@ -790,6 +795,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
             independent_current_demand: current_demand,
             candidate_geometry_kernel: CapturedGeometryKernel::FirstPassPrefixV1,
             candidate_evaluation: candidate,
+            cold_geometry_candidate,
         },
     )?;
     Ok(())
@@ -797,6 +803,9 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
 
 #[path = "capture_replay/reference.rs"]
 mod reference;
+
+#[path = "capture_replay/cold_candidate.rs"]
+mod cold_candidate;
 
 #[path = "capture_replay/tests.rs"]
 mod tests;
