@@ -21,6 +21,8 @@
 
 来源数量仅用于描述选中计划的执行状态，不是独立验收门槛或覆盖率。普通窗口由 health-before/after 差值确定，覆盖各 32 warmup + 32 measured 请求：Metal witness decision/submitted/reconciled 为 131/85/85，CUDA 为 25/21/21；不能用启动与 live 的累计 issued/actual 替换此窗口，也不能把非零采用写成完整覆盖。CUDA startup 有 14 次实际 capture、114 次 restore；普通窗口两者没有增长，健康截点的临时 checkpoint 占用和清理队列为 0。
 
+普通窗口进一步核对：CUDA 有 3361 个完成的控制器 transaction，规划阶段耗尽 2402 次、hard budget 耗尽 527 次；Metal 对应 2914、1916、55。三个计数不是同一事件分类，不能相加。两端实际采用的 witness 均只有一波、tail 为 0，生成/展开候选数均等于 witness 样本数。此轮没有展示实机多候选、带后续波的前瞻计划，也没有 Off 配对来证明改变排程及净收益；非零 issued/actual 配对只证明局部真实采用。依据为原普通观测 `health-before/after`，没有开启 Required 重型追踪；原始差值和 hash 另存 `g10-ordinary-planning-window.json`。
+
 两端服务保持 Qwen3.5-9B Q4_K_M / KV fp16、同机、同配置、固定 C8、原 pinned ShareGPT 64 条选样与输出长度策略，1 次重复，各 64 请求完成且错误为 0。主口径取原 Rust SLO sidecar；TPOT 终点为最后可见输出，ITL 为相邻非空可见 SSE 文本事件间隔。
 
 | 后端 | TTFT P50/P99 ms | TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | successful output tokens/s | 峰值内存 | 原 SLO |
@@ -35,6 +37,18 @@
 本轮没有满足“正常自动链路检查点”。下一步先取数值拒绝的 typed reason、触发位置与原事件身份，不根据固定 universe 的静态可达路径猜测失败算法，也不把 WrongDomain 全部改成非成员；同时拆解 Metal 合并峰值与必要工作量，重判原预算下的覆盖可行性。四入口完整闭环未通过前，不启动 224 单元正式矩阵。
 
 独立结果位于外部证据目录 `/private/tmp/ferrum-slo-recovery-20261002`：`g10-backend-build-identity-audit.json`、四份 `g10-final-{metal,cuda}-{run,serve}-results.json`、`g10-basic-output-results.json` 和各原始 evidence archive；状态汇总为 `g10-validation-status.json`。源码已 push，原 dirty 工作区未改。
+
+## G10 后的定位与局部修复
+
+`f1fade2f`（G11）仅增加错误路径诊断：保留原 `invalid structured numerical replay` 错误和 poison 行为，另记录 typed reason、固定触发位置及原 Source8 event/cohort/ticket/FIFO/call，不序列化完整记录。真实 journal 对照确认成功前缀没有新增日志，日志开关不改变失败记账、原记录或 source receipt。最小测试 1 pass，受影响 structured replay 组 166 pass、0 fail、27 项原外部证据测试未执行，fmt/diff 检查通过。CUDA 诊断构建使用该独立冻结版本，保持 G10 正常 run 的任务、配置、预算及观测设置；实机拒绝原因仍待取得，不能把静态可达的固定 universe 路径写成已证实根因。
+
+`089a49b8`（G12）修正合并候选的一项重复计费：当前选择结果只有一份 `gaps` Vec，原 `memory::plan` 已按完整分组拒绝、早停、geometry、append 和全局缺口上界收费，并包含扩容时旧/新 backing；composition 没有第二份 gaps 缓冲，却再次预约其空间。仅删除后者，其余原配方、scope、builder、机会数组、候选和增长账保持。
+
+最小反例保留真实 A/B algorithm union 与独立 FullLogits terminal 组；增加不产生新 key/member 的空 Unknown 声明时，原有同一条聚合 Unknown gap 已足够。旧代码将同一存活阶段的额度从 255,036 抬至 318,524 bytes，完整计划在原额度处被拒，0 pass/1 fail。修复后两种声明数均为 234,204 bytes，并保持全部代表、scope、schedule、5 条 gaps 和三项实际工作量账；零工作额度场景仍保留 14 条 gaps 及全部请求/动作/行数拒绝。少 1 字节仍在 geometry 前拒绝。最小测试 1 pass，整个 layout 组 120 pass、0 fail、0 ignored，fmt/diff 通过。首个 fixture 曾把 terminal 放入同一个 Greedy family而先触发夹具断言，已保留该失败并以真实独立 product 修正；它不算生产修复前证据。
+
+按 G10 Metal 原 inventory 及实际类型尺寸核算，重复项为 9,389,280 bytes，去重后的保守峰为 32,943,962，低于当时可用 34,195,039。此为同一存活对象的计费纠正，不是新增预算、删除样本或真实内存占用节省的测量；尚不能宣布 Metal 合并、120s 校准或 SLO 通过。G12 尚未执行实机；下一份稳定组合候选仍需规定 workspace/backend checks 和四入口验证。
+
+此外，只读审查确认 Source8 可在一次真实 capture 中保留多个独立 host/product family，各自完成 F/R/Q。当前 selector 的分组、优先级和单一 universe 限制了打包。减少来源槽可能因共同采样周期反增执行工作，必须先重算请求、动作、行数、owner 和内存账；没有证据证明该方向能在 120s/2048 内覆盖必要策略，尚未实现。外部记录为 `g10-multi-family-capture-design-audit.json`。G11/G12 的局部结果分别存于 `g11-validation-status.json`、`g12-validation-status.json`，不覆盖上面的 G10 冻结负结果。
 
 ## G9：同一候选的四入口实机结果（历史）
 
