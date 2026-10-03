@@ -16,6 +16,15 @@ struct BoundFile {
     path: PathBuf,
     sha256: String,
 }
+/// The descriptor declares which kernel produced the captured work ledger.
+/// Never infer this from a commit/path or retry with another kernel on failure.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CapturedGeometryKernel {
+    #[default]
+    LegacyTwoPassV1,
+    FirstPassPrefixV1,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplayCase {
@@ -23,6 +32,9 @@ struct ReplayCase {
     report: BoundFile,
     input_sha256: [u8; 32],
     output: PathBuf,
+    /// Older descriptors bind captures made by the original two-pass kernel.
+    #[serde(default)]
+    captured_geometry_kernel: CapturedGeometryKernel,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,6 +188,7 @@ struct Call {
     result: OriginalResult,
 }
 struct Verified {
+    captured_geometry_kernel: CapturedGeometryKernel,
     cases: CaseTable,
     calls: Vec<Call>,
     limit: u64,
@@ -213,6 +226,7 @@ fn verify_capture(
     bytes: &[u8],
     report: &CaptureReport,
     expected_input: [u8; 32],
+    captured_geometry_kernel: CapturedGeometryKernel,
 ) -> AuditResult<Verified> {
     ensure!(
         report.complete && report.failure.is_none(),
@@ -326,8 +340,14 @@ fn verify_capture(
             matrix.ordinal == ordinal && result.ordinal == ordinal,
             "noncontiguous ordinal at {ordinal}"
         );
-        replay_call(&matrix, &result, &cases, &mut work)
-            .with_context(|| format!("matrix {ordinal}"))?;
+        replay_call(
+            &matrix,
+            &result,
+            &cases,
+            &mut work,
+            captured_geometry_kernel,
+        )
+        .with_context(|| format!("matrix {ordinal}"))?;
         calls.push(Call {
             population,
             matrix,
@@ -351,6 +371,7 @@ fn verify_capture(
     drop(next);
     ensure!(stream.next().is_none(), "records follow shutdown footer");
     Ok(Verified {
+        captured_geometry_kernel,
         cases,
         calls,
         limit: limit.get(),
@@ -366,6 +387,7 @@ fn replay_call(
     result: &OriginalResult,
     cases: &CaseTable,
     work: &mut StructuredInputGeometryWorkV1,
+    captured_geometry_kernel: CapturedGeometryKernel,
 ) -> AuditResult<()> {
     ensure!(
         matrix.maximum_visits == work.maximum_visits()
@@ -399,13 +421,22 @@ fn replay_call(
         .map(|&i| matrix.cases[i])
         .collect();
     let original_count = selected.len();
-    let geometry = input_geometry_pivots_original_v1(
-        &rows,
-        &matrix.mandatory_anchors,
-        &matrix.settings,
-        work,
-        matrix.maximum_scratch_bytes,
-    );
+    let geometry = match captured_geometry_kernel {
+        CapturedGeometryKernel::LegacyTwoPassV1 => input_geometry_pivots_original_v1(
+            &rows,
+            &matrix.mandatory_anchors,
+            &matrix.settings,
+            work,
+            matrix.maximum_scratch_bytes,
+        ),
+        CapturedGeometryKernel::FirstPassPrefixV1 => input_geometry_pivots_v1(
+            &rows,
+            &matrix.mandatory_anchors,
+            &matrix.settings,
+            work,
+            matrix.maximum_scratch_bytes,
+        ),
+    };
     let (rank, gap) = match geometry {
         Ok(geometry) => {
             for &pivot in &geometry.pivot_indices[geometry.anchor_rank..] {
@@ -493,6 +524,12 @@ struct MatrixStatistics<'a> {
     final_selected_cases: &'a [usize],
     rows: usize,
     axes: usize,
+    mandatory_anchor_indices: &'a [usize],
+    raw_row_bit_unique_count: usize,
+    /// Exact positive-zero bits in every original row; -0 is distinct here.
+    all_original_rows_positive_zero_bit_axis_count: usize,
+    /// Numeric zero in every original row; both +0 and -0 qualify.
+    all_original_rows_numeric_zero_axis_count: usize,
     all_original_rows_zero_axes: Vec<usize>,
     scan_coordinates: usize,
     original_audit: &'a GeometryAudit,
@@ -508,6 +545,7 @@ struct DuplicateGroup {
 }
 #[derive(Serialize)]
 struct Statistics<'a> {
+    captured_geometry_kernel: CapturedGeometryKernel,
     baseline_matched: bool,
     maximum_visits: u64,
     final_visits: u64,
@@ -593,6 +631,7 @@ fn statistics(verified: &Verified) -> AuditResult<Statistics<'_>> {
             "invalid original row shape for zero-axis audit"
         );
         let mut zero = vec![true; axes];
+        let mut positive_zero_bits = vec![true; axes];
         for row in &matrix.axis_bits {
             for (axis, &bits) in row.iter().enumerate() {
                 let value = f64::from_bits(bits);
@@ -601,6 +640,7 @@ fn statistics(verified: &Verified) -> AuditResult<Statistics<'_>> {
                     "invalid original coordinate in zero-axis audit"
                 );
                 zero[axis] &= value == 0.;
+                positive_zero_bits[axis] &= bits == 0;
             }
         }
         matrices.push(MatrixStatistics {
@@ -611,6 +651,18 @@ fn statistics(verified: &Verified) -> AuditResult<Statistics<'_>> {
             final_selected_cases: &call.result.final_selected_cases,
             rows: matrix.axis_bits.len(),
             axes,
+            mandatory_anchor_indices: &matrix.mandatory_anchors,
+            raw_row_bit_unique_count: matrix
+                .axis_bits
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            all_original_rows_positive_zero_bit_axis_count: positive_zero_bits
+                .iter()
+                .filter(|&&zero| zero)
+                .count(),
+            all_original_rows_numeric_zero_axis_count: zero.iter().filter(|&&zero| zero).count(),
             all_original_rows_zero_axes: zero
                 .iter()
                 .enumerate()
@@ -649,6 +701,7 @@ fn statistics(verified: &Verified) -> AuditResult<Statistics<'_>> {
         })
         .collect();
     Ok(Statistics {
+        captured_geometry_kernel: verified.captured_geometry_kernel,
         baseline_matched: true,
         maximum_visits: verified.limit,
         final_visits: verified.visits,
@@ -688,13 +741,19 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
     let report_bytes = bound_file(&case.report, METADATA_LIMIT)?;
     let report: CaptureReport = serde_json::from_slice(&report_bytes)?;
     let bytes = bound_file(&case.capture, CAPTURE_LIMIT)?;
-    let verified = verify_capture(&bytes, &report, case.input_sha256)?;
+    let verified = verify_capture(
+        &bytes,
+        &report,
+        case.input_sha256,
+        case.captured_geometry_kernel,
+    )?;
     // Do not create an apparently successful audit before every original call
     // has passed. Statistics never execute an alternative kernel or ledger.
     let stats = statistics(&verified)?;
     // Independent diagnostic references follow the unchanged shared-ledger
     // proof. They never mutate or replace its allowance or outcomes.
     let reference = reference::measure(&verified)?;
+    let current_demand = reference::measure_current(&verified, &reference)?;
     let candidate = reference::evaluate_candidate(&verified, &reference)?;
     let output = fs::OpenOptions::new()
         .write(true)
@@ -709,8 +768,12 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
         capture_original_path: &'a std::path::Path,
         capture_elapsed_ns_diagnostic_only: u128,
         audit: Statistics<'a>,
+        independent_reference_geometry_kernel: CapturedGeometryKernel,
         independent_reference: reference::Measurement<'a>,
-        candidate: reference::CandidateMeasurement,
+        independent_current_demand: reference::CurrentDemand<'a>,
+        candidate_geometry_kernel: CapturedGeometryKernel,
+        #[serde(flatten)]
+        candidate_evaluation: reference::CandidateEvaluation,
     }
     serde_json::to_writer_pretty(
         output,
@@ -722,8 +785,11 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
             capture_original_path: &report.path,
             capture_elapsed_ns_diagnostic_only: report.elapsed_ns,
             audit: stats,
+            independent_reference_geometry_kernel: CapturedGeometryKernel::LegacyTwoPassV1,
             independent_reference: reference,
-            candidate,
+            independent_current_demand: current_demand,
+            candidate_geometry_kernel: CapturedGeometryKernel::FirstPassPrefixV1,
+            candidate_evaluation: candidate,
         },
     )?;
     Ok(())

@@ -2,12 +2,21 @@
 //! checked model recipes or the existing independent geometry-kernel tests.
 use super::*;
 use serde_json::{json, Value};
+use CapturedGeometryKernel::{FirstPassPrefixV1, LegacyTwoPassV1};
 
 fn fixture(limit: u64) -> Vec<Value> {
     fixture_using(limit, StructuredSettingsV2::default())
 }
 
 fn fixture_using(limit: u64, settings: StructuredSettingsV2) -> Vec<Value> {
+    fixture_for_kernel(limit, settings, LegacyTwoPassV1)
+}
+
+fn fixture_for_kernel(
+    limit: u64,
+    settings: StructuredSettingsV2,
+    kernel: CapturedGeometryKernel,
+) -> Vec<Value> {
     let mut config = ferrum_types::EngineConfig::default();
     config.scheduler.slo = serde_json::from_value(json!({"mode":"enforce"})).unwrap();
     let ferrum_types::SloLiveStructuredCalibration::AutomaticV1 {
@@ -76,7 +85,14 @@ fn fixture_using(limit: u64, settings: StructuredSettingsV2) -> Vec<Value> {
         records.push(json!({"kind":"original_matrix", "ordinal":ordinal, "cases":[0,1,2], "axis_bits":bits, "mandatory_anchors":[0], "settings":settings,
             "visits_before":work.visits(), "maximum_visits":limit, "exhausted_before":work.exhausted(), "maximum_scratch_bytes":scratch}));
         let before = work.visits();
-        let outcome = input_geometry_pivots_original_v1(&rows, &[0], &settings, &mut work, scratch);
+        let outcome = match kernel {
+            LegacyTwoPassV1 => {
+                input_geometry_pivots_original_v1(&rows, &[0], &settings, &mut work, scratch)
+            }
+            FirstPassPrefixV1 => {
+                input_geometry_pivots_v1(&rows, &[0], &settings, &mut work, scratch)
+            }
+        };
         let mut selected = vec![0];
         let (rank, gap) = match outcome {
             Ok(pivots) => {
@@ -125,9 +141,107 @@ fn artifact(records: &[Value]) -> (Vec<u8>, CaptureReport) {
 }
 
 #[test]
+fn capture_replay_descriptor_defaults_to_legacy_and_requires_a_known_kernel() {
+    let mut wire = json!({
+        "capture":{"path":"capture.jsonl","sha256":"bound capture"},
+        "report":{"path":"report.json","sha256":"bound report"},
+        "input_sha256":vec![7u8;32], "output":"audit.json"
+    });
+    assert_eq!(
+        serde_json::from_value::<ReplayCase>(wire.clone())
+            .unwrap()
+            .captured_geometry_kernel,
+        LegacyTwoPassV1
+    );
+    for (name, expected) in [
+        ("legacy_two_pass_v1", LegacyTwoPassV1),
+        ("first_pass_prefix_v1", FirstPassPrefixV1),
+    ] {
+        wire["captured_geometry_kernel"] = json!(name);
+        assert_eq!(
+            serde_json::from_value::<ReplayCase>(wire.clone())
+                .unwrap()
+                .captured_geometry_kernel,
+            expected
+        );
+    }
+    for invalid in [
+        json!("auto"),
+        json!("unknown_kernel"),
+        Value::Null,
+        json!(1),
+    ] {
+        wire["captured_geometry_kernel"] = invalid;
+        assert!(serde_json::from_value::<ReplayCase>(wire.clone()).is_err());
+    }
+}
+
+#[test]
+fn capture_replay_kernel_choice_binds_real_charges_without_retry_or_reference_relabeling() {
+    let old = LegacyTwoPassV1;
+    let current = FirstPassPrefixV1;
+    let (old_bytes, old_report) = artifact(&fixture(32_000_000));
+    let (new_bytes, new_report) = artifact(&fixture_for_kernel(
+        32_000_000,
+        StructuredSettingsV2::default(),
+        current,
+    ));
+    let legacy = verify_capture(&old_bytes, &old_report, [7; 32], old).unwrap();
+    let actual = verify_capture(&new_bytes, &new_report, [7; 32], current).unwrap();
+    assert!(actual.visits < legacy.visits);
+    for (original, actual) in legacy.calls.iter().zip(&actual.calls) {
+        assert_eq!(
+            original.result.final_selected_cases,
+            actual.result.final_selected_cases
+        );
+        assert_eq!(
+            original.result.audit.candidate_rank,
+            actual.result.audit.candidate_rank
+        );
+        assert!(actual.result.audit.visits < original.result.audit.visits);
+    }
+    assert!(verify_capture(&new_bytes, &new_report, [7; 32], old).is_err());
+    assert!(verify_capture(&old_bytes, &old_report, [7; 32], current).is_err());
+    assert_eq!(
+        statistics(&actual).unwrap().captured_geometry_kernel,
+        current
+    );
+    // The complete legacy demand remains an independent diagnostic. It cannot
+    // replace either captured ledger or relabel its lower first-pass charges.
+    let before = (actual.limit, actual.visits, actual.exhausted);
+    let reference = reference::measure(&actual).unwrap();
+    let current =
+        serde_json::to_value(reference::measure_current(&actual, &reference).unwrap()).unwrap();
+    let reference = serde_json::to_value(reference).unwrap();
+    assert_eq!(reference["full_required_visits"], json!(legacy.visits));
+    assert_eq!(current["full_required_visits"], json!(actual.visits));
+    assert_eq!(current["geometry_kernel"], "first_pass_prefix_v1");
+    for (old, new) in reference["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(current["calls"].as_array().unwrap())
+    {
+        for field in [
+            "rank",
+            "anchor_rank",
+            "pivot_indices",
+            "final_selected_cases",
+            "original_case_indices",
+            "normalized_call_sha256",
+        ] {
+            assert_eq!(old[field], new[field], "{field}");
+        }
+        assert!(new["full_visits"].as_u64().unwrap() < old["reference_visits"].as_u64().unwrap());
+        assert_eq!(new["mandatory_anchor_indices"], json!([0]));
+    }
+    assert_eq!(before, (actual.limit, actual.visits, actual.exhausted));
+}
+
+#[test]
 fn capture_replay_keeps_u64_bits_original_domains_and_strict_duplicate_identity() {
     let (bytes, report) = artifact(&fixture(32_000_000));
-    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let verified = verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).unwrap();
     assert_eq!(verified.calls[0].matrix.axis_bits[0][0], 1f64.to_bits());
     assert!(verified.calls[0].matrix.axis_bits[0][0] > (1 << 53));
     assert_eq!(verified.calls[2].matrix.axis_bits[0][2], (-0f64).to_bits());
@@ -136,6 +250,13 @@ fn capture_replay_keeps_u64_bits_original_domains_and_strict_duplicate_identity(
     assert_eq!(stats.strict_duplicate_groups[0].ordinals, [0, 1]);
     for matrix in &stats.matrices {
         assert_eq!(matrix.all_original_rows_zero_axes, [2]);
+        assert_eq!(matrix.all_original_rows_numeric_zero_axis_count, 1);
+        assert_eq!(
+            matrix.all_original_rows_positive_zero_bit_axis_count,
+            usize::from(matrix.ordinal != 2)
+        );
+        assert_eq!(matrix.raw_row_bit_unique_count, 3);
+        assert_eq!(matrix.mandatory_anchor_indices, [0]);
         assert_eq!(matrix.scan_coordinates, 12);
     }
     assert_eq!(stats.case_domains[1].original.width, 8);
@@ -152,7 +273,7 @@ fn capture_replay_retains_optional_final_plan_without_granting_it_authority() {
         json!({"kind":"final_selection", "selection":selection}),
     );
     let (bytes, report) = artifact(&records);
-    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let verified = verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).unwrap();
     let stats = statistics(&verified).unwrap();
     assert_eq!(stats.original_selection, Some(&selection));
     assert!(stats.baseline_matched);
@@ -160,30 +281,33 @@ fn capture_replay_retains_optional_final_plan_without_granting_it_authority() {
     // plans cannot silently change which source declaration a reader sees.
     records.insert(position, records[position].clone());
     let (bytes, report) = artifact(&records);
-    assert!(verify_capture(&bytes, &report, [7; 32]).is_err());
+    assert!(verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).is_err());
     records.remove(position);
     let plan = records.remove(position);
     records.insert(3, plan);
     let (bytes, report) = artifact(&records);
-    assert!(verify_capture(&bytes, &report, [7; 32]).is_err());
+    assert!(verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).is_err());
 }
 
 #[test]
 fn capture_replay_preserves_shared_exhaustion_without_refund_or_reset() {
-    let complete = fixture(32_000_000);
-    let first_charge = complete[5]["visits_after"].as_u64().unwrap();
-    assert!(first_charge > 0);
-    let (bytes, report) = artifact(&fixture(first_charge + 1));
-    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
-    assert!(verified.exhausted);
-    assert_eq!(verified.visits, first_charge);
-    assert!(verified.calls[0].result.audit.complete);
-    assert!(!verified.calls[1].matrix.exhausted_before);
-    assert!(verified.calls[1].result.exhausted_after);
-    assert!(verified.calls[2].matrix.exhausted_before);
-    assert!(verified.calls[1..]
-        .iter()
-        .all(|call| { call.result.gap.is_some() && call.result.visits_after == first_charge }));
+    for kernel in [LegacyTwoPassV1, FirstPassPrefixV1] {
+        let fixture = |limit| fixture_for_kernel(limit, StructuredSettingsV2::default(), kernel);
+        let complete = fixture(32_000_000);
+        let first_charge = complete[5]["visits_after"].as_u64().unwrap();
+        assert!(first_charge > 0);
+        let (bytes, report) = artifact(&fixture(first_charge + 1));
+        let verified = verify_capture(&bytes, &report, [7; 32], kernel).unwrap();
+        assert!(verified.exhausted);
+        assert_eq!(verified.visits, first_charge);
+        assert!(verified.calls[0].result.audit.complete);
+        assert!(!verified.calls[1].matrix.exhausted_before);
+        assert!(verified.calls[1].result.exhausted_after);
+        assert!(verified.calls[2].matrix.exhausted_before);
+        assert!(verified.calls[1..]
+            .iter()
+            .all(|call| { call.result.gap.is_some() && call.result.visits_after == first_charge }));
+    }
 }
 
 #[test]
@@ -217,17 +341,17 @@ fn capture_replay_rejects_missing_mapping_footer_and_changed_ledger_or_result() 
         // structure/ledger checks, not merely the preceding checksum check.
         let (bytes, report) = artifact(&records);
         assert!(
-            verify_capture(&bytes, &report, [7; 32]).is_err(),
+            verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).is_err(),
             "fault={fault}"
         );
     }
     let (bytes, mut report) = artifact(&original);
-    assert!(verify_capture(&bytes, &report, [8; 32]).is_err());
+    assert!(verify_capture(&bytes, &report, [8; 32], LegacyTwoPassV1).is_err());
     report.sha256 = "00".repeat(32);
-    assert!(verify_capture(&bytes, &report, [7; 32]).is_err());
+    assert!(verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).is_err());
     report.sha256 = digest(&bytes);
     report.complete = false;
-    assert!(verify_capture(&bytes, &report, [7; 32]).is_err());
+    assert!(verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).is_err());
 }
 
 #[test]
@@ -256,7 +380,7 @@ fn capture_reference_measures_complete_demand_without_changing_shared_baseline()
     let complete = fixture(32_000_000);
     let first_charge = complete[5]["visits_after"].as_u64().unwrap();
     let (bytes, report) = artifact(&fixture(first_charge + 1));
-    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let verified = verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).unwrap();
     let before = (verified.limit, verified.visits, verified.exhausted);
     let measurement = reference::measure(&verified).unwrap();
     let wire = serde_json::to_value(&measurement).unwrap();
@@ -300,7 +424,7 @@ fn capture_reference_groups_only_original_core_bit_equal_normalized_calls() {
         }
     }
     let (bytes, report) = artifact(&records);
-    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let verified = verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).unwrap();
     assert!(statistics(&verified)
         .unwrap()
         .strict_duplicate_groups
@@ -337,8 +461,13 @@ fn capture_reference_does_not_call_partial_rank_rejection_complete_demand() {
         ..Default::default()
     };
     let (bytes, report) = artifact(&fixture_using(32_000_000, settings));
-    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let verified = verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).unwrap();
     let measurement = reference::measure(&verified).unwrap();
+    let current =
+        serde_json::to_value(reference::measure_current(&verified, &measurement).unwrap()).unwrap();
+    assert_eq!(current["failed_calls"], 3);
+    assert!(current["full_required_visits"].is_null());
+    assert!(reference::evaluate_candidate(&verified, &measurement).is_err());
     let wire = serde_json::to_value(&measurement).unwrap();
     assert_eq!(wire["successful_calls"], 0);
     assert_eq!(wire["failed_calls"], 3);
@@ -351,4 +480,75 @@ fn capture_reference_does_not_call_partial_rank_rejection_complete_demand() {
         assert_eq!(call["reference_exhausted"], false);
         assert!(call["rank"].is_null());
     }
+}
+
+#[test]
+fn capture_candidate_exhaustion_is_explicit_output_without_hiding_baseline_errors() {
+    let complete = fixture_for_kernel(
+        32_000_000,
+        StructuredSettingsV2::default(),
+        FirstPassPrefixV1,
+    );
+    let first_charge = complete[5]["visits_after"].as_u64().unwrap();
+    let (bytes, report) = artifact(&fixture_for_kernel(
+        first_charge + 1,
+        StructuredSettingsV2::default(),
+        FirstPassPrefixV1,
+    ));
+    let verified = verify_capture(&bytes, &report, [7; 32], FirstPassPrefixV1).unwrap();
+    let reference = reference::measure(&verified).unwrap();
+    let independent = reference::measure_current(&verified, &reference).unwrap();
+    let candidate = reference::evaluate_candidate(&verified, &reference).unwrap();
+    let wire = serde_json::to_value(&candidate).unwrap();
+    assert!(wire["candidate"].is_null());
+    let error = &wire["candidate_error"];
+    assert_eq!(error["geometry_kernel"], "first_pass_prefix_v1");
+    assert_eq!(error["reason"], "Capacity");
+    assert_eq!(error["failed_ordinal"], 1);
+    assert_eq!(error["maximum_visits"], first_charge + 1);
+    assert_eq!(error["visits_before"], first_charge);
+    assert_eq!(error["used_visits"], verified.visits);
+    assert_eq!(error["exhausted"], true);
+    assert_eq!(error["completed_calls"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        error["completed_calls"][0]["final_selected_cases"],
+        json!([0, 1, 2])
+    );
+    let stats = serde_json::to_value(statistics(&verified).unwrap()).unwrap();
+    assert_eq!(stats["baseline_matched"], true);
+    assert_eq!(stats["exhausted"], true);
+    assert_eq!(stats["final_visits"], verified.visits);
+    let independent = serde_json::to_value(independent).unwrap();
+    assert_eq!(independent["full_required_visits"], first_charge * 3);
+    assert_eq!(independent["failed_calls"], 0);
+
+    // The explicit exhaustion result cannot rescue a wrong selected kernel
+    // or tampered original charge: baseline validation still fails first.
+    assert!(verify_capture(&bytes, &report, [7; 32], LegacyTwoPassV1).is_err());
+    let mut changed: Vec<Value> = bytes
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    changed[5]["audit"]["visits"] = json!(first_charge + 1);
+    let (changed_bytes, changed_report) = artifact(&changed);
+    assert!(verify_capture(&changed_bytes, &changed_report, [7; 32], FirstPassPrefixV1).is_err());
+
+    let (complete_bytes, complete_report) = artifact(&complete);
+    let complete = verify_capture(
+        &complete_bytes,
+        &complete_report,
+        [7; 32],
+        FirstPassPrefixV1,
+    )
+    .unwrap();
+    let reference = reference::measure(&complete).unwrap();
+    let wire = serde_json::to_value(reference::evaluate_candidate(&complete, &reference).unwrap())
+        .unwrap();
+    assert!(wire["candidate_error"].is_null());
+    assert_eq!(
+        wire["candidate"]["all_results_match_complete_original_reference"],
+        true
+    );
+    assert_eq!(wire["candidate"]["used_visits"], complete.visits);
 }

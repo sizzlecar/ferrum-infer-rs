@@ -1,5 +1,5 @@
 //! Independent demand measurement after exact original-ledger replay. Every
-//! reference uses the unchanged kernel, settings, anchors and scratch bound.
+//! Each reference names its kernel and preserves settings, anchors and scratch.
 //! Its fresh MAX allowance is a diagnostic, never a production allowance.
 use super::super::super::super::{input_geometry_core, FitRow, GeometryWork};
 use super::*;
@@ -80,6 +80,24 @@ pub(super) struct CandidateMeasurement {
     calls: Vec<CandidateCall>,
 }
 
+#[derive(Serialize)]
+pub(super) struct CandidateError {
+    geometry_kernel: CapturedGeometryKernel,
+    reason: &'static str,
+    failed_ordinal: usize,
+    maximum_visits: u64,
+    visits_before: u64,
+    used_visits: u64,
+    exhausted: bool,
+    completed_calls: Vec<CandidateCall>,
+}
+
+#[derive(Serialize)]
+pub(super) struct CandidateEvaluation {
+    pub(super) candidate: Option<CandidateMeasurement>,
+    pub(super) candidate_error: Option<CandidateError>,
+}
+
 /// Exercise the actual candidate API once, in original order, against one
 /// original allowance. The independent original kernel supplies every result;
 /// the original exhausted run is neither restarted nor treated as a reference
@@ -87,7 +105,7 @@ pub(super) struct CandidateMeasurement {
 pub(super) fn evaluate_candidate(
     verified: &Verified,
     reference: &Measurement<'_>,
-) -> AuditResult<CandidateMeasurement> {
+) -> AuditResult<CandidateEvaluation> {
     ensure!(
         reference.failed_calls == 0 && reference.calls.len() == verified.calls.len(),
         "candidate comparison requires complete independent original references"
@@ -105,21 +123,40 @@ pub(super) fn evaluate_candidate(
             .collect();
         let rows: Vec<_> = decoded.iter().map(Vec::as_slice).collect();
         let before = work.visits();
-        let geometry = input_geometry_pivots_v1(
+        let result = input_geometry_pivots_v1(
             &rows,
             &matrix.mandatory_anchors,
             &matrix.settings,
             &mut work,
             matrix.maximum_scratch_bytes,
-        )
-        .map_err(|reason| {
-            anyhow::anyhow!(
+        );
+        let geometry = match result {
+            Ok(geometry) => geometry,
+            // Only the optional candidate's actual shared-visit exhaustion
+            // becomes diagnostic output. A reference/baseline mismatch or a
+            // different error remains fatal, never an apparent candidate pass.
+            Err(StructuredUnknown::Capacity) if work.exhausted() => {
+                return Ok(CandidateEvaluation {
+                    candidate: None,
+                    candidate_error: Some(CandidateError {
+                        geometry_kernel: CapturedGeometryKernel::FirstPassPrefixV1,
+                        reason: "Capacity",
+                        failed_ordinal: matrix.ordinal,
+                        maximum_visits: work.maximum_visits(),
+                        visits_before: before,
+                        used_visits: work.visits(),
+                        exhausted: work.exhausted(),
+                        completed_calls: calls,
+                    }),
+                });
+            }
+            Err(reason) => bail!(
                 "candidate ordinal {} failed {reason:?}; visits={} exhausted={}",
                 matrix.ordinal,
                 work.visits(),
                 work.exhausted()
-            )
-        })?;
+            ),
+        };
         ensure!(
             Some(geometry.rank) == expected.rank
                 && Some(geometry.anchor_rank) == expected.anchor_rank
@@ -156,13 +193,16 @@ pub(super) fn evaluate_candidate(
             final_selected_cases: selected,
         });
     }
-    Ok(CandidateMeasurement {
-        maximum_visits: work.maximum_visits(),
-        used_visits: work.visits(),
-        exhausted: work.exhausted(),
-        all_results_match_complete_original_reference: true,
-        original_per_call_scratch_limits_preserved: true,
-        calls,
+    Ok(CandidateEvaluation {
+        candidate: Some(CandidateMeasurement {
+            maximum_visits: work.maximum_visits(),
+            used_visits: work.visits(),
+            exhausted: work.exhausted(),
+            all_results_match_complete_original_reference: true,
+            original_per_call_scratch_limits_preserved: true,
+            calls,
+        }),
+        candidate_error: None,
     })
 }
 fn normalized_signature(bits: &[Vec<u64>], matrix: &Matrix) -> AuditResult<[u8; 32]> {
@@ -272,7 +312,9 @@ pub(super) fn measure(verified: &Verified) -> AuditResult<Measurement<'_>> {
                 entry.rank == call.result.audit.candidate_rank
                     && entry.rank == call.result.audit.selected_rank
                     && entry.final_selected_cases == call.result.final_selected_cases
-                    && entry.reference_visits == call.result.audit.visits,
+                    && (verified.captured_geometry_kernel
+                        != CapturedGeometryKernel::LegacyTwoPassV1
+                        || entry.reference_visits == call.result.audit.visits),
                 "reference changed an originally complete call {}",
                 matrix.ordinal
             );
@@ -395,6 +437,153 @@ pub(super) fn measure(verified: &Verified) -> AuditResult<Measurement<'_>> {
             "Offline group storage, original/normalized matrices and simultaneous temporary allocation peaks are not production cache memory accounting.",
             "A requirement-minus-charge difference is arithmetic, not a legal retry allowance or feasible saving; original failed work remains spent.",
         ],
-        conclusion: "Same-kernel independent demand and bit-exact normalized-input equivalence only. Settings/scratch rejection remains rejection. No cache mechanism, numerical qualification, reduced production work allowance, startup-time or memory feasibility is established.",
+        conclusion: "Legacy two-pass independent demand and bit-exact normalized-input equivalence only. Settings/scratch rejection remains rejection. No cache mechanism, numerical qualification, reduced production work allowance, startup-time or memory feasibility is established.",
+    })
+}
+
+#[derive(Serialize)]
+pub(super) struct CurrentDemandCall<'a> {
+    ordinal: usize,
+    population_index: usize,
+    original_case_indices: &'a [usize],
+    mandatory_anchor_indices: &'a [usize],
+    original_complete: bool,
+    original_charged_visits: u64,
+    complete: bool,
+    rank: Option<usize>,
+    anchor_rank: Option<usize>,
+    pivot_indices: Vec<usize>,
+    final_selected_cases: Vec<usize>,
+    full_visits: u64,
+    exhausted: bool,
+    error: Option<String>,
+    /// Reuses the independently verified original normalization groups. No
+    /// normalized rows or hash are substituted for this call's actual inputs.
+    normalized_call_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Serialize)]
+pub(super) struct CurrentDemand<'a> {
+    geometry_kernel: CapturedGeometryKernel,
+    diagnostic_allowance_per_call: u64,
+    calls: Vec<CurrentDemandCall<'a>>,
+    successful_calls: usize,
+    failed_calls: usize,
+    measured_visits: u128,
+    full_required_visits: Option<u128>,
+    full_requirement_above_original_limit: Option<u128>,
+    conclusion: &'static str,
+}
+
+/// Measure complete current-kernel demand independently for every original
+/// call. This does not reset the verified shared ledger or reuse prior results.
+pub(super) fn measure_current<'a>(
+    verified: &'a Verified,
+    legacy: &Measurement<'_>,
+) -> AuditResult<CurrentDemand<'a>> {
+    ensure!(
+        legacy.calls.len() == verified.calls.len(),
+        "reference call count differs"
+    );
+    let mut calls = Vec::new();
+    let mut measured = 0_u128;
+    let mut successful = 0;
+    for (call, expected) in verified.calls.iter().zip(&legacy.calls) {
+        let matrix = &call.matrix;
+        let decoded: Vec<Vec<f64>> = matrix
+            .axis_bits
+            .iter()
+            .map(|row| row.iter().map(|&bits| f64::from_bits(bits)).collect())
+            .collect();
+        let rows: Vec<_> = decoded.iter().map(Vec::as_slice).collect();
+        let mut work = StructuredInputGeometryWorkV1::new(NonZeroU64::new(u64::MAX).unwrap());
+        let result = input_geometry_pivots_v1(
+            &rows,
+            &matrix.mandatory_anchors,
+            &matrix.settings,
+            &mut work,
+            matrix.maximum_scratch_bytes,
+        );
+        measured = measured
+            .checked_add(u128::from(work.visits()))
+            .context("current demand overflow")?;
+        let mut entry = CurrentDemandCall {
+            ordinal: matrix.ordinal,
+            population_index: call.population.population_index,
+            original_case_indices: &matrix.cases,
+            mandatory_anchor_indices: &matrix.mandatory_anchors,
+            original_complete: call.result.audit.complete,
+            original_charged_visits: call.result.audit.visits,
+            complete: result.is_ok(),
+            rank: None,
+            anchor_rank: None,
+            pivot_indices: Vec::new(),
+            final_selected_cases: Vec::new(),
+            full_visits: work.visits(),
+            exhausted: work.exhausted(),
+            error: None,
+            normalized_call_sha256: expected.normalized_call_sha256,
+        };
+        match result {
+            Ok(geometry) => {
+                ensure!(
+                    Some(geometry.rank) == expected.rank
+                        && Some(geometry.anchor_rank) == expected.anchor_rank
+                        && geometry.pivot_indices == expected.pivot_indices,
+                    "current independent geometry differs from legacy at {}",
+                    matrix.ordinal
+                );
+                entry.rank = Some(geometry.rank);
+                entry.anchor_rank = Some(geometry.anchor_rank);
+                entry.final_selected_cases = matrix
+                    .mandatory_anchors
+                    .iter()
+                    .map(|&index| matrix.cases[index])
+                    .collect();
+                for &pivot in &geometry.pivot_indices[geometry.anchor_rank..] {
+                    let original = matrix.cases[pivot];
+                    if !entry.final_selected_cases.contains(&original) {
+                        entry.final_selected_cases.push(original);
+                    }
+                }
+                entry.final_selected_cases.sort_unstable();
+                entry.pivot_indices = geometry.pivot_indices;
+                ensure!(
+                    entry.final_selected_cases == expected.final_selected_cases,
+                    "current independent case mapping differs at {}",
+                    matrix.ordinal
+                );
+                if call.result.audit.complete
+                    && verified.captured_geometry_kernel
+                        == CapturedGeometryKernel::FirstPassPrefixV1
+                {
+                    ensure!(
+                        work.visits() == call.result.audit.visits,
+                        "current independent charge differs from capture at {}",
+                        matrix.ordinal
+                    );
+                }
+                successful += 1;
+            }
+            Err(reason) => {
+                let error = format!("{reason:?}");
+                ensure!(
+                    !expected.complete && expected.error.as_ref() == Some(&error),
+                    "current independent error differs from legacy at {}",
+                    matrix.ordinal
+                );
+                entry.error = Some(error);
+            }
+        }
+        calls.push(entry);
+    }
+    let full = (successful == calls.len()).then_some(measured);
+    Ok(CurrentDemand {
+        geometry_kernel: CapturedGeometryKernel::FirstPassPrefixV1,
+        diagnostic_allowance_per_call: u64::MAX,
+        successful_calls: successful, failed_calls: calls.len() - successful,
+        calls, measured_visits: measured, full_required_visits: full,
+        full_requirement_above_original_limit: full.map(|total| total.saturating_sub(u128::from(verified.limit))),
+        conclusion: "Independent first-pass-prefix demand only; original settings, anchors and scratch bounds preserved. Each fresh MAX ledger is diagnostic. Decoding, scans, hashing, equality, serialization and storage are not charged here. This is neither the captured shared budget nor legacy two-pass demand, and establishes no feasible cache, qualification or startup deadline.",
     })
 }

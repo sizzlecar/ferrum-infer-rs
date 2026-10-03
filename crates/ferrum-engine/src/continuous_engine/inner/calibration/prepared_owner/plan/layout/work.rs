@@ -249,5 +249,26 @@ fn checked_mul(a: usize, b: usize) -> Result<usize> {
         .ok_or_else(|| error("probe work accounting overflow"))
 }
 
+/// Offline accounting only. Reconstitutes an already captured declaration;
+/// this has no lease, checked-input, execution or publication authority.
+#[cfg(test)]
+pub(super) fn acquisition_from_capture_for_test(
+    case: &Case,
+    prompt_tokens: usize,
+    boundary: usize,
+    prefill_chunk: NonZeroU32,
+    input_tokens_sha256: [u8; 32],
+) -> Result<PreparedProbeAcquisition> {
+    let key = PreparedProbeAcquisition {
+        template: case.template,
+        maximum_output: case.maximum_output,
+        preset: case.preset,
+        plan: ProbePrefixAcquisitionPlan::new(prompt_tokens, boundary, prefill_chunk)?,
+        input_tokens_sha256,
+    };
+    key.validate_case_binding(case)?;
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests;

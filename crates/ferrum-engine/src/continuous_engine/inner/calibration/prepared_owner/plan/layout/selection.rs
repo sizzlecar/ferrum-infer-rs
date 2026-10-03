@@ -11,6 +11,8 @@ use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
     StructuredUnknownV2,
 };
 use populations::{member_groups, CaseOpportunity, CasePopulation, CheckedPopulationKey};
+#[cfg(test)]
+mod capture_plan_audit;
 mod composition;
 mod grouping;
 mod input_geometry;
