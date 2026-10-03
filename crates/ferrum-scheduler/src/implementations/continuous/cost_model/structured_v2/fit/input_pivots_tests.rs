@@ -83,3 +83,6 @@ fn cold_input_pivots_keep_original_tie_order_and_nonrefundable_work_and_scratch_
         pivots
     );
 }
+
+#[path = "input_pivots_tests/capture_replay.rs"]
+mod capture_replay;
