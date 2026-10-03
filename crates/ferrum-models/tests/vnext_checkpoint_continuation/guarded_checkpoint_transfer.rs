@@ -68,12 +68,38 @@ pub(crate) fn verify(timing: DeviceTimingMode, configured: bool) {
             .configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(1).unwrap())
             .unwrap();
     }
-    let before_graph = fixture
-        .lane
-        .reusable_execution_catalog()
-        .unwrap()
-        .into_parts();
-    let before_preparation = fixture.lane.reusable_executable_preparation().unwrap();
+    let graph_snapshot = || {
+        let state = fixture
+            .lane
+            .cost_graph_stream_state()
+            .unwrap()
+            .expect("CUDA exposes the actual graph configuration");
+        assert_eq!(
+            state.configuration(),
+            if configured {
+                DeviceCostGraphConfiguration::OnDemand
+            } else {
+                DeviceCostGraphConfiguration::Unconfigured
+            }
+        );
+        if !configured {
+            assert!(state.is_unconfigured_empty());
+        }
+        // Catalog and preparation inspection require prior configuration;
+        // the typed stream state proves the unconfigured empty case.
+        let prepared = configured.then(|| {
+            (
+                fixture
+                    .lane
+                    .reusable_execution_catalog()
+                    .unwrap()
+                    .into_parts(),
+                fixture.lane.reusable_executable_preparation().unwrap(),
+            )
+        });
+        (state, prepared)
+    };
+    let before_graph = graph_snapshot();
     let binding = fixture.resources.trusted_runtime_binding().unwrap();
     let capture_gate = Gate::new(NativeCheckpointTransferKind::Capture);
     let capture = || loop {
@@ -100,6 +126,7 @@ pub(crate) fn verify(timing: DeviceTimingMode, configured: bool) {
         }
     };
     assert_rejected(capture(), &capture_gate, &fixture);
+    assert_eq!(graph_snapshot(), before_graph);
     assert_eq!(
         fixture
             .reaper
@@ -122,30 +149,14 @@ pub(crate) fn verify(timing: DeviceTimingMode, configured: bool) {
         fixture.reaper.checkpoint_timing_snapshot().capture,
         checkpoint.logical_bytes(),
     );
-    assert_eq!(
-        fixture
-            .lane
-            .reusable_execution_catalog()
-            .unwrap()
-            .into_parts(),
-        before_graph
-    );
-    assert_eq!(
-        fixture.lane.reusable_executable_preparation().unwrap(),
-        before_preparation
-    );
+    assert_eq!(graph_snapshot(), before_graph);
     let expected = [3..4, 4..5].map(|range| fixture.execute(&source, Arc::clone(&tokens), range));
     source.try_complete().unwrap();
     drop(source);
 
     let target = fixture.admit("guarded-checkpoint-target", Arc::clone(&tokens));
     let restore_gate = Gate::new(NativeCheckpointTransferKind::Restore);
-    let before_graph = fixture
-        .lane
-        .reusable_execution_catalog()
-        .unwrap()
-        .into_parts();
-    let before_preparation = fixture.lane.reusable_executable_preparation().unwrap();
+    let before_graph = graph_snapshot();
     let restore = || {
         fixture
             .reaper
@@ -162,6 +173,7 @@ pub(crate) fn verify(timing: DeviceTimingMode, configured: bool) {
             .unwrap()
     };
     assert_rejected(restore(), &restore_gate, &fixture);
+    assert_eq!(graph_snapshot(), before_graph);
     assert_eq!(
         fixture
             .reaper
@@ -182,18 +194,7 @@ pub(crate) fn verify(timing: DeviceTimingMode, configured: bool) {
         fixture.reaper.checkpoint_timing_snapshot().restore,
         checkpoint.logical_bytes(),
     );
-    assert_eq!(
-        fixture
-            .lane
-            .reusable_execution_catalog()
-            .unwrap()
-            .into_parts(),
-        before_graph
-    );
-    assert_eq!(
-        fixture.lane.reusable_executable_preparation().unwrap(),
-        before_preparation
-    );
+    assert_eq!(graph_snapshot(), before_graph);
     for (range, expected) in [3..4, 4..5].into_iter().zip(expected) {
         expected.assert_same(
             &fixture.execute(&target, Arc::clone(&tokens), range),
