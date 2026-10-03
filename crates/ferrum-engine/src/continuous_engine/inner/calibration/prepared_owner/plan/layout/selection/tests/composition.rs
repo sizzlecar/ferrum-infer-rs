@@ -349,7 +349,7 @@ fn local_combination_peak_authorization_preserves_raw_path_on_capacity_denial() 
     );
 }
 
-fn algorithm_pair_inventory(
+pub(super) fn algorithm_pair_inventory(
     width_scales: [usize; 2],
 ) -> (
     Vec<Case>,

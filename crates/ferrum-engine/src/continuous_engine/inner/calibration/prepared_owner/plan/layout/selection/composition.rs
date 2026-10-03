@@ -29,6 +29,8 @@ pub(super) fn extra_peak(
     retained_group_count: usize,
 ) -> Result<usize> {
     let (mentions, guaranteed) = selection_inventory_cardinality(opportunities)?;
+    // Composition adds no separate gap buffer. The sole CheckedSelection::gaps
+    // Vec, including its growth peak, is already charged by memory::plan.
     add(
         add(
             mul(builder_limit(seed)?, add(retained_group_count, 2)?)?,
@@ -38,11 +40,8 @@ pub(super) fn extra_peak(
             )?,
         )?,
         add(
-            vector_peak_bytes::<SelectionGap>(add(mul(opportunities.len(), 2)?, 1)?)?,
-            add(
-                vector_peak_bytes::<usize>(mentions)?,
-                mul(std::mem::size_of::<BatchCandidate>(), 2)?,
-            )?,
+            vector_peak_bytes::<usize>(mentions)?,
+            mul(std::mem::size_of::<BatchCandidate>(), 2)?,
         )?,
     )
 }

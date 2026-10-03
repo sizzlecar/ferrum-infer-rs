@@ -292,6 +292,237 @@ fn append_uncaptured(
 }
 
 #[test]
+fn local_composition_unknown_declarations_share_the_original_gap_backing() {
+    use std::num::NonZeroU64;
+
+    let (mut cases, mut opportunities, mut facts, population) =
+        composition::algorithm_pair_inventory([1, 1]);
+    let pair_cases = cases.len();
+    let seed = ferrum_scheduler::implementations::continuous::cost_model::structured_v2::
+        DeclaredAlgorithmUniverseV1::from_inputs(facts.iter().flatten()
+            .map(|f| f.original.as_deref().unwrap()), population.settings.max_axes).unwrap();
+    // A real FullLogits length-boundary input has a distinct population from
+    // the greedy pair. It retains its original early-stop obligation and is
+    // deferred by input priority, while the ordinary pair can form one union.
+    let mut terminal = cases[0].clone();
+    terminal.product = OpportunityProduct::Full;
+    terminal.maximum_output = NonZeroUsize::new(4).unwrap();
+    terminal.release_generated = 3;
+    terminal.suffix_tokens = 1;
+    let input = natural_termination_input_with_algorithm(
+        terminal.width as u32,
+        CostProductOutput::FullLogits,
+        true,
+        64,
+        "fixture.selection.a",
+        [7; 32],
+    );
+    opportunities.push(CaseOpportunity {
+        population: classify_alternatives(
+            std::slice::from_ref(&input),
+            StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1,
+            true,
+        )
+        .unwrap(),
+        minimum_fresh_members: 1,
+    });
+    let terminal_facts = input_facts(&StructuredQueryV2::exact(input)).unwrap();
+    assert!(terminal_facts.branches[4]);
+    assert!(!terminal_facts.branches[5]);
+    assert!(facts
+        .iter()
+        .all(|row| row[0].key(population.population_policy())
+            != terminal_facts.key(population.population_policy())));
+    facts.push(vec![terminal_facts]);
+    cases.push(terminal);
+    let first_unknown = cases.len();
+    append_uncaptured(
+        &mut cases,
+        &mut opportunities,
+        &mut facts,
+        first_unknown + 1,
+    );
+    let original_len = cases.len();
+    let original_groups = member_groups(&opportunities).unwrap();
+    // Uncaptured declarations create no candidate, scope, member, or per-case
+    // gap: the same single aggregate Unknown gap was already present above.
+    append_uncaptured(
+        &mut cases,
+        &mut opportunities,
+        &mut facts,
+        original_len + population.settings.max_rank,
+    );
+    let groups = member_groups(&opportunities).unwrap();
+    let work_limit = NonZeroU64::new(32_000_000).unwrap();
+    for capacity in [
+        SelectionCapacity::legacy(2048, 10_000_000),
+        SelectionCapacity {
+            requests: 0,
+            execution_actions: 0,
+            declared_offer_rows: 0,
+        },
+    ] {
+        let original_memory = super::super::memory::plan(
+            &original_groups,
+            &opportunities[..original_len],
+            &facts[..original_len],
+            capacity.requests,
+            Some(&population.settings),
+        )
+        .unwrap();
+        let memory = super::super::memory::plan(
+            &groups,
+            &opportunities,
+            &facts,
+            capacity.requests,
+            Some(&population.settings),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&original_memory).unwrap(),
+            "the same live groups and gap backing retain the same stage bound"
+        );
+        // Derive the cap from the original owned stages, not a copied byte
+        // formula or a machine-sized allowance. Extra empty declarations must
+        // fit the identical cap: they add no selection-owned allocation.
+        let tight = original_memory.required_peak_bytes
+            + super::super::composition::extra_peak(
+                &opportunities[..original_len],
+                &seed,
+                original_memory.guaranteed_groups,
+            )
+            .unwrap();
+        let declared_peak = memory.required_peak_bytes
+            + super::super::composition::extra_peak(
+                &opportunities,
+                &seed,
+                memory.guaranteed_groups,
+            )
+            .unwrap();
+        let run = |maximum, work: &mut StructuredInputGeometryWorkV1| {
+            select_with_capacity(
+                &cases,
+                &opportunities,
+                &facts,
+                &[61, 61],
+                8,
+                None,
+                &population,
+                capacity,
+                maximum,
+                None,
+                Some(1),
+                Some(work),
+                None,
+                Some(&seed),
+            )
+        };
+        let mut expected_work = StructuredInputGeometryWorkV1::new(work_limit);
+        let expected = run(
+            declared_peak + memory.required_peak_bytes,
+            &mut expected_work,
+        )
+        .unwrap();
+        assert!(expected
+            .gaps
+            .iter()
+            .any(|g| matches!(g.reason, SelectionGapReason::UnknownPopulation)));
+        assert!(expected.gaps.iter().any(|g| matches!(
+            g.reason,
+            SelectionGapReason::OutcomeDependentEarlyTermination
+        )));
+        assert!(expected.gaps.iter().any(|g| matches!(
+            g.reason,
+            SelectionGapReason::EarlyTerminalOpportunityMissing
+        )));
+        assert!(expected
+            .gaps
+            .iter()
+            .any(|g| matches!(g.reason, SelectionGapReason::DeferredInputPriority { .. })));
+        if capacity.requests != 0 {
+            let union = expected
+                .batches
+                .iter()
+                .find(|b| b.scheduled && b.algorithm_universe.is_some())
+                .unwrap();
+            for index in 0..pair_cases {
+                assert!(
+                    union.representative_case_indices.contains(&index),
+                    "original width/algorithm endpoint lost"
+                );
+            }
+            assert!(union.scoped_opportunities.is_some());
+        } else {
+            assert!(expected.execution_case_indices.is_empty());
+            assert!(expected
+                .gaps
+                .iter()
+                .any(|g| matches!(g.reason, SelectionGapReason::RemainingRequests { .. })));
+            assert!(expected
+                .gaps
+                .iter()
+                .any(|g| matches!(g.reason, SelectionGapReason::RemainingWaves { .. })));
+            assert!(expected
+                .gaps
+                .iter()
+                .any(|g| matches!(g.reason, SelectionGapReason::RemainingOfferRows { .. })));
+        }
+        eprintln!("composition gap backing: original_declarations={original_len} extended_declarations={} guaranteed_groups={} original_peak={tight} extended_peak={declared_peak} actual_gaps={} gap_capacity={}",
+            cases.len(), memory.guaranteed_groups, expected.gaps.len(), expected.gaps.capacity());
+        let mut actual_work = StructuredInputGeometryWorkV1::new(work_limit);
+        let actual = run(tight, &mut actual_work)
+            .expect("unchanged live gap backing must fit its original authorization");
+        assert_eq!(serde_json::to_value(&actual).unwrap(), serde_json::to_value(&expected).unwrap(),
+            "complete representatives, scopes, schedules, all gaps and all work ledgers survive the tight cap");
+        assert_eq!(actual_work.visits(), expected_work.visits());
+        assert!(memory.retained_groups_bytes + actual.retained_payload_bytes().unwrap() <= tight);
+        let mut totals = [0usize; 3];
+        for &index in &actual.execution_case_indices {
+            let work = work::case_work(&cases[index], 61, 8, None).unwrap();
+            totals[0] += work.requests;
+            totals[1] += work.execution_actions;
+            totals[2] += work.serial_declared_offer_rows;
+        }
+        assert_eq!(
+            totals,
+            [
+                actual.requests,
+                actual.serial_wave_upper_bound,
+                actual.declared_offer_row_bound
+            ]
+        );
+        let mut rejected_work = StructuredInputGeometryWorkV1::new(work_limit);
+        assert!(run(tight - 1, &mut rejected_work).is_err());
+        assert_eq!(
+            rejected_work.visits(),
+            0,
+            "capacity rejection precedes geometry"
+        );
+        assert!(composition_authorized(
+            &opportunities,
+            &facts,
+            capacity.requests,
+            &population,
+            true,
+            tight,
+            &seed
+        )
+        .unwrap());
+        assert!(!composition_authorized(
+            &opportunities,
+            &facts,
+            capacity.requests,
+            &population,
+            true,
+            tight - 1,
+            &seed
+        )
+        .unwrap());
+    }
+}
+
+#[test]
 fn checked_selection_sparse_declarations_keep_exact_capacity_and_typed_gaps() {
     let (mut cases, mut opportunities, mut facts, population) = two_families();
     install_natural_termination_facts(
