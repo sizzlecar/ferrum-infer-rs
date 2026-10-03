@@ -12,11 +12,11 @@
 
 此前虽有分阶段计划，实际仍过多依赖完整实机运行寻找组合故障。局部选源、维护、发布与调度测试分别通过，没有证明它们在同一真实计划和原预算下共同成立。G15 首版通过 123 项 layout 测试却破坏原普通查询，就是这类验收缺口；后续以原端到端失败和撤回对照定位，不能把补回两个测试当作整条产品链路已经完整。
 
-当前生产代码冻结在 `5ace3e72`。先完成下面的覆盖、预算与联动审查，形成一份同源码的证据清单；现有检查继续，暂不为当前候选启动整轮实机。验收义务来自原目标、声明的模型能力和目标负载，沿用现有 typed 输入、选择账与回执，不新增另一套运行框架。只统计能支持具体行为的证据，不以源码规模、来源数、测试数量或非零 witness 判定完成。
+当前生产检查点为 `f1c6ccac`：在 `5ace3e72` 的联动修复基础上，G19 减少冷几何的重复正交化计算。真实 CUDA 输入的全部几何结果已在本地保持原 32M 和 scratch 上限通过对照；完整回归及同源码正常后端入口仍须验证。验收义务来自原目标、声明的模型能力和目标负载，沿用现有 typed 输入、选择账与回执，不新增另一套运行框架。只统计能支持具体行为的证据，不以源码规模、来源数、测试数量或非零 witness 判定完成。
 
 | 关口 | 当前已知状态 | 本关完成条件 |
 | --- | --- | --- |
-| 必要策略与几何覆盖 | G13 CUDA 已证实普通 GreedyLength 策略缺失；对应 rows1 候选 geometry 完整且与原 Configured 候选 U 相同。部分 rows8 候选 geometry 在合并之前耗尽预算，当前 packing 不会补算 | 将必要普通请求的可执行路径对应到原 family、选源、独立 F/R/Q 和最终 catalog；列出未覆盖项及原因，明确 C8 的可行路径和支持边界。C8 不等于要求所有 rows8 或所有声明成为 Known，选择成功也不等于数值资格成功 |
+| 必要策略与几何覆盖 | G19 对 G18 实际输入的 162 项几何全部完成，使用 26,627,160 / 32,000,000 visits，秩、枢轴和最终 case 与完整原核一致；新后端选源、独立资格和普通采用仍缺 | 将必要普通请求的可执行路径对应到原 family、选源、独立 F/R/Q 和最终 catalog；列出未覆盖项及原因，明确 C8 的可行路径和支持边界。C8 不等于要求所有 rows8 或所有声明成为 Known，选择成功也不等于数值资格成功 |
 | 准备、容量与工作预算 | G16 已有原冻结预算内维护、受影响来源完整收样及普通采用的 CPU 联动证明；真实 Metal 仍只有修复前 78/815 cohorts 的失败记录 | 从真实冻结计划核对 seed、维护、restore、F/R/Q 的请求、动作、offer rows、owner 和存活内存；证明原 reservation 可完成相关维护并继续完整收样。120s 的实际耗时仍由后端测量判定 |
 | 数值支持到普通采用 | 原 basic/forward E2E 已恢复；新增 GreedyLength 联动严格绑定最终采用的 IndependentReplay，维护联动严格绑定受影响来源和普通实际 Matched 收据，两项 CPU 用例已通过 | 新保留的策略必须由原 catalog 查询成功并产生普通执行 witness；私有维护必须与真实计划、完整 F/R/Q、发布和后续采用连成一条测试路径。保留原断言、数值解释和所有预算 |
 | 默认规划时间 | 普通逻辑 E2E 使用宽松测试时限；当前优化构建的两个原 2ms 探针另已通过 | 实机再核普通事务的预算、合法选择、实际提交与配对，解释预算耗尽；两个受控 CPU 场景不证明真实模型或并发负载可行 |
@@ -45,7 +45,15 @@ G18 CUDA 实际采集已结束：上述同一源码的 release CLI 测试 **1 pa
 
 测试提交 `49f03cd7` 使用 Rust 按原顺序重放同一共享 32M 账本，保留 f64 原始位，逐项核对原结果、最终 case 集、全部前后访问数和 exhausted 状态；实际重放 **1 pass / 0 fail、4.97s**。原 32,000,000 visits 使用 **31,997,348**：98 个 Configured 全部完成，使用 23,389,456；64 个 GreedyLength 中 39 个完成、25 个未完成，使用 8,607,892。耗尽发生在 width5 Full 候选，GreedyLength 的八个 width8 候选均零访问。该结果来自本次输入，不混用旧 G13 的索引和计费。[同次重放报告](/private/tmp/ferrum-slo-recovery-20261002/g18-geometry-replay-run-r1/original-geometry-audit.json)、[执行日志](/private/tmp/ferrum-slo-recovery-20261002/g18-geometry-replay-real-r1.log)
 
-结构统计发现 36 组严格相同计算输入、37 次额外调用；其中已完成重复调用消耗 4,676,784 visits。全部 403,776 个原坐标中有 19,456 个全行零轴坐标，约 4.8%。这些只是优化机会，不是可直接抵扣的节省。下一步以同一输入独立测量每项原内核的完整工作需求，并检查原归一化后是否存在严格位相同输入；诊断参考账与生产共享账分开，不能扩大生产预算。只有计入新增扫描、比对、缓存和共存内存后，必要路径仍可在原额度内完成，才进入后端完整负载。几何通过也不代替 selection、独立 F/R/Q、普通采用及最终容量验收。[离线核算设计](/private/tmp/ferrum-slo-recovery-20261002/g18-offline-geometry-audit-design.json)
+结构统计发现 36 组严格相同计算输入、37 次额外调用；其中已完成重复调用消耗 4,676,784 visits。全部 403,776 个原坐标中有 19,456 个全行零轴坐标，约 4.8%。这些只是优化机会，不是可直接抵扣的节省。随后以同一输入独立测量每项原内核的完整工作需求，并检查原归一化后是否存在严格位相同输入，结果见下文；诊断参考账与生产共享账分开，不能扩大生产预算。只有计入新增扫描、比对、缓存和共存内存后，必要路径仍可在原额度内完成，才进入后端完整负载。几何通过也不代替 selection、独立 F/R/Q、普通采用及最终容量验收。[离线核算设计](/private/tmp/ferrum-slo-recovery-20261002/g18-offline-geometry-audit-design.json)
+
+G18 后续完整需求测量已完成：原 162 项全部独立计算需要 **38,193,728 visits**。仅复用原始位完全相同输入的理想剩余为 **32,627,168**；仅复用原归一化后相同输入、保留每次原 4ND 前处理的理想剩余为 **32,213,072**，均未计缓存、比对等开销。两者单独不足以完整完成当前调用序列，因此未将其直接实现为生产缓存。这不证明所有必要覆盖都不可行。[需求测量](/private/tmp/ferrum-slo-recovery-20261002/g18-geometry-reference-run-r1/demand-summary.json)
+
+G19 改为在单次冷几何调用内复用原正交化的**第一遍前缀残差**。原 basis 只追加且旧方向不变，所以对新增方向继续第一遍，与从原行重新执行第一遍保持同一浮点操作顺序；每次第二遍仍在副本上从头完整执行。原 normalized rows 存储被就地复用，两个标量记录 anchor 与其余行的进度，没有跨调用矩阵缓存或新增堆分配；largest norm 在修改原行之前计算。正常数值 Fit 的原 core 不变，原预算、数值阈值、scratch 门和不可退款语义保留。
+
+`f1c6ccac` 的定向测试 **13 pass / 0 fail / 1 ignored**，覆盖 anchor 转换、相同残差的原顺序、依赖与病态边界、精确预算、差一单位失败及持续耗尽。另以原真实捕获执行显式 Rust 对照 **1 pass / 0 fail、6.86s**：先复现原共享账，再用未改原 core 取得完整参考，最后让生产公开 API 按原顺序共用原 32M。新实现 **162/162 完成、26,627,160 visits、exhausted=false**，与工作量预测完全一致；每项 rank、anchor rank、pivot 和最终 case 均匹配原完整参考，原 scratch 限制不变。减少的 11,566,568 visits 是计算工作，不是实测吞吐或延迟收益。真实后端 Source8、普通采用、完整输出和 SLO 尚未因本项对照而通过，正式验收仍 **0/224**。[独立重放审计](/private/tmp/ferrum-slo-recovery-20261002/g19-first-pass-replay-audit.json)、[当前检查状态](/private/tmp/ferrum-slo-recovery-20261002/g19-first-pass-status.json)
+
+G19 的 fmt、workspace check（56.37s）、完整 workspace test、Clippy `-A warnings`（54.66s）和 Metal 全目标编译（38.56s）均退出 0。全仓按顶层 harness 去重为 **7897 pass / 0 fail / 110 ignored**，另有 16 项 Criterion smoke，不作性能成绩。新增四项优化测试、G17 联动、原 basic/forward/multispan E2E 均通过；显式实机输入重放在全仓仍计 ignored，其单独运行结果不重复累加。上述生产提交已 push。同源码正常产品的 CUDA/Metal 构建材料已准备，CUDA pinned 编译和两后端实际入口验证尚待完成。[全仓审计](/private/tmp/ferrum-slo-recovery-20261002/g19-workspace-audit.json)
 
 新增 GreedyLength 联动测试 r3 为 **1 pass / 0 fail、11.59s**。真实 fresh Prefill 通过原 time-admission，最终采用的 replay 为 transaction1/replay1，其后续 attempt19/alternative1 对新 FullLogits/PlainTextGreedyV1 child 返回 Known；普通后续实际 Decode 仍提交 GreedyToken。独立 F/R/Q、原 numerical scope、输出与清理断言保留，协议测试沿用原宽松规划时限，不是实机或默认 2ms 性能证据。r1 的四次普通采用成功，但目标 child 只出现在 Search，最终绑定断言失败，不能计通过；r2 因新增维护测试访问 calibration 私有方法而编译失败，没有执行测试。两次失败原日志保留。[r1](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r1.log)、[r2](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r2.log)、[r3](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r3.log)
 
