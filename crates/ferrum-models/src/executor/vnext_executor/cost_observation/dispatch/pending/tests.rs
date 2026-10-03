@@ -77,6 +77,7 @@ fn projection(replayed_without_segment: bool) -> FrozenActualProjection {
         kind: ActualWaveKind::Decode,
         product: CostProductOutput::GreedyToken,
         graph_capability: DeviceCostGraphCaptureCapability::Supported,
+        direct_replay_operation: None,
         readback: CoreReadbackRoute::HostSynchronized,
         retries: 0,
         recurrent_state_bytes: 128,
@@ -144,6 +145,172 @@ fn pending_graph_rejection_preserves_only_validated_actual_physical_work() {
         Err(ActualWaveEvidenceUnknown::ProviderPath)
     );
     assert!(projected.physical_evidence.is_none());
+}
+
+#[test]
+fn pending_adaptive_original_commands_keep_physical_proof_without_numeric_shape() {
+    use ferrum_interfaces::vnext::DeviceRuntime;
+
+    let fixture = contract::fixture();
+    fixture
+        .runtime_trace
+        .lock()
+        .unwrap()
+        .cost_direct_replay_projection_enabled = true;
+    let direct_operation = fixture
+        .runtime
+        .cost_direct_graph_replay_operation()
+        .expect("the runtime declares its compact replay operation");
+    let mut original = projection(true);
+    original.direct_replay_operation = DeviceNativeOperationId::new(direct_operation);
+    let before =
+        DeviceCostGraphStreamState::new(DeviceCostGraphConfiguration::OnDemand, 35, 35, 0).unwrap();
+    let after =
+        DeviceCostGraphStreamState::new(DeviceCostGraphConfiguration::OnDemand, 36, 36, 0).unwrap();
+    original.attribution = DeviceSubmissionAttribution::new(
+        ["fixture.native.first", "fixture.native.second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, operation)| {
+                assert_ne!(operation, direct_operation);
+                DeviceNativeWorkAttribution::new(
+                    u32::try_from(index).unwrap(),
+                    Some(0),
+                    DeviceCommandPhase::Compute,
+                    DeviceNativeOperationId::new(operation).unwrap(),
+                    DeviceExecutionPath::Replayed,
+                    DeviceBatchingForm::Packed,
+                    1,
+                    1,
+                    1,
+                    0,
+                    None, // Profile Off does not retain per-command graph node counts.
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap()
+    .with_graph_evidence(
+        DeviceSubmissionGraphEvidence::new(before, after, true, 1, 1, 0, 1, 1).unwrap(),
+    )
+    .unwrap();
+
+    // This is a typed projector regression, not a fabricated CUDA execution.
+    // Both original commands already carry their provider/node/work identities;
+    // neither is the runtime's compact invocation requiring logical expansion.
+    // Freeze the same validated declaration used by the producer. Keep the
+    // separate projection(true) case above as the undeclared negative case.
+    assert!(original.attribution.replayed_segments().is_empty());
+    assert_eq!(original.attribution.commands().len(), 2);
+    let projected = original.project_with_physical_evidence();
+    assert_eq!(projected.shape, Err(ActualWaveEvidenceUnknown::GraphPath));
+    assert_eq!(
+        original.project(),
+        Err(ActualWaveEvidenceUnknown::GraphPath)
+    );
+    let physical = projected
+        .physical_evidence
+        .expect("complete original replay commands retain physical work despite graph rejection");
+    assert_eq!(physical.kind, ActualWaveKind::Decode);
+    assert_eq!(physical.path, ActualWavePath::PlanRuntime);
+    assert_eq!(physical.row_order, ActualWaveRowOrder::Ordered);
+    assert_eq!(
+        (
+            physical.restore_bytes,
+            physical.maintenance_bytes,
+            physical.maintenance_units
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn pending_original_replay_requires_valid_declaration_and_complete_command_body() {
+    let declared = || {
+        let mut value = projection(true);
+        value.direct_replay_operation = DeviceNativeOperationId::new("test.direct");
+        value
+    };
+    assert!(declared()
+        .project_with_physical_evidence()
+        .physical_evidence
+        .is_some());
+    for declaration in [None, Some(""), Some("not a portable operation")] {
+        let mut value = declared();
+        value.direct_replay_operation = declaration.and_then(DeviceNativeOperationId::new);
+        let projected = value.project_with_physical_evidence();
+        assert_eq!(projected.shape, Err(ActualWaveEvidenceUnknown::GraphPath));
+        assert!(projected.physical_evidence.is_none());
+    }
+
+    let replay_command = |index, operation, phase| {
+        DeviceNativeWorkAttribution::new(
+            index,
+            Some(0),
+            phase,
+            DeviceNativeOperationId::new(operation).unwrap(),
+            DeviceExecutionPath::Replayed,
+            DeviceBatchingForm::Packed,
+            1,
+            1,
+            1,
+            0,
+            Some(1),
+        )
+        .unwrap()
+    };
+    let mut compact = declared();
+    compact.attribution = DeviceSubmissionAttribution::new(vec![replay_command(
+        0,
+        "test.direct",
+        DeviceCommandPhase::Compute,
+    )])
+    .unwrap()
+    .with_graph_evidence(compact.attribution.graph_evidence().unwrap())
+    .unwrap();
+    let mut mixed = declared();
+    mixed.attribution = DeviceSubmissionAttribution::new(vec![
+        mixed.attribution.commands()[0].clone(),
+        replay_command(1, "test.direct", DeviceCommandPhase::Compute),
+    ])
+    .unwrap()
+    .with_graph_evidence(mixed.attribution.graph_evidence().unwrap())
+    .unwrap();
+    let mut wrong_phase = declared();
+    wrong_phase.attribution = DeviceSubmissionAttribution::new(vec![replay_command(
+        0,
+        "fixture.native",
+        DeviceCommandPhase::DynamicBinding,
+    )])
+    .unwrap()
+    .with_graph_evidence(wrong_phase.attribution.graph_evidence().unwrap())
+    .unwrap();
+    let mut missing_graph = declared();
+    missing_graph.attribution =
+        DeviceSubmissionAttribution::new(missing_graph.attribution.commands().to_vec()).unwrap();
+    let mut wrong_provider = declared();
+    wrong_provider.providers = Arc::new(ProviderIdentityTable {
+        rows: Box::new([]),
+        retained_bytes: 0,
+    });
+    let mut wrong_row = declared();
+    wrong_row.canonical_rows[0].output = CostRowOutput::Prefill { final_logits: true };
+    let mut unsupported_graph = declared();
+    unsupported_graph.graph_capability = DeviceCostGraphCaptureCapability::Unsupported;
+    for invalid in [
+        compact,
+        mixed,
+        wrong_phase,
+        missing_graph,
+        wrong_provider,
+        wrong_row,
+        unsupported_graph,
+    ] {
+        let projected = invalid.project_with_physical_evidence();
+        assert!(projected.shape.is_err());
+        assert!(projected.physical_evidence.is_none());
+    }
 }
 
 #[test]

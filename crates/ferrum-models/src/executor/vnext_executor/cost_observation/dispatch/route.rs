@@ -114,6 +114,40 @@ pub(super) fn actual_route_components<'a>(
     } else {
         CanonicalWaveCostBuilder::new(retries, product)
     };
+    let replayed = append_actual_commands(&mut canonical, attribution, provider_at, None)?;
+    let graph = super::graph_state(graph_capability, replayed, attribution.graph_evidence());
+    Ok(ObservedRouteComponents { canonical, graph })
+}
+
+/// A separate exact-only reconstruction after the original numerical route
+/// failed. Every compact replay still requires its full sealed logical ledger.
+pub(super) fn actual_physical_route<'a>(
+    attribution: &DeviceSubmissionAttribution,
+    provider_at: impl Fn(u32) -> Option<CostProviderIdentity<'a>>,
+    product: CostProductOutput,
+    retries: u32,
+    direct_operation: ferrum_interfaces::vnext::DeviceNativeOperationId,
+) -> std::result::Result<CanonicalWaveCostBuilder, ActualWaveEvidenceUnknown> {
+    let mut canonical = CanonicalWaveCostBuilder::new_exact(retries, product);
+    append_actual_commands(
+        &mut canonical,
+        attribution,
+        provider_at,
+        Some(direct_operation),
+    )?;
+    Ok(canonical)
+}
+
+fn append_actual_commands<'a>(
+    canonical: &mut CanonicalWaveCostBuilder,
+    attribution: &DeviceSubmissionAttribution,
+    provider_at: impl Fn(u32) -> Option<CostProviderIdentity<'a>>,
+    direct_operation: Option<ferrum_interfaces::vnext::DeviceNativeOperationId>,
+) -> std::result::Result<bool, ActualWaveEvidenceUnknown> {
+    let commands = attribution.commands();
+    if commands.is_empty() || commands.len() > MAX_COST_COMMANDS {
+        return Err(ActualWaveEvidenceUnknown::ProviderPath);
+    }
     let mut replayed = false;
     for command in commands {
         let provider = command
@@ -121,9 +155,15 @@ pub(super) fn actual_route_components<'a>(
             .map(|index| provider_at(index).ok_or(ActualWaveEvidenceUnknown::ProviderPath))
             .transpose()?;
         replayed |= command.execution_path() == DeviceExecutionPath::Replayed;
-        canonical
-            .physical_command(CostPhysicalCommand::from_attribution(command, provider))
-            .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?;
+        let projected = CostPhysicalCommand::from_attribution(command, provider);
+        match direct_operation.filter(|direct| {
+            command.execution_path() == DeviceExecutionPath::Replayed
+                && command.native_op_id() != direct.as_str()
+        }) {
+            Some(direct) => canonical.original_replay_command(projected, direct),
+            None => canonical.physical_command(projected),
+        }
+        .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?;
     }
     for segment in attribution.replayed_segments() {
         canonical
@@ -141,8 +181,7 @@ pub(super) fn actual_route_components<'a>(
                 .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?;
         }
     }
-    let graph = super::graph_state(graph_capability, replayed, attribution.graph_evidence());
-    Ok(ObservedRouteComponents { canonical, graph })
+    Ok(replayed)
 }
 
 #[cfg(test)]

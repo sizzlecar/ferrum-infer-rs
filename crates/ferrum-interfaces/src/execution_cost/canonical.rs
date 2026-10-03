@@ -9,7 +9,7 @@ use super::{
     COST_NUMERIC_FEATURE_SCHEMA_V1, HOST_CONTENT_FEATURE_SCHEMA_V1,
 };
 use crate::vnext::{
-    DeviceCommandPhase, DeviceExecutionPath, DeviceNativeWorkAttribution,
+    DeviceCommandPhase, DeviceExecutionPath, DeviceNativeOperationId, DeviceNativeWorkAttribution,
     DeviceReplayedLogicalCommandAttribution,
 };
 use sha2::{Digest, Sha256};
@@ -219,6 +219,7 @@ pub struct CanonicalWaveCostBuilder {
     logical_commands: usize,
     rows: Vec<ActualRowWork>,
     replayed: bool,
+    physical_only: bool,
     replayed_commands: Vec<(u32, Option<u64>)>,
     segments: usize,
     segment_remaining: usize,
@@ -322,6 +323,7 @@ impl CanonicalWaveCostBuilder {
             logical_commands: 0,
             rows: Vec::new(),
             replayed: false,
+            physical_only: false,
             replayed_commands: Vec::new(),
             segments: 0,
             segment_remaining: 0,
@@ -370,6 +372,39 @@ impl CanonicalWaveCostBuilder {
     pub fn physical_command(
         &mut self,
         command: CostPhysicalCommand<'_>,
+    ) -> Result<(), CanonicalCostError> {
+        self.append_physical_command(command, false)
+    }
+
+    /// An actual adaptive replay may retain every original native command
+    /// instead of one compact invocation. The runtime's declared direct-op
+    /// identity distinguishes these representations; absent segment evidence
+    /// does not. This path validates physical settlement only and permanently
+    /// prevents this builder from producing a numerical shape.
+    pub fn original_replay_command(
+        &mut self,
+        command: CostPhysicalCommand<'_>,
+        direct_operation: DeviceNativeOperationId,
+    ) -> Result<(), CanonicalCostError> {
+        self.guard(|this| {
+            if command.path != CostCommandPath::Replayed
+                || command.native_op_id == direct_operation.as_str()
+                || command.command_phase != DeviceCommandPhase::Compute
+                || command.node_index.is_none()
+                || command.provider.is_none()
+                || this.statistical_enabled
+            {
+                return Err(CanonicalCostError::InvalidRoute);
+            }
+            Ok(())
+        })?;
+        self.append_physical_command(command, true)
+    }
+
+    fn append_physical_command(
+        &mut self,
+        command: CostPhysicalCommand<'_>,
+        original_replay: bool,
     ) -> Result<(), CanonicalCostError> {
         self.guard(|this| {
             if this.commands >= MAX_COST_COMMANDS {
@@ -425,8 +460,12 @@ impl CanonicalWaveCostBuilder {
                     CostCommandPath::Eager => 0,
                     CostCommandPath::Replayed => {
                         this.replayed = true;
-                        this.replayed_commands
-                            .push((command.command_index, command.reusable_graph_node_count));
+                        if original_replay {
+                            this.physical_only = true;
+                        } else {
+                            this.replayed_commands
+                                .push((command.command_index, command.reusable_graph_node_count));
+                        }
                         1
                     }
                 },
@@ -850,6 +889,9 @@ impl CanonicalWaveCostBuilder {
         row_order: ActualWaveRowOrder,
         recurrent_state_bytes: u64,
     ) -> Result<CanonicalWaveCostShape, CanonicalCostError> {
+        if self.physical_only {
+            return Err(CanonicalCostError::InvalidRoute);
+        }
         self.validate_physical_structure(kind)?;
         let raw: [u8; 32] = self.provider.finalize().into();
         let provider_signature = if row_order == ActualWaveRowOrder::Ordered {

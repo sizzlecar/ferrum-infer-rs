@@ -1,6 +1,91 @@
 //! CompleteRequests enters cold capture through a separate one-call gate.
 //! A cost witness is never inferred from this fallback execution.
 use super::*;
+use ferrum_interfaces::execution_cost::{
+    host_history_cost_signature, ActualRowWork, ActualWaveGraphState, ActualWaveKind,
+    ActualWavePath, ActualWaveRowOrder, CanonicalCostError, CanonicalCostRow,
+    CanonicalWaveCostBuilder, CostPhysicalCommand, CostProductOutput, CostRowOutput,
+};
+
+fn captured_original_command_structure(
+    f: &Fixture,
+    actual: &DeviceSubmissionAttribution,
+) -> Result<(), CanonicalCostError> {
+    let direct_operation = f
+        .runtime
+        .cost_direct_graph_replay_operation()
+        .and_then(DeviceNativeOperationId::new)
+        .unwrap();
+    assert!(actual.replayed_segments().is_empty());
+    assert_eq!(actual.graph_evidence().unwrap().replayed_segments(), 1);
+    let mut original_replays = 0;
+    let mut canonical = CanonicalWaveCostBuilder::new_exact(0, CostProductOutput::FullLogits);
+    for command in actual.commands() {
+        if command.execution_path() == DeviceExecutionPath::Replayed {
+            original_replays += 1;
+            assert_ne!(command.native_op_id(), direct_operation.as_str());
+            assert_eq!(command.command_phase(), DeviceCommandPhase::Compute);
+            assert!(command.node_index().is_some());
+            assert_eq!(command.participant_count(), 1);
+            assert_eq!(command.token_count(), 1);
+        }
+        let provider = command
+            .node_index()
+            .map(|index| f.cost_provider_at(index).expect("original bound provider"));
+        let projected = CostPhysicalCommand::from_attribution(command, provider);
+        if command.execution_path() == DeviceExecutionPath::Replayed {
+            canonical.original_replay_command(projected, direct_operation)?;
+        } else {
+            canonical.physical_command(projected)?;
+        }
+    }
+    assert!(
+        original_replays > 0,
+        "the actual cold attempt launched its graph"
+    );
+    // The same readback route was checked by CompleteGuard before submission.
+    canonical.core_readback_route(CoreReadbackRoute::SubmissionStaged)?;
+    let work = span();
+    let range = work.immediate_token_range();
+    // A declared projection row for this one-token, full-output kernel fixture.
+    // There is no sampler/host-settlement authority here and no source8 proof
+    // is minted. The actual commands and provider identities above are retained.
+    canonical.row(CanonicalCostRow {
+        work: ActualRowWork::Prefill {
+            offset: u32::try_from(range.start).unwrap(),
+            count: u32::try_from(
+                range
+                    .end
+                    .checked_sub(range.start)
+                    .expect("ordered admitted token span"),
+            )
+            .unwrap(),
+            total_prompt_tokens: u32::try_from(work.full_input_tokens()).unwrap(),
+        },
+        host_policy_signature: host_history_cost_signature(
+            Sha256::digest(b"cuda-guard-fixture-full-output-projection").into(),
+            0,
+        ),
+        host_features: None,
+        mask_upload_required: false,
+        output: CostRowOutput::Prefill {
+            final_logits: range.end == work.full_input_tokens(),
+        },
+    })?;
+    canonical.validate_physical_structure(ActualWaveKind::Prefill)?;
+    assert_eq!(
+        canonical.finish(
+            ActualWaveKind::Prefill,
+            ActualWavePath::PlanRuntime,
+            ActualWaveGraphState::Warm,
+            ActualWaveRowOrder::Ordered,
+            0,
+        ),
+        Err(CanonicalCostError::InvalidRoute),
+        "physical settlement cannot invent numerical graph eligibility"
+    );
+    Ok(())
+}
 
 struct CompleteGuard {
     reject: bool,
@@ -95,6 +180,7 @@ fn guarded_cuda_cold_complete_rejects_without_preparing_then_retries_and_becomes
 
     // Two real submitted attempts: first warmup, second capture+upload+execute.
     // First retry must still be cold: the rejected attempt did not advance the cache.
+    let mut captured_structure = None;
     for index in 0..2 {
         let (step, wave) = f.prepare();
         let guard = CompleteGuard::new(&f, false);
@@ -114,6 +200,10 @@ fn guarded_cuda_cold_complete_rejects_without_preparing_then_retries_and_becomes
         } else {
             assert_eq!(catalog.programs().len(), 1);
             assert!(catalog.programs()[0].has_resident_segments());
+            captured_structure = Some(captured_original_command_structure(
+                &f,
+                actual.as_ref().unwrap().device(),
+            ));
         }
     }
     let catalog = f.lane.reusable_execution_catalog().unwrap();
@@ -133,6 +223,11 @@ fn guarded_cuda_cold_complete_rejects_without_preparing_then_retries_and_becomes
     warm_graph::finish(&f, handle);
     step.try_retire_normal().unwrap();
     f.close(true);
+    assert_eq!(
+        captured_structure,
+        Some(Ok(())),
+        "actual capture/replay retained complete original commands; it was not a compact invocation"
+    );
 }
 
 #[test]

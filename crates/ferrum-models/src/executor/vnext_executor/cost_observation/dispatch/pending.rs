@@ -1,5 +1,6 @@
 //! Frozen current-wave facts. This type cannot reach a device or live request.
 use super::*;
+use ferrum_interfaces::vnext::DeviceNativeOperationId;
 
 #[cfg(test)]
 mod tests;
@@ -64,6 +65,7 @@ struct FrozenActualProjection {
     kind: ActualWaveKind,
     product: CostProductOutput,
     graph_capability: DeviceCostGraphCaptureCapability,
+    direct_replay_operation: Option<DeviceNativeOperationId>,
     readback: CoreReadbackRoute,
     retries: u32,
     recurrent_state_bytes: u64,
@@ -91,6 +93,51 @@ impl PendingActualWaveProjection for FrozenActualProjection {
 }
 
 impl FrozenActualProjection {
+    fn physical_work(
+        &self,
+        mut canonical: CanonicalWaveCostBuilder,
+    ) -> Option<ActualWavePhysicalEvidenceV1> {
+        self.prepare_canonical_rows(&mut canonical).ok()?;
+        canonical.validate_physical_structure(self.kind).ok()?;
+        Some(ActualWavePhysicalEvidenceV1 {
+            kind: self.kind,
+            path: if self.retries > 0 {
+                ActualWavePath::UnsupportedFallback
+            } else {
+                ActualWavePath::PlanRuntime
+            },
+            row_order: ActualWaveRowOrder::Ordered,
+            restore_bytes: 0,
+            maintenance_bytes: 0,
+            maintenance_units: 0,
+        })
+    }
+
+    fn original_replay_physical_work(
+        &self,
+        attribution: &DeviceSubmissionAttribution,
+    ) -> Option<ActualWavePhysicalEvidenceV1> {
+        let direct = self.direct_replay_operation?;
+        if self.graph_capability != DeviceCostGraphCaptureCapability::Supported
+            || attribution.graph_evidence()?.replayed_segments() == 0
+            || !attribution.commands().iter().any(|command| {
+                command.execution_path() == DeviceExecutionPath::Replayed
+                    && command.native_op_id() != direct.as_str()
+            })
+        {
+            return None;
+        }
+        let canonical = route::actual_physical_route(
+            attribution,
+            |index| self.providers.get(index),
+            self.product,
+            self.retries,
+            direct,
+        )
+        .ok()?;
+        self.physical_work(canonical)
+    }
+
     fn prepare_canonical_rows(
         &self,
         canonical: &mut CanonicalWaveCostBuilder,
@@ -120,10 +167,7 @@ impl FrozenActualProjection {
             .as_ref()
             .and_then(|result| result.as_ref().ok())
             .unwrap_or(&self.attribution);
-        let route::ObservedRouteComponents {
-            mut canonical,
-            graph,
-        } = route::actual_route_components(
+        let parts = route::actual_route_components(
             Some(attribution),
             |index| self.providers.get(index),
             self.graph_capability,
@@ -131,7 +175,24 @@ impl FrozenActualProjection {
             self.retries,
             self.structured_capture && statistics,
             statistics,
-        )?;
+        );
+        let route::ObservedRouteComponents {
+            mut canonical,
+            graph,
+        } = match parts {
+            Ok(parts) => parts,
+            Err(reason) => {
+                // A strict compact-ledger error may also be GraphPath. The
+                // separate physical pass revalidates every compact segment;
+                // it never infers original commands from a missing ledger.
+                return Ok(ActualWaveProjection {
+                    shape: Err(reason),
+                    physical_evidence: (reason == ActualWaveEvidenceUnknown::GraphPath)
+                        .then(|| self.original_replay_physical_work(attribution))
+                        .flatten(),
+                });
+            }
+        };
         let path = if self.retries > 0 {
             ActualWavePath::UnsupportedFallback
         } else {
@@ -143,22 +204,13 @@ impl FrozenActualProjection {
                 // Preserve the original numerical rejection precedence. Only
                 // an otherwise complete actual canonical wave can retain this
                 // separate physical contract; no graph state is invented.
-                let physical_evidence = self
-                    .prepare_canonical_rows(&mut canonical)
-                    .and_then(|()| {
-                        canonical
-                            .validate_physical_structure(self.kind)
-                            .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)
-                    })
-                    .ok()
-                    .map(|()| ActualWavePhysicalEvidenceV1 {
-                        kind: self.kind,
-                        path,
-                        row_order: ActualWaveRowOrder::Ordered,
-                        restore_bytes: 0,
-                        maintenance_bytes: 0,
-                        maintenance_units: 0,
-                    });
+                // Consume/drop the first builder before another bounded pass;
+                // the two command/row projections are never retained together.
+                let physical_evidence = self.physical_work(canonical).or_else(|| {
+                    (reason == ActualWaveEvidenceUnknown::GraphPath)
+                        .then(|| self.original_replay_physical_work(attribution))
+                        .flatten()
+                });
                 return Ok(ActualWaveProjection {
                     shape: Err(reason),
                     physical_evidence,
@@ -359,6 +411,10 @@ pub(in crate::executor::vnext_executor) fn pending_actual_shape<R: DeviceRuntime
             VNextProductOutputMode::GreedyToken => CostProductOutput::GreedyToken,
         },
         graph_capability: executor.runtime.cost_graph_capture_capability(),
+        direct_replay_operation: executor
+            .runtime
+            .cost_direct_graph_replay_operation()
+            .and_then(DeviceNativeOperationId::new),
         readback: core_readback_route,
         retries,
         recurrent_state_bytes,

@@ -45,6 +45,157 @@ fn row(work: ActualRowWork) -> CanonicalCostRow {
         },
     }
 }
+
+fn original_replay_builder() -> CanonicalWaveCostBuilder {
+    let mut builder = CanonicalWaveCostBuilder::new_exact(0, CostProductOutput::FullLogits);
+    for index in 0..2 {
+        let mut original = command(index);
+        original.path = CostCommandPath::Replayed;
+        builder
+            .original_replay_command(
+                original,
+                DeviceNativeOperationId::new("test.direct").unwrap(),
+            )
+            .unwrap();
+    }
+    builder
+        .core_readback_route(CoreReadbackRoute::SubmissionStaged)
+        .unwrap();
+    builder
+        .row(row(ActualRowWork::Decode { kv_tokens: 8 }))
+        .unwrap();
+    builder
+}
+
+#[test]
+fn original_replay_physical_work_never_finishes_as_numerical_evidence() {
+    for finish_kind in 0..4 {
+        let builder = original_replay_builder();
+        assert_eq!(
+            builder.validate_physical_structure(ActualWaveKind::Decode),
+            Ok(())
+        );
+        let result = match finish_kind {
+            0 => builder
+                .finish(
+                    ActualWaveKind::Decode,
+                    ActualWavePath::PlanRuntime,
+                    ActualWaveGraphState::Warm,
+                    ActualWaveRowOrder::Ordered,
+                    0,
+                )
+                .map(|_| ()),
+            1 => builder
+                .finish_with_statistics(
+                    ActualWaveKind::Decode,
+                    ActualWavePath::PlanRuntime,
+                    ActualWaveGraphState::Warm,
+                    ActualWaveRowOrder::Ordered,
+                    0,
+                )
+                .map(|_| ()),
+            2 => builder
+                .finish_with_structure(
+                    ActualWaveKind::Decode,
+                    ActualWavePath::PlanRuntime,
+                    ActualWaveGraphState::Warm,
+                    ActualWaveRowOrder::Ordered,
+                    0,
+                )
+                .map(|_| ()),
+            _ => builder
+                .finish_with_captured_structure(
+                    ActualWaveKind::Decode,
+                    ActualWavePath::PlanRuntime,
+                    ActualWaveGraphState::Warm,
+                    ActualWaveRowOrder::Ordered,
+                    0,
+                )
+                .map(|_| ()),
+        };
+        assert_eq!(result, Err(CanonicalCostError::InvalidRoute));
+    }
+}
+
+#[test]
+fn original_replay_keeps_command_checks_and_compact_expansion_strict() {
+    let direct = DeviceNativeOperationId::new("test.direct").unwrap();
+    let mut original = command(0);
+    original.path = CostCommandPath::Replayed;
+    let mut direct_command = original;
+    direct_command.native_op_id = direct.as_str();
+    let mut wrong_phase = original;
+    wrong_phase.command_phase = DeviceCommandPhase::DynamicBinding;
+    let mut missing_provider = original;
+    missing_provider.provider = None;
+    let mut invalid_provider = original;
+    invalid_provider.provider.as_mut().unwrap().provider_id = "";
+    let mut empty_work = original;
+    empty_work.compute_dispatch_count = 0;
+    empty_work.transfer_command_count = 0;
+    let mut overflow_participants = original;
+    overflow_participants.participant_start = u32::MAX;
+    for invalid in [
+        direct_command,
+        wrong_phase,
+        missing_provider,
+        invalid_provider,
+        empty_work,
+        overflow_participants,
+    ] {
+        let mut builder = CanonicalWaveCostBuilder::new_exact(0, CostProductOutput::FullLogits);
+        assert!(builder.original_replay_command(invalid, direct).is_err());
+        assert!(
+            builder.physical_command(command(1)).is_err(),
+            "failure remains sticky"
+        );
+    }
+
+    let mut mixed = CanonicalWaveCostBuilder::new_exact(0, CostProductOutput::FullLogits);
+    mixed.original_replay_command(original, direct).unwrap();
+    direct_command.command_index = 1;
+    direct_command.reusable_graph_node_count = Some(1);
+    mixed.physical_command(direct_command).unwrap();
+    mixed
+        .row(row(ActualRowWork::Decode { kv_tokens: 8 }))
+        .unwrap();
+    assert_eq!(
+        mixed.validate_physical_structure(ActualWaveKind::Decode),
+        Err(CanonicalCostError::InvalidRoute)
+    );
+    mixed
+        .replay_segment(1, "actual-sealed-executable", 1)
+        .unwrap();
+    mixed
+        .logical_command(CostLogicalCommand {
+            native_op_id: "test.compute",
+            logical_command_ordinal: 0,
+            node_index: 0,
+            provider: original.provider.unwrap(),
+            participant_count: original.participant_count,
+            token_count: original.token_count,
+            batching_form: original.batching_form,
+            compute_dispatch_count: original.compute_dispatch_count,
+            transfer_command_count: original.transfer_command_count,
+            reusable_graph_node_count: 1,
+            statistical_evidence: None,
+        })
+        .unwrap();
+    assert_eq!(
+        mixed.validate_physical_structure(ActualWaveKind::Decode),
+        Ok(())
+    );
+    assert_eq!(
+        mixed.finish(
+            ActualWaveKind::Decode,
+            ActualWavePath::PlanRuntime,
+            ActualWaveGraphState::Warm,
+            ActualWaveRowOrder::Ordered,
+            0
+        ),
+        Err(CanonicalCostError::InvalidRoute)
+    );
+}
 fn finish(
     builder: CanonicalWaveCostBuilder,
     kind: ActualWaveKind,

@@ -671,6 +671,23 @@ impl Fixture {
         self.bucket.is_some()
     }
 
+    pub(super) fn cost_provider_at(
+        &self,
+        node_index: u32,
+    ) -> Option<ferrum_interfaces::execution_cost::CostProviderIdentity<'_>> {
+        self.providers
+            .providers()
+            .get(node_index as usize)
+            .map(|provider| {
+                let descriptor = provider.descriptor();
+                ferrum_interfaces::execution_cost::CostProviderIdentity {
+                    provider_id: descriptor.provider_id().as_str(),
+                    implementation_fingerprint: descriptor.provider_implementation_fingerprint(),
+                    operation_fingerprint: descriptor.operation_fingerprint(),
+                }
+            })
+    }
+
     pub(super) fn prepare(
         &self,
     ) -> (
