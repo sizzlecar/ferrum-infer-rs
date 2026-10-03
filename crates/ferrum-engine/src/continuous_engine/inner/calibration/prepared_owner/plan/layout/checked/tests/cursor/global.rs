@@ -181,14 +181,9 @@ async fn global_cursor_short_and_long_inputs_share_one_final_family_selection() 
     assert_eq!(inputs.templates.len(), 2);
     let geometry_limit = inputs.input_geometry_visit_limit.unwrap();
     let (cases, _, _, _) = prepare_cases(&inputs).unwrap();
-    let initial_readiness_admissions = readiness::initial_inventory_admissions(&cases).unwrap();
-    // These already-ready groups need no execution action. Each still owns a
-    // separate readiness capture and a final complete inventory capture; the
-    // latter must revalidate every fact under its own fresh resource view.
-    let complete_inventory_admissions = initial_readiness_admissions;
-    let expected_admissions = initial_readiness_admissions
-        .checked_add(complete_inventory_admissions)
-        .unwrap();
+    // These already-ready groups need no preparation action. Each initial
+    // complete traversal retains its checked inputs with one real owner group.
+    let expected_admissions = readiness::initial_inventory_admissions(&cases).unwrap();
     let mut cursor = inputs.into_cursor().unwrap();
     let order = cursor.declared_template_order().to_vec();
     let maximum_sources = cursor.maximum_sources();
@@ -538,14 +533,10 @@ async fn global_cursor_late_inventory_exhaustion_never_reserves_a_short_source()
     let mut cursor = inputs.into_cursor().unwrap();
     let first = cursor.declared_template_order()[0];
     let first_cases: Vec<_> = cases.into_iter().filter(|c| c.template == first).collect();
-    let first_readiness_admissions = readiness::initial_inventory_admissions(&first_cases).unwrap();
-    // Fund exactly the first template's readiness and complete captures. The
+    // Fund exactly the first template's uninterrupted complete captures. The
     // second template must fail before admission, after the first template's
     // complete inventory has produced the seed checked below.
-    let first_complete_inventory_admissions = first_readiness_admissions;
-    let first_admissions = first_readiness_admissions
-        .checked_add(first_complete_inventory_admissions)
-        .unwrap();
+    let first_admissions = readiness::initial_inventory_admissions(&first_cases).unwrap();
     let mut budget = ProbeExecutionBudget::new_with_input_projection_limit(
         Instant::now() + Duration::from_millis(settings.cost_probe.maximum_duration_ms.get()),
         settings.cost_probe.maximum_probe_requests,
