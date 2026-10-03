@@ -6,7 +6,56 @@
 
 下一份可运行检查点以同一条产品链路验收：正常 `run` / `serve` 从空成本状态自动完成准备和原独立资格阶段，发布有效成本模型，内容不同但处于支持范围内的普通请求在执行前得到预测，Enforce 实际采用，真实提交与回执配对，输出完整且资源可退役。用户无需手工训练、导入成本文件或设置隐藏环境组合。CPU 正例先约束组合行为，再以同一源码验证真实后端；该检查点通过后才进入完整性能验收，不把它标成最终发布完成。
 
-## G13：最新四入口结果，仍未达到可用检查点
+## 当前收敛计划：先关闭联动缺口，再冻结实机检查点
+
+此前虽有分阶段计划，实际仍过多依赖完整实机运行寻找组合故障。局部选源、维护、发布与调度测试分别通过，没有证明它们在同一真实计划和原预算下共同成立。G15 首版通过 123 项 layout 测试却破坏原普通查询，就是这类验收缺口；后续以原端到端失败和撤回对照定位，不能把补回两个测试当作整条产品链路已经完整。
+
+当前生产代码冻结在 `5ace3e72`。先完成下面的覆盖、预算与联动审查，形成一份同源码的证据清单；现有检查继续，暂不为当前候选启动整轮实机。验收义务来自原目标、声明的模型能力和目标负载，沿用现有 typed 输入、选择账与回执，不新增另一套运行框架。只统计能支持具体行为的证据，不以源码规模、来源数、测试数量或非零 witness 判定完成。
+
+| 关口 | 当前已知状态 | 本关完成条件 |
+| --- | --- | --- |
+| 必要策略与几何覆盖 | G13 CUDA 已证实普通 GreedyLength 策略缺失；对应 rows1 候选 geometry 完整且与原 Configured 候选 U 相同。部分 rows8 候选 geometry 在合并之前耗尽预算，当前 packing 不会补算 | 将必要普通请求的可执行路径对应到原 family、选源、独立 F/R/Q 和最终 catalog；列出未覆盖项及原因，明确 C8 的可行路径和支持边界。C8 不等于要求所有 rows8 或所有声明成为 Known，选择成功也不等于数值资格成功 |
+| 准备、容量与工作预算 | G16 私有 Maintenance 修复有局部 CPU 证明；真实 Metal 仍只有修复前 78/815 cohorts 的失败记录 | 从真实冻结计划核对 seed、维护、restore、F/R/Q 的请求、动作、offer rows、owner 和存活内存；证明原 reservation 可完成相关维护并继续完整收样。120s 的实际耗时仍由后端测量判定 |
+| 数值支持到普通采用 | 原 basic/forward E2E 已恢复；它们的普通请求是 Configured/FullLogits，未直接验证本次新增 GreedyLength 支持 | 新保留的策略必须由原 catalog 查询成功并产生普通执行 witness；私有维护必须与真实计划、完整 F/R/Q、发布和后续采用连成一条测试路径。保留原断言、数值解释和所有预算 |
+| 默认规划时间 | 普通逻辑 E2E 使用宽松测试时限；当前优化构建的两个原 2ms 探针另已通过 | 实机再核普通事务的预算、合法选择、实际提交与配对，解释预算耗尽；两个受控 CPU 场景不证明真实模型或并发负载可行 |
+| 正常入口和资源生命周期 | 旧硬件记录跨不同源码，部分 run 输出被 token 上限截断 | 同一冻结源码在两后端的 run/serve 完成必要自动准备、普通采用、完整输出及清理；取消、过期、漂移、能力降级等原义务各自有适用证据 |
+| SLO 与收益 | CUDA TPOT、Metal 三项 P99 仍失败，无当前同构建 Off 配对 | 固定原选样和配置，先验证同构建 Off/Enforce 的绝对 SLO、自身吞吐和延迟退化门，再完成原 224 单元及原功能场景；全过程保留错误和未完成请求 |
+
+推进顺序如下，下面各关的详细合同继续有效：
+
+1. **完整负载前的可行性与联动验证。** 复用 `CheckedCaseInventory`、`CheckedSelection`、`source_work.rs`、现有 native/普通 E2E 和原日志，集中处理上述已知缺口。优先补齐“新保留策略实际采用”和“维护处于原冻结工作预算内的完整收样”两处联动证明。所需工作超出原容量或覆盖仍无解释时，当前候选留在本关；先给出能改变该结论的机制及工作量依据。历史 artifact 没有完整保存 geometry axes，manifest 和 hash 不能冒充可重放输入；若缺少必要原输入，只进行取得该证据的有限后端诊断，保留原预算，再判断是否适合进入完整负载。
+2. **冻结完整功能检查点。** 必要 CPU 联动、优化构建 2ms 探针和规定检查通过后，再绑定同一源码及配置开展后端验证。每个作业预先列明假设、输入、通过条件和失败分类，首先检查启动及普通窗口证据；前置条件不成立时不扩展整轮负载。实机失败先归入已有覆盖、资源、数值、时间或后端语义合同，取得足以否定具体假设的最小证据，再决定是否改动及重测范围。
+3. **性能收敛与完整交付。** 功能检查点成立后做配对性能和正式矩阵。性能失败按真实阶段耗时与执行热点归因；若必须修改共享执行或调度，按影响范围重过功能门并重新冻结。224 单元、原额外功能场景和发布准备全部保留；正式发布或合并仍需对应授权。
+
+近期联动验证直接复用现有 `plan_e2e.rs`、`source_preparation.rs` 和生产 cursor：新增策略使用原 catalog 查询及实际 witness 对账，绑定采用模型的 capture identity；维护场景使用真实冻结 reservation，保持原工作额度，不沿用局部反例额外加入的 `setup.actions()+1` 作为整体成功条件。联合资源账复用 `work::case_work/setup_for_indices`、`budget::plan_groups`、`packing_valid` 和现有 memory 计费，分别核对请求、projection、执行 action、offer rows、geometry、owner 与共存内存。总额度有余额不代表当前选中 source 仍有执行信用。
+
+若必要路径的工作量或共存资源已证明超过原上限、必要 geometry 在原 32M 内无已证明的完整执行办法，或修复无进展循环后必要准备仍超过真实 120s，则判定当前执行安排未通过可行性关，提出机制及代价明确的设计修订。不能用放宽资格、删必要支持或新增预算结束本关，也不把当前安排失败夸大成所有架构都不可能。
+
+预算核算与实测结论分别报告。离线账能否定请求、动作、geometry、owner 或内存容量上的不可行候选；历史吞吐只能用于估计准备时长，不能证明新计划满足 120s。一次回归的修复也不能关闭其他已知缺口。每次汇报给出当前关口、已关闭义务、仍缺证据以及下一项能改变结论的检查；出现原方案不可行的证据时明确修订机制和代价，不以继续重复完整运行替代判断。
+
+## G15/G16：已修复端到端回归，完整检查进行中
+
+当前实现检查点为 `5ace3e729ba54a92baefb9357f3c2ecefdff551c`，本地规定检查已完成，仍处于上面的联合可行性关。上一份 `f22e70b5695dff7ba0cb6c0deffe263d5b47a3e6` 包含 G15（`12192140`）及 G16 私有维护循环修复；其 G15 回归及失败证据继续保留。
+
+G15 在原来源上限和请求、动作、inference rows 三项容量内，尝试让同产品的不同 host family 共用一份 Source8 journal。首版为此构建共同 U，虽然保留了 host categorical、EOS/length 语义、全部代表和各 family 的独立 F/R/Q，完整验证仍发现它改变原数值解释后导致选择冲突，不能作为可用修复。覆盖增益规则仍保留：完整重算必须保留原可安排覆盖、且实际新增至少一个原未安排候选；只减少 journal 数而未新增覆盖则保持原来源，geometry 不完整的候选不能借此成为完整覆盖。
+
+G16 为私有 prefix acquisition 接入与正常 cohort driver 相同的 Maintenance turn：在原 deadline 内消费原 one-use 维护票据，然后重新捕获 frontier。首次零提交 Wave 和每个后续 Wave 仍扣费；Maintenance 沿原合同不计 inference offer 或 native-copy action，没有退款或扩预算。CPU 反例使用明确的 `setup.actions()+1` 有限额度承担一次真实零提交重试，并验证少一个动作仍拒绝 capture、owner/lease 可清理；这不证明实机冻结计划已有足够重试余量。
+
+G15 有效 before 为 **0 pass / 1 fail、0.05s**，命中 selector 未安排完整 family；前两轮分别是 Prefill 超物理域和 seed 包含不支持的 Prefill，均保留为 fixture 失败，不算产品反例。修复后 focused 为 **1/0**，最新 layout 组为 **123/0、7.50s**。G16 有效 before 为 **0/1、3.24s**，原 reservation 耗尽且 maintenance_calls 为 0；修复后 prefix acquisition 组为 **5/0、3.38s**。严格未观测轴数值回归另为 **1/0**。这些结果不累加成全仓计数。[G15 before](/private/tmp/ferrum-slo-recovery-20261002/g15-cross-policy-before-r3.log)、[layout 回归](/private/tmp/ferrum-slo-recovery-20261002/g15-layout-tests-r2.log)、[G16 before](/private/tmp/ferrum-slo-recovery-20261002/g16-prefix-maintenance-before-r2.log)、[prefix 回归](/private/tmp/ferrum-slo-recovery-20261002/g16-prefix-maintenance-after-suite.log)、[数值回归](/private/tmp/ferrum-slo-recovery-20261002/g15-unobserved-axis-test.log)。
+
+`f22e70b5` 的 fmt check 与 workspace check 均退出 0（后者 40.90s）；workspace test 已退出 **101**，engine 为 **1539 pass / 2 fail / 6 ignored**，全仓中途停止，不报告完整全仓计数。basic `plan_e2e` 的原普通 rows2 / FullLogits / Decode step2 查询返回 `QualificationCoverage`；forward 用例在原 witness 计数处得到 0 而非 1，其 Required journal 记录 rows1 / FullLogits 查询同样缺少资格覆盖，不能把两处失败都写成 step2 断言。[全仓失败日志](/private/tmp/ferrum-slo-recovery-20261002/g15-g16-workspace-tests.log)。
+
+同一 basic E2E 单独复跑仍失败（11.51s）。在保留 G16 的情况下临时撤回六个 G15 文件，原断言通过（9.86s，带完整日志复跑为 9.70s）；随后六文件均恢复，未把临时对照当作候选提交。失败路径新增的有界诊断使用同一个不可变快照和原 query 时刻：新 U child 的 F/R/Q 成员数为 40/16/16，直接预测可用；旧 raw child 为 36/8/8，直接预测返回 `QualificationCoverage`。两者没有 phase support membership 判别，原 catalog 优先选中 raw child，故可用 U 被遮蔽。该对照把回归定位到 G15 改变原数值解释，不支持修改资格门或在预测失败后换模型重试。[撤回对照](/private/tmp/ferrum-slo-recovery-20261002/g16-plan-e2e-without-g15.log)、[同快照 child 诊断](/private/tmp/ferrum-slo-recovery-20261002/g16-plan-e2e-child-diagnostic.log)。
+
+当前 `5ace3e72` 修正只共享 journal，保留原解释：raw 与 raw 合并后仍为 raw；原 U 完全相同才保留该 U 合并；raw/U 混合或不同 U 拒绝新合并。独立 owner、原代表、F/R/Q、关联 recipe 闭合、geometry、原来源覆盖和三项工作预算继续检查，catalog 及原 E2E 断言不变。真实 G13 CUDA 的目标 Configured 和 GreedyLength 候选原本具有相同 U，因此此约束仍针对已发现的实机 host-policy 缺口；是否能通过真实执行仍待验证。[实际候选 scope 审计](/private/tmp/ferrum-slo-recovery-20261002/g16-g13-cuda-equal-universe-audit.json)
+
+修正后原两项失败 E2E 已通过：**2 pass / 0 fail、22.46s**，包含普通查询预测、实际 controller witness 和非终态后续波；同一命令中的默认 2ms 探针为 ignored，不计通过。选源 layout 组为 **124/0、17.04s**，prefix acquisition 组为 **5/0、3.82s**，fmt check 为 0。完整 workspace check 退出 0（37.03s），workspace test 退出 0：229 个顶层 Rust harness 去除 17 条子进程重复汇总后为 **7878 pass / 0 fail / 109 ignored**；另有 16 项 Criterion smoke 通过，不作性能结论。engine 为 1542/0/6 ignored、79.62s。当前优化构建默认 2ms 探针另已通过，结果见下文；`f22e70b5` 的旧硬件包保持停用。[原 E2E 修正后](/private/tmp/ferrum-slo-recovery-20261002/g16-preserved-scope-e2e-r2.log)、[layout](/private/tmp/ferrum-slo-recovery-20261002/g16-preserved-scope-layout.log)、[prefix](/private/tmp/ferrum-slo-recovery-20261002/g16-preserved-scope-prefix.log)、[全仓去重审计](/private/tmp/ferrum-slo-recovery-20261002/g16-preserved-scope-workspace-audit.json)。首轮命令漏设已有共享 Cargo target，依赖编译被主动中止（exit130），未运行测试，不作为行为证据。
+
+当前源码的 release 默认 2ms 探针已退出 0：**2 pass / 0 fail / 0 ignored、1.06s**。basic 有 1 次实际 decision/submitted/reconciled，规划耗时 199,500ns；forward 为 4 次，规划耗时总和 958,917ns，规划波总数 7、其中 tail 3。总和不是单次或 P99 统计，这些只证明受控 CPU 场景在原预算内得到实际采用，不能代替真实后端。[优化构建 2ms 探针](/private/tmp/ferrum-slo-recovery-20261002/g16-preserved-scope-release-2ms.log)
+
+Clippy（`-A warnings`）退出 0、41.32s；Metal 全目标编译退出 0、34.95s。当前源码的 pinned CUDA 编译和双后端正常入口实机验证仍待完成；本地编译不能充当后端运行证据。下方 G13/G14 实机结果不含 G15/G16 修复，不能作为其 after 证据。必要 host-policy、宽度支持和 SLO 尚未闭环，正式验收仍为 **0/224**。
+
+## G13：最近完成的四入口实机结果，仍未达到可用检查点
 
 2026 年 10 月 3 日，冻结候选 `1ad2642e` 的 Metal/CUDA 正常 `run`、`serve` 均已结束，guard/product 退出码为 0，**但普通请求预测采用、必要覆盖和 SLO 尚未闭环，正式验收仍为 0/224**。本轮包含 G12 重复 gaps 计费修正和 G13 完整关联轨迹声明修正；旧失败没有删除。
 
@@ -19,7 +68,13 @@
 | Metal `run` | 完成 287/448 cohorts、两份来源、epoch2 | source2 在原 120s 时限停止，尚有请求与动作额度；reference probe 另耗约 62s，整个 bootstrap 约 182s。512-token 输出仍截断，未取得普通请求独立采用分母 |
 | Metal `serve` | composition 获授权：32,943,962 B ≤ 34,195,039 B；约 21.69s 后停于 78/815 cohorts、首份 Prefill 来源 | source1 的 15 个 key 已 ACK，尚未进入收样即停止；具体拒绝未记录，不能称超时。普通窗口 witness 为 164/119/119，但三项延迟 P99 均失败 |
 
-来源数和 cohort 数只描述当前计划，既不是覆盖率，也不是新增的 4/4 硬门。CUDA `run` 的累计 1069 issued、1037 paired 含启动和私有请求，不能写成普通采用。CUDA `serve` 的普通窗口确有 2833 次实际提交与结算，但预测 witness 为零；同期 planner phase 耗尽 1933 次、hard budget 耗尽 368 次，与 437 次查询不是同一分母。G10 相同选样窗口曾有 25/21/21 witness，本轮零采用不能被启动完成、后续模型发布或 retrospective Known902 掩盖。WrongDomain 聚合了 query 构造、catalog selection 和 child prediction，当前没有原 query 身份，尚不能确定具体失败层或 host/algorithm 字段。
+来源数和 cohort 数只描述当前计划，既不是覆盖率，也不是新增的 4/4 硬门。CUDA `run` 的累计 1069 issued、1037 paired 含启动和私有请求，不能写成普通采用。CUDA `serve` 的普通窗口确有 2833 次实际提交与结算，但预测 witness 为零；同期 planner phase 耗尽 1933 次、hard budget 耗尽 368 次，与 437 次查询不是同一分母。G10 相同选样窗口曾有 25/21/21 witness，本轮零采用不能被启动完成、后续模型发布或 retrospective Known902 掩盖。原正常运行的 WrongDomain 聚合缺少 query 身份，437 次仍不能逐次归因；后续独立 Required 诊断已确定一项必要 host-policy 覆盖缺口。
+
+同一 `1ad2642e` 产品开启 `StructuredRequiredV1` 的 CUDA 诊断已结束，guard/server/client 均为 0，原服务恢复且健康。health-before 的事务数为 0，health-after 为 3158，故保留的事务属于 32 warmup + 32 measured 普通请求窗口；168974 个事件、3158 个完整事务无丢失，原 Rust audit 为 0 issues。377 个 query 均构造成功，其中 369 次 lookup 全在 epoch4 返回 WrongDomain、Known 为 0。**这 369 次是开启 observer 后的独立轨迹，不能替代或逐次解释原正常运行的 437 次，也不作为性能成绩。** 原工具的 `successful_close_attested=false` 保留，成功关闭另由退出与恢复回执佐证。[诊断状态](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-required-query-status.json)
+
+这 369 次查询的实际 host policy 均为 `PlainTextGreedyV1`，epoch4 的两个数值 decode child 却均为 `PlainTextInstalledV2`、`model_eos=true/user_stop=false`，没有相同 host-policy family。事务 1239 的 rows=1、原 owner algorithm 与已安装 Greedy child 相同，仍因成本不可用结束；总规划 1,832,318ns，planner/hard exhausted 均为 false。因此该反例不能归咎于 2ms 耗尽或算法集合完全缺失。缺少同策略 child 足以使 catalog selection 无法选中适用模型，但不证明补齐后算法、数值支持和采用必然成功。epoch5 后有 372 个 snapshot，却无 query 构造或 lookup，不能据此判断新增 child 的覆盖；更晚的 `MissingProducer` 也不能解释前面的 epoch4 失败。[原 query 身份审计](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-required-query-identity-audit.json)
+
+原正常 serve 的完整冻结声明进一步确认：GreedyLength 已生成 1996 个 case、64 个 population、32 个候选来源，选入数为 0。50 个 Configured 候选排序在前，首四份来源先占满原 `maximum_sources=4`。真正匹配该 query host policy 的 rows1 批次为 **52/53**（chat SSE、`include_usage=true`）；两者 geometry 完整，各需 107 请求、368 动作、253 inference rows、99 cohorts，仅被来源保留容量拒绝。rows8 的对应批次 **79/81** 还存在 geometry work 耗尽，不能把单行候选塞入计划就宣称覆盖 C8。正常与 Required 两轮的首四来源及 52/53 账目一致，但完整 inventory 并非逐项相同。该证据定位了选源缺口，并未证明简单改优先级或追加来源能保留全部原义务、通过原预算。[策略与选源审计](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-required-policy-selection-audit.json)
 
 两端仍为原 pinned ShareGPT、固定 C8、32 warmup + 32 measured、1 次重复，64 请求均成功、错误为 0。CUDA 完整包已核：主 TPOT 终点为最后可见输出，ITL 为相邻非空可见 SSE 文本事件间隔。
 
@@ -29,11 +84,15 @@
 
 CUDA measured 为 9210 usage tokens、9179 可见文本事件、9147 间隔；两条 event/usage 不一致请求仍计入可见停顿，无传输合并。Runtime memory 为 833 个样本、NVML 为 844 个样本，覆盖启动至退出；不同口径不相加，WSL per-process NVML 不可用。原服务已恢复为 PID699052，10:10:45 UTC 独立健康检查为 ok，这是该作业结束时的历史状态。Metal 完整归档已核：TTFT/TPOT/可见 ITL P99 为 4849.539/233.788/868.979ms，输出 37.014 tokens/s，原 3400/212/359ms 阈值均失败，joint 3/32。终态 Metal allocation 峰值 8,600,748,032 B（2116 样本、0 错误），独立 host 采样峰值 RSS 533,659,648 B、physical footprint 2,445,871,672 B；口径不相加，采样可能漏过瞬时峰值。单次重复不能建立性能收益或正式主表结论。
 
-**下一步先用既有诊断取得普通失败 query 的原身份、对应 epoch 和失败阶段**，再判定覆盖、查询或预算中的具体阻断；不能只从已安装 child 反推必要域已覆盖。Metal 收样前停止也需原拒绝证据，不能猜成超时后直接扩预算。原独立 F/R/Q、2ms、120s/2048/16384 和完整输出要求不变；当前不启动 224 单元正式矩阵。
+G14 Metal 错误诊断候选 `a08a3257` 已结束，guard、aggregate、server、client 四项退出码均为 0，但 startup 仍在约 21.85s 后停于 **78/815 cohorts、首份来源、epoch1**。source1 在 15 个 private key ACK 后，255-token seed、boundary254、offset0 处累计 2550 次 Blocked，最后一次为 `MaintenanceUnavailable`；随后 `actual_attempts_remaining=selection_attempts_remaining=13647`，原扣费返回 `native action has no original selected reservation`。2550 不是同一种 reason 的计数，也不能回填成 G13 的精确轨迹。该 Wave 分支在检测到待处理 maintenance ticket 时、创建 2ms controller budget 前返回；当时私有 acquisition loop 只重试 Wave，没有正常 driver 的 Maintenance turn，且没有后台执行循环。具体 ticket 的建立事件及底层容量种类仍未确定；上方 G16 CPU 反例只验证这个维护生命周期缺口。[错误证据审计](/private/tmp/ferrum-slo-recovery-20261002/g14-metal-preparation-error-audit.json)
+
+G14 普通 health 窗口涵盖 32 warmup + 32 measured，64 请求成功、错误为 0，witness decision/submitted/reconciled 为 **180/133/133**。measured 32 条输出检查通过；原固定 C8、1 次重复下，TTFT/TPOT/可见 SSE ITL P99 为 **4840.607/212.830/877.658ms**，仍分别超过原 **3400/212/359ms** 阈值，joint 为 3/32，输出 37.146 tokens/s。usage tokens 9210、可见事件 9179、间隔 9147；两条 event/usage 不一致仍纳入可见停顿。完整 runtime 归档已核对配置、14 项 input pins 和原进程身份，并与 `a08a3257` 的 3353 文件源码及实际 Cargo 产物回执对应，产品 SHA 为 `408b7c54…6977f`。Apple M4 的 Metal allocation 峰值为 **8,598,831,104 B**，2114 个样本覆盖权重加载前至 shutdown，终态 complete、0 错误；host 2128 个样本的峰值 RSS 为 **540,049,408 B**、physical footprint 为 **2,401,257,920 B**，同一 PID 与 birth、0 错误，末样本距进程结束 371.122ms，但 host sampler 没有显式 complete 标志。各口径不相加，采样可能漏过瞬时峰值。automatic-reuse cache payload 未完整取回、未重放，不能宣称 warm restart catalog 有效；这些 G14 结果也不是 G15/G16 修复后的硬件证据。[终态摘要](/private/tmp/ferrum-slo-recovery-20261002/g14-metal-serve-summary-runtime-audit.json)、[runtime 与内存审计](/private/tmp/ferrum-slo-recovery-20261002/g14-metal-serve-runtime-audit.json)
+
+**下一步先完成当前候选的规定检查，再验证原预算内必要 host-policy、宽度覆盖及私有维护的真实后端闭环。** G15/G16 的局部通过不能代替正常 `run` / `serve` 的独立资格、普通 query Known、实际采用和完整输出；不能混合策略、丢弃原覆盖义务、增来源槽或把单行资格当作 C8 支持。原独立 F/R/Q、2ms、120s/2048/16384 和完整输出要求不变；当前不启动 224 单元正式矩阵。
 
 外部审计：[CPU 全仓计数](/private/tmp/ferrum-slo-recovery-20261002/g13-workspace-test-audit.json)、[CUDA run 运行](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-runtime-audit.json)与[覆盖边界](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-coverage-audit.json)、[CUDA serve 完整结果](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-serve-runtime-audit.json)、[Metal run](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-run-results.json)、[Metal serve 摘要](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-serve-summary-audit.json)与[完整归档](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-serve-full-audit.json)。两端构建身份另见 `g13-metal-build-audit.json`、`g13-cuda-build-and-runtime-audit.json`。
 
-下一次 Metal 诊断只补失败证据：已有 epoch 时，启动末尾仍记录原 `last_error`、来源位置和实际/预约余额；seed prefill 的动作计费失败时，记录该 seed 已遇到的 Blocked 次数及最后 typed reason。保持原扣费、重试、资格和返回值，既不退款，也不把未提交的尝试排除出 offered 上限。G13 静态账已包含 seed prefill、capture 和 restore；尚不能把余额耗尽直接归因于某一种 Blocked。该日志改动不是预算修复，尚未取得新的 Metal 实机结论。
+G14 仅新增失败证据：已有 epoch 时仍记录原 `last_error`、来源位置和实际/预约余额，seed 动作扣费失败时记录 Blocked 总数及最后 typed reason。原返回值、扣费和资格未改；它与尚待实机验证的 G16 维护修复是不同源码。G13 静态账已包含 seed prefill、capture 和 restore，但不能把 2550 次阻塞都认定为同一种原因。
 
 ## G10：同一候选的四入口实机结果（历史）
 
