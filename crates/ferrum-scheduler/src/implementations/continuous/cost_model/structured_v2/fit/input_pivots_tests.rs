@@ -86,3 +86,6 @@ fn cold_input_pivots_keep_original_tie_order_and_nonrefundable_work_and_scratch_
 
 #[path = "input_pivots_tests/capture_replay.rs"]
 mod capture_replay;
+
+#[path = "input_pivots_tests/first_pass.rs"]
+mod first_pass;

@@ -57,6 +57,114 @@ struct NormalizedBody<'a> {
     matrix: &'a Matrix,
     bits: Vec<Vec<u64>>,
 }
+
+#[derive(Serialize)]
+pub(super) struct CandidateCall {
+    ordinal: usize,
+    visits_before: u64,
+    visits_after: u64,
+    work_visits: u64,
+    rank: usize,
+    anchor_rank: usize,
+    pivot_indices: Vec<usize>,
+    final_selected_cases: Vec<usize>,
+}
+
+#[derive(Serialize)]
+pub(super) struct CandidateMeasurement {
+    maximum_visits: u64,
+    used_visits: u64,
+    exhausted: bool,
+    all_results_match_complete_original_reference: bool,
+    original_per_call_scratch_limits_preserved: bool,
+    calls: Vec<CandidateCall>,
+}
+
+/// Exercise the actual candidate API once, in original order, against one
+/// original allowance. The independent original kernel supplies every result;
+/// the original exhausted run is neither restarted nor treated as a reference
+/// for previously uncomputed numerical geometry.
+pub(super) fn evaluate_candidate(
+    verified: &Verified,
+    reference: &Measurement<'_>,
+) -> AuditResult<CandidateMeasurement> {
+    ensure!(
+        reference.failed_calls == 0 && reference.calls.len() == verified.calls.len(),
+        "candidate comparison requires complete independent original references"
+    );
+    let mut work = StructuredInputGeometryWorkV1::new(
+        NonZeroU64::new(verified.limit).context("zero original allowance")?,
+    );
+    let mut calls = Vec::new();
+    for (call, expected) in verified.calls.iter().zip(&reference.calls) {
+        let matrix = &call.matrix;
+        let decoded: Vec<Vec<f64>> = matrix
+            .axis_bits
+            .iter()
+            .map(|row| row.iter().map(|&bits| f64::from_bits(bits)).collect())
+            .collect();
+        let rows: Vec<_> = decoded.iter().map(Vec::as_slice).collect();
+        let before = work.visits();
+        let geometry = input_geometry_pivots_v1(
+            &rows,
+            &matrix.mandatory_anchors,
+            &matrix.settings,
+            &mut work,
+            matrix.maximum_scratch_bytes,
+        )
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "candidate ordinal {} failed {reason:?}; visits={} exhausted={}",
+                matrix.ordinal,
+                work.visits(),
+                work.exhausted()
+            )
+        })?;
+        ensure!(
+            Some(geometry.rank) == expected.rank
+                && Some(geometry.anchor_rank) == expected.anchor_rank
+                && geometry.pivot_indices == expected.pivot_indices,
+            "candidate numerical result differs at {}",
+            matrix.ordinal
+        );
+        let mut selected: Vec<_> = matrix
+            .mandatory_anchors
+            .iter()
+            .map(|&index| matrix.cases[index])
+            .collect();
+        for &pivot in &geometry.pivot_indices[geometry.anchor_rank..] {
+            let original = matrix.cases[pivot];
+            if !selected.contains(&original) {
+                selected.push(original);
+            }
+        }
+        selected.sort_unstable();
+        ensure!(
+            selected == expected.final_selected_cases
+                && geometry.work_visits == work.visits() - before,
+            "candidate mapping or work differs at {}",
+            matrix.ordinal
+        );
+        calls.push(CandidateCall {
+            ordinal: matrix.ordinal,
+            visits_before: before,
+            visits_after: work.visits(),
+            work_visits: geometry.work_visits,
+            rank: geometry.rank,
+            anchor_rank: geometry.anchor_rank,
+            pivot_indices: geometry.pivot_indices,
+            final_selected_cases: selected,
+        });
+    }
+    Ok(CandidateMeasurement {
+        maximum_visits: work.maximum_visits(),
+        used_visits: work.visits(),
+        exhausted: work.exhausted(),
+        all_results_match_complete_original_reference: true,
+        original_per_call_scratch_limits_preserved: true,
+        calls,
+    })
+}
 fn normalized_signature(bits: &[Vec<u64>], matrix: &Matrix) -> AuditResult<[u8; 32]> {
     let mut h = Sha256::new();
     h.update(b"cold-input-original-normalized-bits-v1\0");
@@ -100,7 +208,7 @@ pub(super) fn measure(verified: &Verified) -> AuditResult<Measurement<'_>> {
             .collect();
         let rows: Vec<_> = decoded.iter().map(Vec::as_slice).collect();
         let mut work = StructuredInputGeometryWorkV1::new(NonZeroU64::new(u64::MAX).unwrap());
-        let result = input_geometry_pivots_v1(
+        let result = input_geometry_pivots_original_v1(
             &rows,
             &matrix.mandatory_anchors,
             &matrix.settings,

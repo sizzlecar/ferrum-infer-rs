@@ -2,6 +2,8 @@
 use super::*;
 use std::num::NonZeroU64;
 
+mod first_pass;
+
 /// One nonrefundable allowance shared by all cold selection scans.
 pub struct StructuredInputGeometryWorkV1 {
     work: GeometryWork,
@@ -77,6 +79,39 @@ pub fn input_geometry_pivots_v1(
     work: &mut StructuredInputGeometryWorkV1,
     maximum_scratch_bytes: usize,
 ) -> Result<StructuredInputPivotsV1> {
+    input_geometry_pivots_with_first_pass::<true>(
+        rows,
+        anchor_indices,
+        settings,
+        work,
+        maximum_scratch_bytes,
+    )
+}
+
+#[cfg(test)]
+fn input_geometry_pivots_original_v1(
+    rows: &[&[f64]],
+    anchor_indices: &[usize],
+    settings: &StructuredSettingsV2,
+    work: &mut StructuredInputGeometryWorkV1,
+    maximum_scratch_bytes: usize,
+) -> Result<StructuredInputPivotsV1> {
+    input_geometry_pivots_with_first_pass::<false>(
+        rows,
+        anchor_indices,
+        settings,
+        work,
+        maximum_scratch_bytes,
+    )
+}
+
+fn input_geometry_pivots_with_first_pass<const RETAIN_FIRST_PASS: bool>(
+    rows: &[&[f64]],
+    anchor_indices: &[usize],
+    settings: &StructuredSettingsV2,
+    work: &mut StructuredInputGeometryWorkV1,
+    maximum_scratch_bytes: usize,
+) -> Result<StructuredInputPivotsV1> {
     settings.validate()?;
     if work.exhausted() {
         return Err(StructuredUnknown::Capacity);
@@ -116,29 +151,32 @@ pub fn input_geometry_pivots_v1(
         .iter()
         .map(|basis| FitRow { basis, wall_ns: 0 })
         .collect();
-    let geometry = input_geometry_core(
-        &borrowed,
-        settings,
-        Some(&mut work.work),
-        false,
-        anchor_indices,
-    )?;
-    let rank = geometry.basis.len();
-    if geometry
+    let pivot_indices = if RETAIN_FIRST_PASS {
+        first_pass::input_geometry_first_pass(&borrowed, settings, &mut work.work, anchor_indices)?
+    } else {
+        input_geometry_core(
+            &borrowed,
+            settings,
+            Some(&mut work.work),
+            false,
+            anchor_indices,
+        )?
         .pivot_indices
+    };
+    let rank = pivot_indices.len();
+    if pivot_indices
         .iter()
         .enumerate()
-        .any(|(position, index)| geometry.pivot_indices[..position].contains(index))
+        .any(|(position, index)| pivot_indices[..position].contains(index))
     {
         return Err(StructuredUnknown::IllConditioned);
     }
-    let anchor_rank = geometry
-        .pivot_indices
+    let anchor_rank = pivot_indices
         .iter()
         .take_while(|&&index| anchor_indices.binary_search(&index).is_ok())
         .count();
     Ok(StructuredInputPivotsV1 {
-        pivot_indices: geometry.pivot_indices,
+        pivot_indices,
         rank,
         anchor_rank,
         work_visits: work.visits() - before,

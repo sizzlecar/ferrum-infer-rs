@@ -76,7 +76,7 @@ fn fixture_using(limit: u64, settings: StructuredSettingsV2) -> Vec<Value> {
         records.push(json!({"kind":"original_matrix", "ordinal":ordinal, "cases":[0,1,2], "axis_bits":bits, "mandatory_anchors":[0], "settings":settings,
             "visits_before":work.visits(), "maximum_visits":limit, "exhausted_before":work.exhausted(), "maximum_scratch_bytes":scratch}));
         let before = work.visits();
-        let outcome = input_geometry_pivots_v1(&rows, &[0], &settings, &mut work, scratch);
+        let outcome = input_geometry_pivots_original_v1(&rows, &[0], &settings, &mut work, scratch);
         let mut selected = vec![0];
         let (rank, gap) = match outcome {
             Ok(pivots) => {

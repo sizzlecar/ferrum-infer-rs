@@ -386,7 +386,7 @@ fn replay_call(
         .map(|&i| matrix.cases[i])
         .collect();
     let original_count = selected.len();
-    let geometry = input_geometry_pivots_v1(
+    let geometry = input_geometry_pivots_original_v1(
         &rows,
         &matrix.mandatory_anchors,
         &matrix.settings,
@@ -678,6 +678,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
     // Independent diagnostic references follow the unchanged shared-ledger
     // proof. They never mutate or replace its allowance or outcomes.
     let reference = reference::measure(&verified)?;
+    let candidate = reference::evaluate_candidate(&verified, &reference)?;
     let output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -692,6 +693,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
         capture_elapsed_ns_diagnostic_only: u128,
         audit: Statistics<'a>,
         independent_reference: reference::Measurement<'a>,
+        candidate: reference::CandidateMeasurement,
     }
     serde_json::to_writer_pretty(
         output,
@@ -704,6 +706,7 @@ fn original_geometry_capture_replays_shared_budget_and_reports_structure() -> Au
             capture_elapsed_ns_diagnostic_only: report.elapsed_ns,
             audit: stats,
             independent_reference: reference,
+            candidate,
         },
     )?;
     Ok(())
