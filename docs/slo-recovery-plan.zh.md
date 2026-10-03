@@ -55,7 +55,7 @@ G18 CUDA 实际采集已结束：上述同一源码的 release CLI 测试 **1 pa
 
 G17 首轮全仓在原 interfaces 用例停止：engine 为 **1544/0/6 ignored、107.33s**，两项新联动和原 E2E 均通过；已完成区间去除子进程重复后为 **4259/1/68 ignored**，不能称完整全仓。失败是 `ready_checkpoint_survives_retired_producer_with_native_restore_and_ack` 要求立即 Known，却收到 `ReadUnavailable(DeferredCleanup)`。原实现该 reason 仅表示进程共享 cleanup registry 的 try-lock 竞争，不表示 producer 有待清理任务；实际饱和仍是 BusyOrUnavailable。测试沿用相邻 fixture 的 5s 有界读取，仅对此临时 reason 重读，全部实际安全负例保留，产品协议不改。原 workspace 依赖配置下相关模块 **8/0、0.15s**；全仓第二轮已退出 0。这个附带测试修正独立报告，不作为新增 SLO 功能完成。[首轮审计](/private/tmp/ferrum-slo-recovery-20261002/g17-joint-workspace-first-audit.json)、[模块回归](/private/tmp/ferrum-slo-recovery-20261002/g17-checkpoint-projection-module.log)
 
-G17 最终全仓为 **7880 pass / 0 fail / 109 ignored**：229 个顶层 Rust harness，排除 17 条子进程重复汇总；另有两个 Criterion harness 的 16 项 smoke，不作性能证据。engine 为 **1544/0/6、91.23s**，原接口失败用例及两项新联动均通过。最终 fmt、workspace check（0.69s）、Clippy `-A warnings`（18.07s）、Metal 全目标编译（49.98s）均退出 0。联动测试提交为 `d94897ca`，附带接口测试修正单独提交为 `b0852d8e`；该检查点未更改普通构建的执行行为，仍对应 `5ace3e72`。CUDA 编译与双后端实际运行尚缺，原默认 2ms release 探针保留为 `5ace3e72` 的既有证据，没有在本次测试提交上重跑。几何采集仍只在仓库外形成草稿，未部署。[最终全仓审计](/private/tmp/ferrum-slo-recovery-20261002/g17-joint-workspace-final-audit.json)、[联动及检查状态](/private/tmp/ferrum-slo-recovery-20261002/g17-joint-gates-status.json)
+G17 最终全仓为 **7880 pass / 0 fail / 109 ignored**：229 个顶层 Rust harness，排除 17 条子进程重复汇总；另有两个 Criterion harness 的 16 项 smoke，不作性能证据。engine 为 **1544/0/6、91.23s**，原接口失败用例及两项新联动均通过。最终 fmt、workspace check（0.69s）、Clippy `-A warnings`（18.07s）、Metal 全目标编译（49.98s）均退出 0。联动测试提交为 `d94897ca`，附带接口测试修正单独提交为 `b0852d8e`；该检查点未更改普通构建的执行行为，仍对应 `5ace3e72`。CUDA 编译与双后端实际运行尚缺，原默认 2ms release 探针保留为 `5ace3e72` 的既有证据，没有在本次测试提交上重跑。G17 当时的几何采集只有仓库外草稿；后续 G18 实际构建和采集结果见上文。[最终全仓审计](/private/tmp/ferrum-slo-recovery-20261002/g17-joint-workspace-final-audit.json)、[联动及检查状态](/private/tmp/ferrum-slo-recovery-20261002/g17-joint-gates-status.json)
 
 ## G15/G16：已修复端到端回归，完整检查进行中
 
@@ -77,7 +77,7 @@ G15 有效 before 为 **0 pass / 1 fail、0.05s**，命中 selector 未安排完
 
 当前源码的 release 默认 2ms 探针已退出 0：**2 pass / 0 fail / 0 ignored、1.06s**。basic 有 1 次实际 decision/submitted/reconciled，规划耗时 199,500ns；forward 为 4 次，规划耗时总和 958,917ns，规划波总数 7、其中 tail 3。总和不是单次或 P99 统计，这些只证明受控 CPU 场景在原预算内得到实际采用，不能代替真实后端。[优化构建 2ms 探针](/private/tmp/ferrum-slo-recovery-20261002/g16-preserved-scope-release-2ms.log)
 
-Clippy（`-A warnings`）退出 0、41.32s；Metal 全目标编译退出 0、34.95s。当前源码的 pinned CUDA 编译和双后端正常入口实机验证仍待完成；本地编译不能充当后端运行证据。下方 G13/G14 实机结果不含 G15/G16 修复，不能作为其 after 证据。必要 host-policy、宽度支持和 SLO 尚未闭环，正式验收仍为 **0/224**。
+Clippy（`-A warnings`）退出 0、41.32s；Metal 全目标编译退出 0、34.95s。G15/G16 当时仍缺 pinned CUDA 编译和双后端正常入口实机验证；后续 G18 已完成前者及限定范围采集，完整入口验证仍缺。本地编译不能充当后端运行证据。下方 G13/G14 实机结果不含 G15/G16 修复，不能作为其 after 证据。必要 host-policy、宽度支持和 SLO 尚未闭环，正式验收仍为 **0/224**。
 
 ## G13：最近完成的四入口实机结果，仍未达到可用检查点
 
