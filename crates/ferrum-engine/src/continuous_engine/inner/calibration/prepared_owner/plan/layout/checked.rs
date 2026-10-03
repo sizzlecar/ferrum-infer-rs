@@ -509,6 +509,7 @@ async fn collect_ready(
             })
             .collect(),
         inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
+        original_inputs: Vec::new(),
         algorithm_inputs: Vec::new(),
         algorithm_case_inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
         gaps: Vec::with_capacity(cases.len()),
@@ -568,7 +569,7 @@ async fn collect_ready(
         .await?;
         // An uninterrupted first traversal already captured every input.
         // Any preparation action still requires a fresh complete inventory.
-        let captured = match prepared {
+        let mut captured = match prepared {
             Some(inventory) => inventory,
             None => capture(session, input, &group, budget, remaining_bytes).await?,
         };
@@ -584,6 +585,7 @@ async fn collect_ready(
             )
             .ok_or_else(|| error("algorithm capture retained overflow"))?;
         out.merge_algorithms(&captured, &indices, maximum_bytes, external)?;
+        out.merge_originals(&mut captured, maximum_bytes, base)?;
         drop(captured.algorithm_inputs);
         drop(captured.algorithm_case_inputs);
         for ((&global, opportunity), facts) in indices

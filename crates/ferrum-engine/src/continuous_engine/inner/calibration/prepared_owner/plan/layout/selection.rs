@@ -37,13 +37,16 @@ pub(super) struct CheckedInputFacts {
 }
 
 impl CheckedInputFacts {
+    pub(super) fn retained_metadata_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>().checked_add(
+            self.axes
+                .capacity()
+                .checked_mul(std::mem::size_of::<f64>())?,
+        )
+    }
+
     pub fn retained_payload_bytes(&self) -> Option<usize> {
-        std::mem::size_of::<Self>()
-            .checked_add(
-                self.axes
-                    .capacity()
-                    .checked_mul(std::mem::size_of::<f64>())?,
-            )?
+        self.retained_metadata_bytes()?
             .checked_add(self.original.as_ref().map_or(Some(0), |original| {
                 original
                     .retained_payload_bytes()?

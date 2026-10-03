@@ -909,6 +909,11 @@ fn local_scope_uses_only_original_cases_checked_trajectory_algorithms() {
     let inventory = inventory::CheckedCaseInventory {
         opportunities: opportunities.clone(),
         inputs: inputs.clone(),
+        original_inputs: inputs
+            .iter()
+            .flatten()
+            .filter_map(|facts| facts.original.clone())
+            .collect(),
         algorithm_inputs: vec![Arc::new(later.clone()), Arc::new(unrelated.clone())],
         algorithm_case_inputs: vec![vec![0], vec![0]],
         gaps: Vec::new(),

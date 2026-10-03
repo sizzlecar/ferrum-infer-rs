@@ -62,7 +62,7 @@ fn limits(requests: usize) -> InventoryLimits {
 async fn checked_inventory_reuses_maximum_width_and_keeps_warm_prefill_conditional() {
     let (mut session, executor) = fixture(2).await;
     let templates = [template(&session)];
-    let inventory = collect(
+    let mut inventory = collect(
         &mut session,
         &[case(1), case(2), case(1)],
         &templates,
@@ -101,6 +101,26 @@ async fn checked_inventory_reuses_maximum_width_and_keeps_warm_prefill_condition
         .gaps
         .iter()
         .all(|gap| matches!(gap.reason, InventoryGapReason::WarmResidencyUnproven)));
+    let first = inventory.inputs[0][0].original.as_ref().unwrap();
+    assert!(Arc::ptr_eq(
+        first,
+        inventory.inputs[2][0].original.as_ref().unwrap()
+    ));
+    assert!(!Arc::ptr_eq(
+        first,
+        inventory.inputs[1][0].original.as_ref().unwrap()
+    ));
+    let original = Arc::downgrade(first);
+    let before_release = inventory.retained_payload_bytes().unwrap();
+    inventory.release_original_inputs();
+    assert!(inventory.original_inputs.is_empty());
+    assert!(inventory
+        .inputs
+        .iter()
+        .flatten()
+        .all(|facts| facts.original.is_none()));
+    assert!(original.upgrade().is_none());
+    assert!(inventory.retained_payload_bytes().unwrap() < before_release);
     assert_unsubmitted_clean(&session, &executor);
     session.shutdown().await.unwrap();
 }

@@ -162,6 +162,7 @@ impl CheckedInputCursor {
                 .collect(),
             inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
             algorithm_inputs: Vec::new(),
+            original_inputs: Vec::new(),
             algorithm_case_inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
             gaps: Vec::with_capacity(cases.len()),
             charge: ProbePreflightCharge::default(),
@@ -312,7 +313,7 @@ impl CheckedInputCursor {
             );
             let mut group = Vec::with_capacity(count);
             group.extend(indices.iter().map(|&i| self.cases[i].clone()));
-            let captured =
+            let mut captured =
                 Box::pin(collect_ready(session, input, &group, budget, available)).await?;
             // Merge while the complete capture still owns its backing. The
             // new raw-input clones and any pool growth share the same limit.
@@ -327,6 +328,16 @@ impl CheckedInputCursor {
                 &indices,
                 self.maximum_retained_bytes,
                 pool_external,
+            )?;
+            let original_external = self
+                .retained_payload_bytes()
+                .and_then(|n| n.checked_sub(self.inventory.retained_payload_bytes()?))
+                .and_then(|n| n.checked_add(scratch))
+                .ok_or_else(|| error("input original recipe merge capacity overflow"))?;
+            self.inventory.merge_originals(
+                &mut captured,
+                self.maximum_retained_bytes,
+                original_external,
             )?;
             drop(captured.algorithm_inputs);
             drop(captured.algorithm_case_inputs);
@@ -427,6 +438,7 @@ impl CheckedInputCursor {
                 opportunities: Vec::new(),
                 inputs: Vec::new(),
                 algorithm_inputs: Vec::new(),
+                original_inputs: Vec::new(),
                 algorithm_case_inputs: Vec::new(),
                 gaps: Vec::new(),
                 charge: budget.preflight_charge(),

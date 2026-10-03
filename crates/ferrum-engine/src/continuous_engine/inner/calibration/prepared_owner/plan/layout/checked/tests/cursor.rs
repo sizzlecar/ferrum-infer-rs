@@ -48,3 +48,4 @@ async fn template_cursor_keeps_declared_length_opportunities_before_smaller_comp
 }
 
 mod global;
+mod recipe_sharing;

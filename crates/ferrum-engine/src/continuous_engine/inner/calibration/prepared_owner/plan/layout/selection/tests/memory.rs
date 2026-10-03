@@ -144,6 +144,11 @@ fn checked_selection_frozen_facts_release_raw_inputs_without_changing_selection(
     let original = facts[0][0].original.as_ref().unwrap().as_ref().clone();
     let mut inventory = super::super::super::inventory::CheckedCaseInventory {
         opportunities,
+        original_inputs: facts
+            .iter()
+            .flatten()
+            .filter_map(|facts| facts.original.clone())
+            .collect(),
         inputs: facts,
         algorithm_inputs: vec![Arc::new(original)],
         algorithm_case_inputs: Vec::new(),

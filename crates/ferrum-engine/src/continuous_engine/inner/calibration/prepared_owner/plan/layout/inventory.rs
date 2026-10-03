@@ -1,7 +1,7 @@
 //! Cold checked input inventory. No projection is a numerical sample, and a
 //! conditional cohort opportunity never replaces actual source8 membership.
 use super::populations::{CaseOpportunity, CasePopulation, CheckedPopulationKey};
-use super::selection::{input_facts, CheckedInputFacts};
+use super::selection::CheckedInputFacts;
 use super::*;
 use crate::continuous_engine::inner::calibration::geometry_projection::{
     GeometryInputScenario, GeometryInputTarget, GeometryPrefixConstraint, GeometryProjectionCharge,
@@ -81,6 +81,9 @@ pub(super) struct CheckedCaseInventory {
     pub opportunities: Vec<CaseOpportunity>,
     /// Every checked alternative, with actual axes and original row facts.
     pub inputs: Vec<Vec<CheckedInputFacts>>,
+    /// One owned recipe per captured outcome/branch. Case facts retain Arc
+    /// handles; numerical family equality never aliases different captures.
+    pub original_inputs: Vec<Arc<StructuredInputV2>>,
     /// Additional checked raw inputs declare finite algorithm support only.
     /// They never supply a numerical sample or increase a case's member floor.
     pub algorithm_inputs: Vec<Arc<StructuredInputV2>>,
@@ -96,6 +99,7 @@ impl CheckedCaseInventory {
     /// Drop the raw authority only after that projection has succeeded; the
     /// frozen universe, exact keys, numerical axes and typed gaps remain.
     pub(super) fn release_original_inputs(&mut self) {
+        self.original_inputs = Vec::new();
         self.algorithm_inputs = Vec::new();
         self.algorithm_case_inputs = Vec::new();
         for facts in self.inputs.iter_mut().flatten() {
@@ -142,6 +146,16 @@ impl CheckedCaseInventory {
                 .checked_add(input.retained_payload_bytes()?)?
                 .checked_add(2 * std::mem::size_of::<usize>())?;
         }
+        bytes = bytes.checked_add(
+            self.original_inputs
+                .capacity()
+                .checked_mul(std::mem::size_of::<Arc<StructuredInputV2>>())?,
+        )?;
+        for input in &self.original_inputs {
+            bytes = bytes
+                .checked_add(input.retained_payload_bytes()?)?
+                .checked_add(2 * std::mem::size_of::<usize>())?;
+        }
         for opportunity in &self.opportunities {
             let capacity = match &opportunity.population {
                 CasePopulation::Unique(_) => 0,
@@ -160,12 +174,106 @@ impl CheckedCaseInventory {
             for input in inputs {
                 bytes = bytes.checked_add(
                     input
-                        .retained_payload_bytes()?
+                        .retained_metadata_bytes()?
                         .checked_sub(std::mem::size_of::<CheckedInputFacts>())?,
                 )?;
             }
         }
         Some(bytes)
+    }
+
+    fn retain_original_input(
+        &mut self,
+        input: &StructuredInputV2,
+        maximum: usize,
+        external: usize,
+    ) -> Result<Arc<StructuredInputV2>> {
+        let payload = input
+            .retained_payload_bytes()
+            .and_then(|n| n.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or_else(|| error("original recipe payload overflow"))?;
+        let old_capacity = self.original_inputs.capacity();
+        let growth = if self.original_inputs.len() == old_capacity {
+            self.original_inputs
+                .len()
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<Arc<StructuredInputV2>>()))
+                .ok_or_else(|| error("original recipe backing overflow"))?
+        } else {
+            0
+        };
+        require_capacity(
+            self.retained_payload_bytes()
+                .and_then(|n| n.checked_add(external))
+                .and_then(|n| n.checked_add(payload))
+                .and_then(|n| n.checked_add(growth)),
+            maximum,
+        )?;
+        if growth != 0 {
+            self.original_inputs
+                .try_reserve_exact(1)
+                .map_err(|_| error("original recipe allocation failed"))?;
+        }
+        let old_backing = if growth != 0 {
+            old_capacity.checked_mul(std::mem::size_of::<Arc<StructuredInputV2>>())
+        } else {
+            Some(0)
+        };
+        require_capacity(
+            self.retained_payload_bytes()
+                .and_then(|n| n.checked_add(external))
+                .and_then(|n| n.checked_add(payload))
+                .and_then(|n| n.checked_add(old_backing?)),
+            maximum,
+        )?;
+        let original = Arc::new(input.clone());
+        self.original_inputs.push(Arc::clone(&original));
+        Ok(original)
+    }
+
+    /// Move original ownership with the captured case facts. Both inventories
+    /// and both Vec backings remain charged during destination growth.
+    pub(super) fn merge_originals(
+        &mut self,
+        captured: &mut Self,
+        maximum: usize,
+        external: usize,
+    ) -> Result<()> {
+        let count = captured.original_inputs.len();
+        let old_capacity = self.original_inputs.capacity();
+        let required = self
+            .original_inputs
+            .len()
+            .checked_add(count)
+            .ok_or_else(|| error("original recipe merge overflow"))?;
+        let growing = required > old_capacity;
+        let growth = if growing {
+            required.checked_mul(std::mem::size_of::<Arc<StructuredInputV2>>())
+        } else {
+            Some(0)
+        };
+        let live = |this: &Self| {
+            this.retained_payload_bytes()
+                .and_then(|n| n.checked_add(captured.retained_payload_bytes()?))
+                .and_then(|n| n.checked_add(external))
+        };
+        require_capacity(live(self).and_then(|n| n.checked_add(growth?)), maximum)?;
+        if growing {
+            self.original_inputs
+                .try_reserve_exact(count)
+                .map_err(|_| error("original recipe merge allocation failed"))?;
+        }
+        let old_backing = if growing {
+            old_capacity.checked_mul(std::mem::size_of::<Arc<StructuredInputV2>>())
+        } else {
+            Some(0)
+        };
+        require_capacity(
+            live(self).and_then(|n| n.checked_add(old_backing?)),
+            maximum,
+        )?;
+        self.original_inputs.append(&mut captured.original_inputs);
+        Ok(())
     }
 
     /// The caller charges every still-live report, scratch array and source
@@ -324,11 +432,109 @@ mod algorithm_pool_tests {
         CheckedCaseInventory {
             opportunities: Vec::new(),
             inputs: Vec::new(),
+            original_inputs: Vec::new(),
             algorithm_inputs: Vec::new(),
             algorithm_case_inputs: Vec::new(),
             gaps: Vec::new(),
             charge: ProbePreflightCharge::default(),
         }
+    }
+
+    #[test]
+    fn original_recipe_pool_authorizes_unique_payload_and_live_growth() {
+        let input = fixture::input(1, 3, CostProductOutput::GreedyToken, false, true);
+        let mut inventory = empty();
+        let external = std::mem::size_of::<Case>();
+        let handle = std::mem::size_of::<Arc<StructuredInputV2>>();
+        let payload = input.retained_payload_bytes().unwrap() + 2 * std::mem::size_of::<usize>();
+        let empty_bytes = inventory.retained_payload_bytes().unwrap();
+        let maximum = empty_bytes + external + payload + handle;
+        assert!(inventory
+            .retain_original_input(&input, maximum - 1, external)
+            .is_err());
+        assert_eq!(inventory.original_inputs.capacity(), 0);
+        let first = inventory
+            .retain_original_input(&input, maximum, external)
+            .unwrap();
+        // Authorization includes the source's full capacities. Vec::clone may
+        // shed spare capacity; retained accounting follows the actual clone.
+        let first_payload =
+            first.retained_payload_bytes().unwrap() + 2 * std::mem::size_of::<usize>();
+        assert!(first_payload <= payload);
+        assert_eq!(
+            inventory.retained_payload_bytes().unwrap(),
+            empty_bytes + inventory.original_inputs.capacity() * handle + first_payload
+        );
+        // A different outcome remains a separate allocation even when all its
+        // values compare equal. Growing the pool also retains its old backing.
+        let old_backing = inventory.original_inputs.capacity() * handle;
+        let new_backing = (inventory.original_inputs.len() + 1) * handle;
+        let growth_peak =
+            inventory.retained_payload_bytes().unwrap() + external + payload + new_backing;
+        assert!(inventory
+            .retain_original_input(&input, growth_peak - old_backing, external)
+            .is_err());
+        assert_eq!(inventory.original_inputs.len(), 1);
+        let second = inventory
+            .retain_original_input(&input, growth_peak, external)
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(!Arc::ptr_eq(&first, &second));
+        let second_payload =
+            second.retained_payload_bytes().unwrap() + 2 * std::mem::size_of::<usize>();
+        assert_eq!(
+            inventory.retained_payload_bytes().unwrap(),
+            empty_bytes
+                + inventory.original_inputs.capacity() * handle
+                + first_payload
+                + second_payload
+        );
+    }
+
+    #[test]
+    fn original_recipe_pool_merge_moves_authority_and_charges_both_backings() {
+        let input = fixture::input(1, 3, CostProductOutput::GreedyToken, false, true);
+        let mut retained = empty();
+        let mut captured = empty();
+        drop(
+            retained
+                .retain_original_input(&input, usize::MAX, 0)
+                .unwrap(),
+        );
+        drop(
+            captured
+                .retain_original_input(&input, usize::MAX, 0)
+                .unwrap(),
+        );
+        let original = Arc::downgrade(&captured.original_inputs[0]);
+        let external = std::mem::size_of::<Case>();
+        let live = retained.retained_payload_bytes().unwrap()
+            + captured.retained_payload_bytes().unwrap()
+            + external;
+        let peak = live
+            + (retained.original_inputs.len() + captured.original_inputs.len())
+                * std::mem::size_of::<Arc<StructuredInputV2>>();
+        assert!(retained
+            .merge_originals(&mut captured, peak - 1, external)
+            .is_err());
+        assert_eq!(retained.original_inputs.len(), 1);
+        assert_eq!(captured.original_inputs.len(), 1);
+        retained
+            .merge_originals(&mut captured, peak, external)
+            .unwrap();
+        assert!(captured.original_inputs.is_empty());
+        assert!(std::ptr::eq(
+            original.as_ptr(),
+            Arc::as_ptr(&retained.original_inputs[1])
+        ));
+        assert!(
+            retained.retained_payload_bytes().unwrap()
+                + captured.retained_payload_bytes().unwrap()
+                + external
+                <= peak
+        );
+        retained.release_original_inputs();
+        assert!(original.upgrade().is_none());
     }
 
     #[test]
@@ -638,6 +844,7 @@ async fn collect_inner(
             })
             .collect(),
         inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
+        original_inputs: Vec::new(),
         algorithm_inputs: Vec::new(),
         algorithm_case_inputs: (0..cases.len()).map(|_| Vec::new()).collect(),
         gaps: Vec::with_capacity(cases.len()),
@@ -1036,7 +1243,7 @@ async fn collect_inner(
                 }
             }
         }
-        for &member in &members {
+        for (member_ordinal, &member) in members.iter().enumerate() {
             let original_target = target(&cases[member], prompts)?;
             let scenario_index = scenario_cases
                 .iter()
@@ -1047,6 +1254,13 @@ async fn collect_inner(
                 .iter()
                 .find(|o| o.scenario_index == scenario_index && o.target == original_target)
                 .ok_or_else(|| error("inventory lost its original target"))?;
+            // Only earlier cases backed by this exact report outcome share a
+            // recipe. Do not merge equal families, widths or other captures.
+            let shared = members[..member_ordinal].iter().copied().find(|&previous| {
+                same_scenario(&cases[previous], &cases[member])
+                    && target(&cases[previous], prompts)
+                        .is_ok_and(|target| target == original_target)
+            });
             if let Some(reason) = &outcome.unknown {
                 readiness::require_nonfatal(
                     reason,
@@ -1073,24 +1287,25 @@ async fn collect_inner(
                                 .regression_axes()
                                 .len()
                                 .checked_mul(std::mem::size_of::<f64>())?,
-                        )?
-                        .checked_add(branch.query.input().retained_payload_bytes()?)?
-                        .checked_add(2 * std::mem::size_of::<usize>())
+                        )
                     })
                 })
-                .and_then(|n| n.checked_add(std::mem::size_of::<CheckedPopulationKey>()));
+                .and_then(|n| n.checked_add(std::mem::size_of::<CheckedPopulationKey>()))
+                .ok_or_else(|| error("checked inventory facts capacity overflow"))?;
+            let external = scratch_arrays
+                .checked_add(group_bytes)
+                .and_then(|n| n.checked_add(report_limit))
+                .and_then(|n| n.checked_add(incoming))
+                .ok_or_else(|| error("checked inventory facts capacity overflow"))?;
             require_capacity(
                 inventory
                     .retained_payload_bytes()
-                    .and_then(|n| n.checked_add(scratch_arrays))
-                    .and_then(|n| n.checked_add(group_bytes))
-                    .and_then(|n| n.checked_add(report_limit))
-                    .and_then(|n| n.checked_add(incoming?)),
+                    .and_then(|n| n.checked_add(external)),
                 limits.maximum_retained_bytes,
             )?;
             let mut keys = Vec::with_capacity(outcome.branches.len());
             let mut facts = Vec::with_capacity(outcome.branches.len());
-            for branch in &outcome.branches {
+            for (branch_index, branch) in outcome.branches.iter().enumerate() {
                 let identity = populations::classify_alternatives(
                     std::slice::from_ref(branch.query.input()),
                     policy,
@@ -1103,8 +1318,21 @@ async fn collect_inner(
                 if !keys.contains(&key) {
                     keys.push(key);
                 }
+                let original = match shared {
+                    Some(previous) => Arc::clone(
+                        inventory.inputs[previous]
+                            .get(branch_index)
+                            .and_then(|facts| facts.original.as_ref())
+                            .ok_or_else(|| error("shared outcome lost its original recipe"))?,
+                    ),
+                    None => inventory.retain_original_input(
+                        branch.query.input(),
+                        limits.maximum_retained_bytes,
+                        external,
+                    )?,
+                };
                 facts.push(
-                    input_facts(&branch.query)
+                    selection::facts_from_input(branch.query.input(), original)
                         .map_err(|reason| error(format!("checked inventory facts: {reason:?}")))?,
                 );
             }
