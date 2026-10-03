@@ -121,11 +121,6 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
                 inventory.algorithm_inputs.iter().map(Arc::as_ref).chain(std::iter::once(&unrelated)),
                 population.settings.max_axes,
             ).unwrap();
-        let local = DeclaredAlgorithmUniverseV1::from_inputs(
-            inventory.algorithm_inputs.iter().map(Arc::as_ref),
-            population.settings.max_axes,
-        )
-        .unwrap();
         let groups = member_groups(&opportunities).unwrap();
         assert_eq!(groups.len(), cases.len());
         let populations: Vec<_> = groups
@@ -151,7 +146,7 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             &population,
         )
         .unwrap();
-        let packed = batch_plan_with_scope(
+        let packed = batch_plan(
             &decode_indices,
             &populations,
             &cases,
@@ -160,10 +155,9 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             8,
             None,
             &population,
-            Some((&inputs, &local)),
         )
         .unwrap();
-        let independent = member_groups(packed.scoped_opportunities.as_ref().unwrap()).unwrap();
+        let independent = member_groups(&opportunities[1..]).unwrap();
         assert_eq!(independent.len(), decode_indices.len());
         for group in &independent {
             assert_eq!(group.guaranteed_case_indices.len(), 1);
@@ -234,21 +228,25 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             .iter()
             .find(|batch| batch.scheduled && batch.population_indices.contains(&1))
             .unwrap();
-        assert_eq!(actual.algorithm_universe.as_ref(), Some(&local));
-        assert!(
-            unrelated.numerical_family_key_for_universe(&local).is_err(),
-            "the shared journal cannot copy an unrelated global seed algorithm"
-        );
+        assert!(actual.algorithm_universe.is_none());
+        assert!(actual.scoped_opportunities.is_none());
+        for &index in &actual.representative_case_indices {
+            assert_eq!(selected.populations[index].key, groups[index].key);
+            assert_eq!(
+                inputs[index][0]
+                    .original
+                    .as_ref()
+                    .unwrap()
+                    .numerical_family_key(),
+                originals[index].numerical_family_key(),
+                "raw numerical identities must not be projected into a new union"
+            );
+        }
         assert_eq!(
             actual.representative_case_indices,
             packed.representative_case_indices
         );
-        assert_eq!(
-            member_groups(actual.scoped_opportunities.as_ref().unwrap())
-                .unwrap()
-                .len(),
-            independent.len()
-        );
+        assert_eq!(actual.population_indices.len(), independent.len());
         assert_eq!(selected.requests, capacity.requests);
         assert_eq!(selected.serial_wave_upper_bound, capacity.execution_actions);
         assert_eq!(
@@ -279,12 +277,7 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             .filter(|batch| batch.scheduled)
             .position(|batch| batch.population_indices.contains(&1))
             .unwrap();
-        let mut declared = population.clone();
-        declared
-            .nonnegative_envelope
-            .as_mut()
-            .unwrap()
-            .algorithm_universe = Some(local.clone());
+        let declared = population.clone();
         let source_inputs::ColdSourceRebuild::Ready(cold) = frozen[decode_source]
             .cold_plan(&declared, NonZeroU32::new(8).unwrap(), None, usize::MAX)
             .unwrap()
@@ -366,11 +359,12 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
         assert!(!denied.populations.iter().all(|member| member.scheduled));
         assert!(denied.populations[0].scheduled && denied.populations[1].scheduled);
         for batch in denied.batches.iter().filter(|batch| batch.scheduled) {
-            if let Some(opportunities) = &batch.scoped_opportunities {
-                assert!(
-                    member_groups(opportunities).unwrap().len() <= owner_limited.maximum_owners
-                );
-            }
+            let original: Vec<_> = batch
+                .representative_case_indices
+                .iter()
+                .map(|&index| opportunities[index].clone())
+                .collect();
+            assert!(member_groups(&original).unwrap().len() <= owner_limited.maximum_owners);
         }
         let mut geometry = StructuredInputGeometryWorkV1::new(NonZeroU64::MIN);
         let incomplete = select(
@@ -407,6 +401,178 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             assert!(raw.populations[0].scheduled && raw.populations[1].scheduled);
         }
         assert!(select(capacity, None, &population, Some(&seed), None, 0).is_err());
+    }
+}
+
+#[test]
+fn independent_family_packing_preserves_equal_scopes_and_declines_mixed_interpretations() {
+    use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1;
+
+    // Each original source obtains its scope through the production same-host
+    // composition pass. Only then may independent host families share a journal.
+    for (scenario, algorithms) in [
+        [
+            ("fixture.selection.a", [7; 32]),
+            ("fixture.selection.b", [8; 32]),
+        ],
+        [
+            ("fixture.selection.c", [9; 32]),
+            ("fixture.selection.d", [10; 32]),
+        ],
+        [
+            ("fixture.selection.c", [9; 32]),
+            ("fixture.selection.c", [9; 32]),
+        ],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (mut cases, mut opportunities, mut inputs, population) =
+            algorithm_pair_inventory([1, 1]);
+        let original_cases = cases.clone();
+        for mut case in original_cases {
+            let (name, implementation) = algorithms[case.template];
+            case.template += 2;
+            let input = natural_termination_input_with_algorithm_and_eos(
+                case.width as u32,
+                CostProductOutput::GreedyToken,
+                false,
+                64,
+                name,
+                implementation,
+                false,
+            );
+            opportunities.push(CaseOpportunity {
+                population: classify_alternatives(
+                    std::slice::from_ref(&input),
+                    population.population_policy(),
+                    true,
+                )
+                .unwrap(),
+                minimum_fresh_members: 1,
+            });
+            inputs.push(vec![input_facts(&StructuredQueryV2::exact(input)).unwrap()]);
+            cases.push(case);
+        }
+        let seed = DeclaredAlgorithmUniverseV1::from_inputs(
+            inputs
+                .iter()
+                .flatten()
+                .map(|fact| fact.original.as_deref().unwrap()),
+            population.settings.max_axes,
+        )
+        .unwrap();
+        let run = |maximum_sources| {
+            select_with_local_composition(
+                &cases,
+                &opportunities,
+                &inputs,
+                &[61; 4],
+                8,
+                None,
+                &population,
+                100_000,
+                10_000_000,
+                usize::MAX,
+                None,
+                None,
+                None,
+                NonZeroUsize::new(maximum_sources),
+                Some(&seed),
+            )
+            .unwrap()
+        };
+        let separate = run(2);
+        assert!(separate.populations.iter().all(|member| member.scheduled));
+        let original: Vec<_> = separate
+            .batches
+            .iter()
+            .filter(|batch| batch.scheduled)
+            .collect();
+        assert_eq!(
+            original.len(),
+            2,
+            "no coverage gain leaves both original journals alone"
+        );
+        let equal = original[0].algorithm_universe == original[1].algorithm_universe;
+        assert_eq!(
+            equal,
+            scenario == 0,
+            "the original scopes establish the tested boundary"
+        );
+        assert_eq!(
+            original
+                .iter()
+                .filter(|batch| batch.algorithm_universe.is_some())
+                .count(),
+            if scenario == 2 { 1 } else { 2 }
+        );
+        let packed = run(1);
+        if equal {
+            assert!(packed.populations.iter().all(|member| member.scheduled));
+            let combined: Vec<_> = packed
+                .batches
+                .iter()
+                .filter(|batch| batch.scheduled)
+                .collect();
+            assert_eq!(combined.len(), 1);
+            assert_eq!(
+                combined[0].algorithm_universe,
+                original[0].algorithm_universe
+            );
+            let scope = combined[0].algorithm_universe.as_ref().unwrap();
+            for before in &original {
+                for &index in &before.representative_case_indices {
+                    assert!(combined[0].representative_case_indices.contains(&index));
+                    let fact = inputs[index][0].original.as_ref().unwrap();
+                    assert_eq!(
+                        fact.numerical_family_key_for_universe(scope),
+                        fact.numerical_family_key_for_universe(
+                            before.algorithm_universe.as_ref().unwrap()
+                        ),
+                    );
+                }
+            }
+            assert_eq!(
+                member_groups(combined[0].scoped_opportunities.as_ref().unwrap())
+                    .unwrap()
+                    .len(),
+                original
+                    .iter()
+                    .map(
+                        |batch| member_groups(batch.scoped_opportunities.as_ref().unwrap())
+                            .unwrap()
+                            .len()
+                    )
+                    .sum::<usize>(),
+                "each original host family keeps independent phase membership"
+            );
+        } else {
+            assert!(!packed.populations.iter().all(|member| member.scheduled));
+            assert_eq!(packed.batches.len(), original.len());
+            for before in original {
+                let after = packed
+                    .batches
+                    .iter()
+                    .find(|batch| batch.population_indices == before.population_indices)
+                    .unwrap();
+                assert_eq!(after.algorithm_universe, before.algorithm_universe);
+                assert_eq!(
+                    after.representative_case_indices,
+                    before.representative_case_indices
+                );
+                assert_eq!(after.planned_cycles, before.planned_cycles);
+                assert_eq!(after.requests, before.requests);
+                assert_eq!(
+                    after.serial_wave_upper_bound,
+                    before.serial_wave_upper_bound
+                );
+                assert_eq!(
+                    after.declared_offer_row_bound,
+                    before.declared_offer_row_bound
+                );
+            }
+        }
     }
 }
 

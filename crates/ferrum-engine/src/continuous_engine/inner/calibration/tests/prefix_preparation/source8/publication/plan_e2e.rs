@@ -403,10 +403,38 @@ async fn check_probe_and_witness_with_prompt(
             runtime.workload_domain().unwrap(),
         )
         .unwrap();
-        let known = runtime.snapshot().unwrap()
-            .audit_structured_query_v2(&query, runtime.clock.now_ns().unwrap())
+        let snapshot = runtime.snapshot().unwrap();
+        let query_now = runtime.clock.now_ns().unwrap();
+        let known = snapshot
+            .audit_structured_query_v2(&query, query_now)
             .unwrap_or_else(|reason| {
                 let children = runtime.startup_series_children_for_test().unwrap();
+                // Failure-only inspection of the original frozen children.
+                // These direct results cannot substitute for catalog dispatch
+                // or turn a rejected query into an execution witness.
+                for child in children.iter().take(32) {
+                    let Some(family) = child.numerical_family_key() else {
+                        continue;
+                    };
+                    let projected = match child.algorithm_universe() {
+                        Some(universe) => query.input().numerical_family_key_for_universe(universe),
+                        None => query.input().numerical_family_key(),
+                    };
+                    if projected.as_ref().ok() != Some(family) {
+                        continue;
+                    }
+                    let membership = child.catalog_input_membership(&query);
+                    let prediction = child
+                        .predict_query_local_with_clock_detailed(snapshot.fingerprint(), &query, query_now)
+                        .map(|(value, model_now)| (value.planning_ns, value.valid_until_ns, model_now));
+                    eprintln!(
+                        "original rejected query child diagnostic: step={step} now={query_now} child_domain={:?} universe={:?} phase_support={:?} phase_members={:?} membership={membership:?} direct_prediction={prediction:?}",
+                        child.domain_signature(),
+                        child.algorithm_universe().map(|universe| universe.signature()),
+                        child.phase_support_policy(),
+                        child.provenance().phases.each_ref().map(|phase| phase.members),
+                    );
+                }
                 let installed: Vec<_> = children.iter().take(32).map(|child| (
                     child.owner(), child.numerical_family_key(), child.domain_signature(),
                     child.provenance().capture_identity,

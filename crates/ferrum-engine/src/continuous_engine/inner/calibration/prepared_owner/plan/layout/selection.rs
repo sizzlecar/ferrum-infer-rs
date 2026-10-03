@@ -996,10 +996,21 @@ fn coalesce_related_batches(
                     next += 1;
                     continue;
                 }
+                // A source has one numerical interpretation. Sharing journals
+                // must not turn a retained raw family into a new scoped child,
+                // or silently enlarge either original universe.
+                if independent_families && a.batch.algorithm_universe != b.batch.algorithm_universe
+                {
+                    next += 1;
+                    continue;
+                }
                 let mut members = a.batch.population_indices.clone();
                 members.extend_from_slice(&b.batch.population_indices);
                 members.sort_unstable();
-                let mut combined = batch_plan(
+                let scope = independent_families
+                    .then_some(a.batch.algorithm_universe.as_ref())
+                    .flatten();
+                let mut combined = batch_plan_with_scope(
                     &members,
                     populations,
                     cases,
@@ -1008,14 +1019,21 @@ fn coalesce_related_batches(
                     chunk,
                     prefill_row_ceiling,
                     population,
+                    scope.map(|universe| (inputs, universe)),
                 )?;
-                if let Some(seed) = combination_seed {
-                    let scope = if independent_families {
-                        composition::packed_candidate
-                    } else {
-                        composition::scoped_candidate
-                    };
-                    if let Some(scoped) = scope(
+                if independent_families {
+                    if !composition::packing_valid(
+                        &combined,
+                        inputs,
+                        trajectories,
+                        population,
+                        combination_seed.unwrap(),
+                    )? {
+                        next += 1;
+                        continue;
+                    }
+                } else if let Some(seed) = combination_seed {
+                    if let Some(scoped) = composition::scoped_candidate(
                         &combined,
                         populations,
                         cases,
@@ -1029,8 +1047,7 @@ fn coalesce_related_batches(
                         seed,
                     )? {
                         combined = scoped;
-                    } else if independent_families
-                        || !raw_related
+                    } else if !raw_related
                         || a.batch.algorithm_universe.is_some()
                         || b.batch.algorithm_universe.is_some()
                     {
