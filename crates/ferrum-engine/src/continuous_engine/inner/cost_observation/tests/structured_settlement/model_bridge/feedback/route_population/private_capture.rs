@@ -3,6 +3,114 @@
 use super::*;
 
 #[tokio::test]
+async fn private_route_diagnostics_preserve_settlement_fifo_and_authority() {
+    use ferrum_interfaces::execution_cost::PreparedCostRouteClassV1;
+
+    for (authorized, outside, extra_unknown, missing_host_features) in [
+        (true, false, false, false),
+        (true, true, false, false),
+        (true, true, true, false),
+        (true, true, false, true),
+        (false, true, false, false),
+    ] {
+        let mut baseline = None;
+        for debug in [false, true] {
+            let (f, outcome) =
+                tracing::subscriber::with_default(diagnostics::RuntimeDebug(debug), || {
+                    let f = Automatic::new(8);
+                    let capture = if authorized {
+                        CostCalibrationCapture::default()
+                            .with_original_route_capture()
+                            .unwrap()
+                    } else {
+                        CostCalibrationCapture::default()
+                    };
+                    let capture = Arc::new(capture);
+                    let before = f.runtime.sink.stats().raw_accepted;
+                    let stages = fixture::record_private_route_with_hook(
+                        &f.runtime,
+                        &f.clock,
+                        wave("private.route-diagnostic"),
+                        outside,
+                        extra_unknown,
+                        capture.clone(),
+                        |call| {
+                            if missing_host_features {
+                                call.participants[0].host_features = None;
+                            }
+                            assert!(call.live_ticket.is_none());
+                            let diagnostic = call.recorder.route_diagnostic();
+                            assert_eq!(diagnostic.is_some(), authorized && debug);
+                            if let Some(diagnostic) = diagnostic {
+                                assert_eq!(diagnostic.preparation_attempts, 1);
+                                let prepared = diagnostic.prepared.unwrap();
+                                if outside {
+                                    assert!(prepared.class.is_outside());
+                                } else {
+                                    assert_eq!(
+                                        prepared.class,
+                                        PreparedCostRouteClassV1::GraphDisabled
+                                    );
+                                }
+                                let submitted = diagnostic.submitted.unwrap();
+                                assert_eq!(submitted.lane_id, prepared.lane_id);
+                                assert!(submitted.graph.is_some());
+                                assert!(diagnostic.first_rejection.is_none());
+                                assert_eq!(diagnostic.other_evidence_unknown, extra_unknown);
+                            }
+                            let mut gate = None;
+                            assert_eq!(
+                                call.make_route_evidence_recording_failure(&mut gate)
+                                    .is_some(),
+                                authorized && !extra_unknown && !missing_host_features
+                            );
+                            assert_eq!(
+                                gate,
+                                if debug && authorized && extra_unknown {
+                                    Some("private_prepared_route_missing")
+                                } else if debug && authorized && missing_host_features {
+                                    Some("outside_host_features_missing")
+                                } else {
+                                    None
+                                }
+                            );
+                        },
+                    );
+                    let accepted = authorized && !extra_unknown && !missing_host_features;
+                    assert_eq!(stages.is_some(), accepted);
+                    f.runtime.consume_samples();
+                    assert_eq!(capture.host_stages().is_some(), accepted);
+                    assert!(!matches!(capture.status(), CostCalibrationStatus::Pending));
+                    let queue = capture.host_stage_queue();
+                    if accepted {
+                        let queue = queue.unwrap();
+                        assert_eq!(queue.disposition, HostStageQueueDisposition::Published);
+                        assert_eq!(queue.accepted_ordinal, Some(before + 1));
+                    }
+                    let audit = f.live().audit();
+                    assert_eq!(audit.population.issued, 0);
+                    assert_eq!(audit.qualified_publications, 0);
+                    let outcome = (
+                        stages.is_some(),
+                        queue.map(|q| (q.disposition, q.accepted_ordinal.map(|n| n - before))),
+                        f.runtime.sink.stats().raw_accepted - before,
+                    );
+                    (f, outcome)
+                });
+            if let Some(expected) = &baseline {
+                assert_eq!(
+                    &outcome, expected,
+                    "diagnostics cannot alter settlement or FIFO"
+                );
+            } else {
+                baseline = Some(outcome);
+            }
+            f.runtime.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn private_route_capture_retains_original_warm_and_outside_receipts_without_live_ticket() {
     for outside in [false, true] {
         let f = Automatic::new(8);

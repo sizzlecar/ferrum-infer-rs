@@ -347,6 +347,16 @@ impl EngineCostCall {
                 previous.mark_conflict();
             }
         } else if capture.claim() {
+            if capture.requests_original_route()
+                && tracing::enabled!(
+                    target: "ferrum_engine::continuous_engine::inner::cost_observation::runtime",
+                    tracing::Level::DEBUG
+                )
+            {
+                // Fixed-size passive facts only. A private capture does not
+                // acquire a live ticket or change route/settlement authority.
+                self.recorder.enable_route_diagnostics();
+            }
             self.calibration_capture = Some(capture);
         }
     }

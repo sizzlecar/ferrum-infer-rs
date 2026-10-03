@@ -596,12 +596,14 @@ impl EngineCostCall {
         Arc<HostStageEvidenceV1>,
         Option<CompletePrivateCalibrationSettlement>,
     )> {
-        let result = self.build_host_stages_with_preparation();
+        let mut route_settlement_gate = None;
+        let result = self.build_host_stages_with_preparation(&mut route_settlement_gate);
         if self.rejection == Some(CostCallRejection::CalibrationPreparation)
             && result.as_ref().is_none_or(|(_, proof)| proof.is_none())
         {
             self.diagnose_unclassified_preparation(
                 result.as_ref().map(|(stages, _)| stages.as_ref()),
+                route_settlement_gate,
             );
         }
         result
@@ -610,7 +612,11 @@ impl EngineCostCall {
     // Worker-side failure-only diagnostics. Fixed scalar fields also cover
     // early stage-construction failure; no extra clock read, shape serialization
     // or numerical qualification is performed, and successful waves are silent.
-    fn diagnose_unclassified_preparation(&self, stages: Option<&HostStageEvidenceV1>) {
+    fn diagnose_unclassified_preparation(
+        &self,
+        stages: Option<&HostStageEvidenceV1>,
+        route_settlement_gate: Option<&'static str>,
+    ) {
         if !tracing::enabled!(
             target: "ferrum_engine::continuous_engine::inner::cost_observation::runtime",
             tracing::Level::WARN
@@ -619,6 +625,9 @@ impl EngineCostCall {
         }
         let wave = self.recorder.observations().first();
         let actual = wave.and_then(|wave| wave.shape.as_ref());
+        // Present only when the original producer opted into DEBUG before
+        // submission. Reading these scalar copies cannot recover authority.
+        let route_diagnostic = self.recorder.route_diagnostic();
         let first_incomplete_row = stages.and_then(|stages| {
             stages.rows.iter().find(|row| {
                 row.completeness != HostStageCompleteness::CompleteSingleWave
@@ -636,6 +645,10 @@ impl EngineCostCall {
             calibration_capture = self.calibration_capture.is_some(),
             original_route_capture = self.calibration_capture.as_ref()
                 .is_some_and(|capture| capture.requests_original_route()),
+            route_prepared = ?route_diagnostic.and_then(|value| value.prepared),
+            route_submitted = ?route_diagnostic.and_then(|value| value.submitted),
+            route_first_rejection = ?route_diagnostic.and_then(|value| value.first_rejection),
+            route_settlement_gate,
             live_ticket = self.live_ticket.is_some(),
             dispatch_waves = self.dispatch.waves,
             retained_waves = self.recorder.observations().len(),
@@ -670,6 +683,7 @@ impl EngineCostCall {
 
     fn build_host_stages_with_preparation(
         &self,
+        route_settlement_gate: &mut Option<&'static str>,
     ) -> Option<(
         Arc<HostStageEvidenceV1>,
         Option<CompletePrivateCalibrationSettlement>,
@@ -679,7 +693,7 @@ impl EngineCostCall {
         }
         let wave = self.recorder.observations().first()?;
         let shape = wave.shape.as_ref();
-        let route_evidence = self.make_route_evidence();
+        let route_evidence = self.make_route_evidence_recording_failure(route_settlement_gate);
         let actual_rows = match shape {
             Some(shape) => shape.rows.as_slice(),
             None if route_evidence.as_ref().is_some_and(|r| r.is_outside()) => {

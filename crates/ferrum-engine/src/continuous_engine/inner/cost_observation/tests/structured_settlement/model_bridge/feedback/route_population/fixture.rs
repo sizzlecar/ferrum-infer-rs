@@ -106,6 +106,18 @@ pub(super) fn record_private_route(
     extra_unknown: bool,
     capture: Arc<CostCalibrationCapture>,
 ) -> Option<Arc<HostStageEvidenceV1>> {
+    record_private_route_with_hook(runtime, clock, w, outside, extra_unknown, capture, |_| {})
+}
+
+pub(super) fn record_private_route_with_hook(
+    runtime: &EngineCostRuntime,
+    clock: &Arc<VirtualClock>,
+    w: Wave,
+    outside: bool,
+    extra_unknown: bool,
+    capture: Arc<CostCalibrationCapture>,
+    hook: impl FnOnce(&mut EngineCostCall),
+) -> Option<Arc<HostStageEvidenceV1>> {
     record_route_with_provider(
         runtime,
         clock,
@@ -116,7 +128,7 @@ pub(super) fn record_private_route(
         false,
         Some(capture),
         false,
-        |_| {},
+        hook,
     )
 }
 

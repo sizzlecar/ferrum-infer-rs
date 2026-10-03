@@ -282,9 +282,19 @@ impl EngineCostCall {
         Ok(prepared)
     }
     pub(super) fn make_route_evidence(&self) -> Option<Arc<LiveRouteEvidence>> {
+        self.make_route_evidence_recording_failure(&mut None)
+    }
+
+    pub(super) fn make_route_evidence_recording_failure(
+        &self,
+        failure: &mut Option<&'static str>,
+    ) -> Option<Arc<LiveRouteEvidence>> {
         match self.make_route_evidence_checked() {
             Ok(evidence) => Some(evidence),
             Err(gate) => {
+                if self.recorder.route_diagnostic().is_some() {
+                    *failure = Some(gate);
+                }
                 self.capture_route_failure_gate(gate);
                 None
             }
