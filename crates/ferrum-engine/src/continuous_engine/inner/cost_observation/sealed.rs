@@ -60,7 +60,8 @@ impl EngineCostCall {
             .participants
             .capacity()
             .checked_add(self.host.capacity())
-            .and_then(|n| n.checked_add(self.host_stages.capacity()));
+            .and_then(|n| n.checked_add(self.host_stages.capacity()))
+            .and_then(|n| n.checked_add(self.private_prefix_rows.capacity()));
         let retained_bytes = self
             .recorder
             .retained_payload_bytes_upper_bound()
@@ -85,6 +86,13 @@ impl EngineCostCall {
                         .capacity()
                         .checked_mul(std::mem::size_of::<host_stages::HostRowProgress>())?,
                 )
+            })
+            .and_then(|n| {
+                n.checked_add(self.private_prefix_rows.capacity().checked_mul(
+                    std::mem::size_of::<
+                        super::super::calibration::token_preparation::BoundPrefixPreparationRow,
+                    >(),
+                )?)
             })
             .and_then(|n| {
                 n.checked_add(match &self.presubmit_prediction {
@@ -141,6 +149,13 @@ impl EngineCostCall {
                 })
             })
             .and_then(|n| n.checked_add(std::mem::size_of::<HostStageEvidenceV1>()))
+            .and_then(|n| {
+                n.checked_add(if self.calibration_capture.is_some() {
+                    CompletePrivateCalibrationSettlement::retained_bytes()
+                } else {
+                    0
+                })
+            })
             .and_then(|n| n.checked_add(std::mem::size_of::<CostCalibrationResult>()))
             .and_then(|n| {
                 n.checked_add(super::memory::maximum_resolution_overhead(
@@ -164,6 +179,7 @@ impl EngineCostCall {
             observation_memory: None,
             identity: self.identity.clone(),
             participants: std::mem::take(&mut self.participants),
+            private_prefix_rows: std::mem::take(&mut self.private_prefix_rows),
             prepare_started_at_ns: self.prepare_started_at_ns,
             boundary: self.boundary,
             recorder: self.recorder.take_frozen(),
@@ -372,6 +388,16 @@ impl SealedCostCall {
             })
             .and_then(|n| {
                 n.checked_add(
+                    if preparation.is_some() && call.calibration_capture.is_some() {
+                        // The proof shares the already charged stages/route payload.
+                        CompletePrivateCalibrationSettlement::retained_bytes()
+                    } else {
+                        0
+                    },
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
                     call.calibration_capture
                         .as_ref()
                         .map_or(Some(0), |capture| capture.retained_diagnostic_bytes())?,
@@ -430,6 +456,9 @@ impl SealedCostCall {
             }
             capture.complete_actual_projection(entry.shared_actual());
             capture.complete_structured_projection(entry.shared_projection());
+        }
+        if let (Some(capture), Some(proof)) = (&capture, preparation) {
+            capture.complete_private_settlement(proof);
         }
         if let (Some(capture), Some(proof)) = (&capture, original_no_submission) {
             capture.complete_no_submission(proof);

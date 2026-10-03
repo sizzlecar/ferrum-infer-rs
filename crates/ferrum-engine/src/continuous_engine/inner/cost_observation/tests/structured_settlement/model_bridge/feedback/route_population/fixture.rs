@@ -322,6 +322,64 @@ fn record_route_with_settlement(
     if let Some(capture) = capture {
         call.attach_calibration_capture(capture);
     }
+    let stages = record_original_call(
+        &mut call,
+        clock,
+        w,
+        outside,
+        extra_unknown,
+        missing_program_binding,
+        cohort,
+        terminal_override,
+        extra_host_ns,
+        None,
+        hook,
+    );
+    call.finish();
+    stages
+}
+
+/// The original engine preparation supplies the private marker and host facts.
+/// This leaf only runs the existing controlled Core submission/settlement.
+pub(super) fn record_original_private_route(
+    call: &mut EngineCostCall,
+    clock: &Arc<VirtualClock>,
+    w: Wave,
+    committed_override: Option<HostCommittedWork>,
+    hook: impl FnOnce(&mut EngineCostCall),
+) -> Option<Arc<HostStageEvidenceV1>> {
+    let cohort = w.actual.rows.len() > 1;
+    record_original_call(
+        call,
+        clock,
+        w,
+        true,
+        false,
+        false,
+        cohort,
+        None,
+        0,
+        committed_override,
+        hook,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_original_call(
+    call: &mut EngineCostCall,
+    clock: &Arc<VirtualClock>,
+    w: Wave,
+    outside: bool,
+    extra_unknown: bool,
+    missing_program_binding: bool,
+    cohort: bool,
+    terminal_override: Option<ferrum_types::FinishReason>,
+    extra_host_ns: u64,
+    committed_override: Option<HostCommittedWork>,
+    hook: impl FnOnce(&mut EngineCostCall),
+) -> Option<Arc<HostStageEvidenceV1>> {
+    use ferrum_interfaces::vnext::*;
+    let start = call.prepare_started_at_ns.unwrap();
     let fixture = if cohort {
         // This existing CPU provider encodes the actual cohort width/tokens in
         // its command; its runtime attribution preserves those same numbers.
@@ -420,6 +478,7 @@ fn record_route_with_settlement(
         OperationDispatch::observe_non_reusable_cost_route(&lane)
     };
     clock.set(start + 1);
+    let call_is_private_prefix = call.rejection == Some(CostCallRejection::CalibrationPreparation);
     let mut context = call.context().unwrap();
     context.prepared_route(
         selection,
@@ -469,14 +528,33 @@ fn record_route_with_settlement(
         }),
         "every submitted compute command must cover the original physical cohort"
     );
-    context.physical_wave(
-        if outside {
-            Err(ActualWaveEvidenceUnknown::GraphPath)
-        } else {
-            Ok(w.actual.clone())
-        },
-        Some(start + 2),
-    );
+    if outside && call_is_private_prefix {
+        let provider_identities = providers
+            .providers()
+            .iter()
+            .map(|provider| {
+                let descriptor = provider.descriptor();
+                CostProviderIdentity {
+                    provider_id: descriptor.provider_id().as_str(),
+                    implementation_fingerprint: descriptor.provider_implementation_fingerprint(),
+                    operation_fingerprint: descriptor.operation_fingerprint(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let pending = crate::continuous_engine::inner::slo_controller::tests::fixture::private_outside_pending(
+            &context, w.actual.rows.clone(), attribution.as_ref().unwrap(), &provider_identities,
+        );
+        context.physical_wave_pending(Ok(pending), Some(start + 2));
+    } else {
+        context.physical_wave(
+            if outside {
+                Err(ActualWaveEvidenceUnknown::GraphPath)
+            } else {
+                Ok(w.actual.clone())
+            },
+            Some(start + 2),
+        );
+    }
     context.route_submission(attribution.as_ref());
     if extra_unknown {
         context.mark_unknown(ActualWaveEvidenceUnknown::InvalidLifecycle);
@@ -509,24 +587,47 @@ fn record_route_with_settlement(
         clock.set(row_start);
         call.begin_host_row(&row.request_id);
         clock.set(row_start + 1);
-        let ActualRowWork::Decode { kv_tokens } = row.work else {
-            panic!("decode fixture")
+        let before = w.host.state.generated_tokens_before;
+        let (work, produces_output) = match row.work {
+            ActualRowWork::Decode { kv_tokens } => (
+                HostCommittedWork::Decode {
+                    kv_tokens_before: kv_tokens,
+                    kv_tokens_after: kv_tokens + 1,
+                    generated_tokens_before: before,
+                    generated_tokens_after: before + 1,
+                },
+                true,
+            ),
+            ActualRowWork::Prefill {
+                offset,
+                count,
+                total_prompt_tokens,
+            } => {
+                let end = offset.checked_add(count).unwrap();
+                let produces_output = end == total_prompt_tokens;
+                (
+                    HostCommittedWork::Prefill {
+                        start: offset,
+                        end,
+                        total_prompt_tokens,
+                        generated_tokens_before: before,
+                        generated_tokens_after: before + u64::from(produces_output),
+                    },
+                    produces_output,
+                )
+            }
+            _ => panic!("route fixture requires prefill/decode"),
         };
         let commit = HostCommitEvidence {
             request_id: row.request_id.clone(),
             owner_incarnation: row.owner_incarnation,
             work_generation: row.work_generation,
             input_index: row.input_index,
-            outcome: HostCommitOutcome::Committed(HostCommittedWork::Decode {
-                kv_tokens_before: kv_tokens,
-                kv_tokens_after: kv_tokens + 1,
-                generated_tokens_before: w.host.state.generated_tokens_before,
-                generated_tokens_after: w.host.state.generated_tokens_before + 1,
-            }),
+            outcome: HostCommitOutcome::Committed(committed_override.unwrap_or(work)),
             committed_at_ns: Some(row_start + 1),
         };
         call.note_host_token_commit(&commit);
-        let generated_after = w.host.state.generated_tokens_before + 1;
+        let generated_after = before + u64::from(produces_output);
         assert!(generated_after <= w.host.state.maximum_output_tokens);
         if generated_after == w.host.state.maximum_output_tokens || terminal_override.is_some() {
             let mut pending = call.host_publication(&commit, true, true).unwrap();
@@ -544,7 +645,9 @@ fn record_route_with_settlement(
             // Same real host commit, now an honest continuing request. A
             // below-capacity row must not manufacture a Length terminal.
             clock.set(row_start + 3);
-            assert!(call.host_publication(&commit, false, true).is_none());
+            assert!(call
+                .host_publication(&commit, false, produces_output)
+                .is_none());
             call.record_host_result(commit);
         }
     }
@@ -553,10 +656,16 @@ fn record_route_with_settlement(
     // Without this actual boundary marker make_sample reports HostMissing.
     call.reject(CostCallRejection::Composite);
     clock.set(start + 20 + 4 * (w.actual.rows.len() as u64 - 1) + extra_host_ns);
-    hook(&mut call);
-    let stages = call.make_host_stages();
-    call.finish();
-    stages
+    // This low-level fixture inspects the producer before finish. Resolve the
+    // same immutable pending facts just as the actual FIFO worker does; the
+    // source8 end-to-end fixture leaves resolution entirely to that worker.
+    if call_is_private_prefix {
+        if let Err(reason) = call.recorder.resolve_pending() {
+            call.dispatch.unknown.get_or_insert(reason);
+        }
+    }
+    hook(call);
+    call.make_host_stages()
 }
 
 // Same real multi-participant admission used by the core submission-readback

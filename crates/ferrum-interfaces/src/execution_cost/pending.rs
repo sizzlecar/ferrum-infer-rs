@@ -9,6 +9,13 @@ pub struct PendingWaveBounds {
     pub retained_rows: usize,
 }
 
+/// Two projections of the same original submission. Physical evidence cannot
+/// turn a rejected numerical graph route into an eligible cost shape.
+pub struct ActualWaveProjection {
+    pub shape: Result<ActualWaveShape, ActualWaveEvidenceUnknown>,
+    pub physical_evidence: Option<ActualWavePhysicalEvidenceV1>,
+}
+
 /// Implementations contain immutable CPU metadata and original-wave values.
 /// They must not own execution resources or consult a runtime/sequence later.
 /// There is deliberately no closure blanket implementation or lazy accessor.
@@ -16,6 +23,12 @@ pub trait PendingActualWaveProjection: Send + Sync {
     fn rows(&self) -> &[ActualWaveRow];
     fn bounds(&self) -> PendingWaveBounds;
     fn project(&self) -> Result<ActualWaveShape, ActualWaveEvidenceUnknown>;
+    fn project_with_physical_evidence(&self) -> ActualWaveProjection {
+        ActualWaveProjection {
+            shape: self.project(),
+            physical_evidence: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -54,19 +67,58 @@ impl PendingActualWave {
     }
     /// Explicit consumer operation. None of the metadata accessors resolves.
     pub fn resolve(self) -> Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
-        let shape = self.projection.project()?;
-        if resolved_shape_bytes(&shape)
-            .is_none_or(|bytes| bytes > self.bounds.maximum_resolved_bytes)
-        {
-            return Err(ActualWaveEvidenceUnknown::Capacity);
+        self.resolve_with_physical_evidence().shape
+    }
+
+    pub(crate) fn resolve_with_physical_evidence(self) -> ActualWaveProjection {
+        let mut result = self.projection.project_with_physical_evidence();
+        // An unusable non-numerical sidecar cannot change the original graph
+        // rejection or rescue another projection error.
+        if result.physical_evidence.is_some_and(|physical| {
+            physical.validate_rows(self.projection.rows()).is_err()
+                || result
+                    .shape
+                    .as_ref()
+                    .is_ok_and(|shape| physical != ActualWavePhysicalEvidenceV1::from_shape(shape))
+        }) {
+            result.physical_evidence = None;
         }
-        if shape.rows != self.projection.rows() {
-            return Err(ActualWaveEvidenceUnknown::ParticipantCorrelation);
+        let validated = (|| {
+            let physical_bytes = if result.physical_evidence.is_some() {
+                std::mem::size_of::<ActualWavePhysicalEvidenceV1>()
+            } else {
+                0
+            };
+            let shape_bytes = match &result.shape {
+                Ok(shape) => {
+                    resolved_shape_bytes(shape).ok_or(ActualWaveEvidenceUnknown::Capacity)?
+                }
+                Err(ActualWaveEvidenceUnknown::GraphPath) => 0,
+                Err(reason) => return Err(*reason),
+            };
+            if shape_bytes
+                .checked_add(physical_bytes)
+                .is_none_or(|bytes| bytes > self.bounds.maximum_resolved_bytes)
+            {
+                return Err(ActualWaveEvidenceUnknown::Capacity);
+            }
+            // Preserve the original numeric error precedence: expansion
+            // capacity, then participant binding, then shape validity.
+            if let Ok(shape) = &result.shape {
+                if shape.rows != self.projection.rows() {
+                    return Err(ActualWaveEvidenceUnknown::ParticipantCorrelation);
+                }
+                shape
+                    .validate(1024)
+                    .map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?;
+            }
+            Ok(())
+        })();
+        if let Err(reason) = validated {
+            result.shape = Err(reason);
+            result.physical_evidence = None;
         }
-        shape
-            .validate(1024)
-            .map_err(|_| ActualWaveEvidenceUnknown::ShapeOverflow)?;
-        Ok(shape)
+        result
     }
 }
 

@@ -145,6 +145,8 @@ pub(in crate::continuous_engine) struct EngineCostPreparation {
     participants: Vec<CostObservationParticipant>,
     rejection: Option<CostCallRejection>,
     preparation_intervention: bool,
+    private_prefix_rows:
+        Vec<super::super::calibration::token_preparation::BoundPrefixPreparationRow>,
     structured_actual_sample: bool,
     numeric_observation: ferrum_interfaces::vnext::DeviceCostObservationDemand,
     live_ticket: Option<super::live_calibration::Ticket>,
@@ -163,14 +165,26 @@ impl EngineCostPreparation {
             self.rejection = Some(CostCallRejection::FrontierMismatch);
             return;
         };
-        self.participants.push(CostObservationParticipant {
+        let participant = CostObservationParticipant {
             request_id: sequence.request_id.clone(),
             owner_incarnation: frontier.owner_incarnation.get(),
             work_generation: frontier.work_generation.get(),
             input_index: self.participants.len() as u32,
             output_policy_signature: participant_output_policy(sequence),
             host_features: participant_host_features(sequence),
-        });
+        };
+        if let Some(bound) = sequence
+            .calibration_prefix
+            .as_ref()
+            .and_then(|prefix| prefix.bind_cost_row(sequence, &participant))
+        {
+            if self.private_prefix_rows.try_reserve_exact(1).is_err() {
+                self.rejection = Some(CostCallRejection::RecorderCapacity);
+                return;
+            }
+            self.private_prefix_rows.push(bound);
+        }
+        self.participants.push(participant);
     }
     pub fn begin(mut self) -> Option<ObservedCostCall> {
         self.finished = true;
@@ -199,6 +213,7 @@ impl EngineCostPreparation {
         )
         .ok()
         .map(|mut call| {
+            call.private_prefix_rows = std::mem::take(&mut self.private_prefix_rows);
             if preparation_intervention {
                 // Reject only numeric training. Real recorder/host settlement
                 // and their original FIFO still exist for the next protocol.
@@ -239,6 +254,7 @@ mod audit_tests {
                 participants: Vec::new(),
                 rejection: None,
                 preparation_intervention: false,
+                private_prefix_rows: Vec::new(),
                 structured_actual_sample: false,
                 numeric_observation:
                     ferrum_interfaces::vnext::DeviceCostObservationDemand::Required,
@@ -318,6 +334,7 @@ impl EngineInner {
             participants: Vec::new(),
             rejection: None,
             preparation_intervention: false,
+            private_prefix_rows: Vec::new(),
             live_ticket,
             source_generation: capture.source_generation,
             structured_actual_sample: capture.structured_sample,

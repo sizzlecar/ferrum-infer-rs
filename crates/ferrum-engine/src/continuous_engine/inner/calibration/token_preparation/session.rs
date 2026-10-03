@@ -147,11 +147,15 @@ impl CalibrationSession {
                 owner: frontier.owner_incarnation.get(),
                 original_policy: normal_policy,
                 original_numeric: normal_numeric,
+                captured_prepared_policy: None,
                 pending_commit: None,
             });
             self.engine.inner.refresh_sequence_cost_policy(sequence);
             let prepared_policy =
                 sequence.current_host_cost_policy(self.engine.inner.tokenizer.as_ref());
+            if let Some(installed) = sequence.calibration_prefix.as_mut() {
+                installed.captured_prepared_policy = prepared_policy;
+            }
             if let Some(InstalledPrefix {
                 authority:
                     PrefixPreparationAuthority::InstalledPlainTextV8 {
@@ -444,15 +448,21 @@ impl CalibrationSession {
         if let Some(error) = &chain_error {
             run.failure.get_or_insert_with(|| error.clone());
         }
-        run.pending_wave = Some(PrefixWaveEvidenceV1 {
-            rows,
-            submission: report.submission,
-            error: report.error.as_ref().map(ToString::to_string),
-            host_stages: report.host_stages.clone(),
-            host_stage_queue: report.host_stage_queue,
-            actual_evidence_diagnostic: report.actual_evidence_diagnostic.clone(),
-            chain_error,
-        });
+        run.pending_wave = Some(CapturedPrefixWaveV5(
+            PrefixWaveEvidenceV1 {
+                rows,
+                submission: report.submission,
+                error: report.error.as_ref().map(ToString::to_string),
+                host_stages: report.host_stages.clone(),
+                host_stage_queue: report.host_stage_queue,
+                actual_evidence_diagnostic: report.actual_evidence_diagnostic.clone(),
+                chain_error,
+            },
+            report
+                .host_stages
+                .as_ref()
+                .and_then(|stages| report.observation_capture.private_prefix_settlement(stages)),
+        ));
         drop(sequences);
         if self.prefix_source5 {
             self.record_prefix_source_wave_v5();

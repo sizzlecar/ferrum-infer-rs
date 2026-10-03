@@ -339,7 +339,18 @@ impl EngineCostCall {
                         ..
                     } => generated_tokens_before,
                 };
-                if !host.supports_installed_plain_text_content()
+                let private_prefix = self.rejection
+                    == Some(CostCallRejection::CalibrationPreparation)
+                    && self.live_ticket.is_none()
+                    && self
+                        .calibration_capture
+                        .as_ref()
+                        .is_some_and(|capture| capture.requests_original_route())
+                    && self
+                        .private_prefix_rows
+                        .iter()
+                        .any(|bound| bound.matches(&self.participants[index]));
+                if (!host.supports_installed_plain_text_content() && !private_prefix)
                     || before != host.state.generated_tokens_before
                     || sample::validate_work(actual.work, work).is_err()
                 {

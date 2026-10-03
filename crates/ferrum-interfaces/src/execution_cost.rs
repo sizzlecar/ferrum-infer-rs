@@ -129,7 +129,8 @@ pub enum ExecutorCostObservationCapability {
     TracedComposite,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActualWaveKind {
     Decode,
     Prefill,
@@ -138,7 +139,8 @@ pub enum ActualWaveKind {
     Maintenance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActualWavePath {
     PlanRuntime,
     NativeUnified,
@@ -157,7 +159,8 @@ pub enum ActualWaveGraphState {
     ConfiguredEager,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActualWaveRowOrder {
     Ordered,
     /// Only a backend declaration, never inferred by sorting observation rows.
@@ -207,6 +210,36 @@ pub struct ActualWaveShape {
     pub restore_bytes: u64,
     pub maintenance_bytes: u64,
     pub maintenance_units: u32,
+}
+
+/// Non-numerical facts from the original actual-wave projector. They retain no
+/// graph eligibility, provider model or execution authority. The recorder must
+/// bind them to the original pending rows and submitted route before retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ActualWavePhysicalEvidenceV1 {
+    pub kind: ActualWaveKind,
+    pub path: ActualWavePath,
+    pub row_order: ActualWaveRowOrder,
+    pub restore_bytes: u64,
+    pub maintenance_bytes: u64,
+    pub maintenance_units: u32,
+}
+
+impl ActualWavePhysicalEvidenceV1 {
+    pub fn from_shape(shape: &ActualWaveShape) -> Self {
+        Self {
+            kind: shape.kind,
+            path: shape.path,
+            row_order: shape.row_order,
+            restore_bytes: shape.restore_bytes,
+            maintenance_bytes: shape.maintenance_bytes,
+            maintenance_units: shape.maintenance_units,
+        }
+    }
+
+    fn validate_rows(&self, rows: &[ActualWaveRow]) -> Result<(), CostRecorderError> {
+        validate_physical_rows(self, rows, 1024)
+    }
 }
 // Equality retains the legacy exact contract. Passive statistics must be
 // compared explicitly and can never alter an execution/route equality gate.
@@ -262,53 +295,69 @@ impl ActualWaveShape {
                 return Err(CostRecorderError::InvalidShape);
             }
         }
-        let mut decode = 0;
-        let mut prefill = 0;
-        for (index, row) in self.rows.iter().enumerate() {
-            if self.rows[..index].iter().any(|other| {
-                other.input_index == row.input_index || other.request_id == row.request_id
-            }) {
-                return Err(CostRecorderError::InvalidShape);
-            }
-            match row.work {
-                ActualRowWork::Decode { kv_tokens } if kv_tokens > 0 => decode += 1,
-                ActualRowWork::Prefill {
-                    offset,
-                    count,
-                    total_prompt_tokens,
-                } if count > 0
-                    && offset
-                        .checked_add(count)
-                        .is_some_and(|end| end <= total_prompt_tokens) =>
-                {
-                    prefill += 1
-                }
-                ActualRowWork::Restore if self.kind == ActualWaveKind::Restore => {}
-                ActualRowWork::Maintenance if self.kind == ActualWaveKind::Maintenance => {}
-                _ => return Err(CostRecorderError::InvalidShape),
-            }
-        }
-        let valid = match self.kind {
-            ActualWaveKind::Decode => decode > 0 && prefill == 0,
-            ActualWaveKind::Prefill => prefill > 0 && decode == 0,
-            ActualWaveKind::Mixed => prefill > 0 && decode > 0,
-            ActualWaveKind::Restore => decode == 0 && prefill == 0 && self.restore_bytes > 0,
-            ActualWaveKind::Maintenance => {
-                decode == 0
-                    && prefill == 0
-                    && self.maintenance_bytes > 0
-                    && self.maintenance_units > 0
-            }
-        };
-        if !valid
-            || (self.kind != ActualWaveKind::Restore && self.restore_bytes != 0)
-            || (self.kind != ActualWaveKind::Maintenance
-                && (self.maintenance_bytes != 0 || self.maintenance_units != 0))
+        validate_physical_rows(
+            &ActualWavePhysicalEvidenceV1::from_shape(self),
+            &self.rows,
+            max_rows,
+        )
+    }
+}
+
+fn validate_physical_rows(
+    physical: &ActualWavePhysicalEvidenceV1,
+    rows: &[ActualWaveRow],
+    max_rows: usize,
+) -> Result<(), CostRecorderError> {
+    if rows.len() > max_rows {
+        return Err(CostRecorderError::RowCapacity);
+    }
+    let mut decode = 0;
+    let mut prefill = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if rows[..index]
+            .iter()
+            .any(|other| other.input_index == row.input_index || other.request_id == row.request_id)
         {
             return Err(CostRecorderError::InvalidShape);
         }
-        Ok(())
+        match row.work {
+            ActualRowWork::Decode { kv_tokens } if kv_tokens > 0 => decode += 1,
+            ActualRowWork::Prefill {
+                offset,
+                count,
+                total_prompt_tokens,
+            } if count > 0
+                && offset
+                    .checked_add(count)
+                    .is_some_and(|end| end <= total_prompt_tokens) =>
+            {
+                prefill += 1
+            }
+            ActualRowWork::Restore if physical.kind == ActualWaveKind::Restore => {}
+            ActualRowWork::Maintenance if physical.kind == ActualWaveKind::Maintenance => {}
+            _ => return Err(CostRecorderError::InvalidShape),
+        }
     }
+    let valid = match physical.kind {
+        ActualWaveKind::Decode => decode > 0 && prefill == 0,
+        ActualWaveKind::Prefill => prefill > 0 && decode == 0,
+        ActualWaveKind::Mixed => prefill > 0 && decode > 0,
+        ActualWaveKind::Restore => decode == 0 && prefill == 0 && physical.restore_bytes > 0,
+        ActualWaveKind::Maintenance => {
+            decode == 0
+                && prefill == 0
+                && physical.maintenance_bytes > 0
+                && physical.maintenance_units > 0
+        }
+    };
+    if !valid
+        || (physical.kind != ActualWaveKind::Restore && physical.restore_bytes != 0)
+        || (physical.kind != ActualWaveKind::Maintenance
+            && (physical.maintenance_bytes != 0 || physical.maintenance_units != 0))
+    {
+        return Err(CostRecorderError::InvalidShape);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +386,8 @@ pub struct ActualWaveObservation {
     /// None retains a real physical-wave occurrence whose actual path could
     /// not be proven. Such an observation cannot train a guessed shape.
     pub shape: Option<ActualWaveShape>,
+    /// Independent actual-work facts, never a replacement numerical shape.
+    pub physical_evidence: Option<ActualWavePhysicalEvidenceV1>,
     pub shape_unknown: Option<ActualWaveEvidenceUnknown>,
     pub boundary: WaveObservationBoundary,
     pub prepare_started_at_ns: u64,

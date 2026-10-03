@@ -144,7 +144,7 @@ impl StructuredServiceOutsideRouteV6 {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct OutsideEvidence {
+pub(in super::super) struct OutsideEvidence {
     protocol: String,
     selection: RouteSelection,
     selected_at_ns: u64,
@@ -352,6 +352,26 @@ pub(super) fn validate_settlement_parts(
     e: &OutsideEvidence,
     frontiers: &mut physical::Frontiers,
 ) -> Result<(usize, u64), CostProfileError> {
+    validate_settlement_parts_for(
+        fingerprint,
+        source_opened,
+        opened,
+        issued_at_ns,
+        e,
+        frontiers,
+        false,
+    )
+}
+
+fn validate_settlement_parts_for(
+    fingerprint: &ProfileFingerprint,
+    source_opened: u64,
+    opened: u64,
+    issued_at_ns: u64,
+    e: &OutsideEvidence,
+    frontiers: &mut physical::Frontiers,
+    private_prefix: bool,
+) -> Result<(usize, u64), CostProfileError> {
     let fail =
         || invalid("source6 OutsideDeclaredRoute lacks original selection/physical/host proof");
     let r = &e.selection;
@@ -480,7 +500,19 @@ pub(super) fn validate_settlement_parts(
             _ => return Err(fail()),
         };
         tokens = tokens.checked_add(work_tokens).ok_or_else(fail)?;
-        if !host.supports_installed_plain_text_content()
+        let host_supported = if private_prefix {
+            host.policy.empirical_content_domain.is_none()
+                && host.state.sampling_history_scope
+                    == ferrum_interfaces::execution_cost::CostSamplingHistoryScope::FullGeneration
+                && host.state.sampling_history_tokens == generated
+                && host.state.completion_state_signature
+                    == ferrum_interfaces::execution_cost::satisfied_completion_cost_signature()
+                && row.terminal.is_none()
+                && row.completion_started_at_ns.is_none()
+        } else {
+            host.supports_installed_plain_text_content()
+        };
+        if !host_supported
             || maximum == 0
             || generated >= maximum
             || before.request_id.is_empty()
@@ -576,6 +608,90 @@ pub(super) fn validate_settlement_parts(
 }
 
 impl OutsideEvidence {
+    pub(in super::super) fn prefix_frontier_matches(
+        &self,
+        request_id: &str,
+        generated: u64,
+        pending_utf8: bool,
+    ) -> bool {
+        self.prepared_rows
+            .iter()
+            .find(|row| row.request_id == request_id)
+            .is_some_and(|row| {
+                row.host_features.state.generated_tokens_before == generated
+                    && row.host_features.state.pending_decoded_utf8 == pending_utf8
+            })
+    }
+
+    /// Journal validation only. This does not mint an original live receipt;
+    /// its caller must additionally validate the declared prefix lifecycle and
+    /// the independent physical-work contract. Ordinary outside validation
+    /// always retains its installed plain-text policy above.
+    pub(in super::super) fn validate_prefix_preparation(
+        &self,
+        fingerprint: &ProfileFingerprint,
+        source_opened: u64,
+        earliest: u64,
+        outer: &Stages,
+    ) -> Result<u64, CostProfileError> {
+        let fail = || invalid("outside preparation differs from original host settlement");
+        let stages = &self.host_stages;
+        if self.physical.shape_unknown.as_deref() != Some("graph_path")
+            || stages.actual_shape.is_some()
+            || outer.actual_shape.is_some()
+            || stages.statistical_evidence.is_some()
+            || outer.statistical_evidence.is_some()
+            || stages.structured_evidence.is_some()
+            || outer.structured_evidence.is_some()
+            || stages.schema_version != outer.schema_version
+            || stages.call_id != outer.call_id
+            || stages.presubmit_prediction != outer.presubmit_prediction
+            || stages.fingerprint != outer.fingerprint
+            || stages.prepare_started_at_ns != outer.prepare_started_at_ns
+            || stages.executor_returned_at_ns != outer.executor_returned_at_ns
+            || stages.finalized_at_ns != outer.finalized_at_ns
+            || stages.full_wall_ns != outer.full_wall_ns
+            || stages.completeness != outer.completeness
+            || stages.rows.len() != outer.rows.len()
+        {
+            return Err(fail());
+        }
+        for row in &stages.rows {
+            let original = outer
+                .rows
+                .iter()
+                .find(|original| original.input_index == row.input_index)
+                .ok_or_else(fail)?;
+            if row.request_id != original.request_id
+                || row.owner_incarnation != original.owner_incarnation
+                || row.work_generation != original.work_generation
+                || row.actual_work.actual() != original.actual_work.actual()
+                || row.host_processing_ordinal != original.host_processing_ordinal
+                || row.host_started_at_ns != original.host_started_at_ns
+                || row.token_committed_at_ns != original.token_committed_at_ns
+                || row.output_published_at_ns != original.output_published_at_ns
+                || row.completion_started_at_ns.is_some()
+                || original.completion_started_at_ns.is_some()
+                || row.settled_at_ns != original.settled_at_ns
+                || row.terminal.is_some()
+                || original.terminal.is_some()
+                || row.completeness != original.completeness
+            {
+                return Err(fail());
+            }
+        }
+        let (_, finalized) = validate_settlement_parts_for(
+            fingerprint,
+            source_opened,
+            earliest,
+            stages.prepare_started_at_ns.ok_or_else(fail)?,
+            self,
+            &mut physical::Frontiers::default(),
+            true,
+        )?;
+        Ok(finalized)
+    }
+
     pub(super) fn original_cohort_rows(
         &self,
     ) -> Result<Vec<super::super::lifecycle::OriginalCohortRow<'_>>, CostProfileError> {

@@ -6,6 +6,7 @@ pub(super) fn validate(
     source_opened_at_ns: u64,
     offered: &[Offered],
     s: &Stages,
+    outside: Option<&OutsidePreparation>,
     earliest: u64,
 ) -> Result<u64, CostProfileError> {
     let fail = || invalid("incomplete original source5 preparation settlement");
@@ -20,16 +21,39 @@ pub(super) fn validate(
     {
         return Err(fail());
     }
-    let shape = s.actual_shape.as_ref().ok_or_else(fail)?;
-    let exact = &shape.exact;
-    if exact.path != ProfileExecutionPath::PlanRuntime
-        || exact.order != ProfileBatchOrder::Ordered
-        || exact.restore_bytes != 0
-        || exact.maintenance_bytes != 0
-        || exact.maintenance_units != 0
-    {
-        return Err(fail());
-    }
+    let exact = match (&s.actual_shape, outside) {
+        (Some(shape), None) => {
+            let exact = &shape.exact;
+            if exact.path != ProfileExecutionPath::PlanRuntime
+                || exact.order != ProfileBatchOrder::Ordered
+                || exact.restore_bytes != 0
+                || exact.maintenance_bytes != 0
+                || exact.maintenance_units != 0
+            {
+                return Err(fail());
+            }
+            Some(exact)
+        }
+        (None, Some(outside)) => {
+            let physical = &outside.physical_work;
+            if physical.path != ProfileExecutionPath::PlanRuntime
+                || physical.row_order != ProfileBatchOrder::Ordered
+                || physical.restore_bytes != 0
+                || physical.maintenance_bytes != 0
+                || physical.maintenance_units != 0
+                || outside.route.validate_prefix_preparation(
+                    fingerprint,
+                    source_opened_at_ns,
+                    earliest,
+                    s,
+                )? != s.finalized_at_ns.ok_or_else(fail)?
+            {
+                return Err(fail());
+            }
+            None
+        }
+        _ => return Err(fail()),
+    };
     let prepare = s.prepare_started_at_ns.ok_or_else(fail)?;
     let returned = s.executor_returned_at_ns.ok_or_else(fail)?;
     let finalized = s.finalized_at_ns.ok_or_else(fail)?;
@@ -51,6 +75,13 @@ pub(super) fn validate(
             .ok_or_else(fail)?;
         let emits = before.work.emits_token().map_err(numeric_error)?;
         if row.owner_incarnation != before.before.owner_incarnation
+            || outside.is_some_and(|outside| {
+                !outside.route.prefix_frontier_matches(
+                    &row.request_id,
+                    before.before.generated_tokens,
+                    !before.before.pending_utf8.is_empty(),
+                )
+            })
             || row.work_generation != before.before.work_generation
             || row.actual_work.actual() != prepared::actual_work(before.work)
             || row.completeness != "complete_single_wave"
@@ -118,9 +149,9 @@ pub(super) fn validate(
     } else {
         ProfileWaveKind::Mixed
     };
-    if exact.kind != kind
-        || exact.decode_kv_tokens != decode
-        || exact.prefill_chunks != prefill
+    if exact.is_some_and(|exact| {
+        exact.kind != kind || exact.decode_kv_tokens != decode || exact.prefill_chunks != prefill
+    }) || outside.is_some_and(|outside| outside.physical_work.kind != kind)
         || end.checked_sub(prepare).filter(|v| *v > 0) != s.full_wall_ns
     {
         return Err(fail());

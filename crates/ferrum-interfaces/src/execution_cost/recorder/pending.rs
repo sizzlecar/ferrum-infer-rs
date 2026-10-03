@@ -88,6 +88,7 @@ impl BoundedWaveRecorder {
             call_id: self.call_id,
             physical_wave_ordinal,
             shape: None,
+            physical_evidence: None,
             shape_unknown: None,
             boundary,
             prepare_started_at_ns,
@@ -119,7 +120,25 @@ impl BoundedWaveRecorder {
             let Some(pending) = self.pending[index].take() else {
                 continue;
             };
-            match pending.resolve() {
+            // The sidecar belongs to these actual pending rows, not merely a
+            // selected recipe. Preserve it only beside the original consumed
+            // submission for this one completed physical wave.
+            let physical_bound = self.observations.len() == 1
+                && self.prepared_route_attempts == 1
+                && !self.invalid_observation
+                && !self.route_unknown
+                && self.lost_observations == 0
+                && self.prepared_route.as_ref().is_some_and(|prepared| {
+                    prepared.submitted().is_some() && prepared.rows() == pending.rows()
+                })
+                && self.observations[index].outcome == Some(ActualWaveOutcome::Completed)
+                && self.observations[index].boundary
+                    == WaveObservationBoundary::IsolatedPreparationToCommit;
+            let resolved = pending.resolve_with_physical_evidence();
+            self.observations[index].physical_evidence = physical_bound
+                .then_some(resolved.physical_evidence)
+                .flatten();
+            match resolved.shape {
                 Ok(shape) => self.observations[index].shape = Some(shape),
                 Err(reason) => {
                     self.observations[index].shape_unknown = Some(reason);

@@ -7,6 +7,13 @@ pub(super) struct ObservedRoute {
     pub graph: ActualWaveGraphState,
 }
 
+/// Actual command structure survives a numerical graph-population rejection.
+/// Earlier command/replay errors still reject the entire projection.
+pub(super) struct ObservedRouteComponents {
+    pub canonical: CanonicalWaveCostBuilder,
+    pub graph: std::result::Result<ActualWaveGraphState, ActualWaveEvidenceUnknown>,
+}
+
 #[cfg(test)]
 pub(super) fn actual_route<'a>(
     attribution: Option<&DeviceSubmissionAttribution>,
@@ -71,6 +78,30 @@ pub(super) fn actual_route_projection<'a>(
     structured_capture: bool,
     statistics: bool,
 ) -> std::result::Result<ObservedRoute, ActualWaveEvidenceUnknown> {
+    let parts = actual_route_components(
+        attribution,
+        provider_at,
+        graph_capability,
+        product,
+        retries,
+        structured_capture,
+        statistics,
+    )?;
+    Ok(ObservedRoute {
+        canonical: parts.canonical,
+        graph: parts.graph?,
+    })
+}
+
+pub(super) fn actual_route_components<'a>(
+    attribution: Option<&DeviceSubmissionAttribution>,
+    provider_at: impl Fn(u32) -> Option<CostProviderIdentity<'a>>,
+    graph_capability: DeviceCostGraphCaptureCapability,
+    product: CostProductOutput,
+    retries: u32,
+    structured_capture: bool,
+    statistics: bool,
+) -> std::result::Result<ObservedRouteComponents, ActualWaveEvidenceUnknown> {
     let attribution = attribution.ok_or(ActualWaveEvidenceUnknown::GraphPath)?;
     let commands = attribution.commands();
     if commands.is_empty() || commands.len() > MAX_COST_COMMANDS {
@@ -110,8 +141,8 @@ pub(super) fn actual_route_projection<'a>(
                 .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?;
         }
     }
-    let graph = super::graph_state(graph_capability, replayed, attribution.graph_evidence())?;
-    Ok(ObservedRoute { canonical, graph })
+    let graph = super::graph_state(graph_capability, replayed, attribution.graph_evidence());
+    Ok(ObservedRouteComponents { canonical, graph })
 }
 
 #[cfg(test)]

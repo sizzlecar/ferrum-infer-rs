@@ -805,14 +805,13 @@ impl CanonicalWaveCostBuilder {
         })
     }
 
-    pub fn finish(
-        mut self,
+    /// Validate the original commands, complete replay segments and inference
+    /// rows independently of numerical graph eligibility. This does not create
+    /// a shape, assign a graph state or qualify a statistical sample.
+    pub fn validate_physical_structure(
+        &self,
         kind: ActualWaveKind,
-        path: ActualWavePath,
-        graph: ActualWaveGraphState,
-        row_order: ActualWaveRowOrder,
-        recurrent_state_bytes: u64,
-    ) -> Result<CanonicalWaveCostShape, CanonicalCostError> {
+    ) -> Result<(), CanonicalCostError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -840,6 +839,18 @@ impl CanonicalWaveCostBuilder {
         ) {
             return Err(CanonicalCostError::InvalidRow);
         }
+        Ok(())
+    }
+
+    pub fn finish(
+        mut self,
+        kind: ActualWaveKind,
+        path: ActualWavePath,
+        graph: ActualWaveGraphState,
+        row_order: ActualWaveRowOrder,
+        recurrent_state_bytes: u64,
+    ) -> Result<CanonicalWaveCostShape, CanonicalCostError> {
+        self.validate_physical_structure(kind)?;
         let raw: [u8; 32] = self.provider.finalize().into();
         let provider_signature = if row_order == ActualWaveRowOrder::Ordered {
             let mut order = self.role_order;

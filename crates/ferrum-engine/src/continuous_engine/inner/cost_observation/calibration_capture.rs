@@ -41,6 +41,7 @@ pub(in crate::continuous_engine) struct CostCalibrationCapture {
     value: OnceLock<Arc<CostCalibrationResult>>,
     host_stages: OnceLock<Arc<HostStageEvidenceV1>>,
     no_submission: OnceLock<Arc<OriginalNoSubmissionReceipt>>,
+    private_settlement: OnceLock<Arc<CompletePrivateCalibrationSettlement>>,
     host_stage_queue: OnceLock<HostStageQueueReceipt>,
     actual_evidence_diagnostic: OnceLock<Arc<CalibrationActualEvidenceDiagnostic>>,
     original_route_capture: bool,
@@ -281,6 +282,32 @@ impl CostCalibrationCapture {
         }
     }
 
+    pub(in crate::continuous_engine::inner) fn private_prefix_settlement(
+        &self,
+        stages: &Arc<HostStageEvidenceV1>,
+    ) -> Option<Arc<CompletePrivateCalibrationSettlement>> {
+        if self.conflict.load(Ordering::Acquire)
+            || !self
+                .host_stages
+                .get()
+                .is_some_and(|original| Arc::ptr_eq(original, stages))
+        {
+            return None;
+        }
+        let proof = self.private_settlement.get()?;
+        proof.prefix_observed_at(stages)?;
+        Some(Arc::clone(proof))
+    }
+    pub(super) fn complete_private_settlement(&self, proof: CompletePrivateCalibrationSettlement) {
+        if self
+            .host_stages
+            .get()
+            .is_some_and(|stages| proof.prefix_observed_at(stages).is_some())
+            && self.private_settlement.set(Arc::new(proof)).is_err()
+        {
+            self.mark_conflict();
+        }
+    }
     pub(super) fn complete_host_stages(&self, stages: Arc<HostStageEvidenceV1>) {
         if self.host_stages.set(stages).is_err() {
             self.mark_conflict();

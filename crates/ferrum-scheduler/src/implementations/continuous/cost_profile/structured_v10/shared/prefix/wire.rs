@@ -169,6 +169,8 @@ pub(super) enum PreparationRecord {
         reconciled: bool,
         queue: Option<Queue>,
         host_stages: Option<Stages>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outside_preparation: Option<OutsidePreparation>,
         #[serde(deserialize_with = "bounded_entries")]
         rows: Vec<Completed>,
         failure: Option<String>,
@@ -179,6 +181,26 @@ pub(super) enum PreparationRecord {
         slot: usize,
         receipt: Released,
     },
+}
+
+/// Untrusted copies of the same original route and independently checked
+/// physical work. Neither grants live selector or numerical authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OutsidePreparation {
+    pub route: super::super::super::service::OutsideEvidence,
+    pub physical_work: PreparationPhysicalWork,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreparationPhysicalWork {
+    pub kind: ProfileWaveKind,
+    pub path: ProfileExecutionPath,
+    pub row_order: ProfileBatchOrder,
+    pub restore_bytes: u64,
+    pub maintenance_bytes: u64,
+    pub maintenance_units: u32,
 }
 
 /// Untrusted transfer metadata; no public value can issue native execution.

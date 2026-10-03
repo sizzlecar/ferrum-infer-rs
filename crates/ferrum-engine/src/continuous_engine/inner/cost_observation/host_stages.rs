@@ -139,16 +139,44 @@ impl<'a> OriginalHostStages<'a> {
 /// Original, fully settled private calibration. Only the host-stage producer
 /// can mint this receipt; diagnostic copies and numerical qualifiers cannot.
 /// The Arc is shared transiently while the FIFO entry is resolved.
-pub(super) struct CompletePrivateCalibrationSettlement {
+#[derive(Debug)]
+pub(in crate::continuous_engine::inner) struct CompletePrivateCalibrationSettlement {
     stages: Arc<HostStageEvidenceV1>,
     kind: PrivateCalibrationSettlementKind,
+    physical_work: Option<ActualWavePhysicalEvidenceV1>,
 }
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum PrivateCalibrationSettlementKind {
     PrefixPreparation,
     StartupReadiness,
 }
 impl CompletePrivateCalibrationSettlement {
+    pub(super) const fn retained_bytes() -> usize {
+        std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()
+    }
+    /// Export is available only from this producer's same-Arc private receipt.
+    /// The diagnostic route remains insufficient to construct a live receipt.
+    pub(in crate::continuous_engine::inner) fn outside_preparation<'a>(
+        &'a self,
+        stages: &'a Arc<HostStageEvidenceV1>,
+    ) -> Option<impl serde::Serialize + 'a> {
+        self.prefix_observed_at(stages)?;
+        let physical_work = self.physical_work?;
+        let route = stages
+            .route_evidence
+            .as_ref()
+            .filter(|route| route.is_outside())?;
+        #[derive(serde::Serialize)]
+        struct View<R: serde::Serialize> {
+            route: R,
+            physical_work: ActualWavePhysicalEvidenceV1,
+        }
+        Some(View {
+            route: route.outside_diagnostic(stages),
+            physical_work,
+        })
+    }
+
     pub(super) fn prefix_observed_at(&self, stages: &Arc<HostStageEvidenceV1>) -> Option<u64> {
         matches!(
             self.kind,
@@ -654,6 +682,8 @@ impl EngineCostCall {
             retained_waves = self.recorder.observations().len(),
             dispatch_outcome = ?self.dispatch.outcome,
             dispatch_unknown = ?self.dispatch.unknown,
+            physical_evidence = ?wave.and_then(|wave| wave.physical_evidence),
+            bound_prefix_rows = self.private_prefix_rows.len(),
             call_boundary = ?self.boundary,
             wave_outcome = ?wave.and_then(|wave| wave.outcome),
             wave_boundary = ?wave.map(|wave| wave.boundary),
@@ -922,6 +952,37 @@ impl EngineCostCall {
         // Private calibration exclusion comes from this original physical
         // recorder and complete host settlement, never a public reason alone.
         // Prefix intervention retains its stricter no-terminal rule below.
+        let numeric_private = self.dispatch.unknown.is_none()
+            && stages.actual_shape.is_some()
+            && shape.is_some_and(|actual| {
+                actual.path == ActualWavePath::PlanRuntime
+                    && actual.row_order == ActualWaveRowOrder::Ordered
+                    && actual.restore_bytes == 0
+                    && actual.maintenance_bytes == 0
+                    && actual.maintenance_units == 0
+            });
+        // Graph numerical eligibility remains Unknown. Only the original actual
+        // projector may supply the independent no-additional-work facts.
+        let outside_private = wave.physical_evidence.filter(|physical| {
+            self.rejection == Some(CostCallRejection::CalibrationPreparation)
+                && shape.is_none()
+                && self.dispatch.unknown == Some(ActualWaveEvidenceUnknown::GraphPath)
+                && stages
+                    .route_evidence
+                    .as_ref()
+                    .is_some_and(|route| route.is_outside())
+                && self.private_prefix_rows.len() == self.participants.len()
+                && self.participants.iter().all(|participant| {
+                    self.private_prefix_rows
+                        .iter()
+                        .any(|bound| bound.matches(participant))
+                })
+                && physical.path == ActualWavePath::PlanRuntime
+                && physical.row_order == ActualWaveRowOrder::Ordered
+                && physical.restore_bytes == 0
+                && physical.maintenance_bytes == 0
+                && physical.maintenance_units == 0
+        });
         let complete_private = self.stage_rejection.is_none()
             && self.live_ticket.is_none()
             && self
@@ -930,21 +991,13 @@ impl EngineCostCall {
                 .is_some_and(|capture| capture.requests_original_route())
             && stages.completeness == HostStageCompleteness::CompleteSingleWave
             && stages.fingerprint.is_some()
-            && stages.actual_shape.is_some()
             && stages.full_wall_ns.is_some()
             && !stages.rows.is_empty()
             && stages
                 .rows
                 .iter()
                 .all(|row| row.completeness == HostStageCompleteness::CompleteSingleWave)
-            && self.dispatch.unknown.is_none()
-            && shape.is_some_and(|actual| {
-                actual.path == ActualWavePath::PlanRuntime
-                    && actual.row_order == ActualWaveRowOrder::Ordered
-                    && actual.restore_bytes == 0
-                    && actual.maintenance_bytes == 0
-                    && actual.maintenance_units == 0
-            });
+            && (numeric_private || outside_private.is_some());
         let kind = if complete_private
             && self.rejection == Some(CostCallRejection::CalibrationPreparation)
             && stages
@@ -974,6 +1027,7 @@ impl EngineCostCall {
         let preparation = kind.map(|kind| CompletePrivateCalibrationSettlement {
             stages: Arc::clone(&stages),
             kind,
+            physical_work: outside_private,
         });
         Some((stages, preparation))
     }

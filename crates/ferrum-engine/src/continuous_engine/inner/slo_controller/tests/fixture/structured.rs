@@ -298,3 +298,159 @@ pub(super) fn provider_identities<'a>(
         })
         .collect()
 }
+
+/// The actual controlled Core submission is the authority for this test-only
+/// projector. It retains canonical CPU facts, never a diagnostic receipt.
+pub(in crate::continuous_engine::inner) fn private_outside_pending(
+    context: &PlanRuntimeCostObservationContext<'_>,
+    rows: Vec<ActualWaveRow>,
+    actual: &vnext::BoundDeviceSubmissionAttribution,
+    providers: &[CostProviderIdentity<'_>],
+) -> PendingActualWave {
+    let mut canonical = CanonicalWaveCostBuilder::new_exact(0, CostProductOutput::FullLogits);
+    assert!(!actual.device().commands().is_empty());
+    assert!(actual.device().replayed_segments().is_empty());
+    for command in actual.device().commands() {
+        // The actual Core program may coalesce its parameter bindings into a
+        // node-less transfer. Those are inference work, not prefix maintenance.
+        // Keep this fixture's supported commands narrow and validate their real
+        // phase/counters before the shared canonical structure checks.
+        assert_eq!(command.execution_path(), vnext::DeviceExecutionPath::Eager);
+        match command.command_phase() {
+            vnext::DeviceCommandPhase::Compute => {
+                assert!(command.node_index().is_some());
+                assert!(command.compute_dispatch_count() > 0);
+                assert_eq!(command.transfer_command_count(), 0);
+            }
+            vnext::DeviceCommandPhase::DynamicBinding => {
+                assert!(matches!(
+                    command.native_op_id(),
+                    "test_program_binding"
+                        | "test_coalesced_program_binding"
+                        | "test_dynamic_binding"
+                ));
+                assert_eq!(command.compute_dispatch_count(), 0);
+                assert_eq!(command.transfer_command_count(), 1);
+            }
+            phase => panic!("unexpected private inference fixture phase: {phase:?}"),
+        }
+        let provider = command.node_index().map(|index| {
+            *providers
+                .get(index as usize)
+                .expect("actual bound provider")
+        });
+        canonical
+            .physical_command(CostPhysicalCommand::from_attribution(command, provider))
+            .unwrap();
+    }
+    let mut row_failure = None;
+    for row in &rows {
+        let participant = context.participant(&row.request_id).unwrap();
+        assert_eq!(row.owner_incarnation, participant.owner_incarnation);
+        assert_eq!(row.work_generation, participant.work_generation);
+        assert_eq!(row.input_index, participant.input_index);
+        let recorded = canonical.row(CanonicalCostRow {
+            work: row.work,
+            host_policy_signature: participant.output_policy_signature.unwrap(),
+            host_features: participant.host_features,
+            mask_upload_required: false,
+            output: match row.work {
+                ActualRowWork::Prefill {
+                    offset,
+                    count,
+                    total_prompt_tokens,
+                } => CostRowOutput::Prefill {
+                    final_logits: offset.checked_add(count) == Some(total_prompt_tokens),
+                },
+                ActualRowWork::Decode { .. } => CostRowOutput::Decode {
+                    requires_full_logits: true,
+                    repetition_tokens: 0,
+                    repetition_penalty_bits: 1_f32.to_bits(),
+                },
+                _ => panic!("private outside fixture requires inference work"),
+            },
+        });
+        if let Some(first) = row_failure {
+            assert_eq!(recorded, Err(first), "a partial row failure is sticky");
+        } else if let Err(error) = recorded {
+            row_failure = Some(error);
+        }
+    }
+    let has_decode = rows
+        .iter()
+        .any(|row| matches!(row.work, ActualRowWork::Decode { .. }));
+    let has_prefill = rows
+        .iter()
+        .any(|row| matches!(row.work, ActualRowWork::Prefill { .. }));
+    let kind = match (has_prefill, has_decode) {
+        (true, true) => ActualWaveKind::Mixed,
+        (true, false) => ActualWaveKind::Prefill,
+        (false, true) => ActualWaveKind::Decode,
+        _ => panic!("empty actual private wave"),
+    };
+    if let Some(error) = row_failure {
+        assert_eq!(canonical.validate_physical_structure(kind), Err(error));
+    }
+    PendingActualWave::new(Arc::new(PrivateOutsideProjection {
+        canonical,
+        rows,
+        kind,
+        row_failure,
+    }))
+    .unwrap()
+}
+
+struct PrivateOutsideProjection {
+    canonical: CanonicalWaveCostBuilder,
+    rows: Vec<ActualWaveRow>,
+    kind: ActualWaveKind,
+    row_failure: Option<CanonicalCostError>,
+}
+impl PendingActualWaveProjection for PrivateOutsideProjection {
+    fn rows(&self) -> &[ActualWaveRow] {
+        &self.rows
+    }
+    fn bounds(&self) -> PendingWaveBounds {
+        PendingWaveBounds {
+            retained_rows: self.rows.len(),
+            retained_bytes: std::mem::size_of::<Self>()
+                + self.rows.capacity() * std::mem::size_of::<ActualWaveRow>()
+                + 2 * self.rows.len()
+                    * (std::mem::size_of::<ActualRowWork>()
+                        + std::mem::size_of::<CostRowNumericFeatures>()
+                        + std::mem::size_of::<HostRowStaticCostFeaturesV2>()),
+            maximum_resolved_bytes: std::mem::size_of::<ActualWavePhysicalEvidenceV1>(),
+        }
+    }
+    fn project(&self) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
+        Err(ActualWaveEvidenceUnknown::GraphPath)
+    }
+    fn project_with_physical_evidence(&self) -> ActualWaveProjection {
+        let physical = self.canonical.validate_physical_structure(self.kind);
+        if let Some(error) = self.row_failure {
+            assert_eq!(
+                physical,
+                Err(error),
+                "pending resolution cannot repair failed rows"
+            );
+        }
+        let projected = ActualWaveProjection {
+            shape: self.project(),
+            physical_evidence: physical.ok().map(|()| ActualWavePhysicalEvidenceV1 {
+                kind: self.kind,
+                path: ActualWavePath::PlanRuntime,
+                row_order: ActualWaveRowOrder::Ordered,
+                restore_bytes: 0,
+                maintenance_bytes: 0,
+                maintenance_units: 0,
+            }),
+        };
+        if self.row_failure.is_some() {
+            assert!(
+                projected.physical_evidence.is_none(),
+                "failed canonical rows cannot produce a receipt"
+            );
+        }
+        projected
+    }
+}

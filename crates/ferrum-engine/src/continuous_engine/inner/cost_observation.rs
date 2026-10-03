@@ -1,6 +1,8 @@
 //! Passive per-call evidence. This module owns no scheduler, KV, output credit,
 //! or retry authority. Errors disable training, never authorize another dispatch.
 
+pub(in crate::continuous_engine::inner) use host_stages::CompletePrivateCalibrationSettlement;
+
 use std::{
     num::NonZeroU64,
     ops::{Deref, DerefMut},
@@ -202,6 +204,7 @@ pub(in crate::continuous_engine) struct EngineCostCall {
     sealed_at_ns: Option<Option<u64>>,
     identity: ExecutorCostIdentityAvailability,
     participants: Vec<CostObservationParticipant>,
+    private_prefix_rows: Vec<super::calibration::token_preparation::BoundPrefixPreparationRow>,
     prepare_started_at_ns: Option<u64>,
     boundary: WaveObservationBoundary,
     recorder: BoundedWaveRecorder,
@@ -321,6 +324,7 @@ impl EngineCostCall {
             observation_memory: None,
             identity: spec.identity,
             participants: spec.participants,
+            private_prefix_rows: Vec::new(),
             prepare_started_at_ns: spec.prepare_started_at_ns,
             boundary: spec.boundary,
             recorder,

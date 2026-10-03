@@ -80,11 +80,11 @@ impl CalibrationSession {
         };
         if group.prefix_pending() {
             // The tuple constructor is private to this actual recorder module.
-            if let Err(error) = group.complete_preparation(&CapturedPrefixWaveV5(evidence)) {
+            if let Err(error) = group.complete_preparation(&evidence) {
                 run.failure.get_or_insert_with(|| error.to_string());
                 group.invalidate(error.to_string());
             }
-        } else if let Some(error) = evidence.error.or(evidence.chain_error) {
+        } else if let Some(error) = evidence.0.error.or(evidence.0.chain_error) {
             // Ordinary suffix events retain the original numeric path, but an
             // incomplete real lifecycle cannot later certify a source5 model.
             group.invalidate(error);

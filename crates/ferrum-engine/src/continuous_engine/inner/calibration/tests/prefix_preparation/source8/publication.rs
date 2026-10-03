@@ -390,3 +390,73 @@ mod journal;
 mod legal_prefill;
 mod prediction_validity;
 mod prefix_acquisition;
+
+/// A real private prefix reaches the same source8 writer/ledger after its
+/// original outside selector, Core submission, sampler and actor settlement.
+/// This is a CPU protocol gate, not CUDA graph or numerical qualification.
+#[tokio::test]
+async fn source8_private_outside_preparation_reaches_original_collector() {
+    let (mut session, executor) = automatic_session().await;
+    executor.enable_structured_query_route();
+    executor
+        .native_structured_submission
+        .store(true, Ordering::Release);
+    executor
+        .project_structured_cpu_fill
+        .store(true, Ordering::Release);
+    executor
+        .native_prefix_preparation_outside
+        .store(true, Ordering::Release);
+    let declared = declaration(&session, 3, false);
+    session
+        .begin_prepared_owner_source(declared, CostProfileLoadLimits::default())
+        .await
+        .unwrap();
+    session.begin_prepared_owner_cohort(0, 0).unwrap();
+    let requests = probe_requests(&session);
+    let mut budget = ProbeExecutionBudget::new(
+        tokio::time::Instant::now() + Duration::from_secs(15),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(3).unwrap(),
+    );
+    let result = session.run_probe_cohort(requests, ProbeCohortSettings {
+        prefill_plan: crate::continuous_engine::inner::calibration::cohort_driver::ProbePrefillPlan::Joint,
+        prefill_chunk: NonZeroU32::MIN,
+        decode_route: CalibrationDecodeRoute::FullLogits,
+        reset_token_policy: false,
+    }, &mut budget).await;
+    let selected_outside = executor
+        .native_prefix_preparation_outside_submissions
+        .load(Ordering::Acquire);
+    let audit = session
+        .prepared_owner_capture
+        .as_ref()
+        .unwrap()
+        .prepared_audit();
+    let poisoned = audit.population.poisoned;
+    let preparation_attempts = audit.preparation_attempts;
+    let end = result
+        .as_ref()
+        .ok()
+        .map(|_| session.end_prepared_owner_cohort());
+    let runtime = session.engine.inner.cost_runtime.as_ref().unwrap().clone();
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        selected_outside, 1,
+        "the real private preparation must use the outside selector"
+    );
+    let summary =
+        result.expect("outside private preparation must pass the original source8 consumer");
+    assert_eq!(
+        (summary.completed_requests, summary.completed_output_tokens),
+        (2, 6)
+    );
+    assert_eq!(summary.released_prefix_rows, 2);
+    assert_eq!(preparation_attempts, 1);
+    assert!(!poisoned);
+    end.unwrap().unwrap();
+    assert!(
+        runtime.snapshot().is_none(),
+        "one cohort cannot claim qualification"
+    );
+}

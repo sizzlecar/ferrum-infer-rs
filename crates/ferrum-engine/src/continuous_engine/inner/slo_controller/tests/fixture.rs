@@ -15,6 +15,7 @@ mod query_resources;
 mod revalidation_retry;
 mod snapshot_epoch;
 mod structured;
+pub(in crate::continuous_engine::inner) use structured::private_outside_pending;
 mod token_policy_residency;
 
 #[path = "../../../../../../ferrum-interfaces/tests/vnext_device_operation_contract/mod.rs"]
@@ -160,6 +161,9 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     >,
     pub emit_structured_cost_observations: AtomicBool,
     pub native_structured_submission: AtomicBool,
+    /// Opt-in original outside selector for real private-prefix CPU preparation.
+    pub native_prefix_preparation_outside: AtomicBool,
+    pub native_prefix_preparation_outside_submissions: AtomicUsize,
     native_structured_history: Arc<Mutex<std::collections::HashMap<RequestId, Vec<u32>>>>,
     token_policy_lifecycle: Mutex<token_policy_residency::Lifecycle>,
     /// Opt-in future algebra for this fixture's actual CPU logits fill.
@@ -1553,6 +1557,8 @@ async fn startup_components_with_generation_config(
         actual_observation_unknown: Mutex::new(None),
         emit_structured_cost_observations: AtomicBool::new(false),
         native_structured_submission: AtomicBool::new(false),
+        native_prefix_preparation_outside: AtomicBool::new(false),
+        native_prefix_preparation_outside_submissions: AtomicUsize::new(0),
         native_structured_history: Arc::new(Mutex::new(Default::default())),
         token_policy_lifecycle: Mutex::new(Default::default()),
         project_structured_cpu_fill: AtomicBool::new(false),

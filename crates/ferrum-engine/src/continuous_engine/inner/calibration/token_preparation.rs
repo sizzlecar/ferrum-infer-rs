@@ -105,10 +105,18 @@ impl PrefixPreparedRowV5 {
         self.work
     }
 }
-pub(in crate::continuous_engine::inner) struct CapturedPrefixWaveV5(PrefixWaveEvidenceV1);
+pub(in crate::continuous_engine::inner) struct CapturedPrefixWaveV5(
+    PrefixWaveEvidenceV1,
+    Option<Arc<super::super::cost_observation::CompletePrivateCalibrationSettlement>>,
+);
 impl CapturedPrefixWaveV5 {
     pub(in crate::continuous_engine::inner) fn evidence(&self) -> &PrefixWaveEvidenceV1 {
         &self.0
+    }
+    pub(in crate::continuous_engine::inner) fn private_settlement(
+        &self,
+    ) -> Option<&super::super::cost_observation::CompletePrivateCalibrationSettlement> {
+        self.1.as_deref()
     }
 }
 pub(in crate::continuous_engine::inner) struct CapturedPrefixReleaseV5(PrefixReleasedV1);
@@ -173,10 +181,73 @@ pub(in crate::continuous_engine) struct InstalledPrefix {
     owner: u64,
     original_policy: [u8; 32],
     original_numeric: HostCostPolicyV2,
+    captured_prepared_policy: Option<([u8; 32], HostCostPolicyV2)>,
     pending_commit: Option<PrefixTokenCommitV1>,
 }
 
+/// Minted under the same sequence lock as the call participant. No public
+/// diagnostic or participant flag can construct a private preparation binding.
+#[derive(Debug)]
+pub(in crate::continuous_engine) struct BoundPrefixPreparationRow {
+    participant: ferrum_interfaces::execution_cost::CostObservationParticipant,
+}
+impl BoundPrefixPreparationRow {
+    pub(in crate::continuous_engine) fn matches(
+        &self,
+        participant: &ferrum_interfaces::execution_cost::CostObservationParticipant,
+    ) -> bool {
+        self.participant.request_id == participant.request_id
+            && self.participant.owner_incarnation == participant.owner_incarnation
+            && self.participant.work_generation == participant.work_generation
+            && self.participant.input_index == participant.input_index
+            && self.participant.output_policy_signature == participant.output_policy_signature
+            && self.participant.host_features == participant.host_features
+    }
+}
+
 impl InstalledPrefix {
+    pub(in crate::continuous_engine) fn bind_cost_row(
+        &self,
+        sequence: &SequenceState,
+        participant: &ferrum_interfaces::execution_cost::CostObservationParticipant,
+    ) -> Option<BoundPrefixPreparationRow> {
+        use ferrum_interfaces::execution_cost::{
+            satisfied_completion_cost_signature, CostSamplingHistoryScope, HostContentDomainV1,
+        };
+        let frontier = sequence.cost_frontier?;
+        let host = participant.host_features?;
+        let prepared = self.captured_prepared_policy?;
+        if frontier.owner_incarnation.get() != self.owner
+            || participant.request_id != sequence.request_id
+            || participant.owner_incarnation != self.owner
+            || participant.work_generation != frontier.work_generation.get()
+            || self.pending_commit.is_some()
+            || sequence.generated_tokens.len() >= self.plan.declaration().release_generated
+            || sequence.cost_policy_signature != Some(prepared.0)
+            || sequence.cost_numeric_policy != Some(prepared.1)
+            || host.policy != prepared.1
+            || prepared.0 == self.original_policy
+            || host.policy.empirical_content_domain.is_some()
+            || !matches!(
+                self.original_numeric.empirical_content_domain,
+                Some(
+                    HostContentDomainV1::PlainTextGreedyV1
+                        | HostContentDomainV1::PlainTextInstalledV2(_)
+                )
+            )
+            || host.state.generated_tokens_before != sequence.generated_tokens.len() as u64
+            || host.state.maximum_output_tokens != sequence.sampling_params.max_tokens as u64
+            || host.state.generated_tokens_before >= host.state.maximum_output_tokens
+            || host.state.sampling_history_scope != CostSamplingHistoryScope::FullGeneration
+            || host.state.sampling_history_tokens != host.state.generated_tokens_before
+            || host.state.completion_state_signature != satisfied_completion_cost_signature()
+        {
+            return None;
+        }
+        Some(BoundPrefixPreparationRow {
+            participant: participant.clone(),
+        })
+    }
     pub(in crate::continuous_engine) fn policy_marker(&self) -> &'static str {
         match self.authority {
             PrefixPreparationAuthority::LengthV5 => "calibration-prefix-preparation.v1",
@@ -229,7 +300,7 @@ enum PrefixSource {
 pub(super) struct PrefixPreparationRun {
     records: HashMap<RequestId, RequestRecord>,
     pending_offer: Option<Vec<PrefixPreparedRowV5>>,
-    pending_wave: Option<PrefixWaveEvidenceV1>,
+    pending_wave: Option<CapturedPrefixWaveV5>,
     last_fifo: u64,
     last_call: u64,
     failure: Option<String>,
@@ -243,7 +314,11 @@ impl CalibrationSession {
     /// Returns diagnostic data only. A future source5 writer must own the
     /// complete declared/settled/released/Length chain, not just this record.
     pub fn take_prefix_wave_evidence(&mut self) -> Option<PrefixWaveEvidenceV1> {
-        self.prefix_preparation.as_mut()?.pending_wave.take()
+        self.prefix_preparation
+            .as_mut()?
+            .pending_wave
+            .take()
+            .map(|wave| wave.0)
     }
     pub fn prefix_preparation_failure(&self) -> Option<&str> {
         self.prefix_preparation.as_ref()?.failure.as_deref()

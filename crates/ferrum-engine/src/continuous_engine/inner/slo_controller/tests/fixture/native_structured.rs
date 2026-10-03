@@ -68,6 +68,20 @@ impl Drop for InstalledFill<'_> {
     }
 }
 
+// Scoped controlled-stream facts; ordinary waves retain their original route.
+struct PrefixOutsideStream<'a> {
+    fixture: &'a contract::Fixture,
+    before: Option<vnext::DeviceCostGraphStreamState>,
+    evidence: Option<vnext::DeviceSubmissionGraphEvidence>,
+}
+impl Drop for PrefixOutsideStream<'_> {
+    fn drop(&mut self) {
+        let mut trace = self.fixture.runtime_trace.lock().unwrap();
+        trace.cost_graph_state = self.before;
+        trace.submitted_graph_evidence = self.evidence;
+    }
+}
+
 impl ControlledExecutor {
     pub(super) fn cpu_fill_layout(
         &self,
@@ -373,19 +387,112 @@ impl ControlledExecutor {
             .bind_plan(&fixture.resolved)
             .map_err(|e| fail(&e))?;
         let provider_identities = structured::provider_identities(providers.providers());
+        let outside_preparation = self
+            .native_prefix_preparation_outside
+            .load(Ordering::Acquire)
+            && context.as_deref().is_some_and(|context| {
+                ids.iter().all(|id| {
+                    context
+                        .participant(id)
+                        .and_then(|p| p.host_features)
+                        .is_some_and(|host| host.policy.empirical_content_domain.is_none())
+                })
+            });
+        let _outside_stream = outside_preparation.then(|| {
+            let mut trace = fixture.runtime_trace.lock().unwrap();
+            let prior = PrefixOutsideStream {
+                fixture,
+                before: trace.cost_graph_state,
+                evidence: trace.submitted_graph_evidence,
+            };
+            let state = vnext::DeviceCostGraphStreamState::new(
+                vnext::DeviceCostGraphConfiguration::OnDemand,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+            trace.cost_graph_state = Some(state);
+            trace.submitted_graph_evidence = Some(
+                vnext::DeviceSubmissionGraphEvidence::new(state, state, false, 0, 0, 0, 0, 0)
+                    .unwrap(),
+            );
+            prior
+        });
+        let mut outside_rows = None;
+        let mut outside_started = None;
         if let Some(context) = context.as_deref_mut() {
-            context.prepared_route(
-                vnext::OperationDispatch::observe_non_reusable_cost_route(lane),
-                Ok(Vec::new()),
-            );
-            structured::record_native_with_layout(
-                context,
-                prefills,
-                decodes,
-                &provider_identities,
-                layout,
-                structured::recurrent_state_bytes(self, ids.len()),
-            );
+            if outside_preparation {
+                let catalog = lane
+                    .reusable_execution_catalog()
+                    .map_err(|e| fail(&e))?
+                    .into_index()
+                    .map_err(|e| fail(&e))?;
+                let selection = vnext::OperationDispatch::select_reusable_execution_for_cost(
+                    providers.providers(),
+                    &fixture.resolved,
+                    &wave,
+                    lane,
+                    Some(&catalog),
+                    true,
+                )
+                .map_err(|e| fail(&e))?;
+                let (program, route) = selection.into_parts();
+                assert!(program.is_none());
+                assert!(
+                    route.class().is_outside(),
+                    "original fixture selector must prove outside"
+                );
+                let rows: Vec<ActualWaveRow> = prefills
+                    .iter()
+                    .map(|input| {
+                        let host = context.participant(&input.request_id).unwrap();
+                        ActualWaveRow {
+                            request_id: host.request_id.clone(),
+                            owner_incarnation: host.owner_incarnation,
+                            work_generation: host.work_generation,
+                            input_index: host.input_index,
+                            work: ActualRowWork::Prefill {
+                                offset: input.chunk.tokens_processed().try_into().unwrap(),
+                                count: input.chunk.tokens_to_process().try_into().unwrap(),
+                                total_prompt_tokens: input
+                                    .chunk
+                                    .total_prompt_tokens()
+                                    .try_into()
+                                    .unwrap(),
+                            },
+                        }
+                    })
+                    .chain(decodes.iter().map(|input| {
+                        let host = context.participant(&input.request_id).unwrap();
+                        ActualWaveRow {
+                            request_id: host.request_id.clone(),
+                            owner_incarnation: host.owner_incarnation,
+                            work_generation: host.work_generation,
+                            input_index: host.input_index,
+                            work: ActualRowWork::Decode {
+                                kv_tokens: input.kv_cache.num_tokens().try_into().unwrap(),
+                            },
+                        }
+                    }))
+                    .collect();
+                context.prepared_route(route, Ok(rows.clone()));
+                outside_rows = Some(rows);
+                outside_started = context.now_ns();
+            } else {
+                context.prepared_route(
+                    vnext::OperationDispatch::observe_non_reusable_cost_route(lane),
+                    Ok(Vec::new()),
+                );
+                structured::record_native_with_layout(
+                    context,
+                    prefills,
+                    decodes,
+                    &provider_identities,
+                    layout,
+                    structured::recurrent_state_bytes(self, ids.len()),
+                );
+            }
         }
         let tokens = prefills
             .iter()
@@ -429,7 +536,20 @@ impl ControlledExecutor {
         };
         let (handle, attribution) = submitted.into_parts();
         self.physical.fetch_add(1, Ordering::AcqRel);
+        if outside_preparation {
+            self.native_prefix_preparation_outside_submissions
+                .fetch_add(1, Ordering::AcqRel);
+        }
         if let Some(context) = context.as_deref_mut() {
+            if let Some(rows) = outside_rows {
+                let pending = structured::private_outside_pending(
+                    context,
+                    rows,
+                    attribution.as_ref().expect("actual inference attribution"),
+                    &provider_identities,
+                );
+                context.physical_wave_pending(Ok(pending), outside_started);
+            }
             context.route_submission(attribution.as_ref());
         }
         assert!(matches!(

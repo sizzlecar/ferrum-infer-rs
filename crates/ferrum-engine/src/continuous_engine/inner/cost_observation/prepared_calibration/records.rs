@@ -201,7 +201,7 @@ impl PreparedOwnerCalibration {
             let p = self.pending.as_ref().unwrap();
             let c = self.active.as_ref().unwrap();
             #[derive(Serialize)]
-            struct Completed<'a> {
+            struct Completed<'a, O: Serialize> {
                 kind: &'static str,
                 offered: u64,
                 phase: file::StructuredProfilePhaseV10,
@@ -209,6 +209,8 @@ impl PreparedOwnerCalibration {
                 reconciled: bool,
                 queue: Option<HostStageQueueReceipt>,
                 host_stages: Option<ExportEvidence<'a>>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                outside_preparation: Option<O>,
                 rows: &'a [PrefixRowEvidenceV1],
                 failure: Option<&'a str>,
             }
@@ -224,6 +226,11 @@ impl PreparedOwnerCalibration {
                     .host_stages
                     .as_deref()
                     .map(|s| ExportEvidence::new(s, true)),
+                outside_preparation: captured.private_settlement().and_then(|proof| {
+                    e.host_stages
+                        .as_ref()
+                        .and_then(|stages| proof.outside_preparation(stages))
+                }),
                 rows: &e.rows,
                 failure: e.error.as_deref().or(e.chain_error.as_deref()),
             })

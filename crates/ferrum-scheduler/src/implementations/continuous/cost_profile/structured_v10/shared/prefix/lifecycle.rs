@@ -442,6 +442,7 @@ impl Preparation {
                 reconciled,
                 queue,
                 host_stages,
+                outside_preparation,
                 rows,
                 failure,
             } => {
@@ -478,6 +479,7 @@ impl Preparation {
                     p.source_opened_at_ns,
                     &pending.rows,
                     &stages,
+                    outside_preparation.as_ref(),
                     if self.native_acquisition.is_some() {
                         p.earliest.max(*p.last_finalized)
                     } else {

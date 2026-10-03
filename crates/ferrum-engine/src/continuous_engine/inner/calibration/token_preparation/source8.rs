@@ -106,9 +106,9 @@ impl CalibrationSession {
             self.prepared_owner_capture
                 .as_mut()
                 .ok_or_else(|| invalid("source8 collector missing"))?
-                .complete_preparation(&CapturedPrefixWaveV5(evidence))
+                .complete_preparation(&evidence)
                 .map_err(capture_error)?;
-        } else if let Some(error) = evidence.error.or(evidence.chain_error) {
+        } else if let Some(error) = evidence.0.error.or(evidence.0.chain_error) {
             return Err(invalid(error));
         }
         Ok(())

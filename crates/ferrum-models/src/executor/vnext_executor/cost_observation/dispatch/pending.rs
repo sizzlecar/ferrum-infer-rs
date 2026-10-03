@@ -1,6 +1,9 @@
 //! Frozen current-wave facts. This type cannot reach a device or live request.
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 pub(in crate::executor::vnext_executor) struct ProviderIdentityTable {
     rows: Box<[OwnedProviderIdentity]>,
     retained_bytes: usize,
@@ -76,6 +79,36 @@ impl PendingActualWaveProjection for FrozenActualProjection {
         self.bounds
     }
     fn project(&self) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
+        self.project_with_physical_evidence().shape
+    }
+    fn project_with_physical_evidence(&self) -> ActualWaveProjection {
+        self.project_observation()
+            .unwrap_or_else(|reason| ActualWaveProjection {
+                shape: Err(reason),
+                physical_evidence: None,
+            })
+    }
+}
+
+impl FrozenActualProjection {
+    fn prepare_canonical_rows(
+        &self,
+        canonical: &mut CanonicalWaveCostBuilder,
+    ) -> std::result::Result<(), ActualWaveEvidenceUnknown> {
+        canonical
+            .core_readback_route(self.readback)
+            .map_err(|_| ActualWaveEvidenceUnknown::OutputPolicy)?;
+        for row in &self.canonical_rows {
+            canonical
+                .row(*row)
+                .map_err(|_| ActualWaveEvidenceUnknown::OutputPolicy)?;
+        }
+        Ok(())
+    }
+
+    fn project_observation(
+        &self,
+    ) -> std::result::Result<ActualWaveProjection, ActualWaveEvidenceUnknown> {
         // Resolution cannot erase the original exact execution ledger. A bad
         // passive sidecar remains unavailable and never reuses capture values.
         let resolved = self
@@ -87,10 +120,10 @@ impl PendingActualWaveProjection for FrozenActualProjection {
             .as_ref()
             .and_then(|result| result.as_ref().ok())
             .unwrap_or(&self.attribution);
-        let route::ObservedRoute {
+        let route::ObservedRouteComponents {
             mut canonical,
             graph,
-        } = route::actual_route_projection(
+        } = route::actual_route_components(
             Some(attribution),
             |index| self.providers.get(index),
             self.graph_capability,
@@ -99,19 +132,40 @@ impl PendingActualWaveProjection for FrozenActualProjection {
             self.structured_capture && statistics,
             statistics,
         )?;
-        canonical
-            .core_readback_route(self.readback)
-            .map_err(|_| ActualWaveEvidenceUnknown::OutputPolicy)?;
-        for row in &self.canonical_rows {
-            canonical
-                .row(*row)
-                .map_err(|_| ActualWaveEvidenceUnknown::OutputPolicy)?;
-        }
         let path = if self.retries > 0 {
             ActualWavePath::UnsupportedFallback
         } else {
             ActualWavePath::PlanRuntime
         };
+        let graph = match graph {
+            Ok(graph) => graph,
+            Err(reason) => {
+                // Preserve the original numerical rejection precedence. Only
+                // an otherwise complete actual canonical wave can retain this
+                // separate physical contract; no graph state is invented.
+                let physical_evidence = self
+                    .prepare_canonical_rows(&mut canonical)
+                    .and_then(|()| {
+                        canonical
+                            .validate_physical_structure(self.kind)
+                            .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)
+                    })
+                    .ok()
+                    .map(|()| ActualWavePhysicalEvidenceV1 {
+                        kind: self.kind,
+                        path,
+                        row_order: ActualWaveRowOrder::Ordered,
+                        restore_bytes: 0,
+                        maintenance_bytes: 0,
+                        maintenance_units: 0,
+                    });
+                return Ok(ActualWaveProjection {
+                    shape: Err(reason),
+                    physical_evidence,
+                });
+            }
+        };
+        self.prepare_canonical_rows(&mut canonical)?;
         let (exact, statistical_evidence) = if statistics {
             let value = canonical
                 .finish_with_captured_structure(
@@ -137,22 +191,25 @@ impl PendingActualWaveProjection for FrozenActualProjection {
                 None,
             )
         };
-        Ok(ActualWaveShape {
-            kind: self.kind,
-            path,
-            graph,
-            row_order: exact.row_order,
-            provider_signature: exact.provider_signature,
-            output_policy_signature: exact.output_policy_signature,
-            numeric_features: exact.numeric_features,
-            host_content_features: exact.host_content_features,
-            row_multiset_features: exact.row_multiset_features,
-            statistical_evidence,
-            rows: self.rows.clone(),
-            recurrent_state_bytes: self.recurrent_state_bytes,
-            restore_bytes: 0,
-            maintenance_bytes: 0,
-            maintenance_units: 0,
+        Ok(ActualWaveProjection {
+            shape: Ok(ActualWaveShape {
+                kind: self.kind,
+                path,
+                graph,
+                row_order: exact.row_order,
+                provider_signature: exact.provider_signature,
+                output_policy_signature: exact.output_policy_signature,
+                numeric_features: exact.numeric_features,
+                host_content_features: exact.host_content_features,
+                row_multiset_features: exact.row_multiset_features,
+                statistical_evidence,
+                rows: self.rows.clone(),
+                recurrent_state_bytes: self.recurrent_state_bytes,
+                restore_bytes: 0,
+                maintenance_bytes: 0,
+                maintenance_units: 0,
+            }),
+            physical_evidence: None,
         })
     }
 }
@@ -278,6 +335,7 @@ pub(in crate::executor::vnext_executor) fn pending_actual_shape<R: DeviceRuntime
     let maximum_resolved_bytes = local_bytes
         .checked_add(row_projection)
         .and_then(|n| n.checked_add(std::mem::size_of::<ActualWaveShape>()))
+        .and_then(|n| n.checked_add(std::mem::size_of::<ActualWavePhysicalEvidenceV1>()))
         .and_then(|n| n.checked_add(std::mem::size_of::<UnsettledStructuredWaveEvidenceV1>()))
         .and_then(|n| n.checked_add(attribution.maximum_working_bytes()?))
         .ok_or(ActualWaveEvidenceUnknown::Capacity)?;

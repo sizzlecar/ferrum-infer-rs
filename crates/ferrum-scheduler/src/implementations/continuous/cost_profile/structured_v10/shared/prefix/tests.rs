@@ -7,6 +7,217 @@ use crate::implementations::continuous::cost_model::structured_v2::prefixes::{
 use ferrum_types::TokenId;
 const POLICY: [u8; 32] = [44; 32];
 
+// Wire-only counterpart of the engine's original outside preparation receipt.
+// It preserves the existing fixture's physical facts and prefix lifecycle;
+// replaying this DTO never constructs a live selector or producer capability.
+fn outside_preparation_record(record: &mut serde_json::Value) {
+    use ferrum_interfaces::execution_cost::{
+        satisfied_completion_cost_signature, CostSamplingHistoryScope, HostCostFeaturesV1,
+        HostCostStateV1,
+    };
+    let (prepared, _, _) = fixture::prepared("private-policy", 1, 0);
+    let mut policy = prepared.recipe.physical_host_rows[0].installed_policy;
+    policy.empirical_content_domain = None;
+    let mut stages = record["host_stages"].clone();
+    let exact = &stages["actual_shape"]["exact"];
+    let physical_work = serde_json::json!({
+        "kind":exact["kind"], "path":exact["path"], "row_order":exact["order"],
+        "restore_bytes":exact["restore_bytes"],
+        "maintenance_bytes":exact["maintenance_bytes"],
+        "maintenance_units":exact["maintenance_units"],
+    });
+    stages["actual_shape"] = serde_json::Value::Null;
+    let rows = stages["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let before = record["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["before"]["request_id"] == row["request_id"])
+                .unwrap();
+            let generated = before["before"]["generated_tokens"].as_u64().unwrap();
+            let host = HostCostFeaturesV1 {
+                policy,
+                state: HostCostStateV1 {
+                    generated_tokens_before: generated,
+                    maximum_output_tokens: prepared.rows[0].frontier.maximum_output,
+                    sampling_history_tokens: generated,
+                    sampling_history_scope: CostSamplingHistoryScope::FullGeneration,
+                    pending_decoded_utf8: !before["before"]["pending_utf8"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty(),
+                    completion_state_signature: satisfied_completion_cost_signature(),
+                },
+            };
+            serde_json::json!({
+                "request_id":row["request_id"], "owner_incarnation":row["owner_incarnation"],
+                "work_generation":row["work_generation"], "input_index":row["input_index"],
+                "actual_work":row["actual_work"], "host_features":host,
+            })
+        })
+        .collect::<Vec<_>>();
+    let tokens = rows
+        .iter()
+        .map(|row| match row["actual_work"]["kind"].as_str().unwrap() {
+            "prefill" => row["actual_work"]["count"].as_u64().unwrap(),
+            "decode" => 1,
+            _ => panic!("fixture has inference work only"),
+        })
+        .sum::<u64>();
+    let start = stages["prepare_started_at_ns"].as_u64().unwrap();
+    let graph = serde_json::json!({"configuration":"on_demand","resident_executables":0,
+        "resident_programs":0,"rejected_executables":0});
+    let plan = "01".repeat(32);
+    let implementation = "02".repeat(32);
+    let route = serde_json::json!({
+        "protocol":"ferrum.outside-declared-route-settled.v1",
+        "selection":{
+            "class":"outside_program_layout_absent", "reason":"program_layout_absent",
+            "program_id":null, "non_reusable_wave":{"plan_hash":plan,
+                "runtime_implementation_fingerprint":implementation,
+                "immediate_sequences":rows.len(),"immediate_tokens":tokens,"immediate_pages":1},
+            "lane_id":1,"lane_epoch":1,"catalog_epoch":1,"graph_state":graph,
+            "batch_step":1,"batch_invocation":1},
+        "selected_at_ns":start+1,
+        "submitted":{"batch_step":1,"batch_invocation":1,"plan_hash":plan,
+            "runtime_implementation_fingerprint":implementation,"lane_id":1,
+            "submission_started_at_ns":start+2,"graph":{"before":graph,"after_preparation":graph,
+                "capture_requested":false,"candidate_segments":0,"captured_segments":0,
+                "capture_rejected_segments":0,"uploaded_segments":0,"replayed_segments":0}},
+        "prepared_rows":rows,
+        "physical":{"call_id":stages["call_id"],"physical_wave_ordinal":0,"physical_waves":1,
+            "retained_waves":1,"lost_observations":0,"boundary":"isolated_preparation_to_commit",
+            "prepare_started_at_ns":start,"submission_started_at_ns":start+2,"terminal_at_ns":start+3,
+            "outcome":"completed","call_outcome":"completed","shape_unknown":"graph_path"},
+        "host_stages":stages,
+    });
+    record["host_stages"] = stages;
+    record["outside_preparation"] =
+        serde_json::json!({"route":route,"physical_work":physical_work});
+}
+
+#[test]
+fn source5_outside_preparation_preserves_physical_prefix_contract_without_numerical_shape() {
+    let original = source5();
+    let bytes = changed(&original, |record| {
+        if record["kind"] != "preparation_completed" {
+            return false;
+        }
+        outside_preparation_record(record);
+        true
+    });
+    let limits = CostProfileLoadLimits::default();
+    let expected = replay::replay_prefix_source(&original, &limits).unwrap();
+    let actual = replay::replay_prefix_source(&bytes, &limits).unwrap();
+    assert_eq!(actual.children.len(), expected.children.len());
+    for (actual, expected) in actual.children.iter().zip(&expected.children) {
+        assert_eq!(actual.total_shape_rows, expected.total_shape_rows);
+        assert_eq!(actual.reserved_members, expected.reserved_members);
+        assert_eq!(
+            actual
+                .phases
+                .iter()
+                .map(|phase| phase.members)
+                .collect::<Vec<_>>(),
+            expected
+                .phases
+                .iter()
+                .map(|phase| phase.members)
+                .collect::<Vec<_>>()
+        );
+    }
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        let wrapper: serde_json::Value = serde_json::from_slice(line).unwrap();
+        let record = &wrapper["record"];
+        if record["outside_preparation"].is_null() {
+            continue;
+        }
+        assert!(record["host_stages"]["actual_shape"].is_null());
+        let stages: Stages = serde_json::from_value(record["host_stages"].clone()).unwrap();
+        assert!(super::super::super::service::StructuredServiceOutsideRouteV6::validate_original_diagnostic(
+            stages.fingerprint.as_ref().unwrap(), stages.prepare_started_at_ns.unwrap(),
+            record["outside_preparation"]["route"].clone(),
+        ).is_err(), "prefix intervention cannot acquire ordinary outside permission");
+    }
+    for change in [
+        "missing",
+        "physical_missing",
+        "path",
+        "order",
+        "kind",
+        "restore",
+        "maintenance_bytes",
+        "maintenance_units",
+        "unknown",
+        "submission",
+        "outer_clock",
+        "row",
+        "host_frontier",
+        "commit",
+        "fifo",
+        "cohort",
+    ] {
+        let invalid = changed(&bytes, |record| {
+            if record["outside_preparation"].is_null() {
+                return false;
+            }
+            match change {
+                "missing" => record["outside_preparation"] = serde_json::Value::Null,
+                "physical_missing" => {
+                    record["outside_preparation"]["physical_work"] = serde_json::Value::Null
+                }
+                "path" => {
+                    record["outside_preparation"]["physical_work"]["path"] = "legacy_split".into()
+                }
+                "order" => {
+                    record["outside_preparation"]["physical_work"]["row_order"] =
+                        "independent_rows".into()
+                }
+                "kind" => record["outside_preparation"]["physical_work"]["kind"] = "decode".into(),
+                "restore" => {
+                    record["outside_preparation"]["physical_work"]["restore_bytes"] = 1.into()
+                }
+                "maintenance_bytes" => {
+                    record["outside_preparation"]["physical_work"]["maintenance_bytes"] = 1.into()
+                }
+                "maintenance_units" => {
+                    record["outside_preparation"]["physical_work"]["maintenance_units"] = 1.into()
+                }
+                "unknown" => {
+                    record["outside_preparation"]["route"]["physical"]["shape_unknown"] =
+                        "invalid_lifecycle".into()
+                }
+                "submission" => {
+                    record["outside_preparation"]["route"]["submitted"]["batch_invocation"] =
+                        2.into()
+                }
+                "outer_clock" => record["host_stages"]["executor_returned_at_ns"] = 0.into(),
+                "row" => {
+                    record["outside_preparation"]["route"]["prepared_rows"][0]["work_generation"] =
+                        999.into()
+                }
+                "host_frontier" => {
+                    record["outside_preparation"]["route"]["prepared_rows"][0]["host_features"]
+                        ["state"]["generated_tokens_before"] = 1.into()
+                }
+                "commit" => record["rows"][0]["preparation_commit"]["committed_token"] = 8.into(),
+                "fifo" => record["queue"]["accepted_ordinal"] = 999.into(),
+                "cohort" => record["cohort"] = 0.into(),
+                _ => unreachable!(),
+            }
+            true
+        });
+        assert!(
+            replay::replay_prefix_source(&invalid, &limits).is_err(),
+            "{change}"
+        );
+    }
+}
+
 fn source5() -> Vec<u8> {
     source5_from(fixture::source_policy(POLICY).0)
 }

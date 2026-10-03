@@ -12,7 +12,11 @@ G9 当前已完成两项局部修复：`38e8b069` 将 Metal 合并候选的 reta
 
 完整 CUDA 准备账的静态估计表明，同 view 合法复用可能将剩余完整 inventory 所需总投影从 18076–18124 降至 16242–16290。该范围假设没有新增 readiness 工作，仅余 94–142 次，不是已满足 16384 上限的实测证明。缓存不跨 captured view，元数据单独计费；淘汰只导致重放，不删分支或资格工作。
 
-G9 CUDA `run` 诊断实际执行的是仅增加观测的 `186c0008`，不含上述两项业务修复。原 selector/submission 对接通过，call 506 在 source 0 第 6 个 cohort 的 `outside_host_work_or_policy` 联合门拒绝；启动 0/4、5/471，剩余请求和执行额度充足。该日志不能独自区分政策、generated counter 与 work 三项条件。源码追踪发现真实前缀安装刻意保持 empirical domain 为 None，而普通 outside 校验要求普通内容资格；后续私有反馈证明及最终 prefix 收据还各有 actual-shape 要求。当前正在建立真实安装到最终消费的回归，保持数值 Unknown 与普通训练规则，尚无已验证的完整修复。G9 与 G8 计划分别为 471、632，不能称同一 call 的精确复现或性能改善。
+G9 CUDA `run` 诊断实际执行的是仅增加观测的 `186c0008`，不含上述两项业务修复。原 selector/submission 对接通过，call 506 在 source 0 第 6 个 cohort 的 `outside_host_work_or_policy` 联合门拒绝；启动 0/4、5/471，剩余请求和执行额度充足。该日志不能独自区分政策、generated counter 与 work 三项条件。源码追踪发现真实前缀安装刻意保持 empirical domain 为 None，而普通 outside 校验要求普通内容资格；后续私有反馈证明及最终 prefix 收据还各有 actual-shape 要求。G9 与 G8 计划分别为 471、632，不能称同一 call 的精确复现或性能改善。
+
+G9 当前候选将实际物理工作凭据与数值 graph 资格分开：只有原始、单次完成的提交及精确 row 绑定可保留物理凭据；真实安装的每行前缀授权、完整 host 结算和同一 Arc 的私有证明共同进入 source8 最终消费。原 `GraphPath` / `Unknown` 不变，不授予训练或普通请求资格；source5 writer 没有新增 outside wrapper。新增保留对象纳入原 rows/bytes 容量账，原请求、动作、时间和来源上限不变。
+
+真实安装→Core selector/submission→采样→FIFO→source8 collector 的受控 CPU 回归，修复前因缺少 prefix host settlement 失败，最终修复后 1 pass、3.18s；两个请求完整输出并释放，仍无成本快照。最小前缀正反例 2 pass，模型物理投影边界 3 pass，记录器边界 6 pass，scheduler prefix 组 7 pass。这些组含重叠检查，不累计成完成度。中间夹具失败（缺少后台 worker、误拒合法参数绑定、错误历史触发 builder sticky error）及模型测试的私有 API 编译失败均保留日志；最终只修正夹具，未放宽生产接受条件。完整 workspace、后端编译和这份候选的实机结果仍待完成，不能把 CPU 协议通过写成 CUDA 实际前缀复制或完整 F/R/Q 成功。
 
 G9 CUDA guard/product 均退出 0，服务恢复记录为 `restored_verified`；独立检查确认 PID 4147753、服务 active、健康响应正常。原 1536-token 输出与 G8 字节一致，但仍在计数任务中途达到上限，不能称完整任务完成。原始证据及独立审核位于外部 `g9-cuda-route-evidence/`；Metal 计费证明及 after 审核分别为 `g9-metal-composition-memory-proof.json`、`g9-metal-composition-memory-after-review.json`。
 

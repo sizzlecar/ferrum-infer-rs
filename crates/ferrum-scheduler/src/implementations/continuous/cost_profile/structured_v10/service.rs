@@ -6,6 +6,7 @@ pub use owner_blocks::*;
 mod no_submission;
 pub use no_submission::StructuredServiceNoSubmissionV6;
 mod route_population;
+pub(super) use route_population::OutsideEvidence;
 pub use route_population::{StructuredServiceOutsideRouteV6, StructuredServiceRouteCountsV1};
 mod owner_diagnostic;
 mod physical;

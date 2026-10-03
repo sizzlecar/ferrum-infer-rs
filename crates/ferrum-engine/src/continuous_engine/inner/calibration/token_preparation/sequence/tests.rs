@@ -89,6 +89,7 @@ async fn fixture(
         owner: state.cost_frontier.unwrap().owner_incarnation.get(),
         original_policy,
         original_numeric,
+        captured_prepared_policy: None,
         pending_commit: None,
     });
     session.engine.inner.refresh_sequence_cost_policy(state);
