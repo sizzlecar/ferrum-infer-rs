@@ -3,7 +3,8 @@
 use super::*;
 use crate::vnext::{
     NativeCheckpointTransferCostDomain, NativeCheckpointTransferKind, ResourcePlanningAvailability,
-    ResourcePlanningLimits, ResourcePlanningState, ResourcePlanningUnknown, ResourcePlanningView,
+    ResourcePlanningLimits, ResourcePlanningReadStage, ResourcePlanningState,
+    ResourcePlanningUnknown, ResourcePlanningView,
 };
 
 /// Each independent fake device has its own capacity account. The production
@@ -30,12 +31,29 @@ fn known<T>(value: ResourcePlanningAvailability<T>) -> T {
         }
     }
 }
+fn known_view(
+    h: &RestoreHarness,
+    sessions: &[&SequenceSession<TestRuntime>],
+) -> ResourcePlanningView {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match h.root.resource_planning_view(
+            sessions,
+            ResourcePlanningLimits::default(),
+            &mut || true,
+        ) {
+            ResourcePlanningAvailability::Known(view) => return view,
+            // Unique fake devices still share the process-wide cleanup registry
+            // mutex. This is a failed nonblocking read, not pending cleanup.
+            ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::ReadUnavailable(
+                ResourcePlanningReadStage::DeferredCleanup,
+            )) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+            other => panic!("real idle checkpoint snapshot: {other:?}"),
+        }
+    }
+}
 fn view(h: &RestoreHarness, target: &SequenceSession<TestRuntime>) -> ResourcePlanningView {
-    known(h.root.resource_planning_view(
-        &[h.session.as_ref(), target],
-        ResourcePlanningLimits::default(),
-        &mut || true,
-    ))
+    known_view(h, &[h.session.as_ref(), target])
 }
 fn free_bytes(h: &RestoreHarness) -> u64 {
     h.root
@@ -193,11 +211,7 @@ fn ready_checkpoint_survives_retired_producer_with_native_restore_and_ack() {
     let reaper = CompletionReaper::new();
     prove_prefix_source(&h, &lane, &reaper);
     let target = admitted_full_target(&h, "ready-after-retirement", &[19, 23]);
-    let before = known(h.root.resource_planning_view(
-        &[target.as_ref()],
-        ResourcePlanningLimits::default(),
-        &mut || true,
-    ));
+    let before = known_view(&h, &[target.as_ref()]);
     let checkpoint = observed_capture(&h, &lane, &reaper);
     assert!(matches!(
         h.root.bind_ready_checkpoint(
@@ -211,11 +225,7 @@ fn ready_checkpoint_survives_retired_producer_with_native_restore_and_ack() {
     ));
     // Close the real native source; there is no producer row in this capture.
     h.session.try_abort_if_quiescent().unwrap();
-    let fresh = known(h.root.resource_planning_view(
-        &[target.as_ref()],
-        ResourcePlanningLimits::default(),
-        &mut || true,
-    ));
+    let fresh = known_view(&h, &[target.as_ref()]);
     assert_eq!(fresh.participants().len(), 1);
     let allocations = h.runtime.allocate_calls();
     let free = free_bytes(&h);
@@ -286,11 +296,7 @@ fn ready_checkpoint_survives_retired_producer_with_native_restore_and_ack() {
         ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::BusyOrUnavailable)
     ));
     publication.acknowledge().unwrap();
-    let after = known(h.root.resource_planning_view(
-        &[target.as_ref()],
-        ResourcePlanningLimits::default(),
-        &mut || true,
-    ));
+    let after = known_view(&h, &[target.as_ref()]);
     assert!(known(h.root.checkpoint_restore_completed(
         &after,
         &checkpoint,
