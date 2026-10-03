@@ -862,12 +862,39 @@ fn project_point(
     let (mut frontiers, mut states) = if let Some(previous) = resume {
         prefill_states.leave_room(previous.states.len());
         (previous.frontiers, previous.states)
-    } else if let Some(state) = decode.and_then(|_| prefill_states.get(width)) {
-        (roots.iter().map(|root| root.prompt).collect(), vec![state])
     } else {
         prefill_states.leave_room(1);
-        let mut frontiers = vec![0u32; roots.len()];
-        let mut state = view.initial_state();
+        let sequential = decode.and_then(|_| prefill_states.sequential(&roots, limits));
+        let joint =
+            prefill_offset.and_then(|offset| prefill_states.joint(width, offset / per_row_chunk));
+        let (mut frontiers, mut state) = if let Some((prepared_width, state)) = sequential {
+            (
+                roots
+                    .iter()
+                    .map(|root| {
+                        if root.participant < prepared_width {
+                            root.prompt
+                        } else {
+                            0
+                        }
+                    })
+                    .collect(),
+                state,
+            )
+        } else if let Some((completed_waves, state)) = joint {
+            (
+                roots
+                    .iter()
+                    .map(|root| {
+                        (u64::from(completed_waves) * u64::from(per_row_chunk))
+                            .min(u64::from(root.prompt)) as u32
+                    })
+                    .collect(),
+                state,
+            )
+        } else {
+            (vec![0u32; roots.len()], Arc::new(view.initial_state()))
+        };
         // Advance the actual prompt only by legal prefill spans. A target context
         // never rewrites the captured frontier or invents a different prompt.
         while roots.iter().zip(&frontiers).any(|(r, p)| *p < r.prompt) {
@@ -961,6 +988,14 @@ fn project_point(
                     .filter(|n| *n <= retained_limit)
                     .ok_or(GeometryProjectionUnknown::Capacity)?;
                 poll_deadline(limits)?;
+                // Only the complete observed target may install a successor.
+                // An ancestor projection followed by missing evidence, query
+                // validation, capacity or deadline failure leaves no new path.
+                let completed_waves =
+                    prefill_offset.ok_or(GeometryProjectionUnknown::Unreachable)? / per_row_chunk
+                        + 1;
+                let successor = Arc::new(projected.state);
+                prefill_states.insert_joint(width, completed_waves, &successor);
                 return Ok((
                     vec![GeometryInputBranch {
                         host_branch: None,
@@ -970,11 +1005,10 @@ fn project_point(
                     retained,
                 ));
             }
-            state = projected.state;
+            state = Arc::new(projected.state);
         }
-        let state = Arc::new(state);
         if decode.is_some() {
-            prefill_states.insert(width, &state);
+            prefill_states.insert_sequential(width, &state);
         }
         (frontiers, vec![state])
     };

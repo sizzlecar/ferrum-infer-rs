@@ -173,9 +173,21 @@ async fn geometry_prefill_evicts_within_original_state_slots_without_losing_bran
         let mut budget = limits();
         budget.maximum_route_states = maximum_route_states;
         let bounded = shared_prefill_projection(&mut session, PrefillReuse::Share, budget).await;
-        // One active slot leaves no cache; two leave one cache entry. Alternating
-        // widths evicts that entry before its next use, so original replay wins.
-        assert_eq!(bounded.projection_attempts, replay.projection_attempts);
+        // Widths 2,1,2,1 need respectively 2,1,2,1 serial prefill queries,
+        // followed by two decode queries apiece: replay costs 14. One active
+        // slot leaves no cache. With two slots, the second target's width-one
+        // prefix can seed the third target's width-two prefix: its one-token
+        // prompt has identical segmentation, so only the new owner is prepared.
+        // Width two cannot seed width one; the fourth target still replays.
+        assert_eq!(replay.projection_attempts, 4 + 3 + 4 + 3);
+        assert_eq!(
+            bounded.projection_attempts,
+            if maximum_route_states == 1 {
+                4 + 3 + 4 + 3
+            } else {
+                4 + 3 + 3 + 3
+            }
+        );
         for (expected, actual) in replay.outcomes.iter().zip(&bounded.outcomes) {
             super::trajectory_tests::assert_equivalent(expected, actual);
         }
@@ -394,5 +406,208 @@ async fn geometry_scenarios_consume_one_projection_allowance_and_clean_all_roots
     );
     assert!(report.outcomes[1].branches.is_empty());
     assert_unsubmitted_clean(&session, &executor);
+    session.shutdown().await.unwrap();
+}
+
+// Preserve the inventory order: original first-prefill/decode scenarios,
+// continuation-prefill scenarios, then ordinary trajectory scenarios. The
+// captured owner group remains the same throughout this complete traversal.
+async fn complete_prefill_geometry(
+    session: &mut CalibrationSession,
+    reuse: PrefillReuse,
+    budget: GeometryProjectionLimits,
+) -> GeometryInputReport {
+    let mut probes = requests(session, 4);
+    for probe in &mut probes {
+        probe.request.prompt = "test ok v7".into();
+        probe.request.sampling_params.max_tokens = 2;
+    }
+    let decode = |rows| {
+        GeometryInputTarget::Decode(GeometryProjectionPoint {
+            rows,
+            sequence_tokens: 4,
+        })
+    };
+    let mut targets = Vec::new();
+    for rows in 1..=4 {
+        targets.push(GeometryInputTarget::InitialPrefill { rows });
+        targets.push(decode(rows));
+    }
+    // With a whole-wave allowance of eight, widths three and four use
+    // two-token row chunks. Their three-token prompts have one continuation.
+    for rows in [3, 4] {
+        targets.push(GeometryInputTarget::PrefillSpan { rows, offset: 2 });
+    }
+    targets.extend((1..=4).map(decode));
+    let scenarios: Vec<_> = targets
+        .iter()
+        .map(|target| GeometryInputScenario {
+            targets: std::slice::from_ref(target),
+            prefixes: &[],
+        })
+        .collect();
+    session
+        .project_geometry_inputs_inner(probes, &scenarios, budget, 0, reuse)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn geometry_complete_prefill_inventory_reuses_only_identical_checked_paths() {
+    let (mut session, executor) = super::tests::fixture_with_domain(4, 32, 8).await;
+    executor
+        .recycle_completed_bindings
+        .store(true, Ordering::Release);
+    let mut budget = limits();
+    budget.prefill_chunk = NonZeroU32::new(8).unwrap();
+    budget.maximum_route_states = 16;
+    let replay = complete_prefill_geometry(&mut session, PrefillReuse::Replay, budget).await;
+    let shared = complete_prefill_geometry(&mut session, PrefillReuse::Share, budget).await;
+    assert_eq!(shared.admitted_requests, replay.admitted_requests);
+    assert_eq!(shared.outcomes.len(), replay.outcomes.len());
+    for (expected, actual) in replay.outcomes.iter().zip(&shared.outcomes) {
+        assert_eq!(expected.unknown, None);
+        super::trajectory_tests::assert_equivalent(expected, actual);
+    }
+    // Four independent initial joint queries. The first width-one successor
+    // supplies its sequential prefix; width two adds one original owner.
+    // Width three changes segmentation and must replay all six row chunks.
+    // Width four has the same two-token segments and adds two chunks. The
+    // two joint continuation targets each advance their own joint predecessor.
+    // All eight original decode queries still run with unchanged host evidence.
+    let required = 4 + (0 + 1 + 6 + 2) + 2 + 8;
+    assert_eq!(shared.projection_attempts, required);
+    assert!(replay.projection_attempts > shared.projection_attempts);
+
+    budget.maximum_projections = required;
+    let exact = complete_prefill_geometry(&mut session, PrefillReuse::Share, budget).await;
+    assert_eq!(exact.projection_attempts, required);
+    for (expected, actual) in shared.outcomes.iter().zip(&exact.outcomes) {
+        super::trajectory_tests::assert_equivalent(expected, actual);
+    }
+    budget.maximum_projections -= 1;
+    let short = complete_prefill_geometry(&mut session, PrefillReuse::Share, budget).await;
+    assert_eq!(short.projection_attempts, budget.maximum_projections);
+    assert_eq!(
+        short.outcomes.last().unwrap().unknown,
+        Some(GeometryProjectionUnknown::BudgetExhausted)
+    );
+    budget = limits();
+    budget.prefill_chunk = NonZeroU32::new(8).unwrap();
+    budget.maximum_route_states = 1;
+    let uncached = complete_prefill_geometry(&mut session, PrefillReuse::Share, budget).await;
+    assert_eq!(uncached.projection_attempts, replay.projection_attempts);
+    for (expected, actual) in replay.outcomes.iter().zip(&uncached.outcomes) {
+        super::trajectory_tests::assert_equivalent(expected, actual);
+    }
+    assert_unsubmitted_clean(&session, &executor);
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn geometry_prefill_failed_target_never_installs_its_partial_joint_successor() {
+    let (mut session, executor) = super::tests::fixture_with_domain(1, 32, 4).await;
+    executor
+        .recycle_completed_bindings
+        .store(true, Ordering::Release);
+    let mut reports = Vec::new();
+    for reuse in [PrefillReuse::Replay, PrefillReuse::Share] {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        *executor.projection_readiness_fault.lock() = Some(Box::new(move |_, _| {
+            // The first ancestor succeeds, but the complete target does not.
+            (calls.fetch_add(1, Ordering::AcqRel) == 1)
+                .then_some(ExecutionCostRouteUnknown::Unsupported)
+        }));
+        let mut probes = requests(&session, 1);
+        probes[0].request.prompt = "test ok v7".into();
+        probes[0].request.sampling_params.max_tokens = 2;
+        let targets = [
+            GeometryInputTarget::PrefillSpan { rows: 1, offset: 2 },
+            GeometryInputTarget::PrefillSpan { rows: 1, offset: 2 },
+            GeometryInputTarget::Decode(GeometryProjectionPoint {
+                rows: 1,
+                sequence_tokens: 4,
+            }),
+        ];
+        let scenarios: Vec<_> = targets
+            .iter()
+            .map(|target| GeometryInputScenario {
+                targets: std::slice::from_ref(target),
+                prefixes: &[],
+            })
+            .collect();
+        let mut budget = limits();
+        budget.prefill_chunk = NonZeroU32::new(1).unwrap();
+        reports.push(
+            session
+                .project_geometry_inputs_inner(probes, &scenarios, budget, 0, reuse)
+                .await
+                .unwrap(),
+        );
+        *executor.projection_readiness_fault.lock() = None;
+        assert_unsubmitted_clean(&session, &executor);
+    }
+    let [replay, shared]: [_; 2] = reports.try_into().ok().unwrap();
+    for (expected, actual) in replay.outcomes.iter().zip(&shared.outcomes) {
+        super::trajectory_tests::assert_equivalent(expected, actual);
+    }
+    assert_eq!(
+        shared.outcomes[0].unknown,
+        Some(GeometryProjectionUnknown::Route(
+            ExecutionCostRouteUnknown::Unsupported
+        ))
+    );
+    assert_eq!(shared.outcomes[1].unknown, None);
+    assert_eq!(shared.outcomes[2].unknown, None);
+    // A failed target leaves neither of its ancestors installed: the second
+    // target still needs all three prefill waves. Only its complete, checked
+    // width-one successor may eliminate the final decode's serial preparation.
+    assert_eq!(shared.projection_attempts, 2 + 3 + 1);
+    assert_eq!(replay.projection_attempts, 2 + 3 + 3 + 1);
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn geometry_prefill_partial_width_one_joint_state_is_not_a_completed_serial_prefix() {
+    let (mut session, executor) = super::tests::fixture_with_domain(1, 32, 4).await;
+    executor
+        .recycle_completed_bindings
+        .store(true, Ordering::Release);
+    let mut reports = Vec::new();
+    for reuse in [PrefillReuse::Replay, PrefillReuse::Share] {
+        let mut probes = requests(&session, 1);
+        probes[0].request.prompt = "test ok v7".into();
+        probes[0].request.sampling_params.max_tokens = 2;
+        let targets = [
+            GeometryInputTarget::InitialPrefill { rows: 1 },
+            GeometryInputTarget::Decode(GeometryProjectionPoint {
+                rows: 1,
+                sequence_tokens: 4,
+            }),
+        ];
+        let scenarios: Vec<_> = targets
+            .iter()
+            .map(|target| GeometryInputScenario {
+                targets: std::slice::from_ref(target),
+                prefixes: &[],
+            })
+            .collect();
+        let mut budget = limits();
+        budget.prefill_chunk = NonZeroU32::new(1).unwrap();
+        reports.push(
+            session
+                .project_geometry_inputs_inner(probes, &scenarios, budget, 0, reuse)
+                .await
+                .unwrap(),
+        );
+        assert_unsubmitted_clean(&session, &executor);
+    }
+    let [replay, shared]: [_; 2] = reports.try_into().ok().unwrap();
+    assert_eq!(shared.projection_attempts, 1 + 3 + 1);
+    assert_eq!(shared.projection_attempts, replay.projection_attempts);
+    for (expected, actual) in replay.outcomes.iter().zip(&shared.outcomes) {
+        assert_eq!(expected.unknown, None);
+        super::trajectory_tests::assert_equivalent(expected, actual);
+    }
     session.shutdown().await.unwrap();
 }

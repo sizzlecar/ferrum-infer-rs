@@ -133,9 +133,9 @@ async fn continuation_prefill_reaches_real_middle_and_final_prompt_spans_before_
         .await
         .unwrap();
     assert_eq!(report.admitted_requests, 2);
-    // Every independent target starts at the real admitted roots. The middle
-    // target consumes initial+middle; the final consumes all three prompt spans.
-    assert_eq!(report.projection_attempts, 1 + 2 + 3);
+    // Every observed target executes its own query. Its checked joint
+    // successor carries the same original roots into the next prompt span.
+    assert_eq!(report.projection_attempts, 1 + 1 + 1);
     assert_eq!(report.outcomes.len(), 3);
     for (index, outcome) in report.outcomes.iter().enumerate() {
         assert_eq!(outcome.unknown, None);
