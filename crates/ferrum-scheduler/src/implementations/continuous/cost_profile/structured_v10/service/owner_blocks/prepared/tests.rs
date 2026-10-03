@@ -232,6 +232,7 @@ mod retained;
 
 mod no_submission;
 
+mod diagnostics;
 pub(super) mod numerical_family;
 mod partial_tail;
 mod phase_exclusion;

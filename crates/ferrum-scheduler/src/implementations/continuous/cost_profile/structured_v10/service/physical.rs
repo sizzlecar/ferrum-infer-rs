@@ -87,7 +87,9 @@ pub(super) fn original_prepared(
             context_before,
             work,
         };
-        frontier.validate().map_err(numeric_error)?;
+        frontier
+            .validate()
+            .map_err(|e| numeric_error_at(NumericalReplaySite::PhysicalFrontier, e))?;
         rows.push(PreparedRow {
             request_id: r.request_id.clone(),
             owner_incarnation: r.owner_incarnation,
@@ -145,7 +147,7 @@ pub(super) fn validate_parts(
             &contract.workload_domain,
         )?
         .with_cost_template_policy(contract.template_policy)
-        .map_err(numeric_error)?,
+        .map_err(|e| numeric_error_at(NumericalReplaySite::PhysicalTemplatePolicy, e))?,
         None => prepared::project_service_actual(&adapted, &offered)?,
     };
     let (wall, observed) = observation::validate_service_actual(
@@ -178,7 +180,7 @@ pub(super) fn validate_parts(
                 .collect::<Vec<_>>(),
         )
     }
-    .map_err(numeric_error)?;
+    .map_err(|e| numeric_error_at(NumericalReplaySite::PhysicalSettledTerminal, e))?;
     for ((r, n), host) in s
         .rows
         .iter()
@@ -209,7 +211,9 @@ pub(super) fn validate_parts(
         )?;
     }
     let input = match envelope {
-        Some(contract) => contract.project_input(input).map_err(numeric_error)?,
+        Some(contract) => contract
+            .project_input(input)
+            .map_err(|e| numeric_error_at(NumericalReplaySite::PhysicalEnvelopeProjection, e))?,
         None => input,
     };
     Ok((input, wall, observed))

@@ -276,7 +276,27 @@ impl ImportedStructuredModelV2 {
 fn invalid(reason: &'static str) -> CostProfileError {
     CostProfileError::Metadata(reason)
 }
-fn numeric_error(_: StructuredUnknownV2) -> CostProfileError {
+#[derive(Debug, Clone, Copy)]
+enum NumericalReplaySite {
+    Replay,
+    PhysicalFrontier,
+    PhysicalTemplatePolicy,
+    PhysicalSettledTerminal,
+    PhysicalEnvelopeProjection,
+}
+fn numeric_error(reason: StructuredUnknownV2) -> CostProfileError {
+    numeric_error_at(NumericalReplaySite::Replay, reason)
+}
+fn numeric_error_at(site: NumericalReplaySite, reason: StructuredUnknownV2) -> CostProfileError {
+    // Diagnostics retain the typed failure without changing the public error,
+    // source records, or any successful replay work.
+    tracing::warn!(
+        target: "ferrum_scheduler::structured_owner_diagnostics",
+        event = "structured_numerical_replay_rejected_v1",
+        ?site,
+        ?reason,
+        "Structured numerical replay rejected"
+    );
     invalid("invalid structured numerical replay")
 }
 fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, CostProfileError> {

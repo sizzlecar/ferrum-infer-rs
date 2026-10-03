@@ -207,6 +207,94 @@ impl StructuredPreparedOwnerBlockCollectorV8 {
         }
         result
     }
+    fn rejection_diagnostic(
+        &self,
+        record: &StructuredPreparedOwnerBlockRecordV8,
+        error: &CostProfileError,
+    ) {
+        use StructuredPreparedOwnerBlockRecordV8 as R;
+        use StructuredServiceRecordV7 as P;
+        // Read only bounded identities on this error path. In particular, do
+        // not serialize a record or clone its original physical evidence.
+        let (record_kind, ticket, fifo, call) = match record {
+            R::Population(P::Completed { wave }) => (
+                "completed",
+                Some(wave.ticket),
+                Some(wave.fifo),
+                Some(wave.host_stages.call_id),
+            ),
+            R::Population(P::OutsideDeclaredRoute { wave }) => (
+                "outside_declared_route",
+                Some(wave.ticket),
+                Some(wave.fifo),
+                Some(wave.evidence.call_id()),
+            ),
+            R::Population(P::NotSubmitted { attempt }) => (
+                "not_submitted",
+                Some(attempt.ticket),
+                None,
+                Some(attempt.call_id()),
+            ),
+            R::Population(P::Failed { ticket, fifo, .. }) => {
+                ("failed", Some(*ticket), Some(*fifo), None)
+            }
+            R::Population(P::BlockOpen { .. }) => ("block_open", None, None, None),
+            R::Population(P::BlockClose { .. }) => ("block_close", None, None, None),
+            R::Population(P::Checkpoint { .. }) => ("checkpoint", None, None, None),
+            R::Population(P::Footer { .. }) => ("footer", None, None, None),
+            R::Cohort(_) => ("cohort", None, None, None),
+            R::Preparation(event) => match event.position() {
+                Some((ticket, fifo, _, call, _, _)) => (
+                    "preparation_completed",
+                    Some(ticket),
+                    Some(fifo),
+                    Some(call),
+                ),
+                None => ("preparation", event.offered(), None, None),
+            },
+            R::PreparationDisposition(
+                StructuredPreparationDispositionV8::PreparationNotSubmitted { attempt, .. },
+            ) => (
+                "preparation_not_submitted",
+                Some(attempt.ticket),
+                None,
+                Some(attempt.call_id()),
+            ),
+            R::Tail(_) => ("partial_tail_closed", None, None, None),
+        };
+        let active = self.lifecycle.cohort().ok();
+        let declaration = &self.header.declaration.population;
+        let reason = match error {
+            CostProfileError::Limit(s)
+            | CostProfileError::Clock(s)
+            | CostProfileError::Metadata(s) => *s,
+            CostProfileError::Io(_) => "io",
+            CostProfileError::Json(_) => "json",
+            CostProfileError::UnsupportedVersion(_) => "unsupported_version",
+            CostProfileError::FingerprintMismatch => "fingerprint_mismatch",
+            CostProfileError::SettingsMismatch => "settings_mismatch",
+            CostProfileError::Sample { .. } => "sample",
+            CostProfileError::Model(_) => "model",
+        };
+        tracing::warn!(
+            target: "ferrum_scheduler::structured_owner_diagnostics",
+            event = "structured_source8_record_rejected_v1",
+            record_kind,
+            active_phase_index = ?active.map(|(phase, _)| phase),
+            active_cohort = ?active.map(|(_, cohort)| cohort),
+            ?ticket,
+            ?fifo,
+            ?call,
+            offered = self.offered(),
+            last_fifo = self.last_fifo(),
+            universe_policy = ?declaration.schedule.algorithm_universe,
+            declared_universe = declaration.nonnegative_envelope.as_ref()
+                .is_some_and(|e| e.algorithm_universe.is_some()),
+            discovered_universe = self.population.frozen_algorithm_universe().is_some(),
+            reason,
+            "Source8 original record rejected before poisoning"
+        );
+    }
     fn check_retained(&mut self) -> Result<(), CostProfileError> {
         let bytes =
             self.header
@@ -305,7 +393,8 @@ impl StructuredPreparedOwnerBlockCollectorV8 {
             }
             Ok(())
         });
-        if result.is_err() {
+        if let Err(error) = &result {
+            self.rejection_diagnostic(record, error);
             self.population.poison();
         }
         result
