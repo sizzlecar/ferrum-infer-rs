@@ -6,7 +6,34 @@
 
 下一份可运行检查点以同一条产品链路验收：正常 `run` / `serve` 从空成本状态自动完成准备和原独立资格阶段，发布有效成本模型，内容不同但处于支持范围内的普通请求在执行前得到预测，Enforce 实际采用，真实提交与回执配对，输出完整且资源可退役。用户无需手工训练、导入成本文件或设置隐藏环境组合。CPU 正例先约束组合行为，再以同一源码验证真实后端；该检查点通过后才进入完整性能验收，不把它标成最终发布完成。
 
-## G10：同一候选的四入口实机结果
+## G13：最新四入口结果，仍未达到可用检查点
+
+2026 年 10 月 3 日，冻结候选 `1ad2642e` 的 Metal/CUDA 正常 `run`、`serve` 均已结束，guard/product 退出码为 0，**但普通请求预测采用、必要覆盖和 SLO 尚未闭环，正式验收仍为 0/224**。本轮包含 G12 重复 gaps 计费修正和 G13 完整关联轨迹声明修正；旧失败没有删除。
+
+规定的 fmt、workspace check/test、Clippy（`-A warnings`）及 Metal 全目标编译通过；全仓按顶层 Rust harness 去重统计为 **7875 pass、0 fail、109 ignored**，ignored 不算已执行。两端均以这份 3353 文件源码完成 release 构建，实际 Cargo artifact 与冻结二进制对应；CUDA 原 pinned native lock 下的 CLI check 也通过。编译和 CPU 测试不能替代实机覆盖、默认 2ms 规划或 SLO 证明。
+
+| 入口 | 本轮实际结果 | 当前缺口与边界 |
+| --- | --- | --- |
+| CUDA `run` | 92.81s 完成当前冻结计划的 632/632 cohorts，发布四份来源、epoch4；整个 bootstrap 约 99.45s | G11 拒绝未重现，但旧计划为 606 cohorts，不能声称逐波重放了原失败轨迹。后续 source7 因容量超出 2689 B 失败，确实进入下一代并结算 5 个 offer，但未再发布；1536-token 输出仍截断 |
+| CUDA `serve` | 59.45s 完成当前 353 cohorts，启动 epoch4；在线实际新增、替换至 epoch5/6 | 普通窗口 witness decision/submitted/reconciled 为 **0/0/0**；437 个候选查询均 WrongDomain，Known 为 0，保持完成请求的回退执行；TPOT 和 joint SLO 失败 |
+| Metal `run` | 完成 287/448 cohorts、两份来源、epoch2 | source2 在原 120s 时限停止，尚有请求与动作额度；reference probe 另耗约 62s，整个 bootstrap 约 182s。512-token 输出仍截断，未取得普通请求独立采用分母 |
+| Metal `serve` | composition 获授权：32,943,962 B ≤ 34,195,039 B；约 21.69s 后停于 78/815 cohorts、首份 Prefill 来源 | source1 的 15 个 key 已 ACK，尚未进入收样即停止；具体拒绝未记录，不能称超时。普通窗口 witness 为 164/119/119，但三项延迟 P99 均失败 |
+
+来源数和 cohort 数只描述当前计划，既不是覆盖率，也不是新增的 4/4 硬门。CUDA `run` 的累计 1069 issued、1037 paired 含启动和私有请求，不能写成普通采用。CUDA `serve` 的普通窗口确有 2833 次实际提交与结算，但预测 witness 为零；同期 planner phase 耗尽 1933 次、hard budget 耗尽 368 次，与 437 次查询不是同一分母。G10 相同选样窗口曾有 25/21/21 witness，本轮零采用不能被启动完成、后续模型发布或 retrospective Known902 掩盖。WrongDomain 聚合了 query 构造、catalog selection 和 child prediction，当前没有原 query 身份，尚不能确定具体失败层或 host/algorithm 字段。
+
+两端仍为原 pinned ShareGPT、固定 C8、32 warmup + 32 measured、1 次重复，64 请求均成功、错误为 0。CUDA 完整包已核：主 TPOT 终点为最后可见输出，ITL 为相邻非空可见 SSE 文本事件间隔。
+
+| 后端 | TTFT P50/P99 ms | TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | successful output tokens/s | 峰值内存 | 原 SLO |
+| --- | --- | --- | --- | --- | --- | --- |
+| CUDA | 71.396 / 138.781 | 18.614 / 20.880 | 17.345 / 40.022 | 350.957 | runtime requested 23,216,118,580 B；NVML 整卡 23,672 MiB；host max RSS 6,684,404 KiB | 原 200/15/50ms P99 阈值下 TTFT、pooled ITL 通过，TPOT 失败；joint 1/32，低于 99% |
+
+CUDA measured 为 9210 usage tokens、9179 可见文本事件、9147 间隔；两条 event/usage 不一致请求仍计入可见停顿，无传输合并。Runtime memory 为 833 个样本、NVML 为 844 个样本，覆盖启动至退出；不同口径不相加，WSL per-process NVML 不可用。原服务已恢复为 PID699052，10:10:45 UTC 独立健康检查为 ok，这是该作业结束时的历史状态。Metal 当前已核摘要：TTFT/TPOT/可见 ITL P99 为 4849.539/233.788/868.979ms，输出 37.014 tokens/s，原 3400/212/359ms 阈值均失败，joint 3/32；完整包和终态内存审计仍待补齐。单次重复不能建立性能收益或正式主表结论。
+
+**下一步先用既有诊断取得普通失败 query 的原身份、对应 epoch 和失败阶段**，再判定覆盖、查询或预算中的具体阻断；不能只从已安装 child 反推必要域已覆盖。Metal 收样前停止也需原拒绝证据，不能猜成超时后直接扩预算。原独立 F/R/Q、2ms、120s/2048/16384 和完整输出要求不变；当前不启动 224 单元正式矩阵。
+
+外部审计：[CPU 全仓计数](/private/tmp/ferrum-slo-recovery-20261002/g13-workspace-test-audit.json)、[CUDA run 运行](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-runtime-audit.json)与[覆盖边界](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-coverage-audit.json)、[CUDA serve 完整结果](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-serve-runtime-audit.json)、[Metal run](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-run-results.json)、[Metal serve 原始摘要](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-serve-summary)。两端构建身份另见 `g13-metal-build-audit.json`、`g13-cuda-build-and-runtime-audit.json`。
+
+## G10：同一候选的四入口实机结果（历史）
 
 2026 年 10 月 3 日，`39eebad8` 的 Metal/CUDA 正常 `run`、`serve` 已全部结束。仍无完整可交付版本，正式验收 **0/224**。本次包含两项修复：同一次 captured outcome 的原始配方共享，以及区分保留全部 native commands 的 adaptive replay 与 sealed direct invocation。前者保持完整配方存活期和引用计账，后者仅恢复原物理凭据，不把 GraphPath Unknown 改成数值合格。两项分别有修复前失败与修复后通过的 Rust 反例，真实 CUDA cold graph 及取消后 fence 生命周期检查也通过。
 
@@ -52,7 +79,7 @@ G11 正常 CUDA run 已在 10 月 3 日 08:47 UTC 前结束，guard/product 均�
 
 最小反例保留真实 A/B algorithm union 与独立 FullLogits terminal 组；增加不产生新 key/member 的空 Unknown 声明时，原有同一条聚合 Unknown gap 已足够。旧代码将同一存活阶段的额度从 255,036 抬至 318,524 bytes，完整计划在原额度处被拒，0 pass/1 fail。修复后两种声明数均为 234,204 bytes，并保持全部代表、scope、schedule、5 条 gaps 和三项实际工作量账；零工作额度场景仍保留 14 条 gaps 及全部请求/动作/行数拒绝。少 1 字节仍在 geometry 前拒绝。最小测试 1 pass，整个 layout 组 120 pass、0 fail、0 ignored，fmt/diff 通过。首个 fixture 曾把 terminal 放入同一个 Greedy family而先触发夹具断言，已保留该失败并以真实独立 product 修正；它不算生产修复前证据。
 
-按 G10 Metal 原 inventory 及实际类型尺寸核算，重复项为 9,389,280 bytes，去重后的保守峰为 32,943,962，低于当时可用 34,195,039。此为同一存活对象的计费纠正，不是新增预算、删除样本或真实内存占用节省的测量；尚不能宣布 Metal 合并、120s 校准或 SLO 通过。G12 尚未执行实机；下一份稳定组合候选仍需规定 workspace/backend checks 和四入口验证。
+按 G10 Metal 原 inventory 及实际类型尺寸核算，重复项为 9,389,280 bytes，去重后的保守峰为 32,943,962，低于当时可用 34,195,039。此为同一存活对象的计费纠正，不是新增预算、删除样本或真实内存占用节省的测量。G12 未单独运行实机，已随 G13 组合候选完成规定 workspace/backend checks 和四入口运行；Metal serve 的真实 composition 授权通过，但准备、收样和 SLO 缺口仍见开头，不能把容量门通过写成完整校准通过。
 
 此外，只读审查确认 Source8 可在一次真实 capture 中保留多个独立 host/product family，各自完成 F/R/Q。当前 selector 的分组、优先级和单一 universe 限制了打包。减少来源槽可能因共同采样周期反增执行工作，必须先重算请求、动作、行数、owner 和内存账；没有证据证明该方向能在 120s/2048 内覆盖必要策略，尚未实现。外部记录为 `g10-multi-family-capture-design-audit.json`。G11/G12 的局部结果分别存于 `g11-validation-status.json`、`g12-validation-status.json`，不覆盖上面的 G10 冻结负结果。
 
@@ -60,7 +87,7 @@ G13 修复声明前的一处已复现遗漏：`local_universe` 曾先按目标 n
 
 最小 typed Rust 反例保留目标 A/B、同 case 关联的另一 product C，以及仅在 global seed 中的无关 D。旧代码在 C 的声明成员检查处失败，0 pass/1 fail、0.06s；修复后 C 可物理投影但仍不同于目标 family，D 仍被排除。seed 缺 C 时的回归保持原代表、成员、cycles 和三项工作量。相关 `local_scope_` 六项通过，整个 layout 组 122 pass、0 fail、0 ignored。另一个完整独立 F/R/Q 与证书重放回归同时覆盖旧 FittedResidual 和生产 IdentifiedFitGlobalResidual：仅测 A 可以资格并预测 A，已声明但未测的 B 严格拒绝为 QualificationCoverage。首轮测试曾错误地要求更后的 UnidentifiedDirection，失败已保留；查明 phase coverage 先于数值求值后修正断言，生产门未改。输入 readiness V3 与 envelope challenge 是两个不同字段，本回归不声称覆盖整个输入准备流程。
 
-G13 仍未实机验证，也未完成组合候选的全仓检查。上述反例证明真实选择逻辑遗漏，但 G11 日志没有具体 CUDA C，尚不能断言已修复该次设备拒绝；新维度仍可能增加容量或资格工作。下一步先用同原配置 CUDA run 检验该假设，再依结果推进同一候选的四入口，不直接启动正式矩阵。局部证据存于 `g13-validation-status.json`。
+G13 组合候选 `1ad2642e` 已完成全仓检查、准确源码对应的双后端构建及四入口实机运行，结果见开头。CUDA 当前 632-cohort 计划完成，G11 的物理投影拒绝未重现；但 G11 没有记录具体缺失算法，且原计划为 606 cohorts，不能把这次成功写成原 wave 的逐项复现。新增声明没有放宽资格，普通 CUDA serve 的预测采用仍为零，必要域覆盖和 SLO 未完成，不进入正式矩阵。局部反例和失败记录继续保留在 `g13-validation-status.json`。
 
 ## G9：同一候选的四入口实机结果（历史）
 
