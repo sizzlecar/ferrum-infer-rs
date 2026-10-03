@@ -162,6 +162,55 @@ fn complete_recording_never_attests_successful_close_or_slo() {
 }
 
 #[test]
+fn query_algorithm_diagnostics_preserve_old_and_extended_trace_audits() {
+    let mut trace = Trace::new();
+    trace.begin(1);
+    trace.snapshot(1, 7, 8);
+    trace.attempt(1, 1, "Search", 3);
+    trace.query(
+        1,
+        1,
+        json!({"kind":"structured_unknown","reason":"WrongDomain"}),
+    );
+    trace.end_attempt(1, 1, 1, 1);
+    trace.end(1, "cost_unavailable");
+    trace.footer();
+    // Original v1 records lacking both optional diagnostics still audit.
+    let old = trace.audit();
+    assert!(
+        old.integrity.trace_content_complete,
+        "{:?}",
+        old.integrity.issues
+    );
+    let query = trace
+        .records
+        .iter_mut()
+        .find(|r| r["event"] == "query_constructed")
+        .unwrap();
+    let signature = [3u8; 32];
+    let universe = [4u8; 32];
+    query["data"]["algorithm_axes"] = json!([{"signature":signature, "kind":0}]);
+    query["data"]["prebound_algorithm_universe"] = json!(universe);
+    let extended = trace.audit();
+    assert!(
+        extended.integrity.trace_content_complete,
+        "{:?}",
+        extended.integrity.issues
+    );
+    assert_eq!(old.counters, extended.counters);
+    assert_eq!(
+        old.integrity.event_records,
+        extended.integrity.event_records
+    );
+    assert_eq!(
+        old.integrity.transactions_ended,
+        extended.integrity.transactions_ended
+    );
+    assert!(!extended.integrity.successful_close_attested);
+    assert_ne!(old.input_jsonl_sha256, extended.input_jsonl_sha256);
+}
+
+#[test]
 fn snapshot_absence_and_model_unavailable_have_different_denominators() {
     let mut trace = Trace::new();
     trace.begin(1);

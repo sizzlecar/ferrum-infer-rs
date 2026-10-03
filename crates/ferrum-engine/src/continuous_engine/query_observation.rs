@@ -516,7 +516,18 @@ impl Event {
             Self::EndTransaction(v) => write(entry, out, "transaction_end", v),
             Self::Query(key, result) => {
                 #[derive(Serialize)]
-                struct Query<'a> { attempt:u64, alternative:usize, demand:Option<&'a ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredQueryDemandV2>, identity:Option<QueryIdentity<'a>>, input_unknown:Option<DebugWire<StructuredUnknownV2>>, demand_error:Option<DebugWire<StructuredUnknownV2>> }
+                struct Query<'a, A: Serialize> {
+                    attempt: u64,
+                    alternative: usize,
+                    demand: Option<&'a ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredQueryDemandV2>,
+                    identity: Option<QueryIdentity<'a>>,
+                    // Borrowed from the already retained original query, never
+                    // reconstructed from a family hash or the installed model.
+                    algorithm_axes: Option<A>,
+                    prebound_algorithm_universe: Option<&'a [u8; 32]>,
+                    input_unknown: Option<DebugWire<StructuredUnknownV2>>,
+                    demand_error: Option<DebugWire<StructuredUnknownV2>>,
+                }
                 let demand = result
                     .as_ref()
                     .map_err(|e| *e)
@@ -530,6 +541,14 @@ impl Event {
                         alternative: key.alternative,
                         demand: demand.as_ref().ok(),
                         identity: result.as_ref().ok().map(QueryIdentity::new),
+                        algorithm_axes: result
+                            .as_ref()
+                            .ok()
+                            .map(|q| q.input().observation_algorithm_axes()),
+                        prebound_algorithm_universe: result
+                            .as_ref()
+                            .ok()
+                            .and_then(|q| q.input().algorithm_universe_signature()),
                         input_unknown: result.as_ref().err().copied().map(DebugWire),
                         demand_error: if result.is_ok() {
                             demand.as_ref().err().copied().map(DebugWire)

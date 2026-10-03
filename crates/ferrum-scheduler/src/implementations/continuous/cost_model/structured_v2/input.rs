@@ -47,6 +47,13 @@ pub(super) struct PendingQuery {
     pub constraint: HostPendingConstraintV2,
 }
 impl StructuredInputV2 {
+    /// Borrow the checked input's original `(signature, kind)` roster for
+    /// passive diagnostics. Universe alignment does not add its zero-work
+    /// algorithms here. This view neither projects work nor grants authority.
+    pub fn observation_algorithm_axes(&self) -> impl serde::Serialize + '_ {
+        &self.algorithm_axes
+    }
+
     /// Inline value and every owned allocation at its actual capacity. Fixed
     /// owner/domain fields are included in Self; allocator/RSS costs are not.
     pub fn retained_payload_bytes(&self) -> Option<usize> {

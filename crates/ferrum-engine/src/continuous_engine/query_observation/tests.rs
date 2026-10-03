@@ -135,6 +135,14 @@ fn lookup(t: &Transaction, key: PlanningQueryKey) {
 // Real canonical command/host construction and physical-domain validation.
 // No serialized family key is used to create a checked query.
 fn identity_query(algorithm: u8, context_limit: u32, policy: u8) -> StructuredQueryV2 {
+    identity_query_algorithms(&[algorithm], context_limit, policy)
+}
+
+fn identity_query_algorithms(
+    algorithms: &[u8],
+    context_limit: u32,
+    policy: u8,
+) -> StructuredQueryV2 {
     use ferrum_interfaces::{execution_cost::*, vnext::DeviceCommandPhase};
     use std::num::{NonZeroU32, NonZeroU64};
     let domain = CostWorkloadDomainV1::new_vnext(
@@ -156,20 +164,27 @@ fn identity_query(algorithm: u8, context_limit: u32, policy: u8) -> StructuredQu
     )
     .unwrap();
     let mut selected = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
-    selected
-        .kernel(
-            SelectedAlgorithmClassV1::new("fixture.query-identity", 1, [algorithm; 32], [2; 32])
+    for &algorithm in algorithms {
+        selected
+            .kernel(
+                SelectedAlgorithmClassV1::new(
+                    "fixture.query-identity",
+                    1,
+                    [algorithm; 32],
+                    [2; 32],
+                )
                 .unwrap(),
-            KernelNumericWorkV1 {
-                logical_units: 8,
-                padded_units: 8,
-                inner_units_per_logical_unit: 2,
-                grid: [1, 1, 1],
-                scratch_bytes: 32,
-                staged_weight_bytes: 0,
-            },
-        )
-        .unwrap();
+                KernelNumericWorkV1 {
+                    logical_units: 8,
+                    padded_units: 8,
+                    inner_units_per_logical_unit: 2,
+                    grid: [1, 1, 1],
+                    scratch_bytes: 32,
+                    staged_weight_bytes: 0,
+                },
+            )
+            .unwrap();
+    }
     let selected = selected.finish().unwrap();
     let mut builder =
         CanonicalWaveCostBuilder::new_with_structured_statistics(0, CostProductOutput::GreedyToken);
@@ -189,7 +204,7 @@ fn identity_query(algorithm: u8, context_limit: u32, policy: u8) -> StructuredQu
             participant_count: 1,
             token_count: 1,
             batching_form: "packed",
-            compute_dispatch_count: 1,
+            compute_dispatch_count: algorithms.len() as u64,
             transfer_command_count: 0,
             reusable_graph_node_count: None,
             statistical_evidence: Some(&selected),
@@ -250,12 +265,24 @@ fn identity_query(algorithm: u8, context_limit: u32, policy: u8) -> StructuredQu
 
 #[test]
 fn required_query_writer_preserves_checked_family_algorithm_and_physical_identity() {
-    let queries = [
+    use ferrum_interfaces::execution_cost::{AlgorithmWorkKindV1, SelectedAlgorithmClassV1};
+    use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1;
+
+    let mut queries = vec![
         identity_query(1, 1024, 4),
         identity_query(2, 1024, 4),
         identity_query(1, 2048, 4),
         identity_query(1, 1024, 5),
     ];
+    let universe =
+        DeclaredAlgorithmUniverseV1::from_inputs([queries[0].input(), queries[1].input()], 4096)
+            .unwrap();
+    queries.push(
+        queries[0]
+            .clone()
+            .with_algorithm_universe(&universe)
+            .unwrap(),
+    );
     let original: Vec<_> = queries
         .iter()
         .map(|q| q.input().numerical_family_key().unwrap())
@@ -283,6 +310,31 @@ fn required_query_writer_preserves_checked_family_algorithm_and_physical_identit
         .map(|r| &r["data"]["identity"])
         .collect();
     assert_eq!(identities.len(), queries.len());
+    for (record, algorithm) in records
+        .iter()
+        .filter(|r| r["event"] == "query_constructed")
+        .zip([1, 2, 1, 1, 1])
+    {
+        let selected =
+            SelectedAlgorithmClassV1::new("fixture.query-identity", 1, [algorithm; 32], [2; 32])
+                .unwrap();
+        assert_eq!(
+            record["data"]["algorithm_axes"],
+            json!([{
+                "signature": selected.signature(), "kind": AlgorithmWorkKindV1::Kernel as u8,
+            }])
+        );
+        // Alignment to A+B must still report this query's actual A alone.
+        let prebound = record["data"]["alternative"] == 4;
+        assert_eq!(
+            record["data"]["prebound_algorithm_universe"],
+            if prebound {
+                json!(universe.signature())
+            } else {
+                Value::Null
+            }
+        );
+    }
     for ((identity, query), family) in identities.iter().zip(&queries).zip(&original) {
         assert_eq!(
             identity["numerical_family"],
@@ -299,7 +351,10 @@ fn required_query_writer_preserves_checked_family_algorithm_and_physical_identit
         );
         assert_eq!(
             identity["numerical_family"]["algorithm_domain"],
-            identity["owner"]["algorithm_domain"]
+            query.input().algorithm_universe_signature().map_or_else(
+                || identity["owner"]["algorithm_domain"].clone(),
+                |u| json!(u)
+            )
         );
         for (name, policy) in [
             (
@@ -353,6 +408,101 @@ fn required_query_writer_preserves_checked_family_algorithm_and_physical_identit
         identities[3]["physical_domain_signature"]
     );
     assert_eq!(writer.snapshot()["recording_complete"], true);
+}
+
+#[test]
+fn required_query_writer_algorithm_roster_respects_exact_event_byte_limit() {
+    struct ReleaseOutput(Arc<Output>);
+    impl Drop for ReleaseOutput {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    // A real checked multi-command roster makes wire bytes, rather than the
+    // retained query, the limiting resource. Clone once in the fixture to make
+    // the producer's original Vec capacities compact too: admission estimates
+    // those capacities BEFORE making its own compact queued clone.
+    let original = identity_query_algorithms(&(1..=32).collect::<Vec<_>>(), 1024, 4);
+    let query = original.clone();
+    let key = PlanningQueryKey {
+        attempt: 1,
+        alternative: 0,
+    };
+    let entry = Entry {
+        ordinal: 3,
+        retained_ordinal: 3,
+        transaction: 1,
+        event: Event::Query(key, Ok(query.clone())),
+        bytes: 0,
+    };
+    let retained = entry.event.retained_bytes().unwrap();
+    let mut line = BoundedLine {
+        bytes: Vec::new(),
+        limit: limits().max_event_bytes,
+    };
+    entry.event.encode(&entry, &mut line).unwrap();
+    line.write_all(b"\n").unwrap();
+    let exact = line.bytes.len();
+    let estimated = query.observation_retained_bytes().unwrap() + size_of::<Entry>();
+    assert!(retained <= estimated);
+    assert!(estimated < exact - 1);
+    assert!(retained < exact - 1);
+    assert!(query.observation_demand_scratch_bytes().unwrap() < exact - 1);
+    for (limit, succeeds) in [(exact, true), (exact - 1, false)] {
+        let mut l = limits();
+        l.max_event_bytes = limit;
+        let output = Arc::new(Output::default());
+        let writer = Writer::start(l, Box::new(TestDestination(output.clone()))).unwrap();
+        // Installed before any paused operation/assertion; unwinding releases
+        // output before Writer::drop joins its worker.
+        let _release = ReleaseOutput(output.clone());
+        output.pause();
+        writer
+            .bind_identity(&ferrum_types::SloConfig::default(), None)
+            .unwrap();
+        output.wait_paused();
+        let retained_before = writer.snapshot()["retained_bytes"].as_u64().unwrap();
+        let t = writer.begin();
+        let accepted_before = writer.snapshot()["statistics"]["accepted"]
+            .as_u64()
+            .unwrap();
+        t.constructed(key, Ok(&query));
+        assert_eq!(
+            writer.snapshot()["statistics"]["accepted"]
+                .as_u64()
+                .unwrap(),
+            accepted_before + 1
+        );
+        // No extra roster allocation accompanies the original queued clone.
+        assert_eq!(
+            writer.snapshot()["retained_bytes"].as_u64().unwrap() - retained_before,
+            (retained - size_of::<Entry>()) as u64
+        );
+        finish(&t);
+        output.release();
+        assert_eq!(writer.close().is_ok(), succeeds);
+        let h = writer.snapshot();
+        assert_eq!(h["recording_complete"], succeeds);
+        assert_eq!(h["retained_events"], 0);
+        assert_eq!(h["statistics"]["lost"]["capacity"], 0);
+        assert_eq!(h["statistics"]["lost"]["encoding"], u64::from(!succeeds));
+        let records = output.records();
+        let queries: Vec<_> = records
+            .iter()
+            .filter(|r| r["event"] == "query_constructed")
+            .collect();
+        assert_eq!(queries.len(), usize::from(succeeds));
+        if succeeds {
+            assert_eq!(
+                queries[0]["data"]["algorithm_axes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                32
+            );
+        }
+        assert_eq!(records.last().unwrap()["recording_complete"], succeeds);
+    }
 }
 
 #[test]
@@ -466,6 +616,10 @@ fn required_query_writer_preserves_original_clock_and_explicit_not_queried_and_r
             .count(),
         2
     );
+    for record in records.iter().filter(|r| r["event"] == "query_constructed") {
+        assert!(record["data"]["algorithm_axes"].is_null());
+        assert!(record["data"]["prebound_algorithm_universe"].is_null());
+    }
     assert_eq!(
         records
             .iter()
