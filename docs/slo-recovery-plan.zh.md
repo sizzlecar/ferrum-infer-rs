@@ -23,6 +23,8 @@
 
 普通窗口进一步核对：CUDA 有 3361 个完成的控制器 transaction，规划阶段耗尽 2402 次、hard budget 耗尽 527 次；Metal 对应 2914、1916、55。三个计数不是同一事件分类，不能相加。两端实际采用的 witness 均只有一波、tail 为 0，生成/展开候选数均等于 witness 样本数。此轮没有展示实机多候选、带后续波的前瞻计划，也没有 Off 配对来证明改变排程及净收益；非零 issued/actual 配对只证明局部真实采用。依据为原普通观测 `health-before/after`，没有开启 Required 重型追踪；原始差值和 hash 另存 `g10-ordinary-planning-window.json`。
 
+这只描述已采用 witness 子集，不代表整个窗口没有搜索多个候选。单波也可能合法满足当前 horizon，lookahead3 是上限，不是每次必须三波。全窗口同时存在真实成本覆盖拒绝和预算停止，健康聚合缺少逐 witness 的 depth、Unknown 和 deadline 关联，不能把每次单波选择归到同一个原因。代码路径与现有计数的界限另存 `g10-ordinary-single-wave-causal-limits.json`；下一步仍以必要覆盖、原预算内有用的选择及同负载 Off 对照判断。
+
 两端服务保持 Qwen3.5-9B Q4_K_M / KV fp16、同机、同配置、固定 C8、原 pinned ShareGPT 64 条选样与输出长度策略，1 次重复，各 64 请求完成且错误为 0。主口径取原 Rust SLO sidecar；TPOT 终点为最后可见输出，ITL 为相邻非空可见 SSE 文本事件间隔。
 
 | 后端 | TTFT P50/P99 ms | TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | successful output tokens/s | 峰值内存 | 原 SLO |
@@ -40,7 +42,11 @@
 
 ## G10 后的定位与局部修复
 
-`f1fade2f`（G11）仅增加错误路径诊断：保留原 `invalid structured numerical replay` 错误和 poison 行为，另记录 typed reason、固定触发位置及原 Source8 event/cohort/ticket/FIFO/call，不序列化完整记录。真实 journal 对照确认成功前缀没有新增日志，日志开关不改变失败记账、原记录或 source receipt。最小测试 1 pass，受影响 structured replay 组 166 pass、0 fail、27 项原外部证据测试未执行，fmt/diff 检查通过。CUDA 诊断构建使用该独立冻结版本，保持 G10 正常 run 的任务、配置、预算及观测设置；实机拒绝原因仍待取得，不能把静态可达的固定 universe 路径写成已证实根因。
+`f1fade2f`（G11）仅增加错误路径诊断：保留原 `invalid structured numerical replay` 错误和 poison 行为，另记录 typed reason、固定触发位置及原 Source8 event/cohort/ticket/FIFO/call，不序列化完整记录。真实 journal 对照确认成功前缀没有新增日志，日志开关不改变失败记账、原记录或 source receipt。最小测试 1 pass，受影响 structured replay 组 166 pass、0 fail、27 项原外部证据测试未执行，fmt/diff 检查通过。CUDA 诊断构建使用该独立冻结版本，保持 G10 正常 run 的任务、配置、预算及观测设置；3353 文件源码清单、实际 Cargo artifact、冻结二进制、native lock/PTX 收据和各构建退出码已独立核对。
+
+G11 正常 CUDA run 已在 10 月 3 日 08:47 UTC 前结束，guard/product 均退出 0，但自动校准仍失败。准确拒绝为 `PhysicalEnvelopeProjection / WrongDomain`；原 Source8 `completed` 记录位于 source1、phase0、cohort1、ticket5、FIFO1070、call877，之前接受到 FIFO1069，offered4，固定 declared universe 存在、discovery 未启用。拒绝发生在约 41.99s，最终 133/606 cohorts、一份来源、epoch1，因此不是 120s 超时。日志定位到了 `contract.project_input`，仍未记录具体算法名单，不能据此断言缺哪一项或把所有 WrongDomain 作为合法非成员放过。相同配置下本轮计划为 606 cohorts，G10 为 621；不声称运行选择轨迹完全一致。
+
+原计数任务 stdout 与 G10 字节一致，仍达到 1536-token 上限；它只作因果诊断，不证明完整输出或性能提升。CUDA 原服务已按原 exe/cwd/cmdline 恢复，PID 560440、health 为 ok。原始证据为 `g11-cuda-run-evidence.tar.gz`，SHA256 `ea36df4bdda04af865bd35e9cd19599e33beca9d1ad0e34efa4457fdf6031bce`；该轮没有加入 G12 内存修复。下一步以准确拒绝路径建立最小因果反例，保留原物理校验、独立资格、计时和计账规则。
 
 `089a49b8`（G12）修正合并候选的一项重复计费：当前选择结果只有一份 `gaps` Vec，原 `memory::plan` 已按完整分组拒绝、早停、geometry、append 和全局缺口上界收费，并包含扩容时旧/新 backing；composition 没有第二份 gaps 缓冲，却再次预约其空间。仅删除后者，其余原配方、scope、builder、机会数组、候选和增长账保持。
 
