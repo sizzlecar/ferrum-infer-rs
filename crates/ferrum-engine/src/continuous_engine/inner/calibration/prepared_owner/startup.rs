@@ -361,6 +361,22 @@ impl CalibrationSession {
         // the existing completion reaper until terminal drain or quarantine.
         drop(interrupted_prefixes);
         last_epoch = self.startup_owner_series_installed_epoch().or(last_epoch);
+        if let Some(error) = last_error.as_ref() {
+            tracing::warn!(
+                %error,
+                source_index,
+                completed_sources,
+                declared_sources,
+                completed_cohorts,
+                planned_cohorts,
+                published_epoch = ?last_epoch,
+                actual_requests_remaining = budget.requests_remaining(),
+                selection_requests_remaining = budget.selection_requests_remaining(),
+                actual_attempts_remaining = budget.attempts_remaining(),
+                selection_attempts_remaining = budget.selection_attempts_remaining(),
+                "Automatic cost startup series stopped after an error"
+            );
+        }
         drained?;
         finished?;
         settled?;

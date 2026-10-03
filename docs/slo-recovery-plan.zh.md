@@ -27,11 +27,13 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | CUDA | 71.396 / 138.781 | 18.614 / 20.880 | 17.345 / 40.022 | 350.957 | runtime requested 23,216,118,580 B；NVML 整卡 23,672 MiB；host max RSS 6,684,404 KiB | 原 200/15/50ms P99 阈值下 TTFT、pooled ITL 通过，TPOT 失败；joint 1/32，低于 99% |
 
-CUDA measured 为 9210 usage tokens、9179 可见文本事件、9147 间隔；两条 event/usage 不一致请求仍计入可见停顿，无传输合并。Runtime memory 为 833 个样本、NVML 为 844 个样本，覆盖启动至退出；不同口径不相加，WSL per-process NVML 不可用。原服务已恢复为 PID699052，10:10:45 UTC 独立健康检查为 ok，这是该作业结束时的历史状态。Metal 当前已核摘要：TTFT/TPOT/可见 ITL P99 为 4849.539/233.788/868.979ms，输出 37.014 tokens/s，原 3400/212/359ms 阈值均失败，joint 3/32；完整包和终态内存审计仍待补齐。单次重复不能建立性能收益或正式主表结论。
+CUDA measured 为 9210 usage tokens、9179 可见文本事件、9147 间隔；两条 event/usage 不一致请求仍计入可见停顿，无传输合并。Runtime memory 为 833 个样本、NVML 为 844 个样本，覆盖启动至退出；不同口径不相加，WSL per-process NVML 不可用。原服务已恢复为 PID699052，10:10:45 UTC 独立健康检查为 ok，这是该作业结束时的历史状态。Metal 完整归档已核：TTFT/TPOT/可见 ITL P99 为 4849.539/233.788/868.979ms，输出 37.014 tokens/s，原 3400/212/359ms 阈值均失败，joint 3/32。终态 Metal allocation 峰值 8,600,748,032 B（2116 样本、0 错误），独立 host 采样峰值 RSS 533,659,648 B、physical footprint 2,445,871,672 B；口径不相加，采样可能漏过瞬时峰值。单次重复不能建立性能收益或正式主表结论。
 
 **下一步先用既有诊断取得普通失败 query 的原身份、对应 epoch 和失败阶段**，再判定覆盖、查询或预算中的具体阻断；不能只从已安装 child 反推必要域已覆盖。Metal 收样前停止也需原拒绝证据，不能猜成超时后直接扩预算。原独立 F/R/Q、2ms、120s/2048/16384 和完整输出要求不变；当前不启动 224 单元正式矩阵。
 
-外部审计：[CPU 全仓计数](/private/tmp/ferrum-slo-recovery-20261002/g13-workspace-test-audit.json)、[CUDA run 运行](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-runtime-audit.json)与[覆盖边界](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-coverage-audit.json)、[CUDA serve 完整结果](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-serve-runtime-audit.json)、[Metal run](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-run-results.json)、[Metal serve 原始摘要](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-serve-summary)。两端构建身份另见 `g13-metal-build-audit.json`、`g13-cuda-build-and-runtime-audit.json`。
+外部审计：[CPU 全仓计数](/private/tmp/ferrum-slo-recovery-20261002/g13-workspace-test-audit.json)、[CUDA run 运行](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-runtime-audit.json)与[覆盖边界](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-run-coverage-audit.json)、[CUDA serve 完整结果](/private/tmp/ferrum-slo-recovery-20261002/g13-cuda-serve-runtime-audit.json)、[Metal run](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-run-results.json)、[Metal serve 摘要](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-serve-summary-audit.json)与[完整归档](/private/tmp/ferrum-slo-recovery-20261002/g13-metal-serve-full-audit.json)。两端构建身份另见 `g13-metal-build-audit.json`、`g13-cuda-build-and-runtime-audit.json`。
+
+下一次 Metal 诊断只补失败证据：已有 epoch 时，启动末尾仍记录原 `last_error`、来源位置和实际/预约余额；seed prefill 的动作计费失败时，记录该 seed 已遇到的 Blocked 次数及最后 typed reason。保持原扣费、重试、资格和返回值，既不退款，也不把未提交的尝试排除出 offered 上限。G13 静态账已包含 seed prefill、capture 和 restore；尚不能把余额耗尽直接归因于某一种 Blocked。该日志改动不是预算修复，尚未取得新的 Metal 实机结论。
 
 ## G10：同一候选的四入口实机结果（历史）
 

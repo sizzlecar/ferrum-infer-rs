@@ -389,6 +389,8 @@ impl CalibrationSession {
             ));
         }
         let plan = declared;
+        let mut blocked_attempts = 0usize;
+        let mut last_blocked_reason = None;
         loop {
             budget.require_time()?;
             let frontier = self
@@ -414,7 +416,22 @@ impl CalibrationSession {
             tokio::time::timeout_at(budget.deadline(), self.startup_output_ready(source))
                 .await
                 .map_err(|_| invalid("prefix acquisition output readiness expired"))??;
-            charge.action(budget)?;
+            if let Err(error) = charge.action(budget) {
+                tracing::warn!(
+                    %error,
+                    source_owner = %source,
+                    ?plan,
+                    offset,
+                    blocked_attempts,
+                    ?last_blocked_reason,
+                    actual_requests_remaining = budget.requests_remaining(),
+                    selection_requests_remaining = budget.selection_requests_remaining(),
+                    actual_attempts_remaining = budget.attempts_remaining(),
+                    selection_attempts_remaining = budget.selection_attempts_remaining(),
+                    "Private prefix prefill action charge rejected"
+                );
+                return Err(error);
+            }
             match self
                 .step(CalibrationAction::Wave(vec![frontier.prefill_work(count)?]))
                 .await?
@@ -427,7 +444,11 @@ impl CalibrationSession {
                         return Err(invalid("prefix acquisition submission is indeterminate"));
                     }
                 }
-                CalibrationTurn::Blocked(_) => tokio::task::yield_now().await,
+                CalibrationTurn::Blocked(reason) => {
+                    blocked_attempts = blocked_attempts.saturating_add(1);
+                    last_blocked_reason = Some(reason);
+                    tokio::task::yield_now().await;
+                }
                 _ => return Err(invalid("prefix acquisition returned an unexpected turn")),
             }
         }
