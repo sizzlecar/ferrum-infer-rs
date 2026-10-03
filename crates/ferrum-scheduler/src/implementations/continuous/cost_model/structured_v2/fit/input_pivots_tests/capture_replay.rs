@@ -163,6 +163,8 @@ enum Record {
     Matrix(Matrix),
     #[serde(rename = "original_result")]
     Result(OriginalResult),
+    #[serde(rename = "final_selection")]
+    Selection { selection: serde_json::Value },
     #[serde(rename = "inventory_retired")]
     Retirement(Retirement),
     #[serde(rename = "completed_after_shutdown")]
@@ -180,6 +182,7 @@ struct Verified {
     visits: u64,
     exhausted: bool,
     retirement: Retirement,
+    selection: Option<serde_json::Value>,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -293,10 +296,19 @@ fn verify_capture(
     let mut work = StructuredInputGeometryWorkV1::new(limit);
     let mut calls = Vec::new();
     let mut seen_populations = std::collections::BTreeSet::new();
+    let mut selection = None;
     let retirement = loop {
         let population = match next()? {
             Record::Population(value) => value,
             Record::Retirement(value) => break value,
+            Record::Selection { selection: value } => {
+                ensure!(!calls.is_empty(), "selection precedes original matrices");
+                selection = Some(value);
+                let Record::Retirement(value) = next()? else {
+                    bail!("final selection must immediately precede retirement")
+                };
+                break value;
+            }
             _ => bail!("expected original population or retirement"),
         };
         ensure!(
@@ -345,6 +357,7 @@ fn verify_capture(
         visits: work.visits(),
         exhausted: work.exhausted(),
         retirement,
+        selection,
     })
 }
 
@@ -510,6 +523,9 @@ struct Statistics<'a> {
     remaining_actual_actions: usize,
     remaining_selected_requests: usize,
     remaining_selected_actions: usize,
+    /// Source plan evidence only; the numerical replay does not validate it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_selection: Option<&'a serde_json::Value>,
     conclusion: &'static str,
 }
 fn statistics(verified: &Verified) -> AuditResult<Statistics<'_>> {
@@ -648,6 +664,7 @@ fn statistics(verified: &Verified) -> AuditResult<Statistics<'_>> {
         remaining_actual_actions: verified.retirement.actual_actions,
         remaining_selected_requests: verified.retirement.selected_requests,
         remaining_selected_actions: verified.retirement.selected_actions,
+        original_selection: verified.selection.as_ref(),
         conclusion: concat!(
             "Descriptive original-input audit only. Strict duplicate groups compare the ordered numerical call body, not ledger state or owner authority. ",
             "Duplicate charges are not savings; zero columns are not proven-safe compaction. ",

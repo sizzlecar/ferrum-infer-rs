@@ -400,8 +400,12 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
                 memory.guaranteed_groups,
             )
             .unwrap();
+        // This bound describes the original prepared raw view. The public
+        // entrypoint can now admit a different, smaller projected view first;
+        // its bound is checked separately below. Keep the original core's
+        // gap-backing and one-byte rejection contract exact.
         let run = |maximum, work: &mut StructuredInputGeometryWorkV1| {
-            select_with_capacity(
+            select_prepared_inputs(
                 &cases,
                 &opportunities,
                 &facts,
@@ -416,6 +420,8 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
                 Some(work),
                 None,
                 Some(&seed),
+                None,
+                None,
             )
         };
         let mut expected_work = StructuredInputGeometryWorkV1::new(work_limit);
@@ -519,6 +525,89 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
             &seed
         )
         .unwrap());
+        if capacity.requests != 0 {
+            // Account the real new view alongside the same selector stages.
+            // This fixture actually collapses two raw numerical families, so
+            // both paths have distinct, independently derived admission caps.
+            let view = super::super::scoped_inputs::prepare(
+                &cases,
+                &opportunities,
+                &facts,
+                None,
+                &population,
+                &seed,
+                capacity.requests,
+                usize::MAX,
+            )
+            .unwrap()
+            .unwrap();
+            let projected_groups = member_groups(&view.opportunities).unwrap();
+            let projected = super::super::memory::plan(
+                &projected_groups,
+                &view.opportunities,
+                &view.inputs,
+                capacity.requests,
+                Some(&population.settings),
+            )
+            .unwrap();
+            assert!(projected.guaranteed_groups < memory.guaranteed_groups);
+            let projected_peak = view.reserved_bytes
+                + projected.required_peak_bytes
+                + super::super::composition::extra_peak(
+                    &view.opportunities,
+                    &seed,
+                    projected.guaranteed_groups,
+                )
+                .unwrap();
+            assert!(projected_peak < tight, "this fixture must exercise genuinely smaller admission, not a bypass of the old bound");
+            let public_run = |maximum, work: &mut StructuredInputGeometryWorkV1| {
+                select_with_capacity(
+                    &cases,
+                    &opportunities,
+                    &facts,
+                    &[61, 61],
+                    8,
+                    None,
+                    &population,
+                    capacity,
+                    maximum,
+                    None,
+                    Some(1),
+                    Some(work),
+                    None,
+                    Some(&seed),
+                )
+            };
+            let mut wide_work = StructuredInputGeometryWorkV1::new(work_limit);
+            let wide = public_run(usize::MAX, &mut wide_work).unwrap();
+            let mut tight_work = StructuredInputGeometryWorkV1::new(work_limit);
+            let scoped = public_run(projected_peak, &mut tight_work).unwrap();
+            assert_eq!(
+                serde_json::to_value(&scoped).unwrap(),
+                serde_json::to_value(&wide).unwrap()
+            );
+            assert_eq!(tight_work.visits(), wide_work.visits());
+            let union = scoped.batches.iter().find(|batch| batch.scheduled).unwrap();
+            assert!(union.algorithm_universe.is_some());
+            assert!((0..pair_cases).all(|index| union.representative_case_indices.contains(&index)));
+            assert!(scoped
+                .gaps
+                .iter()
+                .any(|gap| matches!(gap.reason, SelectionGapReason::UnknownPopulation)));
+            assert!(
+                view.reserved_bytes
+                    + projected.retained_groups_bytes
+                    + scoped.retained_payload_bytes().unwrap()
+                    <= projected_peak
+            );
+            // Here the projected cap is strictly below the raw cap. One byte
+            // less admits neither path: fallback must not start geometry.
+            let mut denied = StructuredInputGeometryWorkV1::new(work_limit);
+            assert!(public_run(projected_peak - 1, &mut denied).is_err());
+            assert_eq!(denied.visits(), 0);
+            eprintln!("distinct selection admission: raw_peak={tight} projected_peak={projected_peak} raw_groups={} projected_groups={}",
+                memory.guaranteed_groups, projected.guaranteed_groups);
+        }
     }
 }
 

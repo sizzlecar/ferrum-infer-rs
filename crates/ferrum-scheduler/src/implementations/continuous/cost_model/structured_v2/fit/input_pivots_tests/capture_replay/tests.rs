@@ -143,6 +143,32 @@ fn capture_replay_keeps_u64_bits_original_domains_and_strict_duplicate_identity(
 }
 
 #[test]
+fn capture_replay_retains_optional_final_plan_without_granting_it_authority() {
+    let mut records = fixture(32_000_000);
+    let selection = json!({"requests": 17, "batches": [], "unqualified": true});
+    let position = records.len() - 2;
+    records.insert(
+        position,
+        json!({"kind":"final_selection", "selection":selection}),
+    );
+    let (bytes, report) = artifact(&records);
+    let verified = verify_capture(&bytes, &report, [7; 32]).unwrap();
+    let stats = statistics(&verified).unwrap();
+    assert_eq!(stats.original_selection, Some(&selection));
+    assert!(stats.baseline_matched);
+    // The legacy capture above remains valid, but multiple or misplaced final
+    // plans cannot silently change which source declaration a reader sees.
+    records.insert(position, records[position].clone());
+    let (bytes, report) = artifact(&records);
+    assert!(verify_capture(&bytes, &report, [7; 32]).is_err());
+    records.remove(position);
+    let plan = records.remove(position);
+    records.insert(3, plan);
+    let (bytes, report) = artifact(&records);
+    assert!(verify_capture(&bytes, &report, [7; 32]).is_err());
+}
+
+#[test]
 fn capture_replay_preserves_shared_exhaustion_without_refund_or_reset() {
     let complete = fixture(32_000_000);
     let first_charge = complete[5]["visits_after"].as_u64().unwrap();

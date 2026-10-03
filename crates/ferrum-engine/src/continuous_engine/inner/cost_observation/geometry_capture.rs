@@ -287,6 +287,23 @@ pub(crate) fn end_selection() {
     with_state(|state| state.selection_ended = true);
 }
 
+/// Preserve the final source scopes and work reservation beside the matrices.
+/// This borrows the existing plan under the same capture byte limit; a plan is
+/// not a fitted model, a qualified source, or a successful runtime execution.
+pub(crate) fn selection_result(selection: &impl Serialize) {
+    #[derive(Serialize)]
+    struct Selection<'a, T> {
+        kind: &'static str,
+        selection: &'a T,
+    }
+    with_state(|state| {
+        state.emit(&Selection {
+            kind: "final_selection",
+            selection,
+        });
+    });
+}
+
 struct AxisBits<'a>(&'a [f64]);
 impl Serialize for AxisBits<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {

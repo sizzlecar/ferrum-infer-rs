@@ -197,6 +197,33 @@ async fn geometry_capture_normal_startup_stops_before_source8_and_retires_owners
         .collect();
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0]["complete"], true);
+    let selections: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row["kind"] == "final_selection")
+        .collect();
+    assert_eq!(selections.len(), 1);
+    let (selection_index, selected) = selections[0];
+    assert!(records[..selection_index]
+        .iter()
+        .any(|row| row["kind"] == "original_result"));
+    assert!(records[selection_index + 1..]
+        .iter()
+        .all(|row| row["kind"] != "original_matrix" && row["kind"] != "original_result"));
+    assert!(
+        selection_index
+            < records
+                .iter()
+                .position(|row| row["kind"] == "inventory_retired")
+                .unwrap()
+    );
+    let batches = selected["selection"]["batches"].as_array().unwrap();
+    assert!(batches.iter().any(|batch| batch["scheduled"] == true));
+    for batch in batches {
+        for index in batch["representative_case_indices"].as_array().unwrap() {
+            assert!(usize::try_from(index.as_u64().unwrap()).unwrap() < cases.len());
+        }
+    }
     assert_eq!(records.last().unwrap()["kind"], "completed_after_shutdown");
 }
 

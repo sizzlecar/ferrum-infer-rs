@@ -16,6 +16,7 @@ mod grouping;
 mod input_geometry;
 mod memory;
 mod priority;
+mod scoped_inputs;
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredInputGeometryWorkV1;
 use input_geometry::{InputGeometryAudit, InputGeometryCharge};
 use priority::CoveragePriority;
@@ -632,7 +633,7 @@ pub(super) fn select_with_capacity_and_trajectories(
     maximum_retained_bytes: usize,
     changed: Option<&[CheckedPopulationKey]>,
     selected_priority: Option<u8>,
-    mut geometry_work: Option<&mut StructuredInputGeometryWorkV1>,
+    geometry_work: Option<&mut StructuredInputGeometryWorkV1>,
     maximum_sources: Option<NonZeroUsize>,
     combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
     trajectories: Option<&inventory::CheckedCaseInventory>,
@@ -655,6 +656,76 @@ pub(super) fn select_with_capacity_and_trajectories(
     }
     #[cfg(any(test, feature = "test-support"))]
     crate::geometry_capture::selection_inputs(cases, prompts, chunk, prefill_row_ceiling);
+    // Freeze the complete declaration before selecting anchors. Optional
+    // incremental scans retain their original raw keys; the final inventory
+    // selection owns one shared geometry ledger and can use the projected view.
+    let prepared = if geometry_work.is_some() && changed.is_none() {
+        combination_seed
+            .map(|seed| {
+                scoped_inputs::prepare(
+                    cases,
+                    opportunities,
+                    inputs,
+                    trajectories,
+                    population,
+                    seed,
+                    capacity.requests,
+                    maximum_retained_bytes,
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let (opportunities, inputs, scopes, retained) = match &prepared {
+        Some(view) => (
+            view.opportunities.as_slice(),
+            view.inputs.as_slice(),
+            Some(view.scopes.as_slice()),
+            view.reserved_bytes,
+        ),
+        None => (opportunities, inputs, None, 0),
+    };
+    select_prepared_inputs(
+        cases,
+        opportunities,
+        inputs,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        population,
+        capacity,
+        maximum_retained_bytes - retained,
+        changed,
+        selected_priority,
+        geometry_work,
+        maximum_sources,
+        combination_seed,
+        trajectories,
+        scopes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_prepared_inputs(
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    capacity: SelectionCapacity,
+    maximum_retained_bytes: usize,
+    changed: Option<&[CheckedPopulationKey]>,
+    selected_priority: Option<u8>,
+    mut geometry_work: Option<&mut StructuredInputGeometryWorkV1>,
+    maximum_sources: Option<NonZeroUsize>,
+    combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
+    trajectories: Option<&inventory::CheckedCaseInventory>,
+    scopes: Option<&[Option<ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>]>,
+) -> Result<CheckedSelection> {
     // Grouping is authorized separately before it allocates. Then its exact
     // identities/capacities bound headers and sequential scratch stages; no
     // representative or geometry algorithm runs before the second check.
@@ -748,13 +819,15 @@ pub(super) fn select_with_capacity_and_trajectories(
             });
             continue;
         }
-        let selected = representatives_with_row_ceiling(
+        let scope = scoped_inputs::for_indices(&candidates, scopes)?;
+        let selected = representatives_with_positive_min(
             &candidates,
             inputs,
             cases,
             prompts,
             chunk,
             prefill_row_ceiling,
+            scope.is_some(),
         )?;
         let has_early_policy = candidates.iter().any(|&i| inputs[i][0].branches[4]);
         let has_early_opportunity = candidates.iter().any(|&i| inputs[i][0].branches[5]);
@@ -786,7 +859,7 @@ pub(super) fn select_with_capacity_and_trajectories(
         // can require far more original work than a token-producing source.
         // This is a declared work heuristic, never a wall-time feasibility
         // estimate or a relaxation of the source's qualification obligations.
-        let initial_batch = batch_plan(
+        let initial_batch = batch_plan_with_scope(
             &[original_population_index],
             &out.populations,
             cases,
@@ -795,6 +868,7 @@ pub(super) fn select_with_capacity_and_trajectories(
             chunk,
             prefill_row_ceiling,
             population,
+            scope.map(|universe| (inputs, universe)),
         )?;
         let declared_work = (
             initial_batch.serial_token_work,
@@ -852,7 +926,8 @@ pub(super) fn select_with_capacity_and_trajectories(
         }
         // Start with complete independent plans. A later bounded merge may
         // share offers with related inputs, without deleting representatives.
-        let batch = batch_plan(
+        let scope = scoped_inputs::for_indices(&candidate.candidates, scopes)?;
+        let batch = batch_plan_with_scope(
             &[original_population_index],
             &out.populations,
             cases,
@@ -861,6 +936,7 @@ pub(super) fn select_with_capacity_and_trajectories(
             chunk,
             prefill_row_ceiling,
             population,
+            scope.map(|universe| (inputs, universe)),
         )?;
         batch_candidates.push(BatchCandidate {
             input_priority: candidate.input_priority,
@@ -882,6 +958,11 @@ pub(super) fn select_with_capacity_and_trajectories(
     // work order and source reservation; no raw observations have been taken.
     if let Some(seed) = combination_seed {
         for candidate in &mut batch_candidates {
+            if scoped_inputs::for_indices(&candidate.batch.representative_case_indices, scopes)?
+                .is_some()
+            {
+                continue;
+            }
             if let Some(scoped) = composition::scoped_candidate(
                 &candidate.batch,
                 &out.populations,
@@ -915,6 +996,7 @@ pub(super) fn select_with_capacity_and_trajectories(
         maximum_sources,
         combination_seed,
         trajectories,
+        scopes,
     )?;
     let mut scheduled_sources = 0_usize;
     for candidate in batch_candidates {
@@ -939,6 +1021,8 @@ pub(super) fn select_with_capacity_and_trajectories(
         maximum_visits: work.maximum_visits(),
         exhausted: work.exhausted(),
     });
+    #[cfg(any(test, feature = "test-support"))]
+    crate::geometry_capture::selection_result(&out);
     Ok(out)
 }
 
@@ -979,6 +1063,7 @@ fn coalesce_related_batches(
     maximum_sources: Option<NonZeroUsize>,
     combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
     trajectories: Option<&inventory::CheckedCaseInventory>,
+    scopes: Option<&[Option<ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>]>,
 ) -> Result<()> {
     // First preserve the existing same-policy journal choices. Only then
     // use their already checked representatives to pack independent host
@@ -1015,7 +1100,16 @@ fn coalesce_related_batches(
                 // A source has one numerical interpretation. Sharing journals
                 // must not turn a retained raw family into a new scoped child,
                 // or silently enlarge either original universe.
-                if independent_families && a.batch.algorithm_universe != b.batch.algorithm_universe
+                let fixed_scope =
+                    scoped_inputs::for_indices(&a.batch.representative_case_indices, scopes)?
+                        .is_some()
+                        || scoped_inputs::for_indices(
+                            &b.batch.representative_case_indices,
+                            scopes,
+                        )?
+                        .is_some();
+                if (independent_families || fixed_scope)
+                    && a.batch.algorithm_universe != b.batch.algorithm_universe
                 {
                     next += 1;
                     continue;
@@ -1023,7 +1117,7 @@ fn coalesce_related_batches(
                 let mut members = a.batch.population_indices.clone();
                 members.extend_from_slice(&b.batch.population_indices);
                 members.sort_unstable();
-                let scope = independent_families
+                let scope = (independent_families || fixed_scope)
                     .then_some(a.batch.algorithm_universe.as_ref())
                     .flatten();
                 let mut combined = batch_plan_with_scope(
@@ -1048,29 +1142,31 @@ fn coalesce_related_batches(
                         next += 1;
                         continue;
                     }
-                } else if let Some(seed) = combination_seed {
-                    if let Some(scoped) = composition::scoped_candidate(
-                        &combined,
-                        populations,
-                        cases,
-                        opportunities,
-                        inputs,
-                        trajectories,
-                        prompts,
-                        chunk,
-                        prefill_row_ceiling,
-                        population,
-                        seed,
-                    )? {
-                        combined = scoped;
-                    } else if !raw_related
-                        || a.batch.algorithm_universe.is_some()
-                        || b.batch.algorithm_universe.is_some()
-                    {
-                        // A failed wider declaration cannot silently replace a
-                        // previously selected valid scope with its raw fallback.
-                        next += 1;
-                        continue;
+                } else if !fixed_scope {
+                    if let Some(seed) = combination_seed {
+                        if let Some(scoped) = composition::scoped_candidate(
+                            &combined,
+                            populations,
+                            cases,
+                            opportunities,
+                            inputs,
+                            trajectories,
+                            prompts,
+                            chunk,
+                            prefill_row_ceiling,
+                            population,
+                            seed,
+                        )? {
+                            combined = scoped;
+                        } else if !raw_related
+                            || a.batch.algorithm_universe.is_some()
+                            || b.batch.algorithm_universe.is_some()
+                        {
+                            // A failed wider declaration cannot silently replace a
+                            // previously selected valid scope with its raw fallback.
+                            next += 1;
+                            continue;
+                        }
                     }
                 }
                 // Recompute the whole source, including every fresh-member phase
@@ -1467,6 +1563,26 @@ fn representatives_with_row_ceiling(
     chunk: usize,
     prefill_row_ceiling: Option<NonZeroU32>,
 ) -> Result<Vec<usize>> {
+    representatives_with_positive_min(
+        candidates,
+        inputs,
+        cases,
+        prompts,
+        chunk,
+        prefill_row_ceiling,
+        false,
+    )
+}
+
+fn representatives_with_positive_min(
+    candidates: &[usize],
+    inputs: &[Vec<CheckedInputFacts>],
+    cases: &[Case],
+    prompts: &[usize],
+    chunk: usize,
+    prefill_row_ceiling: Option<NonZeroU32>,
+    preserve_positive_min: bool,
+) -> Result<Vec<usize>> {
     let dimensions = inputs[candidates[0]][0].axes.len();
     if candidates
         .iter()
@@ -1476,6 +1592,8 @@ fn representatives_with_row_ceiling(
     }
     let mut minima = inputs[candidates[0]][0].axes.clone();
     let mut maxima = minima.clone();
+    // Union zero-extension must not hide the original positive lower endpoint.
+    let mut positive_minima = preserve_positive_min.then(|| vec![f64::INFINITY; dimensions]);
     let mut branch_seen = [[false; 2]; 7];
     for &index in candidates {
         let facts = &inputs[index][0];
@@ -1483,27 +1601,42 @@ fn representatives_with_row_ceiling(
             *min = min.min(value);
             *max = max.max(value);
         }
+        if let Some(positive) = &mut positive_minima {
+            for (minimum, &value) in positive.iter_mut().zip(&facts.axes) {
+                if value > 0. {
+                    *minimum = minimum.min(value);
+                }
+            }
+        }
         for (seen, &branch) in branch_seen.iter_mut().zip(&facts.branches) {
             seen[usize::from(branch)] = true;
         }
     }
-    let count = add(mul(dimensions, 2)?, 14)?;
+    let axis_slots = if preserve_positive_min { 3 } else { 2 };
+    let numeric_slots = mul(dimensions, axis_slots)?;
+    let count = add(numeric_slots, 14)?;
     let mut uncovered = vec![true; count];
+    if let Some(positive) = &positive_minima {
+        for (axis, minimum) in positive.iter().enumerate() {
+            uncovered[axis_slots * axis + 2] = minimum.is_finite();
+        }
+    }
     for (branch, seen) in branch_seen.iter().enumerate() {
         for (value, present) in seen.iter().enumerate() {
-            uncovered[2 * dimensions + 2 * branch + value] = *present;
+            uncovered[numeric_slots + 2 * branch + value] = *present;
         }
     }
     let covers = |facts: &CheckedInputFacts, axis: usize| {
-        if axis < 2 * dimensions {
-            facts.axes[axis / 2]
-                == if axis % 2 == 0 {
-                    minima[axis / 2]
-                } else {
-                    maxima[axis / 2]
+        if axis < numeric_slots {
+            let column = axis / axis_slots;
+            facts.axes[column]
+                == match axis % axis_slots {
+                    0 => minima[column],
+                    1 => maxima[column],
+                    _ => positive_minima.as_ref().unwrap()[column],
                 }
         } else {
-            let slot = axis - 2 * dimensions;
+            let slot = axis - numeric_slots;
             usize::from(facts.branches[slot / 2]) == slot % 2
         }
     };
@@ -1560,6 +1693,7 @@ mod tests {
     mod memory;
     mod policy_priority;
     mod related;
+    mod scoped_inputs;
 
     fn natural_termination_input(
         rows: u32,
