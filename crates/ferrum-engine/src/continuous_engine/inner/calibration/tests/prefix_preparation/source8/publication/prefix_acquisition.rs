@@ -53,6 +53,108 @@ fn configure_actual_executor(executor: &ControlledExecutor) {
 }
 
 #[tokio::test]
+async fn source8_native_prefix_acquisition_retires_backing_maintenance_before_retry() {
+    let plan =
+        crate::continuous_engine::inner::calibration::startup::ProbePrefixAcquisitionPlan::new(
+            3,
+            2,
+            NonZeroU32::MIN,
+        )
+        .unwrap();
+    let setup = plan.setup_work();
+    // The backend below defers exactly one real Wave before encode. Its
+    // attempt remains charged in addition to every successful setup action.
+    // As in drive_probe_cohort, the separate one-use backing-maintenance turn
+    // consumes deadline, not an inference offer or native-copy action.
+    let required_actions = setup.actions().unwrap() + 1;
+    for action_limit in [required_actions, required_actions - 1] {
+        let (mut session, executor) = acquisition_session().await;
+        configure_actual_executor(&executor);
+        let source = probes(&session).remove(0);
+        let source_id = source.request.id.clone();
+        executor
+            .deferrals
+            .capacity(std::slice::from_ref(&source_id), Some(true));
+        let mut budget = ProbeExecutionBudget::new(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            NonZeroUsize::new(setup.requests).unwrap(),
+            NonZeroUsize::new(action_limit).unwrap(),
+        );
+        budget
+            .reserve_selected_source(setup.requests, action_limit)
+            .unwrap();
+        session
+            .begin_startup_owner_series(1, budget.deadline())
+            .unwrap();
+        session.begin_startup_inventory().unwrap();
+        let result = session
+            .acquire_reserved_probe_prefix(source, plan, &mut budget, 64 * 1024)
+            .await;
+        // Both the ready path and the exhausted capture path must retire the
+        // seed owner. A pending maintenance ticket must never strand retries
+        // at its unchanged offset until they spend the reserved source work.
+        session.completed_owner_boundary().unwrap();
+        session.end_startup_inventory().await.unwrap();
+        assert_eq!(
+            executor.deferrals.maintenance_calls.load(Ordering::Acquire),
+            1,
+            "the original backend ticket must retire before another Wave: {result:?}"
+        );
+        assert_eq!(executor.deferrals.capacity_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(
+            executor.physical.load(Ordering::Acquire),
+            setup.inference_waves
+        );
+        assert_eq!(
+            (budget.requests_remaining(), budget.attempts_remaining()),
+            (0, 0)
+        );
+        assert_eq!(
+            (
+                budget.selection_requests_remaining(),
+                budget.selection_attempts_remaining()
+            ),
+            (0, 0),
+            "neither a zero-submit attempt nor maintenance refunds selection"
+        );
+        if action_limit == required_actions {
+            let acquired = match result.unwrap() {
+                ProbePrefixAcquisition::Ready(acquired) => acquired,
+                other => panic!("retired maintenance must allow the original seed: {other:?}"),
+            };
+            assert!(acquired.ready());
+            assert_eq!(acquired.plan(), plan);
+            assert_eq!(executor.native_prefix_terminal_totals(), (1, 0));
+            assert_eq!(executor.native_prefix_live_lease_counts(), (1, 0));
+            drop(acquired);
+        } else {
+            assert!(
+                result.is_err(),
+                "one fewer action cannot authorize capture: {result:?}"
+            );
+            assert_eq!(executor.native_prefix_terminal_totals(), (0, 0));
+        }
+        assert_eq!(executor.native_prefix_live_lease_counts(), (0, 0));
+        assert!(!session
+            .engine
+            .inner
+            .sequences
+            .read()
+            .contains_key(&source_id));
+        assert!(session.prepared_owner_capture.is_none());
+        assert!(session
+            .engine
+            .inner
+            .cost_runtime
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .is_none());
+        session.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn source8_native_prefix_once_seed_close_fresh_restore_final_prefill_and_three_phases() {
     check_native_prefix_three_phase_lifecycle(3).await;
 }

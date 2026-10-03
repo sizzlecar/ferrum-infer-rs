@@ -393,6 +393,17 @@ impl CalibrationSession {
         let mut last_blocked_reason = None;
         loop {
             budget.require_time()?;
+            // A zero-submit Wave may retain the executor's one-use backing or
+            // capacity action. As in drive_probe_cohort, service that action
+            // in its own turn before recapturing the exact frontier. The
+            // failed Wave remains charged; maintenance neither offers an
+            // inference sample nor refunds a later Wave or native copy.
+            match self.step(CalibrationAction::Maintenance).await? {
+                CalibrationTurn::MaintenanceReconciled => continue,
+                CalibrationTurn::Blocked(_) => {}
+                _ => return Err(invalid("unexpected prefix acquisition maintenance state")),
+            }
+            budget.require_time()?;
             let frontier = self
                 .frontiers()?
                 .into_iter()
