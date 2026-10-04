@@ -315,11 +315,12 @@ fn freeze_inventory(
             representatives = batch.representative_case_indices.len(),
             configured,
             greedy_length,
-            cycles = batch.planned_cycles,
+            cycles = ?batch.periodic_cycles(),
+            occurrences = batch.execution_case_count()?,
             requests = batch.requests,
             serial_waves = batch.serial_wave_upper_bound,
             serial_token_work = batch.serial_token_work,
-            maximum_anchor_span = batch.maximum_anchor_span,
+            maximum_anchor_span = ?batch.periodic_anchor_span(),
             ?reasons,
             "Automatic input source budget and policy coverage"
         );
@@ -342,10 +343,10 @@ fn freeze_inventory(
             }
         }
         #[cfg(test)]
-        eprintln!("automatic input source: index={batch_index} scheduled={} populations={} representatives={} configured={configured} greedy_length={greedy_length} cycles={} requests={} serial_waves={} token_work={} anchor_span={} reasons={reasons:?}",
+        eprintln!("automatic input source: index={batch_index} scheduled={} populations={} representatives={} configured={configured} greedy_length={greedy_length} cycles={:?} requests={} serial_waves={} token_work={} anchor_span={:?} reasons={reasons:?}",
             batch.scheduled, batch.population_indices.len(), batch.representative_case_indices.len(),
-            batch.planned_cycles, batch.requests, batch.serial_wave_upper_bound,
-            batch.serial_token_work, batch.maximum_anchor_span);
+            batch.periodic_cycles(), batch.requests, batch.serial_wave_upper_bound,
+            batch.serial_token_work, batch.periodic_anchor_span());
     }
     if selection.batches.len() > 64 {
         tracing::info!(

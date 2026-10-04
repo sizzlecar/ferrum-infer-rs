@@ -650,9 +650,7 @@ pub(super) fn evaluate(
                 options.cycle_order,
             )?;
             total.charge(&batch)?;
-            schedule_fits &= batch.schedule_within_capacity
-                && batch.maximum_anchor_span
-                    <= *batch.schedule.phase_min_offered.iter().min().unwrap();
+            schedule_fits &= batch.schedule_within_capacity && batch.anchors_within_schedule();
             sources.push(
                 json!({"original_population_indices": batch.population_indices,
                 "independent_exact_families": group.iter().map(|p| &p.key).collect::<Vec<_>>(),
@@ -820,20 +818,27 @@ mod tests {
             work::setup_for_indices(&cases, &interleaved.representative_case_indices).unwrap();
         assert_eq!(
             interleaved.requests,
-            cycle.requests * interleaved.planned_cycles + setup.requests
+            cycle.requests * interleaved.periodic_cycles().unwrap() + setup.requests
         );
         assert_eq!(
             interleaved.serial_wave_upper_bound,
-            cycle.execution_actions * interleaved.planned_cycles + setup.execution_actions
+            cycle.execution_actions * interleaved.periodic_cycles().unwrap()
+                + setup.execution_actions
         );
         assert_eq!(
             interleaved.declared_offer_row_bound,
-            cycle.declared_offer_rows * interleaved.planned_cycles
+            cycle.declared_offer_rows * interleaved.periodic_cycles().unwrap()
         );
         for phase in 0..3 {
             assert!(
-                interleaved.input_opportunities.phase_original_offer_bounds[phase]
-                    >= interleaved.input_opportunities.maximum_fresh_member_span[phase]
+                interleaved
+                    .periodic_budget()
+                    .unwrap()
+                    .phase_original_offer_bounds[phase]
+                    >= interleaved
+                        .periodic_budget()
+                        .unwrap()
+                        .maximum_fresh_member_span[phase]
             );
         }
         assert!(serde_json::from_value::<CycleOrder>(json!("round_robin")).is_ok());
@@ -1102,7 +1107,8 @@ mod tests {
         .unwrap();
         assert!(each.schedule_within_capacity);
         assert_eq!(
-            each.input_opportunities
+            each.periodic_budget()
+                .unwrap()
                 .minimum_input_family_opportunities_per_cycle,
             4
         );

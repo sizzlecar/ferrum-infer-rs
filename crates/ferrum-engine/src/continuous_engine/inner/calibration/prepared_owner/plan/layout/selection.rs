@@ -214,14 +214,51 @@ pub(in crate::continuous_engine::inner::calibration) struct SelectedPopulation {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(in crate::continuous_engine::inner::calibration) enum SelectedInputPlan {
+    Periodic {
+        planned_cycles: usize,
+        input_opportunities: ProbeInputOpportunityBudget,
+        maximum_anchor_span: usize,
+    },
+    Finite {
+        plan: budget::finite::FinitePlan,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InputAllocationPolicy {
+    PeriodicOnly,
+    FinitePreferred,
+}
+
+fn finite_membership_supported(population: &StructuredServiceDeclarationV7) -> bool {
+    use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
+        NonNegativePlanningEstimatorV1 as Estimator, StructuredServiceDomainPolicyV1 as Domain,
+    };
+    population.domain_policy == Domain::NonNegativePhysicalEnvelopeV1
+        && population
+            .nonnegative_envelope
+            .as_ref()
+            .is_some_and(|envelope| {
+                matches!(
+                    envelope.planning_estimator,
+                    Estimator::IdentifiedEnvelopeV2 | Estimator::IdentifiedFitGlobalResidualV1
+                )
+            })
+        && population.schedule.input_readiness.is_none()
+        && population.schedule.opening_frontier.is_none()
+        && population.schedule.phase_support.is_none()
+        && population.schedule.algorithm_universe.is_none()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub(in crate::continuous_engine::inner::calibration) struct SelectedBatch {
     pub population_indices: Vec<usize>,
     pub representative_case_indices: Vec<usize>,
-    pub input_opportunities: ProbeInputOpportunityBudget,
+    pub input_plan: SelectedInputPlan,
     pub schedule: OwnerBlockScheduleV1,
     pub schedule_within_capacity: bool,
-    pub planned_cycles: usize,
-    pub maximum_anchor_span: usize,
     pub requests: usize,
     /// Seed, target prefill and decode input tokens across the complete batch.
     /// This declared upper bound is neither a timing sample nor a latency estimate.
@@ -239,6 +276,67 @@ pub(in crate::continuous_engine::inner::calibration) struct SelectedBatch {
     /// preparation must retain this scope rather than restoring raw phase counts.
     #[serde(skip)]
     pub(super) scoped_opportunities: Option<Vec<CaseOpportunity>>,
+}
+
+impl SelectedBatch {
+    pub fn periodic_budget(&self) -> Option<&ProbeInputOpportunityBudget> {
+        match &self.input_plan {
+            SelectedInputPlan::Periodic {
+                input_opportunities,
+                ..
+            } => Some(input_opportunities),
+            SelectedInputPlan::Finite { .. } => None,
+        }
+    }
+
+    pub fn periodic_cycles(&self) -> Option<usize> {
+        match &self.input_plan {
+            SelectedInputPlan::Periodic { planned_cycles, .. } => Some(*planned_cycles),
+            SelectedInputPlan::Finite { .. } => None,
+        }
+    }
+
+    pub fn periodic_anchor_span(&self) -> Option<usize> {
+        match &self.input_plan {
+            SelectedInputPlan::Periodic {
+                maximum_anchor_span,
+                ..
+            } => Some(*maximum_anchor_span),
+            SelectedInputPlan::Finite { .. } => None,
+        }
+    }
+
+    pub fn finite_plan(&self) -> Option<&budget::finite::FinitePlan> {
+        match &self.input_plan {
+            SelectedInputPlan::Finite { plan } => Some(plan),
+            SelectedInputPlan::Periodic { .. } => None,
+        }
+    }
+
+    pub fn anchors_within_schedule(&self) -> bool {
+        self.periodic_anchor_span()
+            .is_none_or(|span| span <= *self.schedule.phase_min_offered.iter().min().unwrap())
+    }
+
+    pub fn execution_case_count(&self) -> Result<usize> {
+        match &self.input_plan {
+            SelectedInputPlan::Periodic { planned_cycles, .. } => {
+                mul(self.representative_case_indices.len(), *planned_cycles)
+            }
+            SelectedInputPlan::Finite { plan } => Ok(plan.occurrence_case_indices.len()),
+        }
+    }
+
+    /// Iteration expands only the periodic variant; a finite sequence is
+    /// already complete and each occurrence is emitted exactly once.
+    pub fn execution_case_indices(&self) -> Result<impl Iterator<Item = usize> + '_> {
+        let count = self.execution_case_count()?;
+        let indices = match &self.input_plan {
+            SelectedInputPlan::Periodic { .. } => &self.representative_case_indices,
+            SelectedInputPlan::Finite { plan } => &plan.occurrence_case_indices,
+        };
+        Ok(indices.iter().copied().cycle().take(count))
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -370,6 +468,9 @@ impl CheckedSelection {
             )?;
         }
         for batch in &self.batches {
+            if let Some(plan) = batch.finite_plan() {
+                bytes = bytes.checked_add(plan.retained_heap_bytes()?)?;
+            }
             if let Some(opportunities) = &batch.scoped_opportunities {
                 bytes = bytes.checked_add(
                     opportunities
@@ -733,6 +834,22 @@ fn select_prepared_inputs(
             "checked selection peak retained payload exceeds remaining budget: required_peak_bytes={peak} remaining_bytes={maximum_retained_bytes} key_mentions={key_mentions} guaranteed_cases={guaranteed_cases}"
         )));
     }
+    let finite_extra = memory::finite_extra_peak(&groups)?;
+    let allocation = if finite_membership_supported(population)
+        && peak
+            .checked_add(finite_extra)
+            .is_some_and(|total| total <= maximum_retained_bytes)
+    {
+        InputAllocationPolicy::FinitePreferred
+    } else {
+        InputAllocationPolicy::PeriodicOnly
+    };
+    tracing::info!(
+        ?allocation,
+        finite_extra,
+        original_peak = peak,
+        "Automatic source allocation memory authorization"
+    );
     let geometry_scratch = memory.geometry_scratch_bytes;
     let mut out = CheckedSelection::default();
     let mut population_candidates = Vec::new();
@@ -844,6 +961,7 @@ fn select_prepared_inputs(
             prefill_row_ceiling,
             population,
             scope.map(|universe| (inputs, universe)),
+            InputAllocationPolicy::PeriodicOnly,
         )?;
         let declared_work = (
             initial_batch.serial_token_work,
@@ -912,6 +1030,7 @@ fn select_prepared_inputs(
             prefill_row_ceiling,
             population,
             scope.map(|universe| (inputs, universe)),
+            InputAllocationPolicy::PeriodicOnly,
         )?;
         batch_candidates.push(BatchCandidate {
             input_priority: candidate.input_priority,
@@ -950,6 +1069,7 @@ fn select_prepared_inputs(
                 prefill_row_ceiling,
                 population,
                 seed,
+                InputAllocationPolicy::PeriodicOnly,
             )? {
                 candidate.batch = scoped;
             }
@@ -972,7 +1092,62 @@ fn select_prepared_inputs(
         combination_seed,
         trajectories,
         scopes,
+        InputAllocationPolicy::PeriodicOnly,
+        false,
     )?;
+    // Lower independent costs can otherwise prevent an old beneficial merge
+    // and evict a formerly covered owner at the source limit. Preserve the
+    // original geometry order, local scopes and periodic packing first. Then
+    // replace each complete source in place without increasing any work ledger.
+    // No second geometry pass or additional full selection is retained.
+    if allocation == InputAllocationPolicy::FinitePreferred {
+        preserve_periodic_reservations(
+            &mut batch_candidates,
+            capacity,
+            selected_priority,
+            maximum_sources,
+        )?;
+        for candidate in &mut batch_candidates {
+            let original = &candidate.batch;
+            let replacement = batch_plan_with_scope(
+                &original.population_indices,
+                &out.populations,
+                cases,
+                opportunities,
+                prompts,
+                chunk,
+                prefill_row_ceiling,
+                population,
+                original
+                    .algorithm_universe
+                    .as_ref()
+                    .map(|universe| (inputs, universe)),
+                allocation,
+            )?;
+            candidate.batch = replacement;
+        }
+        // Additional packing may use the freed allowance, but must keep all
+        // now-schedulable sources and their existing numerical interpretation.
+        coalesce_related_batches(
+            &mut batch_candidates,
+            &out.populations,
+            cases,
+            opportunities,
+            inputs,
+            prompts,
+            chunk,
+            prefill_row_ceiling,
+            population,
+            capacity,
+            selected_priority,
+            maximum_sources,
+            combination_seed,
+            trajectories,
+            scopes,
+            allocation,
+            true,
+        )?;
+    }
     let mut scheduled_sources = 0_usize;
     for candidate in batch_candidates {
         let deferred = selected_priority
@@ -999,6 +1174,37 @@ fn select_prepared_inputs(
     #[cfg(any(test, feature = "test-support"))]
     crate::geometry_capture::selection_result(&out);
     Ok(out)
+}
+
+/// A cheaper previously skipped source can fit earlier and consume the
+/// allowance of a later original reservation. Move those original complete
+/// reservations first, preserving relative order in both partitions. This
+/// allocation-free pass uses original costs before any finite replacement.
+fn preserve_periodic_reservations(
+    candidates: &mut [BatchCandidate],
+    capacity: SelectionCapacity,
+    selected_priority: Option<u8>,
+    maximum_sources: Option<NonZeroUsize>,
+) -> Result<()> {
+    let mut used = SelectionCapacity::default();
+    let mut sources = 0;
+    let mut retained = 0;
+    for index in 0..candidates.len() {
+        let candidate = &candidates[index];
+        if grouping::reserve(
+            &candidate.batch,
+            candidate.input_priority,
+            capacity,
+            selected_priority,
+            maximum_sources,
+            &mut used,
+            &mut sources,
+        )? {
+            candidates[retained..=index].rotate_right(1);
+            retained += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Equality of complete sets, not an overlap graph: {A}, {A, B}, {B} cannot
@@ -1039,6 +1245,8 @@ fn coalesce_related_batches(
     combination_seed: Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>,
     trajectories: Option<&inventory::CheckedCaseInventory>,
     scopes: Option<&[Option<ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1>]>,
+    allocation: InputAllocationPolicy,
+    preserve_source_scopes: bool,
 ) -> Result<()> {
     // First preserve the existing same-policy journal choices. Only then
     // use their already checked representatives to pack independent host
@@ -1075,13 +1283,10 @@ fn coalesce_related_batches(
                 // A source has one numerical interpretation. Sharing journals
                 // must not turn a retained raw family into a new scoped child,
                 // or silently enlarge either original universe.
-                let fixed_scope =
-                    scoped_inputs::for_indices(&a.batch.representative_case_indices, scopes)?
+                let fixed_scope = preserve_source_scopes
+                    || scoped_inputs::for_indices(&a.batch.representative_case_indices, scopes)?
                         .is_some()
-                        || scoped_inputs::for_indices(
-                            &b.batch.representative_case_indices,
-                            scopes,
-                        )?
+                    || scoped_inputs::for_indices(&b.batch.representative_case_indices, scopes)?
                         .is_some();
                 if (independent_families || fixed_scope)
                     && a.batch.algorithm_universe != b.batch.algorithm_universe
@@ -1105,6 +1310,7 @@ fn coalesce_related_batches(
                     prefill_row_ceiling,
                     population,
                     scope.map(|universe| (inputs, universe)),
+                    allocation,
                 )?;
                 if independent_families {
                     if !composition::packing_valid(
@@ -1131,6 +1337,7 @@ fn coalesce_related_batches(
                             prefill_row_ceiling,
                             population,
                             seed,
+                            allocation,
                         )? {
                             combined = scoped;
                         } else if !raw_related
@@ -1325,7 +1532,8 @@ fn batch_plan(
     prefill_row_ceiling: Option<NonZeroU32>,
     population: &StructuredServiceDeclarationV7,
 ) -> Result<SelectedBatch> {
-    batch_plan_with_scope(
+    // Explicit periodic control retained for historical accounting and tests.
+    batch_plan_with_schedule(
         population_indices,
         populations,
         cases,
@@ -1335,6 +1543,7 @@ fn batch_plan(
         prefill_row_ceiling,
         population,
         None,
+        budget::startup_schedule,
     )
 }
 
@@ -1349,8 +1558,9 @@ fn batch_plan_with_scope(
     prefill_row_ceiling: Option<NonZeroU32>,
     population: &StructuredServiceDeclarationV7,
     scope: Option<(&[Vec<CheckedInputFacts>], &ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1)>,
+    allocation: InputAllocationPolicy,
 ) -> Result<SelectedBatch> {
-    batch_plan_with_schedule(
+    let periodic = batch_plan_with_schedule(
         population_indices,
         populations,
         cases,
@@ -1361,7 +1571,83 @@ fn batch_plan_with_scope(
         population,
         scope,
         budget::startup_schedule,
-    )
+    )?;
+    if allocation == InputAllocationPolicy::PeriodicOnly || !finite_membership_supported(population)
+    {
+        return Ok(periodic);
+    }
+    let indices = &periodic.representative_case_indices;
+    let projected: Vec<_> = indices
+        .iter()
+        .map(|&i| match scope {
+            Some((inputs, universe)) => {
+                composition::project_opportunity(&opportunities[i], &inputs[i], universe)
+            }
+            None => Ok(opportunities[i].clone()),
+        })
+        .collect::<Result<_>>()?;
+    let groups = member_groups(&projected)
+        .map_err(|reason| error(format!("finite source family inventory: {reason:?}")))?;
+    let families: Vec<Vec<usize>> = groups
+        .iter()
+        .map(|g| {
+            g.guaranteed_case_indices
+                .iter()
+                .map(|&i| indices[i])
+                .collect()
+        })
+        .collect();
+    let opportunity_for = |index| {
+        indices
+            .iter()
+            .position(|&i| i == index)
+            .map(|position| &projected[position])
+            .ok_or_else(|| error("finite occurrence is not an original representative"))
+    };
+    let work_for = |index: usize| {
+        let case = cases
+            .get(index)
+            .ok_or_else(|| error("finite case missing"))?;
+        let prompt = *prompts
+            .get(case.template)
+            .ok_or_else(|| error("finite prompt missing"))?;
+        work::case_work(case, prompt, chunk, prefill_row_ceiling)
+    };
+    let finite = budget::finite::build_with_view(
+        &families,
+        opportunity_for,
+        work_for,
+        work::setup_for_indices(cases, indices)?,
+        &population.settings,
+        budget::finite::storage_bound(families.len(), indices.len())?,
+    )?;
+    let budget::finite::FiniteVerification::Ready(mut plan) = finite else {
+        return Ok(periodic);
+    };
+    // Both alternatives preserve the same original representatives. Prefer
+    // the finite plan only when no execution ledger becomes more expensive.
+    // Planning the alternative spends no samples and refunds no geometry work.
+    if plan.work.requests > periodic.requests
+        || plan.work.execution_actions > periodic.serial_wave_upper_bound
+        || plan.work.serial_declared_offer_rows > periodic.declared_offer_row_bound
+    {
+        return Ok(periodic);
+    }
+    plan.schedule.prediction_validity = population.schedule.prediction_validity;
+    Ok(SelectedBatch {
+        population_indices: periodic.population_indices,
+        representative_case_indices: periodic.representative_case_indices,
+        schedule: plan.schedule.clone(),
+        schedule_within_capacity: true,
+        requests: plan.work.requests,
+        serial_token_work: plan.work.serial_token_work,
+        serial_wave_upper_bound: plan.work.execution_actions,
+        declared_offer_row_bound: plan.work.serial_declared_offer_rows,
+        scheduled: false,
+        algorithm_universe: periodic.algorithm_universe,
+        scoped_opportunities: periodic.scoped_opportunities,
+        input_plan: SelectedInputPlan::Finite { plan },
+    })
 }
 
 /// Keep the complete work calculation shared with offline schedule experiments.
@@ -1480,11 +1766,13 @@ fn batch_plan_for_cycle(
     Ok(SelectedBatch {
         population_indices: population_indices.to_vec(),
         representative_case_indices,
-        input_opportunities,
+        input_plan: SelectedInputPlan::Periodic {
+            input_opportunities,
+            planned_cycles,
+            maximum_anchor_span,
+        },
         schedule,
         schedule_within_capacity,
-        planned_cycles,
-        maximum_anchor_span,
         requests: add(mul(cycle_requests, planned_cycles)?, setup.requests)?,
         serial_token_work: add(mul(cycle_tokens, planned_cycles)?, setup.serial_token_work)?,
         serial_wave_upper_bound: add(mul(cycle_serial, planned_cycles)?, setup.execution_actions)?,
@@ -1511,9 +1799,12 @@ fn append_batch(
         reasons.push(SelectionGapReason::SourceScheduleCapacity);
     }
     let minimum_phase = *batch.schedule.phase_min_offered.iter().min().unwrap();
-    if batch.maximum_anchor_span > minimum_phase {
+    if let Some(span) = batch
+        .periodic_anchor_span()
+        .filter(|span| *span > minimum_phase)
+    {
         reasons.push(SelectionGapReason::AnchorAfterEarliestFreeze {
-            span: batch.maximum_anchor_span,
+            span,
             minimum_offers: minimum_phase,
         });
     }
@@ -1539,7 +1830,7 @@ fn append_batch(
     for &index in &batch.population_indices {
         let member = &mut out.populations[index];
         if !member.scheduled {
-            member.maximum_anchor_span = batch.maximum_anchor_span;
+            member.maximum_anchor_span = batch.periodic_anchor_span().unwrap_or(0);
             member.scheduled = batch.scheduled;
             member.batch_index = Some(out.batches.len());
         }
@@ -1552,15 +1843,10 @@ fn append_batch(
     }
     if batch.scheduled {
         out.execution_case_indices
-            .try_reserve(mul(
-                batch.representative_case_indices.len(),
-                batch.planned_cycles,
-            )?)
+            .try_reserve(batch.execution_case_count()?)
             .map_err(|_| error("checked selection allocation capacity"))?;
-        for _ in 0..batch.planned_cycles {
-            out.execution_case_indices
-                .extend_from_slice(&batch.representative_case_indices);
-        }
+        out.execution_case_indices
+            .extend(batch.execution_case_indices()?);
         out.requests = add(out.requests, batch.requests)?;
         out.serial_wave_upper_bound =
             add(out.serial_wave_upper_bound, batch.serial_wave_upper_bound)?;
@@ -1726,6 +2012,7 @@ mod tests {
     use populations::{classify_alternatives, tests as fixture};
     mod bootstrap_role_coverage;
     mod composition;
+    mod finite_policy;
     mod input_geometry_tests;
     mod journal_grouping;
     mod memory;
@@ -2041,12 +2328,12 @@ mod tests {
         assert!(!sparse.execution_case_indices.is_empty());
         assert!(sparse.gaps.is_empty());
         let batch = &sparse.batches[0];
-        assert!(batch.maximum_anchor_span > population.schedule.phase_min_offered[0]);
+        assert!(batch.anchors_within_schedule());
         assert!(batch
             .schedule
             .phase_min_offered
             .iter()
-            .all(|minimum| { *minimum >= batch.maximum_anchor_span }));
+            .all(|minimum| *minimum > population.schedule.phase_min_offered[0]));
     }
 
     #[test]
@@ -2316,38 +2603,48 @@ mod tests {
             );
             assert!(batch.scheduled);
             assert_eq!(independent.populations[index].batch_index, Some(index));
-            assert_eq!(batch.planned_cycles, standalone.planned_cycles);
+            assert_eq!(
+                batch.execution_case_count().unwrap(),
+                standalone.execution_case_count().unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&batch.schedule).unwrap(),
+                serde_json::to_value(&standalone.schedule).unwrap()
+            );
             assert_eq!(batch.requests, standalone.requests);
             assert_eq!(
                 batch.serial_wave_upper_bound,
                 standalone.serial_wave_upper_bound
             );
             assert_eq!(batch.serial_token_work, standalone.serial_token_work);
-            let horizon = &batch.input_opportunities;
-            assert_eq!(
-                horizon.required_original_offers,
-                standalone.input_opportunities.required_original_offers
-            );
-            assert_eq!(
-                horizon.phase_original_offer_bounds,
-                standalone.input_opportunities.phase_original_offer_bounds
-            );
-            assert_eq!(
-                horizon.maximum_fresh_member_span,
-                standalone.input_opportunities.maximum_fresh_member_span
-            );
-            assert!(
-                batch.planned_cycles * horizon.minimum_original_offers_per_completed_cycle
-                    >= horizon.required_original_offers + batch.schedule.block_offered
-            );
-            assert!(horizon
-                .phase_original_offer_bounds
-                .iter()
-                .zip(batch.schedule.phase_min_offered)
-                .all(|(offers, minimum)| *offers >= minimum));
-            let expanded = batch
-                .representative_case_indices
-                .repeat(batch.planned_cycles);
+            if let Some(horizon) = batch.periodic_budget() {
+                let standalone_horizon = standalone.periodic_budget().unwrap();
+                assert_eq!(
+                    horizon.required_original_offers,
+                    standalone_horizon.required_original_offers
+                );
+                assert_eq!(
+                    horizon.phase_original_offer_bounds,
+                    standalone_horizon.phase_original_offer_bounds
+                );
+                assert_eq!(
+                    horizon.maximum_fresh_member_span,
+                    standalone_horizon.maximum_fresh_member_span
+                );
+                assert!(
+                    batch.periodic_cycles().unwrap()
+                        * horizon.minimum_original_offers_per_completed_cycle
+                        >= horizon.required_original_offers + batch.schedule.block_offered
+                );
+                assert!(horizon
+                    .phase_original_offer_bounds
+                    .iter()
+                    .zip(batch.schedule.phase_min_offered)
+                    .all(|(offers, minimum)| *offers >= minimum));
+            } else {
+                assert!(standalone.finite_plan().is_some());
+            }
+            let expanded: Vec<_> = batch.execution_case_indices().unwrap().collect();
             assert_eq!(
                 batch.serial_token_work,
                 expanded
@@ -2472,9 +2769,7 @@ mod tests {
         assert!(!tight.populations[0].scheduled);
         assert_eq!(
             tight.execution_case_indices,
-            first
-                .representative_case_indices
-                .repeat(first.planned_cycles)
+            first.execution_case_indices().unwrap().collect::<Vec<_>>()
         );
         assert!(tight.gaps.iter().any(|gap| {
             gap.population.as_ref() == Some(&tight.populations[0].key)
@@ -2490,7 +2785,7 @@ mod tests {
     fn checked_selection_recomputes_shared_source_anchor_window() {
         // Independent raw algorithm families share a journal only when the
         // actual product, readback, installed policy and complete widths agree.
-        // Preserve the original full-cycle anchor/phase recomputation check.
+        // Recompute a complete anchor/phase proof after combining families.
         let (cases, opportunities, facts, mut population) =
             journal_grouping::same_product_families();
         population.schedule.phase_min_offered = [180; 3];
@@ -2508,17 +2803,14 @@ mod tests {
         .unwrap();
         assert_eq!(split.batches.len(), 1);
         assert_eq!(split.batches[0].population_indices, [0, 1]);
-        assert!(split.batches.iter().all(|batch| batch.scheduled
-            && batch.maximum_anchor_span <= batch.schedule.phase_min_offered[0]));
-        assert!(split.batches[0].maximum_anchor_span > 180);
+        assert!(split
+            .batches
+            .iter()
+            .all(|batch| batch.scheduled && batch.anchors_within_schedule()));
         let expected: Vec<_> = split
             .batches
             .iter()
-            .flat_map(|batch| {
-                batch
-                    .representative_case_indices
-                    .repeat(batch.planned_cycles)
-            })
+            .flat_map(|batch| batch.execution_case_indices().unwrap())
             .collect();
         assert_eq!(split.execution_case_indices, expected);
         let requests: usize = split
@@ -2644,12 +2936,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.batches[0].representative_case_indices, [0, 2]);
-        assert_eq!(
-            selected.batches[0]
-                .input_opportunities
-                .minimum_original_offers_per_completed_cycle,
-            8 + 3 + 4 * 31 + 3
-        );
+        let mandatory_minimum: usize = selected.batches[0]
+            .representative_case_indices
+            .iter()
+            .map(|&i| {
+                work::case_work(&cases[i], 61, 8, None)
+                    .unwrap()
+                    .declared_offers_minimum
+            })
+            .sum();
+        assert_eq!(mandatory_minimum, 8 + 3 + 4 * 31 + 3);
         for (index, chunks) in [(0, 8), (2, 31)] {
             let mut case = cases[index].clone();
             assert_eq!(

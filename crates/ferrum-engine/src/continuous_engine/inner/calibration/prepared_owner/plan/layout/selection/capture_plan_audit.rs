@@ -311,6 +311,11 @@ fn checked_cases(ids: &[usize], matrix: &Value, case_count: usize) -> AuditResul
 
 fn compare_original(actual: &SelectedBatch, expected: &Value) -> AuditResult<()> {
     let actual = serde_json::to_value(actual)?;
+    let periodic = field(&actual, "input_plan")?;
+    ensure!(
+        periodic.get("kind").and_then(Value::as_str) == Some("periodic"),
+        "historical control must retain the original periodic plan"
+    );
     for name in [
         "population_indices",
         "representative_case_indices",
@@ -325,11 +330,15 @@ fn compare_original(actual: &SelectedBatch, expected: &Value) -> AuditResult<()>
         "declared_offer_row_bound",
         "algorithm_universe",
     ] {
+        let actual_field = actual.get(name).or_else(|| periodic.get(name));
+        let expected_field = expected
+            .get(name)
+            .or_else(|| expected.get("input_plan").and_then(|v| v.get(name)));
         ensure!(
-            actual.get(name) == expected.get(name),
+            actual_field == expected_field,
             "original batch {name} differs: actual={} expected={}",
-            actual.get(name).unwrap_or(&Value::Null),
-            expected.get(name).unwrap_or(&Value::Null)
+            actual_field.unwrap_or(&Value::Null),
+            expected_field.unwrap_or(&Value::Null)
         );
     }
     Ok(())
@@ -557,9 +566,7 @@ fn audit(
         let fits_requests = complete.requests <= available.requests;
         let fits_actions = complete.serial_wave_upper_bound <= available.execution_actions;
         let fits_rows = complete.declared_offer_row_bound <= available.declared_offer_rows;
-        let fits_schedule = complete.schedule_within_capacity
-            && complete.maximum_anchor_span
-                <= *complete.schedule.phase_min_offered.iter().min().unwrap();
+        let fits_schedule = complete.schedule_within_capacity && complete.anchors_within_schedule();
         let fits = fits_requests && fits_actions && fits_rows && fits_schedule;
         let mut widths: Vec<_> = complete
             .representative_case_indices

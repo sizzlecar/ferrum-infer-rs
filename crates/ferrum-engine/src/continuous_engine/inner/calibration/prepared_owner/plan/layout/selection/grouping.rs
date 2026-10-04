@@ -166,7 +166,7 @@ pub(super) fn independent_families(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reserve(
+pub(super) fn reserve(
     batch: &SelectedBatch,
     priority: u8,
     capacity: SelectionCapacity,

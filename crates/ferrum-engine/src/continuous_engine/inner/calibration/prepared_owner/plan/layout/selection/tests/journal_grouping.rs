@@ -196,16 +196,10 @@ fn checked_decode_journal_covers_context_families_before_wider_auxiliary_sources
         }
     }
     assert_ne!(selected.populations[0].key, selected.populations[1].key);
-    assert!(batch
-        .schedule
-        .phase_min_offered
-        .iter()
-        .all(|minimum| *minimum >= batch.maximum_anchor_span));
+    related::assert_complete_input_plan(batch);
     assert_eq!(
         selected.execution_case_indices,
-        batch
-            .representative_case_indices
-            .repeat(batch.planned_cycles)
+        batch.execution_case_indices().unwrap().collect::<Vec<_>>()
     );
     assert_eq!(
         selected.requests,
@@ -268,7 +262,7 @@ fn checked_decode_journal_covers_context_families_before_wider_auxiliary_sources
             .numerical_family_key_for_universe(local)
             .is_ok());
     }
-    assert!(union.planned_cycles < batch.planned_cycles);
+    assert!(union.execution_case_count().unwrap() < batch.execution_case_count().unwrap());
     assert!(scoped.requests < selected.requests);
     assert_eq!(
         local.algorithm_count(),
@@ -336,6 +330,33 @@ fn checked_decode_journal_combination_cannot_borrow_requests_or_waves() {
     );
     let full = input.select(100_000, 10_000_000, None);
     assert_eq!(full.batches.len(), 1);
+    finite_policy::assert_work(&full, &input.cases, &input.prompts, 8);
+    let merged = &full.batches[0];
+    let original_plan = serde_json::to_value(&merged.input_plan).unwrap();
+    let append_merged = |capacity| {
+        let mut selected = CheckedSelection {
+            populations: full.populations.clone(),
+            ..Default::default()
+        };
+        for member in &mut selected.populations {
+            member.scheduled = false;
+            member.batch_index = None;
+        }
+        append_batch(&mut selected, merged.clone(), capacity, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&selected.batches[0].input_plan).unwrap(),
+            original_plan
+        );
+        finite_policy::assert_work(&selected, &input.cases, &input.prompts, 8);
+        selected
+    };
+    let exact = append_merged(SelectionCapacity {
+        requests: merged.requests,
+        execution_actions: merged.serial_wave_upper_bound,
+        declared_offer_rows: merged.declared_offer_row_bound,
+    });
+    assert!(exact.batches[0].scheduled);
+    assert_eq!(exact.execution_case_indices, full.execution_case_indices);
     for (requests, waves, request_limited) in [
         (full.requests - 1, 10_000_000, true),
         (100_000, full.serial_wave_upper_bound - 1, false),
@@ -346,12 +367,55 @@ fn checked_decode_journal_combination_cannot_borrow_requests_or_waves() {
             .batches
             .iter()
             .all(|batch| batch.population_indices.len() == 1));
-        assert!(selected.populations.iter().any(|member| !member.scheduled));
-        assert!(selected.requests <= requests && selected.serial_wave_upper_bound <= waves);
-        assert!(selected.gaps.iter().any(|gap| if request_limited {
-            matches!(gap.reason, SelectionGapReason::RemainingRequests { .. })
+        // Refusing the more expensive merged journal does not forbid two
+        // cheaper independent complete finite plans under the same allowance.
+        let mut all = SelectionCapacity::default();
+        for batch in &selected.batches {
+            all.charge(batch).unwrap();
+        }
+        let all_fit = all.requests <= requests
+            && all.execution_actions <= waves
+            && all.declared_offer_rows <= waves;
+        assert_eq!(
+            selected.populations.iter().all(|member| member.scheduled),
+            all_fit,
+            "complete independent sources must fit every execution ledger"
+        );
+        if all_fit {
+            finite_policy::assert_preserves_coverage(&full, &selected);
         } else {
-            matches!(gap.reason, SelectionGapReason::RemainingWaves { .. })
+            for member in selected
+                .populations
+                .iter()
+                .filter(|member| !member.scheduled)
+            {
+                assert!(selected.gaps.iter().any(|gap| gap.population.as_ref() == Some(&member.key)
+                    && if request_limited {
+                        matches!(gap.reason, SelectionGapReason::RemainingRequests { required, remaining } if required > remaining)
+                    } else {
+                        matches!(gap.reason, SelectionGapReason::RemainingWaves { required, remaining } if required > remaining)
+                    }));
+            }
+        }
+        finite_policy::assert_work(&selected, &input.cases, &input.prompts, 8);
+        assert!(selected.requests <= requests && selected.serial_wave_upper_bound <= waves);
+        assert!(selected.declared_offer_row_bound <= waves);
+
+        // The original merged candidate itself still cannot borrow that
+        // missing unit or trim its frozen sequence to make it fit.
+        let rejected = append_merged(SelectionCapacity::legacy(requests, waves));
+        assert!(!rejected.batches[0].scheduled);
+        assert!(rejected.populations.iter().all(|member| !member.scheduled));
+        assert!(rejected.execution_case_indices.is_empty());
+        assert_eq!(rejected.requests, 0);
+        assert_eq!(rejected.serial_wave_upper_bound, 0);
+        assert_eq!(rejected.declared_offer_row_bound, 0);
+        assert!(rejected.gaps.iter().any(|gap| if request_limited {
+            matches!(gap.reason, SelectionGapReason::RemainingRequests { required, remaining }
+                if required == merged.requests && remaining + 1 == required)
+        } else {
+            matches!(gap.reason, SelectionGapReason::RemainingWaves { required, remaining }
+                if required == merged.serial_wave_upper_bound && remaining + 1 == required)
         }));
     }
 }

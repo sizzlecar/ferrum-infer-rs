@@ -106,10 +106,15 @@ fn checked_selection_distinct_family_stage_bound_preserves_the_full_plan() {
         Some(&mut actual_work),
     )
     .unwrap();
+    // Extra finite storage may shorten the roomy plan's occurrence stream.
+    // It must retain every original admitted key, endpoint and scoped floor.
+    finite_policy::assert_preserves_coverage(&actual, &expected);
     assert_eq!(
-        serde_json::to_value(&actual).unwrap(),
-        serde_json::to_value(&expected).unwrap()
+        serde_json::to_value(&actual.gaps).unwrap(),
+        serde_json::to_value(&expected.gaps).unwrap()
     );
+    finite_policy::assert_work(&actual, &cases, &[61], 8);
+    finite_policy::assert_work(&expected, &cases, &[61], 8);
     assert_eq!(actual_work.visits(), expected_work.visits());
     assert!(actual
         .gaps
@@ -586,10 +591,13 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
             let wide = experimental_run(usize::MAX, &mut wide_work).unwrap();
             let mut tight_work = StructuredInputGeometryWorkV1::new(work_limit);
             let scoped = experimental_run(projected_peak, &mut tight_work).unwrap();
+            finite_policy::assert_preserves_coverage(&scoped, &wide);
             assert_eq!(
-                serde_json::to_value(&scoped).unwrap(),
-                serde_json::to_value(&wide).unwrap()
+                serde_json::to_value(&scoped.gaps).unwrap(),
+                serde_json::to_value(&wide.gaps).unwrap()
             );
+            finite_policy::assert_work(&scoped, &cases, &[61, 61], 8);
+            finite_policy::assert_work(&wide, &cases, &[61, 61], 8);
             assert_eq!(tight_work.visits(), wide_work.visits());
             let union = scoped.batches.iter().find(|batch| batch.scheduled).unwrap();
             assert!(union.algorithm_universe.is_some());

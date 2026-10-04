@@ -131,13 +131,7 @@ fn scope_first_experiment_preserves_positive_endpoints_linked_scope_and_all_thre
     )
     .unwrap();
     assert_eq!(batch.schedule.min_members, raw.schedule.min_members);
-    for phase in 0..3 {
-        assert!(batch.input_opportunities.phase_cycles[phase] > 0);
-        assert!(
-            batch.input_opportunities.phase_original_offer_bounds[phase]
-                >= batch.input_opportunities.maximum_fresh_member_span[phase]
-        );
-    }
+    related::assert_complete_input_plan(batch);
     let mut actual = SelectionCapacity::default();
     for &index in &selected.execution_case_indices {
         let one = work::case_work(&cases[index], 61, 8, None).unwrap();
@@ -303,7 +297,7 @@ fn scope_first_experiment_preserves_original_recipes_and_independent_host_floors
             input_geometry: None,
         })
         .collect();
-    let sparse = batch_plan_with_scope(
+    let sparse = batch_plan_with_schedule(
         &[0, 1],
         &sparse_populations,
         &cases,
@@ -313,14 +307,15 @@ fn scope_first_experiment_preserves_original_recipes_and_independent_host_floors
         None,
         &population,
         Some((&view.inputs, view.scopes[0].as_ref().unwrap())),
+        budget::startup_schedule, // Explicit historical periodic control.
     )
     .unwrap();
-    eprintln!("sparse independent-host source: requests={} actions={} rows={} cycles={} minimum_cycle={} full_cycle={}",
-        sparse.requests, sparse.serial_wave_upper_bound, sparse.declared_offer_row_bound, sparse.planned_cycles,
-        sparse.input_opportunities.minimum_original_offers_per_completed_cycle,
-        sparse.input_opportunities.successful_cycle_wave_upper_bound);
+    eprintln!("sparse periodic independent-host control: requests={} actions={} rows={} cycles={} minimum_cycle={} full_cycle={}",
+        sparse.requests, sparse.serial_wave_upper_bound, sparse.declared_offer_row_bound, sparse.periodic_cycles().unwrap(),
+        sparse.periodic_budget().unwrap().minimum_original_offers_per_completed_cycle,
+        sparse.periodic_budget().unwrap().successful_cycle_wave_upper_bound);
     assert!(sparse.schedule_within_capacity);
-    assert!(sparse.maximum_anchor_span <= *sparse.schedule.phase_min_offered.iter().min().unwrap());
+    related::assert_complete_input_plan(&sparse);
     assert!(sparse.requests <= 2048);
     assert!(sparse.serial_wave_upper_bound > 16384);
     assert!(super::super::composition::packing_valid(
@@ -356,14 +351,15 @@ fn scope_first_experiment_preserves_original_recipes_and_independent_host_floors
         None,
         &population,
         Some((&view.inputs, view.scopes[0].as_ref().unwrap())),
+        InputAllocationPolicy::FinitePreferred,
     )
     .unwrap();
     eprintln!(
-        "complete independent-host source: requests={} actions={} rows={} cycles={}",
+        "complete independent-host source: requests={} actions={} rows={} occurrences={}",
         complete.requests,
         complete.serial_wave_upper_bound,
         complete.declared_offer_row_bound,
-        complete.planned_cycles
+        complete.execution_case_count().unwrap()
     );
     assert!(super::super::composition::can_schedule(
         &complete,
@@ -461,7 +457,7 @@ fn scope_first_experiment_preserves_original_recipes_and_independent_host_floors
 }
 
 #[test]
-fn scope_first_experiment_c8_keeps_complete_geometry_and_rejects_unaffordable_cold_horizon() {
+fn scope_first_experiment_c8_preserves_periodic_control_and_exact_finite_capacity() {
     let (cases, opportunities, inputs, population) = composition::algorithm_pair_inventory([1, 4]);
     assert_eq!(
         cases.iter().map(|case| case.width).collect::<Vec<_>>(),
@@ -469,8 +465,14 @@ fn scope_first_experiment_c8_keeps_complete_geometry_and_rejects_unaffordable_co
     );
     let universe = seed(&inputs, &population);
     let mut work = StructuredInputGeometryWorkV1::new(NonZeroU64::new(32_000_000).unwrap());
-    // Keep this rejected broad plan as an explicit experiment. Product
-    // selection must not replace its schedulable narrow sources with it.
+    let capacity = SelectionCapacity {
+        requests: 2048,
+        execution_actions: 16384,
+        declared_offer_rows: 16384,
+    };
+    // This remains an explicit scope experiment. The historical periodic
+    // horizon and the finite allocation share exactly the same original U,
+    // complete geometry and required representatives.
     let selection = super::super::scoped_inputs::select_for_test(
         &cases,
         &opportunities,
@@ -479,11 +481,7 @@ fn scope_first_experiment_c8_keeps_complete_geometry_and_rejects_unaffordable_co
         8,
         None,
         &population,
-        SelectionCapacity {
-            requests: 2048,
-            execution_actions: 16384,
-            declared_offer_rows: 16384,
-        },
+        capacity,
         usize::MAX,
         None,
         None,
@@ -499,23 +497,114 @@ fn scope_first_experiment_c8_keeps_complete_geometry_and_rejects_unaffordable_co
     assert_eq!(member.representative_case_indices, [0, 1, 2, 3]);
     let batch = &selection.batches[0];
     assert_eq!(batch.algorithm_universe.as_ref(), Some(&universe));
-    assert!(batch.requests <= 2048);
-    assert!(batch.serial_wave_upper_bound > 16384);
-    assert!(
-        !batch.scheduled,
-        "retaining C8 geometry cannot bypass the original complete-horizon action cap"
-    );
-    assert!(selection.execution_case_indices.is_empty());
-    assert!(selection.gaps.iter().any(|gap| matches!(gap.reason,
-        SelectionGapReason::RemainingWaves { required, remaining }
-        if required == batch.serial_wave_upper_bound && remaining == 16384)));
+    let periodic = batch_plan_with_schedule(
+        &batch.population_indices,
+        &selection.populations,
+        &cases,
+        &opportunities,
+        &[61, 61],
+        8,
+        None,
+        &population,
+        Some((&inputs, &universe)),
+        budget::startup_schedule,
+    )
+    .unwrap();
+    assert!(periodic.periodic_cycles().is_some());
+    assert_eq!(periodic.algorithm_universe, batch.algorithm_universe);
+    assert_eq!(periodic.representative_case_indices, [0, 1, 2, 3]);
+    assert!(periodic.requests <= capacity.requests);
+    assert!(periodic.serial_wave_upper_bound > capacity.execution_actions);
+
+    assert!(batch.finite_plan().is_some());
+    related::assert_complete_input_plan(batch);
+    assert!(batch.requests <= periodic.requests);
+    assert!(batch.serial_wave_upper_bound <= periodic.serial_wave_upper_bound);
+    assert!(batch.declared_offer_row_bound <= periodic.declared_offer_row_bound);
+    let fits = batch.requests <= capacity.requests
+        && batch.serial_wave_upper_bound <= capacity.execution_actions
+        && batch.declared_offer_row_bound <= capacity.declared_offer_rows;
+    assert_eq!(batch.scheduled, fits);
+    if fits {
+        assert_eq!(
+            selection.execution_case_indices,
+            batch.execution_case_indices().unwrap().collect::<Vec<_>>()
+        );
+    } else {
+        assert!(selection.execution_case_indices.is_empty());
+        assert!(selection.gaps.iter().any(|gap| matches!(gap.reason,
+            SelectionGapReason::RemainingRequests { required, remaining }
+                if required == batch.requests && remaining == capacity.requests)
+            || matches!(gap.reason, SelectionGapReason::RemainingWaves { required, remaining }
+                if required == batch.serial_wave_upper_bound && remaining == capacity.execution_actions)
+            || matches!(gap.reason, SelectionGapReason::RemainingOfferRows { required, remaining }
+                if required == batch.declared_offer_row_bound && remaining == capacity.declared_offer_rows)));
+    }
+
+    // Exercise the original append contract at this plan's exact cost, then
+    // one unit short in each independent ledger. No geometry is repeated and
+    // no representative, phase or occurrence is trimmed to fit the short cap.
+    let exact = SelectionCapacity {
+        requests: batch.requests,
+        execution_actions: batch.serial_wave_upper_bound,
+        declared_offer_rows: batch.declared_offer_row_bound,
+    };
+    let frozen_plan = serde_json::to_value(&batch.input_plan).unwrap();
+    for short in 0..=3 {
+        let mut bound = exact;
+        match short {
+            1 => bound.requests -= 1,
+            2 => bound.execution_actions -= 1,
+            3 => bound.declared_offer_rows -= 1,
+            _ => (),
+        }
+        let mut appended = CheckedSelection {
+            populations: selection.populations.clone(),
+            ..Default::default()
+        };
+        for member in &mut appended.populations {
+            member.scheduled = false;
+            member.batch_index = None;
+        }
+        append_batch(&mut appended, batch.clone(), bound, None).unwrap();
+        assert_eq!(appended.batches[0].scheduled, short == 0);
+        assert_eq!(
+            serde_json::to_value(&appended.batches[0].input_plan).unwrap(),
+            frozen_plan
+        );
+        if short == 0 {
+            assert_eq!(appended.requests, exact.requests);
+            assert_eq!(appended.serial_wave_upper_bound, exact.execution_actions);
+            assert_eq!(appended.declared_offer_row_bound, exact.declared_offer_rows);
+            assert_eq!(
+                appended.execution_case_indices,
+                batch.execution_case_indices().unwrap().collect::<Vec<_>>()
+            );
+        } else {
+            assert!(appended.execution_case_indices.is_empty());
+            assert_eq!(appended.requests, 0);
+            assert_eq!(appended.serial_wave_upper_bound, 0);
+            assert_eq!(appended.declared_offer_row_bound, 0);
+            assert!(appended.gaps.iter().any(|gap| match short {
+                1 => matches!(gap.reason, SelectionGapReason::RemainingRequests { required, remaining }
+                    if required == exact.requests && remaining + 1 == required),
+                2 => matches!(gap.reason, SelectionGapReason::RemainingWaves { required, remaining }
+                    if required == exact.execution_actions && remaining + 1 == required),
+                3 => matches!(gap.reason, SelectionGapReason::RemainingOfferRows { required, remaining }
+                    if required == exact.declared_offer_rows && remaining + 1 == required),
+                _ => unreachable!(),
+            }));
+        }
+    }
     eprintln!(
-        "complete C8 cold source: requests={} actions={} rows={} cycles={} geometry_visits={}",
+        "complete C8 finite source: scheduled={} requests={} actions={} rows={} occurrences={} geometry_visits={}; periodic actions={}",
+        batch.scheduled,
         batch.requests,
         batch.serial_wave_upper_bound,
         batch.declared_offer_row_bound,
-        batch.planned_cycles,
-        work.visits()
+        batch.execution_case_count().unwrap(),
+        work.visits(),
+        periodic.serial_wave_upper_bound,
     );
 }
 
@@ -567,15 +656,7 @@ fn scope_first_preserves_schedulable_narrow_inputs_when_complete_c8_horizon_does
     );
     assert!(original_batch.algorithm_universe.is_none());
     assert!(original_batch.schedule_within_capacity);
-    assert!(
-        original_batch.maximum_anchor_span
-            <= *original_batch
-                .schedule
-                .phase_min_offered
-                .iter()
-                .min()
-                .unwrap()
-    );
+    related::assert_complete_input_plan(original_batch);
     for &index in &original_batch.population_indices {
         assert!(
             original.populations[index]
@@ -583,15 +664,6 @@ fn scope_first_preserves_schedulable_narrow_inputs_when_complete_c8_horizon_does
                 .as_ref()
                 .unwrap()
                 .complete
-        );
-    }
-    for phase in 0..3 {
-        assert!(original_batch.input_opportunities.phase_cycles[phase] > 0);
-        assert!(
-            original_batch
-                .input_opportunities
-                .phase_original_offer_bounds[phase]
-                >= original_batch.input_opportunities.maximum_fresh_member_span[phase]
         );
     }
     let mut actual = SelectionCapacity::default();
@@ -630,9 +702,9 @@ fn scope_first_preserves_schedulable_narrow_inputs_when_complete_c8_horizon_does
         Some(&universe),
     )
     .unwrap();
-    eprintln!("original narrow reservation: requests={} actions={} rows={} cycles={}; candidate reservations={:?}",
+    eprintln!("original narrow reservation: requests={} actions={} rows={} occurrences={}; candidate reservations={:?}",
         original.requests, original.serial_wave_upper_bound, original.declared_offer_row_bound,
-        original_batch.planned_cycles,
+        original_batch.execution_case_count().unwrap(),
         candidate.batches.iter().map(|batch| (batch.scheduled, batch.requests, batch.serial_wave_upper_bound, batch.declared_offer_row_bound)).collect::<Vec<_>>());
     // These are the two real positive endpoints of algorithm A. A wider
     // declaration may retain them in a different numerical scope, but merely

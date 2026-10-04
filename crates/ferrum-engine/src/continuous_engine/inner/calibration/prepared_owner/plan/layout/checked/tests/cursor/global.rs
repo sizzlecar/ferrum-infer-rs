@@ -477,8 +477,36 @@ async fn global_cursor_preserves_host_identity_and_every_complete_source_horizon
             serde_json::to_value(&representatives).unwrap(),
             batch["representative_case_indices"]
         );
-        expected_cases
-            .extend(representatives.repeat(batch["planned_cycles"].as_u64().unwrap() as usize));
+        let plan = &batch["input_plan"];
+        let occurrences = match plan["kind"].as_str().unwrap() {
+            "periodic" => representatives
+                .repeat(serde_json::from_value::<usize>(plan["planned_cycles"].clone()).unwrap()),
+            "finite" => {
+                let finite = &plan["plan"];
+                let occurrences =
+                    serde_json::from_value::<Vec<usize>>(finite["occurrence_case_indices"].clone())
+                        .unwrap();
+                assert_eq!(finite["schedule"], batch["schedule"]);
+                assert_eq!(finite["work"]["requests"], batch["requests"]);
+                assert_eq!(
+                    finite["work"]["execution_actions"],
+                    batch["serial_wave_upper_bound"]
+                );
+                assert_eq!(
+                    finite["work"]["serial_declared_offer_rows"],
+                    batch["declared_offer_row_bound"]
+                );
+                assert!(occurrences
+                    .iter()
+                    .all(|index| representatives.contains(index)));
+                assert!(representatives
+                    .iter()
+                    .all(|index| occurrences.contains(index)));
+                occurrences
+            }
+            other => panic!("unrecognized original source input plan: {other}"),
+        };
+        expected_cases.extend(occurrences);
     }
     assert_eq!(
         serde_json::to_value(&expected_cases).unwrap(),

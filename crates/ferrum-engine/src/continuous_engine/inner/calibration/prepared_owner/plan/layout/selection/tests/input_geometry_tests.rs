@@ -101,45 +101,43 @@ fn checked_input_pivots_add_original_cross_case_and_charge_complete_source() {
     assert!(geometry.candidate_rank.unwrap() < facts[0][0].axes.len());
     let batch = &result.batches[group.batch_index.unwrap()];
     assert!(batch.schedule.input_readiness.is_none());
+    related::assert_complete_input_plan(batch);
     assert_eq!(
         result.execution_case_indices,
-        group
-            .representative_case_indices
-            .repeat(batch.planned_cycles)
+        batch.execution_case_indices().unwrap().collect::<Vec<_>>()
     );
     assert_eq!(
         batch.requests,
-        batch.planned_cycles * cases.iter().map(|case| case.width).sum::<usize>()
+        result
+            .execution_case_indices
+            .iter()
+            .map(|&index| cases[index].width)
+            .sum::<usize>()
     );
-    let cycle_setup_and_decode: usize = cases
-        .iter()
-        .map(|case| {
-            let prompt = [13usize, 61][case.template];
-            case.width * prompt.div_ceil(8 / case.width) + case.maximum_output.get() - 1
-        })
-        .sum();
     assert_eq!(
-        batch.input_opportunities.successful_cycle_wave_upper_bound,
-        cycle_setup_and_decode
-    );
-    assert!(
-        batch.planned_cycles
-            * batch
-                .input_opportunities
-                .minimum_original_offers_per_completed_cycle
-            >= batch.input_opportunities.required_original_offers + batch.schedule.block_offered
+        batch.serial_wave_upper_bound,
+        result
+            .execution_case_indices
+            .iter()
+            .map(|&index| {
+                let case = &cases[index];
+                work::case_work(case, [13usize, 61][case.template], 8, None)
+                    .unwrap()
+                    .execution_actions
+            })
+            .sum::<usize>()
     );
     assert_eq!(serde_json::to_value(&cases).unwrap(), original_cases);
     let groups = member_groups(&opportunities).unwrap();
-    let peak = super::super::memory::plan(
+    let memory = super::super::memory::plan(
         &groups,
         &opportunities,
         &facts,
         2048,
         Some(&population.settings),
     )
-    .unwrap()
-    .required_peak_bytes;
+    .unwrap();
+    let peak = memory.required_peak_bytes;
     let mut memory_work = StructuredInputGeometryWorkV1::new(NonZeroU64::new(32_000_000).unwrap());
     assert!(select_changed_with_geometry(
         &cases,
@@ -172,10 +170,14 @@ fn checked_input_pivots_add_original_cross_case_and_charge_complete_source() {
         Some(&mut memory_work),
     )
     .unwrap();
-    assert_eq!(
-        exact_memory.execution_case_indices,
-        result.execution_case_indices
-    );
+    // The original memory boundary can retain the periodic plan while the
+    // roomy selection authorizes a cheaper finite sequence. Both must retain
+    // the same checked geometry and charge their own complete original work.
+    finite_policy::assert_preserves_coverage(&exact_memory, &result);
+    finite_policy::assert_work(&exact_memory, &cases, &[13, 61], 8);
+    finite_policy::assert_work(&result, &cases, &[13, 61], 8);
+    assert_eq!(memory_work.visits(), work.visits());
+    assert!(memory.retained_groups_bytes + exact_memory.retained_payload_bytes().unwrap() <= peak);
 
     for (requests, waves) in [
         (batch.requests - 1, 65_536),

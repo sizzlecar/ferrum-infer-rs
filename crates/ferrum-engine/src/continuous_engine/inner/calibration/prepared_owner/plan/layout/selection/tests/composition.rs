@@ -135,7 +135,7 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             })
             .collect();
         let decode_indices: Vec<_> = (1..populations.len()).collect();
-        let prefill = batch_plan(
+        let prefill = batch_plan_with_scope(
             &[0],
             &populations,
             &cases,
@@ -144,9 +144,11 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             8,
             None,
             &population,
+            None,
+            InputAllocationPolicy::FinitePreferred,
         )
         .unwrap();
-        let packed = batch_plan(
+        let packed = batch_plan_with_scope(
             &decode_indices,
             &populations,
             &cases,
@@ -155,6 +157,8 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             8,
             None,
             &population,
+            None,
+            InputAllocationPolicy::FinitePreferred,
         )
         .unwrap();
         let independent = member_groups(&opportunities[1..]).unwrap();
@@ -166,14 +170,7 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             inputs[2][0].homogeneous_host_policy,
             inputs[3][0].homogeneous_host_policy
         );
-        assert!(
-            packed.planned_cycles
-                * packed
-                    .input_opportunities
-                    .minimum_original_offers_per_completed_cycle
-                >= packed.input_opportunities.required_original_offers
-                    + packed.schedule.block_offered
-        );
+        related::assert_complete_input_plan(&packed);
         let capacity = SelectionCapacity {
             requests: prefill.requests + packed.requests,
             execution_actions: prefill.serial_wave_upper_bound + packed.serial_wave_upper_bound,
@@ -259,7 +256,7 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
                 .iter()
                 .filter(|&&index| index == 0)
                 .count(),
-            prefill.planned_cycles
+            prefill.execution_case_count().unwrap()
         );
         let frozen = source_inputs::freeze_sources(
             &cases,
@@ -279,24 +276,26 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             .unwrap();
         let declared = population.clone();
         let source_inputs::ColdSourceRebuild::Ready(cold) = frozen[decode_source]
-            .cold_plan(&declared, NonZeroU32::new(8).unwrap(), None, usize::MAX)
+            .cold_plan(
+                actual,
+                &declared,
+                NonZeroU32::new(8).unwrap(),
+                None,
+                usize::MAX,
+            )
             .unwrap()
         else {
             panic!("unchanged cold work must retain all independent family horizons");
         };
-        assert_eq!(cold.cycles, actual.planned_cycles);
+        assert_eq!(
+            cold.planned_occurrences,
+            actual.execution_case_count().unwrap()
+        );
         assert_eq!(cold.requests, actual.requests);
         assert_eq!(cold.execution_actions, actual.serial_wave_upper_bound);
         assert_eq!(
-            cold.input_opportunities
-                .minimum_input_family_opportunities_per_cycle,
-            actual
-                .input_opportunities
-                .minimum_input_family_opportunities_per_cycle
-        );
-        assert_eq!(
-            cold.input_opportunities.maximum_fresh_member_span,
-            actual.input_opportunities.maximum_fresh_member_span
+            serde_json::to_value(&cold.input_plan).unwrap(),
+            serde_json::to_value(&actual.input_plan).unwrap()
         );
 
         // Every original constituent must pass a partial priority filter,
@@ -561,7 +560,10 @@ fn independent_family_packing_preserves_equal_scopes_and_declines_mixed_interpre
                     after.representative_case_indices,
                     before.representative_case_indices
                 );
-                assert_eq!(after.planned_cycles, before.planned_cycles);
+                assert_eq!(
+                    serde_json::to_value(&after.input_plan).unwrap(),
+                    serde_json::to_value(&before.input_plan).unwrap()
+                );
                 assert_eq!(after.requests, before.requests);
                 assert_eq!(
                     after.serial_wave_upper_bound,
@@ -655,24 +657,31 @@ fn native_source_coalescing_charges_one_setup_without_advancing_offered_clock() 
     // Each family executes width-one and width-four cohorts: one suffix
     // token per row, twenty decode waves, and one restore per fresh request.
     // The sixty-token seed has thirty two-token prefills and one capture.
-    assert_eq!(combined.schedule.block_offered, 2 * (21 + 24));
+    related::assert_complete_input_plan(combined);
+    let setup = work::setup_for_indices(&cases, &combined.representative_case_indices).unwrap();
     assert_eq!(
-        combined
-            .input_opportunities
-            .successful_cycle_wave_upper_bound,
-        90
+        (
+            setup.requests,
+            setup.execution_actions,
+            setup.serial_token_work
+        ),
+        (1, 31, 60)
     );
+    let mut expected = setup;
+    for index in combined.execution_case_indices().unwrap() {
+        let one = work::case_work(&cases[index], 61, 8, NonZeroU32::new(2)).unwrap();
+        expected.requests += one.requests;
+        expected.execution_actions += one.execution_actions;
+        expected.serial_declared_offer_rows += one.serial_declared_offer_rows;
+        expected.serial_token_work += one.serial_token_work;
+    }
+    assert_eq!(combined.requests, expected.requests);
+    assert_eq!(combined.serial_wave_upper_bound, expected.execution_actions);
     assert_eq!(
-        combined
-            .input_opportunities
-            .minimum_original_offers_per_completed_cycle,
-        2 * (4 + 7)
+        combined.declared_offer_row_bound,
+        expected.serial_declared_offer_rows
     );
-    let cycles = combined.planned_cycles;
-    assert_eq!(combined.requests, 10 * cycles + 1);
-    assert_eq!(combined.serial_wave_upper_bound, 220 * cycles + 31);
-    assert_eq!(combined.declared_offer_row_bound, 210 * cycles);
-    assert_eq!(combined.serial_token_work, 210 * cycles + 60);
+    assert_eq!(combined.serial_token_work, expected.serial_token_work);
     assert_eq!(selected.requests, combined.requests);
     assert_eq!(
         selected.declared_offer_row_bound,
@@ -697,14 +706,17 @@ fn native_source_coalescing_charges_one_setup_without_advancing_offered_clock() 
             &population,
         )
         .unwrap();
-        assert_eq!(separate.requests, 5 * separate.planned_cycles + 1);
+        assert_eq!(
+            separate.requests,
+            5 * separate.periodic_cycles().unwrap() + 1
+        );
         assert_eq!(
             separate.serial_wave_upper_bound,
-            110 * separate.planned_cycles + 31
+            110 * separate.periodic_cycles().unwrap() + 31
         );
         assert_eq!(
             separate.serial_token_work,
-            105 * separate.planned_cycles + 60
+            105 * separate.periodic_cycles().unwrap() + 60
         );
     }
 }
@@ -721,7 +733,15 @@ fn native_source_requires_complete_setup_and_restore_budget_before_selection() {
     );
     let batch = &selected.batches[0];
     assert!(batch.scheduled);
-    let offered_only = batch.schedule.block_offered * batch.planned_cycles;
+    let offered_only: usize = batch
+        .execution_case_indices()
+        .unwrap()
+        .map(|index| {
+            work::case_work(&cases[index], 61, 8, NonZeroU32::new(2))
+                .unwrap()
+                .declared_offers_upper
+        })
+        .sum();
     assert!(offered_only < batch.serial_wave_upper_bound);
     for (requests, actions, fits) in [
         (batch.requests, batch.serial_wave_upper_bound, true),
@@ -751,7 +771,7 @@ fn native_source_requires_complete_setup_and_restore_budget_before_selection() {
             assert_eq!(out.serial_wave_upper_bound, actions);
             assert_eq!(
                 out.execution_case_indices.len(),
-                batch.representative_case_indices.len() * batch.planned_cycles
+                batch.execution_case_count().unwrap()
             );
         } else {
             assert_eq!((out.requests, out.serial_wave_upper_bound), (0, 0));
@@ -840,7 +860,18 @@ fn original_batches() -> (Vec<BatchCandidate>, Vec<Case>, Vec<Vec<CheckedInputFa
         usize::MAX,
     )
     .unwrap();
-    let batch = selected.batches.remove(0);
+    let selected_batch = selected.batches.remove(0);
+    let batch = batch_plan(
+        &selected_batch.population_indices,
+        &selected.populations,
+        &cases,
+        &opportunities,
+        &[61],
+        8,
+        None,
+        &population,
+    )
+    .unwrap();
     let candidate = |batch| BatchCandidate {
         input_priority: 0,
         coverage: CoveragePriority::from_cases(&[0], &cases).unwrap(),
@@ -868,7 +899,7 @@ fn local_combination_cannot_promote_an_invalid_raw_source_into_a_reserved_slot()
         &batches[0].batch,
         SelectionCapacity::legacy(usize::MAX, usize::MAX)
     ));
-    batches[1].batch.maximum_anchor_span = batches[1]
+    let invalid_span = batches[1]
         .batch
         .schedule
         .phase_min_offered
@@ -877,6 +908,14 @@ fn local_combination_cannot_promote_an_invalid_raw_source_into_a_reserved_slot()
         .unwrap()
         .checked_add(1)
         .unwrap();
+    let SelectedInputPlan::Periodic {
+        maximum_anchor_span,
+        ..
+    } = &mut batches[1].batch.input_plan
+    else {
+        panic!("explicit periodic anchor rejection control");
+    };
+    *maximum_anchor_span = invalid_span;
     assert!(!super::super::composition::can_schedule(
         &batches[1].batch,
         SelectionCapacity::legacy(usize::MAX, usize::MAX)
@@ -1258,23 +1297,19 @@ fn same_width_algorithm_families_share_one_complete_union_source() {
         combined.schedule.min_members,
         raw.batches[0].schedule.min_members
     );
-    for phase in 0..3 {
-        assert!(combined.input_opportunities.phase_cycles[phase] > 0);
-        assert!(
-            combined.input_opportunities.phase_original_offer_bounds[phase]
-                >= combined.input_opportunities.maximum_fresh_member_span[phase]
-                    .max(combined.schedule.phase_min_offered[phase])
-        );
-    }
-    assert!(combined.planned_cycles < raw.batches[0].planned_cycles);
+    related::assert_complete_input_plan(combined);
+    assert!(
+        combined.execution_case_count().unwrap() < raw.batches[0].execution_case_count().unwrap()
+    );
     assert!(selected.requests < raw.requests);
     assert!(selected.serial_wave_upper_bound < raw.serial_wave_upper_bound);
     assert!(selected.declared_offer_row_bound < raw.declared_offer_row_bound);
     assert_eq!(
         selected.execution_case_indices,
         combined
-            .representative_case_indices
-            .repeat(combined.planned_cycles)
+            .execution_case_indices()
+            .unwrap()
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         selected.requests,
@@ -1310,18 +1345,24 @@ fn same_width_algorithm_families_share_one_complete_union_source() {
     )
     .unwrap();
     let source_inputs::ColdSourceRebuild::Ready(cold) = frozen[0]
-        .cold_plan(&population, NonZeroU32::new(8).unwrap(), None, usize::MAX)
+        .cold_plan(
+            combined,
+            &population,
+            NonZeroU32::new(8).unwrap(),
+            None,
+            usize::MAX,
+        )
         .unwrap()
     else {
         panic!("unchanged cold work must fit the original union horizon");
     };
-    assert_eq!(cold.cycles, combined.planned_cycles);
     assert_eq!(
-        cold.input_opportunities
-            .minimum_input_family_opportunities_per_cycle,
-        combined
-            .input_opportunities
-            .minimum_input_family_opportunities_per_cycle
+        cold.planned_occurrences,
+        combined.execution_case_count().unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&cold.input_plan).unwrap(),
+        serde_json::to_value(&combined.input_plan).unwrap()
     );
 
     let complete = SelectionCapacity {
@@ -1453,7 +1494,8 @@ fn local_scope_rejects_different_real_installed_host_policies() {
         8,
         None,
         &population,
-        &seed
+        &seed,
+        InputAllocationPolicy::FinitePreferred
     )
     .unwrap()
     .is_none());
@@ -1730,7 +1772,10 @@ fn local_scope_missing_linked_trajectory_seed_preserves_raw_budget_and_members()
             selected.representative_case_indices,
             raw.representative_case_indices
         );
-        assert_eq!(selected.planned_cycles, raw.planned_cycles);
+        assert_eq!(
+            serde_json::to_value(&selected.input_plan).unwrap(),
+            serde_json::to_value(&raw.input_plan).unwrap()
+        );
         assert_eq!(selected.schedule.min_members, raw.schedule.min_members);
     }
 }
@@ -1868,7 +1913,10 @@ fn same_width_union_preserves_later_original_source_at_same_or_lower_policy() {
             retained.representative_case_indices,
             original.representative_case_indices
         );
-        assert_eq!(retained.planned_cycles, original.planned_cycles);
+        assert_eq!(
+            serde_json::to_value(&retained.input_plan).unwrap(),
+            serde_json::to_value(&original.input_plan).unwrap()
+        );
         assert_eq!(retained.requests, original.requests);
         assert_eq!(
             retained.serial_wave_upper_bound,

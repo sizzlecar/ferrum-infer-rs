@@ -385,6 +385,7 @@ mod source_preparation;
 mod startup_series;
 
 mod feedback_coverage;
+mod finite_flow;
 
 mod journal;
 mod legal_prefill;

@@ -1,8 +1,10 @@
 # Ferrum SLO 恢复实施方案
 
-2026 年 10 月 2 日，用户要求在充分理解原目标、现状和连续失败经验后形成方案，并已要求创建、启动和恢复 goal。本方案从 `62b92fb1473bf11f93703d7db41c0dbf9c32ba65` 继续，集成分支为 `slo/recovery-20261002`。10 月 3 日最新核对，goal 工具已返回 `active`，实际工作通过 Tailscale 继续。
+2026 年 10 月 2 日，用户要求在充分理解原目标、现状和连续失败经验后形成方案，并已要求创建、启动和恢复 goal。本方案从 `62b92fb1473bf11f93703d7db41c0dbf9c32ba65` 继续，集成分支为 `slo/recovery-20261002`。10 月 4 日最新核对，goal 工具已返回 `active`，实际工作通过 Tailscale 继续。
 
 当前仍未交付完整的 SLO 自动闭环版本。首先验证原预算下的覆盖和规划可行性，再完成正常入口的自动闭环，随后进行双后端、完整性能和发布验收。每一步都必须产出可复现的行为证据；局部测试、成本快照数量和源码规模不作为完成度。
+
+G25 的有限计划生产接线已完成本地检查：fmt、workspace all-target check（36.25s）、workspace all-target test、Clippy `-A warnings`（48.51s）、Metal all-target check（37.92s）均退出0。按229个顶层 Rust harness 排除子进程重复汇总为 **7937 pass / 0 fail / 111 ignored**；其中 engine **1572/0/7 ignored、104.41s**，包含本轮全部校准与普通采用回归。Criterion smoke 不作性能结论。CUDA编译、当前源码的优化构建2ms探针及双后端正常run/serve与SLO比较尚待执行，正式验收仍为0/224。[全仓审计](/private/tmp/ferrum-slo-recovery-20261002/g25-workspace-test-audit-r1.json)、[本轮状态](/private/tmp/ferrum-slo-recovery-20261002/g25-status.json)
 
 最终容量目标继续沿用[原算法设计中的 C*](slo-algorithm-design.zh.md)：固定请求到达与长度分布族、模型质量、硬件和资源，在完整完成请求的合法策略中，寻找同时满足 TTFT、TPOT、可见文本 ITL、成功率及队列稳定条件的最高可持续请求到达率。实际 successful output tokens/s、原请求级联合达标以及本文件声明的最新配对门槛另行验收；到达率与输出吞吐分别计量。有限窗口只提供持续容量证据，不证明所有策略中的全局最优或无限时间的队列稳定。自动校准、成本模型、有限规划和干预都是实现该目标的手段。
 
@@ -150,6 +152,12 @@ G24 改为核查预先冻结的有限采样序列，保留原 Source8 自动数�
 后续接线按一个完整改动验证：`ProbeInputOpportunityBudget`/`SelectedBatch` 显式区分周期与有限计划，有限计划分别保存代表集合、完整 occurrence 顺序和逐阶段证明；不能伪装成 `cycles=1` 或套周期的单一 anchor span 门。`layout`/`checked`/`series`/`manifest` 按真实 occurrence 数冻结并重算全部工作，每次重复重新绑定 cohort ordinal/native authority。cold fallback 对同一序列重新计算 offered 区间及阶段证明，不能复用 native 账或退款已花 setup。原 Source8 三个 driver pass 仍只是身份分区。先完成 Rust 有限序列费用核算，再一起验证冻结及 native 身份、cold 容量拒绝、父子计划并存内存、真实 Source8 多 host 早晚阶段转换/同 cohort 跨阶段排除/独立 replay，以及原普通采用联动；这些 CPU 门完成前不进入实机性能矩阵。两入口共用 automatic startup builder，保持 `run` 与 `serve` 一致。
 
 G24 改动仅为显式 test-only `finite_flow` 离线核算与上述记录；原周期路径和产品默认未改。新增边界测试 **2/0**，覆盖可变 offer 数、同 cohort 多成员、跨阶段排除、缺少末尾余量和错误 family filler；完整 selection **72/0/1 ignored**。真实输入审计 **1/0、2.07s**，fmt、diff 与 workspace all-target check通过（check29.85s）。本轮未运行全仓测试、Clippy、Metal/CUDA 编译、2ms或硬件推理/性能，不把条件机会证明写成实际数值资格。正式验收仍为 **0/224**。
+
+G25 已将有限序列接入共享 automatic startup 的选择、冻结、来源分段、manifest 和 cold fallback。`SelectedInputPlan` 显式区分周期与有限计划，保留原代表、完整 occurrence、逐阶段 cut 证明和全部 setup/restore 工作；有限计划没有伪造周期数。仅对原成员下限适用的 physical-envelope 合同启用，新增存储不能获准时保留原周期路径。cold fallback 对原完整顺序重新证明，不追加采样或退回已花 setup；新证明与旧 manifest 并存计费。两入口继续共用这些生产函数。
+
+首轮完整校准回归为 **370/11 fail/3 ignored**，暴露真实覆盖回归：单来源有限费用下降，反而使旧同策略合并不满足“合并 token-work 不高于独立来源之和”的条件，四来源上限挤掉 GreedyLength 的 rows2 Prefill，普通请求得到 WrongDomain。修正先按原周期费用完成几何顺序、scope 和合并，再用原三账及来源上限稳定保留原已预约来源，最后原位替换为三账均不增加的有限序列。新增合并继续保护已有可排来源，且不能改变原数值 scope；没有第二次几何分析、退款或新门槛。原普通请求用例随后恢复通过，防止早期新便宜来源挤掉原后续预约的独立测试也通过。
+
+冻结 CUDA 输入已改用同一生产 finite core 复算，仍为 **1465/1598 requests、4862/15424 actions、3403/24576 offer rows、4 sources**，审计 **1/0、1.90s**。该结果仍是原输入条件成立时的预算证明，不证明 live 选择、数值成功或120s完成。新增 CPU 测试实际驱动有限计划，重放原 Source8 各 checkpoint 的独立 F/R/Q、比较已安装模型身份，再验证普通 CLI 请求采用并完整结束；原四项普通采用联动也在第二轮校准测试中通过。第二轮总计 **381/3 fail/3 ignored**，余下失败来自将低内存周期序列与有限序列要求相等、或把新有限最低费用当成旧周期预算。随后保留原覆盖、资格和精确容量拒绝，分别核算两种执行方案，完整 selection 为 **75/0/1 ignored**。有限小预算另保留真实容量缺口，不声称该启发式达到全局覆盖最优。全仓及后端检查尚在继续，本轮没有新的 GPU 推理或 Off/Enforce 性能结果，正式验收仍为 **0/224**。[生产核算](/private/tmp/ferrum-slo-recovery-20261002/g25-production-finite-source-work-r1/source-work-audit.json)、[校准回归第二轮](/private/tmp/ferrum-slo-recovery-20261002/g25-calibration-tests-r2.log)、[选择回归](/private/tmp/ferrum-slo-recovery-20261002/g25-selection-tests-r4.log)
 
 新增 GreedyLength 联动测试 r3 为 **1 pass / 0 fail、11.59s**。真实 fresh Prefill 通过原 time-admission，最终采用的 replay 为 transaction1/replay1，其后续 attempt19/alternative1 对新 FullLogits/PlainTextGreedyV1 child 返回 Known；普通后续实际 Decode 仍提交 GreedyToken。独立 F/R/Q、原 numerical scope、输出与清理断言保留，协议测试沿用原宽松规划时限，不是实机或默认 2ms 性能证据。r1 的四次普通采用成功，但目标 child 只出现在 Search，最终绑定断言失败，不能计通过；r2 因新增维护测试访问 calibration 私有方法而编译失败，没有执行测试。两次失败原日志保留。[r1](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r1.log)、[r2](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r2.log)、[r3](/private/tmp/ferrum-slo-recovery-20261002/g17-greedy-family-joint-r3.log)
 

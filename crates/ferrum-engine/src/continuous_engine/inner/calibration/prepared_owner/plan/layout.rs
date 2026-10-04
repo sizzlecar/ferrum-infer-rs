@@ -1,6 +1,7 @@
 use super::*;
 use prefixes::PrefixPair;
 mod budget;
+pub(super) use budget::finite::FinitePlan;
 mod checked;
 mod inventory;
 mod populations;

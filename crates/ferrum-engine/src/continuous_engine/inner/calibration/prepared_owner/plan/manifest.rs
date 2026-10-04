@@ -89,7 +89,9 @@ pub(super) enum SourcePreparationChoice {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub(super) struct SourceWork {
-    pub planned_cycles: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_cycles: Option<usize>,
+    pub planned_occurrences: usize,
     pub maximum_anchor_span: Option<usize>,
     pub requests: usize,
     pub execution_actions: usize,
@@ -108,6 +110,7 @@ pub(super) fn freeze_source(
     work: SourceWork,
     population: &StructuredServiceDeclarationV7,
     input_opportunities: Option<&ProbeInputOpportunityBudget>,
+    finite_opportunities: Option<&layout::FinitePlan>,
     maximum_bytes: usize,
 ) -> Result<Option<Box<serde_json::value::RawValue>>> {
     #[derive(Serialize)]
@@ -123,6 +126,8 @@ pub(super) fn freeze_source(
         work: SourceWork,
         schedule: &'a ferrum_scheduler::implementations::continuous::cost_model::structured_v2::OwnerBlockScheduleV1,
         input_opportunities: Option<&'a ProbeInputOpportunityBudget>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        finite_opportunities: Option<&'a layout::FinitePlan>,
     }
     let source = Source {
         protocol: "ferrum.automatic-prepared-probe-series-source.v2",
@@ -136,6 +141,7 @@ pub(super) fn freeze_source(
         work,
         schedule: &population.schedule,
         input_opportunities,
+        finite_opportunities,
     };
     // Count without allocating, so a pre-source capacity miss remains typed
     // rather than being confused with an invalid identity/serialization error.

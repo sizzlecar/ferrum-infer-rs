@@ -130,6 +130,10 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
             "same-outcome freeze: retained={retained} duplicate_payload={duplicated_payload} unique_inventory={unique_inventory} seed={seed_bytes} selection_peak={selection_peak} inventory_limit={limit} missing_byte={missing_byte:?}"
         );
         let mut retained_seed = None;
+        let checked_cases = cases.clone();
+        let checked_prompts = inputs.prompts.clone();
+        let checked_chunk = inputs.chunk.get() as usize;
+        let checked_row_ceiling = inputs.prefill_row_ceiling;
         let plan = freeze_inventory(
             &session,
             inputs,
@@ -157,7 +161,66 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
             .batches
             .iter()
             .any(|batch| batch.scheduled && batch.algorithm_universe.is_some());
-        let actual = serde_json::to_value(selected).unwrap();
+        let actual = selected.clone();
+        assert!(actual.retained_payload_bytes().unwrap() <= limit);
+        // Finite allocation can change only the frozen occurrence sequence
+        // and phase barriers. Charge the actual sequence, including source
+        // setup once, through the same original case work contract.
+        let mut totals = [0usize; 3];
+        let mut execution = Vec::new();
+        for batch in &actual.batches {
+            let setup = work::setup_for_indices(&checked_cases, &batch.representative_case_indices)
+                .unwrap();
+            let mut work = [
+                setup.requests,
+                setup.execution_actions,
+                setup.serial_declared_offer_rows,
+                setup.serial_token_work,
+            ];
+            for index in batch.execution_case_indices().unwrap() {
+                let item = work::case_work(
+                    &checked_cases[index],
+                    checked_prompts[checked_cases[index].template],
+                    checked_chunk,
+                    checked_row_ceiling,
+                )
+                .unwrap();
+                for (sum, value) in work.iter_mut().zip([
+                    item.requests,
+                    item.execution_actions,
+                    item.serial_declared_offer_rows,
+                    item.serial_token_work,
+                ]) {
+                    *sum += value;
+                }
+                if batch.scheduled {
+                    execution.push(index);
+                }
+            }
+            assert_eq!(
+                work,
+                [
+                    batch.requests,
+                    batch.serial_wave_upper_bound,
+                    batch.declared_offer_row_bound,
+                    batch.serial_token_work
+                ]
+            );
+            if batch.scheduled {
+                for (total, value) in totals.iter_mut().zip(work) {
+                    *total += value;
+                }
+            }
+        }
+        assert_eq!(execution, actual.execution_case_indices);
+        assert_eq!(
+            totals,
+            [
+                actual.requests,
+                actual.serial_wave_upper_bound,
+                actual.declared_offer_row_bound
+            ]
+        );
         assert_eq!(budget.deadline(), deadline);
         assert_unsubmitted_clean(&session, &executor);
         assert!(session
@@ -186,15 +249,83 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
                     duplicated_payload, 0,
                     "capacity must come from real sharing, not omitted payload accounting"
                 );
-                assert_eq!(actual, *reference.as_ref().unwrap(), "sharing preserves the complete selection, phase floors, branches, widths, work and gaps");
+                let roomy: &selection::CheckedSelection = reference.as_ref().unwrap();
+                assert_eq!(actual.populations.len(), roomy.populations.len());
+                assert_eq!(
+                    serde_json::to_value(&actual.input_geometry).unwrap(),
+                    serde_json::to_value(&roomy.input_geometry).unwrap()
+                );
+                for old in &actual.populations {
+                    let new = roomy
+                        .populations
+                        .iter()
+                        .find(|new| new.key == old.key)
+                        .unwrap();
+                    assert_eq!(
+                        old.representative_case_indices,
+                        new.representative_case_indices
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&old.input_geometry).unwrap(),
+                        serde_json::to_value(&new.input_geometry).unwrap()
+                    );
+                    if old.scheduled {
+                        assert!(
+                            new.scheduled,
+                            "extra finite storage must not evict an original admitted family: {:?}",
+                            old.key
+                        );
+                        let before = &actual.batches[old.batch_index.unwrap()];
+                        let after = &roomy.batches[new.batch_index.unwrap()];
+                        assert_eq!(before.algorithm_universe, after.algorithm_universe);
+                        assert_eq!(before.schedule.min_members, after.schedule.min_members);
+                        for index in &old.representative_case_indices {
+                            let a = before
+                                .representative_case_indices
+                                .iter()
+                                .position(|i| i == index)
+                                .unwrap();
+                            let b = after
+                                .representative_case_indices
+                                .iter()
+                                .position(|i| i == index)
+                                .unwrap();
+                            assert_eq!(
+                                serde_json::to_value(
+                                    before.scoped_opportunities.as_ref().map(|v| &v[a])
+                                )
+                                .unwrap(),
+                                serde_json::to_value(
+                                    after.scoped_opportunities.as_ref().map(|v| &v[b])
+                                )
+                                .unwrap()
+                            );
+                        }
+                    }
+                }
+                for gap in &actual.gaps {
+                    // Work/source capacity may improve. All original input,
+                    // geometry, priority and policy limitations remain visible.
+                    if !matches!(
+                        gap.reason,
+                        selection::SelectionGapReason::RemainingRequests { .. }
+                            | selection::SelectionGapReason::RemainingWaves { .. }
+                            | selection::SelectionGapReason::RemainingOfferRows { .. }
+                            | selection::SelectionGapReason::RetainedSourceCapacity { .. }
+                            | selection::SelectionGapReason::SourceScheduleCapacity
+                            | selection::SelectionGapReason::AnchorAfterEarliestFreeze { .. }
+                    ) {
+                        assert!(roomy
+                            .gaps
+                            .iter()
+                            .any(|candidate| serde_json::to_value(candidate).unwrap()
+                                == serde_json::to_value(gap).unwrap()));
+                    }
+                }
             }
             Some(1) => {
                 assert!(capacity_denied && !scoped);
-                assert!(actual["batches"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|batch| batch["scheduled"] == true));
+                assert!(actual.batches.iter().any(|batch| batch.scheduled));
             }
             _ => unreachable!(),
         }

@@ -58,11 +58,7 @@ impl PreparedProbePlan {
         let mut end = 0usize;
         if let Some(selection) = &self.execution.audit.checked_selection {
             for batch in selection.batches.iter().filter(|batch| batch.scheduled) {
-                let count = batch
-                    .representative_case_indices
-                    .len()
-                    .checked_mul(batch.planned_cycles)
-                    .ok_or_else(|| error("startup source cohort count overflow"))?;
+                let count = batch.execution_case_count()?;
                 let start = end;
                 end = end
                     .checked_add(count)
@@ -292,7 +288,8 @@ impl PreparedProbeSeries {
                     .audit()
                     .input_opportunities
                     .as_ref()
-                    .map_or(0, |v| v.planned_cycles),
+                    .map(|v| v.planned_cycles),
+                planned_occurrences: cohorts.len(),
                 maximum_anchor_span: None,
                 requests: self.plan.audit().planned_requests,
                 execution_actions: self.plan.audit().serial_wave_bound,
@@ -300,8 +297,9 @@ impl PreparedProbeSeries {
                 serial_token_work: None,
             },
             |batch| manifest::SourceWork {
-                planned_cycles: batch.planned_cycles,
-                maximum_anchor_span: Some(batch.maximum_anchor_span),
+                planned_cycles: batch.periodic_cycles(),
+                planned_occurrences: cohorts.len(),
+                maximum_anchor_span: batch.periodic_anchor_span(),
                 requests: batch.requests,
                 execution_actions: batch.serial_wave_upper_bound,
                 declared_offer_row_bound: batch.declared_offer_row_bound,
@@ -322,11 +320,12 @@ impl PreparedProbeSeries {
             },
             work,
             &population,
-            batch.map(|b| &b.input_opportunities).or(self
+            batch.and_then(|b| b.periodic_budget()).or(self
                 .plan
                 .audit()
                 .input_opportunities
                 .as_ref()),
+            batch.and_then(|b| b.finite_plan()),
             payload_limit,
         )?
         .ok_or_else(|| error("startup source manifest retained capacity exhausted"))?;

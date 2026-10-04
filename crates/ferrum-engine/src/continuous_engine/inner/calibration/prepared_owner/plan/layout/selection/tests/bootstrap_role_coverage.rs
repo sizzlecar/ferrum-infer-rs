@@ -185,14 +185,13 @@ fn checked_bootstrap_roles_retain_complete_prefill_and_prepared_decode_sources()
             .iter()
             .find(|batch| batch.representative_case_indices == original.representative_case_indices)
             .unwrap();
-        assert_eq!(actual.planned_cycles, original.planned_cycles);
         assert_eq!(
             serde_json::to_value(&actual.schedule).unwrap(),
             serde_json::to_value(&original.schedule).unwrap()
         );
         assert_eq!(
-            serde_json::to_value(&actual.input_opportunities).unwrap(),
-            serde_json::to_value(&original.input_opportunities).unwrap()
+            serde_json::to_value(&actual.input_plan).unwrap(),
+            serde_json::to_value(&original.input_plan).unwrap()
         );
         let numerical = &population.settings;
         assert_eq!(

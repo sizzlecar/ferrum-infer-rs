@@ -6,6 +6,8 @@ use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
 };
 use populations::{member_groups, CaseOpportunity};
 
+pub(in crate::continuous_engine::inner::calibration) mod finite;
+
 /// A prepared source owns a complete input cycle, unlike an open runtime
 /// traffic stream. Freeze its barriers from that cycle before any execution.
 /// The longest cut-to-anchor span prevents an early phase from omitting an

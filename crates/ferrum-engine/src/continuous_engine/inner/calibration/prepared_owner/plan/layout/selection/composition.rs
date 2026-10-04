@@ -90,7 +90,7 @@ pub(super) fn authorized(
 /// optional scope is added. Invalid raw plans cannot acquire a new source slot.
 pub(super) fn can_schedule(batch: &SelectedBatch, capacity: SelectionCapacity) -> bool {
     batch.schedule_within_capacity
-        && batch.maximum_anchor_span <= *batch.schedule.phase_min_offered.iter().min().unwrap()
+        && batch.anchors_within_schedule()
         && batch.requests <= capacity.requests
         && batch.serial_wave_upper_bound <= capacity.execution_actions
         && batch.declared_offer_row_bound <= capacity.declared_offer_rows
@@ -342,6 +342,7 @@ pub(super) fn scoped_candidate(
     row_ceiling: Option<NonZeroU32>,
     population: &StructuredServiceDeclarationV7,
     seed: &DeclaredAlgorithmUniverseV1,
+    allocation: InputAllocationPolicy,
 ) -> Result<Option<SelectedBatch>> {
     let Some(local) = local_universe(raw, inputs, trajectories, population, seed)? else {
         return Ok(None);
@@ -356,6 +357,7 @@ pub(super) fn scoped_candidate(
         row_ceiling,
         population,
         Some((inputs, &local)),
+        allocation,
     )
     .map(Some)
 }

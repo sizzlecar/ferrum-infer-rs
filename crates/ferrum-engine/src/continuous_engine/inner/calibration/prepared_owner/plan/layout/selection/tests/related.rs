@@ -1,5 +1,72 @@
 use super::*;
 
+pub(super) fn assert_complete_input_plan(batch: &SelectedBatch) {
+    assert!(batch.anchors_within_schedule());
+    let execution = batch.execution_case_indices().unwrap().collect::<Vec<_>>();
+    assert_eq!(execution.len(), batch.execution_case_count().unwrap());
+    assert!(!execution.is_empty());
+    assert!(batch
+        .representative_case_indices
+        .iter()
+        .all(|index| execution.contains(index)));
+    match &batch.input_plan {
+        SelectedInputPlan::Periodic {
+            planned_cycles,
+            input_opportunities,
+            ..
+        } => {
+            assert!(
+                *planned_cycles * input_opportunities.minimum_original_offers_per_completed_cycle
+                    >= input_opportunities.required_original_offers + batch.schedule.block_offered
+            );
+            for phase in 0..3 {
+                assert!(input_opportunities.phase_cycles[phase] > 0);
+                assert!(
+                    input_opportunities.phase_original_offer_bounds[phase]
+                        >= batch.schedule.phase_min_offered[phase]
+                );
+                assert!(
+                    input_opportunities.phase_original_offer_bounds[phase]
+                        >= input_opportunities.maximum_fresh_member_span[phase]
+                );
+            }
+        }
+        SelectedInputPlan::Finite { plan } => {
+            assert_eq!(execution, plan.occurrence_case_indices);
+            assert_eq!(
+                serde_json::to_value(&plan.schedule).unwrap(),
+                serde_json::to_value(&batch.schedule).unwrap()
+            );
+            assert_eq!(plan.work.requests, batch.requests);
+            assert_eq!(plan.work.execution_actions, batch.serial_wave_upper_bound);
+            assert_eq!(
+                plan.work.serial_declared_offer_rows,
+                batch.declared_offer_row_bound
+            );
+            let mut previous = plan.certificate.initial_fit_cut;
+            for (phase, certificate) in plan.certificate.phases.iter().enumerate() {
+                assert_eq!(certificate.start_cut, previous);
+                assert_eq!(
+                    certificate.minimum_members,
+                    batch.schedule.min_members[phase]
+                );
+                assert_eq!(
+                    certificate.phase_min_offered,
+                    batch.schedule.phase_min_offered[phase]
+                );
+                assert!(certificate.start_cut.minimum <= certificate.start_cut.maximum);
+                assert!(certificate.prefix_after_padding.minimum >= certificate.next_cut.maximum);
+                let representatives = &execution[certificate.representatives.clone()];
+                assert!(batch
+                    .representative_case_indices
+                    .iter()
+                    .all(|index| representatives.contains(index)));
+                previous = certificate.next_cut;
+            }
+        }
+    }
+}
+
 fn prefill_input(
     rows: u32,
     prompt: u64,
@@ -234,19 +301,10 @@ fn checked_selection_related_populations_share_one_complete_horizon() {
     assert!(together.gaps.is_empty());
     assert!(batch.requests <= separate.requests * 2);
     assert!(batch.serial_token_work <= separate.batches[0].serial_token_work * 2);
-    assert!(batch.maximum_anchor_span <= batch.schedule.phase_min_offered[0]);
-    assert!(
-        batch.planned_cycles
-            * batch
-                .input_opportunities
-                .minimum_original_offers_per_completed_cycle
-            >= batch.input_opportunities.required_original_offers + batch.schedule.block_offered
-    );
+    assert_complete_input_plan(batch);
     assert_eq!(
         together.execution_case_indices,
-        batch
-            .representative_case_indices
-            .repeat(batch.planned_cycles)
+        batch.execution_case_indices().unwrap().collect::<Vec<_>>()
     );
     // No member, branch or width disappears when related populations share
     // one declared source. The geometry may make separate sources as cheap.
@@ -416,31 +474,16 @@ fn checked_selection_mixed_installed_policies_fit_original_request_budget() {
             .iter()
             .map(|&i| cases[i].waves([1, 2][cases[i].template], 8).unwrap().0)
             .sum();
-        assert_eq!(batch.schedule.block_offered, cycle_waves);
-        assert_eq!(
-            batch.input_opportunities.successful_cycle_wave_upper_bound,
-            cycle_waves
-        );
-        for phase in 0..3 {
-            let phase_offers = batch.input_opportunities.phase_original_offer_bounds[phase];
-            assert_eq!(phase_offers % cycle_waves, 0);
-            assert!(phase_offers >= batch.schedule.phase_min_offered[phase]);
-            assert!(phase_offers >= batch.input_opportunities.maximum_fresh_member_span[phase]);
-            assert!(batch.maximum_anchor_span <= batch.schedule.phase_min_offered[phase]);
+        assert_complete_input_plan(batch);
+        if let Some(periodic) = batch.periodic_budget() {
+            assert_eq!(batch.schedule.block_offered, cycle_waves);
+            assert_eq!(periodic.successful_cycle_wave_upper_bound, cycle_waves);
+            assert!(periodic
+                .phase_original_offer_bounds
+                .iter()
+                .all(|offers| offers % cycle_waves == 0));
         }
-        // Include the final block-closing cycle; every source must complete
-        // all of its independently frozen phases before publication.
-        assert!(
-            batch.planned_cycles
-                * batch
-                    .input_opportunities
-                    .minimum_original_offers_per_completed_cycle
-                >= batch.input_opportunities.required_original_offers
-                    + batch.schedule.block_offered
-        );
-        let expected_execution = batch
-            .representative_case_indices
-            .repeat(batch.planned_cycles);
+        let expected_execution = batch.execution_case_indices().unwrap().collect::<Vec<_>>();
         let execution_end = execution_offset + expected_execution.len();
         assert_eq!(
             &result.execution_case_indices[execution_offset..execution_end],

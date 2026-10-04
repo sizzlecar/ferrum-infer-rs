@@ -1,4 +1,5 @@
-//! Conditional finite-offer certificate, not a Source8 execution or a cycle.
+//! Conditional capture replay through the production finite planner. Captured
+//! identities/floors remain diagnostic inputs, not live checked authority.
 use super::*;
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -99,6 +100,8 @@ impl Flow {
     }
 }
 
+// Small independent offer model used only by the exhaustive tests below.
+// Real captured sources are evaluated by budget::finite::build instead.
 fn construct(
     representatives: &[Vec<usize>],
     fillers: &[usize],
@@ -224,82 +227,69 @@ pub(super) fn evaluate(
     available: SelectionCapacity,
     source_limit: usize,
 ) -> AuditResult<Value> {
-    let lookup = |index: usize| -> AuditResult<work::CaseWork> {
-        let case = capture
-            .cases
-            .get(index)
-            .context("finite case outside capture")?;
-        let prompt = *capture
-            .prompts
-            .get(case.template)
-            .context("finite prompt absent")?;
-        Ok(work::case_work(
-            case,
-            prompt,
-            capture.chunk,
-            capture.row_ceiling,
-        )?)
-    };
     let mut sources = Vec::new();
     let mut total = Charges::default();
     let mut all_schedules_fit = true;
     for group in groups {
-        let mut representatives = Vec::new();
-        let mut fillers = Vec::new();
-        let mut padding: Option<(usize, work::CaseWork)> = None;
-        for member in group {
-            // Reuse the exact existing floor checks and filler cost tuple.
-            let expanded = expand_cycle(
-                &member.key,
-                &member.cases,
-                add(member.cases.len(), 1)?,
-                &capture.cases,
-                opportunities,
-                &capture.prompts,
-                capture.chunk,
-                capture.row_ceiling,
-            )?;
-            fillers.push(*expanded.last().context("finite filler absent")?);
-            representatives.push(member.cases.clone());
-            for &index in &member.cases {
-                let value = lookup(index)?;
-                ensure!(value.declared_offers_minimum > 0, "padding minimum is zero");
-                if match padding {
-                    None => true,
-                    Some((old_i, old)) => padding_precedes(index, value, old_i, old)?,
-                } {
-                    padding = Some((index, value));
-                }
-            }
-        }
-        let padding = padding.context("finite padding absent")?.0;
-        let original = &group[0].declaration;
+        let original = &group
+            .first()
+            .context("finite source group is empty")?
+            .declaration;
+        let representatives: Vec<_> = group.iter().map(|member| member.cases.clone()).collect();
+        let representative_count = representatives
+            .iter()
+            .try_fold(0, |count, cases| add(count, cases.len()))?;
+        // This authorizes the offline calculation's storage only. It does not
+        // substitute for selection's actual remaining retained-memory budget.
+        let diagnostic_storage_bound =
+            budget::finite::storage_bound(group.len(), representative_count)?;
         let settings = &original.settings;
-        let members = [
-            add(settings.max_rank, settings.min_fit_redundancy)?.max(settings.min_phase_samples),
-            settings.min_phase_samples,
-            settings.min_phase_samples,
-        ];
-        let flow = construct(&representatives, &fillers, padding, members, &lookup)?;
-        let minima = std::array::from_fn(|i| flow.phases[i].phase_min_offered);
-        let mut schedule = OwnerBlockScheduleV1::new(1, minima, members)
-            .map_err(|reason| error(format!("finite schedule: {reason:?}")))?;
-        schedule.prediction_validity = original.schedule.prediction_validity;
+        let mut plan = match budget::finite::build(
+            &representatives,
+            opportunities,
+            &capture.cases,
+            &capture.prompts,
+            capture.chunk,
+            capture.row_ceiling,
+            settings,
+            diagnostic_storage_bound,
+        )? {
+            budget::finite::FiniteVerification::Ready(plan) => plan,
+            budget::finite::FiniteVerification::Skip(reason) => {
+                anyhow::bail!("production finite planner rejected captured source: {reason:?}")
+            }
+        };
+        ensure!(
+            plan.representatives == representatives
+                && plan.family_keys.len() == group.len()
+                && plan
+                    .family_keys
+                    .iter()
+                    .zip(group)
+                    .all(|(key, original)| key == &original.key),
+            "production finite plan changed original representative/family identity"
+        );
+        plan.schedule.prediction_validity = original.schedule.prediction_validity;
         let mut numerical = settings.clone();
-        numerical.max_phase_samples = *schedule.maximum_phase_members.iter().max().unwrap();
-        let validation = schedule.validate(&numerical);
+        numerical.max_phase_samples = *plan.schedule.maximum_phase_members.iter().max().unwrap();
+        let validation = plan.schedule.validate(&numerical);
         all_schedules_fit &= validation.is_ok();
-        let setup_work = work::setup_for_indices(&capture.cases, &flow.occurrence_case_indices)?;
+        let setup_work = work::setup_for_indices(&capture.cases, &plan.occurrence_case_indices)?;
         let mut setup = Charges::default();
         setup.charge(setup_work)?;
-        let mut charges = Charges::default();
-        charges.accumulate(&flow.work)?;
-        charges.accumulate(&setup)?;
+        // Production work already includes setup; never add it a second time.
+        let charges = Charges {
+            requests: plan.work.requests,
+            execution_actions: plan.work.execution_actions,
+            declared_offer_rows: plan.work.serial_declared_offer_rows,
+            serial_token_work: plan.work.serial_token_work,
+        };
         total.accumulate(&charges)?;
         sources.push(json!({"original_population_indices":group.iter().map(|p|p.original_index).collect::<Vec<_>>(),
             "independent_exact_families":group.iter().map(|p|&p.key).collect::<Vec<_>>(),
-            "geometry_representatives":representatives,"filler_case_indices":fillers,"padding_case_index":padding,
-            "flow":flow,"schedule":schedule,"derived_max_phase_samples":numerical.max_phase_samples,
+            "geometry_representatives":representatives,"filler_case_indices":plan.filler_case_indices,"padding_case_index":plan.padding_case_index,
+            "production_plan":plan,"schedule":plan.schedule,"derived_max_phase_samples":numerical.max_phase_samples,
+            "diagnostic_storage_bound":diagnostic_storage_bound,"plan_retained_payload_bytes":plan.retained_payload_bytes(),
             "schedule_within_capacity":validation.is_ok(),"schedule_error":validation.err().map(|e|format!("{e:?}")),
             "setup":setup,"totals":charges}));
     }
@@ -311,14 +301,15 @@ pub(super) fn evaluate(
         all_schedules_fit,
     ];
     Ok(
-        json!({"kind":"onlyconditional_finite_offer_certificate","sources":sources,"totals":total,
+        json!({"kind":"onlyconditional_finite_offer_certificate","calculation":"production_budget_finite_v1","sources":sources,"totals":total,
         "source_count":groups.len(),"available":{"requests":available.requests,"execution_actions":available.execution_actions,
             "declared_offer_rows":available.declared_offer_rows,"sources":source_limit},
         "fit_checks":{"requests":checks[0],"execution_actions":checks[1],"declared_offer_rows":checks[2],
             "source_count":checks[3],"schedule":checks[4]},"declared_work_and_source_count_fit":checks.into_iter().all(|v|v),
         "limits":["Conditional on original floor-1 cohorts completing and every numerical phase succeeding; no failed-owner restart is financed.",
+            "The production finite core is exercised with captured diagnostic identities/floors, not newly checked recipes or live authority.",
             "Finite offered-cut certificate only: no periodic fresh_span, SelectedBatch or fictitious cycles are used.",
-            "Original raw recipes, live scope closure, unrecorded current branch flags and retained-memory admission remain unverified.",
+            "Original raw recipes, live scope closure, unrecorded current branch flags and actual selection retained-memory admission remain unverified; diagnostic storage is separately authorized.",
             "Actual Source8 serialization, independent F/R/Q, cold fallback, expiry/120-second execution and ordinary adoption remain unverified."]}),
     )
 }

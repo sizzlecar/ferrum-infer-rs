@@ -48,11 +48,11 @@ fn checked_row_ceiling_preserves_width_and_charges_complete_source_schedule() {
                 61 * case.width + case.maximum_output.get() - 1
             })
             .sum();
-        assert_eq!(
-            batch.input_opportunities.successful_cycle_wave_upper_bound,
-            cycle
-        );
-        assert_eq!(batch.schedule.block_offered, cycle);
+        related::assert_complete_input_plan(batch);
+        if let Some(periodic) = batch.periodic_budget() {
+            assert_eq!(periodic.successful_cycle_wave_upper_bound, cycle);
+            assert_eq!(batch.schedule.block_offered, cycle);
+        }
         assert!(batch
             .schedule
             .min_members
@@ -197,9 +197,7 @@ fn checked_policy_complete_work_precedes_no_token_risk_for_retention_and_executi
     assert_eq!(retained.batches.len(), complete.batches.len());
     assert_eq!(
         retained.execution_case_indices,
-        first
-            .representative_case_indices
-            .repeat(first.planned_cycles)
+        first.execution_case_indices().unwrap().collect::<Vec<_>>()
     );
     assert_eq!(retained.requests, first.requests);
     assert_eq!(
@@ -211,7 +209,10 @@ fn checked_policy_complete_work_precedes_no_token_risk_for_retention_and_executi
             actual.representative_case_indices,
             original.representative_case_indices
         );
-        assert_eq!(actual.planned_cycles, original.planned_cycles);
+        assert_eq!(
+            serde_json::to_value(&actual.input_plan).unwrap(),
+            serde_json::to_value(&original.input_plan).unwrap()
+        );
         assert_eq!(
             serde_json::to_value(&actual.schedule).unwrap(),
             serde_json::to_value(&original.schedule).unwrap()
@@ -226,12 +227,7 @@ fn checked_policy_complete_work_precedes_no_token_risk_for_retention_and_executi
         gap.reason,
         SelectionGapReason::RetainedSourceCapacity { maximum_sources: 1 }
     )));
-    assert!(first
-        .input_opportunities
-        .phase_original_offer_bounds
-        .iter()
-        .zip(first.schedule.phase_min_offered)
-        .all(|(actual, minimum)| *actual >= minimum));
+    related::assert_complete_input_plan(first);
 }
 
 #[test]
@@ -340,7 +336,10 @@ fn checked_policy_priority_retained_source_limit_keeps_complete_required_origins
                 actual.representative_case_indices,
                 expected.representative_case_indices
             );
-            assert_eq!(actual.planned_cycles, expected.planned_cycles);
+            assert_eq!(
+                serde_json::to_value(&actual.input_plan).unwrap(),
+                serde_json::to_value(&expected.input_plan).unwrap()
+            );
             assert_eq!(
                 serde_json::to_value(&actual.schedule).unwrap(),
                 serde_json::to_value(&expected.schedule).unwrap()
@@ -351,8 +350,9 @@ fn checked_policy_priority_retained_source_limit_keeps_complete_required_origins
                 waves += expected.serial_wave_upper_bound;
                 expected_execution.extend(
                     expected
-                        .representative_case_indices
-                        .repeat(expected.planned_cycles),
+                        .execution_case_indices()
+                        .unwrap()
+                        .collect::<Vec<_>>(),
                 );
             } else {
                 for &member in &actual.population_indices {
@@ -409,38 +409,157 @@ fn checked_policy_priority_reserves_original_budget_for_configured_complete_sour
         10_000_000,
     );
     assert!(required.populations.iter().all(|p| p.scheduled));
-    let expected: Vec<_> = required
-        .execution_case_indices
+    // This contract reserves the original periodic complete-source budget.
+    // The isolated generous selector may now use a shorter finite stream;
+    // recompute the control through the original planner, not changed costs.
+    let periodic = required
+        .batches
         .iter()
-        .map(|i| i + 8)
-        .collect();
-    for (requests, waves, by_requests) in [
-        (required.requests, 10_000_000, true),
-        (100_000, required.serial_wave_upper_bound, false),
-    ] {
+        .filter(|batch| batch.scheduled)
+        .map(|batch| {
+            assert!(batch.algorithm_universe.is_none());
+            batch_plan(
+                &batch.population_indices,
+                &required.populations,
+                &cases[8..],
+                &opportunities[8..],
+                &[1, 2],
+                8,
+                None,
+                &population,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let original_requests = periodic.iter().map(|batch| batch.requests).sum::<usize>();
+    let original_waves = periodic
+        .iter()
+        .map(|batch| batch.serial_wave_upper_bound)
+        .sum::<usize>();
+    for (requests, waves) in [(original_requests, 10_000_000), (100_000, original_waves)] {
         let result = select_all(&cases, &opportunities, &facts, &population, requests, waves);
         assert_eq!(result.populations.len(), 4);
-        assert_eq!(result.execution_case_indices, expected);
-        assert!(result.requests <= requests && result.serial_wave_upper_bound <= waves);
-        for group in &result.populations {
-            let configured = group
+        assert!(
+            result.requests <= requests
+                && result.serial_wave_upper_bound <= waves
+                && result.declared_offer_row_bound <= waves
+        );
+        for expected in &required.populations {
+            let actual = result
+                .populations
+                .iter()
+                .find(|group| group.key == expected.key)
+                .unwrap();
+            assert!(actual.scheduled, "original complete Configured owner lost");
+            assert_eq!(
+                actual.representative_case_indices,
+                expected
+                    .representative_case_indices
+                    .iter()
+                    .map(|index| index + 8)
+                    .collect::<Vec<_>>()
+            );
+            let batch = &result.batches[actual.batch_index.unwrap()];
+            let control = periodic
+                .iter()
+                .find(|batch| {
+                    batch.population_indices.contains(
+                        &required
+                            .populations
+                            .iter()
+                            .position(|group| group.key == expected.key)
+                            .unwrap(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(batch.algorithm_universe, control.algorithm_universe);
+            assert_eq!(batch.schedule.min_members, control.schedule.min_members);
+            related::assert_complete_input_plan(batch);
+        }
+        // Savings may admit auxiliary sources, after the complete Configured
+        // prefix. They need not reproduce the original occurrence stream.
+        let mut auxiliary_seen = false;
+        for batch in result.batches.iter().filter(|batch| batch.scheduled) {
+            let configured = batch
                 .representative_case_indices
                 .iter()
                 .all(|&i| cases[i].preset == Configured);
-            assert_eq!(group.scheduled, configured);
-            if !configured {
-                assert!(result
-                    .gaps
-                    .iter()
-                    .any(|gap| gap.population.as_ref() == Some(&group.key)
-                        && if by_requests {
-                            matches!(gap.reason, SelectionGapReason::RemainingRequests { .. })
-                        } else {
-                            matches!(gap.reason, SelectionGapReason::RemainingWaves { .. })
-                        }));
-            }
+            assert!(!configured || !auxiliary_seen);
+            auxiliary_seen |= !configured;
         }
+        finite_policy::assert_work(&result, &cases, &[1, 2], 8);
     }
+
+    // The smaller isolated finite price is a separate capacity boundary.
+    // It does not authorize evicting an already affordable auxiliary owner
+    // from the full inventory in pursuit of a different global optimum.
+    assert!(required.requests < original_requests);
+    let tight_requests = required.requests;
+    let groups = member_groups(&opportunities).unwrap();
+    let original_peak =
+        super::super::memory::plan(&groups, &opportunities, &facts, tight_requests, None)
+            .unwrap()
+            .required_peak_bytes;
+    let baseline = select(
+        &cases,
+        &opportunities,
+        &facts,
+        &[1, 2],
+        8,
+        &population,
+        tight_requests,
+        10_000_000,
+        original_peak,
+    )
+    .unwrap();
+    assert!(baseline
+        .batches
+        .iter()
+        .all(|batch| batch.periodic_budget().is_some()));
+    let tight = select_all(
+        &cases,
+        &opportunities,
+        &facts,
+        &population,
+        tight_requests,
+        10_000_000,
+    );
+    finite_policy::assert_preserves_coverage(&baseline, &tight);
+    finite_policy::assert_work(&baseline, &cases, &[1, 2], 8);
+    finite_policy::assert_work(&tight, &cases, &[1, 2], 8);
+    assert!(
+        tight.requests <= tight_requests
+            && tight.serial_wave_upper_bound <= 10_000_000
+            && tight.declared_offer_row_bound <= 10_000_000
+    );
+    let narrow_width = cases
+        .iter()
+        .filter(|case| case.preset == Configured)
+        .map(|case| case.width)
+        .min()
+        .unwrap();
+    let wider = baseline
+        .populations
+        .iter()
+        .find(|group| {
+            !group.scheduled
+                && group
+                    .representative_case_indices
+                    .iter()
+                    .all(|&i| cases[i].preset == Configured && cases[i].width > narrow_width)
+        })
+        .unwrap();
+    let wider_after = tight
+        .populations
+        .iter()
+        .find(|group| group.key == wider.key)
+        .unwrap();
+    assert!(
+        !wider_after.scheduled,
+        "this tight boundary has no proven all-Configured plan"
+    );
+    assert!(tight.gaps.iter().any(|gap| gap.population.as_ref() == Some(&wider.key)
+        && matches!(gap.reason, SelectionGapReason::RemainingRequests { required, remaining } if required > remaining)));
     assert_eq!(serde_json::to_value(&cases).unwrap(), original);
 }
 
