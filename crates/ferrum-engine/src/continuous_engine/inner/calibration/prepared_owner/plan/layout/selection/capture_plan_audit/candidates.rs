@@ -1,7 +1,13 @@
-//! Explicit offline experiments. Every candidate uses the same production
-//! batch work calculation; no candidate changes product defaults or signs a source.
+//! Explicit offline experiments. Periodic candidates use production batch
+//! accounting; finite candidates use original per-case/setup work only.
+//! Neither changes product defaults nor signs a source.
 use super::*;
 use serde::Serialize;
+mod finite_flow;
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +33,8 @@ enum CycleOrder {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Options {
+    #[serde(default, skip_serializing_if = "is_false")]
+    finite_flow: bool,
     #[serde(default)]
     geometry_plan: GeometryPlan,
     schedule: SchedulePlan,
@@ -661,16 +669,19 @@ pub(super) fn evaluate(
             "fit_checks":{"requests":requests_fit,"execution_actions":actions_fit,"declared_offer_rows":rows_fit,"source_count":sources_fit,"schedule_and_anchors":schedule_fits},
             "declared_work_and_source_count_fit": requests_fit && actions_fit && rows_fit && sources_fit && schedule_fits}));
     }
-    Ok(
-        json!({"options":options,"geometry":geometry,"original_scheduled_and_explicit_required_populations_preserved":true,
+    let mut report = json!({"options":options,"geometry":geometry,"original_scheduled_and_explicit_required_populations_preserved":true,
         "variants":variants,
         "limits":["Compatible metadata only: no original raw recipe closure, selector priority or live packing authority is reconstructed.",
             "Each filler occurrence is a newly declared cohort. It retains the original floor and identity; setup is deduplicated only by the production acquisition key.",
             "Source8 block closure, serialized bytes, retained memory, actual F/R/Q, 120-second runtime and ordinary adoption are not measured.",
             "Cold fallback currently rebuilds the original complete-cycle schedule and is not validated by these candidate costs.",
             "Subset mode preserves historical branch witnesses and certifies current subset span; it does not revalidate unrecorded per-row branch flags, old catalog support or full C8 coverage.",
-            "The original full-geometry, complete-cycle independent plans remain above as the unchanged control."]}),
-    )
+            "The original full-geometry, complete-cycle independent plans remain above as the unchanged control."]});
+    if options.finite_flow {
+        report["finite_flow"] =
+            finite_flow::evaluate(capture, &groups, &opportunities, available, source_limit)?;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
