@@ -229,7 +229,7 @@ pub(in crate::continuous_engine::inner::calibration) enum SelectedInputPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum InputAllocationPolicy {
     PeriodicOnly,
-    FinitePreferred,
+    FinitePreferred { maximum_requests: usize },
 }
 
 fn finite_membership_supported(population: &StructuredServiceDeclarationV7) -> bool {
@@ -834,13 +834,17 @@ fn select_prepared_inputs(
             "checked selection peak retained payload exceeds remaining budget: required_peak_bytes={peak} remaining_bytes={maximum_retained_bytes} key_mentions={key_mentions} guaranteed_cases={guaranteed_cases}"
         )));
     }
-    let finite_extra = memory::finite_extra_peak(&groups)?;
+    // Every finite occurrence consumes at least one request. Use the same
+    // remaining request allowance for memory authorization and construction.
+    let finite_extra = memory::finite_extra_peak(&groups, capacity.requests)?;
     let allocation = if finite_membership_supported(population)
         && peak
             .checked_add(finite_extra)
             .is_some_and(|total| total <= maximum_retained_bytes)
     {
-        InputAllocationPolicy::FinitePreferred
+        InputAllocationPolicy::FinitePreferred {
+            maximum_requests: capacity.requests,
+        }
     } else {
         InputAllocationPolicy::PeriodicOnly
     };
@@ -1100,7 +1104,7 @@ fn select_prepared_inputs(
     // original geometry order, local scopes and periodic packing first. Then
     // replace each complete source in place without increasing any work ledger.
     // No second geometry pass or additional full selection is retained.
-    if allocation == InputAllocationPolicy::FinitePreferred {
+    if matches!(allocation, InputAllocationPolicy::FinitePreferred { .. }) {
         preserve_periodic_reservations(
             &mut batch_candidates,
             capacity,
@@ -1572,8 +1576,10 @@ fn batch_plan_with_scope(
         scope,
         budget::startup_schedule,
     )?;
-    if allocation == InputAllocationPolicy::PeriodicOnly || !finite_membership_supported(population)
-    {
+    let InputAllocationPolicy::FinitePreferred { maximum_requests } = allocation else {
+        return Ok(periodic);
+    };
+    if !finite_membership_supported(population) {
         return Ok(periodic);
     }
     let indices = &periodic.representative_case_indices;
@@ -1619,7 +1625,8 @@ fn batch_plan_with_scope(
         work_for,
         work::setup_for_indices(cases, indices)?,
         &population.settings,
-        budget::finite::storage_bound(families.len(), indices.len())?,
+        maximum_requests,
+        budget::finite::storage_bound(families.len(), indices.len(), maximum_requests)?,
     )?;
     let budget::finite::FiniteVerification::Ready(mut plan) = finite else {
         return Ok(periodic);

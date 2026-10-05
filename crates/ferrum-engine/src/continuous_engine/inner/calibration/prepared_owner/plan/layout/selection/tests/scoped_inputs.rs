@@ -351,7 +351,9 @@ fn scope_first_experiment_preserves_original_recipes_and_independent_host_floors
         None,
         &population,
         Some((&view.inputs, view.scopes[0].as_ref().unwrap())),
-        InputAllocationPolicy::FinitePreferred,
+        InputAllocationPolicy::FinitePreferred {
+            maximum_requests: 2048,
+        },
     )
     .unwrap();
     eprintln!(

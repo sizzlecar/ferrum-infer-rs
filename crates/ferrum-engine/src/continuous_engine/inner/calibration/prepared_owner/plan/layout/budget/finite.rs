@@ -125,17 +125,27 @@ pub(in crate::continuous_engine::inner::calibration) enum FiniteVerification {
 }
 
 /// Conservative simultaneous storage for one result and its construction:
-/// the fixed plan header, exact group/key/filler metadata, and the original
-/// maximum finite occurrence count. Keys contain no heap payload. The filler
+/// the fixed plan header, exact group/key/filler metadata, and the request-bounded
+/// occurrence count. Every checked cohort spends at least one request, including
+/// filler and padding occurrences. Keys contain no heap payload. The filler
 /// vector is moved into the result, so it is not charged twice.
 pub(in crate::continuous_engine::inner::calibration) fn storage_bound(
     families: usize,
     representatives: usize,
+    maximum_requests: usize,
 ) -> Result<usize> {
     if families == 0 && representatives == 0 {
         return Ok(0);
     }
-    storage_for(families, representatives, MAX_COHORTS)
+    storage_for(
+        families,
+        representatives,
+        occurrence_limit(maximum_requests),
+    )
+}
+
+fn occurrence_limit(maximum_requests: usize) -> usize {
+    MAX_COHORTS.min(maximum_requests)
 }
 
 fn storage_for(families: usize, representatives: usize, occurrences: usize) -> Result<usize> {
@@ -160,6 +170,7 @@ pub(in crate::continuous_engine::inner::calibration) fn build(
     chunk: usize,
     row_ceiling: Option<NonZeroU32>,
     settings: &StructuredSettingsV2,
+    maximum_requests: usize,
     maximum_retained_bytes: usize,
 ) -> Result<FiniteVerification> {
     // Every representative occurs in the stream, and every filler/padding is
@@ -203,6 +214,7 @@ pub(in crate::continuous_engine::inner::calibration) fn build(
         },
         setup,
         settings,
+        maximum_requests,
         maximum_retained_bytes,
     )
 }
@@ -213,12 +225,16 @@ pub(in crate::continuous_engine::inner::calibration) fn build_with_view<'a>(
     work_for: impl Fn(usize) -> Result<work::CaseWork>,
     setup: work::CaseWork,
     settings: &StructuredSettingsV2,
+    maximum_requests: usize,
     maximum_retained_bytes: usize,
 ) -> Result<FiniteVerification> {
     let count = validate_families(families, &opportunity_for, None)?;
     let Some(count) = count else {
         return Ok(FiniteVerification::Skip(FiniteRejection::ScheduleCapacity));
     };
+    // This only bounds construction storage. Setup and multi-request cohorts
+    // still contribute their full work to the caller's source admission.
+    let maximum_occurrences = occurrence_limit(maximum_requests);
     // Before any allocation, authorize all fixed metadata. The dry pass uses
     // only stack certificates and the bounded filler vector.
     if storage_for(families.len(), count, 0)? > maximum_retained_bytes {
@@ -251,7 +267,16 @@ pub(in crate::continuous_engine::inner::calibration) fn build_with_view<'a>(
     }
     let padding = padding.ok_or_else(|| error("finite source is empty"))?.0;
     let members = member_floors(settings)?;
-    let dry = traverse(families, &fillers, padding, members, &work_for, None, None)?;
+    let dry = traverse(
+        families,
+        &fillers,
+        padding,
+        members,
+        &work_for,
+        maximum_occurrences,
+        None,
+        None,
+    )?;
     let Some(dry) = dry else {
         return Ok(FiniteVerification::Skip(FiniteRejection::ScheduleCapacity));
     };
@@ -268,6 +293,7 @@ pub(in crate::continuous_engine::inner::calibration) fn build_with_view<'a>(
         padding,
         members,
         &work_for,
+        maximum_occurrences,
         None,
         Some(&mut indices),
     )?;
@@ -338,6 +364,7 @@ pub(in crate::continuous_engine::inner::calibration) fn verify_frozen<'a>(
         original.padding_case_index,
         members,
         &work_for,
+        MAX_COHORTS,
         Some(original),
         None,
     )?;
@@ -452,6 +479,7 @@ struct Traversal {
 
 struct Stream<'a> {
     state: Traversal,
+    maximum_occurrences: usize,
     frozen: Option<&'a FinitePlan>,
     output: Option<&'a mut Vec<usize>>,
 }
@@ -475,7 +503,7 @@ impl Stream<'_> {
         let value = checked_work(index, lookup)?;
         self.state.work.charge(value)?;
         self.state.len = add(self.state.len, 1)?;
-        if self.state.len > MAX_COHORTS
+        if self.state.len > self.maximum_occurrences
             || value.requests > 4096
             || self.state.work.requests > MAX_SLOTS
             || self.state.work.serial_declared_offer_rows > MAX_SLOTS
@@ -507,7 +535,7 @@ impl Stream<'_> {
                     .div_ceil(checked_work(index, lookup)?.declared_offers_minimum),
             )?,
         };
-        if end > MAX_COHORTS {
+        if end > self.maximum_occurrences {
             return Ok(false);
         }
         while self.state.len < end {
@@ -525,11 +553,13 @@ fn traverse(
     padding: usize,
     members: [usize; 3],
     lookup: &impl Fn(usize) -> Result<work::CaseWork>,
+    maximum_occurrences: usize,
     frozen: Option<&FinitePlan>,
     output: Option<&mut Vec<usize>>,
 ) -> Result<Option<Traversal>> {
     let mut stream = Stream {
         state: Traversal::default(),
+        maximum_occurrences,
         frozen,
         output,
     };

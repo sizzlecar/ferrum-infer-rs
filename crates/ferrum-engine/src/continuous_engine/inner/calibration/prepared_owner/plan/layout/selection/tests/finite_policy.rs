@@ -207,8 +207,10 @@ fn finite_policy_extra_heap_keeps_original_admitted_geometry_and_work() {
         memory.retained_groups_bytes + tight.retained_payload_bytes().unwrap()
             <= memory.required_peak_bytes
     );
+    let finite_peak = memory.required_peak_bytes
+        + super::super::memory::finite_extra_peak(&groups, capacity.requests).unwrap();
     let mut generous_work = StructuredInputGeometryWorkV1::new(limit);
-    let generous = run(usize::MAX, &mut generous_work).unwrap();
+    let generous = run(finite_peak, &mut generous_work).unwrap();
     assert!(
         generous
             .batches
@@ -224,6 +226,23 @@ fn finite_policy_extra_heap_keeps_original_admitted_geometry_and_work() {
     assert_eq!(tight_work.visits(), generous_work.visits());
     assert_work(&tight, &cases, &[61], 8);
     assert_work(&generous, &cases, &[61], 8);
+    assert!(generous.requests <= tight.requests);
+    assert!(generous.serial_wave_upper_bound <= tight.serial_wave_upper_bound);
+    assert!(generous.declared_offer_row_bound <= tight.declared_offer_row_bound);
+    // Refusing the extra finite storage must retain the original admitted
+    // geometry and execution work, rather than fail the complete selection.
+    let mut below_work = StructuredInputGeometryWorkV1::new(limit);
+    let below = run(finite_peak - 1, &mut below_work).unwrap();
+    assert!(below.batches.iter().all(|b| b.finite_plan().is_none()));
+    assert_preserves_coverage(&tight, &below);
+    assert_work(&below, &cases, &[61], 8);
+    assert_eq!(below.requests, tight.requests);
+    assert_eq!(below.serial_wave_upper_bound, tight.serial_wave_upper_bound);
+    assert_eq!(
+        below.declared_offer_row_bound,
+        tight.declared_offer_row_bound
+    );
+    assert_eq!(below_work.visits(), tight_work.visits());
     let mut denied_work = StructuredInputGeometryWorkV1::new(limit);
     assert!(run(memory.required_peak_bytes - 1, &mut denied_work).is_err());
     assert_eq!(denied_work.visits(), 0);

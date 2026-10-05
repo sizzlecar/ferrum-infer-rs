@@ -405,15 +405,14 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
                 memory.guaranteed_groups,
             )
             .unwrap();
-        // This bound describes the original prepared raw view. The public
-        // entrypoint can now admit a different, smaller projected view first;
-        // its bound is checked separately below. Keep the original core's
-        // gap-backing and one-byte rejection contract exact.
-        let run = |maximum, work: &mut StructuredInputGeometryWorkV1| {
+        // Compare the original and extended declarations at the same cap.
+        // A larger cap may now authorize a finite schedule; allocation changes
+        // must not be confused with storage added by uncaptured declarations.
+        let run = |count, maximum, work: &mut StructuredInputGeometryWorkV1| {
             select_prepared_inputs(
-                &cases,
-                &opportunities,
-                &facts,
+                &cases[..count],
+                &opportunities[..count],
+                &facts[..count],
                 &[61, 61],
                 8,
                 None,
@@ -430,11 +429,7 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
             )
         };
         let mut expected_work = StructuredInputGeometryWorkV1::new(work_limit);
-        let expected = run(
-            declared_peak + memory.required_peak_bytes,
-            &mut expected_work,
-        )
-        .unwrap();
+        let expected = run(original_len, tight, &mut expected_work).unwrap();
         assert!(expected
             .gaps
             .iter()
@@ -482,7 +477,7 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
         eprintln!("composition gap backing: original_declarations={original_len} extended_declarations={} guaranteed_groups={} original_peak={tight} extended_peak={declared_peak} actual_gaps={} gap_capacity={}",
             cases.len(), memory.guaranteed_groups, expected.gaps.len(), expected.gaps.capacity());
         let mut actual_work = StructuredInputGeometryWorkV1::new(work_limit);
-        let actual = run(tight, &mut actual_work)
+        let actual = run(cases.len(), tight, &mut actual_work)
             .expect("unchanged live gap backing must fit its original authorization");
         assert_eq!(serde_json::to_value(&actual).unwrap(), serde_json::to_value(&expected).unwrap(),
             "complete representatives, scopes, schedules, all gaps and all work ledgers survive the tight cap");
@@ -503,8 +498,42 @@ fn local_composition_unknown_declarations_share_the_original_gap_backing() {
                 actual.declared_offer_row_bound
             ]
         );
+        let finite_extra =
+            super::super::memory::finite_extra_peak(&groups, capacity.requests).unwrap();
+        assert_eq!(
+            finite_extra,
+            super::super::memory::finite_extra_peak(&original_groups, capacity.requests).unwrap()
+        );
+        let finite_peak = tight + finite_extra;
+        let mut original_finite_work = StructuredInputGeometryWorkV1::new(work_limit);
+        let original_finite = run(original_len, finite_peak, &mut original_finite_work).unwrap();
+        let mut extended_finite_work = StructuredInputGeometryWorkV1::new(work_limit);
+        let extended_finite = run(cases.len(), finite_peak, &mut extended_finite_work).unwrap();
+        assert_eq!(
+            serde_json::to_value(&original_finite).unwrap(),
+            serde_json::to_value(&extended_finite).unwrap(),
+            "uncaptured declarations cannot change any finite source, gap or work ledger"
+        );
+        if capacity.requests != 0 {
+            assert!(extended_finite
+                .batches
+                .iter()
+                .any(|b| b.finite_plan().is_some()));
+        }
+        assert_eq!(original_finite_work.visits(), extended_finite_work.visits());
+        assert_eq!(actual_work.visits(), extended_finite_work.visits());
+        assert!(
+            memory.retained_groups_bytes + extended_finite.retained_payload_bytes().unwrap()
+                <= finite_peak
+        );
+        finite_policy::assert_preserves_coverage(&actual, &extended_finite);
+        finite_policy::assert_work(&actual, &cases, &[61, 61], 8);
+        finite_policy::assert_work(&extended_finite, &cases, &[61, 61], 8);
+        assert!(extended_finite.requests <= actual.requests);
+        assert!(extended_finite.serial_wave_upper_bound <= actual.serial_wave_upper_bound);
+        assert!(extended_finite.declared_offer_row_bound <= actual.declared_offer_row_bound);
         let mut rejected_work = StructuredInputGeometryWorkV1::new(work_limit);
-        assert!(run(tight - 1, &mut rejected_work).is_err());
+        assert!(run(cases.len(), tight - 1, &mut rejected_work).is_err());
         assert_eq!(
             rejected_work.visits(),
             0,

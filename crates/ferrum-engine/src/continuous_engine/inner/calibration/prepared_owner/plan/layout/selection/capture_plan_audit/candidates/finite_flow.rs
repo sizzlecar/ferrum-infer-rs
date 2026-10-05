@@ -242,7 +242,7 @@ pub(super) fn evaluate(
         // This authorizes the offline calculation's storage only. It does not
         // substitute for selection's actual remaining retained-memory budget.
         let diagnostic_storage_bound =
-            budget::finite::storage_bound(group.len(), representative_count)?;
+            budget::finite::storage_bound(group.len(), representative_count, available.requests)?;
         let settings = &original.settings;
         let mut plan = match budget::finite::build(
             &representatives,
@@ -252,6 +252,7 @@ pub(super) fn evaluate(
             capture.chunk,
             capture.row_ceiling,
             settings,
+            available.requests,
             diagnostic_storage_bound,
         )? {
             budget::finite::FiniteVerification::Ready(plan) => plan,

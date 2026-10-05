@@ -190,14 +190,20 @@ pub(super) fn plan(
 /// combined plans can also coexist while a scoped replacement is considered.
 /// If this entire additional peak cannot be authorized, selection retains the
 /// original periodic allocation throughout, before building any finite plan.
-pub(super) fn finite_extra_peak(groups: &[PopulationMemberGroup]) -> Result<usize> {
+pub(super) fn finite_extra_peak(
+    groups: &[PopulationMemberGroup],
+    maximum_requests: usize,
+) -> Result<usize> {
     let (mut bytes, mut families, mut representatives) = (0, 0, 0);
     for group in groups
         .iter()
         .filter(|g| !g.guaranteed_case_indices.is_empty())
     {
         let count = group.guaranteed_case_indices.len();
-        bytes = add(bytes, budget::finite::storage_bound(1, count)?)?;
+        bytes = add(
+            bytes,
+            budget::finite::storage_bound(1, count, maximum_requests)?,
+        )?;
         families = add(families, 1)?;
         representatives = add(representatives, count)?;
     }
@@ -206,6 +212,9 @@ pub(super) fn finite_extra_peak(groups: &[PopulationMemberGroup]) -> Result<usiz
     }
     add(
         bytes,
-        mul(budget::finite::storage_bound(families, representatives)?, 2)?,
+        mul(
+            budget::finite::storage_bound(families, representatives, maximum_requests)?,
+            2,
+        )?,
     )
 }

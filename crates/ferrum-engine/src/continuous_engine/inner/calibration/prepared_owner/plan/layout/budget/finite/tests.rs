@@ -57,6 +57,7 @@ fn plan(opportunities: &[CaseOpportunity]) -> FinitePlan {
         },
         &settings,
         usize::MAX,
+        usize::MAX,
     )
     .unwrap() else {
         panic!("finite fixture was not admitted");
@@ -160,7 +161,7 @@ fn finite_plan_proves_original_anchors_for_variable_multi_member_cohorts() {
         plan.work.serial_token_work,
         2 * plan.occurrence_case_indices.len() + 4
     );
-    assert!(plan.retained_payload_bytes().unwrap() <= storage_bound(2, 3).unwrap());
+    assert!(plan.retained_payload_bytes().unwrap() <= storage_bound(2, 3, usize::MAX).unwrap());
     serde_json::to_vec(&plan).unwrap();
 }
 
@@ -243,6 +244,7 @@ fn finite_capacity_and_ambiguous_opportunities_cannot_gain_authority() {
             variable_work,
             work::CaseWork::default(),
             &settings,
+            usize::MAX,
             limit,
         )
     };
@@ -273,14 +275,78 @@ fn finite_capacity_and_ambiguous_opportunities_cannot_gain_authority() {
             },
             work::CaseWork::default(),
             &settings,
+            usize::MAX,
             usize::MAX
         )
         .unwrap(),
         FiniteVerification::Skip(FiniteRejection::ScheduleCapacity)
     ));
-    assert!(storage_bound(usize::MAX, 1).is_err());
+    assert!(storage_bound(usize::MAX, 1, usize::MAX).is_err());
     let mut big = variable_work(1).unwrap();
     big.requests = usize::MAX;
     big.declared_offers_minimum = 2;
     assert!(padding_precedes(0, big, 1, big).is_err());
+}
+
+#[test]
+fn finite_request_bound_preserves_exact_stream_and_rejects_one_fewer_occurrence() {
+    let opportunities = opportunities();
+    let settings = StructuredSettingsV2::default();
+    let build = |maximum_requests, maximum_retained_bytes| {
+        build_with_view(
+            &[vec![0, 1], vec![2]],
+            |i| Ok(&opportunities[i]),
+            variable_work,
+            work::CaseWork::default(),
+            &settings,
+            maximum_requests,
+            maximum_retained_bytes,
+        )
+        .unwrap()
+    };
+    let FiniteVerification::Ready(original) = build(usize::MAX, usize::MAX) else {
+        panic!("original finite stream must be provable");
+    };
+    let count = original.occurrence_case_indices.len();
+    assert_eq!(original.work.requests, count);
+    assert!(original
+        .certificate
+        .phases
+        .iter()
+        .any(|phase| !phase.padding.is_empty()));
+    let bound = storage_bound(2, 3, count).unwrap();
+    assert!(bound < storage_bound(2, 3, usize::MAX).unwrap());
+    let FiniteVerification::Ready(bounded) = build(count, bound) else {
+        panic!("the actual request and storage bounds must retain the full stream");
+    };
+    assert_eq!(
+        bounded.occurrence_case_indices,
+        original.occurrence_case_indices
+    );
+    assert_eq!(bounded.representatives, original.representatives);
+    assert_eq!(bounded.family_keys, original.family_keys);
+    assert_eq!(bounded.filler_case_indices, original.filler_case_indices);
+    assert_eq!(bounded.padding_case_index, original.padding_case_index);
+    assert_eq!(bounded.certificate, original.certificate);
+    assert_eq!(bounded.schedule, original.schedule);
+    assert_eq!(bounded.work, original.work);
+    assert!(bounded.retained_payload_bytes().unwrap() <= bound);
+    for choices in 0..64 {
+        assert!(completes(&bounded, choices, false));
+    }
+    // Bytes remain generous: this rejects the frozen opportunity horizon,
+    // not a smaller memory allowance or a weakened independent phase floor.
+    assert!(matches!(
+        build(count - 1, usize::MAX),
+        FiniteVerification::Skip(FiniteRejection::ScheduleCapacity)
+    ));
+    assert!(matches!(
+        build(0, usize::MAX),
+        FiniteVerification::Skip(FiniteRejection::ScheduleCapacity)
+    ));
+    assert_eq!(
+        storage_bound(2, 3, usize::MAX).unwrap(),
+        storage_bound(2, 3, MAX_COHORTS).unwrap(),
+        "the request allowance cannot enlarge the original wire horizon"
+    );
 }

@@ -145,7 +145,9 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             None,
             &population,
             None,
-            InputAllocationPolicy::FinitePreferred,
+            InputAllocationPolicy::FinitePreferred {
+                maximum_requests: usize::MAX,
+            },
         )
         .unwrap();
         let packed = batch_plan_with_scope(
@@ -158,7 +160,9 @@ fn checked_decode_journal_keeps_distinct_host_families_within_complete_source_ca
             None,
             &population,
             None,
-            InputAllocationPolicy::FinitePreferred,
+            InputAllocationPolicy::FinitePreferred {
+                maximum_requests: usize::MAX,
+            },
         )
         .unwrap();
         let independent = member_groups(&opportunities[1..]).unwrap();
@@ -1495,7 +1499,9 @@ fn local_scope_rejects_different_real_installed_host_policies() {
         None,
         &population,
         &seed,
-        InputAllocationPolicy::FinitePreferred
+        InputAllocationPolicy::FinitePreferred {
+            maximum_requests: usize::MAX,
+        }
     )
     .unwrap()
     .is_none());

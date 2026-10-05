@@ -704,6 +704,7 @@ mod tests {
             None,
             &population.settings,
             usize::MAX,
+            usize::MAX,
         )
         .unwrap() else {
             panic!("original native finite fixture must be provable");
