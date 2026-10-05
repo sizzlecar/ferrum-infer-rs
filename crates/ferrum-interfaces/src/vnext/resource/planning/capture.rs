@@ -4,7 +4,67 @@ use crate::vnext::resource::sequence::{
     SequenceSessionSlotState,
 };
 
+enum ResourcePlanningRead {
+    Captured(ResourcePlanningView),
+    Compared(bool),
+}
+
 impl<R: DeviceRuntime> PlanRuntimeResources<R> {
+    /// Re-read under the original complete lock bracket, comparing physical
+    /// inventories in place. A match is numeric evidence, never Step authority.
+    pub fn revalidate_resource_planning_view(
+        self: &Arc<Self>,
+        sessions: &[&SequenceSession<R>],
+        previous: &ResourcePlanningView,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ResourcePlanningAvailability<bool> {
+        match self.compare_resource_planning_view(sessions, None, previous, budget) {
+            Ok(equal) => ResourcePlanningAvailability::Known(equal),
+            Err(reason) => ResourcePlanningAvailability::Unknown(reason),
+        }
+    }
+
+    pub fn revalidate_resource_planning_view_on_lane(
+        self: &Arc<Self>,
+        sessions: &[&SequenceSession<R>],
+        lane: &ExecutionLane<R>,
+        previous: &ResourcePlanningView,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ResourcePlanningAvailability<bool> {
+        if !Arc::ptr_eq(&self.runtime, lane.runtime_arc()) {
+            return ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::StaleIdentity);
+        }
+        match lane.try_with_resource_planning_lane(|epoch, _| {
+            self.compare_resource_planning_view(
+                sessions,
+                Some((lane.id(), epoch)),
+                previous,
+                budget,
+            )
+        }) {
+            Ok(equal) => ResourcePlanningAvailability::Known(equal),
+            Err(reason) => ResourcePlanningAvailability::Unknown(reason),
+        }
+    }
+
+    fn compare_resource_planning_view(
+        &self,
+        sessions: &[&SequenceSession<R>],
+        lane: Option<(ExecutionLaneId, u64)>,
+        previous: &ResourcePlanningView,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<bool, ResourcePlanningUnknown> {
+        match self.read_resource_planning_view(
+            sessions,
+            lane,
+            previous.limits,
+            budget,
+            Some(previous),
+        )? {
+            ResourcePlanningRead::Compared(equal) => Ok(equal),
+            ResourcePlanningRead::Captured(_) => unreachable!("comparison requested"),
+        }
+    }
     /// Samples existing admitted sessions without pinning their backing. Every
     /// acquired lock is nonblocking; all guards outlive the numeric copy and
     /// drop before returning. No maintenance, admission or allocation occurs.
@@ -73,6 +133,20 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         limits: ResourcePlanningLimits,
         poll_budget: &mut dyn ResourcePlanningBudget,
     ) -> Result<ResourcePlanningView, ResourcePlanningUnknown> {
+        match self.read_resource_planning_view(sessions, lane, limits, poll_budget, None)? {
+            ResourcePlanningRead::Captured(view) => Ok(view),
+            ResourcePlanningRead::Compared(_) => unreachable!("capture requested"),
+        }
+    }
+
+    fn read_resource_planning_view(
+        &self,
+        sessions: &[&SequenceSession<R>],
+        lane: Option<(ExecutionLaneId, u64)>,
+        limits: ResourcePlanningLimits,
+        poll_budget: &mut dyn ResourcePlanningBudget,
+        previous: Option<&ResourcePlanningView>,
+    ) -> Result<ResourcePlanningRead, ResourcePlanningUnknown> {
         use ResourcePlanningReadStage as Stage;
         use ResourcePlanningUnknown as U;
         poll_budget.diagnostic_checkpoint("resource_capture_validation_begin");
@@ -109,14 +183,25 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         }
         let _lifecycle = self.try_read_planning_lifecycle()?;
         poll_budget.diagnostic_checkpoint("resource_capture_static_ranges_begin");
-        let mut physical_ranges = physical_ranges::capture_static(self, limits, poll_budget)?;
+        let mut physical_ranges = physical_ranges::read_static(
+            self,
+            limits,
+            poll_budget,
+            previous.is_some(),
+            previous.and_then(|v| v.physical_ranges.as_ref()),
+        )?;
         poll_budget.diagnostic_checkpoint("resource_capture_sessions_begin");
         let mut slots = Vec::with_capacity(sessions.len());
         let mut backings = Vec::with_capacity(sessions.len());
         let mut participants = Vec::with_capacity(sessions.len());
-        let mut sequence_ranges = Vec::with_capacity(sessions.len());
+        let mut sequence_ranges = Vec::with_capacity(if previous.is_some() {
+            0
+        } else {
+            sessions.len()
+        });
         let mut sequence_segments = 0_usize;
-        for session in sessions {
+        let mut equal = previous.is_none_or(|v| v.sequence_ranges.len() == sessions.len());
+        for (index, session) in sessions.iter().enumerate() {
             poll(poll_budget)?;
             if session.resources().coordinator_id() != pools.logical_admission.id()
                 || participants.iter().any(|p: &ResourcePlanningParticipant| {
@@ -182,16 +267,26 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             if backing.committed_pages() != 0 {
                 return Err(U::Unsupported);
             }
-            sequence_ranges.push(if physical_ranges.is_some() {
-                sequence_ranges::capture(
-                    backing.backing_slices(),
-                    limits.maximum_free_extents,
-                    &mut sequence_segments,
-                    poll_budget,
-                )?
-            } else {
-                Arc::new(BTreeMap::new())
-            });
+            if physical_ranges.is_some() {
+                if let Some(previous) = previous {
+                    equal &= sequence_ranges::matches(
+                        backing.backing_slices(),
+                        previous.sequence_ranges.get(index),
+                        limits.maximum_free_extents,
+                        &mut sequence_segments,
+                        poll_budget,
+                    )?;
+                } else {
+                    sequence_ranges.push(sequence_ranges::capture(
+                        backing.backing_slices(),
+                        limits.maximum_free_extents,
+                        &mut sequence_segments,
+                        poll_budget,
+                    )?);
+                }
+            } else if previous.is_none() {
+                sequence_ranges.push(Arc::new(BTreeMap::new()));
+            }
             let mut restore_zero_initializations_pending = true;
             let pending_zero_initializations = pending_zero_initializations(
                 BatchParticipantAuthority::new(
@@ -257,15 +352,28 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 // even on a runtime without provider cost-buffer ranges.
                 // Ordinary address proofs remain absent on that runtime.
                 if physical_ranges.is_none() && logical.checkpoint_retention().is_some() {
-                    for (range, backing) in sequence_ranges.iter_mut().zip(&backings) {
+                    for (index, backing) in backings.iter().enumerate() {
                         poll(poll_budget)?;
-                        *range = sequence_ranges::capture(
-                            backing.current.backing_slices(),
-                            limits.maximum_free_extents,
-                            &mut sequence_segments,
-                            poll_budget,
-                        )?;
+                        if let Some(previous) = previous {
+                            equal &= sequence_ranges::matches(
+                                backing.current.backing_slices(),
+                                previous.sequence_ranges.get(index),
+                                limits.maximum_free_extents,
+                                &mut sequence_segments,
+                                poll_budget,
+                            )?;
+                        } else {
+                            sequence_ranges[index] = sequence_ranges::capture(
+                                backing.current.backing_slices(),
+                                limits.maximum_free_extents,
+                                &mut sequence_segments,
+                                poll_budget,
+                            )?;
+                        }
                     }
+                } else if physical_ranges.is_none() {
+                    equal &= previous
+                        .is_none_or(|v| v.sequence_ranges.iter().all(|range| range.is_empty()));
                 }
                 let budget = &pools.budget;
                 let account = budget
@@ -313,8 +421,13 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     );
                 }
                 let mut extent_count = 0_usize;
-                let mut views = Vec::with_capacity(pools.pools.len());
-                for ((id, pool), state) in pools.pools.iter().zip(&guards) {
+                let mut views = Vec::with_capacity(if previous.is_some() {
+                    0
+                } else {
+                    pools.pools.len()
+                });
+                equal &= previous.is_none_or(|v| v.pools.len() == pools.pools.len());
+                for (index, ((id, pool), state)) in pools.pools.iter().zip(&guards).enumerate() {
                     poll(poll_budget)?;
                     if state.poisoned {
                         return Err(U::BusyOrUnavailable);
@@ -344,13 +457,10 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                             };
                             if backing.identity.pool_id() != id
                                 || range.length() != backing.descriptor.size_bytes
-                                || physical
-                                    .chunks
-                                    .insert(backing.identity.clone(), range)
-                                    .is_some()
                             {
                                 return Err(U::InvalidDemand);
                             }
+                            physical.chunks.insert(&backing.identity, range)?;
                         }
                     }
                     extent_count = extent_count
@@ -359,20 +469,52 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     if extent_count > limits.maximum_free_extents {
                         return Err(U::LimitExceeded);
                     }
-                    views.push(PoolReadView {
-                        id: id.clone(),
-                        instance: pool.instance_id,
-                        next_extent_generation: pool.next_extent_generation.load(Ordering::Acquire),
-                        resident_bytes: state.resident_bytes,
-                        // Capture real mutable state once under this same
-                        // nonblocking bracket. Only subsequent private numeric
-                        // successors may share this immutable copy.
-                        allocator: Arc::new(state.allocator.clone()),
-                    });
+                    let next_extent_generation =
+                        pool.next_extent_generation.load(Ordering::Acquire);
+                    if let Some(previous) = previous {
+                        equal &= previous.pools.get(index).is_some_and(|old| {
+                            old.matches_live(
+                                id,
+                                pool.instance_id,
+                                next_extent_generation,
+                                state.resident_bytes,
+                                &state.allocator,
+                            )
+                        });
+                    } else {
+                        views.push(PoolReadView {
+                            id: id.clone(),
+                            instance: pool.instance_id,
+                            next_extent_generation,
+                            resident_bytes: state.resident_bytes,
+                            // Capture real mutable state once under this same
+                            // nonblocking bracket. Only subsequent private numeric
+                            // successors may share this immutable copy.
+                            allocator: Arc::new(state.allocator.clone()),
+                        });
+                    }
                 }
                 poll(poll_budget)?;
                 poll_budget.diagnostic_checkpoint("resource_capture_complete");
-                Ok(ResourcePlanningView {
+                let (captured_physical, physical_equal) = match physical_ranges {
+                    Some(read) => read.finish(),
+                    None => (None, previous.is_none_or(|v| v.physical_ranges.is_none())),
+                };
+                if let Some(previous) = previous {
+                    return Ok(ResourcePlanningRead::Compared(
+                        equal
+                            && physical_equal
+                            && previous.plan_hash == *self.planning_plan_hash()
+                            && previous.coordinator_id == pools.logical_admission.id()
+                            && previous.lane_id == lane.map(|(id, _)| id)
+                            && previous.limits == limits
+                            && previous.logical == logical
+                            && previous.budget == budget_view
+                            && previous.participants == participants
+                            && previous.workspace == workspace,
+                    ));
+                }
+                Ok(ResourcePlanningRead::Captured(ResourcePlanningView {
                     fence: Arc::new(()),
                     plan_hash: self.planning_plan_hash().clone(),
                     coordinator_id: pools.logical_admission.id(),
@@ -383,9 +525,9 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     pools: views,
                     participants,
                     workspace,
-                    physical_ranges,
+                    physical_ranges: captured_physical,
                     sequence_ranges,
-                })
+                }))
             })
             .map_err(|_| U::BusyOrUnavailable)?
             .ok_or(U::ReadUnavailable(Stage::LogicalCapacity))?

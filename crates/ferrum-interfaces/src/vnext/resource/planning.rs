@@ -244,16 +244,35 @@ struct PoolReadView {
 
 impl PartialEq for PoolReadView {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.instance == other.instance
-            && self.next_extent_generation == other.next_extent_generation
-            && self.resident_bytes == other.resident_bytes
-            && self.allocator.free_bytes == other.allocator.free_bytes
-            && self.allocator.by_offset == other.allocator.by_offset
-            && self.allocator.by_size == other.allocator.by_size
+        self.matches_live(
+            &other.id,
+            other.instance,
+            other.next_extent_generation,
+            other.resident_bytes,
+            &other.allocator,
+        )
     }
 }
 impl Eq for PoolReadView {}
+
+impl PoolReadView {
+    fn matches_live(
+        &self,
+        id: &DynamicBackingPoolId,
+        instance: u64,
+        next_extent_generation: u64,
+        resident_bytes: u64,
+        allocator: &FreeExtentIndex,
+    ) -> bool {
+        self.id == *id
+            && self.instance == instance
+            && self.next_extent_generation == next_extent_generation
+            && self.resident_bytes == resident_bytes
+            && self.allocator.free_bytes == allocator.free_bytes
+            && self.allocator.by_offset == allocator.by_offset
+            && self.allocator.by_size == allocator.by_size
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BudgetReadView {

@@ -406,6 +406,13 @@ fn planning_pending_zero_spans_match_real_extent_encoding_and_disappear_after_su
         "unimplemented runtimes do not inherit Metal evidence"
     );
     let initial = capture();
+    assert!(super::planning_tests::known_read(|| {
+        harness.root.revalidate_resource_planning_view(
+            &[harness.session.as_ref()],
+            &initial,
+            &mut || true,
+        )
+    }));
     let lengths = initial
         .pending_zero_transfer_bytes(&[0], &mut || true)
         .unwrap()
@@ -431,6 +438,13 @@ fn planning_pending_zero_spans_match_real_extent_encoding_and_disappear_after_su
     prepared.finish(true).unwrap();
     drop(prepared);
     drop(guard);
+    assert!(!super::planning_tests::known_read(|| {
+        harness.root.revalidate_resource_planning_view(
+            &[harness.session.as_ref()],
+            &initial,
+            &mut || true,
+        )
+    }));
     assert_eq!(
         capture()
             .pending_zero_transfer_bytes(&[0], &mut || true)

@@ -9,6 +9,102 @@ pub(super) struct PhysicalRanges {
     pub(super) chunks: BTreeMap<BackingChunkIdentity, DeviceCostBufferRange>,
 }
 
+/// Capture and comparison use the same live reads. Comparison retains only
+/// borrowed lookup metadata, not another copy of the physical range maps.
+pub(super) struct PhysicalRangeRead<'a> {
+    static_ranges: RangeMapRead<'a, ResourceId, (u64, DeviceCostBufferRange)>,
+    pub(super) chunks: RangeMapRead<'a, BackingChunkIdentity, DeviceCostBufferRange>,
+}
+
+pub(super) enum RangeMapRead<'a, K, V> {
+    Capture(BTreeMap<K, V>),
+    Compare {
+        entries: Vec<(&'a K, &'a V, bool)>,
+        // Changed inputs still detect duplicate keys with the same error as
+        // capture. This remains empty on a matching revalidation.
+        additional: BTreeSet<K>,
+        count: usize,
+        equal: bool,
+    },
+}
+
+impl<'a, K: Ord + Clone, V: PartialEq> RangeMapRead<'a, K, V> {
+    fn new(compare: bool, expected: Option<&'a BTreeMap<K, V>>) -> Self {
+        if compare {
+            Self::Compare {
+                entries: expected
+                    .into_iter()
+                    .flat_map(|map| map.iter().map(|(k, v)| (k, v, false)))
+                    .collect(),
+                additional: BTreeSet::new(),
+                count: 0,
+                equal: expected.is_some(),
+            }
+        } else {
+            Self::Capture(BTreeMap::new())
+        }
+    }
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Capture(map) => map.len(),
+            Self::Compare { count, .. } => *count,
+        }
+    }
+    pub(super) fn insert(&mut self, key: &K, value: V) -> Result<(), ResourcePlanningUnknown> {
+        let duplicate = match self {
+            Self::Capture(map) => map.insert(key.clone(), value).is_some(),
+            Self::Compare {
+                entries,
+                additional,
+                count,
+                equal,
+            } => {
+                *count += 1;
+                match entries.binary_search_by(|(k, _, _)| (*k).cmp(key)) {
+                    Ok(index) => {
+                        let (_, prior, seen) = &mut entries[index];
+                        *equal &= **prior == value;
+                        std::mem::replace(seen, true)
+                    }
+                    Err(_) => {
+                        *equal = false;
+                        !additional.insert(key.clone())
+                    }
+                }
+            }
+        };
+        if duplicate {
+            Err(ResourcePlanningUnknown::InvalidDemand)
+        } else {
+            Ok(())
+        }
+    }
+    fn finish(self) -> (Option<BTreeMap<K, V>>, bool) {
+        match self {
+            Self::Capture(map) => (Some(map), true),
+            Self::Compare { entries, equal, .. } => {
+                (None, equal && entries.iter().all(|(_, _, seen)| *seen))
+            }
+        }
+    }
+}
+
+impl PhysicalRangeRead<'_> {
+    pub(super) fn finish(self) -> (Option<PhysicalRanges>, bool) {
+        let (static_ranges, static_equal) = self.static_ranges.finish();
+        let (chunks, chunks_equal) = self.chunks.finish();
+        (
+            static_ranges
+                .zip(chunks)
+                .map(|(static_ranges, chunks)| PhysicalRanges {
+                    static_ranges: Arc::new(static_ranges),
+                    chunks,
+                }),
+            static_equal && chunks_equal,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResourceCostRangeProof {
     static_ranges: Arc<BTreeMap<ResourceId, (u64, DeviceCostBufferRange)>>,
@@ -57,16 +153,18 @@ impl ResourceCostRangeProof {
     }
 }
 
-pub(super) fn capture_static<R: DeviceRuntime>(
+pub(super) fn read_static<'a, R: DeviceRuntime>(
     resources: &PlanRuntimeResources<R>,
     limits: ResourcePlanningLimits,
     budget: &mut dyn ResourcePlanningBudget,
-) -> Result<Option<PhysicalRanges>, ResourcePlanningUnknown> {
+    compare: bool,
+    expected: Option<&'a PhysicalRanges>,
+) -> Result<Option<PhysicalRangeRead<'a>>, ResourcePlanningUnknown> {
     use ResourcePlanningUnknown as U;
     if !resources.runtime.supports_cost_buffer_ranges() {
         return Ok(None);
     }
-    let mut ranges = BTreeMap::new();
+    let mut ranges = RangeMapRead::new(compare, expected.map(|v| v.static_ranges.as_ref()));
     if let PlanRuntimeStatic::Static(source) = &resources.static_resources {
         let lease = source.lease.as_ref().ok_or(U::StaleIdentity)?;
         if source.finalized || lease.slots.len() > limits.maximum_descriptors {
@@ -95,17 +193,12 @@ pub(super) fn capture_static<R: DeviceRuntime>(
             if range.length() != descriptor.size_bytes {
                 return Err(U::InvalidDemand);
             }
-            if ranges
-                .insert(entry.resource_id().clone(), (entry.generation(), range))
-                .is_some()
-            {
-                return Err(U::InvalidDemand);
-            }
+            ranges.insert(entry.resource_id(), (entry.generation(), range))?;
         }
     }
-    Ok(Some(PhysicalRanges {
-        static_ranges: Arc::new(ranges),
-        chunks: BTreeMap::new(),
+    Ok(Some(PhysicalRangeRead {
+        static_ranges: ranges,
+        chunks: RangeMapRead::new(compare, expected.map(|v| &v.chunks)),
     }))
 }
 
@@ -219,6 +312,40 @@ impl PhysicalRanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_revalidation_detects_changes_and_still_rejects_duplicate_live_keys() {
+        let a = ResourceId::new("resident.a").unwrap();
+        let b = ResourceId::new("resident.b").unwrap();
+        let range = DeviceCostBufferRange::new(4096, 256).unwrap();
+        let changed = DeviceCostBufferRange::new(8192, 256).unwrap();
+        let old = BTreeMap::from([(a.clone(), range)]);
+        let mut exact = RangeMapRead::new(true, Some(&old));
+        exact.insert(&a, range).unwrap();
+        let (copied, equal) = exact.finish();
+        assert!(copied.is_none());
+        assert!(equal);
+        for entries in [
+            vec![],
+            vec![(&a, changed)],
+            vec![(&b, range)],
+            vec![(&a, range), (&b, range)],
+        ] {
+            let mut current = RangeMapRead::new(true, Some(&old));
+            for (key, value) in entries {
+                current.insert(key, value).unwrap();
+            }
+            assert!(!current.finish().1);
+        }
+        for key in [&a, &b] {
+            let mut current = RangeMapRead::new(true, Some(&old));
+            current.insert(key, range).unwrap();
+            assert_eq!(
+                current.insert(key, range),
+                Err(ResourcePlanningUnknown::InvalidDemand)
+            );
+        }
+    }
     fn resource(value: &str) -> ResourceId {
         ResourceId::new(value).unwrap()
     }

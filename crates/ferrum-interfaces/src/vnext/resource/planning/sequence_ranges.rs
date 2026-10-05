@@ -13,8 +13,87 @@ pub(super) fn capture(
     visited: &mut usize,
     budget: &mut dyn ResourcePlanningBudget,
 ) -> Result<Arc<BTreeMap<ResourceId, Arc<Vec<BackingSegment>>>>, ResourcePlanningUnknown> {
-    use ResourcePlanningUnknown as U;
     let mut result: BTreeMap<ResourceId, Arc<Vec<BackingSegment>>> = BTreeMap::new();
+    visit_slices(slices, budget, |resource, segments, length, budget| {
+        append(
+            &mut result,
+            resource,
+            segments,
+            0,
+            length,
+            maximum,
+            visited,
+            budget,
+        )
+    })?;
+    Ok(Arc::new(result))
+}
+
+/// Compare every current physical segment in the original logical order. The
+/// only scratch is one borrowed cursor per resource; no segment or resource
+/// identity is cloned, and the original lease validation is still performed.
+pub(super) fn matches(
+    slices: &[LogicalBackingSliceAuthority],
+    expected: Option<&Arc<BTreeMap<ResourceId, Arc<Vec<BackingSegment>>>>>,
+    maximum: usize,
+    visited: &mut usize,
+    budget: &mut dyn ResourcePlanningBudget,
+) -> Result<bool, ResourcePlanningUnknown> {
+    let mut cursors: Vec<_> = expected
+        .into_iter()
+        .flat_map(|map| {
+            map.iter()
+                .map(|(id, segments)| (id, segments.as_slice(), 0))
+        })
+        .collect();
+    let mut equal = expected.is_some();
+    visit_slices(
+        slices,
+        budget,
+        |resource, current_segments, length, budget| {
+            let cursor = cursors.binary_search_by(|(id, _, _)| (*id).cmp(resource));
+            visit_segments(
+                current_segments,
+                0,
+                length,
+                maximum,
+                visited,
+                budget,
+                |chunk, offset, length| {
+                    match cursor {
+                        Ok(index) => {
+                            let (_, segments, position) = &mut cursors[index];
+                            equal &= segments.get(*position).is_some_and(|segment| {
+                                segment.chunk() == chunk
+                                    && segment.offset_bytes() == offset
+                                    && segment.length_bytes() == length
+                            });
+                            *position += 1;
+                        }
+                        Err(_) => equal = false,
+                    }
+                    Ok(())
+                },
+            )
+        },
+    )?;
+    Ok(equal
+        && cursors
+            .iter()
+            .all(|(_, segments, position)| *position == segments.len()))
+}
+
+fn visit_slices(
+    slices: &[LogicalBackingSliceAuthority],
+    budget: &mut dyn ResourcePlanningBudget,
+    mut emit: impl FnMut(
+        &ResourceId,
+        &[BackingSegment],
+        u64,
+        &mut dyn ResourcePlanningBudget,
+    ) -> Result<(), ResourcePlanningUnknown>,
+) -> Result<(), ResourcePlanningUnknown> {
+    use ResourcePlanningUnknown as U;
     for slice in slices {
         poll(budget)?;
         let evidence = slice.evidence();
@@ -40,18 +119,14 @@ pub(super) fn capture(
         if !matches {
             return Err(U::InvalidDemand);
         }
-        append(
-            &mut result,
+        emit(
             evidence.resource_id(),
             evidence.segments(),
-            0,
             evidence.capacity_size_bytes(),
-            maximum,
-            visited,
             budget,
         )?;
     }
-    Ok(Arc::new(result))
+    Ok(())
 }
 
 fn append(
@@ -64,13 +139,42 @@ fn append(
     visited: &mut usize,
     budget: &mut dyn ResourcePlanningBudget,
 ) -> Result<(), ResourcePlanningUnknown> {
+    if length == 0 {
+        return Ok(());
+    }
+    let output = Arc::make_mut(target.entry(resource.clone()).or_default());
+    visit_segments(
+        segments,
+        offset,
+        length,
+        maximum,
+        visited,
+        budget,
+        |chunk, offset, length| {
+            output.push(
+                BackingSegment::new(chunk.clone(), offset, length)
+                    .map_err(|_| ResourcePlanningUnknown::InvalidDemand)?,
+            );
+            Ok(())
+        },
+    )
+}
+
+fn visit_segments(
+    segments: &[BackingSegment],
+    offset: u64,
+    length: u64,
+    maximum: usize,
+    visited: &mut usize,
+    budget: &mut dyn ResourcePlanningBudget,
+    mut emit: impl FnMut(&BackingChunkIdentity, u64, u64) -> Result<(), ResourcePlanningUnknown>,
+) -> Result<(), ResourcePlanningUnknown> {
     use ResourcePlanningUnknown as U;
     if length == 0 {
         return Ok(());
     }
     let mut remaining = length;
     let mut skip = offset;
-    let output = Arc::make_mut(target.entry(resource.clone()).or_default());
     for segment in segments {
         poll(budget)?;
         if skip >= segment.length_bytes() {
@@ -82,17 +186,18 @@ fn append(
         if *visited > maximum {
             return Err(U::LimitExceeded);
         }
-        output.push(
-            BackingSegment::new(
-                segment.chunk().clone(),
-                segment
-                    .offset_bytes()
-                    .checked_add(skip)
-                    .ok_or(U::InvalidDemand)?,
-                take,
-            )
-            .map_err(|_| U::InvalidDemand)?,
-        );
+        // BackingSegment fields are private and its constructor checked the
+        // nonzero chunk identity/length and end offset. Here remaining > 0,
+        // skip < length and take <= length - skip: the emitted subrange has
+        // exactly those invariants without cloning and reconstructing it.
+        emit(
+            segment.chunk(),
+            segment
+                .offset_bytes()
+                .checked_add(skip)
+                .ok_or(U::InvalidDemand)?,
+            take,
+        )?;
         remaining -= take;
         skip = 0;
         if remaining == 0 {

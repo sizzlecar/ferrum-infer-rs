@@ -446,6 +446,14 @@ fn planning_workspace_busy_slot_is_not_assumed_released() {
         .try_retire_normal()
         .unwrap();
     let previously_idle = lane_view(&harness.root, &b, &lane);
+    assert!(known_read(|| harness
+        .root
+        .revalidate_resource_planning_view_on_lane(
+            &[&b],
+            &lane,
+            &previously_idle,
+            &mut || true
+        )));
     known(harness.root.project_resource_wave_with_bucket(
         &previously_idle,
         &previously_idle.initial_state(),
@@ -457,6 +465,22 @@ fn planning_workspace_busy_slot_is_not_assumed_released() {
     let held = step(&batch, &lane, 1, Some(&bucket));
     let busy = lane_view(&harness.root, &b, &lane);
     assert!(!previously_idle.same_live_evidence(&busy));
+    assert!(!known_read(|| harness
+        .root
+        .revalidate_resource_planning_view_on_lane(
+            &[&b],
+            &lane,
+            &previously_idle,
+            &mut || true
+        )));
+    assert!(known_read(|| harness
+        .root
+        .revalidate_resource_planning_view_on_lane(
+            &[&b],
+            &lane,
+            &busy,
+            &mut || true
+        )));
     assert!(busy.participants()[0].matches_session_identity(&b));
     assert!(!busy.participants()[0].matches_session_identity(&a));
     assert!(matches!(
@@ -472,6 +496,14 @@ fn planning_workspace_busy_slot_is_not_assumed_released() {
     held.try_retire_normal().unwrap();
     let idle = lane_view(&harness.root, &b, &lane);
     assert!(!busy.same_live_evidence(&idle));
+    assert!(!known_read(|| harness
+        .root
+        .revalidate_resource_planning_view_on_lane(
+            &[&b],
+            &lane,
+            &busy,
+            &mut || true
+        )));
     known(harness.root.project_resource_wave_with_bucket(
         &idle,
         &idle.initial_state(),

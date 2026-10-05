@@ -54,6 +54,46 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Err(reason) => ResourcePlanningAvailability::Unknown(reason),
         }
     }
+
+    pub(super) fn revalidate_resource_planning_view(
+        &self,
+        requests: &[ExecutorResourcePlanningRequest<'_>],
+        previous: &ResourcePlanningView,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ResourcePlanningAvailability<bool> {
+        match revalidate_registry_view(
+            &self.sequences,
+            &self.plan_resources,
+            Some(&self.lane),
+            requests,
+            previous,
+            budget,
+        ) {
+            Ok(value) => value,
+            Err(reason) => ResourcePlanningAvailability::Unknown(reason),
+        }
+    }
+}
+
+fn revalidate_registry_view<R: DeviceRuntime>(
+    sequences: &Mutex<VNextSequenceRegistry<R>>,
+    plan_resources: &Arc<PlanRuntimeResources<R>>,
+    lane: Option<&ExecutionLane<R>>,
+    requests: &[ExecutorResourcePlanningRequest<'_>],
+    previous: &ResourcePlanningView,
+    budget: &mut dyn ResourcePlanningBudget,
+) -> std::result::Result<ResourcePlanningAvailability<bool>, ResourcePlanningUnknown> {
+    with_registry_sequences(
+        sequences,
+        requests,
+        previous.limits(),
+        budget,
+        |_, sessions, budget| match lane {
+            Some(lane) => plan_resources
+                .revalidate_resource_planning_view_on_lane(sessions, lane, previous, budget),
+            None => plan_resources.revalidate_resource_planning_view(sessions, previous, budget),
+        },
+    )
 }
 
 fn capture_registry_view<R: DeviceRuntime>(

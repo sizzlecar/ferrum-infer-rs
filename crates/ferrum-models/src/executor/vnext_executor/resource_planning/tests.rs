@@ -90,6 +90,28 @@ impl RegistryHarness {
         }
     }
 
+    fn revalidate(
+        &self,
+        request: &RequestId,
+        cache_id: Option<&str>,
+        view: &ResourcePlanningView,
+    ) -> ResourcePlanningAvailability<bool> {
+        match revalidate_registry_view(
+            &self.registry,
+            &self.fixture.plan_resources,
+            None,
+            &[ExecutorResourcePlanningRequest {
+                request_id: request,
+                cache_id,
+            }],
+            view,
+            &mut || true,
+        ) {
+            Ok(value) => value,
+            Err(reason) => ResourcePlanningAvailability::Unknown(reason),
+        }
+    }
+
     fn close(self) {
         drop(self.registry);
         drop(self.fixture.registry);
@@ -102,9 +124,7 @@ impl RegistryHarness {
     }
 }
 
-fn known(
-    mut capture: impl FnMut() -> ResourcePlanningAvailability<ResourcePlanningView>,
-) -> ResourcePlanningView {
+fn known<T>(mut capture: impl FnMut() -> ResourcePlanningAvailability<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = BTreeSet::new();
     loop {
@@ -132,8 +152,8 @@ fn known(
     }
 }
 
-fn unknown(
-    mut capture: impl FnMut() -> ResourcePlanningAvailability<ResourcePlanningView>,
+fn unknown<T: std::fmt::Debug>(
+    mut capture: impl FnMut() -> ResourcePlanningAvailability<T>,
     expected: ResourcePlanningUnknown,
 ) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -162,6 +182,11 @@ fn resource_planning_adapter_maps_ready_prefill_then_exact_activated_cache() {
         (trace.allocation_calls, trace.submit_calls)
     };
     let prefill = known(|| harness.capture(&harness.request, None));
+    assert!(known(|| harness.revalidate(
+        &harness.request,
+        None,
+        &prefill
+    )));
     let (slot, sequence) = harness
         .registry
         .lock()
@@ -173,6 +198,10 @@ fn resource_planning_adapter_maps_ready_prefill_then_exact_activated_cache() {
     );
     unknown(
         || harness.capture(&harness.request, None),
+        ResourcePlanningUnknown::BusyOrUnavailable,
+    );
+    unknown(
+        || harness.revalidate(&harness.request, None, &prefill),
         ResourcePlanningUnknown::BusyOrUnavailable,
     );
     harness
@@ -193,6 +222,11 @@ fn resource_planning_adapter_maps_ready_prefill_then_exact_activated_cache() {
         .unwrap();
     harness.registry.lock().activate(&slot, &sequence).unwrap();
     let decode = known(|| harness.capture(&harness.request, Some(&sequence.cache_id)));
+    assert!(known(|| harness.revalidate(
+        &harness.request,
+        Some(&sequence.cache_id),
+        &decode
+    )));
     assert_eq!(
         decode.participants()[0].authority(),
         prefill.participants()[0].authority()
@@ -260,9 +294,18 @@ fn resource_planning_adapter_busy_operation_and_real_frame_are_unknown() {
     );
     drop(operation);
     let before = known(|| harness.capture(&harness.request, None));
+    assert!(known(|| harness.revalidate(
+        &harness.request,
+        None,
+        &before
+    )));
     let registry_guard = harness.registry.lock();
     unknown(
         || harness.capture(&harness.request, None),
+        ResourcePlanningUnknown::ReadUnavailable(ResourcePlanningReadStage::ModelRegistry),
+    );
+    unknown(
+        || harness.revalidate(&harness.request, None, &before),
         ResourcePlanningUnknown::ReadUnavailable(ResourcePlanningReadStage::ModelRegistry),
     );
     drop(registry_guard);
@@ -277,9 +320,19 @@ fn resource_planning_adapter_busy_operation_and_real_frame_are_unknown() {
         || harness.capture(&harness.request, None),
         ResourcePlanningUnknown::BusyOrUnavailable,
     );
+    unknown(
+        || harness.revalidate(&harness.request, None, &before),
+        ResourcePlanningUnknown::BusyOrUnavailable,
+    );
     step.try_retire_normal().unwrap();
     let after = known(|| harness.capture(&harness.request, None));
     assert!(!before.same_live_evidence(&after));
+    assert!(!known(|| harness.revalidate(
+        &harness.request,
+        None,
+        &before
+    )));
+    assert!(known(|| harness.revalidate(&harness.request, None, &after)));
     assert_eq!(
         harness.fixture.runtime_trace.lock().unwrap().submit_calls,
         0
@@ -302,10 +355,66 @@ fn resource_planning_adapter_cancelled_slot_and_retained_view_do_not_pin_resourc
         || harness.capture(&harness.request, None),
         ResourcePlanningUnknown::BusyOrUnavailable,
     );
+    unknown(
+        || harness.revalidate(&harness.request, None, &view),
+        ResourcePlanningUnknown::BusyOrUnavailable,
+    );
     assert!(!sequence.active.load(Ordering::Acquire));
     drop(sequence);
     assert!(weak.upgrade().is_none());
     harness.close();
     assert_eq!(state.projected_waves(), 0);
     assert_eq!(view.participants().len(), 1);
+}
+
+#[test]
+fn resource_planning_revalidation_preserves_registry_limits_and_budget() {
+    let harness = RegistryHarness::new();
+    let request = ExecutorResourcePlanningRequest {
+        request_id: &harness.request,
+        cache_id: None,
+    };
+    let limits = ResourcePlanningLimits {
+        maximum_participants: 1,
+        ..ResourcePlanningLimits::default()
+    };
+    let view = known(|| {
+        capture_registry_view(
+            &harness.registry,
+            &harness.fixture.plan_resources,
+            None,
+            &[request],
+            limits,
+            &mut || true,
+        )
+        .unwrap()
+    });
+    assert!(known(|| harness.revalidate(&harness.request, None, &view)));
+    assert!(matches!(
+        revalidate_registry_view(
+            &harness.registry,
+            &harness.fixture.plan_resources,
+            None,
+            &[request, request],
+            &view,
+            &mut || true,
+        ),
+        Err(ResourcePlanningUnknown::LimitExceeded)
+    ));
+    assert!(matches!(
+        revalidate_registry_view(
+            &harness.registry,
+            &harness.fixture.plan_resources,
+            None,
+            &[request],
+            &view,
+            &mut || false,
+        ),
+        Err(ResourcePlanningUnknown::BudgetExhausted)
+    ));
+    unknown(
+        || harness.revalidate(&harness.request, Some("foreign-cache"), &view),
+        ResourcePlanningUnknown::StaleIdentity,
+    );
+    harness.close();
 }

@@ -10906,6 +10906,15 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.capture_resource_planning_view(requests, limits, budget)
     }
 
+    fn revalidate_execution_resource_planning_view(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
+        view: &ResourcePlanningView,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ResourcePlanningAvailability<bool> {
+        self.revalidate_resource_planning_view(requests, view, budget)
+    }
+
     fn prepare_execution_resources(
         &self,
         requests: &[ferrum_interfaces::model_executor::ExecutorResourcePreparationRequest],

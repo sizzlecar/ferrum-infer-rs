@@ -78,6 +78,13 @@ fn planning_pool_cow_copies_only_the_touched_pool_and_replays_from_capture() {
         .unwrap());
     assert_eq!(left.domains, replay.domains);
     assert!(captured.same_live_evidence(&view(&harness.root, &[&session])));
+    assert!(known_read(|| harness
+        .root
+        .revalidate_resource_planning_view(
+            &[&session],
+            &captured,
+            &mut || true
+        )));
     assert_eq!(runtime.allocate_calls(), physical_allocations);
     // The same extension performed physically must still invalidate the old
     // capture and agree with its predicted committed coverage/logical demand.
@@ -89,6 +96,20 @@ fn planning_pool_cow_copies_only_the_touched_pool_and_replays_from_capture() {
         .unwrap();
     let fresh = view(&harness.root, &[&session]);
     assert!(!captured.same_live_evidence(&fresh));
+    assert!(!known_read(|| harness
+        .root
+        .revalidate_resource_planning_view(
+            &[&session],
+            &captured,
+            &mut || true
+        )));
+    assert!(known_read(|| harness
+        .root
+        .revalidate_resource_planning_view(
+            &[&session],
+            &fresh,
+            &mut || true
+        )));
     assert_eq!(
         left.state.covered_tokens(0),
         Some(fresh.participants()[0].covered_tokens())

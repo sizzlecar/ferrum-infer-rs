@@ -23,9 +23,15 @@ fn view_with_limits(
     sessions: &[&SequenceSession<TestRuntime>],
     limits: ResourcePlanningLimits,
 ) -> ResourcePlanningView {
+    known_read(|| root.resource_planning_view(sessions, limits, &mut || true))
+}
+
+pub(super) fn known_read<T: std::fmt::Debug>(
+    mut read: impl FnMut() -> ResourcePlanningAvailability<T>,
+) -> T {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        match root.resource_planning_view(sessions, limits, &mut || true) {
+        match read() {
             ResourcePlanningAvailability::Known(view) => return view,
             ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::ReadUnavailable(
                 stage,
