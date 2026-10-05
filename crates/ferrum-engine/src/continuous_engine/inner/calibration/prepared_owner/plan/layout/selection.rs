@@ -14,6 +14,7 @@ use populations::{member_groups, CaseOpportunity, CasePopulation, CheckedPopulat
 #[cfg(test)]
 mod capture_plan_audit;
 mod composition;
+mod coverage_extension;
 mod grouping;
 mod input_geometry;
 mod memory;
@@ -1151,6 +1152,25 @@ fn select_prepared_inputs(
             allocation,
             true,
         )?;
+        if let (Some(seed), Some(maximum_sources)) = (combination_seed, maximum_sources) {
+            coverage_extension::extend(
+                &mut batch_candidates,
+                &out.populations,
+                cases,
+                opportunities,
+                inputs,
+                trajectories,
+                prompts,
+                chunk,
+                prefill_row_ceiling,
+                population,
+                capacity,
+                selected_priority,
+                maximum_sources,
+                seed,
+                allocation,
+            )?;
+        }
     }
     let mut scheduled_sources = 0_usize;
     for candidate in batch_candidates {
@@ -2019,6 +2039,7 @@ mod tests {
     use populations::{classify_alternatives, tests as fixture};
     mod bootstrap_role_coverage;
     mod composition;
+    mod coverage_extension;
     mod finite_policy;
     mod input_geometry_tests;
     mod journal_grouping;

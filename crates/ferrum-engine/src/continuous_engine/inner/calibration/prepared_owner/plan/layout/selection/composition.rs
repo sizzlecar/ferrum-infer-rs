@@ -361,3 +361,83 @@ pub(super) fn scoped_candidate(
     )
     .map(Some)
 }
+
+/// A distinct extension of an admitted scoped source. Unlike local_universe,
+/// this journal can already contain independently qualified host families.
+/// Only its original raw recipes establish the new declaration; existing
+/// scoped inputs cannot be relabelled or contribute old fitted parameters.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn extension_candidate(
+    raw: &SelectedBatch,
+    admitted_scope: &DeclaredAlgorithmUniverseV1,
+    additional_scope: Option<&DeclaredAlgorithmUniverseV1>,
+    populations: &[SelectedPopulation],
+    cases: &[Case],
+    opportunities: &[CaseOpportunity],
+    inputs: &[Vec<CheckedInputFacts>],
+    trajectories: Option<&inventory::CheckedCaseInventory>,
+    prompts: &[usize],
+    chunk: usize,
+    row_ceiling: Option<NonZeroU32>,
+    population: &StructuredServiceDeclarationV7,
+    seed: &DeclaredAlgorithmUniverseV1,
+    allocation: InputAllocationPolicy,
+) -> Result<Option<SelectedBatch>> {
+    if population
+        .nonnegative_envelope
+        .as_ref()
+        .is_none_or(|contract| {
+            contract.population_policy != StructuredPopulationPolicyV1::HomogeneousOrdinaryDecodeV1
+                || contract.template_policy
+                    != StructuredCostTemplatePolicyV1::InstalledAlgorithmSetV1
+        })
+    {
+        return Ok(None);
+    }
+    let mut builder =
+        DeclaredAlgorithmUniverseBuilderV1::new(population.settings.max_axes, builder_limit(seed)?)
+            .map_err(|reason| error(format!("extension declaration builder: {reason:?}")))?;
+    let mut added_algorithm = false;
+    for input in recipes(raw, inputs, trajectories) {
+        if input.algorithm_universe_signature().is_some() || builder.observe(input).is_err() {
+            return Ok(None);
+        }
+        added_algorithm |= admitted_scope.contains_checked_algorithms(input) == Ok(false);
+    }
+    let local = match builder.finish() {
+        Ok(local)
+            if added_algorithm
+                && seed.contains_universe(&local)
+                && local.contains_universe(admitted_scope)
+                && additional_scope.is_none_or(|old| local.contains_universe(old)) =>
+        {
+            local
+        }
+        _ => return Ok(None),
+    };
+    // Check each case's alternatives independently. Sharing a declaration
+    // neither joins host families nor upgrades Unknown/conditional floors.
+    for &index in &raw.representative_case_indices {
+        if project_opportunity(&opportunities[index], &inputs[index], &local).is_err() {
+            return Ok(None);
+        }
+    }
+    let combined = batch_plan_with_scope(
+        &raw.population_indices,
+        populations,
+        cases,
+        opportunities,
+        prompts,
+        chunk,
+        row_ceiling,
+        population,
+        Some((inputs, &local)),
+        allocation,
+    )?;
+    if combined.finite_plan().is_none()
+        || !packing_valid(&combined, inputs, trajectories, population, seed)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(combined))
+}
