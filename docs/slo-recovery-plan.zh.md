@@ -4,6 +4,23 @@
 
 当前仍未交付完整的 SLO 自动闭环版本。首先验证原预算下的覆盖和规划可行性，再完成正常入口的自动闭环，随后进行双后端、完整性能和发布验收。每一步都必须产出可复现的行为证据；局部测试、成本快照数量和源码规模不作为完成度。
 
+10 月 6 日 G31 冻结源码 `fca48700` 已完成两端正常产品构建及 CUDA 正常 `serve`、同二进制 Off 对照和 `run`。资源重验证改为直接比较完整当前证据；CUDA 实际观测复用不可变数值模板；选源增加单次联合候选。原 2ms、120s、工作量和内存限额均未提高。workspace fmt/check/test/Clippy 及实际 CUDA CLI、Metal 全目标编译检查通过；这些不替代运行证据。临时工作树丢失后，工作已恢复到持久目录 `/Users/chejinxuan/rust_ws/ferrum-slo-recovery-20261006`，原始脏工作树未修改。
+
+G31 CUDA 启动完成 4/4 来源、991 cohorts、105.600s，输入准备 38.618s，剩余 265 请求，初始 epoch4 有效。普通窗口 64 请求零错，312 次 witness decision、301 次实际提交及结算，tail0；epoch4→5、撤销0。Source7 后续一次共享工作区需求超原限额 5,220B；这与 CUDA 模板缓存账本是不同容量边界。正常 `run` 已自然结束，91 输入/215 输出 tokens、`finish_reason=stop`，原服务恢复回执通过；完整输出审计仍单独保留。
+
+G31 **未通过覆盖验收**：原 G29 FullLogits/CompletionSSE 的 width3 populations 133/149 在本轮均未入选，稳定 H2D 算法 `dc2c0f5141ab7e9912d301b9349f297d706c36dc1b0d10add088b90fb3c22c6e` 不在已选 U。该候选自身几何完整、需 241 requests/777 actions/522 offers，最终因四个 source 槽位已满拒绝。G31 的联合保护只覆盖本轮联合前已入选的集合；不能据此证明跨版本保住 G29 的支撑范围。不得将启动变快报成覆盖修复。[覆盖审计](/private/tmp/ferrum-slo-recovery-20261002/g31-coverage-audit.json)
+
+CUDA 同一 G31 产品、RTX 5090、Qwen3.5-9B Q4_K_M、原 pinned ShareGPT C8、32 warmup+32 measured、单次配对，64 个选样及实际输入/输出计数均相同。以下 TPOT 终点为最后可见文本，ITL 为非空可见 SSE 文本事件间隔；两条 event/usage 不一致请求仍纳入，未观察到传输合并。
+
+| 模式 | TTFT P50/P99 ms | TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | 输出 tokens/s | runtime CUDA 分配峰 B |
+| --- | --- | --- | --- | --- | --- |
+| Off | 49.178/113.611 | 16.291/18.936 | 15.581/37.086 | 389.185 | 21,475,006,374 |
+| Enforce | 70.798/129.092 | 18.261/19.785 | 17.406/40.098 | 340.888 | 25,054,273,298 |
+
+两边均零错误，TPOT P99 均超过原 15ms；joint 分别 5/32、2/32。Enforce 吞吐低 12.41%，64 请求 CPU 窗口为 50.87s 对 42.82s；单次配对不能证明相对 G30 的改善，也不能将差额全归于资源比较或 CUDA 等待。NVML 整卡峰 Off/Enforce 为 21,968/25,429MiB，host RSS 峰 6,160,020/6,701,940KiB，与 runtime 分配口径不相加。原生资源审计确认本次省去了重验证时的范围和 allocator 再物化，首次捕获及 fresh route 检查仍存在。[同源配对及全部 pins](/private/tmp/ferrum-slo-recovery-20261002/g31-cuda-on-off-client-resource-audit-r1.json)、[资源路径审计](/private/tmp/ferrum-slo-recovery-20261002/g31-resource-comparison-independent-audit.json)
+
+G31 Metal 正常服务零错误，但校准在原 120s 内只完成 1/4 来源、677/1532 cohorts。选源内存审计已定位一项回归：内联 `FinitePlan` 扩大了周期候选，完整 composition 峰从同库存 G19 的 32,943,962B 升到 36,287,066B，超过可用 34,195,039B，导致原输入释放、联合路径未进入。将有限计划改为仅采用时装箱，必须继续完整计入 boxed header、heap 和同时存活的冷重建证明；这只能消除该内存回归，不能单独证明 120s 会通过。Metal Off 对照和正常 `run` 继续收集。下一次联合候选须先冻结每个精确 class 的首个缺失算法义务，再统一构造和计费，失败整表保留，不让一个 class 消耗释放出的槽位后遗漏另一 class。历史具体数值支撑仍须另核，不等同于算法集合覆盖。G31 不作为交付候选，正式验收仍为 0/224。
+
 G29 同一 CUDA 正常产品 `89097fe7`（binary SHA `70877fe39c1baca1ca5fd01a762470d6e6d7168894b3a423faba1a3449ca7a89`）已经完成 `serve` 和 `run`。`serve` 的64请求全部成功，普通窗口实际提交/结算各170、tail0，模型撤销0；终态 epoch6仍有效，170条累计预测全部匹配/配对、无遗弃。四源1115cohorts在114.871s完成，2048请求额度用尽；本次实际接受U34→U35的有限扩域（12 populations，849 requests/2852 actions/1954 offer rows），不能说扩域完全未生效。正常关闭成功commit有效cache，manifest与10个artifact核验通过，但还没有证明新进程复用加载。`run` 四源612cohorts在106.844s完成，91输入/215输出tokens、`finish_reason=stop`，完整三段回答结束，随后cache commit，guard退出0且原服务恢复；这是同产品自然结束样例，不泛化为全部模型和输出场景验收；run累计175 matched/paired无普通窗口前后分母，不能单凭累计值绑定该请求的采用量。serve后续在线学习仍有failed/incomplete来源，有效模型存续不表示全部在线资格完成。[run审计](/private/tmp/ferrum-slo-recovery-20261002/g29-run-audit.json)[本轮状态](/private/tmp/ferrum-slo-recovery-20261002/g29-status.json)
 
 G29性能仍未通过：ShareGPT C8、32 warmup+32 measured、1次，TTFT P50/P99=69.752/140.015ms，last-visible TPOT=18.730/20.564ms，可见SSE文本事件ITL=17.889/40.205ms，successful output TPS335.600，joint0/32、errors0。runtime CUDA backing峰24,045,935,907B，NVML整卡24,465MiB，host RSS6,703,604KiB，口径分列。本轮没有同源码Off配对；不能把模型保持有效直接称作吞吐或SLO改善。必要混合来源覆盖、真实规划开销、Metal原120s内完成及完整同源比较仍未闭合，正式仍0/224。截至北京时间2026年10月5日，G30 `4fbaa3d3` 已完成正常CUDA release及同源码Off/Enforce单次配对，但被拒绝作为交付候选：两边各64请求成功、0错误，Enforce吞吐338.513对Off391.502 tokens/s，低13.53%；两边TPOT P99均超过15ms。这不是原两次独立重复的正式验收。虽然G30完成4/4来源并保持模型和缓存，全部选中算法集合的并集却由G29的37项降至36项，丢失原Full width3来源的physical-rows3 H2D类别，不能称覆盖单调增加或整体可用。撤回提交为`7b4aed62`；核对其与G29 `89097fe7` 的`crates/`、`Cargo.toml`和`Cargo.lock`完全相同，不表示回退产物重新构建或实测。[配对结果](/private/tmp/ferrum-slo-recovery-20261002/g30-slo-pair-r1-results.json)、[覆盖审计](/private/tmp/ferrum-slo-recovery-20261002/g30-coverage-audit.json)。[G29运行审计](/private/tmp/ferrum-slo-recovery-20261002/g29-runtime-audit.json)
