@@ -12,6 +12,7 @@ use ferrum_interfaces::execution_cost::{
     KernelNumericWorkV1, KernelReplayGeometryV1, SelectedAlgorithmClassV1,
     SelectedCommandCostBuilderV1, SelectedCommandCostEvidenceV1, StatisticalTransferKindV1,
 };
+use ferrum_interfaces::vnext::{DeviceObservationDiagnostic, DeviceObservationFailureStage};
 use ferrum_types::SloStructuredCostCapture;
 use std::sync::OnceLock;
 
@@ -642,6 +643,7 @@ impl Recipe {
     ) -> Option<CublasHandleApiIdentity> {
         self.library
     }
+    #[cfg(test)]
     pub(super) fn from_prepared(
         prepared: &prepared::PreparedAttention,
         precision: AttentionPrecision,
@@ -649,26 +651,47 @@ impl Recipe {
         identity: Option<CublasHandleApiIdentity>,
         budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
     ) -> Option<Self> {
-        let mut copied = prepared
-            .launches
-            .len()
-            .checked_mul(std::mem::size_of::<(u64, u32, bool)>())?
-            .checked_add(
-                prepared
-                    .participant_token_counts
-                    .len()
-                    .checked_mul(std::mem::size_of::<u64>())?,
-            )?;
-        for weight in [&prepared.shared.qkvzba, &prepared.shared.output] {
-            if let SharedProjectionWeight::Native { parts, .. } = weight {
-                copied = copied
-                    .checked_add(weights::retained_payload_bytes(parts)?)?
-                    .checked_add(2 * std::mem::size_of::<usize>())?;
+        Self::from_prepared_with_diagnostic(prepared, precision, pair_enabled, identity, budget)
+            .ok()
+    }
+
+    pub(super) fn from_prepared_with_diagnostic(
+        prepared: &prepared::PreparedAttention,
+        precision: AttentionPrecision,
+        pair_enabled: bool,
+        identity: Option<CublasHandleApiIdentity>,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Result<Self, DeviceObservationDiagnostic> {
+        let none = |site| {
+            DeviceObservationDiagnostic::new(DeviceObservationFailureStage::Recipe, site, None)
+        };
+        let copied = (|| {
+            let mut copied = prepared
+                .launches
+                .len()
+                .checked_mul(std::mem::size_of::<(u64, u32, bool)>())?
+                .checked_add(
+                    prepared
+                        .participant_token_counts
+                        .len()
+                        .checked_mul(std::mem::size_of::<u64>())?,
+                )?;
+            for weight in [&prepared.shared.qkvzba, &prepared.shared.output] {
+                if let SharedProjectionWeight::Native { parts, .. } = weight {
+                    copied = copied
+                        .checked_add(weights::retained_payload_bytes(parts)?)?
+                        .checked_add(2 * std::mem::size_of::<usize>())?;
+                }
             }
-        }
-        let construction = budget
-            .reserve(std::mem::size_of::<Self>().checked_add(copied.checked_mul(2)?)?)
-            .ok()?;
+            Some(copied)
+        })()
+        .ok_or_else(|| none("cuda.attention.recipe.copied_bytes"))?;
+        let payload = copied
+            .checked_mul(2)
+            .and_then(|copied| std::mem::size_of::<Self>().checked_add(copied))
+            .ok_or_else(|| none("cuda.attention.recipe.payload_bound"))?;
+        let construction =
+            budget.reserve_with_diagnostic(payload, "cuda.attention.recipe.reserve")?;
         let (native, library) = match (&prepared.shared.qkvzba, &prepared.shared.output) {
             (
                 SharedProjectionWeight::Native { parts: input, .. },
@@ -680,9 +703,12 @@ impl Recipe {
             (SharedProjectionWeight::F16 { .. }, SharedProjectionWeight::F16 { .. })
                 if matches!(precision, AttentionPrecision::F32MasterGgufF16Projections) =>
             {
-                (None, Some(identity?))
+                (
+                    None,
+                    Some(identity.ok_or_else(|| none("cuda.attention.recipe.library_identity"))?),
+                )
             }
-            _ => return None,
+            _ => return Err(none("cuda.attention.recipe.projection_weights")),
         };
         let leaves: Box<[_]> = prepared
             .launches
@@ -696,24 +722,28 @@ impl Recipe {
             })
             .collect();
         let participant_tokens = prepared.participant_token_counts.clone().into_boxed_slice();
-        let mut retained = std::mem::size_of::<Self>()
-            .checked_add(
-                leaves
-                    .len()
-                    .checked_mul(std::mem::size_of::<(u64, u32, bool)>())?,
-            )?
-            .checked_add(
-                participant_tokens
-                    .len()
-                    .checked_mul(std::mem::size_of::<u64>())?,
-            )?;
-        if let Some((input, output)) = &native {
-            retained = retained
-                .checked_add(weights::retained_payload_bytes(input)?)?
-                .checked_add(weights::retained_payload_bytes(output)?)?
-                .checked_add(4 * std::mem::size_of::<usize>())?;
-        }
-        Some(Self {
+        let retained = (|| {
+            let mut retained = std::mem::size_of::<Self>()
+                .checked_add(
+                    leaves
+                        .len()
+                        .checked_mul(std::mem::size_of::<(u64, u32, bool)>())?,
+                )?
+                .checked_add(
+                    participant_tokens
+                        .len()
+                        .checked_mul(std::mem::size_of::<u64>())?,
+                )?;
+            if let Some((input, output)) = &native {
+                retained = retained
+                    .checked_add(weights::retained_payload_bytes(input)?)?
+                    .checked_add(weights::retained_payload_bytes(output)?)?
+                    .checked_add(4 * std::mem::size_of::<usize>())?;
+            }
+            Some(retained)
+        })()
+        .ok_or_else(|| none("cuda.attention.recipe.retained_bytes"))?;
+        Ok(Self {
             _construction: construction,
             shape: prepared.shape,
             precision,

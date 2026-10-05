@@ -77,9 +77,31 @@ impl DeviceObservationTemplateBudget {
         self: &Arc<Self>,
         payload_upper_bound: usize,
     ) -> Result<DeviceObservationTemplateReservation, StatisticalEvidenceUnknown> {
+        self.reserve_with_diagnostic(payload_upper_bound, "template.reserve")
+            .map_err(|failure| failure.error.expect("reservation preserves Capacity"))
+    }
+
+    pub fn reserve_with_diagnostic(
+        self: &Arc<Self>,
+        payload_upper_bound: usize,
+        site: &'static str,
+    ) -> Result<DeviceObservationTemplateReservation, DeviceObservationDiagnostic> {
+        let failure = |required, current| {
+            let mut failure = DeviceObservationDiagnostic::new(
+                DeviceObservationFailureStage::Reserve,
+                site,
+                Some(StatisticalEvidenceUnknown::Capacity),
+            );
+            failure.budget = Some(DeviceObservationBudgetFailure {
+                required,
+                current,
+                maximum: self.maximum,
+            });
+            failure
+        };
         let payload = payload_upper_bound
             .checked_add(RESERVATION_PAYLOAD_OVERHEAD)
-            .ok_or(StatisticalEvidenceUnknown::Capacity)?;
+            .ok_or_else(|| failure(None, self.retained.load(Ordering::Acquire)))?;
         let prior = self
             .retained
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -87,7 +109,7 @@ impl DeviceObservationTemplateBudget {
                     .checked_add(payload)
                     .filter(|next| *next <= self.maximum)
             })
-            .map_err(|_| StatisticalEvidenceUnknown::Capacity)?;
+            .map_err(|current| failure(Some(payload), current))?;
         self.peak.fetch_max(prior + payload, Ordering::AcqRel);
         Ok(DeviceObservationTemplateReservation {
             payload_upper_bound,

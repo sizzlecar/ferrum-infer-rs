@@ -29,6 +29,15 @@ pub trait PendingActualWaveProjection: Send + Sync {
             physical_evidence: None,
         }
     }
+
+    fn project_with_diagnostic(
+        &self,
+    ) -> (
+        ActualWaveProjection,
+        Option<crate::vnext::DeviceObservationDiagnostic>,
+    ) {
+        (self.project_with_physical_evidence(), None)
+    }
 }
 
 #[derive(Clone)]
@@ -71,7 +80,21 @@ impl PendingActualWave {
     }
 
     pub(crate) fn resolve_with_physical_evidence(self) -> ActualWaveProjection {
-        let mut result = self.projection.project_with_physical_evidence();
+        self.resolve_with_diagnostic(false).0
+    }
+
+    pub(crate) fn resolve_with_diagnostic(
+        self,
+        enabled: bool,
+    ) -> (
+        ActualWaveProjection,
+        Option<crate::vnext::DeviceObservationDiagnostic>,
+    ) {
+        let (mut result, diagnostic) = if enabled {
+            self.projection.project_with_diagnostic()
+        } else {
+            (self.projection.project_with_physical_evidence(), None)
+        };
         // An unusable non-numerical sidecar cannot change the original graph
         // rejection or rescue another projection error.
         if result.physical_evidence.is_some_and(|physical| {
@@ -118,7 +141,7 @@ impl PendingActualWave {
             result.shape = Err(reason);
             result.physical_evidence = None;
         }
-        result
+        (result, diagnostic)
     }
 }
 

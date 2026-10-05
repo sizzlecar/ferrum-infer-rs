@@ -75,7 +75,7 @@ pub(super) fn encode(
         regions,
     } = prepare(&invocation)?;
     let recipe = if capture.is_disabled() {
-        None
+        Ok(None)
     } else {
         replay_cost::CudaReplayCostRecipe::rn_fragment(
             &invocation,

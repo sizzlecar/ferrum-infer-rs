@@ -200,12 +200,19 @@ fn encode_with_policy(
         &invocation,
     )?;
     let recipe = if capture.is_disabled() {
-        None
+        Ok(None)
     } else {
         invocation
             .observation_template_budget()
+            .ok_or_else(|| {
+                ferrum_interfaces::vnext::DeviceObservationDiagnostic::new(
+                    ferrum_interfaces::vnext::DeviceObservationFailureStage::Recipe,
+                    "cuda.native_swiglu.recipe.budget",
+                    None,
+                )
+            })
             .and_then(|budget| {
-                replay_cost::Recipe::from_prepared(
+                replay_cost::Recipe::from_prepared_with_diagnostic(
                     &prepared,
                     q8.map(Q8F32ScaleKernels::policy),
                     mmq,

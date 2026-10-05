@@ -2269,12 +2269,19 @@ fn encode_attention(
     let rounded = super::gguf_f16_projection::is_operation(&invocation.operation().id);
     let library_identity = rounded.then_some(library_identity).flatten();
     let observation_recipe = if structured_capture.is_disabled() {
-        None
+        Ok(None)
     } else {
         invocation
             .observation_template_budget()
+            .ok_or_else(|| {
+                ferrum_interfaces::vnext::DeviceObservationDiagnostic::new(
+                    ferrum_interfaces::vnext::DeviceObservationFailureStage::Recipe,
+                    "cuda.causal_attention.recipe.budget",
+                    None,
+                )
+            })
             .and_then(|budget| {
-                selected::Recipe::from_prepared(
+                selected::Recipe::from_prepared_with_diagnostic(
                     &prepared,
                     attention_policy,
                     precision,

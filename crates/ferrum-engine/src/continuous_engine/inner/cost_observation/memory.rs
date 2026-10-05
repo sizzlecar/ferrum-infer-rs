@@ -149,7 +149,11 @@ pub(super) fn maximum_resolution_overhead(rows: usize) -> Option<usize> {
             + 3 * std::mem::size_of::<u32>()
             + std::mem::size_of::<(u32, ferrum_types::FinishReason)>()),
     )?;
-    axes.checked_add(host)?.checked_add(4096)
+    axes.checked_add(host)?
+        .checked_add(4096)?
+        .checked_add(std::mem::size_of::<
+            Option<ferrum_interfaces::vnext::DeviceObservationDiagnostic>,
+        >())
 }
 
 pub(super) fn shape_bytes(

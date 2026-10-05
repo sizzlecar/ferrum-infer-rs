@@ -29,7 +29,8 @@ use ferrum_interfaces::vnext::{
     DeviceComputePathRequirement, DeviceCostGraphConfiguration, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceGuardedAdaptiveCapability, DeviceId,
-    DeviceNativeOperationId, DeviceNativeWorkAttribution, DeviceReplayedLogicalCommandAttribution,
+    DeviceNativeOperationId, DeviceNativeWorkAttribution, DeviceObservationDiagnostic,
+    DeviceObservationFailureStage, DeviceReplayedLogicalCommandAttribution,
     DeviceReplayedSegmentAttribution, DeviceReusableAddressScope, DeviceReusableExecutionCapture,
     DeviceReusableExecutionInvocation, DeviceReusableExecutionObservation,
     DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
@@ -492,6 +493,7 @@ pub struct CudaDeviceCommand {
     completion_checks: Vec<Arc<CudaCompletionReadback>>,
     statistical_evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
     replay_cost_recipe: Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>,
+    observation_diagnostic: Option<DeviceObservationDiagnostic>,
     observation: Option<ferrum_interfaces::vnext::DeviceObservationPacket>,
     core_strided_transfer: Option<(StridedCopyRegion, ferrum_types::SloStructuredCostCapture)>,
     core_transfer: Option<(
@@ -843,6 +845,7 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic: None,
             observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
@@ -892,6 +895,7 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic: None,
             observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
@@ -930,6 +934,7 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic: None,
             observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
@@ -1001,6 +1006,7 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic: None,
             observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
@@ -1034,14 +1040,60 @@ impl CudaDeviceCommand {
     /// selected table. It has no buffers and is not resident until capture succeeds.
     pub(crate) fn with_replay_cost_recipe(
         mut self,
-        recipe: Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>,
+        recipe: Result<
+            Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>,
+            DeviceObservationDiagnostic,
+        >,
     ) -> Self {
+        let recipe = match recipe {
+            Ok(recipe) => recipe,
+            Err(failure) => {
+                self.record_observation_failure(failure);
+                None
+            }
+        };
         self.observation = recipe.as_ref().and_then(|recipe| {
-            observation::compute(Arc::clone(recipe), self.observation_occurrences()?)
+            let packet = self
+                .observation_occurrences()
+                .ok_or_else(|| {
+                    DeviceObservationDiagnostic::new(
+                        DeviceObservationFailureStage::Packet,
+                        "command.compute.occurrences",
+                        None,
+                    )
+                })
+                .and_then(|count| observation::compute(Arc::clone(recipe), count));
+            self.observation_result(packet)
         });
         self.replay_cost_recipe = self.observation.as_ref().and(recipe);
         self.statistical_evidence = None;
         self
+    }
+    pub(crate) fn observation_diagnostic(&self) -> Option<DeviceObservationDiagnostic> {
+        self.observation_diagnostic.map(|mut failure| {
+            if failure.native_operation.is_none() {
+                failure.native_operation = DeviceNativeOperationId::new(self.operation);
+            }
+            failure
+        })
+    }
+    pub(crate) fn record_observation_failure(&mut self, failure: DeviceObservationDiagnostic) {
+        self.observation_diagnostic.get_or_insert(failure);
+    }
+    fn observation_result(
+        &mut self,
+        result: Result<
+            ferrum_interfaces::vnext::DeviceObservationPacket,
+            DeviceObservationDiagnostic,
+        >,
+    ) -> Option<ferrum_interfaces::vnext::DeviceObservationPacket> {
+        match result {
+            Ok(packet) => Some(packet),
+            Err(failure) => {
+                self.record_observation_failure(failure);
+                None
+            }
+        }
     }
 
     pub(crate) fn replay_cost_recipe(&self) -> Option<Arc<super::vnext_ops::CudaReplayCostRecipe>> {
@@ -1170,12 +1222,21 @@ impl CudaDeviceCommand {
     ) {
         if let Some((region, capture)) = self.core_strided_transfer {
             if !capture.is_disabled() {
-                self.observation = observation::strided_transfer(region, self.token_count, budget);
+                self.observation = self.observation_result(observation::strided_transfer(
+                    region,
+                    self.token_count,
+                    budget,
+                ));
             }
         }
         if let Some((kind, bytes, capture)) = self.core_transfer {
             if !capture.is_disabled() {
-                self.observation = observation::transfer(kind, bytes, self.token_count, budget);
+                self.observation = self.observation_result(observation::transfer(
+                    kind,
+                    bytes,
+                    self.token_count,
+                    budget,
+                ));
             }
         }
     }
@@ -1214,6 +1275,7 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic: None,
             observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
@@ -1438,17 +1500,31 @@ impl CudaDeviceCommand {
             ));
             host_storage.push(transfer.payload);
         }
-        let observation = (!structured_capture.is_disabled())
-            .then(|| {
-                observation::program_binding(
-                    transfer_shapes
-                        .iter()
-                        .map(|&(stride, bytes, rows)| (stride as u64, bytes as u64, rows as u64)),
-                    token_count,
-                    budget.as_ref()?,
-                )
-            })
-            .flatten();
+        let (observation, observation_diagnostic) = if structured_capture.is_disabled() {
+            (None, None)
+        } else {
+            match budget
+                .as_ref()
+                .ok_or_else(|| {
+                    DeviceObservationDiagnostic::new(
+                        DeviceObservationFailureStage::Recipe,
+                        "command.program_binding.budget_absent",
+                        None,
+                    )
+                })
+                .and_then(|budget| {
+                    observation::program_binding(
+                        transfer_shapes.iter().map(|&(stride, bytes, rows)| {
+                            (stride as u64, bytes as u64, rows as u64)
+                        }),
+                        token_count,
+                        budget,
+                    )
+                }) {
+                Ok(packet) => (Some(packet), None),
+                Err(failure) => (None, Some(failure)),
+            }
+        };
         let executable = Arc::new(CudaCommandExecutable {
             regions,
             host_storage,
@@ -1475,6 +1551,7 @@ impl CudaDeviceCommand {
             completion_checks,
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic,
             observation,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
@@ -1543,6 +1620,7 @@ impl CudaDeviceCommand {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic: None,
             observation: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
@@ -1752,6 +1830,7 @@ fn cuda_submission_attribution(
             "CUDA command attribution differs from its submitted batch",
         ));
     }
+    let mut diagnostic = None;
     let rows = commands
         .iter()
         .enumerate()
@@ -1764,6 +1843,9 @@ fn cuda_submission_attribution(
                         "CUDA command attribution has a non-portable native operation identity",
                     )
                 })?;
+            if let Some(failure) = command.observation_diagnostic() {
+                diagnostic.get_or_insert(failure.bind_command(command_index, native_op_id));
+            }
             let row = DeviceNativeWorkAttribution::with_participant_range(
                 command_index,
                 command_node_indices[command_index as usize],
@@ -1786,10 +1868,20 @@ fn cuda_submission_attribution(
             // An actual eager command receives its owned CPU snapshot only;
             // native graph launches use their separate sealed logical ledger.
             let row = match &command.observation {
-                Some(observation) => row
-                    .clone()
-                    .with_observation(observation.clone())
-                    .unwrap_or(row),
+                Some(observation) => match row.clone().with_observation(observation.clone()) {
+                    Some(bound) => bound,
+                    None => {
+                        diagnostic.get_or_insert(
+                            DeviceObservationDiagnostic::new(
+                                DeviceObservationFailureStage::Binding,
+                                "actual.command.attach_packet",
+                                None,
+                            )
+                            .bind_command(command_index, native_op_id),
+                        );
+                        row
+                    }
+                },
                 None => command
                     .statistical_evidence
                     .as_ref()
@@ -1801,9 +1893,11 @@ fn cuda_submission_attribution(
             Ok::<_, CudaDeviceRuntimeError>(row)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    DeviceSubmissionAttribution::with_replayed_segments(rows, replayed_segments).ok_or_else(|| {
-        CudaDeviceRuntimeError::contract("CUDA submission attribution is empty or unordered")
-    })
+    DeviceSubmissionAttribution::with_replayed_segments(rows, replayed_segments)
+        .map(|actual| actual.with_observation_diagnostic(diagnostic))
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("CUDA submission attribution is empty or unordered")
+        })
 }
 
 pub struct CudaDeviceStream {
@@ -4917,6 +5011,7 @@ mod tests {
             completion_checks: Vec::new(),
             statistical_evidence: None,
             replay_cost_recipe: None,
+            observation_diagnostic: None,
             observation: None,
             library_cost_requirement:
                 crate::backend::cuda::vnext_ops::CublasCostRequirement::NotRequired,

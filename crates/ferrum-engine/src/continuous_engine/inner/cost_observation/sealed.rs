@@ -356,6 +356,11 @@ impl SealedCostCall {
         };
         let entry = entry.map(|entry| {
             super::resolved::ResolvedCostEntry::new_with_domain(entry, sink.workload_domain())
+                .with_producer_diagnostic(
+                    call.recorder
+                        .route_diagnostic()
+                        .and_then(|d| d.first_producer_failure),
+                )
                 .with_original_preparation(preparation.as_ref())
                 .with_memory(Arc::clone(&memory))
         });

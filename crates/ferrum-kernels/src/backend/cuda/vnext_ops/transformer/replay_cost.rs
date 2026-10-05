@@ -3,7 +3,10 @@
 use super::super::native_blocks::weights;
 use super::*;
 use ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1;
-use ferrum_interfaces::vnext::{DeviceReplayCostWork, FrozenObservationInput};
+use ferrum_interfaces::vnext::{
+    DeviceObservationDiagnostic, DeviceObservationFailureStage, DeviceReplayCostWork,
+    FrozenObservationInput,
+};
 use ferrum_types::SloStructuredCostCapture;
 use std::sync::Arc;
 
@@ -83,14 +86,14 @@ impl CudaReplayCostRecipe {
         primitive: cost_route::Primitive,
         hidden: u64,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         if capture.is_disabled()
             || !matches!(
                 primitive,
                 cost_route::Primitive::RmsNorm { .. } | cost_route::Primitive::ResidualAdd { .. }
             )
         {
-            return None;
+            return Ok(None);
         }
         Self::build(invocation, 0, || {
             Some(RecipeKind::Primitive { primitive, hidden })
@@ -100,14 +103,14 @@ impl CudaReplayCostRecipe {
     pub(super) fn native(
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         numeric: native_swiglu::replay_cost::Recipe,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         Self::build(invocation, 0, || Some(RecipeKind::NativeFfn(numeric)))
     }
     pub(super) fn dense(
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         shape: dense_swiglu_api::Shape,
         identity: cublas_api::CublasHandleApiIdentity,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         Self::build(invocation, 0, || {
             Some(RecipeKind::DenseFfn { shape, identity })
         })
@@ -116,7 +119,7 @@ impl CudaReplayCostRecipe {
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         shape: rn_fragment_swiglu::Shape,
         identity: Option<cublas_api::CublasHandleApiIdentity>,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         Self::build(invocation, 0, || {
             Some(RecipeKind::RnFragmentFfn { shape, identity })
         })
@@ -177,31 +180,37 @@ impl CudaReplayCostRecipe {
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         recipe: attention::selected::Recipe,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
-        (!capture.is_disabled())
-            .then(|| Self::build(invocation, 0, || Some(RecipeKind::Attention(recipe))))
-            .flatten()
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
+        if capture.is_disabled() {
+            return Ok(None);
+        }
+        Self::build(invocation, 0, || Some(RecipeKind::Attention(recipe)))
     }
     pub(super) fn causal(
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         recipe: causal_attention::selected::Recipe,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
-        (!capture.is_disabled())
-            .then(|| Self::build(invocation, 0, || Some(RecipeKind::Causal(recipe))))
-            .flatten()
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
+        if capture.is_disabled() {
+            return Ok(None);
+        }
+        Self::build(invocation, 0, || Some(RecipeKind::Causal(recipe)))
     }
     pub(in crate::backend::cuda::vnext_ops) fn dense_embedding(
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         rows: impl ExactSizeIterator<Item = (u64, u64, u64)>,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         if capture.is_disabled() {
-            return None;
+            return Ok(None);
         }
-        let extra = rows
-            .len()
-            .checked_mul(std::mem::size_of::<(u64, u64, u64)>())?;
+        let extra = (|| {
+            Some(
+                rows.len()
+                    .checked_mul(std::mem::size_of::<(u64, u64, u64)>())?,
+            )
+        })()
+        .ok_or_else(|| Self::recipe_failure("recipe.copied_payload"))?;
         Self::build(invocation, extra, || {
             Some(RecipeKind::DenseEmbedding {
                 rows: rows.collect(),
@@ -215,12 +224,17 @@ impl CudaReplayCostRecipe {
         element: ElementType,
         scratch: u64,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         if capture.is_disabled() {
-            return None;
+            return Ok(None);
         }
-        let extra = weights::retained_payload_bytes(std::slice::from_ref(part))?
-            .checked_add(counts.len().checked_mul(std::mem::size_of::<u64>())?)?;
+        let extra = (|| {
+            Some(
+                weights::retained_payload_bytes(std::slice::from_ref(part))?
+                    .checked_add(counts.len().checked_mul(std::mem::size_of::<u64>())?)?,
+            )
+        })()
+        .ok_or_else(|| Self::recipe_failure("recipe.copied_payload"))?;
         Self::build(invocation, extra, || {
             Some(RecipeKind::NativeEmbedding {
                 part: part.clone(),
@@ -238,12 +252,17 @@ impl CudaReplayCostRecipe {
         element: ElementType,
         scratch: u64,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         if capture.is_disabled() {
-            return None;
+            return Ok(None);
         }
-        let extra = weights::retained_payload_bytes(parts)?
-            .checked_add(rows.len().checked_mul(std::mem::size_of::<u32>())?)?;
+        let extra = (|| {
+            Some(
+                weights::retained_payload_bytes(parts)?
+                    .checked_add(rows.len().checked_mul(std::mem::size_of::<u32>())?)?,
+            )
+        })()
+        .ok_or_else(|| Self::recipe_failure("recipe.copied_payload"))?;
         Self::build(invocation, extra, || {
             Some(RecipeKind::NativeHead {
                 parts: parts.to_vec().into_boxed_slice(),
@@ -259,11 +278,12 @@ impl CudaReplayCostRecipe {
         precision: super::super::ArgmaxPrecision,
         rows: impl ExactSizeIterator<Item = (i32, i32)>,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         if capture.is_disabled() {
-            return None;
+            return Ok(None);
         }
-        let extra = rows.len().checked_mul(std::mem::size_of::<(i32, i32)>())?;
+        let extra = (|| Some(rows.len().checked_mul(std::mem::size_of::<(i32, i32)>())?))()
+            .ok_or_else(|| Self::recipe_failure("recipe.copied_payload"))?;
         Self::build(invocation, extra, || {
             Some(RecipeKind::Argmax {
                 precision,
@@ -274,9 +294,9 @@ impl CudaReplayCostRecipe {
     pub(super) fn attention_bindings(
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         if capture.is_disabled() {
-            return None;
+            return Ok(None);
         }
         Self::build(invocation, 0, || {
             Some(RecipeKind::AttentionBindings {
@@ -288,11 +308,12 @@ impl CudaReplayCostRecipe {
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         bytes: impl ExactSizeIterator<Item = u64>,
         capture: SloStructuredCostCapture,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
         if capture.is_disabled() {
-            return None;
+            return Ok(None);
         }
-        let extra = bytes.len().checked_mul(std::mem::size_of::<u64>())?;
+        let extra = (|| Some(bytes.len().checked_mul(std::mem::size_of::<u64>())?))()
+            .ok_or_else(|| Self::recipe_failure("recipe.copied_payload"))?;
         Self::build(invocation, extra, || {
             Some(RecipeKind::CausalBindings {
                 bytes: bytes.collect(),
@@ -305,26 +326,53 @@ impl CudaReplayCostRecipe {
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
         copied_payload: usize,
         freeze: impl FnOnce() -> Option<RecipeKind>,
-    ) -> Option<Arc<Self>> {
-        let budget = Arc::clone(invocation.observation_template_budget()?);
-        let ranges = invocation
-            .work_shape()
-            .participant_token_ranges()
-            .len()
-            .checked_mul(3)?
-            .checked_mul(std::mem::size_of::<std::ops::Range<u64>>())?;
-        // Two copies bound collect/Arc conversion overlap; persistent nested
-        // numeric recipes hold their own pre-construction reservation.
-        let upper = std::mem::size_of::<Self>()
-            .checked_add(copied_payload.checked_add(ranges)?.checked_mul(2)?)?;
-        let construction = budget.reserve(upper).ok()?;
-        Some(Arc::new(Self {
+    ) -> Result<Option<Arc<Self>>, DeviceObservationDiagnostic> {
+        let budget = Arc::clone(
+            invocation
+                .observation_template_budget()
+                .ok_or_else(|| Self::recipe_failure("recipe.template_budget_absent"))?,
+        );
+        let upper = (|| {
+            let ranges = invocation
+                .work_shape()
+                .participant_token_ranges()
+                .len()
+                .checked_mul(3)?
+                .checked_mul(std::mem::size_of::<std::ops::Range<u64>>())?;
+            std::mem::size_of::<Self>()
+                .checked_add(copied_payload.checked_add(ranges)?.checked_mul(2)?)
+        })()
+        .ok_or_else(|| Self::recipe_failure("recipe.construction_bound"))?;
+        let construction = budget.reserve_with_diagnostic(upper, "recipe.build.reserve")?;
+        Ok(Some(Arc::new(Self {
             budget,
             _construction: construction,
-            captured_work: invocation.replay_cost_work()?,
-            captured_input: FrozenObservationInput::from_work_shape(invocation.work_shape())?,
-            kind: freeze()?,
-        }))
+            captured_work: invocation
+                .replay_cost_work()
+                .ok_or_else(|| Self::recipe_failure("recipe.captured_work"))?,
+            captured_input: FrozenObservationInput::from_work_shape(invocation.work_shape())
+                .ok_or_else(|| Self::recipe_failure("recipe.captured_input"))?,
+            kind: freeze().ok_or_else(|| Self::recipe_failure("recipe.freeze"))?,
+        })))
+    }
+    fn recipe_failure(site: &'static str) -> DeviceObservationDiagnostic {
+        DeviceObservationDiagnostic::new(DeviceObservationFailureStage::Recipe, site, None)
+    }
+    pub(crate) fn projection_site(&self) -> &'static str {
+        match &self.kind {
+            RecipeKind::AttentionBindings { .. } => "recipe.attention_bindings.project",
+            RecipeKind::CausalBindings { .. } => "recipe.causal_bindings.project",
+            RecipeKind::Primitive { .. } => "recipe.primitive.project",
+            RecipeKind::NativeFfn(_) => "recipe.native_ffn.project",
+            RecipeKind::Attention(_) => "recipe.attention.project",
+            RecipeKind::Causal(_) => "recipe.causal.project",
+            RecipeKind::DenseEmbedding { .. } => "recipe.dense_embedding.project",
+            RecipeKind::NativeEmbedding { .. } => "recipe.native_embedding.project",
+            RecipeKind::NativeHead { .. } => "recipe.native_head.project",
+            RecipeKind::Argmax { .. } => "recipe.argmax.project",
+            RecipeKind::RnFragmentFfn { .. } => "recipe.rn_fragment.project",
+            RecipeKind::DenseFfn { .. } => "recipe.dense_ffn.project",
+        }
     }
 
     pub(crate) fn project(

@@ -9,6 +9,7 @@ use ferrum_interfaces::execution_cost::{
     KernelNumericWorkV1, KernelReplayGeometryV1, SelectedAlgorithmClassV1,
     SelectedCommandCostBuilderV1, SelectedCommandCostEvidenceV1, StatisticalTransferKindV1,
 };
+use ferrum_interfaces::vnext::{DeviceObservationDiagnostic, DeviceObservationFailureStage};
 use ferrum_types::SloStructuredCostCapture;
 use std::sync::OnceLock;
 
@@ -487,6 +488,7 @@ impl Recipe {
     ) -> Option<CublasHandleApiIdentity> {
         self.library
     }
+    #[cfg(test)]
     pub(super) fn from_prepared(
         prepared: &prepared::Prepared,
         policy: AttentionExecutionPolicy,
@@ -494,29 +496,50 @@ impl Recipe {
         library: Option<CublasHandleApiIdentity>,
         budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
     ) -> Option<Self> {
+        Self::from_prepared_with_diagnostic(prepared, policy, precision, library, budget).ok()
+    }
+
+    pub(super) fn from_prepared_with_diagnostic(
+        prepared: &prepared::Prepared,
+        policy: AttentionExecutionPolicy,
+        precision: CausalPrecision,
+        library: Option<CublasHandleApiIdentity>,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Result<Self, DeviceObservationDiagnostic> {
+        let none = |site| {
+            DeviceObservationDiagnostic::new(DeviceObservationFailureStage::Recipe, site, None)
+        };
         let weights = [
             &prepared.shared.query_weight,
             &prepared.shared.key_weight,
             &prepared.shared.value_weight,
             &prepared.shared.output_weight,
         ];
-        let mut copied = prepared
-            .launches
-            .len()
-            .checked_mul(std::mem::size_of::<Row>())?
-            .checked_add(
-                4usize.checked_mul(std::mem::size_of::<std::sync::Arc<[weights::MatrixPart]>>())?,
-            )?;
-        for weight in weights {
-            if let SharedProjectionWeight::Native(matrix) = weight {
-                copied = copied
-                    .checked_add(weights::retained_payload_bytes(&matrix.parts)?)?
-                    .checked_add(2 * std::mem::size_of::<usize>())?;
+        let copied = (|| {
+            let mut copied = prepared
+                .launches
+                .len()
+                .checked_mul(std::mem::size_of::<Row>())?
+                .checked_add(
+                    4usize
+                        .checked_mul(std::mem::size_of::<std::sync::Arc<[weights::MatrixPart]>>())?,
+                )?;
+            for weight in weights {
+                if let SharedProjectionWeight::Native(matrix) = weight {
+                    copied = copied
+                        .checked_add(weights::retained_payload_bytes(&matrix.parts)?)?
+                        .checked_add(2 * std::mem::size_of::<usize>())?;
+                }
             }
-        }
-        let construction = budget
-            .reserve(std::mem::size_of::<Self>().checked_add(copied.checked_mul(2)?)?)
-            .ok()?;
+            Some(copied)
+        })()
+        .ok_or_else(|| none("cuda.causal_attention.recipe.copied_bytes"))?;
+        let payload = copied
+            .checked_mul(2)
+            .and_then(|copied| std::mem::size_of::<Self>().checked_add(copied))
+            .ok_or_else(|| none("cuda.causal_attention.recipe.payload_bound"))?;
+        let construction =
+            budget.reserve_with_diagnostic(payload, "cuda.causal_attention.recipe.reserve")?;
         let (native, library): (
             Option<[std::sync::Arc<[weights::MatrixPart]>; 4]>,
             Option<CublasHandleApiIdentity>,
@@ -525,20 +548,33 @@ impl Recipe {
                 let mut parts = Vec::with_capacity(4);
                 for weight in weights {
                     let SharedProjectionWeight::Native(matrix) = weight else {
-                        return None;
+                        return Err(none("cuda.causal_attention.recipe.native_weights"));
                     };
                     parts.push(std::sync::Arc::clone(&matrix.parts));
                 }
-                (Some(parts.try_into().ok()?), None)
+                (
+                    Some(
+                        parts
+                            .try_into()
+                            .map_err(|_| none("cuda.causal_attention.recipe.native_part_count"))?,
+                    ),
+                    None,
+                )
             }
             CausalProjection::F16
                 if weights
                     .iter()
                     .all(|w| matches!(w, SharedProjectionWeight::F16 { .. })) =>
             {
-                (None, Some(library?))
+                (
+                    None,
+                    Some(
+                        library
+                            .ok_or_else(|| none("cuda.causal_attention.recipe.library_identity"))?,
+                    ),
+                )
             }
-            _ => return None,
+            _ => return Err(none("cuda.causal_attention.recipe.projection_weights")),
         };
         let rows: Box<[_]> = prepared
             .launches
@@ -553,18 +589,22 @@ impl Recipe {
             })
             .collect();
         if rows.is_empty() {
-            return None;
+            return Err(none("cuda.causal_attention.recipe.empty_rows"));
         }
-        let mut retained = std::mem::size_of::<Self>()
-            .checked_add(rows.len().checked_mul(std::mem::size_of::<Row>())?)?;
-        if let Some(parts) = &native {
-            for part in parts.iter() {
-                retained = retained
-                    .checked_add(weights::retained_payload_bytes(part.as_ref())?)?
-                    .checked_add(2 * std::mem::size_of::<usize>())?;
+        let retained = (|| {
+            let mut retained = std::mem::size_of::<Self>()
+                .checked_add(rows.len().checked_mul(std::mem::size_of::<Row>())?)?;
+            if let Some(parts) = &native {
+                for part in parts.iter() {
+                    retained = retained
+                        .checked_add(weights::retained_payload_bytes(part.as_ref())?)?
+                        .checked_add(2 * std::mem::size_of::<usize>())?;
+                }
             }
-        }
-        Some(Self {
+            Some(retained)
+        })()
+        .ok_or_else(|| none("cuda.causal_attention.recipe.retained_bytes"))?;
+        Ok(Self {
             _construction: construction,
             shape: prepared.shape,
             precision,

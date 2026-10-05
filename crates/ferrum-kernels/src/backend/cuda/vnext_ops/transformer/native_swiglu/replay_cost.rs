@@ -1,6 +1,7 @@
 //! Numeric FFN plan retained from actual preparation for resident replay.
 use super::*;
 use ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1;
+use ferrum_interfaces::vnext::{DeviceObservationDiagnostic, DeviceObservationFailureStage};
 use ferrum_types::SloStructuredCostCapture;
 use std::ops::Range;
 
@@ -37,23 +38,42 @@ impl Recipe {
             .checked_add(weights::retained_payload_bytes(&self.down)?)?
             .checked_add(leaves)
     }
+    #[cfg(test)]
     pub(super) fn from_prepared(
         prepared: &prepared::Prepared,
         q8: Option<Q8SumPolicy>,
         mmq: Option<&StreamMmq>,
         budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
     ) -> Option<Self> {
-        let copied = weights::retained_payload_bytes(&prepared.gate_up)?
-            .checked_add(weights::retained_payload_bytes(&prepared.down)?)?
-            .checked_add(
-                prepared
-                    .launches
-                    .len()
-                    .checked_mul(std::mem::size_of::<(u32, u64)>())?,
-            )?;
-        let construction = budget
-            .reserve(std::mem::size_of::<Self>().checked_add(copied.checked_mul(2)?)?)
-            .ok()?;
+        Self::from_prepared_with_diagnostic(prepared, q8, mmq, budget).ok()
+    }
+
+    pub(super) fn from_prepared_with_diagnostic(
+        prepared: &prepared::Prepared,
+        q8: Option<Q8SumPolicy>,
+        mmq: Option<&StreamMmq>,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Result<Self, DeviceObservationDiagnostic> {
+        let none = |site| {
+            DeviceObservationDiagnostic::new(DeviceObservationFailureStage::Recipe, site, None)
+        };
+        let copied = (|| {
+            weights::retained_payload_bytes(&prepared.gate_up)?
+                .checked_add(weights::retained_payload_bytes(&prepared.down)?)?
+                .checked_add(
+                    prepared
+                        .launches
+                        .len()
+                        .checked_mul(std::mem::size_of::<(u32, u64)>())?,
+                )
+        })()
+        .ok_or_else(|| none("cuda.native_swiglu.recipe.copied_bytes"))?;
+        let payload = copied
+            .checked_mul(2)
+            .and_then(|copied| std::mem::size_of::<Self>().checked_add(copied))
+            .ok_or_else(|| none("cuda.native_swiglu.recipe.payload_bound"))?;
+        let construction =
+            budget.reserve_with_diagnostic(payload, "cuda.native_swiglu.recipe.reserve")?;
         // Actual prepare has already selected and validated these numerical
         // launch facts. Evidence is built only by the observation worker (or
         // once by cold capture to seal the resident fixed geometry).
@@ -62,13 +82,13 @@ impl Recipe {
                 || prepared.launches[0].2 != rows
                 || prepared.launches[0].3 != 0
             {
-                return None;
+                return Err(none("cuda.native_swiglu.recipe.packed_leaves"));
             }
             Leaves::Packed(rows)
         } else {
             Leaves::Participants(prepared.launches.iter().map(|row| (row.2, row.3)).collect())
         };
-        Some(Self {
+        Ok(Self {
             _construction: construction,
             gate: prepared.gate_up.clone().into_boxed_slice(),
             down: prepared.down.clone().into_boxed_slice(),
@@ -84,7 +104,8 @@ impl Recipe {
                 &prepared.down,
                 prepared.hidden,
                 prepared.intermediate,
-            )?,
+            )
+            .ok_or_else(|| none("cuda.native_swiglu.recipe.mmq_layouts"))?,
         })
     }
 

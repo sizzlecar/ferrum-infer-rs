@@ -51,6 +51,8 @@ pub struct RouteCaptureDiagnostic {
     pub first_rejection: Option<&'static str>,
     pub preparation_attempts: usize,
     pub other_evidence_unknown: bool,
+    #[serde(skip)]
+    pub first_producer_failure: Option<crate::vnext::DeviceObservationDiagnostic>,
 }
 
 impl BoundedWaveRecorder {

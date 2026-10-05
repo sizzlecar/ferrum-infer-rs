@@ -31,8 +31,21 @@ pub(super) struct ResolvedCostEntry {
     /// Private same-call exclusion, minted while the original call still owns
     /// its complete settlement. Re-projecting a diagnostic DTO cannot mint it.
     preparation_feedback_observed_at: Option<u64>,
+    producer_diagnostic: Option<ferrum_interfaces::vnext::DeviceObservationDiagnostic>,
 }
 impl ResolvedCostEntry {
+    pub(super) fn with_producer_diagnostic(
+        mut self,
+        diagnostic: Option<ferrum_interfaces::vnext::DeviceObservationDiagnostic>,
+    ) -> Self {
+        self.producer_diagnostic = diagnostic;
+        self
+    }
+    pub(super) fn producer_diagnostic(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceObservationDiagnostic> {
+        self.producer_diagnostic
+    }
     pub fn new(entry: CostEvidenceEntry) -> Self {
         Self::new_with_domain(entry, None)
     }
@@ -69,6 +82,7 @@ impl ResolvedCostEntry {
             actual,
             structured,
             preparation_feedback_observed_at: None,
+            producer_diagnostic: None,
         }
     }
 

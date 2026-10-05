@@ -552,6 +552,7 @@ impl CostTrainingState {
                         model_epoch = previous.as_ref().map(|s| s.model_version()),
                         reason = ?monitor.revocation(), stage = "resolved",
                         failure = ?failure,
+                        producer_failure = ?resolved.producer_diagnostic(),
                         call_id = stages.map(|s| s.call_id),
                         wave = ?shape.map(|s| s.kind),
                         rows = stages.map(|s| s.rows.len()),

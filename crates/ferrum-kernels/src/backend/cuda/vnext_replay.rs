@@ -18,14 +18,14 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_interfaces::execution_cost::{SelectedReplayAlgorithmTemplateV1, MAX_COST_COMMANDS};
 use ferrum_interfaces::vnext::{
-    DeviceCommandPhase, DeviceObservationPacket, DeviceObservationTemplate,
-    DeviceReplayedCommandCatalogue, DeviceReplayedLogicalCommandAttribution,
-    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
-    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
-    DeviceReusableExecutionPreparationState, DeviceReusableExecutionProgram,
-    DeviceReusableExecutionProgramGap, DeviceReusableExecutionProgramGapReason,
-    DeviceReusableExecutionProgramId, DeviceReusableExecutionSegment, DeviceTimingMode,
-    ElementType,
+    DeviceCommandPhase, DeviceObservationDiagnostic, DeviceObservationFailureStage,
+    DeviceObservationPacket, DeviceObservationTemplate, DeviceReplayedCommandCatalogue,
+    DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
+    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
+    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
+    DeviceReusableExecutionSegment, DeviceTimingMode, ElementType,
 };
 use sha2::{Digest, Sha256};
 
@@ -296,6 +296,7 @@ struct CudaExecutableSegment {
     // Sealed at actual successful capture, not reconstructed during register.
     selected_replay_templates: Option<Box<[Option<SelectedReplayAlgorithmTemplateV1>]>>,
     observation_template: Option<ferrum_interfaces::vnext::RetainedDeviceObservationTemplate>,
+    observation_diagnostic: Option<DeviceObservationDiagnostic>,
     uploaded: bool,
     last_used: u64,
     profile_identity: OnceLock<CudaExecutableProfileIdentity>,
@@ -759,6 +760,11 @@ impl CudaExecutableSegment {
             super::vnext_ops::CublasCostRequirement::NotRequired,
             |prior, command| prior.merge(command.cublas_cost_requirement()),
         );
+        let (observation_template, observation_diagnostic) =
+            match observation::SegmentObservation::new(commands, blas_cost_identity) {
+                Ok(template) => (Some(template), None),
+                Err(failure) => (None, Some(failure)),
+            };
         Ok(Self {
             library_cost: super::vnext_ops::CapturedCublasCostContract::new(
                 library_requirement,
@@ -773,10 +779,8 @@ impl CudaExecutableSegment {
             _blas: Arc::clone(blas),
             _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
             command_graph_node_counts,
-            observation_template: observation::SegmentObservation::new(
-                commands,
-                blas_cost_identity,
-            ),
+            observation_template,
+            observation_diagnostic,
             selected_replay_templates: (commands.len() <= MAX_COST_COMMANDS)
                 .then(|| {
                     commands
@@ -1090,9 +1094,13 @@ pub(crate) struct CudaExecutableLaunch {
     reusable_graph_node_counts: Option<Arc<[u32]>>,
     replayed_logical_commands: Option<Arc<DeviceReplayedCommandCatalogue>>,
     observation: Option<DeviceObservationPacket>,
+    observation_diagnostic: Option<DeviceObservationDiagnostic>,
 }
 
 impl CudaExecutableLaunch {
+    pub(crate) fn observation_diagnostic(&self) -> Option<DeviceObservationDiagnostic> {
+        self.observation_diagnostic
+    }
     pub(crate) fn observation(&self) -> Option<DeviceObservationPacket> {
         self.observation.clone()
     }
@@ -2090,18 +2098,28 @@ impl CudaExecutableCache {
         // Only the real successful launch can attach a pending observation.
         // The queue later joins this ledger to terminal completion; preview
         // never publishes a statistical packet.
+        let mut observation_diagnostic = None;
         let observation = invocation.observation_input().and_then(|input| {
-            entry
-                .observation_template
-                .as_ref()?
-                .packet(input.clone())
-                .ok()
+            observation_diagnostic = entry.observation_diagnostic;
+            let template = entry.observation_template.as_ref()?;
+            match template.packet(input.clone()) {
+                Ok(packet) => Some(packet),
+                Err(error) => {
+                    observation_diagnostic.get_or_insert(DeviceObservationDiagnostic::new(
+                        DeviceObservationFailureStage::Packet,
+                        "segment.launch.packet",
+                        Some(error),
+                    ));
+                    None
+                }
+            }
         });
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint: profile_fingerprint.or(sealed_fingerprint),
             reusable_graph_node_counts,
             replayed_logical_commands,
             observation,
+            observation_diagnostic,
         }))
     }
 
@@ -2167,6 +2185,7 @@ impl CudaExecutableCache {
             reusable_graph_node_counts,
             replayed_logical_commands: None,
             observation: None,
+            observation_diagnostic: None,
         }))
     }
 

@@ -240,11 +240,19 @@ pub(super) fn encode(
         regions,
     } = prepare(operation, &invocation)?;
     let recipe = if rounded && !capture.is_disabled() {
-        identity.and_then(|identity| {
-            replay_cost::CudaReplayCostRecipe::dense(&invocation, shape, identity)
-        })
+        identity
+            .ok_or_else(|| {
+                ferrum_interfaces::vnext::DeviceObservationDiagnostic::new(
+                    ferrum_interfaces::vnext::DeviceObservationFailureStage::Recipe,
+                    "recipe.dense.library_identity",
+                    None,
+                )
+            })
+            .and_then(|identity| {
+                replay_cost::CudaReplayCostRecipe::dense(&invocation, shape, identity)
+            })
     } else {
-        None
+        Ok(None)
     };
     let silu_mul = silu_mul.clone();
     let replay_key = CudaCommandReplayKeyBuilder::new(fingerprint, "vnext_dense_swiglu")

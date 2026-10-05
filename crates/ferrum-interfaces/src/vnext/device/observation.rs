@@ -5,6 +5,8 @@ use crate::execution_cost::{SelectedCommandCostEvidenceV1, StatisticalEvidenceUn
 use std::ops::Range;
 mod budget;
 pub use budget::*;
+mod diagnostic;
+pub use diagnostic::*;
 
 /// Immutable, validated logical population owned by one resident segment.
 /// Validation and payload accounting happen at sealing, not on each launch.
@@ -159,6 +161,20 @@ pub trait DeviceObservationTemplate: Send + Sync + 'static {
         &self,
         input: &FrozenObservationInput,
     ) -> Result<Vec<Option<SelectedCommandCostEvidenceV1>>, StatisticalEvidenceUnknown>;
+
+    fn project_with_diagnostic(
+        &self,
+        input: &FrozenObservationInput,
+        diagnostic: &mut Option<DeviceObservationDiagnostic>,
+    ) -> Result<Vec<Option<SelectedCommandCostEvidenceV1>>, StatisticalEvidenceUnknown> {
+        self.project(input).inspect_err(|error| {
+            diagnostic.get_or_insert(DeviceObservationDiagnostic::new(
+                DeviceObservationFailureStage::Projection,
+                "template.project",
+                Some(*error),
+            ));
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -253,7 +269,15 @@ impl DeviceObservationPacket {
     fn resolve(
         self,
     ) -> Result<Vec<Option<SelectedCommandCostEvidenceV1>>, StatisticalEvidenceUnknown> {
-        let result = self.template.project(&self.input)?;
+        self.resolve_with_diagnostic(&mut None)
+    }
+    fn resolve_with_diagnostic(
+        self,
+        diagnostic: &mut Option<DeviceObservationDiagnostic>,
+    ) -> Result<Vec<Option<SelectedCommandCostEvidenceV1>>, StatisticalEvidenceUnknown> {
+        let result = self
+            .template
+            .project_with_diagnostic(&self.input, diagnostic)?;
         if result.len() != self.template.command_count()
             || result.capacity() > crate::execution_cost::MAX_COST_COMMANDS
         {
@@ -351,54 +375,110 @@ impl DeviceSubmissionAttribution {
 
     /// Explicit worker-only boundary. No getter, Clone, Debug or Serialize
     /// calls it. The caller must first join the original completed settlement.
-    pub fn resolve_observation(mut self) -> Result<Self, StatisticalEvidenceUnknown> {
+    pub fn resolve_observation(self) -> Result<Self, StatisticalEvidenceUnknown> {
+        self.resolve_observation_with_diagnostic(&mut None)
+    }
+
+    pub fn resolve_observation_with_diagnostic(
+        mut self,
+        diagnostic: &mut Option<DeviceObservationDiagnostic>,
+    ) -> Result<Self, StatisticalEvidenceUnknown> {
+        if diagnostic.is_none() {
+            *diagnostic = self.observation_diagnostic;
+        }
         if !self.has_unresolved_observation() {
             return Ok(self);
         }
         for row in Arc::make_mut(&mut self.commands) {
             if let Some(observation) = row.observation.take() {
-                let mut projected = observation.resolve()?;
-                let evidence = projected
-                    .pop()
-                    .ok_or(StatisticalEvidenceUnknown::CommandMismatch)?;
-                row.statistical_evidence = match evidence {
-                    Some(evidence) => {
-                        evidence.validate_command(
-                            row.token_count,
-                            row.compute_dispatch_count,
-                            row.transfer_command_count,
-                        )?;
-                        Some(evidence)
-                    }
-                    None => None,
-                };
+                let mut local = None;
+                let result = (|| {
+                    let mut projected = observation.resolve_with_diagnostic(&mut local)?;
+                    let evidence = projected
+                        .pop()
+                        .ok_or(StatisticalEvidenceUnknown::CommandMismatch)?;
+                    row.statistical_evidence = match evidence {
+                        Some(evidence) => {
+                            evidence.validate_command(
+                                row.token_count,
+                                row.compute_dispatch_count,
+                                row.transfer_command_count,
+                            )?;
+                            Some(evidence)
+                        }
+                        None => None,
+                    };
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    local.get_or_insert(DeviceObservationDiagnostic::new(
+                        DeviceObservationFailureStage::Binding,
+                        "actual.command.resolve",
+                        Some(error),
+                    ));
+                }
+                if diagnostic.is_none() {
+                    *diagnostic =
+                        local.map(|value| value.bind_command(row.command_index, row.native_op_id));
+                }
+                result?;
             }
         }
         for segment in Arc::make_mut(&mut self.replayed_segments) {
             if let Some(observation) = segment.observation.take() {
-                let projected = observation.resolve()?;
-                if projected.len() != segment.logical_commands.len() {
-                    return Err(StatisticalEvidenceUnknown::CommandMismatch);
+                let mut local = None;
+                let result = (|| {
+                    let projected = observation.resolve_with_diagnostic(&mut local)?;
+                    if projected.len() != segment.logical_commands.len() {
+                        return Err(StatisticalEvidenceUnknown::CommandMismatch);
+                    }
+                    for (row, evidence) in Arc::make_mut(&mut segment.logical_commands)
+                        .iter_mut()
+                        .zip(projected)
+                    {
+                        row.statistical_evidence = match evidence {
+                            Some(evidence) => Some(
+                                row.bind_current_cost_evidence(Some(&evidence))
+                                    .ok_or_else(|| {
+                                        local.get_or_insert(DeviceObservationDiagnostic {
+                                            logical_command_ordinal: Some(row.logical_command_ordinal()),
+                                            native_operation: Some(row.native_op_id),
+                                            ..DeviceObservationDiagnostic::new(
+                                                DeviceObservationFailureStage::Binding,
+                                                "actual.replay.bind_current",
+                                                Some(StatisticalEvidenceUnknown::ExactBindingMismatch),
+                                            )
+                                        });
+                                        StatisticalEvidenceUnknown::ExactBindingMismatch
+                                    })?
+                                    .clone(),
+                            ),
+                            None => None,
+                        };
+                    }
+                    segment.logical_payload_bytes =
+                        logical_payload_bytes(&segment.logical_commands)
+                            .ok_or(StatisticalEvidenceUnknown::Capacity)?;
+                    segment.logical_has_statistical_evidence = segment
+                        .logical_commands
+                        .iter()
+                        .any(|row| row.statistical_evidence.is_some());
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    local.get_or_insert(DeviceObservationDiagnostic::new(
+                        DeviceObservationFailureStage::Binding,
+                        "actual.replay.resolve",
+                        Some(error),
+                    ));
                 }
-                for (row, evidence) in Arc::make_mut(&mut segment.logical_commands)
-                    .iter_mut()
-                    .zip(projected)
-                {
-                    row.statistical_evidence = match evidence {
-                        Some(evidence) => Some(
-                            row.bind_current_cost_evidence(Some(&evidence))
-                                .ok_or(StatisticalEvidenceUnknown::ExactBindingMismatch)?
-                                .clone(),
-                        ),
-                        None => None,
-                    };
+                if diagnostic.is_none() {
+                    *diagnostic = local.map(|mut value| {
+                        value.command_index = Some(segment.physical_command_index);
+                        value
+                    });
                 }
-                segment.logical_payload_bytes = logical_payload_bytes(&segment.logical_commands)
-                    .ok_or(StatisticalEvidenceUnknown::Capacity)?;
-                segment.logical_has_statistical_evidence = segment
-                    .logical_commands
-                    .iter()
-                    .any(|row| row.statistical_evidence.is_some());
+                result?;
             }
         }
         Ok(self)

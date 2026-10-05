@@ -352,6 +352,11 @@ impl EngineCostCall {
 
     fn with_source_generation(mut self, generation: u64) -> Self {
         self.source_generation = generation;
+        // Published automatic feedback still owns an original observation when
+        // the current source has no live ticket. Diagnostics grant no ticket.
+        if generation != 0 {
+            self.recorder.enable_route_diagnostics();
+        }
         self
     }
 

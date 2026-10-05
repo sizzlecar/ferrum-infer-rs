@@ -134,7 +134,13 @@ impl BoundedWaveRecorder {
                 && self.observations[index].outcome == Some(ActualWaveOutcome::Completed)
                 && self.observations[index].boundary
                     == WaveObservationBoundary::IsolatedPreparationToCommit;
-            let resolved = pending.resolve_with_physical_evidence();
+            let (resolved, diagnostic) =
+                pending.resolve_with_diagnostic(self.route_diagnostic.is_some());
+            if let Some(route) = &mut self.route_diagnostic {
+                if route.first_producer_failure.is_none() {
+                    route.first_producer_failure = diagnostic;
+                }
+            }
             self.observations[index].physical_evidence = physical_bound
                 .then_some(resolved.physical_evidence)
                 .flatten();

@@ -149,6 +149,11 @@ impl CudaDeviceRuntime {
             };
             if !valid {
                 library_contract_valid = false;
+                command.record_observation_failure(DeviceObservationDiagnostic::new(
+                    DeviceObservationFailureStage::Binding,
+                    "submission.library_identity",
+                    None,
+                ));
                 command.statistical_evidence = None;
                 command.observation = None;
             }
@@ -642,6 +647,7 @@ impl CudaDeviceRuntime {
                 });
                 match launched {
                     Ok(Some(launch)) => {
+                        let mut observation_failure = launch.observation_diagnostic();
                         actual_replayed_segments += 1;
                         if let Some(replayed_segments) = replayed_segments.as_mut() {
                             let physical_command_index = u32::try_from(index).expect(
@@ -670,10 +676,21 @@ impl CudaDeviceRuntime {
                                 );
                             };
                             let replayed = match launch.observation() {
-                                Some(observation) => replayed
-                                    .clone()
-                                    .with_observation(observation)
-                                    .unwrap_or(replayed),
+                                Some(observation) => {
+                                    match replayed.clone().with_observation(observation) {
+                                        Some(bound) => bound,
+                                        None => {
+                                            observation_failure.get_or_insert(
+                                                DeviceObservationDiagnostic::new(
+                                                    DeviceObservationFailureStage::Binding,
+                                                    "actual.segment.attach_packet",
+                                                    None,
+                                                ),
+                                            );
+                                            replayed
+                                        }
+                                    }
+                                }
                                 None => replayed,
                             };
                             execution_paths
@@ -704,6 +721,9 @@ impl CudaDeviceRuntime {
                             replay_observation.observe_replayed_segment(
                                 invocation.segment().logical_command_count() as usize,
                             );
+                        }
+                        if let Some(failure) = observation_failure {
+                            commands[index].record_observation_failure(failure);
                         }
                         index += 1;
                         continue;

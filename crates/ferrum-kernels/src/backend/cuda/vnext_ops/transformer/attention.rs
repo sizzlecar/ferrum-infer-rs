@@ -1585,12 +1585,19 @@ fn encode_attention(
         projection_runtime,
     )?;
     let observation_recipe = if structured_capture.is_disabled() {
-        None
+        Ok(None)
     } else {
         invocation
             .observation_template_budget()
+            .ok_or_else(|| {
+                ferrum_interfaces::vnext::DeviceObservationDiagnostic::new(
+                    ferrum_interfaces::vnext::DeviceObservationFailureStage::Recipe,
+                    "cuda.attention.recipe.budget",
+                    None,
+                )
+            })
             .and_then(|budget| {
-                selected::Recipe::from_prepared(
+                selected::Recipe::from_prepared_with_diagnostic(
                     &prepared,
                     precision,
                     functions.native.q8_pair_enabled(),

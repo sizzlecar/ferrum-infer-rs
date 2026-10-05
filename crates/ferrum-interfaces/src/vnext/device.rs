@@ -30,6 +30,7 @@ mod observation;
 mod replay_cost;
 pub use cost_range::*;
 pub use observation::{
+    DeviceObservationBudgetFailure, DeviceObservationDiagnostic, DeviceObservationFailureStage,
     DeviceObservationPacket, DeviceObservationTemplate, DeviceObservationTemplateBudget,
     DeviceObservationTemplateReservation, DeviceReplayedCommandCatalogue, FrozenObservationInput,
     RetainedDeviceObservationTemplate, DEFAULT_OBSERVATION_TEMPLATE_BYTES,
@@ -3031,7 +3032,7 @@ impl DeviceReplayedSegmentAttribution {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceSubmissionAttribution {
     #[serde(serialize_with = "observation::serialize_commands")]
     commands: Arc<[DeviceNativeWorkAttribution]>,
@@ -3039,7 +3040,18 @@ pub struct DeviceSubmissionAttribution {
     replayed_segments: Arc<[DeviceReplayedSegmentAttribution]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     graph_evidence: Option<DeviceSubmissionGraphEvidence>,
+    #[serde(skip)]
+    observation_diagnostic: Option<observation::DeviceObservationDiagnostic>,
 }
+
+impl PartialEq for DeviceSubmissionAttribution {
+    fn eq(&self, other: &Self) -> bool {
+        self.commands == other.commands
+            && self.replayed_segments == other.replayed_segments
+            && self.graph_evidence == other.graph_evidence
+    }
+}
+impl Eq for DeviceSubmissionAttribution {}
 
 impl DeviceSubmissionAttribution {
     pub fn new(commands: Vec<DeviceNativeWorkAttribution>) -> Option<Self> {
@@ -3086,6 +3098,7 @@ impl DeviceSubmissionAttribution {
             commands: commands.into(),
             replayed_segments: replayed_segments.into(),
             graph_evidence: None,
+            observation_diagnostic: None,
         })
     }
 
@@ -3106,6 +3119,20 @@ impl DeviceSubmissionAttribution {
 
     pub const fn graph_evidence(&self) -> Option<DeviceSubmissionGraphEvidence> {
         self.graph_evidence
+    }
+
+    pub fn with_observation_diagnostic(
+        mut self,
+        failure: Option<observation::DeviceObservationDiagnostic>,
+    ) -> Self {
+        if self.observation_diagnostic.is_none() {
+            self.observation_diagnostic = failure;
+        }
+        self
+    }
+
+    pub fn observation_diagnostic(&self) -> Option<observation::DeviceObservationDiagnostic> {
+        self.observation_diagnostic
     }
 
     pub fn commands(&self) -> &[DeviceNativeWorkAttribution] {

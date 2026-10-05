@@ -1,6 +1,8 @@
 //! Frozen current-wave facts. This type cannot reach a device or live request.
 use super::*;
-use ferrum_interfaces::vnext::DeviceNativeOperationId;
+use ferrum_interfaces::vnext::{
+    DeviceNativeOperationId, DeviceObservationDiagnostic, DeviceObservationFailureStage,
+};
 
 #[cfg(test)]
 mod tests;
@@ -84,11 +86,23 @@ impl PendingActualWaveProjection for FrozenActualProjection {
         self.project_with_physical_evidence().shape
     }
     fn project_with_physical_evidence(&self) -> ActualWaveProjection {
-        self.project_observation()
+        self.project_observation(&mut None)
             .unwrap_or_else(|reason| ActualWaveProjection {
                 shape: Err(reason),
                 physical_evidence: None,
             })
+    }
+    fn project_with_diagnostic(
+        &self,
+    ) -> (ActualWaveProjection, Option<DeviceObservationDiagnostic>) {
+        let mut diagnostic = None;
+        let projected = self
+            .project_observation(&mut diagnostic)
+            .unwrap_or_else(|reason| ActualWaveProjection {
+                shape: Err(reason),
+                physical_evidence: None,
+            });
+        (projected, diagnostic)
     }
 }
 
@@ -155,13 +169,15 @@ impl FrozenActualProjection {
 
     fn project_observation(
         &self,
+        diagnostic: &mut Option<DeviceObservationDiagnostic>,
     ) -> std::result::Result<ActualWaveProjection, ActualWaveEvidenceUnknown> {
         // Resolution cannot erase the original exact execution ledger. A bad
         // passive sidecar remains unavailable and never reuses capture values.
-        let resolved = self
-            .numeric_observation
-            .is_required()
-            .then(|| self.attribution.clone().resolve_observation());
+        let resolved = self.numeric_observation.is_required().then(|| {
+            self.attribution
+                .clone()
+                .resolve_observation_with_diagnostic(diagnostic)
+        });
         let statistics = matches!(resolved, Some(Ok(_)));
         let attribution = resolved
             .as_ref()
@@ -228,6 +244,13 @@ impl FrozenActualProjection {
                     self.recurrent_state_bytes,
                 )
                 .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?;
+            if let Err(error) = &value.statistical {
+                diagnostic.get_or_insert(DeviceObservationDiagnostic::new(
+                    DeviceObservationFailureStage::Statistics,
+                    "canonical.finish_with_captured_structure",
+                    Some(*error),
+                ));
+            }
             (value.exact, value.statistical.ok())
         } else {
             (
