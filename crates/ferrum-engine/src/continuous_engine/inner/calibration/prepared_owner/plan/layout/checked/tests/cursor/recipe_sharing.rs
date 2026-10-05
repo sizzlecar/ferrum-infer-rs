@@ -122,10 +122,54 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
         assert!(selection_peak > 0 && !authorized(selection_peak - 1));
         let unique_limit = unique_inventory + seed_bytes + selection_peak;
         assert!(unique_limit < inventory_limit);
-        // The reference seed was used only to derive the bound. The actual
-        // freeze below builds and retains its own seed under that same bound.
-        drop(seed);
         let limit = missing_byte.map_or(inventory_limit, |missing| unique_limit - missing);
+        // Compare duplicate vs original cases at this same authorization,
+        // rather than comparing periodic selection to a roomier finite scope.
+        // Both controls borrow the same real checked outcomes and global seed.
+        let same_mode_reference = if missing_byte != Some(1) {
+            let mut original_inventory = inventory.clone();
+            original_inventory.opportunities.pop();
+            original_inventory.inputs.pop();
+            original_inventory.algorithm_case_inputs.pop();
+            original_inventory
+                .gaps
+                .retain(|gap| gap.case_index != duplicate);
+            let mut geometry = inputs.input_geometry_visit_limit.map(
+                ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredInputGeometryWorkV1::new,
+            );
+            Some(
+                selection::select_with_capacity_and_trajectories(
+                    &cases[..duplicate],
+                    &original_inventory.opportunities,
+                    &original_inventory.inputs,
+                    &inputs.prompts,
+                    inputs.chunk.get() as usize,
+                    inputs.prefill_row_ceiling,
+                    &inputs.population,
+                    selection::SelectionCapacity {
+                        requests: budget.selection_requests_remaining(),
+                        execution_actions: budget.selection_attempts_remaining(),
+                        declared_offer_rows: inputs
+                            .limits
+                            .max_samples
+                            .get()
+                            .min(inputs.limits.max_total_shape_rows.get()),
+                    },
+                    limit - retained - seed_bytes,
+                    None,
+                    None,
+                    geometry.as_mut(),
+                    Some(inputs.maximum_retained_sources),
+                    Some(&seed),
+                    Some(&original_inventory),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        // Freeze constructs its own seed under the exact original boundary.
+        drop(seed);
         eprintln!(
             "same-outcome freeze: retained={retained} duplicate_payload={duplicated_payload} unique_inventory={unique_inventory} seed={seed_bytes} selection_peak={selection_peak} inventory_limit={limit} missing_byte={missing_byte:?}"
         );
@@ -134,6 +178,16 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
         let checked_prompts = inputs.prompts.clone();
         let checked_chunk = inputs.chunk.get() as usize;
         let checked_row_ceiling = inputs.prefill_row_ceiling;
+        let checked_recipes: Vec<Vec<_>> = inventory
+            .inputs
+            .iter()
+            .map(|facts| {
+                facts
+                    .iter()
+                    .filter_map(|fact| fact.original.clone())
+                    .collect()
+            })
+            .collect();
         let plan = freeze_inventory(
             &session,
             inputs,
@@ -163,9 +217,33 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
             .any(|batch| batch.scheduled && batch.algorithm_universe.is_some());
         let actual = selected.clone();
         assert!(actual.retained_payload_bytes().unwrap() <= limit);
-        // Finite allocation can change only the frozen occurrence sequence
-        // and phase barriers. Charge the actual sequence, including source
-        // setup once, through the same original case work contract.
+        if let Some(original_selection) = same_mode_reference {
+            // Batches include scope, original representatives, full finite or
+            // periodic proof, F/R/Q barriers, opportunities and every work sum.
+            assert_eq!(
+                serde_json::to_value(&actual.batches).unwrap(),
+                serde_json::to_value(&original_selection.batches).unwrap()
+            );
+            assert_eq!(
+                actual.execution_case_indices,
+                original_selection.execution_case_indices
+            );
+            assert_eq!(
+                [
+                    actual.requests,
+                    actual.serial_wave_upper_bound,
+                    actual.declared_offer_row_bound
+                ],
+                [
+                    original_selection.requests,
+                    original_selection.serial_wave_upper_bound,
+                    original_selection.declared_offer_row_bound
+                ]
+            );
+        }
+        // Charge the actual sequence, including source setup once, through
+        // the same original case work contract even if roomy storage permits
+        // an independently recomputed scope extension.
         let mut totals = [0usize; 3];
         let mut execution = Vec::new();
         for batch in &actual.batches {
@@ -277,7 +355,11 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
                         );
                         let before = &actual.batches[old.batch_index.unwrap()];
                         let after = &roomy.batches[new.batch_index.unwrap()];
-                        assert_eq!(before.algorithm_universe, after.algorithm_universe);
+                        match (&before.algorithm_universe, &after.algorithm_universe) {
+                            (Some(old), Some(new)) => assert!(new.contains_universe(old)),
+                            (None, None) => {}
+                            _ => panic!("extra storage lost or relabelled an original raw scope"),
+                        }
                         assert_eq!(before.schedule.min_members, after.schedule.min_members);
                         for index in &old.representative_case_indices {
                             let a = before
@@ -290,16 +372,31 @@ async fn checked_duplicate_outcome_recipe_fits_before_local_scope_selection() {
                                 .iter()
                                 .position(|i| i == index)
                                 .unwrap();
-                            assert_eq!(
-                                serde_json::to_value(
-                                    before.scoped_opportunities.as_ref().map(|v| &v[a])
-                                )
-                                .unwrap(),
-                                serde_json::to_value(
-                                    after.scoped_opportunities.as_ref().map(|v| &v[b])
-                                )
-                                .unwrap()
-                            );
+                            match (&before.scoped_opportunities, &after.scoped_opportunities) {
+                                (Some(old), Some(new)) => {
+                                    assert_eq!(
+                                        old[a].minimum_fresh_members,
+                                        new[b].minimum_fresh_members
+                                    );
+                                    assert!(!checked_recipes[*index].is_empty());
+                                    for recipe in &checked_recipes[*index] {
+                                        for (batch, opportunity) in
+                                            [(before, &old[a]), (after, &new[b])]
+                                        {
+                                            let key = recipe
+                                                .numerical_family_key_for_universe(
+                                                    batch.algorithm_universe.as_ref().unwrap(),
+                                                )
+                                                .unwrap();
+                                            assert_eq!(opportunity.population, CasePopulation::Unique(
+                                                populations::CheckedPopulationKey::NumericalFamily(key),
+                                            ));
+                                        }
+                                    }
+                                }
+                                (None, None) => {}
+                                _ => panic!("scope opportunity/floor was lost"),
+                            }
                         }
                     }
                 }
