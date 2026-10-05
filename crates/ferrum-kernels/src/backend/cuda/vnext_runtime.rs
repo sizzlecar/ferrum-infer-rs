@@ -4436,7 +4436,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
 mod on_demand_tests;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     #[cfg(feature = "vllm-marlin")]
     use crate::marlin_repack::repack_gptq_to_marlin;
@@ -4987,7 +4987,7 @@ mod tests {
         );
     }
 
-    pub(super) fn command(operation: &'static str) -> CudaDeviceCommand {
+    pub(in crate::backend::cuda) fn command(operation: &'static str) -> CudaDeviceCommand {
         CudaDeviceCommand {
             runtime_instance: 1,
             operation,

@@ -71,8 +71,12 @@ impl SegmentObservation {
                     None => budget = Some(Arc::clone(current)),
                     _ => {}
                 }
+                // The checked private lease charges the child template to this
+                // same budget. Keeping the complete packet below keeps that
+                // lease alive; charge only its handle/input here, including
+                // dynamic ranges, rather than charging the template again.
                 retained = retained
-                    .checked_add(packet.retained_payload_bytes())
+                    .checked_add(packet.call_owned_payload_bytes())
                     .ok_or_else(|| failure("segment.retained_overflow"))?;
                 projected = projected
                     .checked_add(packet.projection_retained_bytes_upper_bound())
@@ -155,5 +159,119 @@ impl DeviceObservationTemplate for SegmentObservation {
                 Ok(values.pop().flatten())
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_interfaces::vnext::DeviceObservationTemplateBudget;
+
+    struct CpuMetadata(Box<[u8]>);
+    impl DeviceObservationTemplate for CpuMetadata {
+        fn command_count(&self) -> usize {
+            1
+        }
+        fn retained_payload_bytes(&self) -> Option<usize> {
+            std::mem::size_of::<Self>().checked_add(self.0.len())
+        }
+        fn projection_retained_bytes_upper_bound(&self) -> Option<usize> {
+            Some(std::mem::size_of::<Option<SelectedCommandCostEvidenceV1>>())
+        }
+        fn project(
+            &self,
+            _: &FrozenObservationInput,
+        ) -> Result<Vec<Option<SelectedCommandCostEvidenceV1>>, StatisticalEvidenceUnknown>
+        {
+            Ok(vec![None])
+        }
+    }
+    fn commands(budget: &Arc<DeviceObservationTemplateBudget>) -> Vec<CudaDeviceCommand> {
+        let child = budget
+            .retain(Arc::new(CpuMetadata(vec![0; 16 * 1024].into_boxed_slice())))
+            .unwrap();
+        let packet = child.packet(FrozenObservationInput::command(1)).unwrap();
+        (0..2)
+            .map(|_| {
+                super::super::super::vnext_runtime::tests::command("actual.cuda.metadata")
+                    .with_observation(packet.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cuda_segment_observation_charges_child_once_and_keeps_queued_lease() {
+        let budget = DeviceObservationTemplateBudget::new(128 * 1024).unwrap();
+        let original = commands(&budget);
+        let child_bytes = budget.retained_payload_bytes();
+        let child_projected = original[0]
+            .observation_packet()
+            .unwrap()
+            .projection_retained_bytes_upper_bound();
+        let resident = SegmentObservation::new(&original, None).unwrap();
+        let total = budget.retained_payload_bytes();
+        assert!(
+            total - child_bytes < child_bytes,
+            "parent handles must not reserve another copy of the leased child payload"
+        );
+        let queued = resident.packet(FrozenObservationInput::command(1)).unwrap();
+        assert_eq!(
+            queued.projection_retained_bytes_upper_bound(),
+            2 * child_projected + 2 * std::mem::size_of::<Option<SelectedCommandCostEvidenceV1>>()
+        );
+        let copy = queued.clone();
+        drop(original);
+        drop(resident);
+        drop(queued);
+        assert_eq!(budget.retained_payload_bytes(), total);
+        assert_eq!(copy.template().project(copy.input()).unwrap().len(), 2);
+        drop(copy);
+        assert_eq!(budget.retained_payload_bytes(), 0);
+
+        for (limit, expected) in [(total, true), (total - 1, false)] {
+            let budget = DeviceObservationTemplateBudget::new(limit).unwrap();
+            let original = commands(&budget);
+            let before = budget.retained_payload_bytes();
+            let result = SegmentObservation::new(&original, None);
+            assert_eq!(result.is_ok(), expected);
+            if let Err(failure) = &result {
+                assert_eq!(failure.stage, DeviceObservationFailureStage::Reserve);
+                assert_eq!(failure.error, Some(StatisticalEvidenceUnknown::Capacity));
+                let snapshot = failure.budget.unwrap();
+                assert_eq!(snapshot.current, before);
+                assert_eq!(snapshot.current + snapshot.required.unwrap(), total);
+            }
+            drop(result);
+            assert_eq!(budget.retained_payload_bytes(), before);
+            drop(original);
+            assert_eq!(budget.retained_payload_bytes(), 0);
+        }
+
+        let other = DeviceObservationTemplateBudget::new(128 * 1024).unwrap();
+        let mut mixed = commands(&budget);
+        mixed.push(commands(&other).pop().unwrap());
+        let before = (
+            budget.retained_payload_bytes(),
+            other.retained_payload_bytes(),
+        );
+        assert_eq!(
+            SegmentObservation::new(&mixed, None).unwrap_err().site,
+            "segment.mixed_budget"
+        );
+        assert_eq!(
+            (
+                budget.retained_payload_bytes(),
+                other.retained_payload_bytes()
+            ),
+            before
+        );
+        drop(mixed);
+        assert_eq!(
+            (
+                budget.retained_payload_bytes(),
+                other.retained_payload_bytes()
+            ),
+            (0, 0)
+        );
     }
 }
