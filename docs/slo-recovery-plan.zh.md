@@ -19,7 +19,20 @@ CUDA 同一 G31 产品、RTX 5090、Qwen3.5-9B Q4_K_M、原 pinned ShareGPT C8�
 
 两边均零错误，TPOT P99 均超过原 15ms；joint 分别 5/32、2/32。Enforce 吞吐低 12.41%，64 请求 CPU 窗口为 50.87s 对 42.82s；单次配对不能证明相对 G30 的改善，也不能将差额全归于资源比较或 CUDA 等待。NVML 整卡峰 Off/Enforce 为 21,968/25,429MiB，host RSS 峰 6,160,020/6,701,940KiB，与 runtime 分配口径不相加。原生资源审计确认本次省去了重验证时的范围和 allocator 再物化，首次捕获及 fresh route 检查仍存在。[同源配对及全部 pins](/private/tmp/ferrum-slo-recovery-20261002/g31-cuda-on-off-client-resource-audit-r1.json)、[资源路径审计](/private/tmp/ferrum-slo-recovery-20261002/g31-resource-comparison-independent-audit.json)
 
-G31 Metal 正常服务零错误，但校准在原 120s 内只完成 1/4 来源、677/1532 cohorts。选源内存审计已定位一项回归：内联 `FinitePlan` 扩大了周期候选，完整 composition 峰从同库存 G19 的 32,943,962B 升到 36,287,066B，超过可用 34,195,039B，导致原输入释放、联合路径未进入。将有限计划改为仅采用时装箱，必须继续完整计入 boxed header、heap 和同时存活的冷重建证明；这只能消除该内存回归，不能单独证明 120s 会通过。Metal Off 对照和正常 `run` 继续收集。下一次联合候选须先冻结每个精确 class 的首个缺失算法义务，再统一构造和计费，失败整表保留，不让一个 class 消耗释放出的槽位后遗漏另一 class。历史具体数值支撑仍须另核，不等同于算法集合覆盖。G31 不作为交付候选，正式验收仍为 0/224。
+G31 Metal 正常服务零错误，但校准在原 120s 内只完成 1/4 来源、677/1532 cohorts。选源内存审计已定位一项回归：内联 `FinitePlan` 扩大了周期候选，完整 composition 峰从同库存 G19 的 32,943,962B 升到 36,287,066B，超过可用 34,195,039B，导致原输入释放、联合路径未进入。将有限计划改为仅采用时装箱，必须继续完整计入 boxed header、heap 和同时存活的冷重建证明；这只能消除该内存回归，不能单独证明 120s 会通过。
+
+Metal 同一 G31、Apple M4、同模型、原 4096 context/32 capacity、ShareGPT C8、32 warmup+32 measured 的单次配对已完成。64 个选样及实际输入/输出计数相同，两边均零错误，TPOT/ITL 与上方口径相同。
+
+| 模式 | TTFT P50/P99 ms | TPOT P50/P99 ms | 可见 SSE ITL P50/P99 ms | 输出 tokens/s | Metal 分配峰 B |
+| --- | --- | --- | --- | --- | --- |
+| Off | 594.278/4815.591 | 193.082/246.300 | 175.362/939.705 | 37.121 | 8,604,499,968 |
+| Enforce | 1244.058/4842.895 | 193.112/219.325 | 174.993/877.227 | 36.905 | 8,598,831,104 |
+
+Enforce 吞吐低 0.58%，两边三项 P99 均超过原 3400/212/359ms，joint 分别为 Off 0/32、Enforce 3/32。host physical footprint 峰 Off/Enforce 为 1,731,775,080/2,906,327,872B，RSS 为 424,509,440/794,984,448B；均覆盖启动至关闭，与 Metal 分配不相加。Metal `run` 的不同 CLI 库存中联合计划确实进入，但仍仅完成 1/4 来源、278/512 cohorts，cost series119.964s后时间耗尽；加参考探测后总 startup182.362s。普通输出自然停止、215输出tokens，但累计 issued/Matched/paired均0，不能报普通 SLO 采用已完成。[Metal 同源配对](/private/tmp/ferrum-slo-recovery-20261002/g31-metal-on-off-client-resource-audit-r1.json)
+
+两端 `run` 都显式使用原有 `--profile-jsonl` 收集完成凭据，`profile-detail=off` 未阻止大量既有启动/首帧记录：CUDA 文件3,351,420,095B，Metal 文件1,035,630,214B。它们用于功能审计，不是无观测开销的性能证据；Metal 本地仅保存终态尾部、远端文件 SHA 和长度，完整文件仍在远端。CUDA 后端纯元数据/账本测试在实际 CUDA feature 构建后通过5+1+1项，不涉及设备数值回归。[CUDA run 审计](/private/tmp/ferrum-slo-recovery-20261002/g31-cuda-normal-run-runtime-audit.json)
+
+下一次联合候选先冻结每个精确 class 的首个缺失算法义务，再统一构造和计费，失败整表保留，不让一个 class 消耗释放出的槽位后遗漏另一 class。有限证明的额外内存授权延迟到原周期合并之后，按全部存活候选而非原始717组计费；原 peak/scratch、两份联合临时证明和冷副本的费用均保留。历史具体数值支撑仍须另核，不等同于算法集合覆盖。这些修复尚未取得后端运行结果；G31 不作为交付候选，正式验收仍为 0/224。
 
 G29 同一 CUDA 正常产品 `89097fe7`（binary SHA `70877fe39c1baca1ca5fd01a762470d6e6d7168894b3a423faba1a3449ca7a89`）已经完成 `serve` 和 `run`。`serve` 的64请求全部成功，普通窗口实际提交/结算各170、tail0，模型撤销0；终态 epoch6仍有效，170条累计预测全部匹配/配对、无遗弃。四源1115cohorts在114.871s完成，2048请求额度用尽；本次实际接受U34→U35的有限扩域（12 populations，849 requests/2852 actions/1954 offer rows），不能说扩域完全未生效。正常关闭成功commit有效cache，manifest与10个artifact核验通过，但还没有证明新进程复用加载。`run` 四源612cohorts在106.844s完成，91输入/215输出tokens、`finish_reason=stop`，完整三段回答结束，随后cache commit，guard退出0且原服务恢复；这是同产品自然结束样例，不泛化为全部模型和输出场景验收；run累计175 matched/paired无普通窗口前后分母，不能单凭累计值绑定该请求的采用量。serve后续在线学习仍有failed/incomplete来源，有效模型存续不表示全部在线资格完成。[run审计](/private/tmp/ferrum-slo-recovery-20261002/g29-run-audit.json)[本轮状态](/private/tmp/ferrum-slo-recovery-20261002/g29-status.json)
 
