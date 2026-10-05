@@ -48,11 +48,55 @@ fn complete_raw(
         })
 }
 
-/// Check all admitted interpretations of each exact constituent class. An
-/// algorithm present only in another product's U does not cover this class.
-fn extends_class(
+/// Compare recipes only with admitted interpretations of this exact class.
+/// None means the constituent has no compatible admitted class or is invalid.
+fn class_extension(
+    index: usize,
+    fact: &CheckedInputFacts,
+    admitted: &[usize],
+    candidates: &[BatchCandidate],
+    cases: &[Case],
+    inputs: &[Vec<CheckedInputFacts>],
+    trajectories: Option<&inventory::CheckedCaseInventory>,
+) -> Option<bool> {
+    let mut extends = false;
+    for recipe in composition::case_recipes(index, inputs, trajectories) {
+        let (mut has_class, mut covered) = (false, false);
+        for &source in admitted {
+            let batch = &candidates[source].batch;
+            let Some(scope) = &batch.algorithm_universe else {
+                continue;
+            };
+            let matches = batch.representative_case_indices.iter().any(|&old| {
+                cases[old].route == cases[index].route
+                    && inputs[old].iter().any(|old| same_class(fact, old))
+            });
+            if !matches {
+                continue;
+            }
+            has_class = true;
+            match scope.contains_checked_algorithms(recipe) {
+                Ok(true) => covered = true,
+                Ok(false) => {}
+                Err(_) => return None,
+            }
+        }
+        if !has_class {
+            return None;
+        }
+        extends |= !covered;
+    }
+    Some(extends)
+}
+
+/// Freeze the first unmet constituent of each class against the original
+/// admitted scopes. A previously chosen target only covers a frontier slot
+/// when it also has a missing recipe in that same class; its proposed U is
+/// never used to erase another class's outstanding obligation.
+fn extends_frontier(
     target: &SelectedBatch,
     admitted: &[usize],
+    frontier: &[usize],
     candidates: &[BatchCandidate],
     cases: &[Case],
     inputs: &[Vec<CheckedInputFacts>],
@@ -69,31 +113,40 @@ fn extends_class(
             if !same_domain(first, fact) {
                 return false;
             }
-            for recipe in composition::case_recipes(index, inputs, trajectories) {
-                let (mut has_class, mut covered) = (false, false);
-                for &source in admitted {
-                    let batch = &candidates[source].batch;
-                    let Some(scope) = &batch.algorithm_universe else {
-                        continue;
-                    };
-                    let matches = batch.representative_case_indices.iter().any(|&old| {
-                        cases[old].route == cases[index].route
-                            && inputs[old].iter().any(|old| same_class(fact, old))
-                    });
-                    if !matches {
-                        continue;
-                    }
-                    has_class = true;
-                    match scope.contains_checked_algorithms(recipe) {
-                        Ok(true) => covered = true,
-                        Ok(false) => {}
-                        Err(_) => return false,
-                    }
-                }
-                if !has_class {
-                    return false;
-                }
-                extends |= !covered;
+            let Some(missing) = class_extension(
+                index,
+                fact,
+                admitted,
+                candidates,
+                cases,
+                inputs,
+                trajectories,
+            ) else {
+                return false;
+            };
+            if missing {
+                let represented = frontier.iter().any(|&target| {
+                    candidates[target]
+                        .batch
+                        .representative_case_indices
+                        .iter()
+                        .any(|&previous| {
+                            cases[previous].route == cases[index].route
+                                && inputs[previous].iter().any(|previous_fact| {
+                                    same_class(fact, previous_fact)
+                                        && class_extension(
+                                            previous,
+                                            previous_fact,
+                                            admitted,
+                                            candidates,
+                                            cases,
+                                            inputs,
+                                            trajectories,
+                                        ) == Some(true)
+                                })
+                        })
+                });
+                extends |= !represented;
             }
         }
     }
@@ -135,8 +188,8 @@ pub(in super::super) fn extend(
             replaced.push(index);
         }
     }
-    // Freeze the first legal unmet constituent in the original ordering.
-    // A later capacity failure must not silently choose a cheaper obligation.
+    // The first legal unmet constituent selects the physical component. All
+    // of its admitted classes' frontier obligations are frozen before fees.
     let target = candidates
         .iter()
         .enumerate()
@@ -144,9 +197,10 @@ pub(in super::super) fn extend(
             (!replaced.contains(&index)
                 && selected_priority.is_none_or(|p| p == candidate.input_priority)
                 && complete_raw(&candidate.batch, populations, opportunities, inputs)
-                && extends_class(
+                && extends_frontier(
                     &candidate.batch,
                     &replaced,
+                    &[],
                     candidates,
                     cases,
                     inputs,
@@ -184,8 +238,33 @@ pub(in super::super) fn extend(
     {
         return Ok(());
     }
+    // One preauthorized vector holds disjoint admitted and frontier slices.
+    // No candidate appears twice, so its original capacity remains sufficient.
+    let admitted_count = replaced.len();
     replaced.push(target);
-    replaced.sort_unstable();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if replaced.contains(&index)
+            || selected_priority.is_some_and(|p| p != candidate.input_priority)
+            || !complete_raw(&candidate.batch, populations, opportunities, inputs)
+        {
+            continue;
+        }
+        let first_index = candidate.batch.representative_case_indices[0];
+        if cases[first_index].route == cases[target_index].route
+            && same_domain(&inputs[first_index][0], target_fact)
+            && extends_frontier(
+                &candidate.batch,
+                &replaced[..admitted_count],
+                &replaced[admitted_count..],
+                candidates,
+                cases,
+                inputs,
+                trajectories,
+            )
+        {
+            replaced.push(index);
+        }
+    }
     let count = replaced.iter().try_fold(0usize, |n, &i| {
         add(n, candidates[i].batch.population_indices.len())
     })?;
@@ -231,7 +310,7 @@ pub(in super::super) fn extend(
     if !grouping::preserves_joint_selection(
         candidates,
         &replaced,
-        target,
+        &replaced[admitted_count..],
         &combined,
         capacity,
         selected_priority,
@@ -239,7 +318,7 @@ pub(in super::super) fn extend(
     )? {
         return Ok(());
     }
-    let first = replaced[0];
+    let first = *replaced.iter().min().unwrap();
     let original = replaced
         .iter()
         .map(|&i| candidates[i].original_population_index)
@@ -251,7 +330,8 @@ pub(in super::super) fn extend(
         .max()
         .unwrap();
     tracing::info!(
-        replaced_sources = replaced.len() - 1,
+        replaced_sources = admitted_count,
+        frontier_sources = replaced.len() - admitted_count,
         retained_populations = combined.population_indices.len(),
         algorithms = combined
             .algorithm_universe

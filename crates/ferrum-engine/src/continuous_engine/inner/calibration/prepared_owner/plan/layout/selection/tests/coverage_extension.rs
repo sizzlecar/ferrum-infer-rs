@@ -429,6 +429,15 @@ fn coverage_extension_near_dependent_raw_geometry_is_not_exact_union_span_author
 
 #[test]
 fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
+    joint_extension_fixture(false);
+}
+
+#[test]
+fn joint_extension_freezes_each_class_frontier_before_any_admission() {
+    joint_extension_fixture(true);
+}
+
+fn joint_extension_fixture(multiple_classes: bool) {
     let (mut cases, mut opportunities, mut inputs, population) =
         fixture(CostProductOutput::GreedyToken);
     let (mut full_cases, full_opportunities, full_inputs, _) =
@@ -441,10 +450,140 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
     cases.extend(full_cases);
     opportunities.extend(full_opportunities);
     inputs.extend(full_inputs);
+    if multiple_classes {
+        // Retain a genuinely expanded Full baseline, then give the two unmet
+        // classes wider real rows. The combined obligation costs more than
+        // the baseline, so an exact work bound can reject it atomically while
+        // both original sources still fit.
+        for (index, case) in cases.iter_mut().enumerate() {
+            if case.template < 2 || case.product == OpportunityProduct::Full && case.template == 2 {
+                continue;
+            }
+            case.width = 8;
+            let (name, implementation) = match case.template {
+                2 => ("fixture.extension.c", [73; 32]),
+                3 => ("fixture.extension.d", [74; 32]),
+                _ => unreachable!(),
+            };
+            case.acquisition = work::declared_plan(
+                case,
+                work::PrefixBlueprint {
+                    prompt_tokens: 61,
+                    boundary: 60,
+                    span: CheckpointTokenSpanConstraint::new(
+                        NonZeroU64::new(2).unwrap(),
+                        NonZeroU64::new(2).unwrap(),
+                    )
+                    .unwrap(),
+                    input_tokens_sha256: implementation,
+                },
+                NonZeroU32::new(8).unwrap(),
+                None,
+            )
+            .unwrap();
+            // At width eight the original two-token native span cannot fit
+            // the one-token row chunk. Keep that cold fallback and its full
+            // original work charge; do not retain an incompatible lease.
+            let input = natural_termination_input_with_algorithm_and_eos(
+                case.width as u32,
+                if case.product == OpportunityProduct::Full {
+                    CostProductOutput::FullLogits
+                } else {
+                    CostProductOutput::GreedyToken
+                },
+                true,
+                64,
+                name,
+                implementation,
+                false,
+            );
+            opportunities[index].population = classify_alternatives(
+                std::slice::from_ref(&input),
+                population.population_policy(),
+                true,
+            )
+            .unwrap();
+            inputs[index] = vec![input_facts(&StructuredQueryV2::exact(input)).unwrap()];
+        }
+        // These real typed inputs precede the unmet frontier after the two
+        // admitted sources. Neither an unrelated host nor a raw Prefill may
+        // choose the decode component or consume its frontier obligations.
+        let mut prefill = cases[0].clone();
+        prefill.product = OpportunityProduct::Prefill;
+        prefill.release_generated = 0;
+        prefill.maximum_output = NonZeroUsize::MIN;
+        prefill.prefix = PrefixKind::Ordinary;
+        prefill.acquisition = None;
+        let prefill_input = related::prefill_input_phase(
+            1,
+            8,
+            61,
+            1,
+            SloAutomaticCostProbeSamplingPresetV1::Configured,
+            false,
+        );
+        let mut unrelated = cases[0].clone();
+        unrelated.template = 4;
+        unrelated.acquisition = work::declared_plan(
+            &unrelated,
+            work::PrefixBlueprint {
+                prompt_tokens: 61,
+                boundary: 60,
+                span: CheckpointTokenSpanConstraint::new(
+                    NonZeroU64::new(2).unwrap(),
+                    NonZeroU64::new(2).unwrap(),
+                )
+                .unwrap(),
+                input_tokens_sha256: [71; 32],
+            },
+            NonZeroU32::new(8).unwrap(),
+            None,
+        )
+        .unwrap();
+        let unrelated_input = natural_termination_input_with_algorithm_and_eos(
+            1,
+            CostProductOutput::GreedyToken,
+            true,
+            64,
+            "fixture.extension.a",
+            [71; 32],
+            true,
+        );
+        for (case, input) in [(prefill, prefill_input), (unrelated, unrelated_input)] {
+            opportunities.push(CaseOpportunity {
+                population: classify_alternatives(
+                    std::slice::from_ref(&input),
+                    population.population_policy(),
+                    true,
+                )
+                .unwrap(),
+                minimum_fresh_members: 1,
+            });
+            inputs.push(vec![input_facts(&StructuredQueryV2::exact(input)).unwrap()]);
+            cases.push(case);
+        }
+    }
+    // Check all mutated case bindings before selection, including native
+    // setup keys. The ordinary Prefill and unsupported wide native spans use
+    // the same cold-work path as their actual declarations.
+    for case in &cases {
+        assert_eq!(
+            case.maximum_output.get(),
+            case.release_generated + case.suffix_tokens
+        );
+        work::case_work(case, 61, 8, None).unwrap_or_else(|error| {
+            panic!(
+                "invalid fixture work for template {} width {}: {error}",
+                case.template, case.width
+            )
+        });
+    }
+    work::setup_for_cases(&cases).unwrap();
     let seed = DeclaredAlgorithmUniverseV1::from_inputs(
         inputs
             .iter()
             .flatten()
+            .filter(|f| f.family.is_some())
             .map(|f| f.original.as_deref().unwrap()),
         population.settings.max_axes,
     )
@@ -463,7 +602,7 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
         &cases,
         &opportunities,
         &inputs,
-        &[61; 4],
+        &[61; 5],
         8,
         None,
         &population,
@@ -485,34 +624,47 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
     // A mixed narrow journal and an already expanded Full journal are the
     // protected baseline. The new Greedy obligation uses algorithms already
     // present globally in Full, but absent from the Greedy class's own U.
-    let mut members = [Vec::new(), Vec::new(), Vec::new()];
+    let frontier_start = if multiple_classes { 4 } else { 2 };
+    let mut members = vec![Vec::new(); if multiple_classes { 6 } else { 3 }];
     for (index, member) in checked.populations.iter().enumerate() {
         let case = &cases[member.representative_case_indices[0]];
-        let part = if case.width == 1 {
+        let part = if case.product == OpportunityProduct::Prefill {
+            2
+        } else if case.template == 4 {
+            3
+        } else if case.width == 1 || multiple_classes && case.template < 2 {
             0
         } else if case.product == OpportunityProduct::Full {
-            1
+            if multiple_classes && case.template == 3 {
+                5
+            } else {
+                1
+            }
         } else {
-            2
+            frontier_start
         };
         members[part].push(index);
     }
     let plans: Vec<_> = members
         .iter()
-        .map(|members| {
+        .enumerate()
+        .map(|(part, members)| {
             assert!(!members.is_empty());
             let raw = batch_plan(
                 members,
                 &checked.populations,
                 &cases,
                 &opportunities,
-                &[61; 4],
+                &[61; 5],
                 8,
                 None,
                 &population,
             )
             .unwrap();
-            super::super::composition::extension_candidate(
+            if cases[raw.representative_case_indices[0]].product == OpportunityProduct::Prefill {
+                return raw;
+            }
+            let candidate = super::super::composition::extension_candidate(
                 &raw,
                 None,
                 std::iter::empty(),
@@ -521,15 +673,57 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
                 &opportunities,
                 &inputs,
                 None,
-                &[61; 4],
+                &[61; 5],
                 8,
                 None,
                 &population,
                 &seed,
                 allocation,
             )
-            .unwrap()
-            .unwrap()
+            .unwrap();
+            candidate.unwrap_or_else(|| {
+                // A previously unadmitted target need not be finite by
+                // itself. Its cold wide-only schedule cannot use the cheap
+                // original representatives until the whole joint is built.
+                // Preserve that real scoped periodic candidate, as the
+                // production frontier does, without promoting its schedule.
+                assert!(
+                    part >= frontier_start,
+                    "baseline part {part} lost its finite plan"
+                );
+                let local = DeclaredAlgorithmUniverseV1::from_inputs(
+                    raw.representative_case_indices
+                        .iter()
+                        .flat_map(|&i| inputs[i].iter().map(|f| f.original.as_deref().unwrap())),
+                    population.settings.max_axes,
+                )
+                .unwrap();
+                let scoped = batch_plan_with_scope(
+                    members,
+                    &checked.populations,
+                    &cases,
+                    &opportunities,
+                    &[61; 5],
+                    8,
+                    None,
+                    &population,
+                    Some((&inputs, &local)),
+                    allocation,
+                )
+                .unwrap();
+                let packing = super::super::composition::packing_valid(
+                    &scoped,
+                    &inputs,
+                    None,
+                    &population,
+                    &seed,
+                )
+                .unwrap();
+                assert!(packing, "target part {part} lost its checked scope");
+                assert!(scoped.schedule_within_capacity);
+                assert!(scoped.finite_plan().is_none());
+                scoped
+            })
         })
         .collect();
     let make_candidates = || {
@@ -563,7 +757,7 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
             index < 2
         );
     }
-    let target_input = inputs[plans[2].representative_case_indices[0]][0]
+    let target_input = inputs[plans[frontier_start].representative_case_indices[0]][0]
         .original
         .as_deref()
         .unwrap();
@@ -583,7 +777,9 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
             .contains_checked_algorithms(target_input),
         Ok(true)
     );
-    let run = |candidates: &mut Vec<BatchCandidate>, populations: &[SelectedPopulation]| {
+    let run = |candidates: &mut Vec<BatchCandidate>,
+               populations: &[SelectedPopulation],
+               available: SelectionCapacity| {
         super::super::coverage_extension::joint::extend(
             candidates,
             populations,
@@ -591,11 +787,11 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
             &opportunities,
             &inputs,
             None,
-            &[61; 4],
+            &[61; 5],
             8,
             None,
             &population,
-            capacity,
+            available,
             None,
             sources,
             &seed,
@@ -604,12 +800,12 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
         .unwrap();
     };
     let mut candidates = make_candidates();
-    run(&mut candidates, &checked.populations);
-    assert_eq!(candidates.len(), 1);
+    run(&mut candidates, &checked.populations, capacity);
     let combined = &candidates[0].batch;
     assert!(combined.finite_plan().is_some());
     assert_eq!(combined.algorithm_universe.as_ref(), Some(&seed));
-    for old in &plans {
+    let required_plans = plans[..2].iter().chain(&plans[frontier_start..]);
+    for old in required_plans {
         assert!(combined
             .algorithm_universe
             .as_ref()
@@ -641,6 +837,36 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
             );
         }
     }
+    if multiple_classes {
+        for unrelated in &plans[2..frontier_start] {
+            assert!(unrelated
+                .population_indices
+                .iter()
+                .all(|i| !combined.population_indices.contains(i)));
+        }
+        let full_target = inputs[plans[5].representative_case_indices[0]][0]
+            .original
+            .as_deref()
+            .unwrap();
+        assert_eq!(
+            plans[1]
+                .algorithm_universe
+                .as_ref()
+                .unwrap()
+                .contains_checked_algorithms(full_target),
+            Ok(false)
+        );
+        // Greedy's target already declares this algorithm globally, but that
+        // cannot discharge the Full class's independent input obligation.
+        assert_eq!(
+            plans[frontier_start]
+                .algorithm_universe
+                .as_ref()
+                .unwrap()
+                .contains_checked_algorithms(full_target),
+            Ok(true)
+        );
+    }
     related::assert_complete_input_plan(combined);
     // Exact real work bounds are checked independently of baseline admission;
     // a cheaper standalone alternative is not falsely required to disappear.
@@ -649,7 +875,9 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
         execution_actions: combined.serial_wave_upper_bound,
         declared_offer_rows: combined.declared_offer_row_bound,
     };
-    for capacity in [
+    let replaced: Vec<_> = (0..2).chain(frontier_start..plans.len()).collect();
+    let targets: Vec<_> = (frontier_start..plans.len()).collect();
+    for available in [
         SelectionCapacity {
             requests: exact.requests - 1,
             ..exact
@@ -665,23 +893,49 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
     ] {
         assert!(!grouping::preserves_joint_selection(
             &make_candidates(),
-            &[0, 1, 2],
-            2,
+            &replaced,
+            &targets,
             combined,
-            capacity,
+            available,
             None,
             sources
         )
         .unwrap());
     }
+    if multiple_classes {
+        // The joint can save requests by sharing the original cheap filler.
+        // Isolate the actual added execution work: leave the other original
+        // capacities intact, and first prove both baseline sources still fit.
+        let available = SelectionCapacity {
+            execution_actions: exact.execution_actions - 1,
+            ..capacity
+        };
+        let (mut used, mut count) = (SelectionCapacity::default(), 0);
+        for original in &plans[..2] {
+            assert!(grouping::reserve(
+                original,
+                0,
+                available,
+                None,
+                Some(sources),
+                &mut used,
+                &mut count,
+            )
+            .unwrap());
+        }
+        let mut rejected = make_candidates();
+        run(&mut rejected, &checked.populations, available);
+        assert_eq!(
+            serde_json::to_value(rejected.iter().map(|c| &c.batch).collect::<Vec<_>>()).unwrap(),
+            serde_json::to_value(&plans).unwrap()
+        );
+    }
     let mut invalid = checked.populations.clone();
-    invalid[members[2][0]]
-        .input_geometry
-        .as_mut()
-        .unwrap()
-        .complete = false;
+    for family in &members[frontier_start..] {
+        invalid[family[0]].input_geometry.as_mut().unwrap().complete = false;
+    }
     let mut rejected = make_candidates();
-    run(&mut rejected, &invalid);
+    run(&mut rejected, &invalid, capacity);
     assert_eq!(
         serde_json::to_value(rejected.iter().map(|c| &c.batch).collect::<Vec<_>>()).unwrap(),
         serde_json::to_value(&plans).unwrap()
@@ -691,8 +945,13 @@ fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
         ..Default::default()
     };
     append_batch(&mut proposed, candidates.remove(0).batch, capacity, None).unwrap();
-    assert!(proposed.populations.iter().all(|p| p.scheduled));
-    finite_policy::assert_work(&proposed, &cases, &[61; 4], 8);
+    for plan in plans[..2].iter().chain(&plans[frontier_start..]) {
+        assert!(plan
+            .population_indices
+            .iter()
+            .all(|&i| proposed.populations[i].scheduled));
+    }
+    finite_policy::assert_work(&proposed, &cases, &[61; 5], 8);
     assert_eq!(
         serde_json::to_value(&checked.populations).unwrap(),
         geometry_before

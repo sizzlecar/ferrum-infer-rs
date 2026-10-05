@@ -257,23 +257,27 @@ pub(super) fn preserves_scheduled(
 
 /// Compare one complete frozen baseline with a many-to-one journal proposal.
 /// No partial replacement is published: every old admitted source must remain
-/// covered, and the specifically chosen new obligation must actually be admitted.
+/// covered, and every frozen frontier obligation must actually be admitted.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn preserves_joint_selection(
     candidates: &[BatchCandidate],
     replaced: &[usize],
-    target: usize,
+    targets: &[usize],
     combined: &SelectedBatch,
     capacity: SelectionCapacity,
     selected_priority: Option<u8>,
     maximum_sources: NonZeroUsize,
 ) -> Result<bool> {
-    let Some(&first) = replaced.first() else {
+    let Some(&first) = replaced.iter().min() else {
         return Ok(false);
     };
-    if !replaced.contains(&target)
-        || replaced.last().is_none_or(|&last| last >= candidates.len())
-        || replaced.windows(2).any(|pair| pair[0] >= pair[1])
+    if targets.is_empty()
+        || targets.iter().enumerate().any(|(position, target)| {
+            !replaced.contains(target) || targets[..position].contains(target)
+        })
+        || replaced.iter().enumerate().any(|(position, index)| {
+            *index >= candidates.len() || replaced[..position].contains(index)
+        })
         || replaced.iter().any(|&index| {
             let old = &candidates[index].batch;
             old.population_indices
@@ -289,7 +293,7 @@ pub(super) fn preserves_joint_selection(
     }
     let (mut original, mut proposed) = (SelectionCapacity::default(), SelectionCapacity::default());
     let (mut original_sources, mut proposed_sources) = (0, 0);
-    let (mut union_scheduled, mut target_added) = (false, false);
+    let (mut union_scheduled, mut targets_added) = (false, 0);
     for (index, candidate) in candidates.iter().enumerate() {
         let before = reserve(
             &candidate.batch,
@@ -301,7 +305,7 @@ pub(super) fn preserves_joint_selection(
             &mut original_sources,
         )?;
         let replaced_source = replaced.contains(&index);
-        if replaced_source && before == (index == target) {
+        if replaced_source && before == targets.contains(&index) {
             return Ok(false);
         }
         let after = if replaced_source && index != first {
@@ -328,9 +332,9 @@ pub(super) fn preserves_joint_selection(
         if before && !after {
             return Ok(false);
         }
-        if index == target {
-            target_added = !before && after;
+        if targets.contains(&index) && !before && after {
+            targets_added += 1;
         }
     }
-    Ok(union_scheduled && target_added)
+    Ok(union_scheduled && targets_added == targets.len())
 }
