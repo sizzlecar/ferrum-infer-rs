@@ -4,7 +4,7 @@
 use super::*;
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1;
 
-fn compatible(
+fn structurally_compatible(
     a: &BatchCandidate,
     b: &BatchCandidate,
     populations: &[SelectedPopulation],
@@ -47,8 +47,6 @@ fn compatible(
                 && opportunities[i].minimum_fresh_members > 0
                 && inputs[i].iter().all(|fact| {
                     fact.owner.role == first.owner.role
-                        && fact.owner.product == first.owner.product
-                        && fact.owner.readback == first.owner.readback
                         && fact.homogeneous_host_policy.is_some()
                         && fact.family.is_some_and(|key| {
                             key.workload_domain_signature() == family.workload_domain_signature()
@@ -59,6 +57,36 @@ fn compatible(
                             .is_some_and(|input| input.algorithm_universe_signature().is_none())
                 })
         })
+        // Reject disjoint product/readback classes before replaying admission.
+        // A journal may already contain several independently checked classes.
+        && a.batch.representative_case_indices.iter().any(|&i| {
+            inputs[i].iter().any(|left| {
+                b.batch.representative_case_indices.iter().any(|&j| {
+                    inputs[j].iter().any(|right| same_class(left, right))
+                })
+            })
+        })
+}
+
+fn same_class(left: &CheckedInputFacts, right: &CheckedInputFacts) -> bool {
+    left.owner.role == right.owner.role
+        && left.owner.product == right.owner.product
+        && left.owner.readback == right.owner.readback
+}
+
+fn retains_classes(
+    existing: &SelectedBatch,
+    additional: &SelectedBatch,
+    inputs: &[Vec<CheckedInputFacts>],
+) -> bool {
+    additional.representative_case_indices.iter().all(|&i| {
+        inputs[i].iter().all(|new| {
+            existing
+                .representative_case_indices
+                .iter()
+                .any(|&j| inputs[j].iter().any(|old| same_class(old, new)))
+        })
+    })
 }
 
 /// Borrowed reservation replay: extension must add one of these two original
@@ -121,7 +149,7 @@ pub(super) fn extend(
         while second < candidates.len() {
             let a = &candidates[first];
             let b = &candidates[second];
-            if !compatible(
+            if !structurally_compatible(
                 a,
                 b,
                 populations,
@@ -153,6 +181,13 @@ pub(super) fn extend(
                 second += 1;
                 continue;
             };
+            // Only extend classes present in the actually admitted journal.
+            // Keep every old constituent; neither shared scope nor admission
+            // turns another product/readback into one of its numerical families.
+            if !retains_classes(existing, additional, inputs) {
+                second += 1;
+                continue;
+            }
             let mut members = a.batch.population_indices.clone();
             members.extend_from_slice(&b.batch.population_indices);
             members.sort_unstable();
