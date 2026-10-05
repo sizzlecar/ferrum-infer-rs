@@ -426,3 +426,278 @@ fn coverage_extension_near_dependent_raw_geometry_is_not_exact_union_span_author
     // This test grants no common-scope geometry or numerical model. Fresh
     // fit, residual, qualification and ordinary adoption remain separate gates.
 }
+
+#[test]
+fn joint_extension_preserves_expanded_product_and_adds_only_uncovered_class() {
+    let (mut cases, mut opportunities, mut inputs, population) =
+        fixture(CostProductOutput::GreedyToken);
+    let (mut full_cases, full_opportunities, full_inputs, _) =
+        fixture(CostProductOutput::FullLogits);
+    // Both products are actual declared outputs of the same execution route.
+    // The original native checkpoint key does not include the output route.
+    for case in &mut full_cases {
+        case.route = CalibrationDecodeRoute::Actual;
+    }
+    cases.extend(full_cases);
+    opportunities.extend(full_opportunities);
+    inputs.extend(full_inputs);
+    let seed = DeclaredAlgorithmUniverseV1::from_inputs(
+        inputs
+            .iter()
+            .flatten()
+            .map(|f| f.original.as_deref().unwrap()),
+        population.settings.max_axes,
+    )
+    .unwrap();
+    let capacity = SelectionCapacity {
+        requests: 2048,
+        execution_actions: 16384,
+        declared_offer_rows: 16384,
+    };
+    let sources = NonZeroUsize::new(2).unwrap();
+    let allocation = InputAllocationPolicy::FinitePreferred {
+        maximum_requests: capacity.requests,
+    };
+    let mut geometry = StructuredInputGeometryWorkV1::new(NonZeroU64::new(32_000_000).unwrap());
+    let checked = select_with_capacity(
+        &cases,
+        &opportunities,
+        &inputs,
+        &[61; 4],
+        8,
+        None,
+        &population,
+        capacity,
+        usize::MAX,
+        None,
+        None,
+        Some(&mut geometry),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(checked
+        .populations
+        .iter()
+        .all(|p| p.input_geometry.as_ref().unwrap().complete));
+    let geometry_before = serde_json::to_value(&checked.populations).unwrap();
+    let spent = geometry.visits();
+    // A mixed narrow journal and an already expanded Full journal are the
+    // protected baseline. The new Greedy obligation uses algorithms already
+    // present globally in Full, but absent from the Greedy class's own U.
+    let mut members = [Vec::new(), Vec::new(), Vec::new()];
+    for (index, member) in checked.populations.iter().enumerate() {
+        let case = &cases[member.representative_case_indices[0]];
+        let part = if case.width == 1 {
+            0
+        } else if case.product == OpportunityProduct::Full {
+            1
+        } else {
+            2
+        };
+        members[part].push(index);
+    }
+    let plans: Vec<_> = members
+        .iter()
+        .map(|members| {
+            assert!(!members.is_empty());
+            let raw = batch_plan(
+                members,
+                &checked.populations,
+                &cases,
+                &opportunities,
+                &[61; 4],
+                8,
+                None,
+                &population,
+            )
+            .unwrap();
+            super::super::composition::extension_candidate(
+                &raw,
+                None,
+                std::iter::empty(),
+                &checked.populations,
+                &cases,
+                &opportunities,
+                &inputs,
+                None,
+                &[61; 4],
+                8,
+                None,
+                &population,
+                &seed,
+                allocation,
+            )
+            .unwrap()
+            .unwrap()
+        })
+        .collect();
+    let make_candidates = || {
+        plans
+            .iter()
+            .cloned()
+            .map(|batch| BatchCandidate {
+                input_priority: 0,
+                coverage: CoveragePriority::from_cases(&batch.representative_case_indices, &cases)
+                    .unwrap(),
+                coverage_round: 0,
+                decode_width_tier: 0,
+                original_population_index: batch.population_indices[0],
+                batch,
+            })
+            .collect::<Vec<_>>()
+    };
+    let (mut used, mut count) = (SelectionCapacity::default(), 0);
+    for (index, plan) in plans.iter().enumerate() {
+        assert_eq!(
+            grouping::reserve(
+                plan,
+                0,
+                capacity,
+                None,
+                Some(sources),
+                &mut used,
+                &mut count
+            )
+            .unwrap(),
+            index < 2
+        );
+    }
+    let target_input = inputs[plans[2].representative_case_indices[0]][0]
+        .original
+        .as_deref()
+        .unwrap();
+    assert_eq!(
+        plans[0]
+            .algorithm_universe
+            .as_ref()
+            .unwrap()
+            .contains_checked_algorithms(target_input),
+        Ok(false)
+    );
+    assert_eq!(
+        plans[1]
+            .algorithm_universe
+            .as_ref()
+            .unwrap()
+            .contains_checked_algorithms(target_input),
+        Ok(true)
+    );
+    let run = |candidates: &mut Vec<BatchCandidate>, populations: &[SelectedPopulation]| {
+        super::super::coverage_extension::joint::extend(
+            candidates,
+            populations,
+            &cases,
+            &opportunities,
+            &inputs,
+            None,
+            &[61; 4],
+            8,
+            None,
+            &population,
+            capacity,
+            None,
+            sources,
+            &seed,
+            allocation,
+        )
+        .unwrap();
+    };
+    let mut candidates = make_candidates();
+    run(&mut candidates, &checked.populations);
+    assert_eq!(candidates.len(), 1);
+    let combined = &candidates[0].batch;
+    assert!(combined.finite_plan().is_some());
+    assert_eq!(combined.algorithm_universe.as_ref(), Some(&seed));
+    for old in &plans {
+        assert!(combined
+            .algorithm_universe
+            .as_ref()
+            .unwrap()
+            .contains_universe(old.algorithm_universe.as_ref().unwrap()));
+        assert!(old
+            .population_indices
+            .iter()
+            .all(|i| combined.population_indices.contains(i)));
+        for &index in &old.representative_case_indices {
+            let position = combined
+                .representative_case_indices
+                .iter()
+                .position(|&i| i == index)
+                .unwrap();
+            assert_eq!(
+                combined.scoped_opportunities.as_ref().unwrap()[position].minimum_fresh_members,
+                opportunities[index].minimum_fresh_members
+            );
+            let expected = super::super::composition::project_opportunity(
+                &opportunities[index],
+                &inputs[index],
+                &seed,
+            )
+            .unwrap();
+            assert_eq!(
+                combined.scoped_opportunities.as_ref().unwrap()[position].population,
+                expected.population
+            );
+        }
+    }
+    related::assert_complete_input_plan(combined);
+    // Exact real work bounds are checked independently of baseline admission;
+    // a cheaper standalone alternative is not falsely required to disappear.
+    let exact = SelectionCapacity {
+        requests: combined.requests,
+        execution_actions: combined.serial_wave_upper_bound,
+        declared_offer_rows: combined.declared_offer_row_bound,
+    };
+    for capacity in [
+        SelectionCapacity {
+            requests: exact.requests - 1,
+            ..exact
+        },
+        SelectionCapacity {
+            execution_actions: exact.execution_actions - 1,
+            ..exact
+        },
+        SelectionCapacity {
+            declared_offer_rows: exact.declared_offer_rows - 1,
+            ..exact
+        },
+    ] {
+        assert!(!grouping::preserves_joint_selection(
+            &make_candidates(),
+            &[0, 1, 2],
+            2,
+            combined,
+            capacity,
+            None,
+            sources
+        )
+        .unwrap());
+    }
+    let mut invalid = checked.populations.clone();
+    invalid[members[2][0]]
+        .input_geometry
+        .as_mut()
+        .unwrap()
+        .complete = false;
+    let mut rejected = make_candidates();
+    run(&mut rejected, &invalid);
+    assert_eq!(
+        serde_json::to_value(rejected.iter().map(|c| &c.batch).collect::<Vec<_>>()).unwrap(),
+        serde_json::to_value(&plans).unwrap()
+    );
+    let mut proposed = CheckedSelection {
+        populations: checked.populations.clone(),
+        ..Default::default()
+    };
+    append_batch(&mut proposed, candidates.remove(0).batch, capacity, None).unwrap();
+    assert!(proposed.populations.iter().all(|p| p.scheduled));
+    finite_policy::assert_work(&proposed, &cases, &[61; 4], 8);
+    assert_eq!(
+        serde_json::to_value(&checked.populations).unwrap(),
+        geometry_before
+    );
+    assert_eq!(geometry.visits(), spent);
+    // These are input obligations and a freshly planned schedule, not samples,
+    // parameters or a qualification certificate borrowed from either old U.
+}

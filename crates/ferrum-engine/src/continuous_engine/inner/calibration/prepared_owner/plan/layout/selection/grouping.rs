@@ -254,3 +254,83 @@ pub(super) fn preserves_scheduled(
     // that can now use the released journal slot.
     Ok(!require_combined || union_scheduled && coverage_gained)
 }
+
+/// Compare one complete frozen baseline with a many-to-one journal proposal.
+/// No partial replacement is published: every old admitted source must remain
+/// covered, and the specifically chosen new obligation must actually be admitted.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn preserves_joint_selection(
+    candidates: &[BatchCandidate],
+    replaced: &[usize],
+    target: usize,
+    combined: &SelectedBatch,
+    capacity: SelectionCapacity,
+    selected_priority: Option<u8>,
+    maximum_sources: NonZeroUsize,
+) -> Result<bool> {
+    let Some(&first) = replaced.first() else {
+        return Ok(false);
+    };
+    if !replaced.contains(&target)
+        || replaced.last().is_none_or(|&last| last >= candidates.len())
+        || replaced.windows(2).any(|pair| pair[0] >= pair[1])
+        || replaced.iter().any(|&index| {
+            let old = &candidates[index].batch;
+            old.population_indices
+                .iter()
+                .any(|i| !combined.population_indices.contains(i))
+                || old
+                    .representative_case_indices
+                    .iter()
+                    .any(|i| !combined.representative_case_indices.contains(i))
+        })
+    {
+        return Ok(false);
+    }
+    let (mut original, mut proposed) = (SelectionCapacity::default(), SelectionCapacity::default());
+    let (mut original_sources, mut proposed_sources) = (0, 0);
+    let (mut union_scheduled, mut target_added) = (false, false);
+    for (index, candidate) in candidates.iter().enumerate() {
+        let before = reserve(
+            &candidate.batch,
+            candidate.input_priority,
+            capacity,
+            selected_priority,
+            Some(maximum_sources),
+            &mut original,
+            &mut original_sources,
+        )?;
+        let replaced_source = replaced.contains(&index);
+        if replaced_source && before == (index == target) {
+            return Ok(false);
+        }
+        let after = if replaced_source && index != first {
+            union_scheduled
+        } else {
+            let admitted = reserve(
+                if index == first {
+                    combined
+                } else {
+                    &candidate.batch
+                },
+                candidate.input_priority,
+                capacity,
+                selected_priority,
+                Some(maximum_sources),
+                &mut proposed,
+                &mut proposed_sources,
+            )?;
+            if index == first {
+                union_scheduled = admitted;
+            }
+            admitted
+        };
+        if before && !after {
+            return Ok(false);
+        }
+        if index == target {
+            target_added = !before && after;
+        }
+    }
+    Ok(union_scheduled && target_added)
+}

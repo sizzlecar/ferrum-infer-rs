@@ -849,6 +849,15 @@ fn select_prepared_inputs(
     } else {
         InputAllocationPolicy::PeriodicOnly
     };
+    // Optional joint replacement retains one index per baseline candidate.
+    // Do not add it to the original composition/finite authorization: failure
+    // here must leave every previously affordable baseline source unchanged.
+    let joint_authorized = peak
+        .checked_add(finite_extra)
+        .and_then(|bytes| {
+            bytes.checked_add(vector_peak_bytes::<usize>(memory.guaranteed_groups).ok()?)
+        })
+        .is_some_and(|bytes| bytes <= maximum_retained_bytes);
     tracing::info!(
         ?allocation,
         finite_extra,
@@ -1170,6 +1179,28 @@ fn select_prepared_inputs(
                 seed,
                 allocation,
             )?;
+            if joint_authorized && batch_candidates.len() <= memory.guaranteed_groups {
+                // The complete original extension is the protected baseline.
+                // No measured source has run and the entire series is still
+                // charged once, after the chosen source list is frozen.
+                coverage_extension::joint::extend(
+                    &mut batch_candidates,
+                    &out.populations,
+                    cases,
+                    opportunities,
+                    inputs,
+                    trajectories,
+                    prompts,
+                    chunk,
+                    prefill_row_ceiling,
+                    population,
+                    capacity,
+                    selected_priority,
+                    maximum_sources,
+                    seed,
+                    allocation,
+                )?;
+            }
         }
     }
     let mut scheduled_sources = 0_usize;

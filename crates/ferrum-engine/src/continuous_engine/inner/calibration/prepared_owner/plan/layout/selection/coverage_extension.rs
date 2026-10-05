@@ -4,6 +4,8 @@
 use super::*;
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::DeclaredAlgorithmUniverseV1;
 
+pub(super) mod joint;
+
 fn compatible(
     a: &BatchCandidate,
     b: &BatchCandidate,
@@ -170,8 +172,8 @@ pub(super) fn extend(
             )?;
             let Some(combined) = composition::extension_candidate(
                 &raw,
-                existing_scope,
-                additional.algorithm_universe.as_ref(),
+                Some(existing_scope),
+                std::iter::once(existing_scope).chain(additional.algorithm_universe.as_ref()),
                 populations,
                 cases,
                 opportunities,

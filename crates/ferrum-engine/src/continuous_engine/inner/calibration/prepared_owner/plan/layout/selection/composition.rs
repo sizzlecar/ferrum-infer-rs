@@ -106,6 +106,24 @@ fn facts<'a>(
         .flat_map(|&index| &inputs[index])
 }
 
+pub(super) fn case_recipes<'a>(
+    index: usize,
+    inputs: &'a [Vec<CheckedInputFacts>],
+    trajectories: Option<&'a inventory::CheckedCaseInventory>,
+) -> impl Iterator<Item = &'a ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredInputV2> + Clone{
+    let indices = trajectories.map_or(&[][..], |inventory| {
+        inventory.algorithm_case_inputs[index].as_slice()
+    });
+    inputs[index]
+        .iter()
+        .filter_map(|fact| fact.original.as_deref())
+        .chain(
+            indices
+                .iter()
+                .map(move |&input| trajectories.unwrap().algorithm_inputs[input].as_ref()),
+        )
+}
+
 fn recipes<'a>(
     batch: &'a SelectedBatch,
     inputs: &'a [Vec<CheckedInputFacts>],
@@ -114,19 +132,7 @@ fn recipes<'a>(
     batch
         .representative_case_indices
         .iter()
-        .flat_map(move |&index| {
-            let indices = trajectories.map_or(&[][..], |inventory| {
-                inventory.algorithm_case_inputs[index].as_slice()
-            });
-            inputs[index]
-                .iter()
-                .filter_map(|fact| fact.original.as_deref())
-                .chain(
-                    indices
-                        .iter()
-                        .map(move |&input| trajectories.unwrap().algorithm_inputs[input].as_ref()),
-                )
-        })
+        .flat_map(move |&index| case_recipes(index, inputs, trajectories))
 }
 
 fn same_requirement(left: &CheckedInputFacts, right: &CheckedInputFacts) -> bool {
@@ -367,10 +373,10 @@ pub(super) fn scoped_candidate(
 /// Only its original raw recipes establish the new declaration; existing
 /// scoped inputs cannot be relabelled or contribute old fitted parameters.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn extension_candidate(
+pub(super) fn extension_candidate<'a>(
     raw: &SelectedBatch,
-    admitted_scope: &DeclaredAlgorithmUniverseV1,
-    additional_scope: Option<&DeclaredAlgorithmUniverseV1>,
+    growth_from: Option<&DeclaredAlgorithmUniverseV1>,
+    protected_scopes: impl Iterator<Item = &'a DeclaredAlgorithmUniverseV1>,
     populations: &[SelectedPopulation],
     cases: &[Case],
     opportunities: &[CaseOpportunity],
@@ -402,14 +408,16 @@ pub(super) fn extension_candidate(
         if input.algorithm_universe_signature().is_some() || builder.observe(input).is_err() {
             return Ok(None);
         }
-        added_algorithm |= admitted_scope.contains_checked_algorithms(input) == Ok(false);
+        added_algorithm |=
+            growth_from.is_some_and(|scope| scope.contains_checked_algorithms(input) == Ok(false));
     }
     let local = match builder.finish() {
         Ok(local)
-            if added_algorithm
+            if (growth_from.is_none() || added_algorithm)
                 && seed.contains_universe(&local)
-                && local.contains_universe(admitted_scope)
-                && additional_scope.is_none_or(|old| local.contains_universe(old)) =>
+                && protected_scopes
+                    .into_iter()
+                    .all(|old| local.contains_universe(old)) =>
         {
             local
         }
