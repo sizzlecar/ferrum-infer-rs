@@ -13,6 +13,12 @@ pub(in crate::backend::cuda::vnext_ops::transformer::causal_attention) struct Co
     cuda: CudaCausalAttentionShape,
     classes: Vec<(&'static str, [u32; 3], SelectedAlgorithmClassV1)>,
     gemms: [PreparedGemmF16Cost; 4],
+    observation: std::sync::OnceLock<Option<ObservationRetention>>,
+}
+
+struct ObservationRetention {
+    budget: std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    _lease: ferrum_interfaces::vnext::DeviceObservationTemplateReservation,
 }
 
 impl CostTemplate {
@@ -110,7 +116,56 @@ impl CostTemplate {
                 matrix(shape.kv_features, shape.hidden_size)?,
                 matrix(shape.hidden_size, shape.query_features)?,
             ],
+            observation: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Share the original plan-node table, charging it once while any plan or
+    /// queued actual recipe retains it. A full or different ledger only loses
+    /// this optimization; the original current-work projector stays usable.
+    pub(super) fn for_observation(
+        self: &std::sync::Arc<Self>,
+        shape: CausalAttentionShape,
+        precision: CausalPrecision,
+        projection: CausalProjection,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Option<std::sync::Arc<Self>> {
+        let projection_matches = match (self.projection, projection) {
+            (CausalProjection::F16, CausalProjection::F16) => true,
+            (
+                CausalProjection::Native {
+                    transform_bytes_per_token: a,
+                },
+                CausalProjection::Native {
+                    transform_bytes_per_token: b,
+                },
+            ) => a == b,
+            _ => false,
+        };
+        if self.shape != shape || self.precision != precision || !projection_matches {
+            return None;
+        }
+        let retention = self
+            .observation
+            .get_or_init(|| {
+                let bytes = self.observation_payload_bytes()?;
+                Some(ObservationRetention {
+                    _lease: budget.reserve(bytes).ok()?,
+                    budget: std::sync::Arc::clone(budget),
+                })
+            })
+            .as_ref()?;
+        std::sync::Arc::ptr_eq(&retention.budget, budget).then(|| std::sync::Arc::clone(self))
+    }
+
+    pub(super) fn observation_payload_bytes(&self) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(self.classes.capacity().checked_mul(std::mem::size_of::<(
+                &'static str,
+                [u32; 3],
+                SelectedAlgorithmClassV1,
+            )>())?)?
+            .checked_add(2 * std::mem::size_of::<usize>())
     }
 
     pub(in crate::backend::cuda::vnext_ops::transformer::causal_attention) fn geometry(

@@ -42,7 +42,7 @@ impl PreparedOperationCostData {
         Self(Arc::new(value))
     }
 
-    pub(super) fn get<T: Any>(&self) -> Option<&T> {
+    pub(in crate::vnext::operation) fn get<T: Any>(&self) -> Option<&T> {
         self.0.downcast_ref()
     }
 }

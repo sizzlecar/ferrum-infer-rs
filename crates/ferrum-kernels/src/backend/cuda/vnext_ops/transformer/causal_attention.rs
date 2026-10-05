@@ -2288,6 +2288,14 @@ fn encode_attention(
                     library_identity,
                     budget,
                 )
+                .map(|recipe| {
+                    recipe.with_prepared_template(
+                        invocation
+                            .prepared_cost_data::<cost_route::PreparedCostData>()
+                            .map(cost_route::PreparedCostData::observation_template),
+                        budget,
+                    )
+                })
             })
             .and_then(|recipe| {
                 super::replay_cost::CudaReplayCostRecipe::causal(

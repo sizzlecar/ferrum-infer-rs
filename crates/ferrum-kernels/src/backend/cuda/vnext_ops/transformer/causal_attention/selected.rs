@@ -480,6 +480,7 @@ pub(in crate::backend::cuda::vnext_ops::transformer) struct Recipe {
     tokens: u64,
     packed: bool,
     retained: usize,
+    template: Option<std::sync::Arc<CostTemplate>>,
     _construction: ferrum_interfaces::vnext::DeviceObservationTemplateReservation,
 }
 impl Recipe {
@@ -616,7 +617,18 @@ impl Recipe {
             tokens: prepared.total_tokens,
             packed: prepared.packed.is_some(),
             retained,
+            template: None,
         })
+    }
+    pub(super) fn with_prepared_template(
+        mut self,
+        template: Option<&std::sync::Arc<CostTemplate>>,
+        budget: &std::sync::Arc<ferrum_interfaces::vnext::DeviceObservationTemplateBudget>,
+    ) -> Self {
+        self.template = template.and_then(|template| {
+            template.for_observation(self.shape, self.precision, self.projection, budget)
+        });
+        self
     }
     pub(in crate::backend::cuda::vnext_ops::transformer) fn retained_payload_bytes(&self) -> usize {
         self.retained
@@ -667,6 +679,16 @@ impl Recipe {
             Some(parts) => ProjectionWork::Native([&parts[0], &parts[1], &parts[2], &parts[3]]),
             None => ProjectionWork::DenseF16(self.library?),
         };
+        if let Some(template) = &self.template {
+            if let Some(evidence) = template
+                .geometry(self.policy, self.tokens, rows.len())
+                .ok()
+                .and_then(|geometry| geometry.finish(&rows, self.packed, projections))
+                .and_then(|query| query.compute(SloStructuredCostCapture::HostSettledV1))
+            {
+                return Some(evidence);
+            }
+        }
         compute(
             self.shape,
             self.precision,

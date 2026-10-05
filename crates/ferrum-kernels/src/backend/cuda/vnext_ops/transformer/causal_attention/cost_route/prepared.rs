@@ -8,7 +8,7 @@ pub(in crate::backend::cuda::vnext_ops::transformer::causal_attention) struct Pr
     pub(super) projection: CausalProjection,
     pub(super) rounded: bool,
     pub(super) parts: Vec<Vec<weights::MatrixPart>>,
-    pub(super) template: selected::CostTemplate,
+    pub(super) template: std::sync::Arc<selected::CostTemplate>,
 }
 
 impl PreparedCostData {
@@ -51,12 +51,20 @@ impl PreparedCostData {
                 .collect::<Result<Vec<_>, String>>()?
         };
         Ok(Some(Self {
-            template: selected::CostTemplate::new(shape, precision, projection)?,
+            template: std::sync::Arc::new(selected::CostTemplate::new(
+                shape, precision, projection,
+            )?),
             shape,
             projection,
             rounded,
             parts,
         }))
+    }
+
+    pub(in crate::backend::cuda::vnext_ops::transformer::causal_attention) fn observation_template(
+        &self,
+    ) -> &std::sync::Arc<selected::CostTemplate> {
+        &self.template
     }
 }
 

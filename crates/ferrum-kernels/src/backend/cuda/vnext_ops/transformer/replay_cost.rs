@@ -131,6 +131,28 @@ impl CudaReplayCostRecipe {
     pub(crate) fn captured_input(&self) -> &FrozenObservationInput {
         &self.captured_input
     }
+    /// These recipes use only the checked immediate partition and immutable
+    /// encoder metadata. Causal attention additionally uses current source
+    /// positions and must always project fresh numerical work.
+    pub(crate) fn can_reuse_static_observation(&self, input: &FrozenObservationInput) -> bool {
+        let fixed = match &self.kind {
+            RecipeKind::Causal(_) => false,
+            RecipeKind::AttentionBindings { .. }
+            | RecipeKind::CausalBindings { .. }
+            | RecipeKind::Primitive { .. }
+            | RecipeKind::NativeFfn(_)
+            | RecipeKind::Attention(_)
+            | RecipeKind::DenseEmbedding { .. }
+            | RecipeKind::NativeEmbedding { .. }
+            | RecipeKind::NativeHead { .. }
+            | RecipeKind::Argmax { .. }
+            | RecipeKind::RnFragmentFfn { .. }
+            | RecipeKind::DenseFfn { .. } => true,
+        };
+        fixed
+            && input.tokens() == self.captured_input.tokens()
+            && input.participant_ranges() == self.captured_input.participant_ranges()
+    }
     pub(crate) fn retained_payload_bytes(&self) -> Option<usize> {
         let extra = match &self.kind {
             RecipeKind::CausalBindings { bytes } => {

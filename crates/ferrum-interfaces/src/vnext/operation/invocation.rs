@@ -1156,6 +1156,7 @@ pub struct BatchedOperationInvocation<'a, B> {
     program_binding: Option<ProgramBindingNodeBinding>,
     observation_template_budget:
         Option<std::sync::Arc<crate::vnext::DeviceObservationTemplateBudget>>,
+    prepared_cost_data: Option<super::PreparedOperationCostData>,
 }
 
 impl<'a, B> BatchedOperationInvocation<'a, B> {
@@ -1292,6 +1293,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             participants,
             program_binding,
             observation_template_budget: runtime.observation_template_budget(),
+            prepared_cost_data: None,
         })
     }
 
@@ -1452,6 +1454,22 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         &self,
     ) -> Option<&std::sync::Arc<crate::vnext::DeviceObservationTemplateBudget>> {
         self.observation_template_budget.as_ref()
+    }
+
+    /// Read-only metadata from this exact bound provider and plan node. It
+    /// supplies neither current work nor physical execution authority.
+    pub fn prepared_cost_data<T: std::any::Any>(&self) -> Option<&T> {
+        self.prepared_cost_data
+            .as_ref()
+            .and_then(super::PreparedOperationCostData::get::<T>)
+    }
+
+    pub(super) fn with_prepared_cost_data(
+        mut self,
+        data: Option<super::PreparedOperationCostData>,
+    ) -> Self {
+        self.prepared_cost_data = data;
+        self
     }
 
     pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {

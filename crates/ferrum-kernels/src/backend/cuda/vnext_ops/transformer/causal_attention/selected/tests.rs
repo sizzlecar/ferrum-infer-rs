@@ -107,6 +107,79 @@ fn cublas_causal_resident_binding_keeps_gemm_abi_and_updates_context_work() {
 }
 
 #[test]
+fn cuda_causal_observation_template_charges_once_and_releases_after_last_recipe() {
+    use ferrum_interfaces::vnext::DeviceObservationTemplateBudget;
+    use std::sync::Arc;
+    let shape = shape();
+    let make = || {
+        Arc::new(
+            CostTemplate::new(shape, CausalPrecision::F32Master, CausalProjection::F16).unwrap(),
+        )
+    };
+    let template = make();
+    let payload = template.observation_payload_bytes().unwrap();
+    let probe = DeviceObservationTemplateBudget::new(1 << 20).unwrap();
+    let lease = probe.reserve(0).unwrap();
+    let overhead = probe.retained_payload_bytes();
+    drop(lease);
+    let budget = DeviceObservationTemplateBudget::new(payload + overhead).unwrap();
+    let retained = template
+        .for_observation(
+            shape,
+            CausalPrecision::F32Master,
+            CausalProjection::F16,
+            &budget,
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&template, &retained));
+    assert_eq!(budget.retained_payload_bytes(), payload + overhead);
+    let second = template
+        .for_observation(
+            shape,
+            CausalPrecision::F32Master,
+            CausalProjection::F16,
+            &budget,
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&retained, &second));
+    assert_eq!(budget.retained_payload_bytes(), payload + overhead);
+    assert!(template
+        .for_observation(
+            shape,
+            CausalPrecision::F32Master,
+            CausalProjection::F16,
+            &probe
+        )
+        .is_none());
+    assert!(template
+        .for_observation(shape, CausalPrecision::F16, CausalProjection::F16, &budget)
+        .is_none());
+    let small = DeviceObservationTemplateBudget::new(payload + overhead - 1).unwrap();
+    assert!(make()
+        .for_observation(
+            shape,
+            CausalPrecision::F32Master,
+            CausalProjection::F16,
+            &small
+        )
+        .is_none());
+    assert_eq!(small.retained_payload_bytes(), 0);
+    assert!(make_library(
+        shape,
+        &[(1, 37)],
+        false,
+        SloStructuredCostCapture::HostSettledV1
+    )
+    .is_some());
+    eprintln!("causal observation table: payload={payload}, reservation_overhead={overhead}, table_size={}", std::mem::size_of::<CostTemplate>());
+    drop(template);
+    drop(second);
+    assert_eq!(budget.retained_payload_bytes(), payload + overhead);
+    drop(retained);
+    assert_eq!(budget.retained_payload_bytes(), 0);
+}
+
+#[test]
 fn cublas_causal_disabled_int8_and_wrong_projection_never_mint_table() {
     let on = SloStructuredCostCapture::HostSettledV1;
     assert!(make_library(

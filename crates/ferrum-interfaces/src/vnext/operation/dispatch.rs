@@ -818,7 +818,7 @@ impl OperationDispatch {
             )?;
         }
         let expected_phase = invocation.operation().profile_phase;
-        let operation = match provider.provider().encode_selected(invocation) {
+        let operation = match provider.encode_selected(invocation) {
             Ok(operation) => operation,
             Err(failure)
                 if batch_identity.contains_identity(failure.identity())
@@ -2147,7 +2147,7 @@ impl OperationDispatch {
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
-                let operation = match provider.provider().encode_selected(invocation) {
+                let operation = match provider.encode_selected(invocation) {
                     Ok(operation) => operation,
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())
@@ -2241,7 +2241,7 @@ impl OperationDispatch {
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
-                let operation = match provider.provider().encode_selected(invocation) {
+                let operation = match provider.encode_selected(invocation) {
                     Ok(operation) => operation,
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())

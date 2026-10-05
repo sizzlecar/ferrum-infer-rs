@@ -10,7 +10,10 @@ use ferrum_interfaces::vnext::{
 };
 
 enum CommandMetadata {
-    Compute(Arc<super::super::vnext_ops::CudaReplayCostRecipe>),
+    Compute {
+        recipe: Arc<super::super::vnext_ops::CudaReplayCostRecipe>,
+        static_evidence: std::sync::OnceLock<Option<Box<SelectedCommandCostEvidenceV1>>>,
+    },
     Transfer {
         kind: StatisticalTransferKindV1,
         bytes: u64,
@@ -23,6 +26,32 @@ struct CommandObservation {
     retained: usize,
     projected: usize,
 }
+
+fn static_evidence(
+    slot: &std::sync::OnceLock<Option<Box<SelectedCommandCostEvidenceV1>>>,
+    budget: &Arc<DeviceObservationTemplateBudget>,
+    working: usize,
+    allowance: Option<usize>,
+    project: impl FnOnce() -> Option<SelectedCommandCostEvidenceV1>,
+) -> Option<SelectedCommandCostEvidenceV1> {
+    let mut project = Some(project);
+    let mut projected = None;
+    let cached = slot.get_or_init(|| {
+        let allowance = allowance?;
+        let _working = budget.reserve(working).ok()?;
+        projected = Some(project.take()?());
+        let evidence = projected.as_ref()?.as_ref()?;
+        evidence
+            .retained_payload_bytes()
+            .is_some_and(|cached| cached <= allowance)
+            .then(|| Box::new(evidence.clone()))
+    });
+    match cached {
+        Some(evidence) => Some((**evidence).clone()),
+        None => projected.unwrap_or_else(|| project.and_then(|project| project())),
+    }
+}
+
 impl DeviceObservationTemplate for CommandObservation {
     fn command_count(&self) -> usize {
         1
@@ -46,7 +75,20 @@ impl DeviceObservationTemplate for CommandObservation {
     ) -> Result<Vec<Option<SelectedCommandCostEvidenceV1>>, StatisticalEvidenceUnknown> {
         let capture = ferrum_types::SloStructuredCostCapture::HostSettledV1;
         let evidence = match &self.metadata {
-            CommandMetadata::Compute(recipe) => recipe.project_observation(input),
+            CommandMetadata::Compute {
+                recipe,
+                static_evidence,
+            } if recipe.can_reuse_static_observation(input) => {
+                // Only the worker/original cold seal reaches this helper.
+                self::static_evidence(
+                    static_evidence,
+                    recipe.budget(),
+                    self.projected,
+                    recipe.retained_payload_bytes(),
+                    || recipe.project_observation(input),
+                )
+            }
+            CommandMetadata::Compute { recipe, .. } => recipe.project_observation(input),
             CommandMetadata::Transfer { kind, bytes } => {
                 selected_cost::transfer(*kind, *bytes, input.tokens(), capture)
             }
@@ -59,7 +101,7 @@ impl DeviceObservationTemplate for CommandObservation {
         };
         if evidence.is_none() {
             let site = match &self.metadata {
-                CommandMetadata::Compute(recipe) => recipe.projection_site(),
+                CommandMetadata::Compute { recipe, .. } => recipe.projection_site(),
                 CommandMetadata::Transfer { .. } => "command.transfer.project",
                 CommandMetadata::ProgramBinding(_) => "command.program_binding.project",
                 CommandMetadata::StridedTransfer(_) => "command.strided_transfer.project",
@@ -88,7 +130,7 @@ fn packet(
 ) -> Result<DeviceObservationPacket, DeviceObservationDiagnostic> {
     let bounds = (|| {
         let retained = std::mem::size_of::<CommandObservation>().checked_add(match &metadata {
-            CommandMetadata::Compute(recipe) => recipe.retained_payload_bytes()?,
+            CommandMetadata::Compute { recipe, .. } => recipe.retained_payload_bytes()?,
             CommandMetadata::Transfer { .. } | CommandMetadata::StridedTransfer(_) => 0,
             CommandMetadata::ProgramBinding(rows) => rows
                 .len()
@@ -97,7 +139,7 @@ fn packet(
         let projected = SelectedCommandCostEvidenceV1::maximum_working_payload_bytes(occurrences)?
             .checked_add(std::mem::size_of::<Option<SelectedCommandCostEvidenceV1>>())?
             .checked_add(match &metadata {
-                CommandMetadata::Compute(recipe) => recipe.projection_scratch_bytes()?,
+                CommandMetadata::Compute { recipe, .. } => recipe.projection_scratch_bytes()?,
                 _ => 0,
             })?;
         Some((retained, projected))
@@ -109,8 +151,13 @@ fn packet(
             None,
         )
     })?;
-    budget
-        .reserve_with_diagnostic(retained, "command.packet.reserve")?
+    let reservation = budget.reserve_with_diagnostic(retained, "command.packet.reserve")?;
+    // Compute recipes and their nested allocations retain their own original
+    // construction leases. The packet's pre-existing duplicate recipe charge
+    // may instead cover one static evidence table of no greater size. Its
+    // private OnceLock cannot add an unreserved allocation; segment parents
+    // continue charging only packet-owned payload, not this template again.
+    reservation
         .retain(Arc::new(CommandObservation {
             metadata,
             retained,
@@ -139,7 +186,10 @@ pub(super) fn compute(
     let input = recipe.captured_input().clone();
     let budget = Arc::clone(recipe.budget());
     packet(
-        CommandMetadata::Compute(recipe),
+        CommandMetadata::Compute {
+            recipe,
+            static_evidence: std::sync::OnceLock::new(),
+        },
         input,
         occurrences,
         &budget,
@@ -364,5 +414,102 @@ mod tests {
         assert!(budget.retained_payload_bytes() > 0);
         drop(packet);
         assert_eq!(budget.retained_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn cuda_observation_static_memo_preserves_private_identity_and_packet_layout() {
+        use ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1;
+        use std::{cell::Cell, mem::size_of, sync::OnceLock};
+        #[allow(dead_code)]
+        enum PreviousMetadata {
+            Compute(Arc<super::super::super::vnext_ops::CudaReplayCostRecipe>),
+            Transfer {
+                kind: StatisticalTransferKindV1,
+                bytes: u64,
+            },
+            ProgramBinding(Box<[(u64, u64, u64)]>),
+            StridedTransfer(StridedCopyRegion),
+        }
+        #[allow(dead_code)]
+        struct PreviousObservation {
+            metadata: PreviousMetadata,
+            retained: usize,
+            projected: usize,
+        }
+        assert_eq!(size_of::<CommandMetadata>(), size_of::<PreviousMetadata>());
+        assert_eq!(
+            size_of::<CommandObservation>(),
+            size_of::<PreviousObservation>()
+        );
+        let evidence = selected_cost::program_binding(
+            [(16, 8, 2), (8, 8, 1)].into_iter(),
+            3,
+            ferrum_types::SloStructuredCostCapture::HostSettledV1,
+        )
+        .unwrap();
+        let bytes = evidence.retained_payload_bytes().unwrap();
+        let budget = DeviceObservationTemplateBudget::new(1 << 20).unwrap();
+        // The actual packet owns this pre-existing recipe-sized reservation.
+        let parent = budget.reserve(bytes).unwrap();
+        let resident = budget.retained_payload_bytes();
+        let calls = Cell::new(0);
+        let slot = OnceLock::new();
+        for _ in 0..2 {
+            let actual = static_evidence(&slot, &budget, bytes, Some(bytes), || {
+                calls.set(calls.get() + 1);
+                Some(evidence.clone())
+            })
+            .unwrap();
+            assert_eq!(actual, evidence);
+            assert_eq!(
+                actual.independent_attention_family_v2(),
+                evidence.independent_attention_family_v2()
+            );
+            assert_eq!(
+                actual.algorithm_work().unwrap(),
+                evidence.algorithm_work().unwrap()
+            );
+            assert_eq!(
+                SelectedReplayAlgorithmTemplateV1::from_selected(&actual, 3, 0, 2).unwrap(),
+                SelectedReplayAlgorithmTemplateV1::from_selected(&evidence, 3, 0, 2).unwrap()
+            );
+            assert_eq!(budget.retained_payload_bytes(), resident);
+        }
+        assert_eq!(calls.get(), 1);
+        drop(slot);
+        drop(parent);
+        assert_eq!(budget.retained_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn cuda_observation_static_memo_capacity_miss_keeps_original_projection() {
+        use std::{cell::Cell, sync::OnceLock};
+        let evidence = selected_cost::transfer(
+            StatisticalTransferKindV1::HostToDevice,
+            8,
+            1,
+            ferrum_types::SloStructuredCostCapture::HostSettledV1,
+        )
+        .unwrap();
+        let bytes = evidence.retained_payload_bytes().unwrap();
+        for (limit, allowance) in [(1, bytes), (1 << 20, bytes - 1)] {
+            let budget = DeviceObservationTemplateBudget::new(limit).unwrap();
+            let slot = OnceLock::new();
+            let calls = Cell::new(0);
+            for _ in 0..2 {
+                let actual = static_evidence(&slot, &budget, bytes, Some(allowance), || {
+                    calls.set(calls.get() + 1);
+                    Some(evidence.clone())
+                })
+                .unwrap();
+                assert_eq!(
+                    actual.algorithm_work().unwrap(),
+                    evidence.algorithm_work().unwrap()
+                );
+                assert_eq!(budget.retained_payload_bytes(), 0);
+            }
+            assert_eq!(calls.get(), 2);
+            assert!(slot.get().unwrap().is_none());
+        }
     }
 }

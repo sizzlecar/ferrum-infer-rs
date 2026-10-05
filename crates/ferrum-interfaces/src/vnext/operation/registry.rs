@@ -1108,6 +1108,17 @@ where
         self.cost_data.as_ref()
     }
 
+    /// Dispatch has validated this bound provider against the invocation's
+    /// plan/node. Attach only its immutable numerical metadata before calling
+    /// the same encoder; no registry lookup or resource proof is replaced.
+    pub(super) fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, R::Buffer>,
+    ) -> Result<EncodedDeviceOperation<R::Command>, OperationFailure> {
+        self.provider()
+            .encode_selected(invocation.with_prepared_cost_data(self.cost_data.clone()))
+    }
+
     pub fn descriptor(&self) -> &OperationProviderDescriptor {
         self.provider().descriptor()
     }

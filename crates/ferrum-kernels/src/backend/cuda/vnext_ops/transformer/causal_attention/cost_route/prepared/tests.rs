@@ -688,6 +688,43 @@ fn prepared_causal_template_matches_legacy_for_batch_alias_and_kernel_abi_varian
                                 "fixture must exercise a complete numeric route"
                             );
                             assert_eq!(candidate, legacy, "head={head_dim} policy={policy:?} packed={packed} inplace={inplace}");
+                            let candidate = candidate.as_ref().unwrap();
+                            let legacy = legacy.as_ref().unwrap();
+                            assert_eq!(
+                                candidate.independent_attention_family_v2(),
+                                legacy.independent_attention_family_v2()
+                            );
+                            // This comparison includes the private command assignment
+                            // binding and every sparse algorithm/work entry.
+                            assert_eq!(
+                                candidate.algorithm_work().unwrap(),
+                                legacy.algorithm_work().unwrap()
+                            );
+                            let table = legacy.algorithm_work().unwrap().unwrap();
+                            let compute = table
+                                .entries()
+                                .iter()
+                                .filter(|entry| entry.kind().is_compute())
+                                .map(|entry| entry.commands())
+                                .sum();
+                            let transfers = table
+                                .entries()
+                                .iter()
+                                .filter(|entry| !entry.kind().is_compute())
+                                .map(|entry| entry.commands())
+                                .sum();
+                            use ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1;
+                            // Replay templates additionally bind fixed launch geometry.
+                            assert_eq!(
+                                SelectedReplayAlgorithmTemplateV1::from_selected(
+                                    candidate, tokens, compute, transfers
+                                )
+                                .unwrap(),
+                                SelectedReplayAlgorithmTemplateV1::from_selected(
+                                    legacy, tokens, compute, transfers
+                                )
+                                .unwrap()
+                            );
                             assert!(query.compute(SloStructuredCostCapture::Disabled).is_none());
                         }
                     }
