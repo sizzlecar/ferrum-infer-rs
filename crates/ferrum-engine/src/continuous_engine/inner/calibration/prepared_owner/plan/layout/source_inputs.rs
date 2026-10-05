@@ -30,7 +30,7 @@ impl ColdSourcePlan {
     pub fn retained_heap_bytes(&self) -> Option<usize> {
         match &self.input_plan {
             selection::SelectedInputPlan::Periodic { .. } => Some(0),
-            selection::SelectedInputPlan::Finite { plan } => plan.retained_heap_bytes(),
+            selection::SelectedInputPlan::Finite { plan } => plan.retained_payload_bytes(),
         }
     }
 }
@@ -447,7 +447,11 @@ impl PreparedProbeSourceInputs {
             execution_actions: plan.work.execution_actions,
             declared_offer_row_bound: plan.work.serial_declared_offer_rows,
             serial_token_work: plan.work.serial_token_work,
-            input_plan: selection::SelectedInputPlan::Finite { plan },
+            // verify_frozen authorized the new boxed header and backing while
+            // the original selected proof remains owned by its source.
+            input_plan: selection::SelectedInputPlan::Finite {
+                plan: Box::new(plan),
+            },
             original_collection_actions: self.collection_actions,
             original_declared_offer_row_bound: self.declared_offer_rows,
         }))
@@ -715,7 +719,9 @@ mod tests {
             population_indices: vec![0],
             representative_case_indices: vec![0, 1],
             schedule: plan.schedule.clone(),
-            input_plan: selection::SelectedInputPlan::Finite { plan },
+            input_plan: selection::SelectedInputPlan::Finite {
+                plan: Box::new(plan),
+            },
             schedule_within_capacity: true,
             requests: work.requests,
             serial_token_work: work.serial_token_work,
@@ -746,13 +752,30 @@ mod tests {
         let input = &mut frozen[0];
         let batch = &selected.batches[0];
         let before = input.retained_heap_bytes().unwrap();
+        let proof_bound = batch
+            .finite_plan()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap();
+        assert!(matches!(
+            input
+                .cold_plan(
+                    batch,
+                    &population,
+                    NonZeroU32::new(2).unwrap(),
+                    None,
+                    proof_bound - 1,
+                )
+                .unwrap(),
+            ColdSourceRebuild::Skip(ColdSourceSkip::RetainedCapacity)
+        ));
         let ColdSourceRebuild::Ready(cold) = input
             .cold_plan(
                 batch,
                 &population,
                 NonZeroU32::new(2).unwrap(),
                 None,
-                usize::MAX,
+                proof_bound,
             )
             .unwrap()
         else {
@@ -773,7 +796,29 @@ mod tests {
         );
         assert!(cold.execution_actions > cold.original_collection_actions);
         assert_eq!(cold.execution_actions, cold.declared_offer_row_bound);
-        assert!(cold.retained_heap_bytes().unwrap() > 0);
+        assert_eq!(
+            cold.retained_heap_bytes().unwrap(),
+            std::mem::size_of::<budget::finite::FinitePlan>() + plan.retained_heap_bytes().unwrap()
+        );
+        assert!(cold.retained_heap_bytes().unwrap() <= proof_bound);
+        // The cold proof is separately owned while the original selected
+        // proof remains live. A further clone must retain its own box and
+        // backing after the temporary cold plan is retired.
+        let cold_clone = cold.clone();
+        let selection::SelectedInputPlan::Finite { plan: cloned_plan } = &cold_clone.input_plan
+        else {
+            unreachable!();
+        };
+        assert!(!std::ptr::eq(plan.as_ref(), cloned_plan.as_ref()));
+        assert!(!std::ptr::eq(plan.as_ref(), batch.finite_plan().unwrap()));
+        let cold_wire = serde_json::to_value(&cold).unwrap();
+        assert_eq!(serde_json::to_value(&cold_clone).unwrap(), cold_wire);
+        assert_eq!(
+            cold_clone.retained_heap_bytes().unwrap(),
+            cloned_plan.retained_payload_bytes().unwrap()
+        );
+        drop(cold);
+        assert_eq!(serde_json::to_value(&cold_clone).unwrap(), cold_wire);
         assert_eq!(input.retained_heap_bytes().unwrap(), before);
         assert!(input
             .cases

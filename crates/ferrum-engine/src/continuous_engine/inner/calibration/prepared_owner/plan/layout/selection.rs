@@ -223,7 +223,7 @@ pub(in crate::continuous_engine::inner::calibration) enum SelectedInputPlan {
         maximum_anchor_span: usize,
     },
     Finite {
-        plan: budget::finite::FinitePlan,
+        plan: Box<budget::finite::FinitePlan>,
     },
 }
 
@@ -470,7 +470,7 @@ impl CheckedSelection {
         }
         for batch in &self.batches {
             if let Some(plan) = batch.finite_plan() {
-                bytes = bytes.checked_add(plan.retained_heap_bytes()?)?;
+                bytes = bytes.checked_add(plan.retained_payload_bytes()?)?;
             }
             if let Some(opportunities) = &batch.scoped_opportunities {
                 bytes = bytes.checked_add(
@@ -835,35 +835,6 @@ fn select_prepared_inputs(
             "checked selection peak retained payload exceeds remaining budget: required_peak_bytes={peak} remaining_bytes={maximum_retained_bytes} key_mentions={key_mentions} guaranteed_cases={guaranteed_cases}"
         )));
     }
-    // Every finite occurrence consumes at least one request. Use the same
-    // remaining request allowance for memory authorization and construction.
-    let finite_extra = memory::finite_extra_peak(&groups, capacity.requests)?;
-    let allocation = if finite_membership_supported(population)
-        && peak
-            .checked_add(finite_extra)
-            .is_some_and(|total| total <= maximum_retained_bytes)
-    {
-        InputAllocationPolicy::FinitePreferred {
-            maximum_requests: capacity.requests,
-        }
-    } else {
-        InputAllocationPolicy::PeriodicOnly
-    };
-    // Optional joint replacement retains one index per baseline candidate.
-    // Do not add it to the original composition/finite authorization: failure
-    // here must leave every previously affordable baseline source unchanged.
-    let joint_authorized = peak
-        .checked_add(finite_extra)
-        .and_then(|bytes| {
-            bytes.checked_add(vector_peak_bytes::<usize>(memory.guaranteed_groups).ok()?)
-        })
-        .is_some_and(|bytes| bytes <= maximum_retained_bytes);
-    tracing::info!(
-        ?allocation,
-        finite_extra,
-        original_peak = peak,
-        "Automatic source allocation memory authorization"
-    );
     let geometry_scratch = memory.geometry_scratch_bytes;
     let mut out = CheckedSelection::default();
     let mut population_candidates = Vec::new();
@@ -1109,6 +1080,43 @@ fn select_prepared_inputs(
         InputAllocationPolicy::PeriodicOnly,
         false,
     )?;
+    // No finite proof exists before original periodic packing is complete.
+    // Count all surviving candidates, not only currently affordable sources.
+    // The original peak and scratch stay reserved; only the optional proof
+    // allowance uses the actual remaining topology. An unavailable/overflowed
+    // bound must lose the optimization rather than reject the old selection.
+    let finite_memory = memory::finite_candidates_peak(
+        batch_candidates.iter().map(|candidate| &candidate.batch),
+        opportunities,
+        capacity.requests,
+    );
+    let finite_peak = finite_memory.and_then(|memory| peak.checked_add(memory.extra_peak_bytes));
+    let allocation = if finite_membership_supported(population)
+        && finite_peak.is_some_and(|bytes| bytes <= maximum_retained_bytes)
+    {
+        InputAllocationPolicy::FinitePreferred {
+            maximum_requests: capacity.requests,
+        }
+    } else {
+        InputAllocationPolicy::PeriodicOnly
+    };
+    // Joint replacement owns one index per surviving candidate. This separate
+    // authorization cannot disable an otherwise affordable finite baseline.
+    let joint_authorized = finite_peak
+        .and_then(|bytes| {
+            bytes.checked_add(vector_peak_bytes::<usize>(batch_candidates.len()).ok()?)
+        })
+        .is_some_and(|bytes| bytes <= maximum_retained_bytes);
+    tracing::info!(
+        ?allocation,
+        finite_bound_available = finite_memory.is_some(),
+        retained_candidates = batch_candidates.len(),
+        finite_families = finite_memory.map_or(0, |memory| memory.families),
+        finite_representatives = finite_memory.map_or(0, |memory| memory.representatives),
+        finite_extra = finite_memory.map_or(0, |memory| memory.extra_peak_bytes),
+        original_peak = peak,
+        "Automatic source allocation memory authorization"
+    );
     // Lower independent costs can otherwise prevent an old beneficial merge
     // and evict a formerly covered owner at the source limit. Preserve the
     // original geometry order, local scopes and periodic packing first. Then
@@ -1704,7 +1712,12 @@ fn batch_plan_with_scope(
         scheduled: false,
         algorithm_universe: periodic.algorithm_universe,
         scoped_opportunities: periodic.scoped_opportunities,
-        input_plan: SelectedInputPlan::Finite { plan },
+        // storage_bound authorized the complete FinitePlan header and its
+        // backing before construction. Box only the accepted plan; periodic
+        // candidates do not reserve an unused inline finite certificate.
+        input_plan: SelectedInputPlan::Finite {
+            plan: Box::new(plan),
+        },
     })
 }
 

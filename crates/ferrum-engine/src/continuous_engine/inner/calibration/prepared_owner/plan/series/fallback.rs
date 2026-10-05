@@ -75,21 +75,22 @@ impl PreparedProbeSource<'_> {
             RecomputedColdSource::Ready(cold) => cold,
             RecomputedColdSource::Skip(reason) => return Ok(ColdSourceRebuild::Skip(reason)),
         };
-        let (planned_cycles, maximum_anchor_span, input_opportunities, finite_plan) = match &cold
-            .input_plan
-        {
-            layout::selection::SelectedInputPlan::Periodic {
-                planned_cycles,
-                input_opportunities,
-                maximum_anchor_span,
-            } => (
-                Some(*planned_cycles),
-                Some(*maximum_anchor_span),
-                Some(input_opportunities),
-                None,
-            ),
-            layout::selection::SelectedInputPlan::Finite { plan } => (None, None, None, Some(plan)),
-        };
+        let (planned_cycles, maximum_anchor_span, input_opportunities, finite_plan) =
+            match &cold.input_plan {
+                layout::selection::SelectedInputPlan::Periodic {
+                    planned_cycles,
+                    input_opportunities,
+                    maximum_anchor_span,
+                } => (
+                    Some(*planned_cycles),
+                    Some(*maximum_anchor_span),
+                    Some(input_opportunities),
+                    None,
+                ),
+                layout::selection::SelectedInputPlan::Finite { plan } => {
+                    (None, None, None, Some(plan.as_ref()))
+                }
+            };
         if planned_cycles != self.work.planned_cycles
             || cold.planned_occurrences != self.work.planned_occurrences
             || cold.planned_occurrences != self.cohorts.len()

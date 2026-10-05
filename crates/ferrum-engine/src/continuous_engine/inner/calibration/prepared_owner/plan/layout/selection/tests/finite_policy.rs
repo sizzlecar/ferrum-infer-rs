@@ -207,8 +207,44 @@ fn finite_policy_extra_heap_keeps_original_admitted_geometry_and_work() {
         memory.retained_groups_bytes + tight.retained_payload_bytes().unwrap()
             <= memory.required_peak_bytes
     );
-    let finite_peak = memory.required_peak_bytes
-        + super::super::memory::finite_extra_peak(&groups, capacity.requests).unwrap();
+    let finite_memory = super::super::memory::finite_candidates_peak(
+        tight.batches.iter(),
+        &opportunities,
+        capacity.requests,
+    )
+    .unwrap();
+    assert_eq!(finite_memory.candidates, tight.batches.len());
+    assert!(finite_memory.extra_peak_bytes > 0);
+    assert!(
+        finite_memory.extra_peak_bytes
+            <= super::super::memory::finite_extra_peak(&groups, capacity.requests).unwrap()
+    );
+    // Admission is not a lifetime filter: an unadmitted original candidate
+    // remains available for a later complete finite combination and costs the
+    // same retained proof allowance.
+    let mut unadmitted = tight.batches.clone();
+    for batch in &mut unadmitted {
+        batch.scheduled = false;
+    }
+    assert_eq!(
+        super::super::memory::finite_candidates_peak(
+            unadmitted.iter(),
+            &opportunities,
+            capacity.requests,
+        )
+        .unwrap()
+        .extra_peak_bytes,
+        finite_memory.extra_peak_bytes
+    );
+    let mut unavailable_floor = opportunities.clone();
+    unavailable_floor[tight.batches[0].representative_case_indices[0]].minimum_fresh_members = 0;
+    assert!(super::super::memory::finite_candidates_peak(
+        tight.batches.iter(),
+        &unavailable_floor,
+        capacity.requests,
+    )
+    .is_none());
+    let finite_peak = memory.required_peak_bytes + finite_memory.extra_peak_bytes;
     let mut generous_work = StructuredInputGeometryWorkV1::new(limit);
     let generous = run(finite_peak, &mut generous_work).unwrap();
     assert!(
@@ -229,6 +265,30 @@ fn finite_policy_extra_heap_keeps_original_admitted_geometry_and_work() {
     assert!(generous.requests <= tight.requests);
     assert!(generous.serial_wave_upper_bound <= tight.serial_wave_upper_bound);
     assert!(generous.declared_offer_row_bound <= tight.declared_offer_row_bound);
+    assert!(
+        memory.retained_groups_bytes + generous.retained_payload_bytes().unwrap() <= finite_peak
+    );
+    // Removing an actually allocated finite proof releases its boxed header
+    // as well as its nested backing. Keep every selection Vec unchanged so
+    // this checks the retained ledger, not a particular enum layout.
+    let mut accounting = generous.clone();
+    let retained_with_proofs = accounting.retained_payload_bytes().unwrap();
+    let proof_bytes: usize = accounting
+        .batches
+        .iter()
+        .filter_map(|batch| batch.finite_plan())
+        .map(|plan| plan.retained_payload_bytes().unwrap())
+        .sum();
+    assert!(proof_bytes > 0);
+    for batch in &mut accounting.batches {
+        if batch.finite_plan().is_some() {
+            batch.input_plan = tight.batches[0].input_plan.clone();
+        }
+    }
+    assert_eq!(
+        retained_with_proofs - accounting.retained_payload_bytes().unwrap(),
+        proof_bytes
+    );
     // Refusing the extra finite storage must retain the original admitted
     // geometry and execution work, rather than fail the complete selection.
     let mut below_work = StructuredInputGeometryWorkV1::new(limit);

@@ -190,6 +190,7 @@ pub(super) fn plan(
 /// combined plans can also coexist while a scoped replacement is considered.
 /// If this entire additional peak cannot be authorized, selection retains the
 /// original periodic allocation throughout, before building any finite plan.
+#[cfg(test)]
 pub(super) fn finite_extra_peak(
     groups: &[PopulationMemberGroup],
     maximum_requests: usize,
@@ -217,4 +218,84 @@ pub(super) fn finite_extra_peak(
             2,
         )?,
     )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FiniteCandidateMemory {
+    pub candidates: usize,
+    pub families: usize,
+    pub representatives: usize,
+    pub extra_peak_bytes: usize,
+}
+
+fn finite_key<'a>(
+    batch: &'a SelectedBatch,
+    opportunities: &'a [CaseOpportunity],
+    position: usize,
+) -> Option<&'a CheckedPopulationKey> {
+    let original = opportunities.get(*batch.representative_case_indices.get(position)?)?;
+    if original.minimum_fresh_members != 1
+        || !matches!(original.population, CasePopulation::Unique(_))
+    {
+        return None;
+    }
+    let opportunity = match &batch.scoped_opportunities {
+        Some(scoped) if scoped.len() == batch.representative_case_indices.len() => {
+            scoped.get(position)?
+        }
+        Some(_) => return None,
+        None => original,
+    };
+    match &opportunity.population {
+        CasePopulation::Unique(key) if opportunity.minimum_fresh_members == 1 => Some(key),
+        _ => None,
+    }
+}
+
+/// The first packing pass has only periodic plans. Authorize finite storage
+/// from every remaining candidate, including currently unadmitted sources,
+/// without allocating another identity list. Later merges only join disjoint
+/// representatives. Replacing a decode universe preserves each equal key's
+/// host/product/route and tail dimensions, so it cannot split that family.
+/// Thus total families/representatives and candidate count cannot grow.
+/// Keep two full combined proofs beside all retained plans for trial/replacement
+/// overlap; the original selection/composition scratch remains charged separately.
+pub(super) fn finite_candidates_peak<'a>(
+    batches: impl Iterator<Item = &'a SelectedBatch>,
+    opportunities: &[CaseOpportunity],
+    maximum_requests: usize,
+) -> Option<FiniteCandidateMemory> {
+    let mut memory = FiniteCandidateMemory::default();
+    for batch in batches {
+        let representatives = batch.representative_case_indices.len();
+        if representatives == 0 || batch.finite_plan().is_some() {
+            return None;
+        }
+        let mut families = 0usize;
+        for position in 0..representatives {
+            let key = finite_key(batch, opportunities, position)?;
+            let mut seen = false;
+            for previous in 0..position {
+                if finite_key(batch, opportunities, previous)? == key {
+                    seen = true;
+                    break;
+                }
+            }
+            if !seen {
+                families = families.checked_add(1)?;
+            }
+        }
+        memory.candidates = memory.candidates.checked_add(1)?;
+        memory.families = memory.families.checked_add(families)?;
+        memory.representatives = memory.representatives.checked_add(representatives)?;
+        memory.extra_peak_bytes = memory.extra_peak_bytes.checked_add(
+            budget::finite::storage_bound(families, representatives, maximum_requests).ok()?,
+        )?;
+    }
+    memory.extra_peak_bytes = memory.extra_peak_bytes.checked_add(
+        budget::finite::storage_bound(memory.families, memory.representatives, maximum_requests)
+            .ok()?
+            .checked_mul(2)?,
+    )?;
+    Some(memory)
 }
