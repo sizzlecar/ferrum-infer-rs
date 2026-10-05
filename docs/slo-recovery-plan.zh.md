@@ -1,5 +1,9 @@
 # Ferrum SLO 恢复实施方案
 
+2026-10-06 北京时间本轮实时检查点：G32 同一冻结源码 `e3b9dda0` 已完成两端实际 release 重编译和后端编译检查；Metal 产品 SHA `598741c9…3912966`、CUDA `20e52df5…357576c`，各自 engine/CLI 均有 `fresh=false` 回执。新正常 `serve` 已在两端启动，尚无完整 G32 On/Off 配对或 `run` 结论。[Metal 构建回执](/private/tmp/ferrum-slo-recovery-20261002/g32-metal-build-receipts-r2/AUDIT.json)、[CUDA 构建回执](/private/tmp/ferrum-slo-recovery-20261002/g32-cuda-build-receipts-r3/AUDIT.json)
+
+G32 Metal 首个实际结果仍失败：composition 峰32,990,394B已落入34,195,039B可用空间，但后续 finite 预留3,282,336B仍令总需求超出2,077,691B，保持PeriodicOnly，joint未运行。190个存活候选各按原剩余1867请求授权 occurrence，仅这一项上界即2,837,840B；这是构造容量预留，不能写成实际观测分配峰。原120s series在123,124.885ms的完成边界退出，仅完成2/4来源、418/815 cohorts，epoch2有效；reference probe62,577.339ms另计，普通窗口随后开始。相较G31的1/4不能升级为完整校准或完整覆盖通过。接下来在同一冻结产品上完成普通采用与开关、正常run取证，不提高预算或将局部检查当交付。[启动观测](/private/tmp/ferrum-slo-recovery-20261002/g32-metal-serve-poll-3.txt)
+
 2026 年 10 月 2 日，用户要求在充分理解原目标、现状和连续失败经验后形成方案，并已要求创建、启动和恢复 goal。本方案从 `62b92fb1473bf11f93703d7db41c0dbf9c32ba65` 继续，集成分支为 `slo/recovery-20261002`。10 月 5 日实际工作通过 Tailscale 继续；本轮 goal 工具查询仍返回 `blocked`，不能将实际执行进展写成目标模式已经恢复。
 
 当前仍未交付完整的 SLO 自动闭环版本。首先验证原预算下的覆盖和规划可行性，再完成正常入口的自动闭环，随后进行双后端、完整性能和发布验收。每一步都必须产出可复现的行为证据；局部测试、成本快照数量和源码规模不作为完成度。
