@@ -1,0 +1,159 @@
+# Ferrum 目标：满足延迟 SLO 的最大输出吞吐
+
+制定于 2026-10-06。本文件取代 `slo/recovery-20261002` 分支上的 SLO 恢复计划和 G1–G32 验收流程，是后续性能工作唯一的目标文档。
+
+## 1. 目标
+
+```text
+G(θ) = max over C of  成功请求的输出 tokens / 测量时间
+       约束：P99(TTFT) ≤ S_TTFT
+             P99(TPOT) ≤ S_TPOT
+             P99(ITL，可见 SSE 文本事件) ≤ S_ITL
+             错误 = 0，拒绝 = 0
+目标：max over θ of G(θ)
+```
+
+| 项 | 定义 |
+| --- | --- |
+| θ | 代码版本，加上通过 typed config、CLI 或 preset 设置的服务配置：并发上限、prefill 分块和预算、split/mixed、数值 profile、KV、graph 等 |
+| C | 客户端 closed-loop 并发。C 是测量轴，不属于配置：同一个 θ 从 C=1 开始按 1、2、4、6、8、12、16 逐档加大。探索时可在首次不满足约束处停止，G 取已测达标档中的最大吞吐，并报告对应 C；这只是已测范围内的最优值，不假定吞吐或达标状态随 C 单调变化。C=1 就不满足时记为"当前扫描未找到可行档"，不记成 0 |
+| 指标 | 沿用 `bench-serve` 客户端 SLO 评估的口径。TTFT 指到首个非空可见文本的时间。TPOT = (最后可见文本 − TTFT) / (usage 输出 token − 1)。ITL 是所有请求的非空 SSE 文本事件间隔合并后的 P99 |
+| 负载 | ShareGPT 文件固定（sha256 `35f0e213…`），seed 42；输入 4–1024 token，总长 ≤2048；输出长度取参考答案长度，并开启 ignore_eos；关闭 thinking，temperature 0 |
+| S | 沿用已声明值：CUDA RTX 5090 为 200/15/50ms，Metal M4 为 3400/212/359ms。只有用户可以修改，不能按结果倒推 |
+
+公式之外不再设门槛：不要求请求级三项同时达标，不看 Enforce/Off 吞吐比，不要求固定测试矩阵或启动校准。llama.cpp 同机同负载的结果只作参考列，不作胜负门槛。
+
+旧 `bench-serve --slo-out` 的三项单独指标可以复用，但总体 SLO 状态和 `--slo-fail-on-violation` 仍包含请求级 joint 门槛，不能直接用作本目标的判定。按每次重复的三项 P99、错误数和拒绝数独立判定；缺失指标记为未评估，不当作通过，也不以跨重复平均值掩盖失败。
+
+**为什么把 C 作为扫描轴：** 固定在 C8 时，现有 S 对 Ferrum 和 llama.cpp 都不可行（见第 2 节），结果只剩"过/不过"，没有可以优化的方向。改成扫 C 之后，G 是一个连续量：内核提速和调度改进都会体现为"能在更高并发下达标"或"同一并发下吞吐更高"。
+
+## 2. 现状
+
+以下是已有实测：同机、同模型（Qwen3.5-9B Q4_K_M）、同一批样本，每格 32 个测量请求，各跑 1 次。32 个样本的 P99 基本就是最大值，主要由最长的那个 prompt（606 token）决定，所以这些数据只用来定位问题，不作验收。
+
+### CUDA RTX 5090，C8，S = 200/15/50
+
+| 配置 | 输出 tok/s | TTFT P50/P99 | TPOT P50/P99 | ITL P50/P99 | 显存峰值 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| llama.cpp b11065 | 521.6 | 74.6 / 212.8 | 12.67 / 19.32 | 11.21 / 39.87 | 未采集 |
+| Ferrum Off，RN-F16 profile（10-06，G32） | 391.4 | 51.0 / 119.3 | 16.35 / 18.51 | 15.53 / 37.43 | 整卡 21968MiB |
+| Ferrum Enforce（同一构建） | 343.0 | 70.4 / 141.1 | 18.39 / 20.29 | 17.58 / 39.43 | 整卡 25103MiB |
+| Ferrum Off，Q8 profile（09-25 构建） | 205.8 | 166.3 / 735.9 | 31.25 / 45.76 | 27.17 / 143.01 | 未整理 |
+
+### Apple M4 Mac mini，S = 3400/212/359
+
+| 配置 | C | 输出 tok/s | TTFT P50/P99 | TPOT P50/P99 | ITL P50/P99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| llama.cpp（Mini 上的 llama-server-memory-v1 构建） | 1 | 17.48 | 339 / 3097 | 55.3 / 55.6 | 55.3 / 56.6 |
+| llama.cpp | 4 | 21.22 | 666 / 3373 | 183.0 / 210.4 | 180.1 / 357.6 |
+| llama.cpp | 8 | 21.16 | 986 / 4532 | 369.1 / 405.0 | 360.0 / 625.3 |
+| Ferrum Enforce（09-23 构建） | 1 | 16.93 | 332 / 3092 | 57.1 / 57.7 | 57.2 / 58.8 |
+| Ferrum Off split（09-23 构建） | 4 | 34.03 | 429 / 3747 | 107.2 / 136.8 | 103.8 / 285.3 |
+| Ferrum Off split（10-06，G32） | 8 | 37.18 | 595 / 4801 | 192.7 / 245.6 | 175.1 / 938.7 |
+| Ferrum Off mixed（09-24 构建） | 8 | 38.51 | 612 / 4526 | 183.9 / 208.5 | 171.8 / 730.0 |
+
+M4 各行的 TPOT 取自 bench-serve 报告值，与 G32 采用的 last-visible 口径略有差异。
+
+## 3. 当前判断与待验证的瓶颈假设
+
+1. **固定 C8 不可行，这不是 Ferrum 独有的问题。** CUDA 上 llama.cpp 的 TTFT 和 TPOT 也超标。Metal 的阈值本身就是 llama.cpp 在 C4 下的 P99（3373/210/358），却被拿去要求 C8。
+2. **CUDA 的瓶颈是 decode 单步。**
+   - G32 用的 RN-F16 profile 把投影权重解码成 FP16 常驻显存。按显存账估算，每步要读约 17GB 权重，按 5090 的 1.79TB/s 带宽算，下限约 10ms。
+   - llama.cpp 直接读 Q4_K 权重（约 5.6GB），下限约 3ms。
+   - Ferrum 自己的量化小 batch 路径（Q8 profile）只有 206 tok/s。所以最大的杠杆是高效的 Q4_K/Q5_K/Q6_K 小 batch（m=1–8）decode kernel。
+3. **M4 的瓶颈是 batched decode 随并发的扩展。**
+   - 单请求每步 57ms，与 llama.cpp 持平。
+   - 每多一行约增加 16ms：C4 约 104ms，C8 约 175ms。按 M4 GPU 约 4 TFLOPS 估算，每行的计算量只需约 4.5ms。
+   - prefill 约 200 tok/s，按同样的估算已用到峰值的八成以上，所以 TTFT P99 主要由最长的 prompt 决定。
+4. **ITL 尾部是调度参数问题。** G32 和大多数对照都用 split 模式，并关闭了 active-decode 时的 prefill 预算；Metal 默认每个 prefill 块 128 token，CUDA 没有分块上限。这样一来，prefill 块会整波卡住 decode。M4 C8 下的 ITL P99：split 939ms，mixed 730ms，llama.cpp 625ms。调度参数空间从没被系统地扫过。
+5. **放弃 SLO 控制器（Enforce）。** 它每波串行规划约 1.75ms，约 90% 的结论是 Unknown，CUDA 吞吐下降 12%；Metal 在 120s 内完成不了启动校准。
+
+## 4. 阶段
+
+每个阶段结束时交一页结果表：AGENTS.md 规定的列，加上 G 和对应的 C。原始数据放在仓库外。
+
+当前执行优先级（2026-10-06 用户补充）：快速完成功能和真实 `run` / `serve` E2E，复用已有测试；仅补改动所需的边界检查，不扩展单元测试或审计体系。独立客户端移植、构建和 P0 采集可以并行；候选功能验证不等待完整性能扫描。
+
+### P0 摸底，不改产品代码（≤2 天）
+
+1. 在两台机器上用现有二进制（G32 Off 产品和 llama.cpp）按第 1 节的规则扫 C，得出两者的 G 和对应的 C。
+2. 在 Ferrum 的边界 C 附近扫调度参数，不超过 8 组：`--prefill-decode-execution` 取 split/mixed，`--scheduler-active-decode-prefill-chunk` 取 128/256/512，`--scheduler-active-decode-prefill-token-budget` 取关闭/256。
+3. 构建 main，用默认配置跑同样的 C 档，确定 main 和分支 Off 之间的差距。
+4. 在 CUDA 上用 nsys 跑一次 Off C8，记录 GPU 忙碌比例、耗时最多的 kernel、每步权重读取带宽和波与波之间的 host 间隙。M4 上做对应的 Metal 采样。
+5. 核对可行性：样本 P99 prompt 长度除以实测 prefill 速度是否 ≤ S_TTFT？decode 单步下限是否 ≤ S_TPOT？
+
+退出条件：两台机器各有一张 (θ, C) → G 的表，附瓶颈分解，并确定 P1 用哪个基线。
+
+### P1 干净基线（≤1 周）
+
+1. 给 `slo/recovery-20261002` 打归档 tag，不合并，不再开发。
+2. 从 main 新建分支，只移植三类东西：客户端 SLO 测量（可见 ITL、P99 评估）、调度参数的 CLI、P0 证明有收益的内核或数值 profile。不移植 SLO 控制器、启动校准、成本模型和成本观测、guarded submission。
+3. 如果关键内核脱离不了 SLO 接口，就改为在分支上删除 SLO 子系统。两条路按 P0 数据和移植成本二选一，并在结果表里写明理由。
+4. 把 `ferrum serve` 的默认配置（或一个文档化的 preset）改成 P0 选出的最佳静态 θ。`run` 和 serve 共用调度器，要确认单请求延迟没有回退。
+
+退出条件：
+- 新基线的 G 与 P0 中最好的 Ferrum 结果相差不超过 3%。如果有意不移植某个 profile，写明由 P2 的哪一项替代。
+- workspace 检查和两个后端的编译检查全部通过。
+
+### P2 内核（按 P0 的瓶颈排序，每项 ≤2 周，第 1 周末检查一次）
+
+- **CUDA**：做 Q4_K/Q5_K/Q6_K 的小 batch decode kernel，替代 FP16 常驻权重。
+  - 里程碑：先以 P0 的相同实际 batch/上下文采样确定 decode 单步基线，再追平 llama.cpp，并探索 8ms 以内的单步目标。表中的约 12.7ms 是客户端请求级 TPOT P50，不是 GPU 单步耗时。
+  - 显存回到 10GB 以内，给更高的 C 留出 KV 空间。
+- **Metal**：m=2–8 的 batched decode，把每行增量从约 16ms 降到 8ms 以内；单请求不能比 llama.cpp 慢。
+
+每项的验收：G 要提升，即能在更高的 C 下达标，或在同一个 C 下吞吐更高；输出质量按 `numerical-execution.zh.md` 里的 profile 合同核对。第 1 周末如果单步还没有 ≥10% 的实测改善，就停下来复盘，不追加补丁。
+
+### P3 轻量动态调度（可选）
+
+前提：P0/P2 的数据显示最优的静态 θ 会随负载变化，按负载切换能比最佳静态 θ 多出 ≥5% 的 G。
+
+做法：
+- 每一波用在线拟合的步时模型选 prefill 预算，模型为：波时长 ≈ a + b·decode 行数 + c·prefill token 数。预算要保证预计波时长不超过 ITL/TPOT 的余量。
+- 首字即将超时的请求优先。
+- 冷启动直接用静态默认值：不做启动校准，没有 Unknown 或空转分支。
+- 每波开销不超过 50µs，代码（含测试）不超过 2000 行。
+
+退出条件：G 比最佳静态 θ 高 ≥5%，否则删除这部分代码。
+
+### P4 验收与发布
+
+两台机器都出完整的表：
+- 每个 C 档至少 200 个测量请求，跑 2 次。
+- 包含显存/内存列和错误数，llama.cpp 放在同一张表里作参考。
+
+默认配置和 README 只写实测范围内的结论。
+
+## 5. 规则
+
+- 先测后写：每个新机制都必须对应 P0/P2 测出的一个具体缺口，并用 G 的前后对比来验收。
+- 每个改动单独提交、单独测量。witness、cohort、覆盖率这类内部计数不算进度。
+- 探索阶段每格至少 64 个请求，验收阶段至少 200 个；不用 32 个样本的 P99 下结论。
+- θ 只通过 typed config、CLI 或 preset 暴露，不依赖环境变量组合。
+- 测试和基准逻辑写在 Rust 里，不新增 Python 或 shell 框架。CUDA 机器上原服务的停止和恢复沿用现有 guard。
+- 计划和结果文档保持简短：只有本文件，加上每个阶段一页的结果表。
+
+## 6. 明确不做
+
+- 不继续 G33，也不继续 SLO 控制器那一套：每波搜索和证明、启动校准、Fitting/Residual/Qualification、成本路线目录、class frontier、joint extension。
+- 不加公式之外的门槛。
+- 不为了让某次实机运行过关，针对它暴露的单个问题追加补丁和专项测试。
+
+## 7. 用户决定
+
+1. 以 C 为扫描轴的容量形式：**已确认**（2026-10-06）。
+
+2026-10-06 用户已授权开启目标模式，按本计划尽快收敛可用版本。沿用以下默认值：
+
+2. S 沿用现值。
+3. 暂不加入 M1 Max，目标机器为 CUDA RTX 5090 和 Metal M4。
+4. 原工作树 `perf/prefill-decode-isolation` 的未提交改动保持原样；在独立工作树 `ferrum-throughput-20261006`、分支 `release/slo-throughput-20261006` 开发。
+
+## 8. 证据位置
+
+- G32 交接和 On/Off 计时审计：`~/ferrum-handoffs/20261006-g32/`
+- 本次拉取的 llama.cpp 与 Ferrum 对照副本（附来源和 SHA256）：`~/ferrum-handoffs/20261006-goal-baseline/`
+- 原件：
+  - Mac mini：`~/ferrum-bench/20260922-mini2/slo-goal-20260923/` 下的 `paired-r8d-sharegpt-20260923`、`concurrency-primary-20260923`、`slo-a3-primary-c8-mixed-ablation-r1`
+  - CUDA 主机：`~/ferrum-slo-20260923/evidence/cuda-q4-residual2-mmq-primary-c8-{llama,off,enforce}-r1`
+- 机器的访问方式：`ferrum-slo-recovery-20261006` 工作树中 `docs/HANDOFF-20261006-G32.zh.md` 的第 8 节
