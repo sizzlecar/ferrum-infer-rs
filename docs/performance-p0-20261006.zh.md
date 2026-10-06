@@ -1,6 +1,6 @@
 # P0：干净候选与首轮实测
 
-状态：轻量 SLO-aware 已接入；CUDA RN 与 M4 的真实功能 E2E 已通过，具体版本及范围见下文。`a890afc9` 的 CUDA 固定 ShareGPT 静态/动态 C1、C2、C4、C8 对比未见 G 收益。后续 Q6 内核恢复版已恢复 C1 吞吐，通过 CUDA 数值测试和自然 `run`，但动态 E2E 的模型有效性断言失败，正在定位；M4 当前候选主负载 C1 仍在测量。尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
+状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式实机 E2E 正在验证。CUDA Q6 恢复版静态 C1 已恢复吞吐；a890 主负载静态/动态对比未见 G 收益，M4 相同主负载 C1 仍因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
 
 候选 `57ee5ccb` 基于 main `2c9998a2`，仅接入既有静态执行优化 `c3c9ee0b` 与独立客户端测量；没有服务 SLO 控制器、启动校准或成本模型。旧恢复分支已作本地归档 tag `archive/slo-recovery-20261006`。原脏工作树未修改。
 
@@ -103,14 +103,19 @@ M4 定位重跑 r6 仍失败：长 prefill 到达前只有 4 个反馈波，仿�
 
 ## 首轮 M4 数据
 
-沿用同一 ShareGPT 选择规则及 32 预热 + 64 测量请求、一次重复；context 4096，其余服务容量固定。G32 Off C1 完成 64/64、错误/拒绝 0：
+沿用同一 ShareGPT 选择规则及 32 预热 + 64 测量请求、一次重复；context 4096、slots 32、batch 2048、FP16 KV，其余服务容量固定。G32 Off 与 a890 动态 C1 均完成 64/64、错误/拒绝 0；两轮全部 96 条样本身份及顺序一致：
 
 | 实现 | C | TTFT P50/P99 ms | last-visible TPOT P50/P99 ms/token | 可见 SSE 文本事件 ITL P50/P99 ms | 输出 tok/s | MTLDevice 分配峰值 B | 本次 SLO |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | G32 Off | 1 | 333.80 / 4260.72 | 56.56 / 57.37 | 56.64 / 58.96 | 17.04 | 8590311424 | TTFT 超标 |
+| a890 SLO-aware / Auto / mixed | 1 | 334.69 / 4274.67 | 56.67 / 57.51 | 56.77 / 59.04 | 17.00 | 未采集 | TTFT 超标 |
 
 阈值为 P99 3400/212/359ms。当前扫描未找到可行档，不记为 G=0。保留 8 个 event/usage 不一致，未观察到 transport coalescing；内存收集 6596 个样本、错误 0。OS footprint 峰值 1628850672 B、RSS 峰值 380387328 B；MTLDevice 分配量不代表整机物理内存占用，各口径不相加。
 
 最长请求为模板前 954 token、服务端 966 token，TTFT 4985.16ms；约 190 tok/s 是当前实现的有效速率，不是硬件物理上限。该结果说明当前 C1 长 prompt 已超标，不能推出所有配置均不可行。原目标表中的 llama.cpp C1 是另一组 32 个测量样本、最长 606 token，不能用其 P99 直接证明本轮 64 样本的同负载可行性；本次保留原阈值和筛选规则。
 
-原始报告、完整命令和配置位于仓库外 `~/ferrum-handoffs/20261006-throughput-p0/`（CUDA 旧版基线为 `cuda/c1-r1/`，静态候选为 `cuda/run-smoke-r2/`、`cuda/candidate-serve-r1/`，本机静态/动态功能为 `local-smoke/`、`local-slo-smoke/`，M4 为 `metal/`）。上述 CUDA 测量已结束并恢复原服务，M4 静态服务已清理。a890 CUDA 主负载首轮未见动态收益；M4 尚无该候选的同负载主表结果。
+a890 的最长请求 TTFT 为 4972.05ms，4/64 请求 TTFT 超过 3400ms；TTFT/TPOT 各 64 个样本，可见 SSE 文本事件 19744 / 间隔 19680，保留 8 个 event/usage 不一致，无 coalescing、缺失 usage 或协议/机械输出检查异常。主机内存采样 6619 次，RSS 峰值 251674624 B、physical footprint 峰值 1668057344 B，二者不相加；设备分配峰值未采集。请求排空，服务退出且端口释放。此行为 a890 的性能证据，不作为后续 c068 拟合修正的实测结果。
+
+两版本存在明确配置差异：a890 为 Auto→`qwen3_5.f32-master`、mixed、active-decode chunk 128 / budget 256；旧 G32 为 `f16-head`、split、budget 0。两者 effective reusable execution 均为 0。此表用于报告现状，不能单独归因于 SLO 开关。a890 本轮实际动态 prefill 步数为 0，故本格也不能代替已有混合请求 E2E 的动态使用验证。完整结果见仓库外 [M4 C1 摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-sharegpt-c1-r1-summary.json)。
+
+原始报告、完整命令和配置位于仓库外 `~/ferrum-handoffs/20261006-throughput-p0/`（CUDA 旧版基线为 `cuda/c1-r1/`，静态候选为 `cuda/run-smoke-r2/`、`cuda/candidate-serve-r1/`，本机静态/动态功能为 `local-smoke/`、`local-slo-smoke/`，M4 为 `metal/`）。上述 CUDA 测量已结束并恢复原服务，M4 两轮主负载服务均已清理。a890 CUDA 主负载首轮未见动态收益；M4 相同主负载 C1 仍因 TTFT 未达标。
