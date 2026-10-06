@@ -269,6 +269,22 @@ impl CudaCausalPagedAttentionProvider {
         )
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master_gguf_f16_projections(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = ferrum_interfaces::vnext::causal_paged_attention_f32_master_gguf_f16_projections_contract()
+            .map_err(contract_error)?;
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &contract,
+            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+            CausalAttentionSemantics::Standard,
+            CausalPrecision::F32Master,
+        )
+    }
+
     /// Builds the CUDA provider for Gemma 4's sandwich-normalized attention.
     ///
     /// The contract and capability are supplied by the registration layer so
@@ -321,16 +337,28 @@ impl CudaCausalPagedAttentionProvider {
             ));
         }
 
+        let rounded_gguf = super::gguf_f16_projection::is_operation(&contract.descriptor().id);
+        let provider_id = if rounded_gguf {
+            "provider.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
+        } else {
+            precision.provider_id(semantics)
+        };
+        let estimator_id = if rounded_gguf {
+            "resource-estimator.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
+        } else {
+            precision.estimator_id(semantics)
+        };
         let source = include_str!("causal_attention.rs");
         let mut provider_sources = vec![
             source.as_bytes(),
             include_bytes!("causal_attention/precision.rs"),
+            include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),
-            precision.provider_id(semantics).as_bytes(),
+            provider_id.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
             crate::ptx::PAGED_VARLEN_ATTENTION_VLLM.as_bytes(),
@@ -361,7 +389,8 @@ impl CudaCausalPagedAttentionProvider {
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
-            precision.estimator_id(semantics).as_bytes(),
+            estimator_id.as_bytes(),
+            include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
@@ -469,8 +498,13 @@ impl CudaCausalPagedAttentionProvider {
                 .map_err(contract_error)?,
             );
         }
+        let accepted_weight_formats = super::gguf_f16_projection::provider_formats(
+            &contract.descriptor().id,
+            accepted_weight_formats,
+        )
+        .map_err(contract_error)?;
         let mut descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(precision.provider_id(semantics)).map_err(contract_error)?,
+            ProviderId::new(provider_id).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -484,7 +518,7 @@ impl CudaCausalPagedAttentionProvider {
             accepted_weight_formats,
             accepted_quantization_formats,
             storage_bindings(semantics).map_err(contract_error)?,
-            precision.estimator_id(semantics),
+            estimator_id,
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )

@@ -118,6 +118,11 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_matrix.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_swiglu.rs").as_bytes(),
+        include_bytes!("vnext_ops/transformer/gguf_f16_projection.rs"),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu.rs"),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/plan.rs"),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/weights.rs"),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/execution.rs"),
         include_str!("vnext_ops/native_blocks.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks/hadamard.rs").as_bytes(),
         include_str!("vnext_ops/native_io.rs").as_bytes(),
@@ -196,6 +201,10 @@ pub fn cuda_vnext_runtime_config(
     })
 }
 
+pub(crate) fn rn_fragment_mma_compiled() -> bool {
+    transformer::compiled_mma_target(crate::ptx::VNEXT_GGUF)
+}
+
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     let capabilities = [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
@@ -209,6 +218,10 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RMS_NORM_F32_CAPABILITY_ID,
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
+        ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID,
+        crate::gguf_rn_fragment_materializer::GGUF_RN_FRAGMENT_CAPABILITY_ID,
+        ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+        ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
         DENSE_GEGLU_TANH_F16_CAPABILITY_ID,
         CONSTANT_SCALE_F16_CAPABILITY_ID,
         LOGIT_SOFTCAP_F16_CAPABILITY_ID,
@@ -263,12 +276,33 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         )?);
         capabilities
     };
+    let mut capabilities = capabilities;
+    if !rn_fragment_mma_compiled() {
+        capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
+    }
     Ok(capabilities)
 }
 
 pub fn cuda_weight_materializer_selection(
     family: &PreparedModelFamily,
 ) -> Result<WeightMaterializerSelection, VNextError> {
+    if crate::gguf_rn_fragment_materializer::requests_gguf_rn_fragment_materialization(family) {
+        let selection =
+            crate::gguf_rn_fragment_materializer::gguf_rn_fragment_materializer_selection(family)?;
+        let inventory = crate::gguf_rn_fragment_materializer::gguf_rn_fragment_inventory(family)?;
+        tracing::info!(
+            source_schema_fingerprint = %inventory.source_schema_fingerprint,
+            execution_schema_fingerprint = %inventory.execution_schema_fingerprint,
+            source_consumed_bytes = inventory.source_consumed_bytes,
+            converted_f16_bytes = inventory.converted_f16_bytes,
+            packed_fragment_bytes = inventory.packed_fragment_bytes,
+            retained_consumed_bytes = inventory.retained_consumed_bytes,
+            unique_consumed_execution_bytes = inventory.unique_consumed_execution_bytes,
+            includes_placement_alignment = inventory.includes_placement_alignment,
+            "Explicit GGUF RN-F16 dense and fragment inventory (not Peak VRAM)"
+        );
+        return Ok(selection);
+    }
     let block_fp8_weight_format = WeightFormatId::new(BLOCK_FP8_SAFETENSORS_FORMAT_ID)?;
     let block_fp8_quantization =
         QuantizationFormatId::new(BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID)?;
@@ -387,6 +421,8 @@ fn cuda_operation_contracts(
         Box::new(rms_norm_f32_to_f16_contract().map_err(contract_error)?),
         Box::new(rms_norm_f32_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
+        Box::new(ferrum_interfaces::vnext::gated_delta_recurrent_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
+        Box::new(ferrum_interfaces::vnext::causal_paged_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
         Box::new(dense_geglu_tanh_contract().map_err(contract_error)?),
         Box::new(constant_scale_contract().map_err(contract_error)?),
@@ -435,7 +471,7 @@ fn cuda_operation_contracts(
 pub fn cuda_vnext_operation_registry(
     runtime: &CudaDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
-    let contracts = cuda_operation_contracts(runtime.attention_execution_policy())?;
+    let mut contracts = cuda_operation_contracts(runtime.attention_execution_policy())?;
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
         Box::new(CudaTokenEmbeddingProvider::new_f32(runtime)?),
@@ -448,6 +484,8 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaRmsNormProvider::new_f32(runtime)?),
         Box::new(transformer::CudaDenseLinearProvider::new(runtime)?),
         Box::new(transformer::CudaDenseSwiGluProvider::new(runtime)?),
+        Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new_f32_master_gguf_f16_projections(runtime)?),
+        Box::new(transformer::CudaCausalPagedAttentionProvider::new_f32_master_gguf_f16_projections(runtime, runtime.attention_execution_policy())?),
         Box::new(transformer::CudaDenseGeGluTanhProvider::new(runtime)?),
         Box::new(transformer::CudaConstantScaleProvider::new(runtime)?),
         Box::new(transformer::CudaLogitSoftcapProvider::new(runtime)?),
@@ -523,6 +561,19 @@ pub fn cuda_vnext_operation_registry(
         ));
         providers
     };
+    let mut providers = providers;
+    if runtime.descriptor().capabilities.iter().any(|capability| {
+        capability.as_str()
+            == ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID
+    }) {
+        contracts.push(Box::new(
+            ferrum_interfaces::vnext::dense_swiglu_gguf_rn_f16_fragment_m1to8_contract()
+                .map_err(contract_error)?,
+        ));
+        providers.push(Box::new(transformer::CudaRnFragmentSwiGluProvider::new(
+            runtime,
+        )?));
+    }
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
 
@@ -546,28 +597,25 @@ impl CudaVNextComposition {
             .map_err(contract_error)?;
         let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
         let registry = cuda_vnext_operation_registry(&runtime)?;
+        #[allow(unused_mut)]
+        let mut weight_materializers = vec![
+            crate::gguf_rn_fragment_materializer::gguf_rn_fragment_materializer()
+                .map_err(contract_error)?,
+        ];
         #[cfg(feature = "vllm-marlin")]
-        let weight_materializers = vec![
+        weight_materializers.extend([
             crate::marlin_fp8_materializer::marlin_fp8_weight_materializer()
                 .map_err(contract_error)?,
             crate::marlin_fp8_materializer::block_fp8_to_marlin_fp8_weight_materializer()
                 .map_err(contract_error)?,
-        ];
+        ]);
         #[cfg(feature = "vllm-moe-marlin")]
-        let weight_materializers = {
-            let mut weight_materializers = weight_materializers;
-            weight_materializers.push(
-                crate::mxfp4_marlin_materializer::gpt_oss_mxfp4_to_marlin_weight_materializer()
-                    .map_err(contract_error)?,
-            );
-            weight_materializers
-        };
-        #[cfg(feature = "vllm-marlin")]
+        weight_materializers.push(
+            crate::mxfp4_marlin_materializer::gpt_oss_mxfp4_to_marlin_weight_materializer()
+                .map_err(contract_error)?,
+        );
         let weight_materializers =
             WeightMaterializerRegistry::new(weight_materializers).map_err(contract_error)?;
-        #[cfg(not(feature = "vllm-marlin"))]
-        let weight_materializers =
-            WeightMaterializerRegistry::identity_only().map_err(contract_error)?;
         let engine = EngineProviderDescriptor::new(
             ProviderId::new(CUDA_ENGINE_PROVIDER_ID).map_err(contract_error)?,
             ContractVersion::new(1, 0),

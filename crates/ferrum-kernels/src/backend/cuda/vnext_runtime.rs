@@ -2112,7 +2112,7 @@ impl CudaDeviceRuntime {
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))
     }
 
-    pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+    pub fn new(mut config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
         if !config.attention_execution_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA runtime requires a resolved attention execution policy",
@@ -2120,6 +2120,13 @@ impl CudaDeviceRuntime {
         }
         let context = CudaContext::new(config.ordinal)
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
+        // Advertise the fragment op only when both the embedded module and
+        // the actual device support its SM80 MMA instructions.
+        let major = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(|error| CudaDeviceRuntimeError::driver("MMA compute capability", error))?;
+        if major < 8 || !super::vnext_ops::rn_fragment_mma_compiled() {
+            config.capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
+        }
         // vNext owns all cross-stream ordering through explicit commands and
         // fences. Per-slice implicit events would create a second authority.
         unsafe {

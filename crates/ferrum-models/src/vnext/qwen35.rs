@@ -22,9 +22,13 @@ use ferrum_interfaces::vnext::{
     StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
+    WeightSchema, WeightTensorSpec,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
-    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID,
+    DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
@@ -68,6 +72,7 @@ mod hadamard;
 mod numerical;
 pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
+    F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID,
     F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID,
 };
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
@@ -306,6 +311,34 @@ impl Qwen35OperationProfile {
         argmax: OperationSelection::new(LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, 1, 0),
     };
 
+    const F32_MASTER_GGUF_F16_PROJECTIONS: Self = Self {
+        dense_feed_forward: OperationSelection::new(
+            DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID,
+            1,
+            0,
+        ),
+        linear_attention: OperationSelection::new(
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
+            1,
+            0,
+        ),
+        causal_attention: OperationSelection::new(
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
+            1,
+            0,
+        ),
+        ..Self::F32_MASTER
+    };
+
+    const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8: Self = Self {
+        dense_feed_forward: OperationSelection::new(
+            DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID,
+            1,
+            0,
+        ),
+        ..Self::F32_MASTER_GGUF_F16_PROJECTIONS
+    };
+
     const F16_INT8_KV: Self = Self {
         causal_attention: OperationSelection::new(
             CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
@@ -327,6 +360,9 @@ impl Qwen35OperationProfile {
         match profile.id.as_str() {
             F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
+            F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8)
+            }
             F16_INT8_KV_NUMERICAL_PROFILE_ID => Ok(Self::F16_INT8_KV),
             F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER_INT8_KV),
             _ => Err(invalid_config(
@@ -783,6 +819,23 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             return Err(invalid_config("numerical_profile.kv_storage", "Hadamard weight execution currently requires F16 KV; INT8 KV must be qualified as a separate combination"));
         }
         let text = Self::text_config(config)?;
+        if profile.id.as_str() == F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID {
+            if !numerical::gguf_rn_f16_fragment_eligible(config, &text)
+                || profile
+                    .kv_storage
+                    .iter()
+                    .any(|state| state.format() != KvStorageFormat::F16)
+            {
+                return Err(invalid_config("numerical_profile", "RN-F16 fragment FFN requires native non-Hadamard dense GGUF, same-format Q4K/Q5K/Q6K gate/up, eligible down, negative-rate recurrent ABI and F16 KV"));
+            }
+            let catalog = numerical::profiles(&self.family_id, config)?;
+            if catalog.resolve(&profile.id)? != profile {
+                return Err(invalid_config(
+                    "numerical_profile",
+                    "RN-F16 fragment profile differs from the declared family contract",
+                ));
+            }
+        }
         let operations = Qwen35OperationProfile::for_profile(profile)?;
         let mut weight_refs = Vec::with_capacity(config.weights.len());
         for weight in &config.weights {
@@ -7296,6 +7349,7 @@ mod tests {
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
+            | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. }
             | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
     }
@@ -7334,6 +7388,7 @@ mod tests {
             }
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
+            | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. }
             | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
     }

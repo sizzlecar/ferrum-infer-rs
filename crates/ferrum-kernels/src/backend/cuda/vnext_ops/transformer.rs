@@ -67,6 +67,7 @@ mod attention;
 mod causal_attention;
 #[cfg(test)]
 mod f16_tests;
+mod gguf_f16_projection;
 mod gpt_oss_attention;
 #[cfg(feature = "vllm-moe-marlin")]
 mod gpt_oss_moe;
@@ -88,6 +89,7 @@ mod native_linear;
 mod native_matrix;
 mod native_swiglu;
 mod precision;
+mod rn_fragment_swiglu;
 #[cfg(test)]
 mod test_support;
 
@@ -107,6 +109,7 @@ pub(super) use moe_weights::{
     COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_SYMMETRIC_CAPABILITY_ID,
     GPTQ_MARLIN_CAPABILITY_ID,
 };
+pub(super) use rn_fragment_swiglu::{compiled_mma_target, CudaRnFragmentSwiGluProvider};
 
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.cuda.dense_linear.f16.cublas";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_linear.f16.cublas";
@@ -1299,6 +1302,13 @@ pub(super) fn provider_descriptor_with_formats(
     accepted_quantization_formats: BTreeSet<QuantizationFormatId>,
     provider_fingerprint: String,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    let accepted_weight_formats =
+        gguf_f16_projection::provider_formats(&contract.descriptor().id, accepted_weight_formats)
+            .map_err(contract_error)?;
+    let provider_fingerprint = implementation_fingerprint(&[
+        provider_fingerprint.as_bytes(),
+        include_bytes!("transformer/gguf_f16_projection.rs"),
+    ]);
     let capability = CapabilityId::new(capability_id).map_err(contract_error)?;
     if !runtime.descriptor().capabilities.contains(&capability) {
         return Err(CudaDeviceRuntimeError::contract(format!(
@@ -1503,6 +1513,8 @@ pub(super) fn ensure_estimator_request(
             descriptor.resource_estimator_id()
         )));
     }
+    gguf_f16_projection::validate_values(&request.operation().id, request.values())
+        .map_err(invalid_plan)?;
     Ok(())
 }
 
@@ -4550,6 +4562,7 @@ pub(super) fn ensure_invocation(
             "CUDA provider for `{operation_id}` received another or empty operation"
         ));
     }
+    gguf_f16_projection::validate_invocation(invocation)?;
     Ok(())
 }
 
