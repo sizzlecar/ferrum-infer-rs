@@ -1,6 +1,6 @@
 # 热门模型并发 P0（2026-10-07，进行中）
 
-[目标](goal-popular-models-concurrency.zh.md)尚未完成。当前以 `main` 的 `0680840becae342e481df4ac0705c43fc08633a7` 采集基线，首个27B llama.cpp C1主负载格已完成；未修改产品代码，尚无本轮Ferrum/对照吞吐比值，也未进入 P1。原工作区的旧 SLO 修改保留。按用户最新决定，Metal 仅比较 llama.cpp，vLLM 仅在 CUDA 测试。
+[目标](goal-popular-models-concurrency.zh.md)尚未完成。当前以 `main` 的 `0680840becae342e481df4ac0705c43fc08633a7` 采集基线，27B llama.cpp Metal C1/C4已完成，共2/60格；未修改产品代码，尚无本轮Ferrum/对照吞吐比值，也未进入 P1。原工作区的旧 SLO 修改保留。按用户最新决定，Metal 仅比较 llama.cpp，vLLM 仅在 CUDA 测试。
 
 ## 固定输入与对照
 
@@ -11,36 +11,37 @@
 | Qwen3.8 AWQ | `cyankiwi/Qwen3.8-27B-AWQ-INT4@6e134bae811fb5adac50ee042ae5f029ac6779aa`；实际为 compressed-tensors INT4/G32/非对称；5/5分片的399组量化头部布局已核对，未下载权重payload |
 | Qwen3.6 AWQ | `QuantTrio/Qwen3.6-35B-A3B-AWQ@119886a1072372348f73ef0df2d801cdcc0f455b`；AWQ/GEMM、4bit、group128、zero-point；已核对索引与2/9分片头部，完整覆盖第0/1层；未下载或验证权重payload |
 | semantic | Qwen3.8 官方 `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`；Qwen3.6 官方 `995ad96eacd98c81ed38be0c5b274b04031597b0` |
-| llama.cpp | 固定 [b11429](https://github.com/ggml-org/llama.cpp/releases/tag/b11429)，commit `d81235049384534c167caea52b85a694f6103d14`；macOS arm64 包已按发行摘要校验；27B、35B短测试通过，27B主负载C1 r4已完成，64请求零错误 |
+| llama.cpp | 固定 [b11429](https://github.com/ggml-org/llama.cpp/releases/tag/b11429)，commit `d81235049384534c167caea52b85a694f6103d14`；macOS arm64 包已按发行摘要校验；27B、35B短测试通过，27B主负载C1/C4各完成64请求、零错误 |
 | CUDA vLLM | 官方候选 `vllm/vllm-openai:v0.31.0-cu129`、`linux/amd64` 固定digest `sha256:b18abb2df97b8f798e81862bd93f872ea18613372e2c3adc0cc2ac21e66ac12f`；镜像配置声明CUDA12.9.1/SM12.0目标，尚未拉取、部署或在5090验证 |
 
 ShareGPT 延用 `anon8231489123/ShareGPT_Vicuna_unfiltered@745745adf6cd15b84e4f1c4a5a051fb4304f9342` 的 `ShareGPT_V3_unfiltered_cleaned_split.json`，本机已下载并核对完整 SHA256 `35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4`。
 
 为保留 #402 的原始样本与输出预算，选择器继续使用已核对 SHA256 `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42` 的 tokenizer；服务端各用目标模型自己的 tokenizer 和模板。27B 官方 tokenizer 的 SHA256 是 `0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3`，不能直接换入选择器并声称样本未变。
 
-每格 32 预热 + 64 测量、一次重复、seed/sampling-seed 42；输入 4–1024、输出至少 4、输入+参考输出+32-token 模板预留 ≤2048；参考输出长度、ignore_eos、thinking off、temperature 0、top_p 1、repetition penalty 1。C1 r4实取选择 SHA 已核对为冻结值 `03676b00ee0b9e8407f59e3fb531eeff99dde5ccc9e59844b6abf7d22f1d5df2`。不同引擎和并发档复用同一选择，服务容量固定32，FP16 KV、prefix/session cache off。新模型 S 尚未按目标规则计算，不预填 SLO pass。
+每格 32 预热 + 64 测量、一次重复、seed/sampling-seed 42；输入 4–1024、输出至少 4、输入+参考输出+32-token 模板预留 ≤2048；参考输出长度、ignore_eos、thinking off、temperature 0、top_p 1、repetition penalty 1。C1/C4实取选择 SHA 均已核对为冻结值 `03676b00ee0b9e8407f59e3fb531eeff99dde5ccc9e59844b6abf7d22f1d5df2`。不同引擎和并发档复用同一选择，服务容量固定32，FP16 KV、prefix/session cache off。新模型 S 尚未按目标规则计算，不预填 SLO pass。
 
 ## 已完成主负载
 
-M1 Max/32GiB，27B同一UD-Q4_K_M文件，llama.cpp固定49层GPU、其余CPU、32槽、共享KV16384/每槽2048、FP16 KV。一次重复：32预热与64测量均完成，错误/拒绝及全部协议质量计数均为0；无跨重复方差或CI。测量窗口3050.697375708秒、19,801个usage输出token；选择器输入实测5–954 token，均值101.453125。以下延迟单位为ms，P50/P99；SLO阈值未声明，状态为unknown。
+M1 Max/32GiB，27B同一UD-Q4_K_M文件，llama.cpp固定49层GPU、其余CPU、32槽、共享KV16384/每槽2048、FP16 KV。C1/C4各一次重复，32预热与64测量全成功，错误/拒绝及全部协议质量计数均为0；无跨重复方差或CI。测量窗口分别3050.697375708 / 2108.819163458秒，各19,801个usage输出token；选择器输入均为5–954 token，均值101.453125。以下延迟单位为ms，P50/P99；SLO阈值未声明，状态为unknown。
 
-| 引擎 / 模型 / 客户端并发 | TTFT P50/P99 | TPOT P50/P99（last-visible） | ITL P50/P99（可见SSE文本事件） | 输出 tok/s | Peak Memory | 成功/错误/拒绝；重复 | SLO |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| llama.cpp / 27B / C1 | 2168.744 / 15679.401 | 142.544 / 154.879 | 143.285 / 196.639 | 6.490647 | 宿主RSS 11,430,707,200B；设备峰值未采集 | 64/0/0；1 | unknown |
+| 引擎 / 模型 / 客户端并发 | TTFT P50/P99 | TPOT P50/P99（last-visible） | ITL P50/P99（可见SSE文本事件） | 输出 tok/s | Metal分配峰值 | 采样footprint峰值（B） | 采样RSS峰值（B） | 成功/错误/拒绝；重复 | SLO |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| llama.cpp / 27B / C1 | 2168.744 / 15679.401 | 142.544 / 154.879 | 143.285 / 196.639 | 6.490647 | 未采集 | 8,740,024,000 | 11,430,707,200 | 64/0/0；1 | unknown |
+| llama.cpp / 27B / C4 | 2820.175 / 15638.016 | 396.565 / 511.273 | 366.985 / 1690.317 | 9.389615 | 未采集 | 8,786,964,288 | 11,858,051,072 | 64/0/0；1 | unknown |
 
-主表TPOT由既有Rust reader按每请求最后可见文本计算，未舍入P50/P99为142.54386315722883 / 154.87915203000318；原生报告的终止时刻TPOT为142.5442053113307 / 154.88000243711105，不混用。ITL保留64个请求的19,617个可见文本事件、19,553个间隔；观测到的transport coalescing为0。严格单token诊断仅51个请求符合，另13个事件数与usage不一致，但不从可见SSE ITL中丢弃；旧 `itl_ms=0` 不是主表口径。
+主表TPOT使用既有Rust reader的last-visible口径，不混入原报告的终止时刻TPOT；旧 `itl_ms=0` 也不作为主表ITL。C1/C4分别保留19,617/19,622个可见文本事件、19,553/19,558个间隔，观测到的transport coalescing均为0；严格单token诊断分别51/52个请求符合，其余13/12个事件数与usage不一致，仍保留在可见SSE ITL中。C4吞吐更高，但TPOT与可见SSE ITL、尤其P99尾延迟明显增加；这是吞吐/延迟取舍，不能据此判定SLO通过或优化成功。
 
-内存为 `proc_pid_rusage.RUSAGE_INFO_V2` 在整个client调用窗口（含预热）对服务进程的17,267次采样，缺失/采集错误均为0；RSS峰值11,430,707,200B、physical footprint峰值8,740,024,000B，两者重叠、不能相加。这是采样下界，不是独立测量阶段或逐repeat峰值，也不是Metal设备分配峰值。原始报告在 `metal-dense-llama-primary-c1-r4/serve-guard/qwen38-dense-llama-primary-c1-r4/client/report.jsonl`，Rust提取在 `analysis/primary-summaries/metal-dense-llama-c1-r4.jsonl`；相邻命令、退出状态和 `metal-memory-source.json` 保留取证。协议计数通过不等于64题语义质量或完整token一致率已验收。
+内存为 `proc_pid_rusage.RUSAGE_INFO_V2` 在各自整个client调用窗口（含预热）对服务进程采样：C1/C4各17,267/11,717次，缺失/采集错误均为0；physical footprint峰值分别8,740,024,000 / 8,786,964,288B，与表中RSS重叠、不能相加。这些是采样下界，不是独立测量阶段、逐repeat或Metal设备分配峰值。Rust提取为 `analysis/primary-summaries/metal-dense-llama-c1-r4.jsonl`、`analysis/primary-summaries/metal-dense-llama-c4.jsonl`，各自 `source_report` 指向原生报告，相邻命令和退出状态保留取证；C4 client/server/cell均退出0。协议计数通过不等于64题语义质量或完整token一致率已验收。
 
 ## 当前缺口与矩阵状态
 
-下表是准备/支持状态，不是性能排名。CUDA 每模型四组、Metal 每模型两组，共 12 组 × 5 个并发档 = 60 格；目前仅27B llama.cpp Metal C1完成一次主负载采集，SLO及设备峰值限制见上表。
+下表是准备/支持状态，不是性能排名。CUDA 每模型四组、Metal 每模型两组，共60格；27B llama.cpp Metal C1/C4已完成2/60格，SLO及设备峰值限制见上表。
 
 | 后端 / 模型 | Ferrum GGUF | llama.cpp GGUF | Ferrum AWQ / vLLM（仅 CUDA） |
 | --- | --- | --- | --- |
 | CUDA / 27B | 待运行 | 待运行 | CT的399组头部布局已核对，未实跑；主机认证阻塞 |
 | CUDA / 35B-A3B | provider 格式缺口，未实跑 | 待下载与运行 | AWQ及混合BF16专家支持缺口，未实跑；vLLM 待部署 |
-| M1 Max / 27B | run 1槽默认0.9通过；serve 32槽默认0.9容量拒绝，显式1.0短测试通过 | 全GPU32槽OOM；固定49层GPU/32槽的主负载C1 r4已完成，6.490647 tok/s；C4已启动，后续档待完成 | 不适用 |
+| M1 Max / 27B | run 1槽默认0.9通过；serve 32槽显式1.0短测试通过；主负载C4运行中 | 全GPU32槽OOM；固定49层GPU/32槽的C1/C4已完成，后续档待完成 | 不适用 |
 | M1 Max / 35B-A3B | run（1槽）与serve（32槽）均实测失败：混合 MoE provider 不接受 Q6_K | 32槽自动放置OOM；固定16层GPU/32槽短测试通过，未完成主负载 | 不适用 |
 
 - Ferrum CUDA 27B：399组实际CT量化头部的dtype、布局和配置维度均匹配现有路径，未发现头部层面的阻塞；BF16 scales会转为F16，比较时须披露该精度差异。尚未验证 `weight_shape` 实际值、权重payload、完整分片hash或CUDA加载/计算。证据为 `metadata/dense-ct-headers/` 与 `analysis/cuda-ct-dense-gap.json`，只计元数据审计完成。
@@ -50,12 +51,12 @@ M1 Max/32GiB，27B同一UD-Q4_K_M文件，llama.cpp固定49层GPU、其余CPU、
 - 上述成功复测的有效配置中，1槽run的available/usable为22,906,109,952 / 20,615,498,410B，context/decode计划峰值为16,906,678,832 / 16,433,928,768B；32槽serve显式1.0的available=usable=22,906,109,952B，context/decode计划峰值为16,979,635,344 / 21,359,593,088B。这些是启动计划成本，**不是实测分配峰值**，不能填入主表Peak Memory。
 - 同文件 llama.cpp：32槽、共享KV16384、每槽2048、FP16KV、全GPU层在warmup出现 `kIOGPUCommandBufferCallbackErrorOutOfMemory`，首个算术请求HTTP500。单槽/共享KV2048诊断则回答42，第二条KV解释44个usage输出token、自然stop，guard退出0。单槽启动分配为MTL模型15356.48MiB、KV128MiB、递归状态149.62MiB、compute144.02MiB；不是主负载或逐格峰值。UD文件包含F32/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ3_S/IQ4_XS，不能当作所有张量均为Q4_K。两次配置与原始结果分别在 `metal-dense-llama-smoke/`、`metal-dense-llama-c1-smoke/`，进程均已退出并清理。
 - 27B llama.cpp保持32槽/共享KV16384/每槽2048/FP16KV，改用文档化 `--gpu-layers auto --fit on` 后，两条相同短请求通过并自然stop，guard退出0。自动放置实选49/66层到GPU；日志报告启动时空闲设备内存17056MiB，目标保留1024MiB，未改变显式上下文。KV为GPU768MiB+CPU256MiB，部分递归状态和层计算在CPU，与全GPU运行的执行配置不同。短测试证据在 `metal-dense-llama-fit-smoke/`。
-- 27B主负载C1 r4已正常结束（session20613退出0，所属进程已清理），固定 `--gpu-layers 49 --fit off`、32槽、6000秒时限及 `NO_PROXY/no_proxy=127.0.0.1,localhost,::1`。r3因发现仓库外guard普通client仍有3600秒上限而主动停止，不计产品或性能失败。guard v2改为作业声明时限后，61项测试、fmt与release构建通过；产品代码未改。后续14格串行队列 `metal-primary-remaining-combined-v2/serve.guard.json` 已启动（session83720）：首格 `qwen38-dense-llama-primary-c4` 正在准备客户端/预热，guard/server/client PID为16832/16870/16922；后续13格尚未完成，不重复执行子集。队列包括27B两引擎的C4/8/16/32、Ferrum C1及35B llama的五档。
+- 27B主负载C1 r4已正常结束；r3因guard普通client的3600秒上限而主动停止，不计产品或性能失败。仓库外guard v2改用作业声明时限，61项测试、fmt与release构建通过。14格串行队列 `metal-primary-remaining-combined-v2/serve.guard.json` 的首格llama C4已完成；同一session83720/guard16832现运行第二格Ferrum C4（server19619/client19702），已实查4条到 `127.0.0.1:39333` 的直连。其余格待完成，不重复执行子集；`NO_PROXY/no_proxy`设置保留，产品代码未改。
 - 27B容量比较说明：两引擎均声明32槽、每请求输入与请求输出合计最多2048 token、FP16 KV，但总KV策略不同。Ferrum的KV/状态池按总运行时字节预算动态增长，2048不是共享池大小；llama.cpp显式预留共享16384-token KV池。Ferrum启动检查覆盖单序列完整上下文及32序列各一个已提交token的decode状态，不表示能同时容纳32个完整2048上下文；现有短测也只覆盖两个顺序请求。Ferrum全Metal与llama的49层GPU加CPU放置同样是有意配置差异。审计证据为 `analysis/metal-kv-capacity-comparison.json`；并发能力和实际错误须由主负载验证。
 - 35B llama.cpp保持32槽/共享KV16384/每槽2048/FP16KV：`--gpu-layers auto --fit on` 实选41/41层GPU，在warmup发生Metal OOM，首个请求HTTP500，guard退出1（`metal-moe-llama-fit-smoke/`）。随后改为 `--gpu-layers 16 --fit off --no-repack`，实选16/41层GPU、其余CPU；算术回答42（3个usage输出token），KV解释为两句话（39个usage输出token），均自然stop，流式含有效 `[DONE]`，guard退出0（`metal-moe-llama-gpu16-smoke/`）。启动日志为KV CPU192+GPU128MiB、递归状态CPU1273+GPU737MiB、Metal模型映射19914.65MiB及compute207.02MiB；这些不是驻留峰值或主负载结果。
 - 主机：已确认本机为 M1 Max/32GiB/macOS15.1.1。CUDA 的文档路由为本机→Mini→WSL；Mini Tailscale 可达，但现有密码和本机公钥认证均失败，未进入5090、未改原服务。
-- 测量：仓库外Rust `analysis/report-reader/` 的last-visible读取通过2项测试，已成功读取上述C1原生报告；历史schema缺字段仍被明确拒绝。`analysis/quality-replay/` 的collector已通过7项测试、fmt与锁定离线release构建，pin未变；独立原始ID比较工具通过8项测试、fmt和release构建，有1条unused `token_record` helper警告，证据为 `analysis/quality-replay/comparison-validation.json`。真实64题质量/一致率套件仍未运行；其余主负载、设备峰值与质量证据待完成，短测试不替代验收。
+- 测量：仓库外Rust `analysis/report-reader/` 的last-visible读取通过2项测试，已成功读取上述C1/C4原生报告；历史schema缺字段仍被明确拒绝。`analysis/quality-replay/` 的collector已通过7项测试、fmt与锁定离线release构建，pin未变；独立原始ID比较工具通过8项测试、fmt和release构建，有1条unused `token_record` helper警告，证据为 `analysis/quality-replay/comparison-validation.json`。真实64题质量/一致率套件仍未运行；其余主负载、设备峰值与质量证据待完成，短测试不替代验收。
 
-下一步按冻结配置采集其余可运行格，并补真实64题质量/一致率；P0 尚缺完整运行矩阵、两后端各自对照的 profile 与按耗时排序的缺口表。Qwen3.5-9B 的 #402 CUDA C4/C8 回归基线仍为284.688/414.436 tok/s，不以本轮单个基线格替代回归。已取消的 vllm-metal 环境及其uv下载缓存已删除以释放磁盘，仓库外小型元数据保留；不再测试或下载Metal vLLM权重，不属于当前验收范围。
+下一步按冻结配置采集其余可运行格，并补真实64题质量/一致率；P0 尚缺完整运行矩阵、两后端各自对照的 profile 与按耗时排序的缺口表。Qwen3.5-9B 的 #402 CUDA C4/C8 回归基线仍为284.688/414.436 tok/s，不以本轮两个基线格替代回归。已取消的 vllm-metal 环境及其uv下载缓存已删除以释放磁盘，仓库外小型元数据保留；不再测试或下载Metal vLLM权重，不属于当前验收范围。
 
 独立工作区：`/private/tmp/ferrum-popular-models-20261007`；全部过程、配置、元数据、下载和日志在仓库外 `/private/tmp/ferrum-popular-models-p0-20261007/`。恢复工作须核验进程/会话的当前状态，不能仅凭这些路径判断任务仍在运行。
