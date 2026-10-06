@@ -268,7 +268,54 @@ async fn exercise_live_lifecycle(require_slo: bool) {
                 .await;
         });
         join_all(followups).await;
-        let after = assert_drained(&client, &origin).await;
+        let mut after = assert_drained(&client, &origin).await;
+        let adaptation_requests = if require_slo {
+            // The cold long-prefill scenario above must finish safely even
+            // when its TTFT is infeasible or the cost model is not ready.
+            // Exercise learned budgeting separately with a smaller prefill;
+            // retain the original cancellation load and all its assertions.
+            let adapted_before = after["scheduler"]["slo"]["adapted_prefill_steps"]
+                .as_u64()
+                .expect("learned SLO-aware execution counter");
+            for coefficient in [
+                "fixed_step_ms",
+                "decode_ms_per_sequence",
+                "prefill_ms_per_token",
+            ] {
+                assert!(
+                    after["scheduler"]["slo"][coefficient].is_number(),
+                    "live traffic must supply an identifiable model: {}",
+                    after["scheduler"]["slo"]
+                );
+            }
+            let mut decoder = Stream::start(
+                &client,
+                &origin,
+                model,
+                "Continue counting integers starting at one.",
+                32,
+            )
+            .await;
+            decoder.wait_for_content(2).await;
+            let prompt = format!(
+                "Read this list then repeat its colors: {}",
+                "red green blue. ".repeat(32)
+            );
+            let prefill = Stream::start(&client, &origin, model, &prompt, 8).await;
+            tokio::join!(decoder.finish(32), prefill.finish(8));
+            after = assert_drained(&client, &origin).await;
+            assert!(
+                after["scheduler"]["slo"]["adapted_prefill_steps"]
+                    .as_u64()
+                    .expect("SLO-aware execution counter")
+                    > adapted_before,
+                "learned controller must use its budget for the followup prefill: {}",
+                after["scheduler"]["slo"]
+            );
+            2
+        } else {
+            0
+        };
         if require_slo {
             let previous = &before["scheduler"]["slo"];
             let current = &after["scheduler"]["slo"];
@@ -291,7 +338,7 @@ async fn exercise_live_lifecycle(require_slo: bool) {
         };
         assert_eq!(
             completed(&after) - completed(&before),
-            2 + followup_count,
+            2 + followup_count + adaptation_requests,
             "the disconnected request must not silently run to normal completion"
         );
         assert_eq!(
