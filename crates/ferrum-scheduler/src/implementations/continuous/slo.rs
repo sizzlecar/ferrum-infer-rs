@@ -206,7 +206,9 @@ struct OnlineAffineCost {
 
 impl OnlineAffineCost {
     fn record(&mut self, decode: f64, prefill: f64, elapsed_ms: f64) {
-        const DECAY: f64 = 0.8;
+        // Prefill observations are sparse between long decode runs. Retain
+        // their information longer instead of halving its weight every 3 waves.
+        const DECAY: f64 = 0.99;
         let sample = [decode, prefill, elapsed_ms];
         let delta = std::array::from_fn::<_, 3, _>(|i| sample[i] - self.mean[i]);
         self.weight = DECAY * self.weight + 1.0;
