@@ -165,6 +165,26 @@ requesting unsupported `on_demand` reports an error. Set `reusable_execution = f
 to disable device-program preparation. These options do not change request
 admission, queuing, or the model's numerical profile.
 
+Development builds also expose optional SLO-aware prefill scheduling in both
+`run` and `serve`: `--scheduler-slo ttft:200,tpot:15,itl:50` (milliseconds).
+Alternatively, set the targets in the working directory's `ferrum.toml`:
+
+```toml
+[scheduler.slo]
+ttft_ms = 200
+tpot_ms = 15
+itl_ms = 50
+```
+
+All three targets must be positive and finite. CLI targets override the file;
+scheduling stays static when neither source enables this option.
+`GET /health` → `scheduler.slo` exposes actual `adapted_prefill_steps`,
+`ttft_fallback_steps`, and `decode_target_infeasible` status.
+Budget feedback is a scheduling estimate. Measure client P99 latency and
+throughput changes with `bench-serve` on the same hardware, model, and workload.
+See the [throughput goal](docs/goal-slo-throughput.zh.md) and
+[measurement results](docs/performance-p0-20261006.zh.md) for scope and evidence.
+
 ### KV cache precision
 
 Ferrum v0.11.0 accepts `--kv-dtype int8` in both `run` and `serve`. FP16 remains
