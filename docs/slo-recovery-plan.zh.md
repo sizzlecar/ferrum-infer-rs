@@ -1,8 +1,8 @@
 # Ferrum SLO 恢复实施方案
 
-2026-10-06 北京时间本轮实时检查点：G32 同一冻结源码 `e3b9dda0` 已完成两端实际 release 重编译和后端编译检查；Metal 产品 SHA `598741c9…3912966`、CUDA `20e52df5…357576c`，各自 engine/CLI 均有 `fresh=false` 回执。新正常 `serve` 已在两端启动，尚无完整 G32 On/Off 配对或 `run` 结论。[Metal 构建回执](/private/tmp/ferrum-slo-recovery-20261002/g32-metal-build-receipts-r2/AUDIT.json)、[CUDA 构建回执](/private/tmp/ferrum-slo-recovery-20261002/g32-cuda-build-receipts-r3/AUDIT.json)
+2026-10-06 最新状态以 [G32 交接文档](HANDOFF-20261006-G32.zh.md) 为准；本页后续是累积过程记录，其中旧“当前”措辞仅描述写入当时。G32 同一冻结源码 `e3b9dda0` 已完成两端真实 release 重编译和各自 `serve Enforce → Off → run`，全部退出、清理与CUDA原服务恢复完成。北京时间11:32重新只读核验两端无测试进程，CUDA原服务健康；没有待等待的G32作业。Metal 产品 SHA `598741c9…3912966`、CUDA `20e52df5…357576c`，engine/CLI均有实际重编译回执。关键证据已复制至持久目录 `/Users/chejinxuan/ferrum-handoffs/20261006-g32`。
 
-G32 Metal 首个实际结果仍失败：composition 峰32,990,394B已落入34,195,039B可用空间，但后续 finite 预留3,282,336B仍令总需求超出2,077,691B，保持PeriodicOnly，joint未运行。190个存活候选各按原剩余1867请求授权 occurrence，仅这一项上界即2,837,840B；这是构造容量预留，不能写成实际观测分配峰。原120s series在123,124.885ms的完成边界退出，仅完成2/4来源、418/815 cohorts，epoch2有效；reference probe62,577.339ms另计，普通窗口随后开始。相较G31的1/4不能升级为完整校准或完整覆盖通过。接下来在同一冻结产品上完成普通采用与开关、正常run取证，不提高预算或将局部检查当交付。[启动观测](/private/tmp/ferrum-slo-recovery-20261002/g32-metal-serve-poll-3.txt)
+G32仍未通过：CUDA单次配对Enforce342.975/Off391.405 tok/s，低12.373%，两边TPOT P99均超过15ms；虽startup完成4/4、1077cohorts/112.923s且普通实际提交/核对120次，原FullLogits width3 populations133/149仍未选中。Metal serve的composition回归消除，但finite预留仍超2,077,691B、joint未运行，startup仅2/4、418/815cohorts/123.125s；普通实际提交/核对94次，最后OriginalSampleAgeExpired使epoch5→0。Metal单次Enforce36.898/Off37.182 tok/s，低0.766%，两边三项P99均失败。两端CLI三段自然输出均完整（91输入/215输出、stop）；CUDA完成4/4，而Metal虽joint实际执行仍仅1/4且普通issued/Matched为0。详细P50/P99、内存、样本、重复、覆盖和证据见交接；正式仍0/224，未交付完整版本。
 
 2026 年 10 月 2 日，用户要求在充分理解原目标、现状和连续失败经验后形成方案，并已要求创建、启动和恢复 goal。本方案从 `62b92fb1473bf11f93703d7db41c0dbf9c32ba65` 继续，集成分支为 `slo/recovery-20261002`。10 月 5 日实际工作通过 Tailscale 继续；本轮 goal 工具查询仍返回 `blocked`，不能将实际执行进展写成目标模式已经恢复。
 
