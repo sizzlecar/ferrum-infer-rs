@@ -11,14 +11,20 @@ pub struct SchedulerSloSnapshot {
     pub enabled: bool,
     pub observed_steps: u64,
     /// Last mixed-iteration budget after static and live token limits. None
-    /// means cold-start fallback or an iteration without runnable decoders.
+    /// means cold start, no runnable decoders, or overload fallback to static limits.
     pub prefill_budget_tokens: Option<usize>,
     pub budget_updates: u64,
     /// Successful prefill steps whose plan used the dynamic aggregate budget.
     pub adapted_prefill_steps: u64,
     /// Pure decode waves already longer than min(TPOT, ITL). Reducing prefill
-    /// cannot fix these observations; a one-token floor only ensures progress.
+    /// cannot fix these observations.
     pub decode_overload_steps: u64,
+    /// Current decode estimate alone cannot meet the tighter TPOT/ITL target.
+    pub decode_target_infeasible: bool,
+    /// Selected wave target before 10% headroom, including cumulative TPOT
+    /// allowance or overload fallback. This can differ from user SLO thresholds.
+    /// None means no dynamic budget, including fallback to static limits.
+    pub budget_target_ms: Option<f64>,
     pub prefill_ms_per_token: Option<f64>,
     pub decode_step_ms: Option<f64>,
 }
@@ -32,6 +38,8 @@ pub(super) struct SloController {
     budget_updates: u64,
     adapted_prefill_steps: u64,
     decode_overload_steps: u64,
+    decode_target_infeasible: bool,
+    budget_target_ms: Option<f64>,
     decode_step_ms: Option<f64>,
     pending_adapted_prefill: bool,
 }
@@ -69,17 +77,39 @@ impl SloController {
         targets: SchedulerSloConfig,
         decode_sequences: usize,
         static_limit: usize,
+        tpot_allowance_ms: Option<f64>,
     ) -> Option<usize> {
         let previous = self.prefill_budget_tokens.take();
+        self.decode_target_infeasible = false;
+        self.budget_target_ms = None;
         self.decode_step_ms = self.decode_ms(decode_sequences);
         if decode_sequences == 0 {
             return None;
         }
-        let prefill_ms = self.prefill_ms_per_token?;
         let decode_ms = self.decode_step_ms?;
+        let strict_target_ms = targets.tpot_ms.min(targets.itl_ms);
+        self.decode_target_infeasible = decode_ms >= strict_target_ms;
+        let target_ms = if self.decode_target_infeasible {
+            targets.tpot_ms.max(targets.itl_ms)
+        } else {
+            // TPOT is an average over generated tokens, so earlier fast waves
+            // can fund a longer mixed wave. ITL still limits each visible gap.
+            targets
+                .itl_ms
+                .min(tpot_allowance_ms.unwrap_or(targets.tpot_ms))
+        };
         // Reserve 10% for host/transport work that execution timing does not
         // measure. This is headroom, not a promise about client-visible P99.
-        let step_ms = targets.tpot_ms.min(targets.itl_ms) * 0.9;
+        let step_ms = target_ms * 0.9;
+        // Pure decode already violates the tighter target. Protect the wider
+        // target when it still has room; otherwise use the static budget rather
+        // than starving prefill one token at a time for an infeasible target.
+        // This fallback does not change or certify the user's original SLOs.
+        if self.decode_target_infeasible && decode_ms >= step_ms {
+            return None;
+        }
+        let prefill_ms = self.prefill_ms_per_token?;
+        self.budget_target_ms = Some(target_ms);
         let budget = (((step_ms - decode_ms).max(0.0) / prefill_ms).floor() as usize)
             .max(1)
             .min(static_limit);
@@ -111,16 +141,14 @@ impl SloController {
             if adapted {
                 self.adapted_prefill_steps = self.adapted_prefill_steps.saturating_add(1);
             }
-            // Mixed waves update only prefill residual cost; attributing their
-            // full duration to decode would erase the very headroom we need.
-            if let Some(decode_ms) = self.decode_ms(decode_sequences) {
-                let residual = elapsed_ms - decode_ms;
-                if residual > 0.0 {
-                    update_cost(
-                        &mut self.prefill_ms_per_token,
-                        residual / prefill_tokens as f64,
-                    );
-                }
+            // Mixed waves include dispatch and decode overhead that cannot be
+            // reliably attributed per prefill token. Learning from tiny mixed
+            // chunks makes costs inflate as chunks shrink; use pure prefills.
+            if decode_sequences == 0 {
+                update_cost(
+                    &mut self.prefill_ms_per_token,
+                    elapsed_ms / prefill_tokens as f64,
+                );
             }
         } else {
             if elapsed_ms > targets.tpot_ms.min(targets.itl_ms) {
@@ -141,6 +169,8 @@ impl SloController {
             budget_updates: self.budget_updates,
             adapted_prefill_steps: self.adapted_prefill_steps,
             decode_overload_steps: self.decode_overload_steps,
+            decode_target_infeasible: self.decode_target_infeasible,
+            budget_target_ms: self.budget_target_ms,
             prefill_ms_per_token: self.prefill_ms_per_token,
             decode_step_ms: self.decode_step_ms,
         }
