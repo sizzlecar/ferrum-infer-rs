@@ -1,6 +1,6 @@
 # P0：干净候选与首轮实测
 
-状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式自然 `run` 与原动态 E2E 均通过。代码冻结，最终 CUDA 二进制的静态/动态 C1/C2/C4 主负载对比已完成，未见动态 G 收益；M4 同负载 llama.cpp 参考仍在采集。CUDA Q6 恢复版静态 C1 已恢复吞吐；a890 主负载对比同样未见动态 G 收益，M4 相同主负载 C1 仍因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
+状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式自然 `run` 与原动态 E2E 均通过。代码冻结，CUDA 静态/动态 C1/C2/C4 主负载对比未见动态 G 收益。补测旧 G32 的 C4 达标，新版 C4 却因 TPOT 失败，P1 并发性能尚未恢复，不能用 C1 恢复代替。M4 同一组 64 样本的 Ferrum 与 llama.cpp 均因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
 
 候选 `57ee5ccb` 基于 main `2c9998a2`，仅接入既有静态执行优化 `c3c9ee0b` 与独立客户端测量；没有服务 SLO 控制器、启动校准或成本模型。旧恢复分支已作本地归档 tag `archive/slo-recovery-20261006`。原脏工作树未修改。
 
@@ -122,21 +122,37 @@ M4 定位重跑 r6 仍失败：长 prefill 到达前只有 4 个反馈波，仿�
 
 动态整趟实际采用 prefill 预算 396 步、预算更新 1034 次、TTFT 回退 91 次、纯 decode 超载 2384 步。整个调度平均耗时静态 7.56µs / 动态 7.70µs；这是总调度均值，不是控制器独占开销或 P99 保证。两模式客户端与服务端均 exit 0、请求排空，guard 成功且原服务恢复健康。原始结果与完整配置见仓库外 [c068 主负载摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/rn-nonnegative-r1/primary-summary.json)。
 
+补测旧 G32 Off 保持原 RN-F16 / split / budget 0、相同容量及客户端；每格仍为相同选择 hash 的 32 预热 + 64 测量、1 次重复，阈值不变：
+
+| 版本 / 配置 | C | TTFT P50/P99 ms | last-visible TPOT P50/P99 ms/token | 可见 SSE 文本事件 ITL P50/P99 ms | 输出 tok/s | 本次 SLO |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| G32 Off / split | 2 | 29.99 / 114.04 | 11.62 / 12.71 | 11.48 / 21.23 | 167.632 | 三项通过 |
+| G32 Off / split | 4 | 34.47 / 117.13 | 13.18 / 14.33 | 12.83 / 29.33 | 287.582 | 三项通过 |
+| c068 静态 / mixed / chunk 256、budget 256 | 4 | 42.40 / 172.28 | 14.58 / 15.73 | 14.52 / 25.00 | 257.073 | TPOT 超标 |
+| c068 动态 / mixed / chunk 256、budget 256 | 4 | 59.62 / 190.49 | 14.84 / 16.07 | 14.68 / 24.44 | 252.926 | TPOT 超标 |
+
+这四格各 64/64 完成、错误/拒绝/坏输出/协议异常为 0，TTFT/TPOT 各 64 样本；前三格均有 19740 个文本事件 / 19676 个间隔，末格 19742 / 19678。各格均有 8 个 event/usage 不一致，无缺失 usage 或观测到的 coalescing。旧 G32 整个 C2/C4 服务生命周期峰值为 NVML 22315 MiB / RSS 6153984 KiB；chunk 256 静态/动态各自含加载和 C4 的峰值为 20089 / 20088 MiB、6072716 / 6072688 KiB。GPU allocated 和 OS footprint 未采集，各口径不相加。客户端、服务端及 guard 均 exit 0，排空且原服务恢复。
+
+旧版已扫描达标 G 至少为 **287.582 tok/s@C4**，高于新版默认 mixed 的 168.545；C1 恢复不能证明 P1 完成。旧 split / 新 mixed 差异仍需独立核查；单组 chunk 256 / budget 256 未恢复 C4，不扩展成大规模参数搜索。证据见仓库外 [旧 G32 并发摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/g32-c2c4-r1/summary.json)与 [chunk 256 对照摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/fixed-boundary-chunk256-c4-r1/summary.json)。
+
 ## 首轮 M4 数据
 
-沿用同一 ShareGPT 选择规则及 32 预热 + 64 测量请求、一次重复；context 4096、slots 32、batch 2048、FP16 KV，其余服务容量固定。G32 Off 与 a890 动态 C1 均完成 64/64、错误/拒绝 0；两轮全部 96 条样本身份及顺序一致：
+沿用同一 ShareGPT 选择规则及 32 预热 + 64 测量请求、一次重复；context 4096、slots 32、batch 2048、FP16 KV，其余服务容量固定。G32 Off、a890 动态与本次 llama.cpp C1 均完成 64/64、错误/拒绝 0；三轮全部 96 条样本身份及顺序一致：
 
 | 实现 | C | TTFT P50/P99 ms | last-visible TPOT P50/P99 ms/token | 可见 SSE 文本事件 ITL P50/P99 ms | 输出 tok/s | MTLDevice 分配峰值 B | 本次 SLO |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | G32 Off | 1 | 333.80 / 4260.72 | 56.56 / 57.37 | 56.64 / 58.96 | 17.04 | 8590311424 | TTFT 超标 |
 | a890 SLO-aware / Auto / mixed | 1 | 334.69 / 4274.67 | 56.67 / 57.51 | 56.77 / 59.04 | 17.00 | 未采集 | TTFT 超标 |
+| llama.cpp b10964 / b29c606e2-device-memory | 1 | 344.01 / 4268.42 | 54.75 / 55.10 | 54.72 / 56.41 | 17.62 | 12383600640 | TTFT 超标 |
 
-阈值为 P99 3400/212/359ms。当前扫描未找到可行档，不记为 G=0。保留 8 个 event/usage 不一致，未观察到 transport coalescing；内存收集 6596 个样本、错误 0。OS footprint 峰值 1628850672 B、RSS 峰值 380387328 B；MTLDevice 分配量不代表整机物理内存占用，各口径不相加。
+阈值为 P99 3400/212/359ms。当前扫描未找到可行档，不记为 G=0。G32 保留 8 个 event/usage 不一致，未观察到 transport coalescing；内存收集 6596 个样本、错误 0。OS footprint 峰值 1628850672 B、RSS 峰值 380387328 B；MTLDevice 分配量不代表整机物理内存占用，各口径不相加。
 
 最长请求为模板前 954 token、服务端 966 token，TTFT 4985.16ms；约 190 tok/s 是当前实现的有效速率，不是硬件物理上限。该结果说明当前 C1 长 prompt 已超标，不能推出所有配置均不可行。原目标表中的 llama.cpp C1 是另一组 32 个测量样本、最长 606 token，不能用其 P99 直接证明本轮 64 样本的同负载可行性；本次保留原阈值和筛选规则。
 
 a890 的最长请求 TTFT 为 4972.05ms，4/64 请求 TTFT 超过 3400ms；TTFT/TPOT 各 64 个样本，可见 SSE 文本事件 19744 / 间隔 19680，保留 8 个 event/usage 不一致，无 coalescing、缺失 usage 或协议/机械输出检查异常。主机内存采样 6619 次，RSS 峰值 251674624 B、physical footprint 峰值 1668057344 B，二者不相加；设备分配峰值未采集。请求排空，服务退出且端口释放。此行为 a890 的性能证据，不作为后续 c068 拟合修正的实测结果。
 
 两版本存在明确配置差异：a890 为 Auto→`qwen3_5.f32-master`、mixed、active-decode chunk 128 / budget 256；旧 G32 为 `f16-head`、split、budget 0。两者 effective reusable execution 均为 0。此表用于报告现状，不能单独归因于 SLO 开关。a890 本轮实际动态 prefill 步数为 0，故本格也不能代替已有混合请求 E2E 的动态使用验证。完整结果见仓库外 [M4 C1 摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-sharegpt-c1-r1-summary.json)。
+
+本次 llama.cpp 补齐同 64 样本参考：最长 954/966 token 请求 TTFT 为 4970.64ms，3/64 请求超过 3400ms；TTFT/TPOT 各 64 样本，19740 个可见文本事件 / 19676 个间隔，9 个 event/usage 不一致，无 coalescing、缺失 usage 或协议/机械输出检查异常。使用相同 GGUF、模板、长度政策和 Rust 客户端，固定 unified KV 为 32 slots × 4096、batch 2048 / ubatch 512、Flash Attention 开启、缓存关闭；Ferrum 采用自身动态 KV 及 8GiB runtime budget，保留实现差异。llama 主机内存采样 6423 次，RSS 峰值 11856625664 B、physical footprint 6357181608 B；Metal 分配采样 6426 次、错误 0、完整覆盖加载至关闭。各内存口径不相加，a890 缺少设备分配量，不能据此声称设备内存优势。guard / 客户端 exit 0，端口释放。同负载两实现都失败支持当前 TTFT 瓶颈判断，但仍不等于硬件物理不可能；没有放宽阈值或缩短输入。证据见仓库外 [M4 llama.cpp 同负载摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/llama-sharegpt-c1-r1-summary.json)。
 
 原始报告、完整命令和配置位于仓库外 `~/ferrum-handoffs/20261006-throughput-p0/`（CUDA 旧版基线为 `cuda/c1-r1/`，静态候选为 `cuda/run-smoke-r2/`、`cuda/candidate-serve-r1/`，本机静态/动态功能为 `local-smoke/`、`local-slo-smoke/`，M4 为 `metal/`）。上述 CUDA 测量已结束并恢复原服务，M4 两轮主负载服务均已清理。a890 与 c068 CUDA 主负载首轮均未见动态收益；M4 相同主负载 C1 仍因 TTFT 未达标。
