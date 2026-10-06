@@ -293,6 +293,7 @@ fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
         (GgufBlockFormat::Iq4Xs, 512),
         (GgufBlockFormat::Pq2_0, 384),
         (GgufBlockFormat::Q4K, 768),
+        (GgufBlockFormat::Q6K, 768),
     ] {
         for rows in [1, 3, 8, 11] {
             mixed_matrix_rows::<T>(activation, format, columns, rows);

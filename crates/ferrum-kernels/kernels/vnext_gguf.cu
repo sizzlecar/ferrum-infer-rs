@@ -181,6 +181,52 @@ extern "C" __global__ void vnext_gguf_linear_q4k_##suffix(const half* x, const b
 NATIVE_Q4K_LINEAR(f16, 1)
 NATIVE_Q4K_LINEAR(tiled_f16, 8)
 
+// Fix Q6_K's 256-value/210-byte ABI without changing reconstructed F32
+// coefficients, each lane's K order, or the final warp reduction. Byte-safe
+// coefficient loads preserve odd-offset views. F32 operands remain F32: the
+// output head must not acquire an intermediate half rounding here.
+template<typename Input, typename Output, unsigned RowTile>
+__device__ void native_q6k_linear(const Input* x, const byte* w, Output* y,
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
+    const unsigned row = blockIdx.y * RowTile;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned column = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= rows || column >= outputs) return;
+    const unsigned blocks = inputs / 256;
+    const byte* weights = w + size_t(column) * blocks * 210;
+    float sums[RowTile] = {};
+    for (unsigned block = 0; block < blocks; ++block) {
+        const byte* source = weights + size_t(block) * 210;
+        #pragma unroll
+        for (unsigned group = 0; group < 8; ++group) {
+            const unsigned local = group * 32 + lane;
+            const unsigned i = block * 256 + local;
+            const float weight = native_block_value(source, local, 14);
+            #pragma unroll
+            for (unsigned r = 0; r < RowTile; ++r) {
+                if (row + r < rows) sums[r] += float(x[size_t(row + r) * inputs + i]) * weight;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && row + r < rows)
+            y[size_t(row + r) * stride + offset + column] = Output(sums[r]);
+    }
+}
+
+#define NATIVE_Q6K_LINEAR(Input, Output, suffix, tile) \
+extern "C" __global__ void vnext_gguf_linear_q6k_##suffix(const Input* x, const byte* w, Output* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
+    unsigned format, unsigned values, unsigned bytes) { \
+    if (format != 14 || values != 256 || bytes != 210 || inputs % 256 != 0) return; \
+    native_q6k_linear<Input, Output, tile>(x, w, y, rows, inputs, outputs, stride, offset); \
+}
+NATIVE_Q6K_LINEAR(float, float, f32, 1)
+NATIVE_Q6K_LINEAR(float, float, tiled_f32, 8)
+
 #define NATIVE_EMBEDDING(T, suffix) \
 extern "C" __global__ void vnext_gguf_embedding_##suffix(const unsigned* tokens, const byte* w, T* y, \
     unsigned count, unsigned width, unsigned vocabulary, unsigned format, unsigned values, unsigned bytes) { \
