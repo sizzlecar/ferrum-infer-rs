@@ -302,7 +302,9 @@ async fn exercise_live_lifecycle(require_slo: bool) {
             decoder.wait_for_content(2).await;
             let prompt = format!(
                 "Read this list then repeat its colors: {}",
-                "red green blue. ".repeat(64)
+                // Fill the configured 512-token chunk: a shorter prefill can
+                // legitimately fit ITL after backend execution gets faster.
+                "red green blue. ".repeat(128)
             );
             let prefill = Stream::start(&client, &origin, model, &prompt, 8).await;
             tokio::join!(decoder.finish(32), prefill.finish(8));
