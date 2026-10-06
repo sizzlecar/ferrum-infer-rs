@@ -237,7 +237,17 @@ impl OnlineAffineCost {
             return None;
         }
         let decode_ms_per_sequence = (dt * pp - pt * dp) / determinant;
-        let prefill_ms_per_token = (pt * dd - dt * dp) / determinant;
+        if !decode_ms_per_sequence.is_finite() {
+            return None;
+        }
+        // For the constraint b >= 0, a negative unconstrained optimum lies
+        // beyond the boundary b = 0. Refit a and c on that boundary instead
+        // of clamping b while retaining the unconstrained coefficients.
+        let (decode_ms_per_sequence, prefill_ms_per_token) = if decode_ms_per_sequence < 0.0 {
+            (0.0, pt / pp)
+        } else {
+            (decode_ms_per_sequence, (pt * dd - dt * dp) / determinant)
+        };
         let fixed_ms = self.mean[2]
             - decode_ms_per_sequence * self.mean[0]
             - prefill_ms_per_token * self.mean[1];
@@ -256,4 +266,30 @@ impl OnlineAffineCost {
             prefill_ms_per_token,
         })
     }
+}
+
+#[test]
+fn slo_affine_negative_decode_coefficient_refits_the_boundary() {
+    let cost = OnlineAffineCost {
+        weight: 74.76393369106533,
+        mean: [1.303653103805007, 4.605877310372727, 12.562799866932473],
+        covariance: [
+            29.75091583102048,
+            -129.93724156068672,
+            36278.12667787943,
+            -72.52633283997464,
+            8584.304492705858,
+        ],
+    }
+    .fit()
+    .expect("full-rank live observations have a nonnegative boundary fit");
+    assert_eq!(cost.decode_ms_per_sequence, 0.0);
+    assert!((cost.fixed_ms - 11.472935066598309).abs() < 1e-10);
+    assert!((cost.prefill_ms_per_token - 0.23662480063889665).abs() < 1e-12);
+    let predict = |decode, prefill| {
+        cost.fixed_ms + cost.decode_ms_per_sequence * decode + cost.prefill_ms_per_token * prefill
+    };
+    let predictions = [predict(1.0, 0.0), predict(1.0, 128.0), predict(8.0, 128.0)];
+    assert!(predictions.iter().all(|value| value.is_finite()));
+    assert!(predictions.windows(2).all(|pair| pair[0] <= pair[1]));
 }
