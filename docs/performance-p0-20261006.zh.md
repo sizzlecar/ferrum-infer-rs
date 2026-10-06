@@ -1,6 +1,6 @@
 # P0：干净候选与首轮实测
 
-状态：单位成本算法已淘汰；原 P3 仿射模型与 TTFT 预算可行性判断 `fe46d6b5` 已通过 M4 真实 E2E，短负载仍存在延迟权衡。CUDA 已测 RN-F16 快路径正在完成移植后的实机验证；尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
+状态：轻量 SLO-aware 已接入；CUDA RN 与 M4 的真实功能 E2E 已通过，具体版本及范围见下文。`a890afc9` 的 CUDA 固定 ShareGPT 静态/动态 C1、C2、C4、C8 对比未见 G 收益。后续 Q6 内核恢复版已恢复 C1 吞吐，通过 CUDA 数值测试和自然 `run`，但动态 E2E 的模型有效性断言失败，正在定位；M4 当前候选主负载 C1 仍在测量。尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
 
 候选 `57ee5ccb` 基于 main `2c9998a2`，仅接入既有静态执行优化 `c3c9ee0b` 与独立客户端测量；没有服务 SLO 控制器、启动校准或成本模型。旧恢复分支已作本地归档 tag `archive/slo-recovery-20261006`。原脏工作树未修改。
 
@@ -38,7 +38,7 @@ M4 / 同模型也通过自然 `run`、非流式及 SSE 流式请求，以及相�
 
 `0a7c0cfc` 使用原 P3 的 `a + b·decode + c·prefill` 模型；M4 自然 `run` 和动态断流 E2E（14.82s）通过，预算确实使用，但相同诊断 TTFT 仍为静态的 2.16 倍。拟合过程中存在不可识别后回静态的情况，未隐藏。后续只补预算对活跃 prefill 剩余 TTFT 的必要可行性判断，不更换模型。
 
-M4 最终运行源码为 `fe46d6b5`，保留 `bc85eec2` 的既有静态结果作对照；沿用上述容量、负载、阈值和一次重复 / 3 个测量请求。自然 `run` 与动态断流 E2E（14.80s）通过；诊断实际动态 prefill 12 步，TTFT 可行性回退 1 次。新请求 TTFT 从上一版 3835.67ms 降至 2954.04ms，但仍比静态慢 66%，吞吐低 2.24%；最大可见间隔 365.35ms 也不能作为 359ms P99 达标证据。设备分配峰值未采集，主机内存口径不相加。这是功能通过及短负载取舍，**不是主负载 SLO 或 G 改善证明**。服务已清理，端口释放；[结果摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-r4-summary.json)与[原始证据](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-r4-evidence.tar.gz)已取回，早期失败结果保留。
+M4 该轮短负载运行源码为 `fe46d6b5`，保留 `bc85eec2` 的既有静态结果作对照；沿用上述容量、负载、阈值和一次重复 / 3 个测量请求。自然 `run` 与动态断流 E2E（14.80s）通过；诊断实际动态 prefill 12 步，TTFT 可行性回退 1 次。新请求 TTFT 从上一版 3835.67ms 降至 2954.04ms，但仍比静态慢 66%，吞吐低 2.24%；最大可见间隔 365.35ms 也不能作为 359ms P99 达标证据。设备分配峰值未采集，主机内存口径不相加。这是功能通过及短负载取舍，**不是主负载 SLO 或 G 改善证明**。服务已清理，端口释放；[结果摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-r4-summary.json)与[原始证据](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-r4-evidence.tar.gz)已取回，早期失败结果保留。
 
 `0d0e4788` 前向移植已测 RN-F16 快路径，显式选择 `--numerical-profile qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8`，Auto 保持原行为。未带回旧 SLO / 校准 / 成本观测接口；这是保留 P1 执行基线，仍有常驻 FP16 与双物理布局的显存代价，不代表 P2 的低显存量化内核目标完成。工作区编译、测试（4621 通过、0 失败、73 ignored）、Clippy 及 CUDA 三 feature 编译已通过；实机验证进行中。
 
@@ -81,7 +81,23 @@ M4 定位重跑 r6 仍失败：长 prefill 到达前只有 4 个反馈波，仿�
 
 本轮已扫描达标格中的 G 为静态 **143.848 tok/s@C2**、动态 **143.234 tok/s@C2**，动态低 **0.43%**，未见收益；一次重复不足以声称最佳静态或完成主负载验收。新静态 C1 仍比旧 RN G32 的 102.079 tok/s 低 9.9%；新 mixed / 旧 split 的配置差异保留，不能把这两版比较当成单独的 SLO 开关实验。
 
+两种模式的 C4 均有 63/64 请求 TPOT 超过 15ms，C8 均为 64/64；可见间隔中位数分别约 18.8ms、29.7ms。超过 50ms 的长间隔仅占跨请求累计间隔时长的约 0.9%（C4）及 2.1%–2.5%（C8）；这是间隔时长之和，非并发测量墙钟。数据更支持持续输出节奏偏慢，单独减少少数长停顿不足以解决 TPOT 超标。记录缺少逐波工作标签与设备计时，尚不能精确分解 GPU decode、prefill 和主机开销。全部可见间隔仍计入正式 SLO。
+
 动态整趟实际采用 prefill 预算 85 步、预算更新 254 次、TTFT 可行性回退 13 次、纯 decode 超载 10498 步；这是机制运行证据，不改变各格 SLO 结论。两模式最终请求排空，原服务已恢复。完整命令、配置与原始数据见仓库外 [结果摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/rn-primary-a890-r1/summary.json)。
+
+## Q6 CUDA 路径恢复
+
+`07523c72` 恢复现有 Q6_K F32 单行及 tiled 投影内核，共 55 行；实际模型 output.weight 为 Q6_K。未改 RN profile 或调度策略。CUDA 三 feature 编译、既有真实 GPU 混合矩阵数值测试和自然 `run` 通过；`run` 为 21/32 输入/输出 token、正常 stop，文本与前版一致。此版通过 workspace 格式、全目标编译/测试（4625 通过、0 失败、73 ignored）、Clippy 及 Metal 编译。
+
+静态 C1 使用与 a890 相同的 RN/mixed、服务容量、24GiB runtime budget、客户端及 ShareGPT 选择 hash；32 预热 + 64 测量、1 次重复，64/64 完成，错误/拒绝 0：
+
+| 版本 | TTFT P50/P99 ms | last-visible TPOT P50/P99 ms/token | 可见 SSE 文本事件 ITL P50/P99 ms | 输出 tok/s | NVML 整卡峰值 MiB | RSS 峰值 KiB | 本次 SLO |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 07523 Q6 恢复 | 19.52 / 104.35 | 9.66 / 10.10 | 9.80 / 10.66 | 101.438 | 20219 | 6074464 | 三项通过 |
+
+相比 a890 静态 C1 提升 **10.27%**，与旧 G32 C1 参考相差 **−0.63%**；这验证了该内核恢复的收益，不代表已重测本版的并发容量 G。TTFT/TPOT 各 64 个样本、文本事件 19742 / 间隔 19678，保留 8 个 event/usage 不一致，无 coalescing、坏输出或协议错误。GPU allocated 与 OS footprint 未采集，各内存口径不相加；原服务已恢复。证据见仓库外 `cuda/rn-q6-07523-r1/c1-summary.json`。
+
+同版 `ff47c0a3` 动态 E2E 失败：原冷请求、取消与三个后续请求正常完成并排空，但反馈 140 波后模型系数仍为空、动态步数 0，在追加已学习阶段前触发断言。失败原样保留于 `cuda/rn-q6-07523-r1/lifecycle-failure.json`，不能用数值测试、自然输出或静态 C1 通过替代动态功能验证。当前仅对同一负载做一次拟合统计诊断，未改变策略或阈值。
 
 ## 首轮 M4 数据
 
