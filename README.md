@@ -180,6 +180,9 @@ All three targets must be positive and finite. CLI targets override the file;
 scheduling stays static when neither source enables this option.
 SLO-aware scheduling is disabled by default. No throughput benefit has been
 measured on the current ShareGPT workload; keep it opt-in.
+Prefill is limited only when the estimated wave would exceed ITL, with a TTFT
+feasibility fallback. TPOT remains a request-level benchmark constraint, not a
+per-wave limit. These estimates do not guarantee client-observed SLO compliance.
 `GET /health` → `scheduler.slo` exposes actual `adapted_prefill_steps`,
 `ttft_fallback_steps`, and `decode_target_infeasible` status.
 Budget feedback is a scheduling estimate. Measure client P99 latency and

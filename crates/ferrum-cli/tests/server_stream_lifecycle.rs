@@ -4,8 +4,10 @@
 //! at least three sequences, context >= 4096, and the desired split/mixed
 //! execution policy. Set FERRUM_LIVE_TEST_URL to its HTTP origin and run this
 //! ignored test. For the SLO-aware test, also enable `--scheduler-slo` with
-//! the desired latency targets. It exercises real disconnects; scheduler/device traces are
-//! still required to prove the exact point of cancellation within a GPU wave.
+//! the desired latency targets and prefill chunk/budget limits that permit an
+//! ITL-sized wave (the CUDA/Metal validation uses 512/512). It exercises real
+//! disconnects; scheduler/device traces are still required to prove the exact
+//! point of cancellation within a GPU wave.
 
 use futures::future::join_all;
 use reqwest::{Client, Response};
@@ -272,8 +274,9 @@ async fn exercise_live_lifecycle(require_slo: bool) {
         let adaptation_requests = if require_slo {
             // The cold long-prefill scenario above must finish safely even
             // when its TTFT is infeasible or the cost model is not ready.
-            // Exercise learned budgeting separately with a smaller prefill;
-            // retain the original cancellation load and all its assertions.
+            // Exercise learned budgeting with a prefill that can exceed ITL
+            // while retaining TTFT room; the original cancellation load and
+            // all of its assertions remain unchanged.
             let adapted_before = after["scheduler"]["slo"]["adapted_prefill_steps"]
                 .as_u64()
                 .expect("learned SLO-aware execution counter");
@@ -299,7 +302,7 @@ async fn exercise_live_lifecycle(require_slo: bool) {
             decoder.wait_for_content(2).await;
             let prompt = format!(
                 "Read this list then repeat its colors: {}",
-                "red green blue. ".repeat(32)
+                "red green blue. ".repeat(64)
             );
             let prefill = Stream::start(&client, &origin, model, &prompt, 8).await;
             tokio::join!(decoder.finish(32), prefill.finish(8));

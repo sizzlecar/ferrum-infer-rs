@@ -41,13 +41,9 @@ fn train(scheduler: &ContinuousBatchScheduler) {
 }
 
 #[test]
-fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
+fn slo_cold_start_and_itl_budget_preserve_fixed_mixed_overhead() {
     let scheduler = scheduler(None);
     activate_decode_requests(&scheduler, 1);
-    // Keep controller arithmetic independent of wall-clock elapsed time.
-    for request in scheduler.decode_queue.write().requests.values_mut() {
-        request.slo_output_progress = None;
-    }
     let first = waiting(&scheduler, 100);
     waiting(&scheduler, 100);
     let cold = scheduler.create_iteration_batch(hint()).unwrap();
@@ -59,33 +55,49 @@ fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
 
     train(&scheduler);
     let adapted = scheduler.create_iteration_batch(hint()).unwrap();
-    // 90 ms allowance minus 19.75 ms decode permits 70 aggregate prefill tokens.
-    assert_eq!(adapted.resource_requirements.gpu_memory, 71 * 16);
+    // 120 ms ITL minus 19.75 ms decode permits 100 aggregate prefill tokens.
+    assert_eq!(adapted.resource_requirements.gpu_memory, 101 * 16);
     assert!(!scheduler.slo_snapshot().unwrap().decode_target_infeasible);
     assert_eq!(
         scheduler.slo_snapshot().unwrap().budget_target_ms,
-        Some(100.0)
+        Some(120.0)
     );
     assert_eq!(scheduler.slo_snapshot().unwrap().adapted_prefill_steps, 0);
-    scheduler.mark_prefill_chunk_processed(&first, 100, 70);
-    scheduler.record_execution_step(70, 1, Duration::from_micros(89_750));
+    scheduler.mark_prefill_chunk_processed(&first, 100, 100);
+    scheduler.record_execution_step(100, 1, Duration::from_micros(119_750));
     assert_eq!(scheduler.slo_snapshot().unwrap().adapted_prefill_steps, 1);
     let stable = scheduler.create_iteration_batch(hint()).unwrap();
-    assert_eq!(stable.resource_requirements.gpu_memory, 71 * 16);
+    // One additional decoder leaves floor(120 - 29.25) = 90 prefill tokens.
+    assert_eq!(stable.resource_requirements.gpu_memory, 92 * 16);
     assert_eq!(
         scheduler.slo_snapshot().unwrap().prefill_budget_tokens,
-        Some(70)
+        Some(90)
     );
 
     let targets = scheduler.config.slo.unwrap();
     let mut controller = scheduler.slo_controller.as_ref().unwrap().lock();
-    // Accumulated TPOT allowance permits a wave longer than one 100 ms TPOT,
-    // while 120 ms ITL remains a per-wave ceiling: floor(108 - 19.75) = 88.
-    assert_eq!(
-        controller.budget(targets, 1, 256, Some(200.0), []),
-        Some(88)
-    );
+    // TPOT does not constrain individual waves or reject feasible ITL work.
+    let tight_tpot = SchedulerSloConfig {
+        tpot_ms: 1.0,
+        ..targets
+    };
+    assert_eq!(controller.budget(tight_tpot, 1, 256, []), Some(100));
     assert_eq!(controller.snapshot().budget_target_ms, Some(120.0));
+    let decode_ms = controller.snapshot().decode_step_ms.unwrap();
+    let exact_itl = decode_ms + controller.prefill_ms_per_token().unwrap() * 100.0;
+    assert_eq!(
+        controller.budget(
+            SchedulerSloConfig {
+                itl_ms: exact_itl,
+                ..tight_tpot
+            },
+            1,
+            100,
+            []
+        ),
+        None
+    );
+    assert_eq!(controller.snapshot().budget_target_ms, None);
     for tokens in [8, 2, 1] {
         controller.record(
             targets,
@@ -95,14 +107,26 @@ fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
         );
         // Small mixed waves retain fixed overhead in a, not in c/token.
         assert!((controller.prefill_ms_per_token().unwrap() - 1.0).abs() < 1e-8);
-        assert_eq!(
-            controller.budget(targets, 1, 256, Some(200.0), []),
-            Some(88)
-        );
+        assert_eq!(controller.budget(targets, 1, 256, []), Some(100));
     }
     let model = controller.snapshot();
     assert!((model.fixed_step_ms.unwrap() - 10.25).abs() < 1e-8);
     assert!((model.decode_ms_per_sequence.unwrap() - 9.5).abs() < 1e-8);
+    controller.record(tight_tpot, 0, 1, Duration::from_micros(19_750));
+    assert_eq!(controller.snapshot().decode_overload_steps, 0);
+}
+
+#[test]
+fn slo_unused_dynamic_budget_does_not_count_adaptation() {
+    let scheduler = scheduler(None);
+    train(&scheduler);
+    activate_decode_requests(&scheduler, 1);
+    waiting(&scheduler, 95);
+    // 114.75 ms fits ITL, but would have been shrunk by the old 90% margin.
+    let batch = scheduler.create_iteration_batch(hint()).unwrap();
+    assert_eq!(batch.resource_requirements.gpu_memory, 96 * 16);
+    scheduler.record_execution_step(95, 1, Duration::from_micros(114_750));
+    assert_eq!(scheduler.slo_snapshot().unwrap().adapted_prefill_steps, 0);
 }
 
 #[test]
@@ -121,6 +145,12 @@ fn slo_respects_static_and_live_caps_and_keeps_pure_prefill_elastic() {
     waiting(&scheduler, 100);
     let mixed = scheduler.create_iteration_batch(hint()).unwrap();
     assert_eq!(mixed.resource_requirements.gpu_memory, 14 * 16);
+    assert_eq!(
+        scheduler.slo_snapshot().unwrap().prefill_budget_tokens,
+        None
+    );
+    scheduler.record_execution_step(13, 1, Duration::from_micros(32_750));
+    assert_eq!(scheduler.slo_snapshot().unwrap().adapted_prefill_steps, 0);
     let narrow = scheduler
         .create_iteration_batch(BatchHint {
             max_tokens: 7,
@@ -130,7 +160,7 @@ fn slo_respects_static_and_live_caps_and_keeps_pure_prefill_elastic() {
     assert_eq!(narrow.resource_requirements.gpu_memory, 7 * 16);
     assert_eq!(
         scheduler.slo_snapshot().unwrap().prefill_budget_tokens,
-        Some(6)
+        None
     );
 }
 
@@ -141,9 +171,8 @@ fn slo_decode_overload_keeps_prefill_progress_and_no_progress_does_not_train() {
     waiting(&scheduler, 100);
     scheduler.record_execution_step(100, 0, Duration::from_micros(110_250));
     scheduler.record_execution_step(50, 0, Duration::from_micros(60_250));
-    scheduler.record_execution_step(0, 1, Duration::from_millis(101));
-    // Pure decode violates strict TPOT even though the wider ITL still fits.
-    // Keep static prefill progress instead of switching to the wider target.
+    scheduler.record_execution_step(0, 1, Duration::from_millis(121));
+    // Pure decode already violates ITL, so retain static prefill progress.
     let batch = scheduler.create_iteration_batch(hint()).unwrap();
     assert_eq!(batch.resource_requirements.gpu_memory, 101 * 16);
     let before = scheduler.slo_snapshot().unwrap();
@@ -164,44 +193,41 @@ fn slo_decode_overload_keeps_prefill_progress_and_no_progress_does_not_train() {
 fn slo_ttft_prioritizes_urgent_prefill_and_rejects_an_infeasible_dynamic_budget() {
     let scheduler = scheduler(None);
     activate_decode_requests(&scheduler, 1);
-    for request in scheduler.decode_queue.write().requests.values_mut() {
-        request.slo_output_progress = None;
-    }
     train(&scheduler);
     let short = waiting(&scheduler, 20);
-    let urgent = waiting(&scheduler, 80);
+    let urgent = waiting(&scheduler, 120);
     scheduler.promote_to_prefill_with_empty_retry(&short, None);
     scheduler.promote_to_prefill_with_empty_retry(&urgent, None);
     let now = chrono::Utc::now();
     for request in scheduler.prefill_queue.write().iter_mut() {
-        // The urgent request has 150 ms left: 80 + 19.75*ceil(80/70)
-        // fits within the 135 ms allowance, while the short request has slack.
+        // The urgent request has 200 ms left: 120 + 19.75*ceil(120/100)
+        // fits within the 180 ms allowance, while the short request has slack.
         let age_ms = if request.inner.request.id == short {
             200
         } else {
-            850
+            800
         };
         request.inner.submitted_at = now - chrono::Duration::milliseconds(age_ms);
     }
     let batch = scheduler.create_iteration_batch(hint()).unwrap();
     assert_eq!(batch.requests[1].request.id, urgent);
-    assert_eq!(batch.requests[1].tokens_to_process, Some(70));
+    assert_eq!(batch.requests[1].tokens_to_process, Some(100));
     assert!(!batch
         .requests
         .iter()
         .any(|request| request.request.id == short));
     assert!(!scheduler.slo_snapshot().unwrap().ttft_budget_infeasible);
 
-    // With only 100 ms left, the same optimistic completion time cannot fit.
+    // With only 150 ms left, the same optimistic completion time cannot fit.
     // Retain the original static budget and report the actual fallback.
     for request in scheduler.prefill_queue.write().iter_mut() {
         if request.inner.request.id == urgent {
-            request.inner.submitted_at = chrono::Utc::now() - chrono::Duration::milliseconds(900);
+            request.inner.submitted_at = chrono::Utc::now() - chrono::Duration::milliseconds(850);
         }
     }
     let fallback = scheduler.create_iteration_batch(hint()).unwrap();
     assert_eq!(fallback.requests[1].request.id, urgent);
-    assert_eq!(fallback.requests[1].tokens_to_process, Some(80));
+    assert_eq!(fallback.requests[1].tokens_to_process, Some(120));
     let snapshot = scheduler.slo_snapshot().unwrap();
     assert!(snapshot.ttft_budget_infeasible);
     assert_eq!(snapshot.ttft_fallback_steps, 1);

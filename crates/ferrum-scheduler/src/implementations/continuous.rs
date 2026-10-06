@@ -426,13 +426,6 @@ struct ExecutionMaintenanceRetryTicket {
     latest_capacity_epoch: u64,
 }
 
-/// Lifetime output accounting for the optional cumulative TPOT budget.
-#[derive(Debug, Clone, Copy)]
-struct SloOutputProgress {
-    first_token_at: Instant,
-    output_tokens: usize,
-}
-
 /// Extended scheduled request with continuous batching metadata
 #[derive(Debug, Clone)]
 pub struct ContinuousBatchRequest {
@@ -444,9 +437,8 @@ pub struct ContinuousBatchRequest {
     pub prefill_tokens: usize,
     /// Number of decode tokens generated
     pub decode_tokens: usize,
-    /// Actual output progress survives KV eviction/recompute. None leaves the
-    /// original static path free of per-request clock reads and accounting.
-    slo_output_progress: Option<SloOutputProgress>,
+    /// Keep recompute after the first output outside the TTFT deadline.
+    slo_first_token_emitted: bool,
     /// Phase-independent logical progress and resident-work state.
     logical_work_frontier: LogicalWorkFrontier,
     /// Optional restore state for this admission, separate from compute work.
@@ -497,7 +489,7 @@ impl ContinuousBatchRequest {
             phase: RequestPhase::Waiting,
             prefill_tokens: 0,
             decode_tokens: 0,
-            slo_output_progress: None,
+            slo_first_token_emitted: false,
             logical_work_frontier: LogicalWorkFrontier::default(),
             prefix_restore: PrefixRestoreState::default(),
             prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState::default(),
@@ -3282,6 +3274,8 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
+        slo_static_prefill_tokens_remaining: &mut Option<usize>,
+        slo_prefill_limited: &mut bool,
         active_decode_prefill_chunks_remaining: &mut Option<usize>,
         capacity_deferred_mixed_recompute_slots_remaining: &mut Option<usize>,
         active_decode_prefill_chunk: Option<usize>,
@@ -3355,6 +3349,17 @@ impl ContinuousBatchScheduler {
                 prefill_step_chunk,
                 step_tokens_remaining,
             );
+            if let Some(static_remaining) = *slo_static_prefill_tokens_remaining {
+                // Count adaptation only when this runnable request would have
+                // received more work under the original static limits.
+                let static_chunk_tokens = self.prefill_budget_tokens(
+                    req,
+                    active_decode_prefill_chunk,
+                    prefill_step_chunk,
+                    static_remaining.min(hint.max_tokens.saturating_sub(*total_tokens)),
+                );
+                *slo_prefill_limited |= prefill_chunk_tokens < static_chunk_tokens;
+            }
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
@@ -3377,6 +3382,9 @@ impl ContinuousBatchScheduler {
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
                 if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(prefill_chunk_tokens);
+                }
+                if let Some(remaining) = slo_static_prefill_tokens_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
                 }
                 if let Some(remaining) = active_decode_prefill_chunks_remaining.as_mut() {
@@ -3633,32 +3641,6 @@ impl ContinuousBatchScheduler {
         Ok(())
     }
 
-    fn scheduled_tpot_allowance_ms(
-        &self,
-        requests: &[ScheduledRequest],
-        now: Instant,
-    ) -> Option<f64> {
-        let targets = self.config.slo?;
-        let decode_queue = self.decode_queue.read();
-        let mut allowance: Option<f64> = None;
-        // The n-th completed output allows the next token by first+n*TPOT.
-        // This is cumulative average-token credit, not a per-wave TPOT cap.
-        // Only the decoders actually selected for this wave constrain it.
-        for scheduled in requests {
-            let progress = decode_queue
-                .requests
-                .get(&scheduled.request.id)?
-                .slo_output_progress?;
-            let elapsed_ms = now
-                .saturating_duration_since(progress.first_token_at)
-                .as_secs_f64()
-                * 1000.0;
-            let remaining = targets.tpot_ms * progress.output_tokens as f64 - elapsed_ms;
-            allowance = Some(allowance.map_or(remaining, |current| current.min(remaining)));
-        }
-        allowance
-    }
-
     fn create_iteration_batch_with_admission(
         &self,
         hint: BatchHint,
@@ -3726,13 +3708,13 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
+        let mut slo_static_prefill_tokens_remaining = None;
+        let mut slo_prefill_limited = false;
         let dynamic_prefill_budget =
             if let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) {
                 let live_limit = hint.max_tokens.saturating_sub(total_tokens);
                 let static_limit = active_decode_prefill_tokens_remaining
                     .map_or(live_limit, |limit| limit.min(live_limit));
-                let tpot_allowance_ms =
-                    self.scheduled_tpot_allowance_ms(&batch_requests, Instant::now());
                 // Follow the existing prefill-queue -> controller lock order.
                 // Waiting admission stays unchanged; once admitted, a request
                 // participates with its real remaining work and chunk ceiling.
@@ -3741,7 +3723,7 @@ impl ContinuousBatchScheduler {
                 let active_prefills = prefill_queue
                     .iter()
                     // Recompute after visible output has no first-token deadline.
-                    .filter(|request| request.slo_output_progress.is_none())
+                    .filter(|request| !request.slo_first_token_emitted)
                     .map(|request| slo::PrefillTtftWork {
                         remaining_tokens: self.remaining_prefill_tokens(request),
                         chunk_cap: self.prefill_budget_tokens(
@@ -3756,13 +3738,14 @@ impl ContinuousBatchScheduler {
                             .as_secs_f64()
                             * 1000.0,
                     });
-                controller.lock().budget(
+                let budget = controller.lock().budget(
                     targets,
                     scheduled_decode_count,
                     static_limit,
-                    tpot_allowance_ms,
                     active_prefills,
-                )
+                );
+                slo_static_prefill_tokens_remaining = budget.map(|_| static_limit);
+                budget
             } else {
                 None
             };
@@ -3823,6 +3806,8 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut slo_static_prefill_tokens_remaining,
+            &mut slo_prefill_limited,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -3913,6 +3898,8 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut slo_static_prefill_tokens_remaining,
+            &mut slo_prefill_limited,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -3994,7 +3981,7 @@ impl ContinuousBatchScheduler {
         let batch_id = BatchId::new();
         if let Some(controller) = &self.slo_controller {
             controller.lock().mark_adapted_prefill(
-                dynamic_prefill_budget.is_some() && batch_requests.len() > scheduled_decode_count,
+                slo_prefill_limited && batch_requests.len() > scheduled_decode_count,
             );
         }
         let max_seq_len = batch_requests
@@ -4029,7 +4016,6 @@ impl ContinuousBatchScheduler {
 
     /// Mark a request as having completed prefill
     pub fn mark_prefill_complete(&self, request_id: &RequestId, tokens: usize) {
-        let first_token_at = self.config.slo.map(|_| Instant::now());
         let mut prefill_queue = self.prefill_queue.write();
         let mut found = false;
         let mut progress = None;
@@ -4050,18 +4036,11 @@ impl ContinuousBatchScheduler {
 
         // Promote to decode
         self.promote_to_decode(request_id);
-        if let Some(first_token_at) = first_token_at {
+        if self.config.slo.is_some() {
             if let Some(request) = self.decode_queue.write().requests.get_mut(request_id) {
-                // Recompute must neither restart the clock nor grant replayed
-                // prompt/history tokens fresh average-token latency credit.
                 // Legacy chunked prefill may already have promoted the request;
                 // record the first output here, after sampling actually finished.
-                request
-                    .slo_output_progress
-                    .get_or_insert(SloOutputProgress {
-                        first_token_at,
-                        output_tokens: 1,
-                    });
+                request.slo_first_token_emitted = true;
             }
         }
         if found {
@@ -4179,9 +4158,6 @@ impl ContinuousBatchScheduler {
         let mut progress = None;
         if let Some(req) = decode_queue.requests.get_mut(request_id) {
             req.decode_tokens = tokens_generated;
-            if let Some(output) = req.slo_output_progress.as_mut() {
-                output.output_tokens = output.output_tokens.max(tokens_generated);
-            }
             req.logical_work_frontier.commit_decode(tokens_generated);
             progress = Some(req.logical_work_frontier.progress_generation());
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
@@ -4733,45 +4709,7 @@ mod tests {
     }
 
     #[test]
-    fn slo_tpot_credit_uses_actual_selected_output_progress() {
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
-            slo: Some(ferrum_types::SchedulerSloConfig {
-                ttft_ms: 1000.0,
-                tpot_ms: 100.0,
-                itl_ms: 120.0,
-            }),
-            ..SchedulerConfig::default()
-        });
-        let requests = activate_decode_requests(&scheduler, 2);
-        let now = Instant::now();
-        let selected = {
-            let mut queue = scheduler.decode_queue.write();
-            let first = queue.requests.get_mut(&requests[0]).unwrap();
-            first.slo_output_progress = Some(SloOutputProgress {
-                first_token_at: now - Duration::from_millis(50),
-                output_tokens: 3,
-            });
-            let first_inner = first.inner.clone();
-            let second = queue.requests.get_mut(&requests[1]).unwrap();
-            second.slo_output_progress = Some(SloOutputProgress {
-                first_token_at: now - Duration::from_millis(150),
-                output_tokens: 1,
-            });
-            vec![first_inner, second.inner.clone()]
-        };
-        assert_eq!(
-            scheduler.scheduled_tpot_allowance_ms(&selected[..1], now),
-            Some(250.0)
-        );
-        assert_eq!(
-            scheduler.scheduled_tpot_allowance_ms(&selected, now),
-            Some(-50.0)
-        );
-        assert_eq!(scheduler.scheduled_tpot_allowance_ms(&[], now), None);
-    }
-
-    #[test]
-    fn slo_output_clock_and_count_survive_recompute_and_stay_disabled_by_default() {
+    fn slo_first_output_marker_survives_recompute_and_stays_disabled_by_default() {
         for enabled in [false, true] {
             let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
                 slo: enabled.then_some(ferrum_types::SchedulerSloConfig {
@@ -4782,30 +4720,32 @@ mod tests {
                 ..SchedulerConfig::default()
             });
             let request = activate_decode_requests(&scheduler, 1).remove(0);
-            let initial = scheduler.decode_queue.read().requests[&request].slo_output_progress;
             assert_eq!(
-                initial.map(|progress| progress.output_tokens),
-                enabled.then_some(1)
+                scheduler.decode_queue.read().requests[&request].slo_first_token_emitted,
+                enabled
             );
             scheduler.update_decode_progress(&request, 8);
             assert!(scheduler.defer_decode_to_waiting_for_capacity(&request, 1));
             assert!(scheduler.promote_to_prefill_with_empty_retry(&request, None));
-            scheduler.mark_prefill_complete(&request, 18);
-            let resumed = scheduler.decode_queue.read().requests[&request].slo_output_progress;
             assert_eq!(
-                resumed.map(|progress| progress.first_token_at),
-                initial.map(|progress| progress.first_token_at)
+                scheduler
+                    .prefill_queue
+                    .read()
+                    .iter()
+                    .find(|entry| entry.inner.request.id == request)
+                    .unwrap()
+                    .slo_first_token_emitted,
+                enabled
             );
+            scheduler.mark_prefill_complete(&request, 18);
             assert_eq!(
-                resumed.map(|progress| progress.output_tokens),
-                enabled.then_some(8)
+                scheduler.decode_queue.read().requests[&request].slo_first_token_emitted,
+                enabled
             );
             scheduler.update_decode_progress(&request, 9);
             assert_eq!(
-                scheduler.decode_queue.read().requests[&request]
-                    .slo_output_progress
-                    .map(|progress| progress.output_tokens),
-                enabled.then_some(9)
+                scheduler.decode_queue.read().requests[&request].slo_first_token_emitted,
+                enabled
             );
         }
     }
