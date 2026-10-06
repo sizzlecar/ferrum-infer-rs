@@ -5642,6 +5642,10 @@ async fn health_handler(
         .llm
         .as_ref()
         .and_then(|engine| engine.execution_attribution_snapshot());
+    let scheduler_slo = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.scheduler_slo_snapshot());
     let engine_lora = state
         .llm
         .as_ref()
@@ -5673,6 +5677,7 @@ async fn health_handler(
             "queued_requests": engine_status.queued_requests,
         },
         "scheduler": {
+            "slo": scheduler_slo,
             "total_requests": scheduler_metrics.total_requests,
             "successful_requests": scheduler_metrics.successful_requests,
             "failed_requests": scheduler_metrics.failed_requests,

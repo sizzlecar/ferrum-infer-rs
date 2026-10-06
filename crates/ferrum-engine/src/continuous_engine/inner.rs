@@ -1907,10 +1907,42 @@ impl EngineInner {
         // selected batch owns its request authorities, so new ingress may be
         // published while the device executes this wave.
         drop(iteration_guard);
+        // Fit only completed work. Planned tokens can disappear through
+        // cancellation, cache reuse or capacity deferral; they are not execution
+        // samples. Read these counters only when the optional policy is enabled.
+        let slo_before = self.config.scheduler.slo.as_ref().and_then(|_| {
+            let planned_tokens = batch
+                .requests
+                .iter()
+                .map(|request| request.tokens_to_process)
+                .sum::<Option<usize>>()?;
+            Some((
+                self.total_prefill_tokens.load(Ordering::Relaxed),
+                self.total_decode_tokens.load(Ordering::Relaxed),
+                planned_tokens as u64,
+            ))
+        });
         let process_t0 = Instant::now();
         let r = self.process_batch(&batch).await;
         let process_elapsed = process_t0.elapsed();
         self.record_model_execution_time(process_elapsed);
+        if let Some((prefill_before, decode_before, planned_tokens)) = slo_before {
+            let prefill = self
+                .total_prefill_tokens
+                .load(Ordering::Relaxed)
+                .saturating_sub(prefill_before);
+            let decode = self
+                .total_decode_tokens
+                .load(Ordering::Relaxed)
+                .saturating_sub(decode_before);
+            if r.is_ok() && prefill + decode > 0 && prefill + decode == planned_tokens {
+                self.scheduler.record_execution_step(
+                    prefill as usize,
+                    decode as usize,
+                    sched_elapsed + process_elapsed,
+                );
+            }
+        }
         self.execute_executor_prefill_maintenance(prefill_maintenance);
         self.complete_typed_admission_failures().await?;
         if trace_enabled {

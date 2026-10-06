@@ -874,6 +874,10 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
+    /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
+    #[arg(long, value_name = "TARGETS")]
+    pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
+
     /// Cap total prefill tokens per scheduler iteration with active decode; 0 disables.
     #[arg(long, value_name = "N")]
     pub scheduler_active_decode_prefill_token_budget: Option<usize>,
@@ -989,6 +993,7 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    let scheduler_slo = config.resolve_scheduler_slo(cmd.scheduler_slo)?;
     if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Run,
@@ -1082,6 +1087,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    engine_config.scheduler.slo = scheduler_slo;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
     // Family candidates and startup sizing must see the same KV request as
@@ -1311,6 +1317,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     crate::commands::serve::write_resolved_execution_config(
         cmd.effective_config_json.as_deref(),
         engine.cache_metrics_snapshot().as_ref(),
+        engine.config().scheduler.slo,
     )?;
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
@@ -2925,6 +2932,7 @@ mod tests {
             max_num_seqs: None,
             max_num_batched_tokens: None,
             prefill_decode_execution: None,
+            scheduler_slo: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
             prefix_rendezvous_max_wait_ms: None,

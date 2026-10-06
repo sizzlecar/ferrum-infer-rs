@@ -127,6 +127,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
+    /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
+    #[arg(long, value_name = "TARGETS")]
+    pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
+
     /// Sequence fit gate used before prefill admission.
     #[arg(long, value_enum)]
     pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
@@ -406,6 +410,7 @@ async fn execute_with_compatibility(
         max_num_seqs,
         max_num_batched_tokens,
         prefill_decode_execution,
+        scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
@@ -454,6 +459,7 @@ async fn execute_with_compatibility(
         lora_model_id_template,
     } = cmd;
 
+    let scheduler_slo = config.resolve_scheduler_slo(scheduler_slo)?;
     let default_enable_thinking = if enable_thinking {
         Some(true)
     } else if disable_thinking {
@@ -578,6 +584,7 @@ async fn execute_with_compatibility(
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut product_engine_config = product_input.engine_config;
+    product_engine_config.scheduler.slo = scheduler_slo;
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
     let config_runtime_entries = config.runtime.runtime_config_entries();
@@ -1179,6 +1186,7 @@ async fn execute_with_compatibility(
     write_resolved_execution_config(
         effective_config_json.as_deref(),
         resolved_execution_metrics.as_ref(),
+        scheduler_slo,
     )?;
     let server = server
         .with_auto_config(startup_auto_config)
@@ -1945,15 +1953,14 @@ fn write_startup_config_artifacts_with_failure(
 
 /// Replace requested-only startup evidence with the selected plan after the
 /// executor has compiled and initialized successfully. Both run and serve use
-/// this path; legacy executors without numerical evidence leave it unchanged.
+/// this path; legacy executors without numerical evidence retain their requested
+/// numerical policy. Scheduler targets are recorded independently of the backend.
 pub(crate) fn write_resolved_execution_config(
     path: Option<&std::path::Path>,
     executor_snapshot: Option<&serde_json::Value>,
+    scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
 ) -> Result<()> {
-    let (Some(path), Some(snapshot)) = (path, executor_snapshot) else {
-        return Ok(());
-    };
-    let Some(numerical) = snapshot.get("numerical_execution") else {
+    let Some(path) = path else {
         return Ok(());
     };
     let bytes =
@@ -1963,10 +1970,21 @@ pub(crate) fn write_resolved_execution_config(
     let object = document.as_object_mut().ok_or_else(|| {
         ferrum_types::FerrumError::serialization("effective startup config must be an object")
     })?;
-    object.insert("numerical_execution".into(), numerical.clone());
-    for field in ["kv_storage", "attention_execution_policy"] {
-        if let Some(value) = snapshot.get(field) {
-            object.insert(field.into(), value.clone());
+    object.insert(
+        "scheduler".into(),
+        serde_json::json!({"slo": scheduler_slo}),
+    );
+    if let Some(snapshot) =
+        executor_snapshot.filter(|value| value.get("numerical_execution").is_some())
+    {
+        for field in [
+            "numerical_execution",
+            "kv_storage",
+            "attention_execution_policy",
+        ] {
+            if let Some(value) = snapshot.get(field) {
+                object.insert(field.into(), value.clone());
+            }
         }
     }
     let bytes = serde_json::to_vec_pretty(&document)
@@ -3785,11 +3803,12 @@ mod tests {
         let original = serde_json::json!({
             "resolution_evidence": {"source": "fixture"},
             "numerical_execution": {"requested": "auto"},
+            "scheduler": {"slo": null},
         });
         std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
         // Legacy/non-numerical snapshots must not claim the requested dtype
         // was selected merely because it appears in the input configuration.
-        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({}))).unwrap();
+        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({})), None).unwrap();
         let unchanged: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(unchanged, original);
@@ -3799,7 +3818,8 @@ mod tests {
             "kv_storage": {"source": "resolved_model_plan", "selected": "int8_per_token_head_f32_scale_v1"},
             "attention_execution_policy": "portable",
         });
-        write_resolved_execution_config(Some(&path), Some(&selected)).unwrap();
+        let slo = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        write_resolved_execution_config(Some(&path), Some(&selected), Some(slo)).unwrap();
         let actual: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
@@ -3812,5 +3832,9 @@ mod tests {
             selected["numerical_execution"]
         );
         assert_eq!(actual["attention_execution_policy"], "portable");
+        assert_eq!(
+            actual["scheduler"]["slo"],
+            serde_json::to_value(slo).unwrap()
+        );
     }
 }

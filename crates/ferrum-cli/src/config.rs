@@ -18,6 +18,9 @@ pub struct CliConfig {
     #[serde(default)]
     pub numerical_execution: ferrum_types::NumericalExecutionPolicy,
 
+    /// Shared run/serve scheduler policy; explicit CLI selection takes precedence.
+    pub scheduler: SchedulerCliConfig,
+
     /// Server configuration
     pub server: ServerCliConfig,
 
@@ -36,6 +39,13 @@ pub struct CliConfig {
     /// Runtime overrides loaded from the CLI config file.
     #[serde(default)]
     pub runtime: RuntimeCliConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SchedulerCliConfig {
+    /// Optional latency targets for adaptive scheduling, in milliseconds.
+    pub slo: Option<ferrum_types::SchedulerSloConfig>,
 }
 
 /// Server CLI configuration
@@ -687,6 +697,17 @@ fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
 }
 
 impl CliConfig {
+    pub fn resolve_scheduler_slo(
+        &self,
+        cli: Option<ferrum_types::SchedulerSloConfig>,
+    ) -> Result<Option<ferrum_types::SchedulerSloConfig>> {
+        let slo = cli.or(self.scheduler.slo);
+        if let Some(slo) = slo {
+            slo.validate().map_err(ferrum_types::FerrumError::config)?;
+        }
+        Ok(slo)
+    }
+
     pub fn resolve_numerical_execution(
         &self,
         cli: Option<&ferrum_types::NumericalExecutionPolicy>,
@@ -725,6 +746,7 @@ impl CliConfig {
 
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
+        self.resolve_scheduler_slo(None)?;
         // Validate server config
         if self.server.port == 0 {
             return Err(ferrum_types::FerrumError::configuration(
@@ -893,6 +915,55 @@ mod tests {
                 Self::Serve(command) => command.numerical_profile.as_ref(),
                 Self::Bench(command) => command.numerical_profile.as_ref(),
             }
+        }
+    }
+
+    #[test]
+    fn scheduler_slo_is_shared_by_run_serve_and_cli_overrides_config() {
+        let config: CliConfig =
+            toml::from_str("[scheduler.slo]\nttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\n").unwrap();
+        let configured = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        assert_eq!(
+            config.resolve_scheduler_slo(None).unwrap(),
+            Some(configured)
+        );
+        assert_eq!(
+            CliConfig::default().resolve_scheduler_slo(None).unwrap(),
+            None
+        );
+        for entrypoint in ["run", "serve"] {
+            let selected = "ttft:300,tpot:20,itl:60";
+            let cli = NumericalCli::try_parse_from([
+                "ferrum",
+                entrypoint,
+                "fixture",
+                "--scheduler-slo",
+                selected,
+            ])
+            .unwrap();
+            let targets = match cli.command {
+                NumericalCommand::Run(command) => command.scheduler_slo,
+                NumericalCommand::Serve(command) => command.scheduler_slo,
+                NumericalCommand::Bench(_) => unreachable!(),
+            };
+            assert_eq!(
+                config.resolve_scheduler_slo(targets).unwrap(),
+                Some(selected.parse().unwrap())
+            );
+            assert!(NumericalCli::try_parse_from([
+                "ferrum",
+                entrypoint,
+                "fixture",
+                "--scheduler-slo",
+                "ttft:0,tpot:15,itl:50",
+            ])
+            .is_err());
+        }
+        for invalid in ["0", "-1", "nan", "inf"] {
+            assert!(toml::from_str::<CliConfig>(&format!(
+                "[scheduler.slo]\nttft_ms = 200\ntpot_ms = 15\nitl_ms = {invalid}\n"
+            ))
+            .is_err());
         }
     }
 

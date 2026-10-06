@@ -3,7 +3,8 @@
 //! Start the backend/model under test with prefix/session caching disabled,
 //! at least three sequences, context >= 4096, and the desired split/mixed
 //! execution policy. Set FERRUM_LIVE_TEST_URL to its HTTP origin and run this
-//! ignored test. It exercises real disconnects; scheduler/device traces are
+//! ignored test. For the SLO-aware test, also enable `--scheduler-slo` with
+//! the desired latency targets. It exercises real disconnects; scheduler/device traces are
 //! still required to prove the exact point of cancellation within a GPU wave.
 
 use futures::future::join_all;
@@ -15,7 +16,7 @@ struct Stream {
     response: Response,
     pending: Vec<u8>,
     request_id: Option<String>,
-    content_seen: bool,
+    content_updates: usize,
     done: bool,
     output_tokens: Option<u64>,
     finish_reason: Option<String>,
@@ -46,7 +47,7 @@ impl Stream {
             response,
             pending: Vec::new(),
             request_id: None,
-            content_seen: false,
+            content_updates: 0,
             done: false,
             output_tokens: None,
             finish_reason: None,
@@ -78,9 +79,12 @@ impl Stream {
                 }
                 self.request_id = Some(id.to_owned());
             }
-            self.content_seen |= event["choices"][0]["delta"]["content"]
+            if event["choices"][0]["delta"]["content"]
                 .as_str()
-                .is_some_and(|text| !text.is_empty());
+                .is_some_and(|text| !text.is_empty())
+            {
+                self.content_updates += 1;
+            }
             if let Some(tokens) = event["usage"]["completion_tokens"].as_u64() {
                 assert!(self.output_tokens.is_none(), "duplicate terminal usage");
                 self.output_tokens = Some(tokens);
@@ -93,8 +97,8 @@ impl Stream {
         true
     }
 
-    async fn first_content(&mut self) {
-        while !self.content_seen {
+    async fn wait_for_content(&mut self, minimum_updates: usize) {
+        while self.content_updates < minimum_updates {
             assert!(self.advance().await, "EOF before generated content");
             assert!(
                 !self.done,
@@ -107,7 +111,7 @@ impl Stream {
     async fn finish(mut self, expected_tokens: u64) {
         while self.advance().await {}
         assert!(self.done, "missing stream terminal");
-        assert!(self.content_seen, "empty generated text");
+        assert!(self.content_updates > 0, "empty generated text");
         assert!(self.request_id.is_some(), "missing request identity");
         assert_eq!(self.finish_reason.as_deref(), Some("length"));
         assert_eq!(self.output_tokens, Some(expected_tokens));
@@ -174,6 +178,16 @@ async fn assert_drained(client: &Client, origin: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a dedicated live model server; set FERRUM_LIVE_TEST_URL"]
 async fn disconnected_decode_releases_resources_without_losing_peers() {
+    exercise_live_lifecycle(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a dedicated SLO-aware live model server; set FERRUM_LIVE_TEST_URL"]
+async fn slo_aware_prefill_uses_feedback_without_losing_disconnected_request_peers() {
+    exercise_live_lifecycle(true).await;
+}
+
+async fn exercise_live_lifecycle(require_slo: bool) {
     tokio::time::timeout(Duration::from_secs(240), async {
         let origin = std::env::var("FERRUM_LIVE_TEST_URL")
             .expect("FERRUM_LIVE_TEST_URL must name the dedicated test server")
@@ -186,6 +200,9 @@ async fn disconnected_decode_releases_resources_without_losing_peers() {
             .build()
             .unwrap();
         let before = assert_drained(&client, &origin).await;
+        if require_slo {
+            assert_eq!(before["scheduler"]["slo"]["enabled"], true);
+        }
         let models: Value = client
             .get(format!("{origin}/v1/models"))
             .send()
@@ -213,7 +230,13 @@ async fn disconnected_decode_releases_resources_without_losing_peers() {
                 128
             )
         );
-        tokio::join!(cancelled.first_content(), survivor.first_content());
+        // A second visible update lets decode execute before the late prefill
+        // arrives, so the SLO-aware scheduler can use actual decode feedback.
+        let warmup_updates = if require_slo { 2 } else { 1 };
+        tokio::join!(
+            cancelled.wait_for_content(warmup_updates),
+            survivor.wait_for_content(warmup_updates)
+        );
         let prompt = format!(
             "Read this list then repeat its colors: {}",
             "red green blue. ".repeat(256)
@@ -234,6 +257,21 @@ async fn disconnected_decode_releases_resources_without_losing_peers() {
         });
         join_all(followups).await;
         let after = assert_drained(&client, &origin).await;
+        if require_slo {
+            let previous = &before["scheduler"]["slo"];
+            let current = &after["scheduler"]["slo"];
+            assert_eq!(current["enabled"], true);
+            for field in ["observed_steps", "adapted_prefill_steps"] {
+                assert!(
+                    current[field]
+                        .as_u64()
+                        .expect("SLO-aware execution counter")
+                        > previous[field].as_u64().expect("initial SLO-aware counter"),
+                    "live execution must advance {field}: before={previous}, after={current}"
+                );
+            }
+            eprintln!("scheduler SLO before={previous}, after={current}");
+        }
         let completed = |state: &Value| {
             state["admission"]["completed_requests_total"]
                 .as_u64()

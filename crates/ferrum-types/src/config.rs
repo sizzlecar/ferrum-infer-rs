@@ -434,9 +434,94 @@ impl Default for EngineModelConfig {
     }
 }
 
+/// Latency targets used by the optional adaptive scheduler, in milliseconds.
+/// These are scheduling hints; client-observed SLO compliance is measured
+/// separately, including transport and queueing time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerSloConfig {
+    #[serde(deserialize_with = "deserialize_slo_milliseconds")]
+    pub ttft_ms: f64,
+    #[serde(deserialize_with = "deserialize_slo_milliseconds")]
+    pub tpot_ms: f64,
+    #[serde(deserialize_with = "deserialize_slo_milliseconds")]
+    pub itl_ms: f64,
+}
+
+impl SchedulerSloConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (name, value) in [
+            ("ttft", self.ttft_ms),
+            ("tpot", self.tpot_ms),
+            ("itl", self.itl_ms),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!(
+                    "scheduler SLO {name} must be positive finite milliseconds"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for SchedulerSloConfig {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let mut values = [None; 3];
+        for item in raw.split(',') {
+            let (name, value) = item.split_once(':').ok_or_else(|| {
+                "expected scheduler SLO ttft:200,tpot:15,itl:50 (milliseconds)".to_owned()
+            })?;
+            let index = match name.trim() {
+                "ttft" => 0,
+                "tpot" => 1,
+                "itl" => 2,
+                other => return Err(format!("unknown scheduler SLO metric {other:?}")),
+            };
+            if values[index].is_some() {
+                return Err(format!("duplicate scheduler SLO metric {:?}", name.trim()));
+            }
+            values[index] = Some(
+                value
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|error| format!("invalid scheduler SLO {}: {error}", name.trim()))?,
+            );
+        }
+        let [Some(ttft_ms), Some(tpot_ms), Some(itl_ms)] = values else {
+            return Err("scheduler SLO requires ttft, tpot, and itl thresholds".to_owned());
+        };
+        let slo = Self {
+            ttft_ms,
+            tpot_ms,
+            itl_ms,
+        };
+        slo.validate()?;
+        Ok(slo)
+    }
+}
+
+fn deserialize_slo_milliseconds<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(serde::de::Error::custom(
+            "scheduler SLO thresholds must be positive finite milliseconds",
+        ));
+    }
+    Ok(value)
+}
+
 /// Scheduler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
+    /// Optional feedback-driven latency targets. None retains static scheduling.
+    #[serde(default)]
+    pub slo: Option<SchedulerSloConfig>,
     /// Scheduling policy
     pub policy: SchedulingPolicy,
     /// Maximum waiting queue size
@@ -485,6 +570,7 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
+            slo: None,
             policy: SchedulingPolicy::Priority,
             max_waiting_requests: 1000,
             max_running_requests: 32,
@@ -1288,6 +1374,37 @@ mod tests {
         assert_eq!(
             SchedulerConfig::default().sequence_fit_policy,
             SequenceFitPolicy::ImmediateOnly
+        );
+    }
+
+    #[test]
+    fn scheduler_slo_requires_three_positive_finite_targets() {
+        let slo: SchedulerSloConfig = "itl:50, ttft:200,tpot:15".parse().unwrap();
+        assert_eq!(slo.ttft_ms, 200.0);
+        assert_eq!(slo.tpot_ms, 15.0);
+        assert_eq!(slo.itl_ms, 50.0);
+        for invalid in [
+            "ttft:200,tpot:15",
+            "ttft:200,tpot:15,itl:50,itl:60",
+            "ttft:200,tpot:15,unknown:50",
+            "ttft:0,tpot:15,itl:50",
+            "ttft:200,tpot:-1,itl:50",
+            "ttft:200,tpot:15,itl:NaN",
+            "ttft:inf,tpot:15,itl:50",
+        ] {
+            assert!(invalid.parse::<SchedulerSloConfig>().is_err(), "{invalid}");
+        }
+        let mut legacy = serde_json::to_value(SchedulerConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("slo");
+        assert!(serde_json::from_value::<SchedulerConfig>(legacy)
+            .unwrap()
+            .slo
+            .is_none());
+        assert!(
+            serde_json::from_value::<SchedulerSloConfig>(serde_json::json!({
+                "ttft_ms": 200, "tpot_ms": 15, "itl_ms": 0,
+            }))
+            .is_err()
         );
     }
 

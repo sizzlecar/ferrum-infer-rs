@@ -3403,6 +3403,10 @@ impl InferenceEngine for ContinuousBatchEngine {
         self.inner.model_executor.execution_attribution_snapshot()
     }
 
+    fn scheduler_slo_snapshot(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(self.inner.scheduler.slo_snapshot()?).ok()
+    }
+
     fn admission_snapshot(
         &self,
     ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
