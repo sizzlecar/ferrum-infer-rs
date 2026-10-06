@@ -21,6 +21,10 @@ pub struct SchedulerSloSnapshot {
     pub decode_overload_steps: u64,
     /// Current decode estimate alone cannot meet the tighter TPOT/ITL target.
     pub decode_target_infeasible: bool,
+    /// The dynamic budget cannot meet even an optimistic active-prefill TTFT.
+    pub ttft_budget_infeasible: bool,
+    /// Scheduling iterations that retained static limits for that reason.
+    pub ttft_fallback_steps: u64,
     /// Selected wave target before 10% headroom, including cumulative TPOT
     /// allowance. This can differ from user SLO thresholds.
     /// None means no dynamic budget, including fallback to static limits.
@@ -40,9 +44,17 @@ pub(super) struct SloController {
     adapted_prefill_steps: u64,
     decode_overload_steps: u64,
     decode_target_infeasible: bool,
+    ttft_budget_infeasible: bool,
+    ttft_fallback_steps: u64,
     budget_target_ms: Option<f64>,
     decode_step_ms: Option<f64>,
     pending_adapted_prefill: bool,
+}
+
+pub(super) struct PrefillTtftWork {
+    pub remaining_tokens: usize,
+    pub chunk_cap: usize,
+    pub age_ms: f64,
 }
 
 impl SloController {
@@ -62,9 +74,11 @@ impl SloController {
         decode_sequences: usize,
         static_limit: usize,
         tpot_allowance_ms: Option<f64>,
+        active_prefills: impl IntoIterator<Item = PrefillTtftWork>,
     ) -> Option<usize> {
         let previous = self.prefill_budget_tokens.take();
         self.decode_target_infeasible = false;
+        self.ttft_budget_infeasible = false;
         self.budget_target_ms = None;
         self.decode_step_ms = None;
         if decode_sequences == 0 {
@@ -91,11 +105,32 @@ impl SloController {
         // Reserve 10% for host/transport work that execution timing does not
         // measure. This is headroom, not a promise about client-visible P99.
         let step_ms = target_ms * 0.9;
-        self.budget_target_ms = Some(target_ms);
         let budget = (((step_ms - decode_ms).max(0.0) / cost.prefill_ms_per_token).floor()
             as usize)
             .max(1)
             .min(static_limit);
+        // Optimistically give each active prefill the entire budget on every
+        // wave. If even that cannot finish before TTFT, shrinking its progress
+        // is not a feasible three-target choice. This is a necessary condition,
+        // not a guarantee for shared budgets, future arrivals or transport.
+        if active_prefills.into_iter().any(|request| {
+            if request.remaining_tokens == 0 {
+                return false;
+            }
+            let chunk = budget.min(request.chunk_cap);
+            let completion_ms = if chunk == 0 {
+                f64::INFINITY
+            } else {
+                cost.prefill_ms_per_token * request.remaining_tokens as f64
+                    + decode_ms * request.remaining_tokens.div_ceil(chunk) as f64
+            };
+            completion_ms > (targets.ttft_ms - request.age_ms).max(0.0) * 0.9
+        }) {
+            self.ttft_budget_infeasible = true;
+            self.ttft_fallback_steps = self.ttft_fallback_steps.saturating_add(1);
+            return None;
+        }
+        self.budget_target_ms = Some(target_ms);
         self.prefill_budget_tokens = Some(budget);
         if previous != Some(budget) {
             self.budget_updates = self.budget_updates.saturating_add(1);
@@ -142,6 +177,8 @@ impl SloController {
             adapted_prefill_steps: self.adapted_prefill_steps,
             decode_overload_steps: self.decode_overload_steps,
             decode_target_infeasible: self.decode_target_infeasible,
+            ttft_budget_infeasible: self.ttft_budget_infeasible,
+            ttft_fallback_steps: self.ttft_fallback_steps,
             budget_target_ms: self.budget_target_ms,
             prefill_ms_per_token: cost.map(|cost| cost.prefill_ms_per_token),
             decode_step_ms: self.decode_step_ms,

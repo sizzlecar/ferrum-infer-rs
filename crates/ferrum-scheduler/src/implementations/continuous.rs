@@ -3733,11 +3733,35 @@ impl ContinuousBatchScheduler {
                     .map_or(live_limit, |limit| limit.min(live_limit));
                 let tpot_allowance_ms =
                     self.scheduled_tpot_allowance_ms(&batch_requests, Instant::now());
+                // Follow the existing prefill-queue -> controller lock order.
+                // Waiting admission stays unchanged; once admitted, a request
+                // participates with its real remaining work and chunk ceiling.
+                let prefill_queue = self.prefill_queue.read();
+                let now = chrono::Utc::now();
+                let active_prefills = prefill_queue
+                    .iter()
+                    // Recompute after visible output has no first-token deadline.
+                    .filter(|request| request.slo_output_progress.is_none())
+                    .map(|request| slo::PrefillTtftWork {
+                        remaining_tokens: self.remaining_prefill_tokens(request),
+                        chunk_cap: self.prefill_budget_tokens(
+                            request,
+                            active_decode_prefill_chunk,
+                            prefill_step_chunk,
+                            static_limit,
+                        ),
+                        age_ms: (now - request.inner.submitted_at)
+                            .to_std()
+                            .unwrap_or_default()
+                            .as_secs_f64()
+                            * 1000.0,
+                    });
                 controller.lock().budget(
                     targets,
                     scheduled_decode_count,
                     static_limit,
                     tpot_allowance_ms,
+                    active_prefills,
                 )
             } else {
                 None

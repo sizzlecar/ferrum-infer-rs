@@ -81,7 +81,10 @@ fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
     let mut controller = scheduler.slo_controller.as_ref().unwrap().lock();
     // Accumulated TPOT allowance permits a wave longer than one 100 ms TPOT,
     // while 120 ms ITL remains a per-wave ceiling: floor(108 - 19.75) = 88.
-    assert_eq!(controller.budget(targets, 1, 256, Some(200.0)), Some(88));
+    assert_eq!(
+        controller.budget(targets, 1, 256, Some(200.0), []),
+        Some(88)
+    );
     assert_eq!(controller.snapshot().budget_target_ms, Some(120.0));
     for tokens in [8, 2, 1] {
         controller.record(
@@ -92,7 +95,10 @@ fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
         );
         // Small mixed waves retain fixed overhead in a, not in c/token.
         assert!((controller.prefill_ms_per_token().unwrap() - 1.0).abs() < 1e-8);
-        assert_eq!(controller.budget(targets, 1, 256, Some(200.0)), Some(88));
+        assert_eq!(
+            controller.budget(targets, 1, 256, Some(200.0), []),
+            Some(88)
+        );
     }
     let model = controller.snapshot();
     assert!((model.fixed_step_ms.unwrap() - 10.25).abs() < 1e-8);
@@ -155,7 +161,7 @@ fn slo_decode_overload_keeps_prefill_progress_and_no_progress_does_not_train() {
 }
 
 #[test]
-fn slo_ttft_urgency_prioritizes_the_request_with_least_remaining_slack() {
+fn slo_ttft_prioritizes_urgent_prefill_and_rejects_an_infeasible_dynamic_budget() {
     let scheduler = scheduler(None);
     activate_decode_requests(&scheduler, 1);
     for request in scheduler.decode_queue.write().requests.values_mut() {
@@ -163,17 +169,17 @@ fn slo_ttft_urgency_prioritizes_the_request_with_least_remaining_slack() {
     }
     train(&scheduler);
     let short = waiting(&scheduler, 20);
-    let urgent = waiting(&scheduler, 900);
+    let urgent = waiting(&scheduler, 80);
     scheduler.promote_to_prefill_with_empty_retry(&short, None);
     scheduler.promote_to_prefill_with_empty_retry(&urgent, None);
     let now = chrono::Utc::now();
     for request in scheduler.prefill_queue.write().iter_mut() {
-        // The younger long request is already close to its predicted deadline;
-        // the older short request still has ample slack.
+        // The urgent request has 150 ms left: 80 + 19.75*ceil(80/70)
+        // fits within the 135 ms allowance, while the short request has slack.
         let age_ms = if request.inner.request.id == short {
             200
         } else {
-            100
+            850
         };
         request.inner.submitted_at = now - chrono::Duration::milliseconds(age_ms);
     }
@@ -184,6 +190,23 @@ fn slo_ttft_urgency_prioritizes_the_request_with_least_remaining_slack() {
         .requests
         .iter()
         .any(|request| request.request.id == short));
+    assert!(!scheduler.slo_snapshot().unwrap().ttft_budget_infeasible);
+
+    // With only 100 ms left, the same optimistic completion time cannot fit.
+    // Retain the original static budget and report the actual fallback.
+    for request in scheduler.prefill_queue.write().iter_mut() {
+        if request.inner.request.id == urgent {
+            request.inner.submitted_at = chrono::Utc::now() - chrono::Duration::milliseconds(900);
+        }
+    }
+    let fallback = scheduler.create_iteration_batch(hint()).unwrap();
+    assert_eq!(fallback.requests[1].request.id, urgent);
+    assert_eq!(fallback.requests[1].tokens_to_process, Some(80));
+    let snapshot = scheduler.slo_snapshot().unwrap();
+    assert!(snapshot.ttft_budget_infeasible);
+    assert_eq!(snapshot.ttft_fallback_steps, 1);
+    assert_eq!(snapshot.prefill_budget_tokens, None);
+    assert_eq!(snapshot.budget_target_ms, None);
 }
 
 #[tokio::test]
