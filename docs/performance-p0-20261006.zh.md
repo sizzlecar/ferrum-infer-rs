@@ -1,6 +1,6 @@
 # P0：干净候选与首轮实测
 
-状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式自然 `run` 与原动态 E2E 均通过。代码冻结，正在采集最终 CUDA 二进制的静态/动态主负载对比与 M4 同负载 llama.cpp 参考。CUDA Q6 恢复版静态 C1 已恢复吞吐；a890 主负载对比未见动态 G 收益，M4 相同主负载 C1 仍因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
+状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式自然 `run` 与原动态 E2E 均通过。代码冻结，最终 CUDA 二进制的静态/动态 C1/C2/C4 主负载对比已完成，未见动态 G 收益；M4 同负载 llama.cpp 参考仍在采集。CUDA Q6 恢复版静态 C1 已恢复吞吐；a890 主负载对比同样未见动态 G 收益，M4 相同主负载 C1 仍因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
 
 候选 `57ee5ccb` 基于 main `2c9998a2`，仅接入既有静态执行优化 `c3c9ee0b` 与独立客户端测量；没有服务 SLO 控制器、启动校准或成本模型。旧恢复分支已作本地归档 tag `archive/slo-recovery-20261006`。原脏工作树未修改。
 
@@ -103,6 +103,25 @@ M4 定位重跑 r6 仍失败：长 prefill 到达前只有 4 个反馈波，仿�
 
 正式 `c068e3d7` 在 CUDA / M4 均通过自然 `run` 及未修改的 `ff47c0a3` 动态 E2E（2.67s / 17.71s）：两端各 7 个请求完成、失败 0、资源排空，新增已学习阶段的独立动态使用断言通过。最终累计动态 prefill 步数为 7 / 10，TTFT 可行性回退为 1 / 9；这些是机制与恢复验证，不是吞吐收益。自然输出分别为 21/32、91/215 输入/输出 token，均正常 stop，文本与前版一致。M4 在第 4 个反馈波的快照已采用 `b=0` 的边界拟合，随后学习到正斜率；既有失败原样保留，修正没有换负载或放宽断言。M4 原始结果见仓库外 `metal/slo-r8-summary.json`。
 
+## c068 CUDA RN 主负载静态 / 动态对比
+
+两种模式均为正式 `c068e3d7` 二进制（SHA256 `70a310b6…`），保留 Q6 路径恢复与约束拟合；RN-F16 profile / mixed、context 2048 / slots 32 / batch 2048 / 24GiB runtime budget、FP16 KV、缓存关闭和前述客户端均相同，唯一配置变量仍为 SLO 开关。沿用固定 ShareGPT 选择 hash `03676b00…1d5df2`、长度筛选与参考输出长度政策；每格 32 预热 + 64 测量、1 次重复，P99 阈值仍为 200/15/50ms。
+
+| 模式 | C | TTFT P50/P99 ms | last-visible TPOT P50/P99 ms/token | 可见 SSE 文本事件 ITL P50/P99 ms | 输出 tok/s | 文本事件 / 间隔数 | 本次 SLO |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 静态 | 1 | 19.54 / 103.68 | 9.68 / 10.08 | 9.79 / 10.63 | 101.492 | 19742 / 19678 | 三项通过 |
+| 静态 | 2 | 31.45 / 114.37 | 11.50 / 12.12 | 11.55 / 12.84 | 168.545 | 19742 / 19678 | 三项通过 |
+| 静态 | 4 | 42.82 / 125.53 | 14.82 / 15.74 | 14.64 / 24.21 | 255.865 | 19740 / 19676 | TPOT 超标 |
+| 动态 | 1 | 19.69 / 104.35 | 9.68 / 10.14 | 9.80 / 10.66 | 101.382 | 19742 / 19678 | 三项通过 |
+| 动态 | 2 | 73.18 / 194.68 | 11.49 / 12.05 | 11.49 / 16.01 | 166.844 | 19746 / 19682 | 三项通过 |
+| 动态 | 4 | 58.71 / 137.36 | 15.02 / 16.01 | 14.81 / 23.40 | 252.159 | 19740 / 19676 | TPOT 超标 |
+
+各格均完成 64/64、错误/拒绝 0，TTFT/TPOT 各 64 个样本；每种模式合计完成 288 个请求（含预热）。均保留 8 个 event/usage 不一致，无缺失 usage、观测到的 coalescing、坏输出或协议错误。内存为**每种模式整个服务生命周期、含加载与 C1/C2/C4 的峰值**：静态 NVML 20803 MiB / RSS 6073324 KiB，动态 20676 MiB / 6073492 KiB；不是逐格峰值，GPU allocated 与 OS footprint 未采集，各口径不相加。
+
+已扫描达标格中的 G 为静态 **168.545 tok/s@C2**、动态 **166.844 tok/s@C2（−1.01%）**，没有收益。动态 C2 TTFT P99 从 114.37ms 升至 **194.68ms**，逼近 200ms 阈值；C4 两臂均因 TPOT 未通过。这里只有固定配置、C1/C2/C4、每格一次 64 样本，不能声称最佳静态，也未完成正式 200 样本 × 2 次验收。
+
+动态整趟实际采用 prefill 预算 396 步、预算更新 1034 次、TTFT 回退 91 次、纯 decode 超载 2384 步。整个调度平均耗时静态 7.56µs / 动态 7.70µs；这是总调度均值，不是控制器独占开销或 P99 保证。两模式客户端与服务端均 exit 0、请求排空，guard 成功且原服务恢复健康。原始结果与完整配置见仓库外 [c068 主负载摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/rn-nonnegative-r1/primary-summary.json)。
+
 ## 首轮 M4 数据
 
 沿用同一 ShareGPT 选择规则及 32 预热 + 64 测量请求、一次重复；context 4096、slots 32、batch 2048、FP16 KV，其余服务容量固定。G32 Off 与 a890 动态 C1 均完成 64/64、错误/拒绝 0；两轮全部 96 条样本身份及顺序一致：
@@ -120,4 +139,4 @@ a890 的最长请求 TTFT 为 4972.05ms，4/64 请求 TTFT 超过 3400ms；TTFT/
 
 两版本存在明确配置差异：a890 为 Auto→`qwen3_5.f32-master`、mixed、active-decode chunk 128 / budget 256；旧 G32 为 `f16-head`、split、budget 0。两者 effective reusable execution 均为 0。此表用于报告现状，不能单独归因于 SLO 开关。a890 本轮实际动态 prefill 步数为 0，故本格也不能代替已有混合请求 E2E 的动态使用验证。完整结果见仓库外 [M4 C1 摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-sharegpt-c1-r1-summary.json)。
 
-原始报告、完整命令和配置位于仓库外 `~/ferrum-handoffs/20261006-throughput-p0/`（CUDA 旧版基线为 `cuda/c1-r1/`，静态候选为 `cuda/run-smoke-r2/`、`cuda/candidate-serve-r1/`，本机静态/动态功能为 `local-smoke/`、`local-slo-smoke/`，M4 为 `metal/`）。上述 CUDA 测量已结束并恢复原服务，M4 两轮主负载服务均已清理。a890 CUDA 主负载首轮未见动态收益；M4 相同主负载 C1 仍因 TTFT 未达标。
+原始报告、完整命令和配置位于仓库外 `~/ferrum-handoffs/20261006-throughput-p0/`（CUDA 旧版基线为 `cuda/c1-r1/`，静态候选为 `cuda/run-smoke-r2/`、`cuda/candidate-serve-r1/`，本机静态/动态功能为 `local-smoke/`、`local-slo-smoke/`，M4 为 `metal/`）。上述 CUDA 测量已结束并恢复原服务，M4 两轮主负载服务均已清理。a890 与 c068 CUDA 主负载首轮均未见动态收益；M4 相同主负载 C1 仍因 TTFT 未达标。
