@@ -2,6 +2,8 @@
 
 状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式自然 `run` 与原动态 E2E 均通过。CUDA 静态/动态 C1/C2/C4 主负载对比未见动态 G 收益。补测旧 G32 的 C4 达标，新版 C4 却因 TPOT 失败，P1 并发性能尚未恢复，不能用 C1 恢复代替。短采样证实新版未使用 Q6 多行投影，`4d373a5c` 仅恢复旧版输出投影合批路径，正在验证，尚无修复后性能结论。M4 同一组 64 样本的 Ferrum 与 llama.cpp 均因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
 
+最新决定（2026-10-06）：先追平旧 G32，暂停新增动态收益扫描；在同 ShareGPT、C4、split/RN/固定容量下采集 G32 与 `4d373` 的完整 kernel 对照，集中检查遗漏路径。用户委托选择后，M4 后续 TTFT P99 改为 **5500ms**，TPOT/ITL 仍为 212/359ms，样本不变；下文原 **3400ms** 的失败结论保留原阈值，不冒充新阈值下的验收。SLO-aware 默认关闭，当前负载未测到收益；ITL 触发的保守策略尚待实现与验证。
+
 候选 `57ee5ccb` 基于 main `2c9998a2`，仅接入既有静态执行优化 `c3c9ee0b` 与独立客户端测量；没有服务 SLO 控制器、启动校准或成本模型。旧恢复分支已作本地归档 tag `archive/slo-recovery-20261006`。原脏工作树未修改。
 
 候选已有 workspace 格式、编译、测试（4591 通过、72 项现有 ignored）、Clippy、Metal 全目标编译和 CUDA CLI 三 feature 编译通过。RTX 5090 / Qwen3.5-9B Q4_K_M 已跑通自然 `run`、非流式 `serve` 和现有 mixed 调度断流恢复 E2E（5.43s）：取消一个请求后，同批请求和新 prefill 正常完成，资源排空，随后三个并发请求成功。自然问答解释 KV cache，21 输入 / 32 输出 token，正常 stop。
@@ -162,5 +164,7 @@ a890 的最长请求 TTFT 为 4972.05ms，4/64 请求 TTFT 超过 3400ms；TTFT/
 本次 llama.cpp 补齐同 64 样本参考：最长 954/966 token 请求 TTFT 为 4970.64ms，3/64 请求超过 3400ms；TTFT/TPOT 各 64 样本，19740 个可见文本事件 / 19676 个间隔，9 个 event/usage 不一致，无 coalescing、缺失 usage 或协议/机械输出检查异常。使用相同 GGUF、模板、长度政策和 Rust 客户端，固定 unified KV 为 32 slots × 4096、batch 2048 / ubatch 512、Flash Attention 开启、缓存关闭；Ferrum 采用自身动态 KV 及 8GiB runtime budget，保留实现差异。llama 主机内存采样 6423 次，RSS 峰值 11856625664 B、physical footprint 6357181608 B；Metal 分配采样 6426 次、错误 0、完整覆盖加载至关闭。各内存口径不相加，a890 缺少设备分配量，不能据此声称设备内存优势。guard / 客户端 exit 0，端口释放。同负载两实现都失败支持当前 TTFT 瓶颈判断，但仍不等于硬件物理不可能；没有放宽阈值或缩短输入。证据见仓库外 [M4 llama.cpp 同负载摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/llama-sharegpt-c1-r1-summary.json)。
 
 M4 `c068` Off 的 C8 kernel 诊断已结束，8 预热 + 8 测量全部完成、错误/拒绝 0；使用不同于主表的短选择，instrumentation 改变执行边界，不用于 SLO 或 G 结论。仅取首个 fingerprint 的 484 条原始 native 记录作有界摘要：Metal GPU 时间戳区间合计 9444.07ms，SwiGLU 占 59.31%、gated delta 占 32.30%、causal attention 占 7.43%。缺少 physical submission 总记录和阶段标签，command index 有 8 个内部缺口，故这些比例只描述该组已观察记录，不能证明完整 submission、代表性 decode/prefill 或全局 GPU 忙碌率；host gap 与权重带宽亦缺测。两份约 8.34GB 原始文件留在 M4，精确路径/大小/hash、小子集及现有 Rust 摘要器输出见仓库外 [Metal 采样摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/native-profile-r8-c8-r1-summary.json)。服务已清理，不为补指标扩大采集。
+
+该子集的 GDN 3050.81ms 包含投影 1950.90ms；真正的 `recurrent_scan` 为 969.35ms，占总已观察时间 **10.26%**。源码与原始区间共同确认：Metal GDN 投影已 packed，但 scan 仍逐 participant dispatch，grid 没有序列维度；24 个 GDN 记录各有 7 participants / 7 个 scan 区间，共 168 个。可将跨序列 scan 合批列为后续候选，但此子集不能代表纯 decode，不能据此归因每新增请求约 16ms 的增量或承诺收益。路径为 `crates/ferrum-kernels/src/backend/metal/vnext_ops/gated_delta_attention.rs` 的 `dispatch_delta` 调用及对应 `.metal` token 内循环；本轮尚未修改。
 
 原始报告、完整命令和配置位于仓库外 `~/ferrum-handoffs/20261006-throughput-p0/`（CUDA 旧版基线为 `cuda/c1-r1/`，静态候选为 `cuda/run-smoke-r2/`、`cuda/candidate-serve-r1/`，本机静态/动态功能为 `local-smoke/`、`local-slo-smoke/`，M4 为 `metal/`）。上述 CUDA 测量已结束并恢复原服务，M4 两轮主负载服务均已清理。a890 与 c068 CUDA 主负载首轮均未见动态收益；M4 相同主负载 C1 仍因 TTFT 未达标。
