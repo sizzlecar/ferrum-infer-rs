@@ -1,6 +1,6 @@
 # P0：干净候选与首轮实测
 
-状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式自然 `run` 与原动态 E2E 均通过。代码冻结，CUDA 静态/动态 C1/C2/C4 主负载对比未见动态 G 收益。补测旧 G32 的 C4 达标，新版 C4 却因 TPOT 失败，P1 并发性能尚未恢复，不能用 C1 恢复代替。M4 同一组 64 样本的 Ferrum 与 llama.cpp 均因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
+状态：候选 `c068e3d7` 保留轻量 SLO-aware，补上负 decode 成本的约束拟合；workspace 格式、全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy、Metal 全目标编译及 CUDA 三 feature 编译均通过，两端正式自然 `run` 与原动态 E2E 均通过。CUDA 静态/动态 C1/C2/C4 主负载对比未见动态 G 收益。补测旧 G32 的 C4 达标，新版 C4 却因 TPOT 失败，P1 并发性能尚未恢复，不能用 C1 恢复代替。短采样证实新版未使用 Q6 多行投影，`4d373a5c` 仅恢复旧版输出投影合批路径，正在验证，尚无修复后性能结论。M4 同一组 64 样本的 Ferrum 与 llama.cpp 均因 TTFT 未达标。版本及适用范围见下文，尚未发布。目标与口径见 [目标文档](goal-slo-throughput.zh.md)。
 
 候选 `57ee5ccb` 基于 main `2c9998a2`，仅接入既有静态执行优化 `c3c9ee0b` 与独立客户端测量；没有服务 SLO 控制器、启动校准或成本模型。旧恢复分支已作本地归档 tag `archive/slo-recovery-20261006`。原脏工作树未修改。
 
@@ -136,6 +136,10 @@ M4 定位重跑 r6 仍失败：长 prefill 到达前只有 4 个反馈波，仿�
 这六格各 64/64 完成、错误/拒绝/坏输出/协议异常为 0，TTFT/TPOT 各 64 样本；仅 chunk 256 动态格为 19742 个文本事件 / 19678 个间隔，其余各格为 19740 / 19676。各格均有 8 个 event/usage 不一致，无缺失 usage 或观测到的 coalescing。旧 G32 整个 C2/C4 服务生命周期峰值为 NVML 22315 MiB / RSS 6153984 KiB；chunk 256 静态/动态各自含加载和 C4 的峰值为 20089 / 20088 MiB、6072716 / 6072688 KiB；新版 split 静态/动态为 20481 / 20480 MiB、6073236 / 6073136 KiB。GPU allocated 和 OS footprint 未采集，各口径不相加。客户端、服务端及 guard 均 exit 0，排空且原服务恢复。
 
 旧版已扫描达标 G 至少为 **287.582 tok/s@C4**，高于新版默认 mixed 的 168.545；C1 恢复不能证明 P1 完成。新版单独改回 split 或采用 chunk 256 / budget 256 均未恢复 C4，不能将差距归因于 mixed 配置；停止扩大参数搜索，核查旧版输出投影合批路径是否漏移植。证据见仓库外 [旧 G32 并发摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/g32-c2c4-r1/summary.json)、[chunk 256 对照摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/fixed-boundary-chunk256-c4-r1/summary.json)与 [split 对照摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/fixed-boundary-split-c4-r1/summary.json)。
+
+`c068` Off C8 的一次 Nsight 短诊断（8 预热 + 8 测量，非主负载验收）记录 Q6 单行 `vnext_gguf_linear_q6k_f32` 发射 4634 次、累计 2.81777s，占完整 trace 内 kernel 累计时间的 19.0%；Q6 tiled 发射为 0，RN fragment 仍实际使用。统计包含加载与预热，不能当作测量窗口 GPU 利用率。源码确认当前输出 head 按 participant 固定 `rows=1`，遗漏旧 G32 的连续行合批入口。`4d373a5c` 恢复该入口，生产代码净增 123 行，并复用两项原有内存边界测试：仅在输入/输出连续、行序合法且输出不覆盖输入或权重时合批；其他情况保留逐请求执行。不引入旧成本观测框架，不修改 SLO 控制器。待现有 CUDA 数值测试、真实 `run` / 动态 E2E 与相同 C4 主负载复测后判定收益。
+
+`4d373a5c` 已通过格式、workspace 全目标编译/测试（4626 通过、0 失败、73 ignored）、Clippy 和 Metal 全目标编译；本机无 CUDA，新增的两项 CUDA 模块边界测试由 CUDA 主机执行，不能算在上述通过数内。该修复只修改 CUDA encoder，Metal 执行代码不变；CUDA 实机验证进行中。
 
 ## 首轮 M4 数据
 
