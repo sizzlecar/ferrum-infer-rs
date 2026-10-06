@@ -3,7 +3,7 @@
 
 use ferrum_types::SchedulerSloConfig;
 use serde::Serialize;
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 /// Read on demand by health reporting; no serialization occurs during a step.
 #[derive(Debug, Clone, Serialize)]
@@ -22,17 +22,18 @@ pub struct SchedulerSloSnapshot {
     /// Current decode estimate alone cannot meet the tighter TPOT/ITL target.
     pub decode_target_infeasible: bool,
     /// Selected wave target before 10% headroom, including cumulative TPOT
-    /// allowance or overload fallback. This can differ from user SLO thresholds.
+    /// allowance. This can differ from user SLO thresholds.
     /// None means no dynamic budget, including fallback to static limits.
     pub budget_target_ms: Option<f64>,
     pub prefill_ms_per_token: Option<f64>,
     pub decode_step_ms: Option<f64>,
+    pub fixed_step_ms: Option<f64>,
+    pub decode_ms_per_sequence: Option<f64>,
 }
 
 #[derive(Default)]
 pub(super) struct SloController {
-    prefill_ms_per_token: Option<f64>,
-    decode_ms_by_width: BTreeMap<usize, f64>,
+    cost: OnlineAffineCost,
     observed_steps: u64,
     prefill_budget_tokens: Option<usize>,
     budget_updates: u64,
@@ -52,24 +53,7 @@ impl SloController {
     }
 
     pub(super) fn prefill_ms_per_token(&self) -> Option<f64> {
-        self.prefill_ms_per_token
-    }
-
-    fn decode_ms(&self, width: usize) -> Option<f64> {
-        if width == 0 {
-            return Some(0.0);
-        }
-        // Use a measured larger width conservatively. Above the observed range
-        // extrapolate linearly, without inventing a calibrated backend model.
-        self.decode_ms_by_width
-            .range(width..)
-            .next()
-            .map(|(_, ms)| *ms)
-            .or_else(|| {
-                self.decode_ms_by_width
-                    .last_key_value()
-                    .map(|(measured_width, ms)| ms * width as f64 / *measured_width as f64)
-            })
+        self.cost.fit().map(|cost| cost.prefill_ms_per_token)
     }
 
     pub(super) fn budget(
@@ -82,35 +66,34 @@ impl SloController {
         let previous = self.prefill_budget_tokens.take();
         self.decode_target_infeasible = false;
         self.budget_target_ms = None;
-        self.decode_step_ms = self.decode_ms(decode_sequences);
+        self.decode_step_ms = None;
         if decode_sequences == 0 {
             return None;
         }
-        let decode_ms = self.decode_step_ms?;
+        // Three non-collinear naturally observed (decode, prefill) shapes are
+        // needed to distinguish fixed overhead from both incremental costs.
+        // Cold or unidentifiable models immediately retain static scheduling.
+        let cost = self.cost.fit()?;
+        let decode_ms = cost.fixed_ms + cost.decode_ms_per_sequence * decode_sequences as f64;
+        self.decode_step_ms = Some(decode_ms);
         let strict_target_ms = targets.tpot_ms.min(targets.itl_ms);
         self.decode_target_infeasible = decode_ms >= strict_target_ms;
-        let target_ms = if self.decode_target_infeasible {
-            targets.tpot_ms.max(targets.itl_ms)
-        } else {
-            // TPOT is an average over generated tokens, so earlier fast waves
-            // can fund a longer mixed wave. ITL still limits each visible gap.
-            targets
-                .itl_ms
-                .min(tpot_allowance_ms.unwrap_or(targets.tpot_ms))
-        };
+        // Prefill throttling cannot repair an already infeasible pure decode.
+        // Keep the original strict targets and return to static limits.
+        if self.decode_target_infeasible {
+            return None;
+        }
+        // TPOT is an average over generated tokens, so earlier fast waves
+        // can fund a longer mixed wave. ITL still limits each visible gap.
+        let target_ms = targets
+            .itl_ms
+            .min(tpot_allowance_ms.unwrap_or(targets.tpot_ms));
         // Reserve 10% for host/transport work that execution timing does not
         // measure. This is headroom, not a promise about client-visible P99.
         let step_ms = target_ms * 0.9;
-        // Pure decode already violates the tighter target. Protect the wider
-        // target when it still has room; otherwise use the static budget rather
-        // than starving prefill one token at a time for an infeasible target.
-        // This fallback does not change or certify the user's original SLOs.
-        if self.decode_target_infeasible && decode_ms >= step_ms {
-            return None;
-        }
-        let prefill_ms = self.prefill_ms_per_token?;
         self.budget_target_ms = Some(target_ms);
-        let budget = (((step_ms - decode_ms).max(0.0) / prefill_ms).floor() as usize)
+        let budget = (((step_ms - decode_ms).max(0.0) / cost.prefill_ms_per_token).floor()
+            as usize)
             .max(1)
             .min(static_limit);
         self.prefill_budget_tokens = Some(budget);
@@ -137,31 +120,20 @@ impl SloController {
         }
         let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
         self.observed_steps = self.observed_steps.saturating_add(1);
-        if prefill_tokens > 0 {
-            if adapted {
-                self.adapted_prefill_steps = self.adapted_prefill_steps.saturating_add(1);
-            }
-            // Mixed waves include dispatch and decode overhead that cannot be
-            // reliably attributed per prefill token. Learning from tiny mixed
-            // chunks makes costs inflate as chunks shrink; use pure prefills.
-            if decode_sequences == 0 {
-                update_cost(
-                    &mut self.prefill_ms_per_token,
-                    elapsed_ms / prefill_tokens as f64,
-                );
-            }
-        } else {
-            if elapsed_ms > targets.tpot_ms.min(targets.itl_ms) {
-                self.decode_overload_steps = self.decode_overload_steps.saturating_add(1);
-            }
-            let mut cost = self.decode_ms_by_width.get(&decode_sequences).copied();
-            update_cost(&mut cost, elapsed_ms);
-            self.decode_ms_by_width
-                .insert(decode_sequences, cost.unwrap());
+        if prefill_tokens > 0 && adapted {
+            self.adapted_prefill_steps = self.adapted_prefill_steps.saturating_add(1);
         }
+        if prefill_tokens == 0 && elapsed_ms > targets.tpot_ms.min(targets.itl_ms) {
+            self.decode_overload_steps = self.decode_overload_steps.saturating_add(1);
+        }
+        // Fit all successful waves together; the intercept absorbs fixed work
+        // instead of charging it once per token in small mixed chunks.
+        self.cost
+            .record(decode_sequences as f64, prefill_tokens as f64, elapsed_ms);
     }
 
     pub(super) fn snapshot(&self) -> SchedulerSloSnapshot {
+        let cost = self.cost.fit();
         SchedulerSloSnapshot {
             enabled: true,
             observed_steps: self.observed_steps,
@@ -171,17 +143,78 @@ impl SloController {
             decode_overload_steps: self.decode_overload_steps,
             decode_target_infeasible: self.decode_target_infeasible,
             budget_target_ms: self.budget_target_ms,
-            prefill_ms_per_token: self.prefill_ms_per_token,
+            prefill_ms_per_token: cost.map(|cost| cost.prefill_ms_per_token),
             decode_step_ms: self.decode_step_ms,
+            fixed_step_ms: cost.map(|cost| cost.fixed_ms),
+            decode_ms_per_sequence: cost.map(|cost| cost.decode_ms_per_sequence),
         }
     }
 }
 
-fn update_cost(estimate: &mut Option<f64>, sample: f64) {
-    // React immediately to slow waves; a cheap wave only gradually increases
-    // the next budget, avoiding an aggressive jump after one easy request.
-    *estimate = Some(match *estimate {
-        Some(previous) if sample < previous => previous * 0.8 + sample * 0.2,
-        _ => sample,
-    });
+#[derive(Clone, Copy)]
+struct AffineCost {
+    fixed_ms: f64,
+    decode_ms_per_sequence: f64,
+    prefill_ms_per_token: f64,
+}
+
+/// Exponentially weighted, centered sufficient statistics for t = a + b*d + c*p.
+/// No samples, per-width tables, startup calibration, or candidate search.
+#[derive(Default)]
+struct OnlineAffineCost {
+    weight: f64,
+    mean: [f64; 3],       // decode rows, prefill tokens, elapsed milliseconds
+    covariance: [f64; 5], // dd, dp, pp, dt, pt
+}
+
+impl OnlineAffineCost {
+    fn record(&mut self, decode: f64, prefill: f64, elapsed_ms: f64) {
+        const DECAY: f64 = 0.8;
+        let sample = [decode, prefill, elapsed_ms];
+        let delta = std::array::from_fn::<_, 3, _>(|i| sample[i] - self.mean[i]);
+        self.weight = DECAY * self.weight + 1.0;
+        for (mean, change) in self.mean.iter_mut().zip(delta) {
+            *mean += change / self.weight;
+        }
+        let correction = 1.0 - self.weight.recip();
+        let products = [
+            delta[0] * delta[0],
+            delta[0] * delta[1],
+            delta[1] * delta[1],
+            delta[0] * delta[2],
+            delta[1] * delta[2],
+        ];
+        for (covariance, product) in self.covariance.iter_mut().zip(products) {
+            *covariance = DECAY * *covariance + correction * product;
+        }
+    }
+
+    fn fit(&self) -> Option<AffineCost> {
+        let [dd, dp, pp, dt, pt] = self.covariance;
+        let determinant = dd * pp - dp * dp;
+        // This relative rank check handles different row/token units. Two
+        // shapes, or collinear shapes, cannot identify all three coefficients.
+        if dd <= 0.0 || pp <= 0.0 || determinant <= 1e-9 * dd * pp {
+            return None;
+        }
+        let decode_ms_per_sequence = (dt * pp - pt * dp) / determinant;
+        let prefill_ms_per_token = (pt * dd - dt * dp) / determinant;
+        let fixed_ms = self.mean[2]
+            - decode_ms_per_sequence * self.mean[0]
+            - prefill_ms_per_token * self.mean[1];
+        if !fixed_ms.is_finite()
+            || !decode_ms_per_sequence.is_finite()
+            || !prefill_ms_per_token.is_finite()
+            || fixed_ms < 0.0
+            || decode_ms_per_sequence < 0.0
+            || prefill_ms_per_token <= 0.0
+        {
+            return None;
+        }
+        Some(AffineCost {
+            fixed_ms,
+            decode_ms_per_sequence,
+            prefill_ms_per_token,
+        })
+    }
 }

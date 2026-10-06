@@ -32,8 +32,12 @@ fn waiting(scheduler: &ContinuousBatchScheduler, tokens: usize) -> RequestId {
 }
 
 fn train(scheduler: &ContinuousBatchScheduler) {
-    scheduler.record_execution_step(100, 0, Duration::from_millis(100));
-    scheduler.record_execution_step(0, 1, Duration::from_millis(20));
+    // t = 10.25 ms fixed + 9.5 ms/decode row + 1 ms/prefill token.
+    scheduler.record_execution_step(100, 0, Duration::from_micros(110_250));
+    scheduler.record_execution_step(50, 0, Duration::from_micros(60_250));
+    // Pure-prefill observations alone cannot identify the decode coefficient.
+    assert_eq!(scheduler.slo_snapshot().unwrap().prefill_ms_per_token, None);
+    scheduler.record_execution_step(0, 1, Duration::from_micros(19_750));
 }
 
 #[test]
@@ -55,7 +59,7 @@ fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
 
     train(&scheduler);
     let adapted = scheduler.create_iteration_batch(hint()).unwrap();
-    // 90 ms server allowance minus 20 ms decode = 70 aggregate prefill tokens.
+    // 90 ms allowance minus 19.75 ms decode permits 70 aggregate prefill tokens.
     assert_eq!(adapted.resource_requirements.gpu_memory, 71 * 16);
     assert!(!scheduler.slo_snapshot().unwrap().decode_target_infeasible);
     assert_eq!(
@@ -64,7 +68,7 @@ fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
     );
     assert_eq!(scheduler.slo_snapshot().unwrap().adapted_prefill_steps, 0);
     scheduler.mark_prefill_chunk_processed(&first, 100, 70);
-    scheduler.record_execution_step(70, 1, Duration::from_millis(160));
+    scheduler.record_execution_step(70, 1, Duration::from_micros(89_750));
     assert_eq!(scheduler.slo_snapshot().unwrap().adapted_prefill_steps, 1);
     let stable = scheduler.create_iteration_batch(hint()).unwrap();
     assert_eq!(stable.resource_requirements.gpu_memory, 71 * 16);
@@ -76,14 +80,23 @@ fn slo_cold_start_and_tpot_credit_preserve_budget_under_mixed_overhead() {
     let targets = scheduler.config.slo.unwrap();
     let mut controller = scheduler.slo_controller.as_ref().unwrap().lock();
     // Accumulated TPOT allowance permits a wave longer than one 100 ms TPOT,
-    // while the 120 ms ITL remains a per-wave ceiling: 0.9 * 120 - 20 = 88.
+    // while 120 ms ITL remains a per-wave ceiling: floor(108 - 19.75) = 88.
     assert_eq!(controller.budget(targets, 1, 256, Some(200.0)), Some(88));
     assert_eq!(controller.snapshot().budget_target_ms, Some(120.0));
     for tokens in [8, 2, 1] {
-        controller.record(targets, tokens, 1, Duration::from_millis(160));
-        assert_eq!(controller.prefill_ms_per_token(), Some(1.0));
+        controller.record(
+            targets,
+            tokens,
+            1,
+            Duration::from_micros(19_750 + tokens as u64 * 1000),
+        );
+        // Small mixed waves retain fixed overhead in a, not in c/token.
+        assert!((controller.prefill_ms_per_token().unwrap() - 1.0).abs() < 1e-8);
         assert_eq!(controller.budget(targets, 1, 256, Some(200.0)), Some(88));
     }
+    let model = controller.snapshot();
+    assert!((model.fixed_step_ms.unwrap() - 10.25).abs() < 1e-8);
+    assert!((model.decode_ms_per_sequence.unwrap() - 9.5).abs() < 1e-8);
 }
 
 #[test]
@@ -120,18 +133,11 @@ fn slo_decode_overload_keeps_prefill_progress_and_no_progress_does_not_train() {
     let scheduler = scheduler(None);
     activate_decode_requests(&scheduler, 1);
     waiting(&scheduler, 100);
-    train(&scheduler);
-    // At the strict target boundary, protect the wider 120 ms target instead:
-    // 0.9 * 120 - 100 = 8 prefill tokens, without claiming the strict SLO fits.
-    scheduler.record_execution_step(0, 1, Duration::from_millis(100));
-    let wider = scheduler.create_iteration_batch(hint()).unwrap();
-    assert_eq!(wider.resource_requirements.gpu_memory, 9 * 16);
-    let degraded = scheduler.slo_snapshot().unwrap();
-    assert!(degraded.decode_target_infeasible);
-    assert_eq!(degraded.budget_target_ms, Some(120.0));
-    assert_eq!(degraded.prefill_budget_tokens, Some(8));
-    // No headroom remains even for the wider target; retain static progress.
-    scheduler.record_execution_step(0, 1, Duration::from_millis(150));
+    scheduler.record_execution_step(100, 0, Duration::from_micros(110_250));
+    scheduler.record_execution_step(50, 0, Duration::from_micros(60_250));
+    scheduler.record_execution_step(0, 1, Duration::from_millis(101));
+    // Pure decode violates strict TPOT even though the wider ITL still fits.
+    // Keep static prefill progress instead of switching to the wider target.
     let batch = scheduler.create_iteration_batch(hint()).unwrap();
     assert_eq!(batch.resource_requirements.gpu_memory, 101 * 16);
     let before = scheduler.slo_snapshot().unwrap();
