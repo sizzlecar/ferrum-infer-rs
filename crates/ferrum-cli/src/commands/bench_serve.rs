@@ -18,6 +18,7 @@
 
 use clap::{Args, ValueEnum};
 use colored::*;
+use ferrum_bench_core::client_slo::{ClientSloConfig, ClientSloReport, ClientSloStatus};
 use ferrum_bench_core::env::HttpRequestSampling;
 use ferrum_bench_core::{
     arrivals::poisson_arrival_times, compute_metrics, BenchReport, BenchmarkPhase,
@@ -42,9 +43,11 @@ use crate::config::CliConfig;
 
 mod decode_isolation;
 mod sampling;
+mod sharegpt;
 
 use decode_isolation::{BenchServeWorkload, DecodeIsolationArgs};
 use sampling::BenchSamplingArgs;
+use sharegpt::ShareGptArgs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BenchTargetBackend {
@@ -136,7 +139,7 @@ pub struct BenchServeCommand {
     pub request_rate: Option<f64>,
 
     // ─── Dataset ───────────────────────────────────────────────────
-    /// Dataset: `random` (tokenizer-aware), `sharegpt` (load from JSONL),
+    /// Dataset: `random` (tokenizer-aware), `sharegpt` (JSON array or JSONL),
     /// `shared-prefix` (1024-tok shared prefix + unique suffix).
     /// PLAYBOOK § 2 Scenario A (sharegpt) / Scenario C (shared-prefix).
     #[arg(long, default_value = "random")]
@@ -146,7 +149,7 @@ pub struct BenchServeCommand {
     #[arg(long, default_value_t = 256)]
     pub random_input_len: usize,
 
-    /// Max output tokens per request.
+    /// Max output tokens for random/shared-prefix; ShareGPT uses reference-answer lengths.
     #[arg(long, default_value_t = 128)]
     pub random_output_len: usize,
 
@@ -164,12 +167,13 @@ pub struct BenchServeCommand {
     #[arg(long, value_name = "LEVEL")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
-    /// Path to a ShareGPT-format JSONL file (`--dataset sharegpt`, standard
-    /// workloads only).
-    /// Each line should be a `{"conversations": [{"from": "...", "value":
-    /// "..."}, ...]}` object (HF anon8231489123/ShareGPT_Vicuna format).
+    /// ShareGPT JSON array or JSONL, selecting each record's first human/gpt pair.
+    /// Prompts are filtered without truncation; --seed is required.
     #[arg(long)]
     pub sharegpt_path: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub sharegpt: ShareGptArgs,
 
     /// Shared prefix length in *tokens* (`--dataset shared-prefix`, standard
     /// workloads only).
@@ -203,6 +207,15 @@ pub struct BenchServeCommand {
     /// are set.
     #[arg(long, value_parser = parse_slo)]
     pub goodput: Option<Slo>,
+
+    /// Client-visible P99 limits in ms: ttft:200,tpot:15,itl:50.
+    /// TPOT ends at last visible text; ITL pools nonempty SSE text-event gaps.
+    #[arg(long)]
+    pub latency_slo: Option<ClientSloConfig>,
+
+    /// Exit nonzero after writing reports if any repeat fails or lacks SLO evidence.
+    #[arg(long, requires = "latency_slo")]
+    pub latency_slo_fail_on_violation: bool,
 
     /// Per-request HTTP timeout in seconds.
     #[arg(long, default_value_t = 600.0)]
@@ -332,6 +345,7 @@ struct PromptCase {
     text: String,
     input_tokens: u32,
     sha256: String,
+    output_budget: Option<usize>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -401,7 +415,9 @@ async fn stream_one_observed(
         text,
         input_tokens,
         sha256: prompt_sha256,
+        output_budget,
     } = prompt;
+    let max_tokens = output_budget.unwrap_or(max_tokens);
     let body = chat_completion_body(
         model,
         &text,
@@ -421,6 +437,7 @@ async fn stream_one_observed(
     state.expected_completion_tokens = ignore_eos
         .then(|| u32::try_from(max_tokens).expect("validated output token limit fits u32"));
 
+    state.maximum_completion_tokens = output_budget.map(|tokens| tokens as u32);
     let resp = match client
         .post(format!("{}/v1/chat/completions", base_url))
         .header(BENCHMARK_RUN_ID_HEADER, &correlation.benchmark_run_id)
@@ -469,6 +486,9 @@ async fn stream_one_observed(
             clipped_debug_text(&txt, 200)
         );
         let mut quality_issues = QualityIssueCounts::default();
+        if matches!(status.as_u16(), 429 | 503) {
+            quality_issues.http_rejected = 1;
+        }
         if status.as_u16() == 500 {
             quality_issues.http_500 = 1;
         }
@@ -725,6 +745,7 @@ struct StreamState {
     output_delta_events: u32,
     usage_completion_tokens: Option<u32>,
     expected_completion_tokens: Option<u32>,
+    maximum_completion_tokens: Option<u32>,
     itl_ms: Vec<f64>,
     transport_coalesced_output_chunks: u32,
     done_count: u32,
@@ -757,6 +778,7 @@ impl StreamState {
             output_delta_events: 0,
             usage_completion_tokens: None,
             expected_completion_tokens: None,
+            maximum_completion_tokens: None,
             itl_ms: Vec::new(),
             transport_coalesced_output_chunks: 0,
             done_count: 0,
@@ -806,6 +828,9 @@ impl StreamState {
             }
         }
         if let Some(choices) = chunk.choices {
+            if choices.len() > 1 {
+                return Err("benchmark requires a single completion choice".into());
+            }
             if let Some(first) = choices.into_iter().next() {
                 if let Some(delta) = first.delta {
                     if let Some(text) = first_non_empty_delta_text(&delta) {
@@ -873,6 +898,13 @@ impl StreamState {
         }
         if output_tokens == 0 {
             self.quality_issues.zero_output_tokens = 1;
+        }
+        if self.maximum_completion_tokens.is_some_and(|maximum| {
+            !self
+                .usage_completion_tokens
+                .is_some_and(|actual| actual > 0 && actual <= maximum)
+        }) {
+            self.quality_issues.malformed_stream = 1;
         }
         let e2e_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         let ttft_ms = self
@@ -1195,12 +1227,9 @@ fn build_prompts(
             cmd.shared_suffix_len,
             rng,
         ),
-        "sharegpt" => {
-            let p = cmd.sharegpt_path.as_ref().ok_or_else(|| {
-                ferrum_types::FerrumError::model("--dataset sharegpt requires --sharegpt-path PATH")
-            })?;
-            load_sharegpt_prompts(p, tok, count, rng)
-        }
+        "sharegpt" => Err(ferrum_types::FerrumError::internal(
+            "ShareGPT requires a prepared selection",
+        )),
         other => Err(ferrum_types::FerrumError::model(format!(
             "unknown --dataset '{}': allowed values are random, sharegpt, shared-prefix",
             other
@@ -1220,6 +1249,7 @@ fn prompt_case(tok: &tokenizers::Tokenizer, text: String) -> Result<PromptCase> 
         text,
         input_tokens,
         sha256,
+        output_budget: None,
     })
 }
 
@@ -1251,82 +1281,6 @@ fn gen_shared_prefix_prompts(
             prompt_case(tok, format!("{prefix}\n{suffix}"))
         })
         .collect()
-}
-
-/// Load up to `count` user-turn prompts from a ShareGPT-format JSONL.
-///
-/// Accepts either:
-///   - HF `anon8231489123/ShareGPT_Vicuna` format: each line is
-///     `{"id": "...", "conversations": [{"from": "human"/"gpt", "value": "..."}]}`
-///   - vLLM-style: `{"input": "..."}` per line
-///
-/// Picks the first `human` turn per conversation (matches vLLM's
-/// benchmark_serving.py heuristic). If `count` < records available,
-/// randomly samples; if `count` > available, cycles with replacement.
-fn load_sharegpt_prompts(
-    path: &std::path::Path,
-    tok: &tokenizers::Tokenizer,
-    count: usize,
-    rng: &mut (impl Rng + ?Sized),
-) -> Result<Vec<PromptCase>> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(path).map_err(|e| {
-        ferrum_types::FerrumError::model(format!("open sharegpt {}: {e}", path.display()))
-    })?;
-    let mut prompts: Vec<String> = Vec::new();
-    for (idx, line) in std::io::BufReader::new(f).lines().enumerate() {
-        let line = line.map_err(|e| {
-            ferrum_types::FerrumError::model(format!("read line {idx} of {}: {e}", path.display()))
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[warn] sharegpt line {idx}: skip (parse error: {e})");
-                continue;
-            }
-        };
-        // Try ShareGPT-Vicuna format first.
-        let prompt: Option<String> = v
-            .get("conversations")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|t| t.get("from").and_then(|f| f.as_str()) == Some("human"))
-                    .and_then(|t| {
-                        t.get("value")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string())
-                    })
-            })
-            // Fallback: simple {"input": "..."} format.
-            .or_else(|| {
-                v.get("input")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-            });
-        if let Some(p) = prompt {
-            if !p.is_empty() {
-                prompts.push(p);
-            }
-        }
-    }
-    if prompts.is_empty() {
-        return Err(ferrum_types::FerrumError::model(format!(
-            "sharegpt {}: no usable prompts found",
-            path.display()
-        )));
-    }
-    // Sample `count` with replacement (cycles deterministically for the
-    // given seed via rng).
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        let idx = rng.random_range(0..prompts.len());
-        out.push(prompt_case(tok, prompts[idx].clone())?);
-    }
-    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1693,6 +1647,7 @@ async fn execute_cell(
     ctx: &RunContext,
     cell: Cell,
     cell_id: &str,
+    prepared_sharegpt: Option<&[sharegpt::PreparedRepeat]>,
 ) -> Result<BenchReport> {
     // A neutral HTTP client can measure a different backend, so canonical
     // collectors supply the target explicitly. Direct product invocations keep
@@ -1727,6 +1682,7 @@ async fn execute_cell(
     let total_prompts = usize::try_from(total_prompts_u32)
         .map_err(|_| ferrum_types::FerrumError::model("prompt count exceeds platform capacity"))?;
 
+    let mut dataset_evidence = None;
     let mut runs: Vec<RunRecord> = Vec::with_capacity(cmd.n_repeats as usize);
     let mut actual_input_lengths: Vec<u32> = Vec::new();
     let mut actual_input_tokens_per_request: Vec<Vec<u32>> =
@@ -1742,7 +1698,15 @@ async fn execute_cell(
             thread_rng = rand::rng();
             &mut thread_rng
         };
-        let prompts = build_prompts(cmd, &tok, rng, total_prompts)?;
+        let prompts = if cmd.dataset == "sharegpt" {
+            let prepared = prepared_sharegpt
+                .and_then(|repeats| repeats.get(repeat_idx as usize))
+                .ok_or_else(|| ferrum_types::FerrumError::internal("missing ShareGPT selection"))?;
+            sharegpt::append_evidence(&mut dataset_evidence, prepared.evidence.clone())?;
+            prepared.prompts.clone()
+        } else {
+            build_prompts(cmd, &tok, rng, total_prompts)?
+        };
         let measured_input_lengths: Vec<u32> = prompts
             .iter()
             .skip(cmd.warmup_requests as usize)
@@ -1788,9 +1752,13 @@ async fn execute_cell(
         runs.push(run);
     }
     let requested_input_len = requested_input_len(cmd)?;
-    let requested_output_len = u32::try_from(cmd.random_output_len).map_err(|_| {
-        ferrum_types::FerrumError::model("random output length exceeds report capacity")
-    })?;
+    let requested_output_len = if cmd.dataset == "sharegpt" {
+        cmd.sharegpt.sharegpt_fixed_output_tokens.unwrap_or(0)
+    } else {
+        u32::try_from(cmd.random_output_len).map_err(|_| {
+            ferrum_types::FerrumError::model("random output length exceeds report capacity")
+        })?
+    };
     let actual_input_tokens = input_token_stats(&actual_input_lengths, requested_input_len);
     let token_count_source = output_token_count_source_from_runs(&runs);
 
@@ -1806,6 +1774,11 @@ async fn execute_cell(
         Cell::Open(r) => (Scenario::OpenLoop, None, Some(r)),
     };
 
+    let client_slo = cmd
+        .latency_slo
+        .map(|config| ClientSloReport::evaluate(config, &runs))
+        .transpose()
+        .map_err(ferrum_types::FerrumError::model)?;
     let mut report = compute_metrics(
         model_field,
         backend.to_string(),
@@ -1819,6 +1792,8 @@ async fn execute_cell(
         runs,
         env,
     );
+    report.dataset_evidence = dataset_evidence;
+    report.client_slo = client_slo;
     report.actual_input_tokens = Some(actual_input_tokens);
     report.actual_input_tokens_per_request = Some(actual_input_tokens_per_request);
     report.output_token_count_source = Some(token_count_source);
@@ -1827,6 +1802,7 @@ async fn execute_cell(
 
 fn requested_input_len(cmd: &BenchServeCommand) -> Result<u32> {
     match cmd.dataset.as_str() {
+        "sharegpt" => Ok(0),
         "shared-prefix" => cmd
             .shared_prefix_len
             .checked_add(cmd.shared_suffix_len)
@@ -1904,6 +1880,7 @@ fn benchmark_cell_id(index: usize, cell: Cell) -> String {
 
 pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
+    let prepared_sharegpt = sharegpt::prepare(&cmd)?;
     let banner = if cmd.scenario == BenchServeWorkload::DecodeIsolation {
         format!(
             "ferrum bench-serve — scenario=decode-isolation dataset=random warmup={} n_repeats={} fixed_output=true",
@@ -1967,7 +1944,7 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     for (cell_index, cell) in cells.into_iter().enumerate() {
         eprintln!("{}", format!("→ {}", cell_label(cell)).bold());
         let cell_id = benchmark_cell_id(cell_index, cell);
-        let r = execute_cell(&cmd, &ctx, cell, &cell_id).await?;
+        let r = execute_cell(&cmd, &ctx, cell, &cell_id, prepared_sharegpt.as_deref()).await?;
         emit_summary_line(&r);
         reports.push(r);
     }
@@ -1983,7 +1960,20 @@ fn emit_then_enforce_error_policy(cmd: &BenchServeCommand, reports: &[BenchRepor
     // PLAYBOOK § 1.5: static globals don't drop on Rust process exit.
     ferrum_bench_core::trace::flush_global_trace();
 
-    enforce_error_policy(cmd, reports)
+    enforce_error_policy(cmd, reports)?;
+    if cmd.latency_slo_fail_on_violation
+        && reports.iter().any(|report| {
+            report
+                .client_slo
+                .as_ref()
+                .is_none_or(|slo| slo.status != ClientSloStatus::Pass)
+        })
+    {
+        return Err(ferrum_types::FerrumError::model(
+            "client latency SLO failed or has incomplete evidence; reports were written",
+        ));
+    }
+    Ok(())
 }
 
 fn emit_reports(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
@@ -2002,6 +1992,21 @@ fn emit_reports(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> 
 
 fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
     cmd.sampling.request_sampling().validate()?;
+    if let Some(config) = cmd.latency_slo {
+        config
+            .validate()
+            .map_err(ferrum_types::FerrumError::model)?;
+        if cmd.scenario != BenchServeWorkload::Standard {
+            return Err(ferrum_types::FerrumError::model(
+                "--latency-slo requires --scenario standard",
+            ));
+        }
+    }
+    if cmd.latency_slo_fail_on_violation && cmd.latency_slo.is_none() {
+        return Err(ferrum_types::FerrumError::model(
+            "--latency-slo-fail-on-violation requires --latency-slo",
+        ));
+    }
     if cmd.scenario == BenchServeWorkload::DecodeIsolation {
         if cmd.dataset != "random" {
             return Err(ferrum_types::FerrumError::model(
@@ -2032,6 +2037,7 @@ fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
             ));
         }
     }
+    sharegpt::validate(cmd)?;
     if cmd.scenario == BenchServeWorkload::DecodeIsolation
         && (cmd.request_rate.is_some() || !cmd.concurrency_sweep.is_empty())
     {
@@ -2233,11 +2239,29 @@ fn emit_summary_line(r: &BenchReport) {
     };
     eprintln!("    {} {}{}", "summary".bold(), scenario_str, ci);
     fmt_metric("TTFT_ms ", &r.ttft_ms, r.n_repeats);
-    fmt_metric("TPOT_ms ", &r.tpot_ms, r.n_repeats);
+    fmt_metric("TPOT (terminal, legacy) ms", &r.tpot_ms, r.n_repeats);
+    if let Some(metric) = &r.sse_text_event_gap_ms {
+        fmt_metric("ITL (visible SSE text events) ms", metric, r.n_repeats);
+    }
+    if let Some(slo) = &r.client_slo {
+        eprintln!("      Client latency SLO: {:?} (each repeat)", slo.status);
+        for repeat in &slo.repeats {
+            eprintln!(
+                "      repeat {}: {:?}, last-visible TPOT P50/P99={:?}, errors={}, rejected={}",
+                repeat.repeat,
+                repeat.status,
+                repeat
+                    .last_visible_tpot_ms
+                    .map(|metric| (metric.p50, metric.p99)),
+                repeat.errors,
+                repeat.rejected_requests
+            );
+        }
+    }
     if r.has_complete_itl_evidence() {
-        fmt_metric("ITL_ms  ", &r.itl_ms, r.n_repeats);
+        fmt_metric("ITL (strict token diagnostic) ms", &r.itl_ms, r.n_repeats);
     } else {
-        eprintln!("      ITL_ms   unavailable");
+        eprintln!("      ITL (strict token diagnostic) unavailable");
     }
     let thr = &r.output_throughput_tps;
     let good = &r.goodput_rps;
@@ -2942,12 +2966,15 @@ mod tests {
             enable_thinking: None,
             reasoning_effort: None,
             sharegpt_path: None,
+            sharegpt: ShareGptArgs::default(),
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
             num_prompts: 1,
             warmup_requests: 0,
             n_repeats: 1,
             goodput: None,
+            latency_slo: None,
+            latency_slo_fail_on_violation: false,
             timeout: 1.0,
             fail_on_error: false,
             max_error_rate: None,
@@ -3173,12 +3200,15 @@ mod tests {
             enable_thinking: None,
             reasoning_effort: None,
             sharegpt_path: None,
+            sharegpt: ShareGptArgs::default(),
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
             num_prompts: 2,
             warmup_requests: 0,
             n_repeats: 1,
             goodput: None,
+            latency_slo: None,
+            latency_slo_fail_on_violation: false,
             timeout: 1.0,
             fail_on_error: true,
             max_error_rate: None,
@@ -3267,12 +3297,15 @@ mod tests {
             enable_thinking: None,
             reasoning_effort: None,
             sharegpt_path: None,
+            sharegpt: ShareGptArgs::default(),
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
             num_prompts: 1,
             warmup_requests: 1,
             n_repeats: 1,
             goodput: None,
+            latency_slo: None,
+            latency_slo_fail_on_violation: false,
             timeout: 1.0,
             fail_on_error: true,
             max_error_rate: None,

@@ -23,12 +23,15 @@
 //! - CI95 fields are suppressed when `n_repeats < 3` (degenerate).
 
 pub mod arrivals;
+pub mod client_slo;
+pub mod dataset;
 pub mod decode_isolation;
 pub mod env;
 pub mod jsonl_journal;
 pub mod profile;
 pub mod release_regression;
 pub mod report;
+pub mod sse_text_event_gap;
 pub mod stats;
 pub mod trace;
 
@@ -164,12 +167,15 @@ fn validate_benchmark_correlation_id(field: &str, value: &str) -> Result<(), Str
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRequestRecord {
     #[serde(flatten)]
     pub correlation: BenchmarkRequestCorrelation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_request_id: Option<String>,
+    /// Raw client observations. Older reports omit this evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<client_slo::RequestTiming>,
 }
 
 /// Locked enum of bench scenarios shared by all benchmark producers.
@@ -263,6 +269,12 @@ pub struct BenchReport {
 
     pub n_prompt: u32,
     pub n_gen: u32,
+    /// Pinned dataset selection, independent of the concurrency cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_evidence: Option<dataset::ShareGptDatasetEvidence>,
+    /// Per-repeat visible-text latency evaluation; independent of legacy goodput.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_slo: Option<client_slo::ClientSloReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_input_tokens: Option<TokenLengthStats>,
     /// Client-tokenized prompt content, before the server applies its template.
@@ -304,6 +316,10 @@ pub struct BenchReport {
     pub ttft_ms: MetricSet,
     pub tpot_ms: MetricSet,
     pub itl_ms: MetricSet,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_ms: Option<MetricSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_evidence: Option<sse_text_event_gap::SseTextEventGapEvidence>,
     pub e2e_ms: MetricSet,
 
     pub output_throughput_tps: ScalarStats,
@@ -394,6 +410,9 @@ pub struct QualityIssueCounts {
     pub zero_output_tokens: u32,
     pub stream_bulk_flush: u32,
     pub http_500: u32,
+    /// HTTP admission rejections (429 or 503), also counted as failed requests.
+    #[serde(default)]
+    pub http_rejected: u32,
     pub panic: u32,
 }
 
@@ -443,6 +462,10 @@ pub struct BenchRepeatMetrics {
     pub ttft_ms: RepeatPercentiles,
     pub tpot_ms: RepeatPercentiles,
     pub itl_ms: RepeatPercentiles,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_ms: Option<RepeatPercentiles>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_evidence: Option<sse_text_event_gap::SseTextEventGapEvidence>,
     pub e2e_ms: RepeatPercentiles,
     pub output_throughput_tps: f64,
     pub total_throughput_tps: f64,
@@ -635,6 +658,10 @@ impl QualityIssueCounts {
             .http_500
             .checked_add(other.http_500)
             .expect("quality http_500 count overflow");
+        self.http_rejected = self
+            .http_rejected
+            .checked_add(other.http_rejected)
+            .expect("quality http_rejected count overflow");
         self.panic = self
             .panic
             .checked_add(other.panic)
@@ -649,6 +676,7 @@ impl QualityIssueCounts {
             self.duplicate_done,
             self.zero_output_tokens,
             self.http_500,
+            self.http_rejected,
             self.panic,
         ]
         .into_iter()
@@ -803,6 +831,8 @@ fn aggregate_itl_evidence(records: &[RequestRecord]) -> (ItlEligibilityCounts, u
 }
 
 fn build_repeat_metrics(run: &RunRecord, repeat: u32, slo: &Slo) -> BenchRepeatMetrics {
+    let (sse_text_event_gap_ms, sse_text_event_gap_evidence) =
+        sse_text_event_gap::summarize_requests(&run.records);
     let success: Vec<&RequestRecord> = run.records.iter().filter(|record| record.success).collect();
     let (
         itl_eligibility_counts,
@@ -888,6 +918,8 @@ fn build_repeat_metrics(run: &RunRecord, repeat: u32, slo: &Slo) -> BenchRepeatM
         ttft_ms: repeat_percentiles(&ttft),
         tpot_ms: repeat_percentiles(&tpot),
         itl_ms: repeat_percentiles(&itl),
+        sse_text_event_gap_ms,
+        sse_text_event_gap_evidence,
         e2e_ms: repeat_percentiles(&e2e),
         output_throughput_tps,
         total_throughput_tps,
@@ -1055,6 +1087,8 @@ pub fn compute_metrics(
         })
         .collect();
 
+    let (sse_text_event_gap_ms, sse_text_event_gap_evidence) =
+        sse_text_event_gap::summarize_repeats(&repeat_metrics);
     let values = |field: fn(&BenchRepeatMetrics) -> f64| {
         repeat_metrics.iter().map(field).collect::<Vec<_>>()
     };
@@ -1182,6 +1216,7 @@ pub fn compute_metrics(
                             .clone()
                             .expect("correlation presence checked above"),
                         server_request_id: record.server_request_id.clone(),
+                        timing: Some(client_slo::RequestTiming::from_record(record)),
                     })
                     .collect::<Vec<_>>()
             })
@@ -1213,6 +1248,8 @@ pub fn compute_metrics(
         request_rate,
         n_prompt,
         n_gen,
+        dataset_evidence: None,
+        client_slo: None,
         actual_input_tokens: None,
         actual_input_tokens_per_request: None,
         server_input_tokens_per_request: Some(
@@ -1253,6 +1290,8 @@ pub fn compute_metrics(
             p95: checked_scalar_stats(&itl_p95, "ITL p95"),
             p99: checked_scalar_stats(&itl_p99, "ITL p99"),
         },
+        sse_text_event_gap_ms,
+        sse_text_event_gap_evidence,
         e2e_ms: MetricSet {
             p50: checked_scalar_stats(&e2e_p50, "E2E p50"),
             p75: checked_scalar_stats(&e2e_p75, "E2E p75"),
@@ -1895,6 +1934,7 @@ mod tests {
             zero_output_tokens: u32::MAX,
             stream_bulk_flush: u32::MAX,
             http_500: u32::MAX,
+            http_rejected: u32::MAX,
             panic: u32::MAX,
         };
         assert_eq!(issues.request_error_count(), u32::MAX);

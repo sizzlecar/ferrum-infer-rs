@@ -991,6 +991,7 @@ mod tests {
 
     fn prepared(warmups: usize) -> PreparedRun {
         let prompt = || PromptCase {
+            output_budget: None,
             text: "test prompt".to_string(),
             input_tokens: 8,
             sha256: "test".to_string(),
