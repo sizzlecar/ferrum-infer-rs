@@ -235,6 +235,9 @@ pub fn write_synthetic_product_observability(
     config: &ProductObservabilityConfig,
 ) -> Result<Vec<PathBuf>> {
     config.validate()?;
+    if config.metrics_only() {
+        return Ok(Vec::new());
+    }
     let request_id = format!(
         "product-obs-{}-{}",
         entrypoint_label(config.entrypoint),
@@ -284,6 +287,9 @@ pub fn write_actual_run_observability(
         return Ok(Vec::new());
     }
     config.validate()?;
+    if config.metrics_only() {
+        return Ok(Vec::new());
+    }
     if let Some(timing) = observation
         .execution_evidence
         .as_ref()
@@ -306,6 +312,9 @@ pub fn write_actual_run_failure_observability(
         return Ok(Vec::new());
     }
     config.validate()?;
+    if config.metrics_only() {
+        return Ok(Vec::new());
+    }
     let replay_command = replay_command(config);
     let events = actual_run_failure_events(config, observation, &replay_command);
     write_actual_run_failure_artifacts(config, &events, observation, &replay_command)
@@ -321,6 +330,9 @@ pub fn write_actual_serve_startup_observability(
         return Ok(Vec::new());
     }
     config.validate()?;
+    if config.metrics_only() {
+        return Ok(Vec::new());
+    }
     let request_id = format!("serve-startup-{}", Uuid::new_v4().simple());
     let replay_command = replay_command(config);
     let events = actual_serve_startup_events(
@@ -342,6 +354,9 @@ pub fn append_actual_serve_memory_stage_observability(
         return Ok(Vec::new());
     }
     config.validate()?;
+    if config.metrics_only() {
+        return Ok(Vec::new());
+    }
     let request_id = format!("serve-memory-{}", Uuid::new_v4().simple());
     let events = actual_memory_stage_events(config, &request_id, &[stage], Utc::now());
     write_profile_outputs(
@@ -1935,6 +1950,54 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basic_metrics_only_product_writers_skip_artifacts_and_keep_validation() {
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            let mut config = ProductObservabilityConfig::new(
+                entrypoint,
+                "model",
+                None,
+                ProfileDetailArg::Basic,
+                None,
+                None,
+                None,
+                default_profile_sample_rate(),
+            );
+            assert!(
+                write_actual_serve_startup_observability(&config, 1, None, Vec::new())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(append_actual_serve_memory_stage_observability(
+                &config,
+                ActualMemoryStageObservation::new("shutdown", "shutdown", None, None),
+            )
+            .unwrap()
+            .is_empty());
+            let failure = ActualRunFailureObservation {
+                request_id: "failed-request".to_owned(),
+                duration_us: 1,
+                sampling_params: SamplingParams::greedy(),
+                prompt_token_ids: None,
+                prompt_token_count: None,
+                prompt_chars: 0,
+                failure_kind: "test".to_owned(),
+                error_kind: "test".to_owned(),
+                error_message: "test".to_owned(),
+                memory: None,
+                memory_stages: Vec::new(),
+            };
+            assert!(write_actual_run_failure_observability(&config, &failure)
+                .unwrap()
+                .is_empty());
+            config.core.profile_sample_rate = f64::NAN;
+            assert!(write_actual_run_failure_observability(&config, &failure).is_err());
+            assert!(
+                write_actual_serve_startup_observability(&config, 1, None, Vec::new()).is_err()
+            );
+        }
+    }
 
     #[test]
     fn engine_cache_observation_does_not_report_static_weights_as_kv() {

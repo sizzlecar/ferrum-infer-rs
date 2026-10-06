@@ -24,6 +24,13 @@ struct ScratchLayout {
 }
 
 impl ScratchLayout {
+    fn packed_rows(self, tokens: u64) -> Option<u32> {
+        // The linear grid bounds rows, while SiLU and gate/up indexing use i32.
+        // Keep larger, otherwise valid participant batches on the existing path.
+        native_matrix::single_launch_rows(tokens)
+            .filter(|_| self.gate_up_bytes / 2 <= i32::MAX as u64)
+    }
+
     fn new(tokens: u64, intermediate: u64) -> Result<Self, String> {
         let activation_elements = tokens
             .checked_mul(intermediate)
@@ -112,6 +119,10 @@ pub(super) fn encode(
     if invocation.participant_token_ranges().len() != invocation.participants().len() {
         return Err("CUDA native SwiGLU participant ranges are incomplete".into());
     }
+    let packed_rows = scratch_layout
+        .packed_rows(tokens)
+        .filter(|_| input_packed && output_packed);
+    key = key.boolean(packed_rows.is_some());
     let mut launches = Vec::new();
     for (participant, range) in invocation
         .participants()
@@ -141,6 +152,9 @@ pub(super) fn encode(
         let source = range.source_token_range();
         if packed.end > tokens {
             return Err("native SwiGLU packed span exceeds scratch".into());
+        }
+        if packed_rows.is_some() {
+            continue;
         }
         let input_index = regions.len();
         regions.push(contiguous_token_region(
@@ -173,7 +187,30 @@ pub(super) fn encode(
             .u32(count)
             .u64(packed.start);
     }
-    let participants = checked_u32(launches.len() as u64, "native SwiGLU participants")?;
+    if let Some(rows) = packed_rows {
+        let input = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            tokens,
+        )?);
+        let output = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            tokens,
+        )?);
+        launches.push((input, output, rows, 0));
+        key = key.u64(input as u64).u64(output as u64).u32(rows).u64(0);
+    }
+    let participants = checked_u32(
+        invocation.participants().len() as u64,
+        "native SwiGLU participants",
+    )?;
     let dispatches = (launches.len() as u64)
         .checked_mul(weights::dispatches(&gate_up) + weights::dispatches(&down) + 1)
         .ok_or("native SwiGLU dispatch count overflows")?;
@@ -246,7 +283,13 @@ pub(super) fn encode(
     )
     .and_then(|command| {
         command.with_work_attribution(
-            DeviceBatchingForm::ParticipantLoop,
+            if participants == 1 {
+                DeviceBatchingForm::Scalar
+            } else if packed_rows.is_some() {
+                DeviceBatchingForm::Packed
+            } else {
+                DeviceBatchingForm::ParticipantLoop
+            },
             participants,
             tokens,
             dispatches,

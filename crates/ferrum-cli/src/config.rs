@@ -18,6 +18,9 @@ pub struct CliConfig {
     #[serde(default)]
     pub numerical_execution: ferrum_types::NumericalExecutionPolicy,
 
+    /// Shared run/serve scheduler policy; explicit CLI selection takes precedence.
+    pub scheduler: SchedulerCliConfig,
+
     /// Server configuration
     pub server: ServerCliConfig,
 
@@ -36,6 +39,13 @@ pub struct CliConfig {
     /// Runtime overrides loaded from the CLI config file.
     #[serde(default)]
     pub runtime: RuntimeCliConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SchedulerCliConfig {
+    /// Optional latency targets for adaptive scheduling, in milliseconds.
+    pub slo: Option<ferrum_types::SchedulerSloConfig>,
 }
 
 /// Server CLI configuration
@@ -231,6 +241,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub max_batched_tokens: Option<usize>,
 
+    /// Native plan-runtime prefill/decode policy (`FERRUM_PREFILL_DECODE_EXECUTION`).
+    /// Legacy executors retain their existing execution policy.
+    #[serde(default)]
+    pub prefill_decode_execution: Option<ferrum_types::PrefillDecodeExecution>,
+
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -243,6 +258,11 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`.
     #[serde(default)]
     pub scheduler_active_decode_prefill_chunk: Option<usize>,
+
+    /// Total prefill tokens per scheduler iteration with active decode,
+    /// equivalent to `FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET`. Zero disables it.
+    #[serde(default)]
+    pub scheduler_active_decode_prefill_token_budget: Option<usize>,
 
     /// Prefix-state cache override, equivalent to `FERRUM_PREFIX_CACHE`.
     /// When absent, serve requests native caching and run leaves it disabled.
@@ -454,6 +474,12 @@ impl RuntimeCliConfig {
             "FERRUM_MAX_BATCHED_TOKENS",
             self.max_batched_tokens,
         );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_PREFILL_DECODE_EXECUTION",
+            self.prefill_decode_execution
+                .map(ferrum_types::PrefillDecodeExecution::as_runtime_value),
+        );
         push_usize_entry(
             &mut entries,
             "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
@@ -463,6 +489,11 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
             self.scheduler_active_decode_prefill_chunk,
+        );
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+            self.scheduler_active_decode_prefill_token_budget,
         );
         push_bool_entry(&mut entries, "FERRUM_PREFIX_CACHE", self.prefix_cache);
         push_string_entry(
@@ -666,6 +697,17 @@ fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
 }
 
 impl CliConfig {
+    pub fn resolve_scheduler_slo(
+        &self,
+        cli: Option<ferrum_types::SchedulerSloConfig>,
+    ) -> Result<Option<ferrum_types::SchedulerSloConfig>> {
+        let slo = cli.or(self.scheduler.slo);
+        if let Some(slo) = slo {
+            slo.validate().map_err(ferrum_types::FerrumError::config)?;
+        }
+        Ok(slo)
+    }
+
     pub fn resolve_numerical_execution(
         &self,
         cli: Option<&ferrum_types::NumericalExecutionPolicy>,
@@ -704,6 +746,7 @@ impl CliConfig {
 
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
+        self.resolve_scheduler_slo(None)?;
         // Validate server config
         if self.server.port == 0 {
             return Err(ferrum_types::FerrumError::configuration(
@@ -876,6 +919,55 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_slo_is_shared_by_run_serve_and_cli_overrides_config() {
+        let config: CliConfig =
+            toml::from_str("[scheduler.slo]\nttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\n").unwrap();
+        let configured = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        assert_eq!(
+            config.resolve_scheduler_slo(None).unwrap(),
+            Some(configured)
+        );
+        assert_eq!(
+            CliConfig::default().resolve_scheduler_slo(None).unwrap(),
+            None
+        );
+        for entrypoint in ["run", "serve"] {
+            let selected = "ttft:300,tpot:20,itl:60";
+            let cli = NumericalCli::try_parse_from([
+                "ferrum",
+                entrypoint,
+                "fixture",
+                "--scheduler-slo",
+                selected,
+            ])
+            .unwrap();
+            let targets = match cli.command {
+                NumericalCommand::Run(command) => command.scheduler_slo,
+                NumericalCommand::Serve(command) => command.scheduler_slo,
+                NumericalCommand::Bench(_) => unreachable!(),
+            };
+            assert_eq!(
+                config.resolve_scheduler_slo(targets).unwrap(),
+                Some(selected.parse().unwrap())
+            );
+            assert!(NumericalCli::try_parse_from([
+                "ferrum",
+                entrypoint,
+                "fixture",
+                "--scheduler-slo",
+                "ttft:0,tpot:15,itl:50",
+            ])
+            .is_err());
+        }
+        for invalid in ["0", "-1", "nan", "inf"] {
+            assert!(toml::from_str::<CliConfig>(&format!(
+                "[scheduler.slo]\nttft_ms = 200\ntpot_ms = 15\nitl_ms = {invalid}\n"
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
     fn numerical_cli_selection_overrides_config_in_every_model_entrypoint() {
         let configured = "qwen3_5.f32-master".parse().unwrap();
         let config = CliConfig {
@@ -1011,9 +1103,11 @@ mod tests {
             recurrent_state_max_slots: Some(16),
             attention_policy: Some(AttentionExecutionPolicy::NativeAdaptive),
             max_batched_tokens: Some(2048),
+            prefill_decode_execution: Some(ferrum_types::PrefillDecodeExecution::Mixed),
             scheduler_prefill_first_until_active: Some(16),
             prefix_rendezvous_max_wait_ms: std::num::NonZeroU64::new(321),
             scheduler_active_decode_prefill_chunk: Some(24),
+            scheduler_active_decode_prefill_token_budget: Some(96),
             prefix_cache: Some(false),
             layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
@@ -1117,6 +1211,10 @@ mod tests {
             .contains(&RuntimeConfigEffect::Performance));
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(
+            entry("FERRUM_PREFILL_DECODE_EXECUTION").effective_value,
+            "mixed"
+        );
+        assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "16"
         );
@@ -1124,6 +1222,13 @@ mod tests {
             entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
             "24"
         );
+        assert_eq!(
+            entry("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET").effective_value,
+            "96"
+        );
+        assert!(entry("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET")
+            .affects
+            .contains(&RuntimeConfigEffect::Performance));
         assert_eq!(
             entry("FERRUM_LAYER_SPLIT_PIPELINE_MODE").effective_value,
             "batch"

@@ -26,12 +26,13 @@ use ferrum_interfaces::model_executor::{
     ExecutorRequestOrigin, ExecutorRequestStateDeferral, ExecutorSamplingOutput,
     ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, LogitsReturnPolicy,
     MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
-    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
-    PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
-    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreDeferral,
-    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
-    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary,
-    PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
+    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimeMixedBatchOutcome,
+    PlanRuntimePrefillAuthority, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
+    PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimePrefillProduct,
+    PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
+    PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PlanRuntimeResourceSnapshot,
+    PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease,
+    PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -59,8 +60,10 @@ use super::{
     vnext_timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
 };
 
+mod backing_maintenance;
 mod composition;
 mod determinism;
+mod mixed_batch;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
 mod request;
@@ -1436,9 +1439,11 @@ struct VNextExecutorMetrics {
     wave_timing: VNextWaveTimingMetrics,
     prefill_wave_timing: VNextWaveTimingMetrics,
     decode_wave_timing: VNextWaveTimingMetrics,
+    mixed_wave_timing: VNextWaveTimingMetrics,
     device_timing: VNextDeviceTimingMetrics,
     prefill_device_timing: VNextDeviceTimingMetrics,
     decode_device_timing: VNextDeviceTimingMetrics,
+    mixed_device_timing: VNextDeviceTimingMetrics,
     last_failure: Mutex<Option<String>>,
 }
 
@@ -1446,12 +1451,61 @@ struct VNextExecutorMetrics {
 enum VNextExecutionWaveKind {
     Prefill,
     Decode,
+    Mixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VNextProductOutputMode {
     FullLogits,
     GreedyToken,
+}
+
+/// Product consumption is distinct from the complete device plan. An
+/// intermediate prefill advances state without authorizing token sampling.
+#[derive(Debug, Clone)]
+enum VNextParticipantOutputRole {
+    IntermediatePrefill,
+    FinalPrefill,
+    Decode(LogitsReturnPolicy),
+}
+
+impl VNextParticipantOutputRole {
+    fn prefill(chunk: PrefillChunk) -> Self {
+        if chunk.is_final() {
+            Self::FinalPrefill
+        } else {
+            Self::IntermediatePrefill
+        }
+    }
+
+    fn logits_policy(&self) -> Option<&LogitsReturnPolicy> {
+        match self {
+            Self::Decode(policy) => Some(policy),
+            Self::IntermediatePrefill | Self::FinalPrefill => None,
+        }
+    }
+
+    fn matches_frontier(
+        &self,
+        kind: VNextExecutionWaveKind,
+        span: &TokenSpanWork,
+        token_count: usize,
+    ) -> bool {
+        let end = span.immediate_token_range().end;
+        match self {
+            Self::IntermediatePrefill => {
+                kind != VNextExecutionWaveKind::Decode && end < token_count as u64
+            }
+            Self::FinalPrefill => {
+                kind != VNextExecutionWaveKind::Decode && end == token_count as u64
+            }
+            Self::Decode(_) => {
+                kind != VNextExecutionWaveKind::Prefill
+                    && span.immediate_tokens() == 1
+                    && end == token_count as u64
+            }
+        }
+    }
 }
 
 impl VNextProductOutputMode {
@@ -1823,21 +1877,25 @@ impl VNextProductRepetitionInput<'_> {
     }
 }
 
-fn product_output_mode_for_policies<'a>(
+fn product_output_mode_for_roles<'a>(
     kind: VNextExecutionWaveKind,
-    policies: impl IntoIterator<Item = Option<&'a LogitsReturnPolicy>>,
+    roles: impl IntoIterator<Item = &'a VNextParticipantOutputRole>,
 ) -> VNextProductOutputMode {
-    if kind != VNextExecutionWaveKind::Decode {
+    if kind == VNextExecutionWaveKind::Prefill {
         return VNextProductOutputMode::FullLogits;
     }
-    let mut has_participant = false;
-    for policy in policies {
-        has_participant = true;
-        if !matches!(policy, Some(LogitsReturnPolicy::GreedyArgmax { .. })) {
-            return VNextProductOutputMode::FullLogits;
+    let mut has_decode = false;
+    for role in roles {
+        match role {
+            VNextParticipantOutputRole::IntermediatePrefill
+                if kind == VNextExecutionWaveKind::Mixed => {}
+            VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax { .. }) => {
+                has_decode = true;
+            }
+            _ => return VNextProductOutputMode::FullLogits,
         }
     }
-    if has_participant {
+    if has_decode {
         VNextProductOutputMode::GreedyToken
     } else {
         VNextProductOutputMode::FullLogits
@@ -1975,12 +2033,13 @@ impl VNextExecutionWaveKind {
         match self {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
+            Self::Mixed => "mixed",
         }
     }
 
     const fn reusable_execution_class(self) -> &'static str {
         match self {
-            Self::Prefill => PACKED_TOKEN_REUSABLE_CLASS,
+            Self::Prefill | Self::Mixed => PACKED_TOKEN_REUSABLE_CLASS,
             Self::Decode => UNIFORM_QUERY_REUSABLE_CLASS,
         }
     }
@@ -2055,6 +2114,10 @@ struct VNextWaveTimingMetrics {
     contract_validate_reserve: AtomicDurationMetrics,
     backing_input_encode: AtomicDurationMetrics,
     provider_node_encode: AtomicDurationMetrics,
+    node_identity_materialize: AtomicDurationMetrics,
+    node_invocation_construct: AtomicDurationMetrics,
+    provider_dynamic_binding_encode: AtomicDurationMetrics,
+    binding_validate_coalesce: AtomicDurationMetrics,
     lane_reserve_submit_arm: AtomicDurationMetrics,
     lane_reserve: AtomicDurationMetrics,
     device_runtime_submit: AtomicDurationMetrics,
@@ -2160,6 +2223,13 @@ impl VNextWaveTimingMetrics {
                     "contract_validate_reserve": self.contract_validate_reserve.snapshot(),
                     "backing_input_encode": self.backing_input_encode.snapshot(),
                     "provider_node_encode": self.provider_node_encode.snapshot(),
+                    "provider_node_encode_breakdown": {
+                        "collection": "profile_attached_only",
+                        "identity_materialize": self.node_identity_materialize.snapshot(),
+                        "invocation_construct": self.node_invocation_construct.snapshot(),
+                        "dynamic_binding_encode": self.provider_dynamic_binding_encode.snapshot(),
+                        "binding_validate_coalesce": self.binding_validate_coalesce.snapshot(),
+                    },
                     "lane_reserve_submit_arm": self.lane_reserve_submit_arm.snapshot(),
                     "lane_reserve_submit_arm_breakdown": {
                         "lane_reserve": self.lane_reserve.snapshot(),
@@ -2186,6 +2256,9 @@ impl VNextWaveTimingMetrics {
                 "resource_prepare residual includes caller-side participant construction and orchestration not attributed to the three child intervals",
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
+                "provider_node_encode children sample node or patch operations, not waves; compare total_ns over parent wave samples rather than adding child averages",
+                "identity_materialize includes one bulk identity materialization on eager waves; dynamic_binding_encode covers reusable binding payloads only; eager provider compute encoding and command assembly remain in the parent residual",
+                "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
                 "device_runtime_submit breakdown isolates backend validation/preparation, timing start, ordered command enqueue, and fence/accounting for runtimes that implement typed attribution",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
@@ -2207,6 +2280,10 @@ impl VNextWaveTimingMetrics {
             &self.contract_validate_reserve,
             &self.backing_input_encode,
             &self.provider_node_encode,
+            &self.node_identity_materialize,
+            &self.node_invocation_construct,
+            &self.provider_dynamic_binding_encode,
+            &self.binding_validate_coalesce,
             &self.lane_reserve_submit_arm,
             &self.lane_reserve,
             &self.device_runtime_submit,
@@ -2355,6 +2432,18 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
             }
             SubmissionWaveDispatchStage::ProviderNodeEncode => {
                 self.provider_node_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::NodeIdentityMaterialize => {
+                self.node_identity_materialize.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::NodeInvocationConstruct => {
+                self.node_invocation_construct.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode => {
+                self.provider_dynamic_binding_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce => {
+                self.binding_validate_coalesce.record(elapsed)
             }
             SubmissionWaveDispatchStage::LaneReserve => self.lane_reserve.record(elapsed),
             SubmissionWaveDispatchStage::DeviceRuntimeSubmit => {
@@ -2641,6 +2730,7 @@ impl VNextExecutorMetrics {
         match kind {
             VNextExecutionWaveKind::Prefill => &self.prefill_wave_timing,
             VNextExecutionWaveKind::Decode => &self.decode_wave_timing,
+            VNextExecutionWaveKind::Mixed => &self.mixed_wave_timing,
         }
     }
 
@@ -2648,6 +2738,7 @@ impl VNextExecutorMetrics {
         match kind {
             VNextExecutionWaveKind::Prefill => &self.prefill_device_timing,
             VNextExecutionWaveKind::Decode => &self.decode_device_timing,
+            VNextExecutionWaveKind::Mixed => &self.mixed_device_timing,
         }
     }
 
@@ -2721,9 +2812,11 @@ impl VNextExecutorMetrics {
         self.reusable_catalog_miss_ledger.lock().reset();
         self.prefill_wave_timing.reset();
         self.decode_wave_timing.reset();
+        self.mixed_wave_timing.reset();
         self.device_timing.reset();
         self.prefill_device_timing.reset();
         self.decode_device_timing.reset();
+        self.mixed_device_timing.reset();
         *self.last_failure.lock() = None;
     }
 }
@@ -3449,7 +3542,7 @@ struct VNextExecutionParticipant<'a, R: DeviceRuntime> {
     sequence: &'a Arc<VNextSequence<R>>,
     tokens: &'a [u32],
     span: &'a TokenSpanWork,
-    logits_policy: Option<&'a LogitsReturnPolicy>,
+    output_role: &'a VNextParticipantOutputRole,
 }
 
 struct VNextDecodeCandidate<R: DeviceRuntime> {
@@ -6263,6 +6356,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let Some(sink) = self.event_sink.read().clone() else {
             return Ok(None);
         };
+        if sink.enablement() == ferrum_interfaces::vnext::ExecutionEventSinkEnablement::None {
+            // Timing is configured independently when the sink is attached. A
+            // metrics-only observer needs no transactional event cursor or payloads.
+            return Ok(None);
+        }
         VNextExecutionJournal::open(
             sink,
             self.resolved_plan.execution_plan(),
@@ -6473,7 +6571,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("sequence extension", &deferred));
                     }
-                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
+                    if !backing_maintenance::allows_backing_attempt(
+                        &prefix_maintenance,
+                        backing_attempts,
+                        &maintenance_receipts,
+                    ) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6507,7 +6609,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
+                    if !backing_maintenance::allows_backing_attempt(
+                        &prefix_maintenance,
+                        backing_attempts,
+                        &maintenance_receipts,
+                    ) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6724,7 +6830,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("step admission", &deferred));
                     }
-                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
+                    if !backing_maintenance::allows_backing_attempt(
+                        &prefix_maintenance,
+                        backing_attempts,
+                        &maintenance_receipts,
+                    ) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::StepAdmission,
@@ -6761,7 +6871,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
+                    if !backing_maintenance::allows_backing_attempt(
+                        &prefix_maintenance,
+                        backing_attempts,
+                        &maintenance_receipts,
+                    ) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::StepAdmission,
@@ -6926,7 +7040,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("submission wave", &deferred));
                     }
-                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
+                    if !backing_maintenance::allows_backing_attempt(
+                        &prefix_maintenance,
+                        backing_attempts,
+                        &maintenance_receipts,
+                    ) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -6963,7 +7081,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
+                    if !backing_maintenance::allows_backing_attempt(
+                        &prefix_maintenance,
+                        backing_attempts,
+                        &maintenance_receipts,
+                    ) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -7040,11 +7162,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         kind: VNextExecutionWaveKind,
     ) -> VNextProductOutputMode {
-        product_output_mode_for_policies(
+        product_output_mode_for_roles(
             kind,
             participants
                 .iter()
-                .map(|participant| participant.logits_policy),
+                .map(|participant| participant.output_role),
         )
     }
 
@@ -7073,7 +7195,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     request_capacity: 1,
                 })
             }
-            VNextExecutionWaveKind::Prefill | VNextExecutionWaveKind::Decode => None,
+            VNextExecutionWaveKind::Prefill
+            | VNextExecutionWaveKind::Decode
+            | VNextExecutionWaveKind::Mixed => None,
         }
     }
 
@@ -7232,7 +7356,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let mut offset_uploads = Vec::with_capacity(participants.len());
             let mut penalty_uploads = Vec::with_capacity(participants.len());
             for (participant_index, participant) in participants.iter().enumerate() {
-                let repetition = product_repetition_input(participant.logits_policy, output_mode);
+                let repetition =
+                    product_repetition_input(participant.output_role.logits_policy(), output_mode);
                 if !repetition.penalty.is_finite() || repetition.penalty <= 0.0 {
                     return Err(FerrumError::backend(
                         "vNext sparse repetition penalty must be finite and positive",
@@ -7708,7 +7833,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             span,
             prepared,
             VNextExecutionWaveKind::Decode,
-            Some(logits_policy),
+            VNextParticipantOutputRole::Decode(logits_policy.clone()),
         )
         .await
     }
@@ -7720,13 +7845,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         token_batches: &[Vec<u32>],
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
-        logits_policies: Option<&[LogitsReturnPolicy]>,
+        output_roles: &[VNextParticipantOutputRole],
     ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
-            || logits_policies.is_some_and(|policies| policies.len() != sequences.len())
-            || (kind == VNextExecutionWaveKind::Decode) != logits_policies.is_some()
+            || output_roles.len() != sequences.len()
+            || output_roles
+                .iter()
+                .zip(spans)
+                .zip(token_batches)
+                .any(|((role, span), tokens)| !role.matches_frontier(kind, span, tokens.len()))
             || sequences.len() != batch.sessions().len()
             || batch
                 .sessions()
@@ -7816,7 +7945,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     sequence,
                     tokens,
                     span,
-                    logits_policy: logits_policies.map(|policies| &policies[participant_index]),
+                    output_role: &output_roles[participant_index],
                 },
             )
             .collect::<Vec<_>>();
@@ -7832,13 +7961,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         span: TokenSpanWork,
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
-        logits_policy: Option<&LogitsReturnPolicy>,
+        output_role: VNextParticipantOutputRole,
     ) -> Result<ExecutorSamplingOutput> {
         let participant = VNextExecutionParticipant {
             sequence,
             tokens,
             span: &span,
-            logits_policy,
+            output_role: &output_role,
         };
         let mut logits = self
             .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind)
@@ -7879,6 +8008,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map(|participant| participant.sequence.request_id()),
                 participants.first().map(|participant| participant.tokens),
             )?,
+            (VNextExecutionWaveKind::Mixed, Some(_)) => {
+                return Err(FerrumError::internal(
+                    "mixed execution must fall back before diagnostic checkpoint capture",
+                ));
+            }
             (_, None) => None,
         };
         let teacher_forced_decision = match (capture_claim, self.checkpoint_capture.as_ref()) {
@@ -7914,7 +8048,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 token_mask_slot_identity,
                 participants.iter().map(|participant| {
                     VNextProductTokenMaskContent::from_policy(
-                        participant.logits_policy,
+                        participant.output_role.logits_policy(),
                         output_mode,
                         self.io.output_elements,
                     )
@@ -8344,7 +8478,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         let (sparse_repetition_participants, sparse_repetition_token_ids) = participants
             .iter()
-            .map(|participant| product_repetition_input(participant.logits_policy, output_mode))
+            .map(|participant| {
+                product_repetition_input(participant.output_role.logits_policy(), output_mode)
+            })
             .filter(|input| input.is_active())
             .fold((0_u64, 0_u64), |(participants, token_ids), input| {
                 (
@@ -8368,10 +8504,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 self.metrics
                     .full_logits_readback_waves
                     .fetch_add(1, Ordering::Relaxed);
-                if kind == VNextExecutionWaveKind::Decode
+                if kind != VNextExecutionWaveKind::Prefill
                     && participants.iter().any(|participant| {
                         matches!(
-                            participant.logits_policy,
+                            participant.output_role.logits_policy(),
                             Some(LogitsReturnPolicy::GreedyArgmax { .. })
                         )
                     })
@@ -8714,9 +8850,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .map(|candidate| Arc::clone(&candidate.sequence))
             .collect::<Vec<_>>();
-        let logits_policies = canonical_candidates
+        let output_roles = canonical_candidates
             .iter()
-            .map(|candidate| candidate.logits_policy.clone())
+            .map(|candidate| VNextParticipantOutputRole::Decode(candidate.logits_policy.clone()))
             .collect::<Vec<_>>();
         let logits = match self
             .execute_batch_step(
@@ -8725,7 +8861,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &token_batches,
                 &spans,
                 VNextExecutionWaveKind::Decode,
-                Some(&logits_policies),
+                &output_roles,
             )
             .await
         {
@@ -8975,7 +9111,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::slice::from_ref(&tokens),
                     std::slice::from_ref(&span),
                     VNextExecutionWaveKind::Prefill,
-                    None,
+                    &[VNextParticipantOutputRole::prefill(completed_chunk)],
                 )
                 .await?
             {
@@ -9268,6 +9404,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .map_err(|error| FerrumError::backend(error.to_string()))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let output_roles = completed_chunks
+                .iter()
+                .copied()
+                .map(VNextParticipantOutputRole::prefill)
+                .collect::<Vec<_>>();
             match self
                 .execute_batch_step(
                     &batch,
@@ -9275,7 +9416,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     &token_batches,
                     &spans,
                     VNextExecutionWaveKind::Prefill,
-                    None,
+                    &output_roles,
                 )
                 .await?
             {
@@ -9676,11 +9817,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "wave_timing_by_phase": {
                 VNextExecutionWaveKind::Prefill.as_str(): self.metrics.prefill_wave_timing.snapshot(),
                 VNextExecutionWaveKind::Decode.as_str(): self.metrics.decode_wave_timing.snapshot(),
+                VNextExecutionWaveKind::Mixed.as_str(): self.metrics.mixed_wave_timing.snapshot(),
             },
             "device_timing": self.metrics.device_timing.snapshot(),
             "device_timing_by_phase": {
                 VNextExecutionWaveKind::Prefill.as_str(): self.metrics.prefill_device_timing.snapshot(),
                 VNextExecutionWaveKind::Decode.as_str(): self.metrics.decode_device_timing.snapshot(),
+                VNextExecutionWaveKind::Mixed.as_str(): self.metrics.mixed_device_timing.snapshot(),
             },
             "completion_worker": self.completion_worker.metrics_snapshot(),
             "checkpoint_timings": self.reaper.checkpoint_timing_snapshot(),
@@ -10176,6 +10319,15 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             .await
     }
 
+    async fn plan_runtime_mixed_batch_with_capacity(
+        &self,
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeMixedBatchOutcome> {
+        self.execute_plan_runtime_mixed_batch(prefills, decodes)
+            .await
+    }
+
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         let started = Instant::now();
         if input.batch_size() != 1 {
@@ -10462,23 +10614,24 @@ mod tests {
         decode_output_width, decode_selected_token, is_language_masked_argmax_operation,
         is_language_token_embedding_operation, journal_clock_anchor_required,
         nonterminal_completion_message, normalized_product_token_mask,
-        padded_repetition_token_id_bytes, product_output_mode_for_policies,
-        product_repetition_input, reported_allocated_bytes, resolve_reusable_execution_policy,
+        padded_repetition_token_id_bytes, product_output_mode_for_roles, product_repetition_input,
+        reported_allocated_bytes, resolve_reusable_execution_policy,
         resolve_runtime_attention_authority, resolved_sequence_fit_policy,
         reusable_catalog_lookup_allowed, reusable_executable_inventory_matches,
         reusable_execution_program_catalog_is_usable, reusable_execution_requires_eager_fallback,
         reusable_program_identity_required, reusable_startup_case_budget_violation,
         submission_execution_policy_for_timing, validate_sequence_completion_accounting,
         AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
-        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
-        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextProductTokenMaskContent,
-        VNextProductTokenMaskResidency, VNextProductTokenMaskResidencyTransaction,
-        VNextProductTokenMaskSlotIdentity, VNextProductTokenMaskSlotTarget,
-        VNextReusableExecutionCatalogMissKey, VNextReusableExecutionCatalogMissLedger,
-        VNextReusableExecutionCatalogMissReason, VNextReusableExecutionDescriptor,
-        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
-        VNextTeacherForcedDecision, VNextWaveTimingMetrics, VNextWaveTimingSink,
-        MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES, MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
+        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextParticipantOutputRole,
+        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
+        VNextProductTokenMaskContent, VNextProductTokenMaskResidency,
+        VNextProductTokenMaskResidencyTransaction, VNextProductTokenMaskSlotIdentity,
+        VNextProductTokenMaskSlotTarget, VNextReusableExecutionCatalogMissKey,
+        VNextReusableExecutionCatalogMissLedger, VNextReusableExecutionCatalogMissReason,
+        VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
+        VNextReusableExecutionStartupPlan, VNextTeacherForcedDecision, VNextWaveTimingMetrics,
+        VNextWaveTimingSink, MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES,
+        MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
     };
     use ferrum_interfaces::model_executor::{
         ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
@@ -11133,6 +11286,64 @@ mod tests {
     }
 
     #[test]
+    fn wave_timing_node_encode_children_are_phase_scoped_and_reset() {
+        use super::{SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink};
+
+        let aggregate = VNextWaveTimingMetrics::default();
+        let decode = VNextWaveTimingMetrics::default();
+        let other_phase = VNextWaveTimingMetrics::default();
+        let sink = VNextWaveTimingSink {
+            aggregate: &aggregate,
+            phase: &decode,
+        };
+        let stages = [
+            (
+                SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+                "identity_materialize",
+            ),
+            (
+                SubmissionWaveDispatchStage::NodeInvocationConstruct,
+                "invocation_construct",
+            ),
+            (
+                SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+                "dynamic_binding_encode",
+            ),
+            (
+                SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+                "binding_validate_coalesce",
+            ),
+        ];
+        for (index, (stage, _)) in stages.iter().enumerate() {
+            sink.record(*stage, Duration::from_nanos(100 + index as u64));
+            sink.record(*stage, Duration::from_nanos(200 + index as u64));
+        }
+        let child = |metrics: &VNextWaveTimingMetrics| {
+            metrics.snapshot()["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
+                ["provider_node_encode_breakdown"]
+                .clone()
+        };
+        for metrics in [&aggregate, &decode] {
+            let snapshot = child(metrics);
+            assert_eq!(snapshot["collection"], "profile_attached_only");
+            for (index, (_, field)) in stages.iter().enumerate() {
+                assert_eq!(snapshot[field]["samples"], 2);
+                assert_eq!(snapshot[field]["total_ns"], 300 + 2 * index as u64);
+            }
+            // Recording a nested interval does not invent a parent wave sample.
+            assert_eq!(metrics.snapshot()["submitted_wave_total"]["samples"], 0);
+            metrics.reset();
+            for (_, field) in stages {
+                assert_eq!(child(metrics)[field]["samples"], 0);
+                assert_eq!(child(metrics)[field]["total_ns"], 0);
+            }
+        }
+        for (_, field) in stages {
+            assert_eq!(child(&other_phase)[field]["samples"], 0);
+        }
+    }
+
+    #[test]
     fn wave_timing_reset_clears_resource_prepare_breakdown() {
         let metrics = VNextWaveTimingMetrics::default();
         metrics
@@ -11311,43 +11522,34 @@ mod tests {
 
     #[test]
     fn product_output_mode_requires_a_uniform_exact_greedy_decode_wave() {
-        let greedy = LogitsReturnPolicy::GreedyArgmax {
+        let greedy = VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax {
             token_mask: None,
             repetition_penalty: None,
-        };
-        let full = LogitsReturnPolicy::FullLogits;
-        let repetition = LogitsReturnPolicy::GreedyArgmax {
+        });
+        let full = VNextParticipantOutputRole::Decode(LogitsReturnPolicy::FullLogits);
+        let repetition = VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax {
             token_mask: None,
             repetition_penalty: Some(GreedyRepetitionPenalty::new(1.1, vec![7, 11])),
-        };
+        });
 
         assert_eq!(
-            product_output_mode_for_policies(
-                VNextExecutionWaveKind::Decode,
-                [Some(&greedy), Some(&greedy)],
-            ),
+            product_output_mode_for_roles(VNextExecutionWaveKind::Decode, [&greedy, &greedy],),
             VNextProductOutputMode::GreedyToken
         );
         assert_eq!(
-            product_output_mode_for_policies(
-                VNextExecutionWaveKind::Decode,
-                [Some(&greedy), Some(&repetition)],
-            ),
+            product_output_mode_for_roles(VNextExecutionWaveKind::Decode, [&greedy, &repetition],),
             VNextProductOutputMode::GreedyToken
         );
         assert_eq!(
-            product_output_mode_for_policies(
-                VNextExecutionWaveKind::Decode,
-                [Some(&greedy), Some(&full)],
-            ),
+            product_output_mode_for_roles(VNextExecutionWaveKind::Decode, [&greedy, &full],),
             VNextProductOutputMode::FullLogits
         );
         assert_eq!(
-            product_output_mode_for_policies(VNextExecutionWaveKind::Prefill, [Some(&greedy)],),
+            product_output_mode_for_roles(VNextExecutionWaveKind::Prefill, [&greedy]),
             VNextProductOutputMode::FullLogits
         );
         assert_eq!(
-            product_output_mode_for_policies(VNextExecutionWaveKind::Decode, std::iter::empty(),),
+            product_output_mode_for_roles(VNextExecutionWaveKind::Decode, std::iter::empty()),
             VNextProductOutputMode::FullLogits
         );
     }

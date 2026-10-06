@@ -1,5 +1,29 @@
 use super::*;
 
+/// Enables typed host/completion timing without opening a journal or materializing events.
+pub(super) struct MetricsOnlyExecutionEventSink;
+
+impl ExecutionEventSink for MetricsOnlyExecutionEventSink {
+    fn enablement(&self) -> ferrum_interfaces::vnext::ExecutionEventSinkEnablement {
+        ferrum_interfaces::vnext::ExecutionEventSinkEnablement::None
+    }
+
+    fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
+        false
+    }
+
+    fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
+        ferrum_interfaces::vnext::DeviceTimingMode::Completion
+    }
+
+    fn record(
+        &self,
+        _permit: ferrum_interfaces::vnext::EventEmissionPermit,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        Ok(())
+    }
+}
+
 fn vnext_execution_event_name(kind: VNextExecutionEventKind) -> &'static str {
     match kind {
         VNextExecutionEventKind::RequestAccepted => "request_accepted",

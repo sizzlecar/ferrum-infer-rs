@@ -2,8 +2,8 @@ use super::{build_env, detect_features, BenchServeCommand, RunContext};
 use clap::{Args, ValueEnum};
 use ferrum_bench_core::decode_isolation::{
     aggregate_decode_isolation_runs, DecodeIsolationCapabilities, DecodeIsolationConfig,
-    DecodeIsolationErrorPolicy, DecodeIsolationReport, DecodeIsolationScenarioContract,
-    DecodeIsolationWindowEnd,
+    DecodeIsolationErrorPolicy, DecodeIsolationNativeSequenceState, DecodeIsolationReport,
+    DecodeIsolationScenarioContract, DecodeIsolationWindowEnd,
 };
 use ferrum_bench_core::Scenario;
 use ferrum_types::Result;
@@ -30,12 +30,14 @@ pub enum BenchServeWorkload {
 pub struct DecodeIsolationArgs {
     /// Number of live decoders. Defaults to /health capacity minus two and may
     /// decrease only when required by the advertised aggregate KV budget.
+    /// Required explicitly for native state pools without a KV token budget.
     #[arg(long)]
     pub decode_isolation_incumbents: Option<u32>,
 
     /// Long-prefill input tokens. Defaults to the smaller of eight scheduler
     /// chunks and 75% of the effective per-request limit, then is bounded by
-    /// aggregate KV headroom while retaining one incumbent.
+    /// aggregate KV headroom while retaining one incumbent. Required explicitly
+    /// for native state pools; actual request admission validates capacity.
     #[arg(long)]
     pub decode_isolation_prefill_tokens: Option<usize>,
 
@@ -60,10 +62,33 @@ struct HealthResponse {
     admission: HealthAdmission,
     #[serde(default)]
     auto_config: HealthAutoConfig,
+    kv_storage: Option<HealthKvStorage>,
+    #[serde(default)]
+    cache: HealthCache,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct HealthCache {
+    #[serde(default)]
+    prefix_cache: HealthNativeExecutor,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct HealthNativeExecutor {
+    maximum_model_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HealthKvStorage {
+    source: String,
+    logical_sequence_state: DecodeIsolationNativeSequenceState,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HealthAdmission {
+    resource_authority: Option<ferrum_types::ExecutionResourceAuthority>,
+    runtime_snapshot_available: Option<bool>,
+    runtime_contract_error: Option<String>,
     effective_max_concurrent: Option<u32>,
     preflight_effective_max_concurrent: Option<u32>,
     maximum_active_sequences: Option<u32>,
@@ -87,6 +112,8 @@ struct HealthModelCapabilities {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HealthAutoAdmission {
+    resource_authority: Option<ferrum_types::ExecutionResourceAuthority>,
+    kv_capacity_applies_to_selected_state_layout: Option<bool>,
     effective_max_concurrent: Option<u32>,
     maximum_active_sequences: Option<u32>,
     maximum_scheduled_tokens: Option<u64>,
@@ -135,7 +162,7 @@ pub(super) async fn execute(cmd: &BenchServeCommand, ctx: &RunContext) -> Result
         None => cmd.model.clone(),
     };
     let report = DecodeIsolationReport {
-        schema_version: 2,
+        schema_version: 3,
         scenario: Scenario::DecodeIsolation,
         model,
         backend,
@@ -223,6 +250,54 @@ fn resolve_capabilities(health: HealthResponse) -> Result<DecodeIsolationCapabil
             "decode-isolation /health omitted effective {field} capability"
         ))
     };
+    if health.admission.resource_authority
+        == Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+        || health.auto_config.admission.resource_authority
+            == Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+        || health
+            .auto_config
+            .admission
+            .kv_capacity_applies_to_selected_state_layout
+            == Some(false)
+    {
+        if health.admission.runtime_snapshot_available != Some(true)
+            || health.admission.runtime_contract_error.is_some()
+            || health.admission.resource_authority
+                != Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+        {
+            return Err(missing("valid native runtime admission snapshot"));
+        }
+        let effective_max_concurrent = health
+            .admission
+            .maximum_active_sequences
+            .filter(|value| *value > 0)
+            .ok_or_else(|| missing("native active sequence limit"))?;
+        let maximum_scheduled_tokens = health
+            .admission
+            .maximum_scheduled_tokens
+            .filter(|value| *value > 0)
+            .ok_or_else(|| missing("native scheduled token limit"))?;
+        let max_model_length = health
+            .cache
+            .prefix_cache
+            .maximum_model_tokens
+            .filter(|value| *value > 0)
+            .ok_or_else(|| missing("native model token limit"))?;
+        let storage = health
+            .kv_storage
+            .filter(|storage| storage.source == "resolved_model_plan")
+            .ok_or_else(|| missing("resolved native sequence-state layout"))?;
+        return Ok(DecodeIsolationCapabilities {
+            effective_max_concurrent,
+            maximum_scheduled_tokens,
+            max_model_length,
+            kv_capacity_tokens: None,
+            selected_kv_capacity_tokens: health.auto_config.selected_kv_capacity,
+            kv_block_size_tokens: None,
+            kv_block_size_source: "not_applicable_native_state_pools".into(),
+            native_sequence_state: Some(storage.logical_sequence_state),
+        });
+    }
     let auto = health.auto_config.admission;
     let effective_max_concurrent = [
         health.admission.maximum_active_sequences,
@@ -279,10 +354,11 @@ fn resolve_capabilities(health: HealthResponse) -> Result<DecodeIsolationCapabil
         effective_max_concurrent,
         maximum_scheduled_tokens,
         max_model_length,
-        kv_capacity_tokens,
+        kv_capacity_tokens: Some(kv_capacity_tokens),
         selected_kv_capacity_tokens: health.auto_config.selected_kv_capacity,
-        kv_block_size_tokens,
+        kv_block_size_tokens: Some(kv_block_size_tokens),
         kv_block_size_source,
+        native_sequence_state: None,
     })
 }
 
@@ -313,8 +389,21 @@ fn resolve_config(
         ));
     }
 
-    let block = capabilities.kv_block_size_tokens;
-    let aggregate_kv_budget_blocks = (capabilities.kv_capacity_tokens / block)
+    if capabilities.native_sequence_state.is_some() {
+        return resolve_native_config(
+            cmd,
+            capabilities,
+            incumbent_input_tokens,
+            incumbent_output_tokens,
+        );
+    }
+    let block = capabilities
+        .kv_block_size_tokens
+        .ok_or_else(|| infeasible_shape(&capabilities))?;
+    let aggregate_kv_budget_blocks = (capabilities
+        .kv_capacity_tokens
+        .ok_or_else(|| infeasible_shape(&capabilities))?
+        / block)
         .checked_mul(u64::from(KV_HEADROOM_NUMERATOR))
         .ok_or_else(|| ferrum_types::FerrumError::model("KV headroom calculation overflow"))?
         / u64::from(KV_HEADROOM_DENOMINATOR);
@@ -438,11 +527,11 @@ fn resolve_config(
         aggressor_scheduled_chunks: aggressor_input_tokens
             .div_ceil(capabilities.maximum_scheduled_tokens),
         aggressor_output_tokens: AGGRESSOR_OUTPUT_TOKENS,
-        aggregate_kv_budget_tokens,
-        aggregate_kv_budget_blocks,
+        aggregate_kv_budget_tokens: Some(aggregate_kv_budget_tokens),
+        aggregate_kv_budget_blocks: Some(aggregate_kv_budget_blocks),
         estimated_unrounded_aggregate_kv_tokens,
-        estimated_aggregate_kv_tokens,
-        estimated_aggregate_kv_blocks,
+        estimated_aggregate_kv_tokens: Some(estimated_aggregate_kv_tokens),
+        estimated_aggregate_kv_blocks: Some(estimated_aggregate_kv_blocks),
         capabilities,
         contract: DecodeIsolationScenarioContract {
             baseline_output_events_per_incumbent: cmd
@@ -453,8 +542,87 @@ fn resolve_config(
             interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputEvent,
             post_aggressor_observable_progress_required_per_incumbent: true,
             minimum_aggressor_scheduled_chunks: MINIMUM_AGGRESSOR_SCHEDULED_CHUNKS,
-            kv_capacity_headroom_numerator: KV_HEADROOM_NUMERATOR,
-            kv_capacity_headroom_denominator: KV_HEADROOM_DENOMINATOR,
+            kv_capacity_headroom_numerator: Some(KV_HEADROOM_NUMERATOR),
+            kv_capacity_headroom_denominator: Some(KV_HEADROOM_DENOMINATOR),
+            invalid_evidence_policy: if cmd.fail_on_error {
+                DecodeIsolationErrorPolicy::EmitDiagnosticsAndFail
+            } else {
+                DecodeIsolationErrorPolicy::EmitDiagnostics
+            },
+            warmup_failure_always_fatal: true,
+            measured_error_rate_limit: cmd.max_error_rate,
+        },
+    })
+}
+
+fn resolve_native_config(
+    cmd: &BenchServeCommand,
+    capabilities: DecodeIsolationCapabilities,
+    incumbent_input_tokens: u64,
+    incumbent_output_tokens: u64,
+) -> Result<DecodeIsolationConfig> {
+    let incumbents = cmd.decode_isolation.decode_isolation_incumbents.ok_or_else(|| {
+        ferrum_types::FerrumError::model("native decode-isolation requires --decode-isolation-incumbents; native state pools do not advertise a single KV token budget")
+    })?;
+    let aggressor_input_tokens = cmd
+        .decode_isolation
+        .decode_isolation_prefill_tokens
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::model(
+                "native decode-isolation requires --decode-isolation-prefill-tokens",
+            )
+        })?;
+    let minimum = capabilities
+        .maximum_scheduled_tokens
+        .checked_mul(u64::from(MINIMUM_AGGRESSOR_SCHEDULED_CHUNKS))
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::model("minimum aggressor token count overflow")
+        })?;
+    if incumbents == 0
+        || incumbents >= capabilities.effective_max_concurrent
+        || aggressor_input_tokens < minimum
+        || aggressor_input_tokens >= capabilities.max_model_length
+    {
+        return Err(ferrum_types::FerrumError::model(
+            "native decode-isolation shape exceeds runtime sequence/model limits or does not span four scheduler chunks",
+        ));
+    }
+    let estimated_unrounded_aggregate_kv_tokens = incumbent_input_tokens
+        .checked_add(incumbent_output_tokens)
+        .and_then(|tokens| tokens.checked_mul(u64::from(incumbents)))
+        .and_then(|tokens| tokens.checked_add(aggressor_input_tokens))
+        .and_then(|tokens| tokens.checked_add(AGGRESSOR_OUTPUT_TOKENS))
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::model("aggregate request token budget overflow")
+        })?;
+    Ok(DecodeIsolationConfig {
+        incumbents,
+        incumbents_source: "cli_native_runtime_admission".into(),
+        incumbent_input_tokens,
+        incumbent_output_tokens,
+        aggressor_input_tokens,
+        aggressor_input_source: "cli_native_runtime_admission".into(),
+        aggressor_scheduled_chunks: aggressor_input_tokens
+            .div_ceil(capabilities.maximum_scheduled_tokens),
+        aggressor_output_tokens: AGGRESSOR_OUTPUT_TOKENS,
+        aggregate_kv_budget_tokens: None,
+        aggregate_kv_budget_blocks: None,
+        estimated_unrounded_aggregate_kv_tokens,
+        estimated_aggregate_kv_tokens: None,
+        estimated_aggregate_kv_blocks: None,
+        capabilities,
+        contract: DecodeIsolationScenarioContract {
+            baseline_output_events_per_incumbent: cmd
+                .decode_isolation
+                .decode_isolation_baseline_events,
+            fixed_output_budget: true,
+            injection_requires_all_incumbents_ready: true,
+            interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputEvent,
+            post_aggressor_observable_progress_required_per_incumbent: true,
+            minimum_aggressor_scheduled_chunks: MINIMUM_AGGRESSOR_SCHEDULED_CHUNKS,
+            kv_capacity_headroom_numerator: None,
+            kv_capacity_headroom_denominator: None,
             invalid_evidence_policy: if cmd.fail_on_error {
                 DecodeIsolationErrorPolicy::EmitDiagnosticsAndFail
             } else {
@@ -542,6 +710,7 @@ fn render_markdown(report: &DecodeIsolationReport) -> String {
         ));
     }
     output.push_str("The output-event gap is measured between user-visible SSE text events; it is not token-level latency.\n\n");
+    output.push_str("Throughput uses server usage tokens over the complete measured request cohort, excluding warmup. Prompt usage includes chat-template tokens.\n\n");
     output.push_str("| repeat | baseline event-gap p50/p95 ms | interference event-gap p50/p95 ms | max event gap ms | observable output progress | time to first output event ms | valid |\n");
     output.push_str("|---:|---:|---:|---:|---:|---:|:---:|\n");
     for run in &report.runs {
@@ -569,6 +738,41 @@ fn render_markdown(report: &DecodeIsolationReport) -> String {
             ));
         }
     }
+    output.push_str("\n| repeat | measured duration ms | usage prompt/output tokens | usage output tokens/s | usage total tokens/s |\n|---:|---:|---:|---:|---:|\n");
+    for run in &report.runs {
+        if let Some(value) = run.throughput.as_ref().filter(|_| run.validity.all_valid) {
+            output.push_str(&format!(
+                "| {} | {:.2} | {}/{} | {:.2} | {:.2} |\n",
+                run.repeat + 1,
+                value.duration_ms,
+                value.usage_input_tokens,
+                value.usage_output_tokens,
+                value.usage_output_tokens_per_second,
+                value.usage_total_tokens_per_second
+            ));
+        }
+    }
+    output.push_str("\n| repeat | role | request ID | client time to first output event ms | client end-to-end ms | usage prompt/output tokens |\n|---:|:---|:---|---:|---:|---:|\n");
+    for run in &report.runs {
+        for request in run.incumbents.iter().chain(std::iter::once(&run.aggressor)) {
+            if let (true, Some(first), Some(e2e)) = (
+                run.validity.all_valid,
+                request.client_time_to_first_output_event_ms,
+                request.client_e2e_ms,
+            ) {
+                output.push_str(&format!(
+                    "| {} | {} | {} | {:.2} | {:.2} | {}/{} |\n",
+                    run.repeat + 1,
+                    request.role,
+                    request.server_request_id.as_deref().unwrap_or("—"),
+                    first,
+                    e2e,
+                    request.usage_input_tokens.unwrap_or_default(),
+                    request.usage_output_tokens.unwrap_or_default()
+                ));
+            }
+        }
+    }
     output
 }
 
@@ -581,10 +785,11 @@ mod tests {
             effective_max_concurrent: 10,
             maximum_scheduled_tokens: 512,
             max_model_length: 8192,
-            kv_capacity_tokens: 65536,
+            kv_capacity_tokens: Some(65536),
             selected_kv_capacity_tokens: Some(8192),
-            kv_block_size_tokens: 16,
+            kv_block_size_tokens: Some(16),
             kv_block_size_source: "test".to_string(),
+            native_sequence_state: None,
         }
     }
 
@@ -658,8 +863,8 @@ mod tests {
         assert_eq!(caps.effective_max_concurrent, 8);
         assert_eq!(caps.maximum_scheduled_tokens, 1024);
         assert_eq!(caps.max_model_length, 8192);
-        assert_eq!(caps.kv_capacity_tokens, 32768);
-        assert_eq!(caps.kv_block_size_tokens, 16);
+        assert_eq!(caps.kv_capacity_tokens, Some(32768));
+        assert_eq!(caps.kv_block_size_tokens, Some(16));
     }
 
     #[test]
@@ -670,6 +875,80 @@ mod tests {
         }))
         .unwrap();
         assert!(resolve_capabilities(health).is_err());
+    }
+
+    fn native_health() -> serde_json::Value {
+        serde_json::json!({
+            "admission": {
+                "resource_authority": "plan_runtime", "runtime_snapshot_available": true,
+                "maximum_active_sequences": 2, "maximum_scheduled_tokens": 256
+            },
+            "cache": {"prefix_cache": {"maximum_model_tokens": 8192}},
+            "kv_storage": {
+                "source": "resolved_model_plan",
+                "logical_sequence_state": {
+                    "kv_bytes_per_token": 528, "other_token_scaled_bytes_per_token": 0,
+                    "fixed_bytes_per_sequence": 280
+                }
+            },
+            "auto_config": {"admission": {
+                "resource_authority": "plan_runtime",
+                "kv_capacity_applies_to_selected_state_layout": false,
+                "kv_capacity_tokens": 16, "kv_block_size_tokens": 16,
+                "max_model_length": 32, "effective_max_concurrent": 1
+            }}
+        })
+    }
+
+    #[test]
+    fn native_shape_uses_runtime_caps_and_explicit_work_without_a_fake_kv_budget() {
+        let caps = resolve_capabilities(serde_json::from_value(native_health()).unwrap()).unwrap();
+        assert_eq!(caps.effective_max_concurrent, 2);
+        assert_eq!(caps.max_model_length, 8192);
+        assert!(caps.kv_capacity_tokens.is_none());
+        assert!(caps.kv_block_size_tokens.is_none());
+        assert_eq!(
+            caps.native_sequence_state
+                .as_ref()
+                .unwrap()
+                .kv_bytes_per_token,
+            528
+        );
+        let mut cmd = command();
+        assert!(resolve_config(&cmd, caps.clone()).is_err());
+        cmd.decode_isolation.decode_isolation_incumbents = Some(1);
+        assert!(resolve_config(&cmd, caps.clone()).is_err());
+        cmd.decode_isolation.decode_isolation_prefill_tokens = Some(1024);
+        let config = resolve_config(&cmd, caps.clone()).unwrap();
+        assert_eq!(config.incumbents, 1);
+        assert!(config.aggregate_kv_budget_tokens.is_none());
+        assert!(config.estimated_aggregate_kv_tokens.is_none());
+        assert!(config.contract.kv_capacity_headroom_numerator.is_none());
+        cmd.decode_isolation.decode_isolation_incumbents = Some(2);
+        assert!(resolve_config(&cmd, caps.clone()).is_err());
+        cmd.decode_isolation.decode_isolation_incumbents = Some(1);
+        cmd.decode_isolation.decode_isolation_prefill_tokens = Some(8192);
+        assert!(resolve_config(&cmd, caps).is_err());
+    }
+
+    #[test]
+    fn native_missing_or_failed_evidence_cannot_fall_back_to_legacy_capacity() {
+        for path in [
+            "/admission/runtime_snapshot_available",
+            "/admission/maximum_scheduled_tokens",
+            "/cache/prefix_cache/maximum_model_tokens",
+            "/kv_storage",
+        ] {
+            let mut health = native_health();
+            *health.pointer_mut(path).unwrap() = serde_json::Value::Null;
+            assert!(
+                resolve_capabilities(serde_json::from_value(health).unwrap()).is_err(),
+                "{path}"
+            );
+        }
+        let mut health = native_health();
+        health["admission"]["runtime_contract_error"] = serde_json::json!("capacity unavailable");
+        assert!(resolve_capabilities(serde_json::from_value(health).unwrap()).is_err());
     }
 
     #[test]
@@ -713,7 +992,7 @@ mod tests {
     #[test]
     fn default_reduces_incumbents_to_make_prefill_feasible() {
         let mut caps = capabilities();
-        caps.kv_capacity_tokens = 2500;
+        caps.kv_capacity_tokens = Some(2500);
         let config = resolve_config(&command(), caps).unwrap();
         assert!(config.incumbents < 8);
         assert!(config.aggressor_scheduled_chunks >= 4);
@@ -731,20 +1010,21 @@ mod tests {
                 effective_max_concurrent: 16,
                 maximum_scheduled_tokens: 192,
                 max_model_length: 4096,
-                kv_capacity_tokens: 4096,
+                kv_capacity_tokens: Some(4096),
                 selected_kv_capacity_tokens: Some(4096),
-                kv_block_size_tokens: 16,
+                kv_block_size_tokens: Some(16),
                 kv_block_size_source: "health_auto_config_admission".to_string(),
+                native_sequence_state: None,
             },
         )
         .unwrap();
         assert_eq!(config.aggressor_input_tokens, 1536);
         assert_eq!(config.aggressor_scheduled_chunks, 8);
         assert_eq!(config.incumbents, 5);
-        assert_eq!(config.aggregate_kv_budget_blocks, 230);
-        assert_eq!(config.estimated_aggregate_kv_blocks, 217);
-        assert_eq!(config.estimated_aggregate_kv_tokens, 3472);
-        assert_eq!(4096 - config.estimated_aggregate_kv_tokens, 624);
+        assert_eq!(config.aggregate_kv_budget_blocks, Some(230));
+        assert_eq!(config.estimated_aggregate_kv_blocks, Some(217));
+        assert_eq!(config.estimated_aggregate_kv_tokens, Some(3472));
+        assert_eq!(4096 - config.estimated_aggregate_kv_tokens.unwrap(), 624);
     }
 
     #[test]

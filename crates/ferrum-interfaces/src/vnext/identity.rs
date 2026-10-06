@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 use super::VNextError;
 
@@ -32,19 +33,31 @@ fn validate_identity(kind: &'static str, value: &str) -> Result<(), VNextError> 
 
 macro_rules! stable_identity {
     ($name:ident, $kind:literal) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(try_from = "String", into = "String")]
-        pub struct $name(String);
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+        #[serde(try_from = "String")]
+        pub struct $name(Arc<str>);
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, VNextError> {
                 let value = value.into();
                 validate_identity($kind, &value)?;
-                Ok(Self(value))
+                Ok(Self(value.into()))
             }
 
             pub fn as_str(&self) -> &str {
                 &self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                // Identity values are immutable and frequently cloned into
+                // live resource views. Preserve string wire values without
+                // the owned conversion's additional allocation.
+                serializer.serialize_str(self.as_str())
             }
         }
 
@@ -64,7 +77,7 @@ macro_rules! stable_identity {
 
         impl From<$name> for String {
             fn from(value: $name) -> Self {
-                value.0
+                value.as_str().to_owned()
             }
         }
     };

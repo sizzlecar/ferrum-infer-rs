@@ -1973,10 +1973,8 @@ impl ExecutorExecutionCapacityEvidence {
         boundary: Option<crate::vnext::DynamicPoolMaintenanceBoundaryReceipt>,
     ) -> Result<Self> {
         match (self.backing_pressure(), boundary.as_ref()) {
-            (
-                Some(crate::vnext::DynamicBackingPressure::DeviceCapacity(pressure)),
-                Some(boundary),
-            ) if pressure == boundary.pressure() && !boundary.reclaim_sufficient() => {}
+            (Some(pressure), Some(boundary))
+                if pressure == boundary.pressure() && !boundary.reclaim_sufficient() => {}
             (Some(crate::vnext::DynamicBackingPressure::PoolResident(_)), None) | (None, None) => {}
             (Some(crate::vnext::DynamicBackingPressure::DeviceCapacity(_)), None) => {
                 return Err(FerrumError::internal(
@@ -2697,6 +2695,21 @@ pub enum PlanRuntimeBatchPrefillOutcome {
     Unsupported,
 }
 
+/// One physical execution containing prefill chunks and decode frontiers.
+/// Each output list preserves the order of its corresponding input list.
+/// `NotSubmitted` proves that no participant reached provider encoding or
+/// device submission and every retained frontier is retryable. Ordinary
+/// errors may follow submission and must never trigger a replay fallback.
+pub enum PlanRuntimeMixedBatchOutcome {
+    Completed {
+        prefills: Vec<PlanRuntimePrefillCompletion>,
+        decodes: Vec<PlanRuntimeDecodeOutput>,
+    },
+    NotSubmitted(ExecutorExecutionDeferral),
+    /// The executor left all input frontiers unchanged.
+    Unsupported,
+}
+
 /// Capacity-aware result for one planned prefill frontier.
 ///
 /// `Deferred` is only legal before provider encode or device submission. The
@@ -3312,6 +3325,19 @@ pub trait ModelExecutor: Send + Sync {
         _inputs: &[PlanRuntimePrefillInput],
     ) -> Result<PlanRuntimeBatchPrefillOutcome> {
         Ok(PlanRuntimeBatchPrefillOutcome::Unsupported)
+    }
+
+    /// Attempt one physical mixed prefill/decode wave. Prefills must already
+    /// hold typed admission, and decodes must retain their exact cache identity.
+    /// An intermediate prefill completion is never sampleable. Full logits are
+    /// a legal fallback for a decode participant's greedy sampling policy.
+    /// Only `Unsupported` or `NotSubmitted` permit separate-phase fallback.
+    async fn plan_runtime_mixed_batch_with_capacity(
+        &self,
+        _prefills: &[PlanRuntimePrefillInput],
+        _decodes: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeMixedBatchOutcome> {
+        Ok(PlanRuntimeMixedBatchOutcome::Unsupported)
     }
 
     /// Discard an exact prefill authority after engine-side validation,

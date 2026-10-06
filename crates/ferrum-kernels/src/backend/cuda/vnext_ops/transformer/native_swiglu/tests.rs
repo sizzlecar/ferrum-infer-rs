@@ -16,6 +16,45 @@ fn native_swiglu_scratch_accounts_only_for_bounded_activations() {
     }
 }
 
+#[test]
+fn native_swiglu_packed_rows_preserve_larger_participant_batches() {
+    let max_rows = u64::from(u16::MAX);
+    assert_eq!(
+        ScratchLayout::new(max_rows, 1)
+            .unwrap()
+            .packed_rows(max_rows),
+        Some(u16::MAX.into())
+    );
+    assert_eq!(
+        ScratchLayout::new(max_rows + 1, 1)
+            .unwrap()
+            .packed_rows(max_rows + 1),
+        None
+    );
+    // The aggregate cannot use one launch, but its two old participant launches
+    // remain within both the grid and the signed gate/up indexing capacity.
+    for rows in [max_rows / 2, max_rows / 2 + 1] {
+        assert_eq!(
+            ScratchLayout::new(rows, 16_385).unwrap().packed_rows(rows),
+            Some(rows as u32)
+        );
+    }
+    assert_eq!(
+        ScratchLayout::new(max_rows, 16_384)
+            .unwrap()
+            .packed_rows(max_rows),
+        Some(u16::MAX.into())
+    );
+    assert_eq!(
+        ScratchLayout::new(max_rows, 16_385)
+            .unwrap()
+            .packed_rows(max_rows),
+        None
+    );
+    assert!(native_matrix::single_launch_rows(0).is_none());
+    assert!(native_matrix::single_launch_rows(u64::MAX).is_none());
+}
+
 fn matrix(format: MatrixFormat, rows: usize, columns: usize, salt: usize) -> (Vec<u8>, Vec<f32>) {
     match format {
         MatrixFormat::DenseF16 => {
@@ -205,5 +244,123 @@ fn native_swiglu_mixed_matrices_match_stage_oracles_on_cuda() {
                 assert_eq!(&actual[16..], bytes);
             }
         }
+    }
+}
+
+/// Exercises the native launchers, not BatchedOperationInvocation admission.
+/// The packed rows must preserve the old independent matrix computations even
+/// when a row tile crosses a request boundary or a source starts after row zero.
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn native_swiglu_packed_rows_match_independent_source_slices_on_cuda() {
+    use super::super::test_support::Guarded;
+
+    let context = CudaContext::new(0).expect("packed native SwiGLU requires CUDA");
+    let stream = context.default_stream();
+    let kernels = CudaNativeBlockKernels::load(&context).unwrap();
+    let module = context
+        .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL))
+        .unwrap();
+    let silu = module.load_function(SILU_MUL_FUNCTION_NAME).unwrap();
+    let hidden = 256;
+    let intermediate = 256;
+    let formats = [
+        GgufBlockFormat::Q4K,
+        GgufBlockFormat::Q6K,
+        GgufBlockFormat::Q4K,
+    ];
+    let matrices = formats
+        .into_iter()
+        .enumerate()
+        .map(|(index, format)| {
+            let (bytes, _) = matrix(MatrixFormat::Block(format), 256, 256, index);
+            Guarded::new(&stream, &bytes, 0xAB_u8)
+        })
+        .collect::<Vec<_>>();
+    let pointers = matrices
+        .iter()
+        .map(|matrix| matrix.pointer(&stream))
+        .collect::<Vec<_>>();
+    let part = |index: usize, offset| MatrixPart {
+        transform: None,
+        signs_region: None,
+        component_id: WeightId::new(format!("component.packed.{index}")).unwrap(),
+        format: MatrixFormat::Block(formats[index]),
+        rows: 256,
+        columns: 256,
+        output_offset: offset,
+    };
+    let gate_up = [part(0, 0), part(1, intermediate as u32)];
+    let down = [part(2, 0)];
+    let run = |input, count: usize| {
+        let guard = f16::from_f32(-12345.0);
+        let gate = Guarded::new(&stream, &vec![f16::NAN; count * intermediate * 2], guard);
+        let activation = Guarded::new(&stream, &vec![f16::NAN; count * intermediate], guard);
+        let output = Guarded::new(&stream, &vec![f16::NAN; count * hidden], guard);
+        launch(
+            &kernels,
+            &silu,
+            &stream,
+            &gate_up,
+            &down,
+            &pointers,
+            input,
+            output.pointer(&stream),
+            gate.pointer(&stream),
+            activation.pointer(&stream),
+            count as u32,
+            hidden as u32,
+            intermediate as u32,
+            0,
+        )
+        .unwrap();
+        [
+            gate.read(&stream),
+            activation.read(&stream),
+            output.read(&stream),
+        ]
+    };
+    for counts in [
+        vec![1, 1],
+        vec![7, 1],
+        vec![3, 11, 1],
+        vec![64, 1],
+        vec![1, 64],
+    ] {
+        let mut packed = Vec::new();
+        let mut separate = [Vec::new(), Vec::new(), Vec::new()];
+        for (participant, &count) in counts.iter().enumerate() {
+            let source_start = 3 + participant;
+            let source = (0..(source_start + count + 2) * hidden)
+                .map(|index| {
+                    f16::from_f32(((index * 13 + participant * 3) % 17) as f32 / 16384.0 - 0.0005)
+                })
+                .collect::<Vec<_>>();
+            // Separate physical input allocation and a nonzero source offset.
+            let source_gpu = Guarded::new(&stream, &source, f16::from_f32(73.0));
+            let stages = run(
+                source_gpu.pointer(&stream) + (source_start * hidden * 2) as u64,
+                count,
+            );
+            for (actual, expected) in separate.iter_mut().zip(stages) {
+                actual.extend(expected);
+            }
+            packed
+                .extend_from_slice(&source[source_start * hidden..(source_start + count) * hidden]);
+            source_gpu.assert_unchanged(&stream);
+        }
+        let packed_gpu = Guarded::new(&stream, &packed, f16::from_f32(79.0));
+        let combined = run(packed_gpu.pointer(&stream), counts.iter().sum());
+        for (stage, (combined, separate)) in combined.into_iter().zip(separate).enumerate() {
+            assert!(combined.iter().all(|value| value.is_finite()));
+            assert_eq!(
+                combined, separate,
+                "native packed stage {stage}, participant rows {counts:?}"
+            );
+        }
+        packed_gpu.assert_unchanged(&stream);
+    }
+    for matrix in matrices {
+        matrix.assert_unchanged(&stream);
     }
 }

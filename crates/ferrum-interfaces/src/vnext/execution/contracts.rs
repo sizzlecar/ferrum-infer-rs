@@ -5,6 +5,7 @@ use super::{
     ResolvedValueRole, ResourceId, SemanticValue, Serialize, StateId, TensorAccess, VNextError,
 };
 use crate::vnext::ProviderExecutionSemantics;
+use std::sync::Arc;
 
 pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(8, 1);
 pub const MAX_EXECUTION_PLAN_WIRE_BYTES: usize = 16 * 1024 * 1024;
@@ -24,20 +25,28 @@ impl PlanSchemaVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct PlanHash(String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlanHash(Arc<str>);
 
 impl PlanHash {
     pub(super) fn new(value: String) -> Result<Self, VNextError> {
         if !is_canonical_sha256(&value) {
             return Err(invalid_plan("plan hash must be a lowercase SHA256"));
         }
-        Ok(Self(value))
+        Ok(Self(value.into()))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Serialize for PlanHash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
     }
 }
 

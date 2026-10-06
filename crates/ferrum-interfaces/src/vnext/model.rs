@@ -19,9 +19,9 @@ use super::{
     NumericalProfileId, OperationId, PhysicalStorageLayout, PhysicalWeightComponentBinding,
     PhysicalWeightLayout, PhysicalWeightPadding, ProgramValueId, QuantizationGrouping,
     QuantizationPacking, QuantizationSpec, ResolvedTensorLayout, ResolvedWeightBinding,
-    ResolvedWeightComponentLayout, ResolvedWeightLogicalValidation, SemanticValue, StateId,
-    StateInitialization, TokenizerId, VNextError, WeightComponentRole, WeightEncoding,
-    WeightFormatId, WeightId, WeightLayoutId, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
+    ResolvedWeightComponentLayout, ResolvedWeightLogicalValidation, RnF16FragmentPlanV1,
+    SemanticValue, StateId, StateInitialization, TokenizerId, VNextError, WeightComponentRole,
+    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
     MAX_PHYSICAL_WEIGHT_LAYOUT_NODES,
 };
 
@@ -1240,6 +1240,50 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                     return Err(
                         self.invalid("block encoding changed while validating the physical layout")
                     );
+                }
+            }
+            PhysicalWeightLayout::RnF16DenseAndFragmentV1 {
+                dense_values,
+                fragment_values,
+                source_format,
+            } => {
+                if logical_element_type != ElementType::F16
+                    || dense_values.component_id == fragment_values.component_id
+                    || dense_values.storage != PhysicalStorageLayout::exact_contiguous()
+                    || fragment_values.storage != PhysicalStorageLayout::exact_contiguous()
+                {
+                    return Err(self.invalid("RN-F16 dual projection requires two distinct exact-contiguous components and logical F16"));
+                }
+                let plan =
+                    RnF16FragmentPlanV1::from_dimensions(*source_format, semantic_dimensions)?;
+                let dense = self.bind_component(
+                    dense_values,
+                    semantic_dimensions,
+                    WeightComponentRole::Values,
+                    depth,
+                )?;
+                if dense.encoding
+                    != (WeightEncoding::Dense {
+                        element_type: ElementType::F16,
+                    })
+                    || dense.physical_bytes()? != plan.dense_bytes()
+                {
+                    return Err(self.invalid(
+                        "RN-F16 dense representation differs from its logical F16 projection",
+                    ));
+                }
+                let fragment = self.bind_component(
+                    fragment_values,
+                    &plan.packed_dimensions(),
+                    WeightComponentRole::PackedValues,
+                    depth,
+                )?;
+                if fragment.encoding != plan.packed_encoding()
+                    || fragment.physical_bytes()? != plan.packed_bytes()
+                {
+                    return Err(self.invalid(
+                        "RN-F16 fragment representation differs from its checked ABI/format/span",
+                    ));
                 }
             }
             PhysicalWeightLayout::Hadamard { values, transform } => {

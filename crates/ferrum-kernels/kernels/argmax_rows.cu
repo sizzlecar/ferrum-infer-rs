@@ -192,8 +192,16 @@ extern "C" __global__ void argmax_rows_f16_masked(
 // vNext selection preserves the semantic logits value. When a repetition
 // penalty is active, one block first creates a private penalized row in the
 // invocation-scoped scratch supplied by the provider contract. The common
-// no-penalty path reads logits directly and performs no scratch traffic.
-template<typename Logit>
+// scalar no-penalty path reads logits directly; partitioned selection writes
+// only its 32 partials into the existing per-participant vocabulary scratch.
+struct VNextArgmaxPartial {
+    float maximum;
+    int index;
+};
+
+static constexpr int VNEXT_ARGMAX_PARTITIONS = 32;
+
+template<typename Logit, bool Partitioned = false>
 __device__ void vnext_masked_argmax_preserving_logits(
     const Logit* __restrict__ logits,
     Logit* __restrict__ scratch,
@@ -212,6 +220,10 @@ __device__ void vnext_masked_argmax_preserving_logits(
     unsigned int repetition_end = min(repetition_offsets[1], (unsigned int)repetition_capacity);
     const float penalty = repetition_penalty[0];
     const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
+    if (Partitioned && apply_penalty && blockIdx.x != 0) {
+        return;
+    }
+    const bool partition = Partitioned && !apply_penalty;
     const Logit* selection_logits = logits;
 
     if (apply_penalty) {
@@ -238,7 +250,9 @@ __device__ void vnext_masked_argmax_preserving_logits(
 
     float local_max = -INFINITY;
     int local_idx = -1;
-    for (int token = tid; token < n; token += block_size) {
+    const int first = tid + (partition ? int(blockIdx.x) * block_size : 0);
+    const int stride = block_size * (partition ? VNEXT_ARGMAX_PARTITIONS : 1);
+    for (int token = first; token < n; token += stride) {
         if (token >= mask_len || valid[token] == 0) {
             continue;
         }
@@ -287,7 +301,12 @@ __device__ void vnext_masked_argmax_preserving_logits(
             }
         }
         if (lane == 0) {
-            out_idx[0] = local_idx;
+            if (partition) {
+                auto* parts = reinterpret_cast<VNextArgmaxPartial*>(scratch);
+                parts[blockIdx.x] = {local_max, local_idx};
+            } else {
+                out_idx[0] = local_idx;
+            }
         }
     }
 }
@@ -322,4 +341,52 @@ extern "C" __global__ void last_token_masked_argmax_preserving_logits_f32(
 ) {
     vnext_masked_argmax_preserving_logits(logits, scratch, n, valid, mask_len,
         repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16_partitioned(
+    const __half* __restrict__ logits, __half* __restrict__ scratch, int n,
+    const signed char* __restrict__ valid, int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty, int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits<__half, true>(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_f32_partitioned(
+    const float* __restrict__ logits, float* __restrict__ scratch, int n,
+    const signed char* __restrict__ valid, int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty, int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits<float, true>(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_finalize(
+    const VNextArgmaxPartial* __restrict__ parts,
+    const unsigned int* __restrict__ repetition_offsets,
+    const float* __restrict__ repetition_penalty, int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    if (threadIdx.x != 0 || (repetition_penalty[0] != 1.0f &&
+        min(repetition_offsets[0], (unsigned int)repetition_capacity) <
+        min(repetition_offsets[1], (unsigned int)repetition_capacity))) {
+        return;
+    }
+    float maximum = -INFINITY;
+    int selected = -1;
+    for (int group = 0; group < VNEXT_ARGMAX_PARTITIONS; ++group) {
+        const VNextArgmaxPartial part = parts[group];
+        if (part.index >= 0 && (selected < 0 || part.maximum > maximum ||
+            (part.maximum == maximum && part.index < selected))) {
+            maximum = part.maximum;
+            selected = part.index;
+        }
+    }
+    out_idx[0] = selected;
 }

@@ -37,6 +37,10 @@ mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
+#[path = "metrics_only_tests.rs"]
+mod metrics_only_tests;
+#[path = "mixed_batch_tests.rs"]
+mod mixed_batch_tests;
 #[path = "prefix_prompt_tail_tests.rs"]
 mod prefix_prompt_tail_tests;
 
@@ -66,6 +70,7 @@ fn test_execution_capacity_deferral(
 
 struct PlanRuntimeAdmissionTestExecutor {
     inner: MockModelExecutor,
+    event_sink: std::sync::Mutex<Option<Arc<dyn ExecutionEventSink>>>,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     admission_accounting: std::sync::Mutex<Vec<(RequestId, usize, usize, usize)>>,
     completions: std::sync::Mutex<Vec<ExecutorSequenceCompletion>>,
@@ -174,6 +179,8 @@ struct PlanRuntimeBatchDecodeTestExecutor {
     decode_calls: AtomicU64,
     batch_decode_calls: AtomicU64,
     released_cache_count: AtomicU64,
+    mixed_behavior: std::sync::Mutex<Option<mixed_batch_tests::MixedBehavior>>,
+    mixed_calls: AtomicU64,
 }
 
 fn plan_runtime_prefill_to_mock_input(input: &PlanRuntimePrefillInput) -> PrefillInput {
@@ -240,6 +247,8 @@ impl PlanRuntimeBatchDecodeTestExecutor {
             decode_calls: AtomicU64::new(0),
             batch_decode_calls: AtomicU64::new(0),
             released_cache_count: AtomicU64::new(0),
+            mixed_behavior: std::sync::Mutex::new(None),
+            mixed_calls: AtomicU64::new(0),
         }
     }
 
@@ -599,6 +608,14 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
+    async fn plan_runtime_mixed_batch_with_capacity(
+        &self,
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+    ) -> Result<ferrum_interfaces::model_executor::PlanRuntimeMixedBatchOutcome> {
+        self.mock_mixed_batch(prefills, decodes).await
+    }
+
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -880,6 +897,7 @@ impl PlanRuntimeAdmissionTestExecutor {
     fn new(vocab_size: usize) -> Self {
         Self {
             inner: MockModelExecutor::instant(vocab_size),
+            event_sink: std::sync::Mutex::new(None),
             retained: std::sync::Mutex::new(HashSet::new()),
             admission_accounting: std::sync::Mutex::new(Vec::new()),
             completions: std::sync::Mutex::new(Vec::new()),
@@ -950,6 +968,10 @@ impl PlanRuntimeAdmissionTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
+    fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        *self.event_sink.lock().unwrap() = Some(sink);
+    }
+
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }

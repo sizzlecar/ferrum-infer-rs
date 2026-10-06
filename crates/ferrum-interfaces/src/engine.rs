@@ -51,6 +51,12 @@ pub trait InferenceEngine: Send + Sync {
         None
     }
 
+    /// Online latency scheduling state, when enabled for this engine.
+    /// This is a host execution feedback snapshot, not client-observed SLO compliance.
+    fn scheduler_slo_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Runtime-authoritative admission state. Startup sizing estimates are
     /// intentionally not accepted through this method.
     fn admission_snapshot(&self) -> Result<Option<ExecutorAdmissionSnapshot>> {

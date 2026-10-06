@@ -31,6 +31,21 @@ __device__ __forceinline__ const int* vnext_participant_control(
       binding_bytes + (unsigned long long)participant * binding_slot_bytes);
 }
 
+// The binding upload is refreshed before each graph replay. Keep the native
+// batched ABI's dense length vector current without caching host frontiers or
+// copying/replacing any authoritative page-table entry.
+extern "C" __global__ void vnext_causal_gather_decode_lengths(
+    const int* __restrict__ binding_base,
+    const unsigned long long binding_slot_bytes,
+    int* __restrict__ sequence_lengths,
+    const int participants) {
+  const int participant = blockIdx.x * blockDim.x + threadIdx.x;
+  if (participant < participants) {
+    sequence_lengths[participant] =
+        vnext_participant_control(binding_base, binding_slot_bytes, participant)[3];
+  }
+}
+
 // Packed query rows are contiguous even when their owning sequences have
 // different active-token counts. Resolve a packed row with a bounded binary
 // search over the stable binding slots so grid.x can be the packed token axis;

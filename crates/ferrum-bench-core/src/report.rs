@@ -20,6 +20,7 @@ pub fn render_single(report: &BenchReport) -> String {
     write_header(&mut s, report);
     write_env_block(&mut s, report);
     write_metrics_block(&mut s, report);
+    write_client_slo_block(&mut s, report);
     write_completion_block(&mut s, report);
     s
 }
@@ -33,7 +34,83 @@ pub fn render_sweep(reports: &[BenchReport]) -> String {
         write_env_block(&mut s, first);
     }
     write_sweep_table(&mut s, reports);
+    for report in reports {
+        write_client_slo_block(&mut s, report);
+    }
     s
+}
+
+fn write_client_slo_block(s: &mut String, report: &BenchReport) {
+    let Some(client) = &report.client_slo else {
+        return;
+    };
+    writeln!(
+        s,
+        "\n## Client latency SLO — concurrency {:?}\n",
+        report.concurrency
+    )
+    .ok();
+    writeln!(s, "P99 limits: TTFT {} ms, last-visible TPOT {} ms, visible SSE text-event ITL {} ms. Every repeat must pass with zero errors/rejections. Status: {:?}.\n",
+        client.config.ttft_p99_ms, client.config.tpot_p99_ms, client.config.visible_itl_p99_ms, client.status).ok();
+    writeln!(s, "| Repeat | SLO | Requests | Errors / rejects | TTFT P50/P99 ms | Last-visible TPOT P50/P99 ms | Visible SSE ITL P50/P99 ms | Successful usage tok/s | Peak VRAM / memory |").ok();
+    writeln!(s, "|---|---|---|---|---|---|---|---|---|").ok();
+    let percentiles = |metric: Option<crate::RepeatPercentiles>| {
+        metric
+            .map(|m| format!("{:.3} / {:.3}", m.p50, m.p99))
+            .unwrap_or_else(|| "unavailable".into())
+    };
+    for row in &client.repeats {
+        writeln!(
+            s,
+            "| {} | {:?} | {} | {} / {} | {} | {} | {} | {} | not collected |",
+            row.repeat + 1,
+            row.status,
+            row.offered_requests,
+            row.errors,
+            row.rejected_requests,
+            percentiles(row.ttft_ms),
+            percentiles(row.last_visible_tpot_ms),
+            percentiles(row.visible_sse_itl_ms),
+            row.successful_output_throughput_tps
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "unavailable".into())
+        )
+        .ok();
+    }
+    writeln!(s, "\nThroughput uses the entire measurement window, including failed work. Peak memory requires separate server-side evidence. HTTP rejects count 429/503 responses; other failures remain errors.\n").ok();
+    for row in &client.repeats {
+        writeln!(s, "Repeat {}: {} TTFT samples; {} TPOT samples, {} not applicable (one usage token), {} unknown.", row.repeat + 1, row.ttft_samples, row.tpot_samples, row.tpot_not_applicable_requests, row.tpot_unknown_requests).ok();
+        if let Some(evidence) = &row.text_timing {
+            writeln!(s, "{} visible events / {} observed gaps / {} contributing gaps; {} requests with fewer than two events; {} event/usage mismatches; {} missing usage; coalescing in {} requests / {} chunks.\n",
+                evidence.observed_text_events, evidence.observed_intervals, evidence.contributing_intervals,
+                evidence.fewer_than_two_events_requests, evidence.event_usage_mismatch_requests, evidence.missing_usage_requests,
+                evidence.transport_coalesced_requests, evidence.transport_coalesced_output_chunks).ok();
+        }
+    }
+    if let Some(dataset) = &report.dataset_evidence {
+        writeln!(
+            s,
+            "ShareGPT source SHA256 `{}`; tokenizer SHA256 `{}`; seed {}; output policy {}.\n",
+            dataset.source_sha256,
+            dataset.tokenizer_sha256,
+            dataset.prompt_seed,
+            if dataset.filter.fixed_output_tokens.is_some() {
+                "explicit fixed length"
+            } else {
+                "reference-answer token length"
+            }
+        )
+        .ok();
+        for selection in &dataset.repeats {
+            writeln!(
+                s,
+                "Repeat {} selection SHA256 `{}`.\n",
+                selection.repeat_index + 1,
+                selection.selection_sha256
+            )
+            .ok();
+        }
+    }
 }
 
 fn write_header(s: &mut String, r: &BenchReport) {
@@ -119,7 +196,7 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
     .ok();
     writeln!(
         s,
-        "| TPOT (ms) | {} | {} | {} | {} |",
+        "| TPOT (terminal, legacy ms) | {} | {} | {} | {} |",
         fmt(&r.tpot_ms.p50, has_ci),
         fmt(&r.tpot_ms.p75, has_ci),
         fmt(&r.tpot_ms.p95, has_ci),
@@ -129,7 +206,7 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
     if r.has_complete_itl_evidence() {
         writeln!(
             s,
-            "| ITL (ms)  | {} | {} | {} | {} |",
+            "| ITL (strict token diagnostic ms) | {} | {} | {} | {} |",
             fmt(&r.itl_ms.p50, has_ci),
             fmt(&r.itl_ms.p75, has_ci),
             fmt(&r.itl_ms.p95, has_ci),
@@ -139,7 +216,7 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
     } else {
         writeln!(
             s,
-            "| ITL (ms)  | unavailable | unavailable | unavailable | unavailable |"
+            "| ITL (strict token diagnostic ms) | unavailable | unavailable | unavailable | unavailable |"
         )
         .ok();
     }
@@ -337,7 +414,7 @@ mod tests {
         assert!(md.contains("## Environment"));
         assert!(md.contains("## Metrics"));
         assert!(md.contains("env_hash"));
-        assert!(md.contains("| ITL (ms)  | unavailable |"));
+        assert!(md.contains("| ITL (strict token diagnostic ms) | unavailable |"));
         // n_repeats=3 → CI columns ARE present
         assert!(!md.contains("⚠ < 3"));
         assert!(md.contains("±")); // mean ± ci95 format

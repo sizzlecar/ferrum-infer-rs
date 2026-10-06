@@ -47,6 +47,8 @@ use ferrum_types::AttentionExecutionPolicy;
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 use super::vnext_tool_correlation;
 
+mod binding_transfers;
+
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
@@ -365,161 +367,48 @@ fn coalesce_program_binding_transfers(
     mut writes: Vec<CudaProgramBindingWrite>,
     arena_size_bytes: u64,
 ) -> Result<Vec<CudaProgramBindingTransfer>, CudaDeviceRuntimeError> {
-    if writes.is_empty() || arena_size_bytes == 0 {
-        return Err(CudaDeviceRuntimeError::contract(
-            "CUDA sparse program binding transfer has no writes or arena",
-        ));
-    }
+    use binding_transfers::{coalesce_sorted_writes, BindingWrite};
     writes.sort_by_key(|write| write.destination_offset_bytes);
-
-    let mut prior_end = 0_u64;
-    for write in &writes {
-        let payload_bytes = u64::try_from(write.payload.len()).map_err(|_| {
-            CudaDeviceRuntimeError::contract("CUDA program binding payload exceeds u64")
-        })?;
-        if payload_bytes == 0 {
-            return Err(CudaDeviceRuntimeError::contract(
-                "CUDA sparse program binding write payload is empty",
-            ));
-        }
-        let end = write
-            .destination_offset_bytes
-            .checked_add(payload_bytes)
-            .ok_or_else(|| {
-                CudaDeviceRuntimeError::contract(
-                    "CUDA sparse program binding write range overflows u64",
-                )
+    let spans = writes
+        .iter()
+        .map(|write| {
+            let length = u64::try_from(write.payload.len()).map_err(|_| {
+                CudaDeviceRuntimeError::contract("CUDA program binding payload exceeds u64")
             })?;
-        if write.destination_offset_bytes < prior_end || end > arena_size_bytes {
-            return Err(CudaDeviceRuntimeError::contract(
-                "CUDA sparse program binding writes overlap or exceed the arena",
-            ));
-        }
-        prior_end = end;
-    }
-
-    let mut groups = Vec::new();
-    let mut group_count = 0_usize;
-    let mut group_bytes = 0_usize;
-    let mut group_end = None;
-    for write in &writes {
-        if group_end.is_some_and(|end| end != write.destination_offset_bytes) {
-            groups.push((group_count, group_bytes));
-            group_count = 0;
-            group_bytes = 0;
-        }
-        group_count = group_count.checked_add(1).ok_or_else(|| {
-            CudaDeviceRuntimeError::contract(
-                "CUDA sparse program binding transfer count overflows usize",
-            )
-        })?;
-        group_bytes = group_bytes
-            .checked_add(write.payload.len())
-            .ok_or_else(|| {
-                CudaDeviceRuntimeError::contract(
-                    "CUDA sparse program binding transfer size overflows usize",
-                )
-            })?;
-        group_end = Some(
-            write
-                .destination_offset_bytes
-                .checked_add(u64::try_from(write.payload.len()).map_err(|_| {
-                    CudaDeviceRuntimeError::contract("CUDA program binding payload exceeds u64")
-                })?)
-                .ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract(
-                        "CUDA sparse program binding write range overflows u64",
-                    )
-                })?,
-        );
-    }
-    groups.push((group_count, group_bytes));
-
-    let mut writes = writes.into_iter();
-    let mut rows = Vec::with_capacity(groups.len());
-    for (group_count, group_bytes) in groups {
-        let first = writes
-            .next()
-            .expect("validated sparse transfer group owns its first write");
-        let destination_offset_bytes = first.destination_offset_bytes;
-        if group_count == 1 {
-            rows.push(CudaProgramBindingWrite {
-                destination_offset_bytes,
-                payload: first.payload,
-            });
-            continue;
-        }
-        let mut payload = Vec::with_capacity(group_bytes);
-        payload.extend_from_slice(&first.payload);
-        for _ in 1..group_count {
-            let write = writes
-                .next()
-                .expect("validated sparse transfer group owns every adjacent write");
-            payload.extend_from_slice(&write.payload);
-        }
-        debug_assert_eq!(payload.len(), group_bytes);
-        rows.push(CudaProgramBindingWrite {
-            destination_offset_bytes,
-            payload: payload.into_boxed_slice(),
-        });
-    }
-    debug_assert!(writes.next().is_none());
-
-    let mut transfers = Vec::with_capacity(rows.len());
-    let mut row_index = 0_usize;
-    while row_index < rows.len() {
-        let row_bytes = rows[row_index].payload.len();
-        let mut row_count = 1_usize;
-        let mut destination_stride_bytes = u64::try_from(row_bytes).map_err(|_| {
-            CudaDeviceRuntimeError::contract("CUDA sparse program binding row size exceeds u64")
-        })?;
-        if let Some(next) = rows.get(row_index + 1).filter(|next| {
-            next.payload.len() == row_bytes
-                && next.destination_offset_bytes > rows[row_index].destination_offset_bytes
-        }) {
-            destination_stride_bytes = next
-                .destination_offset_bytes
-                .checked_sub(rows[row_index].destination_offset_bytes)
-                .expect("sorted non-overlapping program binding rows have a positive stride");
-            row_count = 2;
-            while let Some(next) = rows.get(row_index + row_count) {
-                let prior = &rows[row_index + row_count - 1];
-                if next.payload.len() != row_bytes
-                    || next
-                        .destination_offset_bytes
-                        .checked_sub(prior.destination_offset_bytes)
-                        != Some(destination_stride_bytes)
-                {
-                    break;
+            BindingWrite::new(write.destination_offset_bytes, length)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let layouts = coalesce_sorted_writes(&spans, arena_size_bytes)?;
+    layouts
+        .into_iter()
+        .map(|layout| {
+            let row_bytes = checked_usize(layout.row_bytes, "binding row")?;
+            let packed_bytes = row_bytes
+                .checked_mul(layout.row_count)
+                .ok_or_else(|| CudaDeviceRuntimeError::contract("binding payload overflows"))?;
+            let payload = if layout.source_write_ranges.len() == 1
+                && layout.source_write_ranges[0].len() == 1
+            {
+                std::mem::take(&mut writes[layout.source_write_ranges[0].start].payload)
+            } else {
+                let mut payload = Vec::with_capacity(packed_bytes);
+                for range in layout.source_write_ranges {
+                    for write in &writes[range] {
+                        payload.extend_from_slice(&write.payload);
+                    }
                 }
-                row_count += 1;
-            }
-        }
-
-        let packed_bytes = row_bytes.checked_mul(row_count).ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("CUDA sparse program binding packed rows exceed usize")
-        })?;
-        let destination_offset_bytes = rows[row_index].destination_offset_bytes;
-        let payload = if row_count == 1 {
-            std::mem::take(&mut rows[row_index].payload)
-        } else {
-            let mut payload = Vec::with_capacity(packed_bytes);
-            for row in &rows[row_index..row_index + row_count] {
-                payload.extend_from_slice(&row.payload);
-            }
+                payload.into_boxed_slice()
+            };
             debug_assert_eq!(payload.len(), packed_bytes);
-            payload.into_boxed_slice()
-        };
-        transfers.push(CudaProgramBindingTransfer {
-            destination_offset_bytes,
-            destination_stride_bytes,
-            row_bytes,
-            row_count,
-            payload,
-        });
-        row_index += row_count;
-    }
-    Ok(transfers)
+            Ok(CudaProgramBindingTransfer {
+                destination_offset_bytes: layout.destination_offset_bytes,
+                destination_stride_bytes: layout.destination_stride_bytes,
+                row_bytes,
+                row_count: layout.row_count,
+                payload,
+            })
+        })
+        .collect()
 }
 
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
@@ -2112,7 +2001,7 @@ impl CudaDeviceRuntime {
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))
     }
 
-    pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+    pub fn new(mut config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
         if !config.attention_execution_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA runtime requires a resolved attention execution policy",
@@ -2120,6 +2009,13 @@ impl CudaDeviceRuntime {
         }
         let context = CudaContext::new(config.ordinal)
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
+        // Advertise the fragment op only when both the embedded module and
+        // the actual device support its SM80 MMA instructions.
+        let major = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(|error| CudaDeviceRuntimeError::driver("MMA compute capability", error))?;
+        if major < 8 || !super::vnext_ops::rn_fragment_mma_compiled() {
+            config.capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
+        }
         // vNext owns all cross-stream ordering through explicit commands and
         // fences. Per-slice implicit events would create a second authority.
         unsafe {
@@ -4692,6 +4588,41 @@ mod tests {
     }
 
     #[test]
+    fn sparse_program_binding_transfers_join_interleaved_equal_width_rows() {
+        let transfers = coalesce_program_binding_transfers(
+            vec![
+                program_binding_write(0, vec![1; 2]),
+                program_binding_write(2, vec![2; 2]),
+                program_binding_write(16, vec![3; 8]),
+                program_binding_write(64, vec![4; 1]),
+                program_binding_write(65, vec![5; 3]),
+                program_binding_write(80, vec![6; 8]),
+                program_binding_write(128, vec![7; 4]),
+                program_binding_write(144, vec![8; 8]),
+            ],
+            152,
+        )
+        .unwrap();
+        assert_eq!(transfers.len(), 2);
+        assert_eq!(transfers[0].destination_offset_bytes, 0);
+        assert_eq!(transfers[0].destination_stride_bytes, 64);
+        assert_eq!(transfers[0].row_bytes, 4);
+        assert_eq!(transfers[0].row_count, 3);
+        assert_eq!(
+            transfers[0].payload.as_ref(),
+            &[1, 1, 2, 2, 4, 5, 5, 5, 7, 7, 7, 7]
+        );
+        assert_eq!(transfers[1].destination_offset_bytes, 16);
+        assert_eq!(transfers[1].destination_stride_bytes, 64);
+        assert_eq!(transfers[1].row_bytes, 8);
+        assert_eq!(transfers[1].row_count, 3);
+        assert_eq!(
+            transfers[1].payload.as_ref(),
+            [vec![3; 8], vec![6; 8], vec![8; 8]].concat()
+        );
+    }
+
+    #[test]
     fn qwen_max_context_sixty_four_patches_keep_only_live_binding_payload() {
         const PARTICIPANTS: u64 = 32;
         const RECURRENT_ROW_BYTES: u64 = 16;
@@ -4742,20 +4673,26 @@ mod tests {
         }
         assert_eq!(logical_patches.len(), 64);
 
-        let transfers = coalesce_program_binding_transfers(
-            logical_patches.into_iter().flatten().collect(),
-            arena_size,
-        )
-        .unwrap();
+        let writes = logical_patches.into_iter().flatten().collect::<Vec<_>>();
+        let mut expected = std::collections::BTreeMap::new();
+        for write in &writes {
+            for (byte, value) in write.payload.iter().copied().enumerate() {
+                assert!(expected
+                    .insert(write.destination_offset_bytes + byte as u64, value)
+                    .is_none());
+            }
+        }
+        let transfers = coalesce_program_binding_transfers(writes, arena_size).unwrap();
         let live_payload_bytes = transfers
             .iter()
             .map(|transfer| transfer.payload.len())
             .sum::<usize>();
         assert_eq!(live_payload_bytes, 65_536);
-        assert_eq!(transfers.len(), 32);
+        assert_eq!(transfers.len(), 17);
         assert_eq!(transfers[0].destination_offset_bytes, 0);
         assert_eq!(transfers[0].row_bytes, 1_616);
-        assert_eq!(transfers[0].row_count, 1);
+        assert_eq!(transfers[0].row_count, 16);
+        assert_eq!(transfers[0].destination_stride_bytes, group_capacity);
         assert_eq!(
             transfers[1].destination_offset_bytes,
             3 * recurrent_slot_capacity + causal_row_capacity,
@@ -4763,7 +4700,35 @@ mod tests {
         assert_eq!(transfers[1].destination_stride_bytes, causal_row_capacity);
         assert_eq!(transfers[1].row_bytes, CAUSAL_ROW_BYTES);
         assert_eq!(transfers[1].row_count, 31);
-        assert_eq!(transfers[2].destination_offset_bytes, group_capacity);
+        assert_eq!(
+            transfers[2].destination_offset_bytes,
+            group_capacity + 3 * recurrent_slot_capacity + causal_row_capacity
+        );
+        let mut actual = std::collections::BTreeMap::new();
+        for transfer in &transfers {
+            assert_eq!(
+                transfer.payload.len(),
+                transfer.row_bytes * transfer.row_count
+            );
+            for row in 0..transfer.row_count {
+                let destination = transfer.destination_offset_bytes
+                    + row as u64 * transfer.destination_stride_bytes;
+                for byte in 0..transfer.row_bytes {
+                    let address = destination + byte as u64;
+                    assert!(address < arena_size);
+                    assert!(
+                        actual
+                            .insert(address, transfer.payload[row * transfer.row_bytes + byte])
+                            .is_none(),
+                        "live destination byte may be written only once"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "exact live bytes; no arena hole is written"
+        );
     }
 
     pub(super) fn command(operation: &'static str) -> CudaDeviceCommand {

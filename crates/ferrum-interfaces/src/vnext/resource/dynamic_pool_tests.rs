@@ -11,9 +11,9 @@ use crate::vnext::{
     DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode, DynamicResourceDemand,
     ExecutionResourceMaintenanceStage, FenceIndeterminate, FenceQuery, HostTransferLayout,
     ProgramValueId, ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec,
-    ReusableExecutionCapacity, ReusableExecutionClassId, ReusableExecutionMemoryPlan,
-    ReusablePoolWorkspaceBudget, StateId, TrustedActiveSequenceBinding,
-    EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION,
+    ReusableExecutionCapacity, ReusableExecutionCatalogLifetime, ReusableExecutionClassId,
+    ReusableExecutionMemoryPlan, ReusablePoolWorkspaceBudget, StateId,
+    TrustedActiveSequenceBinding, EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -24,8 +24,17 @@ mod checkpoint_maintenance_tests;
 #[path = "capacity_pressure_tests.rs"]
 mod capacity_pressure_tests;
 
+#[path = "pool_resident_reclaim_tests.rs"]
+mod pool_resident_reclaim_tests;
+
+#[path = "reusable_pressure_tests.rs"]
+mod reusable_pressure_tests;
+
 #[path = "plan_fit_tests.rs"]
 mod plan_fit_tests;
+
+#[path = "operation_view_coverage_tests.rs"]
+mod operation_view_coverage_tests;
 
 #[path = "checkpoint/tests.rs"]
 mod checkpoint_backing_tests;
@@ -105,6 +114,8 @@ struct TestRuntime {
     observed_close_return_during_allocation: AtomicBool,
     reusable_resident_executables: AtomicU64,
     reusable_trim_calls: AtomicU64,
+    reusable_catalog_lifetime: Mutex<ReusableExecutionCatalogLifetime>,
+    reusable_trim_fails: AtomicBool,
     fence_behavior: AtomicU8,
     submit_behavior: AtomicU8,
     device_timing: Mutex<DeviceTimingMeasurement<DeviceExecutionTiming>>,
@@ -168,6 +179,8 @@ impl TestRuntime {
             observed_close_return_during_allocation: AtomicBool::new(false),
             reusable_resident_executables: AtomicU64::new(0),
             reusable_trim_calls: AtomicU64::new(0),
+            reusable_catalog_lifetime: Mutex::new(ReusableExecutionCatalogLifetime::StartupSealed),
+            reusable_trim_fails: AtomicBool::new(false),
             fence_behavior: AtomicU8::new(TestFenceBehavior::Succeeded as u8),
             submit_behavior: AtomicU8::new(TestSubmitBehavior::Submitted as u8),
             device_timing: Mutex::new(DeviceTimingMeasurement::NotRequested),
@@ -264,6 +277,10 @@ impl TestRuntime {
 
     fn reusable_trim_calls(&self) -> u64 {
         self.reusable_trim_calls.load(Ordering::Acquire)
+    }
+
+    fn set_reusable_catalog_lifetime(&self, lifetime: ReusableExecutionCatalogLifetime) {
+        *self.reusable_catalog_lifetime.lock().unwrap() = lifetime;
     }
 }
 
@@ -440,7 +457,15 @@ impl DeviceRuntime for TestRuntime {
             return Ok(DeviceReusableExecutionPreparation::unsupported());
         }
         let resident_executables = usize::try_from(resident_executables).unwrap();
-        let plan = DeviceReusableExecutionPlan::new(resident_executables).unwrap();
+        let plan = match *self.reusable_catalog_lifetime.lock().unwrap() {
+            ReusableExecutionCatalogLifetime::StartupSealed => {
+                DeviceReusableExecutionPlan::new(resident_executables)
+            }
+            ReusableExecutionCatalogLifetime::OnDemandBounded => {
+                DeviceReusableExecutionPlan::on_demand(resident_executables)
+            }
+        }
+        .unwrap();
         Ok(DeviceReusableExecutionPreparation::ready(
             plan,
             resident_executables,
@@ -457,6 +482,9 @@ impl DeviceRuntime for TestRuntime {
         _stream: &mut Self::Stream,
     ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
         self.reusable_trim_calls.fetch_add(1, Ordering::AcqRel);
+        if self.reusable_trim_fails.load(Ordering::Acquire) {
+            return Err(TestRuntimeError);
+        }
         let released_executables = self.reusable_resident_executables.swap(0, Ordering::AcqRel);
         Ok(DeviceReusableExecutionTrim::new(
             usize::try_from(released_executables).unwrap(),
@@ -1383,6 +1411,16 @@ fn reusable_step_memory_plan(
 }
 
 fn idle_reusable_step_slot_harness() -> (Harness, Arc<ExecutionLane<TestRuntime>>) {
+    let (harness, lane, slices) = idle_reusable_step_slot_harness_with_pin();
+    drop(slices);
+    (harness, lane)
+}
+
+fn idle_reusable_step_slot_harness_with_pin() -> (
+    Harness,
+    Arc<ExecutionLane<TestRuntime>>,
+    Vec<LogicalBackingSliceAuthority>,
+) {
     let catalog = pool_catalog(
         linear_profile(),
         AllocationLifetime::Step,
@@ -1421,7 +1459,6 @@ fn idle_reusable_step_slot_harness() -> (Harness, Arc<ExecutionLane<TestRuntime>
         panic!("resident reusable capacity bucket must prepare")
     };
     let (slices, slot) = prepared.commit().into_parts();
-    drop(slices);
     drop(slot);
     drop(binding);
 
@@ -1429,7 +1466,7 @@ fn idle_reusable_step_slot_harness() -> (Harness, Arc<ExecutionLane<TestRuntime>
     let occupancy = status.pools()[0].live_occupancy();
     assert_eq!(occupancy.lane_stable().total().claim_count(), 1);
     assert_eq!(occupancy.lane_stable().total().physical_bytes(), 256);
-    (harness, lane)
+    (harness, lane, slices)
 }
 
 #[test]
@@ -2855,7 +2892,12 @@ fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
     let boundary = growth
         .maintenance_boundary()
         .expect("pressure-driven growth must retain its pre-mutation boundary");
-    assert_eq!(boundary.schema_version(), 1);
+    assert_eq!(
+        boundary.schema_version(),
+        DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION
+    );
+    assert!(boundary.reclaim_attempted());
+    assert!(boundary.pressure().device_capacity().is_some());
     assert!(boundary.reclaim_sufficient());
     assert_eq!(boundary.selected_bytes(), rebalance.reclaimed_bytes());
     assert_eq!(boundary.selected_chunks(), rebalance.pools()[0].chunks());

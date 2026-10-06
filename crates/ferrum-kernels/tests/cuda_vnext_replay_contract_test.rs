@@ -289,7 +289,9 @@ fn token_replay_identity_uses_typed_coordinate_ownership() {
     assert!(topology.contains("binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)"));
     assert!(topology.contains("if bind_source_ranges"));
     assert!(VNEXT_OPS_SOURCE.contains("token-embedding.reusable-topology.v2"));
-    assert!(VNEXT_OPS_SOURCE.contains("last-token-linear.reusable-topology.v2"));
+    // Last-token v3 also binds the gather workspace address scope. Its old
+    // topology must not be reused for the new copy-plus-GEMM command sequence.
+    assert!(VNEXT_OPS_SOURCE.contains("last-token-linear.reusable-topology.v3"));
     assert!(!VNEXT_OPS_SOURCE.contains("reusable-topology.v1"));
 }
 

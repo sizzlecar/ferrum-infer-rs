@@ -25,7 +25,10 @@ use ferrum_interfaces::vnext::{
     TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
     TOKEN_EMBEDDING_OPERATION_ID,
 };
-use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
+use metal::{
+    CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, FunctionConstantValues,
+    MTLDataType, MTLSize,
+};
 
 use crate::gguf_blocks::GgufBlockFormat;
 
@@ -93,6 +96,8 @@ const RMS_NORM_F32_TO_F16_KERNEL: &str = "vnext_rms_norm_f32_to_f16";
 const RMS_NORM_F32_KERNEL: &str = "vnext_rms_norm_f32";
 const RESIDUAL_ADD_F32_F16_KERNEL: &str = "vnext_residual_add_f32_f16";
 const LAST_TOKEN_MASKED_ARGMAX_F32_KERNEL: &str = "vnext_last_token_masked_argmax_f32";
+const MASKED_ARGMAX_PARTITIONS: u64 = 32;
+const MASKED_ARGMAX_PARALLEL_MIN_VOCAB: u32 = 8192;
 
 pub(super) struct MetalPrimitivePipelines {
     hadamard: MetalHadamardPipelines,
@@ -113,6 +118,9 @@ pub(super) struct MetalPrimitivePipelines {
     rms_norm_f32: ComputePipelineState,
     residual_add_f32_f16: ComputePipelineState,
     last_token_masked_argmax_f32: ComputePipelineState,
+    parallel_masked_argmax: ComputePipelineState,
+    parallel_masked_argmax_f32: ComputePipelineState,
+    masked_argmax_finalize: ComputePipelineState,
 }
 
 impl MetalPrimitivePipelines {
@@ -124,8 +132,21 @@ impl MetalPrimitivePipelines {
                     "compile Metal vNext primitive library: {error}"
                 ))
             })?;
-        let pipeline = |name: &str| {
-            let function = library.get_function(name, None).map_err(|error| {
+        let specialized_pipeline = |name: &str, parallel: bool| {
+            let constants = matches!(
+                name,
+                LAST_TOKEN_MASKED_ARGMAX_KERNEL | LAST_TOKEN_MASKED_ARGMAX_F32_KERNEL
+            )
+            .then(|| {
+                let constants = FunctionConstantValues::new();
+                constants.set_constant_value_at_index(
+                    &parallel as *const bool as *const c_void,
+                    MTLDataType::Bool,
+                    0,
+                );
+                constants
+            });
+            let function = library.get_function(name, constants).map_err(|error| {
                 MetalDeviceRuntimeError::contract(format!(
                     "load Metal vNext primitive `{name}`: {error}"
                 ))
@@ -138,6 +159,7 @@ impl MetalPrimitivePipelines {
                     ))
                 })
         };
+        let pipeline = |name: &str| specialized_pipeline(name, false);
         Ok(Self {
             hadamard: MetalHadamardPipelines::new(device)?,
             embedding_dense: pipeline(EMBEDDING_DENSE_KERNEL)?,
@@ -157,6 +179,12 @@ impl MetalPrimitivePipelines {
             rms_norm_f32: pipeline(RMS_NORM_F32_KERNEL)?,
             residual_add_f32_f16: pipeline(RESIDUAL_ADD_F32_F16_KERNEL)?,
             last_token_masked_argmax_f32: pipeline(LAST_TOKEN_MASKED_ARGMAX_F32_KERNEL)?,
+            parallel_masked_argmax: specialized_pipeline(LAST_TOKEN_MASKED_ARGMAX_KERNEL, true)?,
+            parallel_masked_argmax_f32: specialized_pipeline(
+                LAST_TOKEN_MASKED_ARGMAX_F32_KERNEL,
+                true,
+            )?,
+            masked_argmax_finalize: pipeline("vnext_masked_argmax_finalize")?,
         })
     }
 }
@@ -1449,7 +1477,8 @@ fn encode_last_token_masked_argmax_typed(
         invocation.participants().len() as u64,
         "Metal masked argmax participant count",
     )?;
-    let dispatch_count = launches.len() as u64;
+    let dispatch_count =
+        launches.len() as u64 * masked_argmax_dispatch_count(launches[0].params.vocabulary_size);
     MetalDeviceCommand::operation(
         "vnext_last_token_masked_argmax",
         regions,
@@ -1561,9 +1590,12 @@ fn dispatch_last_token_masked_argmax(
     params: LastTokenMaskedArgmaxParams,
     logits_type: ElementType,
 ) {
-    let pipeline = match logits_type {
-        ElementType::F16 => &pipelines.last_token_masked_argmax,
-        ElementType::F32 => &pipelines.last_token_masked_argmax_f32,
+    let parallel = masked_argmax_dispatch_count(params.vocabulary_size) == 2;
+    let pipeline = match (logits_type, parallel) {
+        (ElementType::F16, false) => &pipelines.last_token_masked_argmax,
+        (ElementType::F32, false) => &pipelines.last_token_masked_argmax_f32,
+        (ElementType::F16, true) => &pipelines.parallel_masked_argmax,
+        (ElementType::F32, true) => &pipelines.parallel_masked_argmax_f32,
         other => panic!("unsupported Metal masked argmax logits type {other:?}"),
     };
     encoder.set_compute_pipeline_state(pipeline);
@@ -1579,7 +1611,34 @@ fn dispatch_last_token_masked_argmax(
         std::mem::size_of::<LastTokenMaskedArgmaxParams>() as u64,
         &params as *const _ as *const c_void,
     );
-    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(THREADS_PER_GROUP, 1, 1));
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            if parallel {
+                MASKED_ARGMAX_PARTITIONS
+            } else {
+                1
+            },
+            1,
+            1,
+        ),
+        MTLSize::new(THREADS_PER_GROUP, 1, 1),
+    );
+    if parallel {
+        encoder.set_compute_pipeline_state(&pipelines.masked_argmax_finalize);
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 1, 1));
+    }
+}
+
+fn masked_argmax_dispatch_count(vocabulary_size: u32) -> u64 {
+    // Each partition writes an F32 maximum plus U32 index (256 bytes total).
+    // The existing per-participant vocabulary scratch already covers this even
+    // for F16. An active repetition penalty retains the original one-group
+    // algorithm on the GPU; its finalization dispatch does no work.
+    if vocabulary_size >= MASKED_ARGMAX_PARALLEL_MIN_VOCAB {
+        2
+    } else {
+        1
+    }
 }
 
 fn estimate_masked_argmax_resources(
@@ -1944,6 +2003,10 @@ fn dispatch_residual_add_typed_at(
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
     );
 }
+
+#[cfg(test)]
+#[path = "primitives_argmax_tests.rs"]
+mod parallel_argmax_tests;
 
 #[cfg(test)]
 mod tests {

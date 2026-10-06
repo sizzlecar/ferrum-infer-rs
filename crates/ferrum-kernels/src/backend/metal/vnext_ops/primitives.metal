@@ -4,6 +4,13 @@ using namespace metal;
 constant uint THREADS_PER_GROUP = 256;
 constant uint QK_K = 256;
 constant uint QK8_0 = 32;
+constant bool PARALLEL_MASKED_ARGMAX [[function_constant(0)]];
+constant uint ARGMAX_PARTITIONS = 32;
+
+struct ArgmaxPartial {
+    float maximum;
+    uint index;
+};
 
 struct EmbeddingParams {
     uint token_count;
@@ -295,11 +302,16 @@ kernel void vnext_last_token_masked_argmax_f16(
     constant LastTokenMaskedArgmaxParams & params [[buffer(7)]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]) {
     const float penalty = repetition_penalty[0];
     const uint repetition_start = min(repetition_offsets[0], params.repetition_capacity);
     const uint repetition_end = min(repetition_offsets[1], params.repetition_capacity);
     const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
+    if (PARALLEL_MASKED_ARGMAX && apply_penalty && group_id.x != 0) {
+        return;
+    }
+    const bool partition = PARALLEL_MASKED_ARGMAX && !apply_penalty;
     if (apply_penalty) {
         for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {
             scratch[token] = logits[token];
@@ -323,7 +335,9 @@ kernel void vnext_last_token_masked_argmax_f16(
 
     float local_maximum = -INFINITY;
     int local_index = -1;
-    for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {
+    const uint first = lane + (partition ? group_id.x * THREADS_PER_GROUP : 0);
+    const uint stride = THREADS_PER_GROUP * (partition ? ARGMAX_PARTITIONS : 1);
+    for (uint token = first; token < params.vocabulary_size; token += stride) {
         if (valid_mask[token] == 0) {
             continue;
         }
@@ -363,7 +377,13 @@ kernel void vnext_last_token_masked_argmax_f16(
                 index = candidate_index;
             }
         }
-        output[0] = index == 0x7fffffff ? 0xffffffffu : uint(index);
+        const uint selected = index == 0x7fffffff ? 0xffffffffu : uint(index);
+        if (partition) {
+            device ArgmaxPartial * parts = reinterpret_cast<device ArgmaxPartial *>(scratch);
+            parts[group_id.x] = {maximum, selected};
+        } else {
+            output[0] = selected;
+        }
     }
 }
 
@@ -558,11 +578,16 @@ kernel void vnext_last_token_masked_argmax_f32(
     constant LastTokenMaskedArgmaxParams & params [[buffer(7)]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]) {
     const float penalty = repetition_penalty[0];
     const uint repetition_start = min(repetition_offsets[0], params.repetition_capacity);
     const uint repetition_end = min(repetition_offsets[1], params.repetition_capacity);
     const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
+    if (PARALLEL_MASKED_ARGMAX && apply_penalty && group_id.x != 0) {
+        return;
+    }
+    const bool partition = PARALLEL_MASKED_ARGMAX && !apply_penalty;
     if (apply_penalty) {
         for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {
             scratch[token] = logits[token];
@@ -586,7 +611,9 @@ kernel void vnext_last_token_masked_argmax_f32(
 
     float local_maximum = -INFINITY;
     int local_index = -1;
-    for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {
+    const uint first = lane + (partition ? group_id.x * THREADS_PER_GROUP : 0);
+    const uint stride = THREADS_PER_GROUP * (partition ? ARGMAX_PARTITIONS : 1);
+    for (uint token = first; token < params.vocabulary_size; token += stride) {
         if (valid_mask[token] == 0) {
             continue;
         }
@@ -626,6 +653,38 @@ kernel void vnext_last_token_masked_argmax_f32(
                 index = candidate_index;
             }
         }
-        output[0] = index == 0x7fffffff ? 0xffffffffu : uint(index);
+        const uint selected = index == 0x7fffffff ? 0xffffffffu : uint(index);
+        if (partition) {
+            device ArgmaxPartial * parts = reinterpret_cast<device ArgmaxPartial *>(scratch);
+            parts[group_id.x] = {maximum, selected};
+        } else {
+            output[0] = selected;
+        }
     }
+}
+
+kernel void vnext_masked_argmax_finalize(
+    device const ArgmaxPartial * parts [[buffer(1)]],
+    device const uint * repetition_offsets [[buffer(4)]],
+    device const float * repetition_penalty [[buffer(5)]],
+    device uint * output [[buffer(6)]],
+    constant LastTokenMaskedArgmaxParams & params [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (lane != 0 || (repetition_penalty[0] != 1.0f &&
+        min(repetition_offsets[0], params.repetition_capacity) <
+        min(repetition_offsets[1], params.repetition_capacity))) {
+        return;
+    }
+    float maximum = -INFINITY;
+    uint selected = 0xffffffffu;
+    for (uint group = 0; group < ARGMAX_PARTITIONS; ++group) {
+        const ArgmaxPartial part = parts[group];
+        if (part.index != 0xffffffffu && (selected == 0xffffffffu ||
+            part.maximum > maximum ||
+            (part.maximum == maximum && part.index < selected))) {
+            maximum = part.maximum;
+            selected = part.index;
+        }
+    }
+    output[0] = selected;
 }

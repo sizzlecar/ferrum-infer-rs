@@ -1148,6 +1148,13 @@ impl FerrumConfigBuilder {
                 );
             }
         }
+        if self.entry("FERRUM_PREFILL_DECODE_EXECUTION").is_none() {
+            runtime_config.upsert(
+                "FERRUM_PREFILL_DECODE_EXECUTION",
+                crate::PrefillDecodeExecution::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
             if self
                 .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
@@ -1222,6 +1229,7 @@ impl FerrumConfigBuilder {
             default_prefill_first_until_active,
             default_active_decode_prefill_chunk,
         )?);
+        decisions.push(self.prefill_decode_execution_decision()?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -2502,6 +2510,35 @@ impl FerrumConfigBuilder {
         )
     }
 
+    fn prefill_decode_execution_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = "FERRUM_PREFILL_DECODE_EXECUTION";
+        let (policy, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::PrefillDecodeExecution::parse_runtime_value(&entry.effective_value)
+                    .map_err(|reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    })?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::PrefillDecodeExecution::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        Ok(self.decision(
+            "prefill_decode_execution",
+            policy.as_runtime_value(),
+            source,
+            source_key,
+            ["split", "mixed"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
     fn scheduler_decision(
         &self,
         default_prefill_first_until_active: Option<ResolvedValue<usize>>,
@@ -2667,6 +2704,24 @@ impl FerrumConfigBuilder {
         {
             selected.push_str("+prefill_token_budget:elastic");
         }
+        let budget_key = "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET";
+        if let Some(value) = entries.get(budget_key) {
+            let budget = parse_usize_env_value(value).map_err(|reason| {
+                AutoConfigError::InvalidOverride {
+                    key: budget_key.to_owned(),
+                    reason,
+                }
+            })?;
+            if budget == 0 {
+                selected.push_str("+active_decode_prefill_token_budget:disabled");
+            } else {
+                selected.push_str(&format!("+active_decode_prefill_token_budget:{budget}"));
+            }
+            if source_key.is_none() {
+                source = self.source_for_key(budget_key, AutoConfigSource::Default);
+                source_key = Some(budget_key.to_owned());
+            }
+        }
         Ok(self.decision(
             "scheduler_admission_policy",
             &selected,
@@ -2678,6 +2733,7 @@ impl FerrumConfigBuilder {
                 "prefill_first_until_active",
                 "prefill_first_until_active+active_decode_prefill_chunk",
                 "active_decode_prefill_chunk",
+                "active_decode_prefill_token_budget",
                 "prefill_step_chunk",
                 "prefill_token_budget:elastic",
             ],
@@ -5121,6 +5177,172 @@ mod tests {
             .with_execution_resource_authority(authority)
             .resolve()
             .unwrap()
+    }
+
+    #[test]
+    fn prefill_decode_execution_records_split_default_and_explicit_sources() {
+        let key = "FERRUM_PREFILL_DECODE_EXECUTION";
+        for (value, runtime_source, source) in [
+            (
+                None,
+                RuntimeConfigSource::Default,
+                AutoConfigSource::Default,
+            ),
+            (
+                Some("mixed"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("mixed"),
+                RuntimeConfigSource::Env,
+                AutoConfigSource::Env,
+            ),
+            (
+                Some("split"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+        ] {
+            let snapshot = value
+                .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
+                .unwrap_or_default();
+            let resolved = scheduler_resolution(
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                4,
+                snapshot,
+            );
+            let expected = value.unwrap_or("split");
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, expected);
+            assert_eq!(entry.source, runtime_source);
+            let decision = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "prefill_decode_execution")
+                .unwrap();
+            assert_eq!(decision.selected, expected);
+            assert_eq!(decision.source, source);
+            assert_eq!(decision.source_key.as_deref(), value.map(|_| key));
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.batching.prefill_decode_execution.as_runtime_value(),
+                expected
+            );
+        }
+        let error = FerrumConfigBuilder::new(snapshot(&[(key, "automatic")]))
+            .resolve()
+            .unwrap_err();
+        assert!(
+            matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+        );
+    }
+
+    #[test]
+    fn active_decode_prefill_token_budget_preserves_override_sources_and_disable() {
+        let key = "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET";
+        for backend in ["metal", "cuda"] {
+            for (value, runtime_source, source) in [
+                (
+                    "96",
+                    RuntimeConfigSource::ConfigFile,
+                    AutoConfigSource::ConfigFile,
+                ),
+                ("192", RuntimeConfigSource::Env, AutoConfigSource::Env),
+                ("0", RuntimeConfigSource::Cli, AutoConfigSource::Cli),
+            ] {
+                let resolved = scheduler_resolution(
+                    backend,
+                    ExecutionResourceAuthority::PlanRuntime,
+                    4,
+                    snapshot_with_sources(&[(key, value, runtime_source)]),
+                );
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                let expected = value.parse::<usize>().unwrap();
+                assert_eq!(
+                    engine.scheduler.active_decode_prefill_token_budget,
+                    (expected > 0).then_some(expected)
+                );
+                let entry = resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .unwrap();
+                assert_eq!(entry.effective_value, value);
+                assert_eq!(entry.source, runtime_source);
+                let policy = resolved
+                    .decisions
+                    .iter()
+                    .find(|decision| decision.selection == "scheduler_admission_policy")
+                    .unwrap();
+                let suffix = if expected == 0 { "disabled" } else { value };
+                assert!(policy
+                    .selected
+                    .split('+')
+                    .any(|part| part == format!("active_decode_prefill_token_budget:{suffix}")));
+                assert_eq!(policy.source, source);
+                assert_eq!(policy.source_key.as_deref(), Some(key));
+            }
+        }
+    }
+
+    #[test]
+    fn active_decode_prefill_token_budget_has_no_implicit_default() {
+        for backend in ["cpu", "metal", "cuda"] {
+            let resolved = scheduler_resolution(
+                backend,
+                ExecutionResourceAuthority::PlanRuntime,
+                4,
+                snapshot(&[]),
+            );
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert!(engine
+                .scheduler
+                .active_decode_prefill_token_budget
+                .is_none());
+            assert!(resolved
+                .runtime_config
+                .entries
+                .iter()
+                .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET"));
+            let policy = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "scheduler_admission_policy")
+                .unwrap();
+            assert!(!policy
+                .selected
+                .contains("active_decode_prefill_token_budget"));
+        }
+    }
+
+    #[test]
+    fn active_decode_prefill_token_budget_rejects_invalid_overrides() {
+        let key = "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET";
+        for value in ["many", "-1", "1.5"] {
+            let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+            );
+        }
     }
 
     #[test]

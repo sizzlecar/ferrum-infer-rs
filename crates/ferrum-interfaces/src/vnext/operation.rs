@@ -13,6 +13,8 @@ mod dispatch_contract;
 mod foundation;
 mod identity;
 mod invocation;
+#[cfg(test)]
+pub(crate) use invocation::test_only_backing_window_coverage;
 mod provider;
 mod registry;
 mod resolved_value;
@@ -86,8 +88,8 @@ pub use registry::{
     BoundOperationProvider, BoundOperationProviderSet, OperationPlanningHandle,
     OperationPlanningRegistry, OperationProvider, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
-    ReusableExecutionWorkspaceAddress,
+    ReusableBindingResources, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
+    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress,
 };
 pub use resolved_value::{
     ProviderStorageBindingRequirement, ResolvedStorageComponent, ResolvedValueBinding,
@@ -111,6 +113,7 @@ pub use weight_contract::{
     HadamardApplication, HadamardSigns, HadamardTransformSpec, PhysicalStorageLayout,
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
     QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedWeightBinding,
-    ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding,
-    MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH, MAX_PHYSICAL_WEIGHT_LAYOUT_NODES,
+    ResolvedWeightComponentLayout, RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1,
+    WeightComponentRole, WeightEncoding, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
+    MAX_PHYSICAL_WEIGHT_LAYOUT_NODES, RN_F16_FRAGMENT_ABI_V1,
 };

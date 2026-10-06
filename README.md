@@ -165,6 +165,53 @@ requesting unsupported `on_demand` reports an error. Set `reusable_execution = f
 to disable device-program preparation. These options do not change request
 admission, queuing, or the model's numerical profile.
 
+Optional SLO-aware prefill scheduling is available in both
+`run` and `serve`: `--scheduler-slo ttft:200,tpot:15,itl:50` (milliseconds).
+Alternatively, set the targets in the working directory's `ferrum.toml`:
+
+```toml
+[scheduler.slo]
+ttft_ms = 200
+tpot_ms = 15
+itl_ms = 50
+```
+
+All three targets must be positive and finite. CLI targets override the file;
+scheduling stays static when neither source enables this option.
+SLO-aware scheduling is disabled by default. No throughput benefit has been
+measured on the current ShareGPT workload; keep it opt-in.
+Prefill is limited only when the estimated wave would exceed ITL, with a TTFT
+feasibility fallback. TPOT remains a request-level benchmark constraint, not a
+per-wave limit. These estimates do not guarantee client-observed SLO compliance.
+`GET /health` → `scheduler.slo` exposes actual `adapted_prefill_steps`,
+`ttft_fallback_steps`, and `decode_target_infeasible` status.
+Budget feedback is a scheduling estimate. Measure client P99 latency and
+throughput changes with `bench-serve` on the same hardware, model, and workload.
+See the [throughput goal](docs/goal-slo-throughput.zh.md) and
+[measurement results](docs/performance-p0-20261006.zh.md) for scope and evidence.
+
+To reproduce the static CUDA configuration for the RTX 5090 / Qwen3.5-9B
+Q4_K_M measurements, use the following options with no `[scheduler.slo]` or
+additional prefill chunk settings in `ferrum.toml`. Replace both model paths.
+This uses a 24 GiB runtime budget and keeps capacity fixed during the client
+concurrency sweep; it is not a general recommendation for other models or GPUs.
+
+```sh
+ferrum serve --model /path/Qwen3.5-9B-Q4_K_M.gguf \
+  --semantic-source /path/qwen35-9b-semantic \
+  --backend cuda --gpu-devices 0 \
+  --numerical-profile qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8 \
+  --prefill-decode-execution split \
+  --scheduler-active-decode-prefill-token-budget 0 \
+  --max-model-len 2048 --kv-capacity 2048 \
+  --max-num-seqs 32 --max-num-batched-tokens 2048 \
+  --runtime-memory-budget-bytes 25769803776 \
+  --kv-dtype fp16 --disable-prefix-cache --session-cache off \
+  --disable-thinking --profile-detail off \
+  --host 127.0.0.1 --port 19081 --served-model-name comparison \
+  --effective-config-json /tmp/ferrum-effective.json
+```
+
 ### KV cache precision
 
 Ferrum v0.11.0 accepts `--kv-dtype int8` in both `run` and `serve`. FP16 remains

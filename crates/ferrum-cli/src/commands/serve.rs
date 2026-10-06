@@ -122,6 +122,15 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
 
+    /// Native plan-runtime prefill/decode execution: split (default) or mixed.
+    /// Applies only to native plan runtimes; legacy execution follows its existing policy.
+    #[arg(long, value_enum)]
+    pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
+
+    /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
+    #[arg(long, value_name = "TARGETS")]
+    pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
+
     /// Sequence fit gate used before prefill admission.
     #[arg(long, value_enum)]
     pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
@@ -137,6 +146,10 @@ pub struct ServeCommand {
     /// Cap prefill chunks while decode requests are active.
     #[arg(long, value_name = "N")]
     pub scheduler_active_decode_prefill_chunk: Option<usize>,
+
+    /// Cap total prefill tokens per scheduler iteration with active decode; 0 disables.
+    #[arg(long, value_name = "N")]
+    pub scheduler_active_decode_prefill_token_budget: Option<usize>,
 
     /// Enable prefix caching (`FERRUM_PREFIX_CACHE=1`).
     #[arg(
@@ -258,7 +271,7 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
-    /// Product observability detail level.
+    /// Product observability detail level. Basic without artifact paths collects timing metrics only.
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
@@ -396,10 +409,13 @@ async fn execute_with_compatibility(
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
+        prefill_decode_execution,
+        scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
+        scheduler_active_decode_prefill_token_budget,
         enable_prefix_caching,
         no_enable_prefix_caching,
         enable_prefix_cache,
@@ -443,6 +459,7 @@ async fn execute_with_compatibility(
         lora_model_id_template,
     } = cmd;
 
+    let scheduler_slo = config.resolve_scheduler_slo(scheduler_slo)?;
     let default_enable_thinking = if enable_thinking {
         Some(true)
     } else if disable_thinking {
@@ -567,6 +584,7 @@ async fn execute_with_compatibility(
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut product_engine_config = product_input.engine_config;
+    product_engine_config.scheduler.slo = scheduler_slo;
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
     let config_runtime_entries = config.runtime.runtime_config_entries();
@@ -821,6 +839,8 @@ async fn execute_with_compatibility(
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
+        scheduler_active_decode_prefill_token_budget,
+        prefill_decode_execution,
         greedy_argmax_cli_override(greedy_argmax, disable_greedy_argmax),
         prefix_cache_cli_override(
             enable_prefix_caching,
@@ -1166,6 +1186,7 @@ async fn execute_with_compatibility(
     write_resolved_execution_config(
         effective_config_json.as_deref(),
         resolved_execution_metrics.as_ref(),
+        scheduler_slo,
     )?;
     let server = server
         .with_auto_config(startup_auto_config)
@@ -1556,6 +1577,8 @@ fn serve_cli_runtime_entries(
     scheduler_prefill_first_until_active: Option<usize>,
     scheduler_prefill_step_chunk: Option<usize>,
     scheduler_active_decode_prefill_chunk: Option<usize>,
+    scheduler_active_decode_prefill_token_budget: Option<usize>,
+    prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
     greedy_argmax: Option<bool>,
     prefix_cache: Option<bool>,
     session_cache: Option<&str>,
@@ -1600,6 +1623,16 @@ fn serve_cli_runtime_entries(
         &mut entries,
         "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
         scheduler_active_decode_prefill_chunk,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+        scheduler_active_decode_prefill_token_budget,
+    );
+    push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_PREFILL_DECODE_EXECUTION",
+        prefill_decode_execution.map(crate::commands::PrefillDecodeExecutionArg::as_runtime_value),
     );
     if let Some(enabled) = greedy_argmax {
         entries.push(RuntimeConfigEntry::new(
@@ -1920,15 +1953,14 @@ fn write_startup_config_artifacts_with_failure(
 
 /// Replace requested-only startup evidence with the selected plan after the
 /// executor has compiled and initialized successfully. Both run and serve use
-/// this path; legacy executors without numerical evidence leave it unchanged.
+/// this path; legacy executors without numerical evidence retain their requested
+/// numerical policy. Scheduler targets are recorded independently of the backend.
 pub(crate) fn write_resolved_execution_config(
     path: Option<&std::path::Path>,
     executor_snapshot: Option<&serde_json::Value>,
+    scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
 ) -> Result<()> {
-    let (Some(path), Some(snapshot)) = (path, executor_snapshot) else {
-        return Ok(());
-    };
-    let Some(numerical) = snapshot.get("numerical_execution") else {
+    let Some(path) = path else {
         return Ok(());
     };
     let bytes =
@@ -1938,10 +1970,21 @@ pub(crate) fn write_resolved_execution_config(
     let object = document.as_object_mut().ok_or_else(|| {
         ferrum_types::FerrumError::serialization("effective startup config must be an object")
     })?;
-    object.insert("numerical_execution".into(), numerical.clone());
-    for field in ["kv_storage", "attention_execution_policy"] {
-        if let Some(value) = snapshot.get(field) {
-            object.insert(field.into(), value.clone());
+    object.insert(
+        "scheduler".into(),
+        serde_json::json!({"slo": scheduler_slo}),
+    );
+    if let Some(snapshot) =
+        executor_snapshot.filter(|value| value.get("numerical_execution").is_some())
+    {
+        for field in [
+            "numerical_execution",
+            "kv_storage",
+            "attention_execution_policy",
+        ] {
+            if let Some(value) = snapshot.get(field) {
+                object.insert(field.into(), value.clone());
+            }
         }
     }
     let bytes = serde_json::to_vec_pretty(&document)
@@ -2640,6 +2683,45 @@ mod tests {
     }
 
     #[test]
+    fn serve_active_decode_prefill_token_budget_is_optional_and_accepts_explicit_disable() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+
+        let default = TestCli::try_parse_from(["ferrum", "--model", "test-model"]).unwrap();
+        assert!(default
+            .serve
+            .scheduler_active_decode_prefill_token_budget
+            .is_none());
+        for budget in ["96", "0"] {
+            let parsed = TestCli::try_parse_from([
+                "ferrum",
+                "--model",
+                "test-model",
+                "--scheduler-active-decode-prefill-token-budget",
+                budget,
+            ])
+            .unwrap();
+            assert_eq!(
+                parsed.serve.scheduler_active_decode_prefill_token_budget,
+                Some(budget.parse().unwrap())
+            );
+        }
+        assert!(TestCli::try_parse_from([
+            "ferrum",
+            "--model",
+            "test-model",
+            "--scheduler-active-decode-prefill-token-budget",
+            "many",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {
         let mut entries = serve_cli_runtime_entries(
             Some("int8"),
@@ -2652,6 +2734,8 @@ mod tests {
             Some(8),
             Some(16),
             Some(24),
+            Some(96),
+            Some(crate::commands::PrefillDecodeExecutionArg::Mixed),
             Some(true),
             Some(false),
             Some("memory"),
@@ -2715,7 +2799,15 @@ mod tests {
             entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
             "24"
         );
+        assert_eq!(
+            entry("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET").effective_value,
+            "96"
+        );
         assert_eq!(entry("FERRUM_GREEDY_ARGMAX").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_PREFILL_DECODE_EXECUTION").effective_value,
+            "mixed"
+        );
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_SESSION_CACHE").effective_value, "memory");
         assert_eq!(
@@ -2824,6 +2916,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         push_sequence_fit_policy_cli_entry(
             &mut cli_entries,
@@ -2885,6 +2979,8 @@ mod tests {
             max_model_len: Some(1024),
             paged_max_seqs: Some(2),
             max_batched_tokens: Some(128),
+            scheduler_active_decode_prefill_token_budget: Some(256),
+            prefill_decode_execution: Some(ferrum_types::PrefillDecodeExecution::Mixed),
             prefix_cache: Some(false),
             ..Default::default()
         }
@@ -2893,6 +2989,16 @@ mod tests {
             RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "2048", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "4", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "256", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new(
+                "FERRUM_PREFILL_DECODE_EXECUTION",
+                "mixed",
+                RuntimeConfigSource::Env,
+            ),
+            RuntimeConfigEntry::new(
+                "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+                "192",
+                RuntimeConfigSource::Env,
+            ),
             RuntimeConfigEntry::new("FERRUM_PREFIX_CACHE", "1", RuntimeConfigSource::Env),
         ]);
 
@@ -2913,6 +3019,14 @@ mod tests {
             entry(&env_over_config, "FERRUM_PREFIX_CACHE").source,
             RuntimeConfigSource::Env
         );
+        assert_eq!(
+            entry(
+                &env_over_config,
+                "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET"
+            )
+            .effective_value,
+            "192"
+        );
 
         let cli_entries = serve_cli_runtime_entries(
             None,
@@ -2925,6 +3039,8 @@ mod tests {
             Some(8),
             Some(16),
             Some(32),
+            Some(96),
+            Some(crate::commands::PrefillDecodeExecutionArg::Split),
             Some(false),
             Some(false),
             None,
@@ -2959,6 +3075,23 @@ mod tests {
         assert_eq!(
             entry(&cli_over_env, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
             "32"
+        );
+        let budget = entry(&cli_over_env, "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET");
+        assert_eq!(budget.effective_value, "96");
+        assert_eq!(budget.source, RuntimeConfigSource::Cli);
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&cli_over_env).unwrap();
+        assert_eq!(
+            entry(&cli_over_env, "FERRUM_PREFILL_DECODE_EXECUTION").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(
+            engine.batching.prefill_decode_execution,
+            ferrum_types::PrefillDecodeExecution::Split
+        );
+        assert_eq!(
+            engine.scheduler.active_decode_prefill_token_budget,
+            Some(96)
         );
         assert_eq!(
             entry(&cli_over_env, "FERRUM_PREFIX_CACHE").effective_value,
@@ -3405,6 +3538,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -3469,6 +3604,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -3483,6 +3620,8 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
             None,
             None,
             None,
@@ -3519,6 +3658,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -3533,6 +3674,8 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
+            None,
             None,
             None,
             None,
@@ -3660,11 +3803,12 @@ mod tests {
         let original = serde_json::json!({
             "resolution_evidence": {"source": "fixture"},
             "numerical_execution": {"requested": "auto"},
+            "scheduler": {"slo": null},
         });
         std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
         // Legacy/non-numerical snapshots must not claim the requested dtype
         // was selected merely because it appears in the input configuration.
-        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({}))).unwrap();
+        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({})), None).unwrap();
         let unchanged: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(unchanged, original);
@@ -3674,7 +3818,8 @@ mod tests {
             "kv_storage": {"source": "resolved_model_plan", "selected": "int8_per_token_head_f32_scale_v1"},
             "attention_execution_policy": "portable",
         });
-        write_resolved_execution_config(Some(&path), Some(&selected)).unwrap();
+        let slo = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        write_resolved_execution_config(Some(&path), Some(&selected), Some(slo)).unwrap();
         let actual: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
@@ -3687,5 +3832,9 @@ mod tests {
             selected["numerical_execution"]
         );
         assert_eq!(actual["attention_execution_policy"], "portable");
+        assert_eq!(
+            actual["scheduler"]["slo"],
+            serde_json::to_value(slo).unwrap()
+        );
     }
 }

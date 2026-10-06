@@ -510,6 +510,12 @@ fn typed_contiguous_input_uploads_coalesce_before_the_plan() {
         vec![
             SubmissionWaveDispatchStage::ContractValidateAndReserve,
             SubmissionWaveDispatchStage::BackingAndInputEncode,
+            SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+            SubmissionWaveDispatchStage::NodeInvocationConstruct,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+            SubmissionWaveDispatchStage::NodeInvocationConstruct,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
             SubmissionWaveDispatchStage::ProviderNodeEncode,
             SubmissionWaveDispatchStage::LaneReserve,
             SubmissionWaveDispatchStage::DeviceRuntimeSubmit,

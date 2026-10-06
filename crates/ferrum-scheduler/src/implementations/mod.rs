@@ -13,6 +13,7 @@ pub use continuous::{
     PressureEpisodeState, PressureHoldReleaseReason, PressureInvariantViolation,
     PressureInvariantViolationClass, PressureTransition, PressureTransitionKind,
     PressureTransitionOrdinal, PressureYieldKind, PressureYieldTransaction, RequestPhase,
+    SchedulerSloSnapshot,
 };
 pub use fifo::FifoScheduler;
 pub use priority::PriorityScheduler;

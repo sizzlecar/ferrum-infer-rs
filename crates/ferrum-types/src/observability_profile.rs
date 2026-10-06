@@ -276,6 +276,15 @@ impl FerrumObservabilityConfig {
         self.enabled() && self.model == "synthetic/no-weight"
     }
 
+    /// Basic timing counters can be collected without constructing artifact events.
+    pub fn metrics_only(&self) -> bool {
+        self.profile_detail == ObservabilityProfileDetail::Basic
+            && self.profile_jsonl.is_none()
+            && self.memory_profile_jsonl.is_none()
+            && self.scheduler_trace_jsonl.is_none()
+            && self.request_dump_dir.is_none()
+    }
+
     pub fn unified_product_profile_enabled(&self) -> bool {
         self.enabled()
             && (self.profile_detail != ObservabilityProfileDetail::Off
@@ -292,13 +301,15 @@ impl FerrumObservabilityConfig {
             return Err("profile_sample_rate must be between 0.0 and 1.0".to_string());
         }
         if self.enabled()
+            && !self.metrics_only()
             && self.profile_jsonl.is_none()
             && self.memory_profile_jsonl.is_none()
             && self.scheduler_trace_jsonl.is_none()
             && self.request_dump_dir.is_none()
         {
             return Err(
-                "observability profile detail requires at least one artifact path".to_string(),
+                "observability profile detail other than basic requires at least one artifact path"
+                    .to_string(),
             );
         }
         Ok(())
@@ -650,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn observability_config_requires_artifact_path_when_detail_enabled() {
+    fn observability_config_allows_basic_metrics_without_artifacts() {
         let disabled = FerrumObservabilityConfig::new(
             ProfileEntrypoint::Serve,
             "model",
@@ -677,7 +688,34 @@ mod tests {
         );
         assert!(config.enabled());
         assert!(config.synthetic_no_weight_enabled());
-        assert!(config.validate().is_err());
+        assert!(config.metrics_only());
+        assert!(config.validate().is_ok());
+        for detail in [
+            ObservabilityProfileDetail::Resource,
+            ObservabilityProfileDetail::Latency,
+            ObservabilityProfileDetail::Kernel,
+            ObservabilityProfileDetail::Debug,
+            ObservabilityProfileDetail::Replay,
+            ObservabilityProfileDetail::Verify,
+            ObservabilityProfileDetail::Full,
+        ] {
+            let mut detailed = config.clone();
+            detailed.profile_detail = detail;
+            assert!(!detailed.metrics_only());
+            assert!(detailed.validate().is_err(), "{detail:?}");
+        }
+        for artifact in 0..4 {
+            let mut configured = config.clone();
+            let path = Some(PathBuf::from("artifact"));
+            match artifact {
+                0 => configured.profile_jsonl = path,
+                1 => configured.memory_profile_jsonl = path,
+                2 => configured.scheduler_trace_jsonl = path,
+                _ => configured.request_dump_dir = path,
+            }
+            assert!(!configured.metrics_only());
+            assert!(configured.validate().is_ok());
+        }
 
         let with_artifact = FerrumObservabilityConfig::new(
             ProfileEntrypoint::Serve,

@@ -129,6 +129,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         Self::with_precision(runtime, AttentionPrecision::F32Master)
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master_gguf_f16_projections(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterGgufF16Projections)
+    }
+
     fn with_precision(
         runtime: &CudaDeviceRuntime,
         precision: AttentionPrecision,
@@ -147,6 +153,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             source.as_bytes(),
             precision.operation().as_bytes(),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks.rs"),
@@ -173,6 +180,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
@@ -239,6 +247,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                     .map_err(contract_error)?,
             );
         }
+        let accepted_weight_formats = super::gguf_f16_projection::provider_formats(
+            &contract.descriptor().id,
+            accepted_weight_formats,
+        )
+        .map_err(contract_error)?;
         let descriptor = OperationProviderDescriptor::new(
             ProviderId::new(precision.provider()).map_err(contract_error)?,
             contract.descriptor().id.clone(),
@@ -441,6 +454,10 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
+    fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
+        ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,

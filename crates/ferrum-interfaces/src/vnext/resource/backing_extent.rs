@@ -68,15 +68,7 @@ impl BackingSegment {
         offset_bytes: u64,
         length_bytes: u64,
     ) -> Result<Self, VNextError> {
-        if chunk_ordinal == 0
-            || chunk_generation == 0
-            || length_bytes == 0
-            || offset_bytes.checked_add(length_bytes).is_none()
-        {
-            return Err(invalid_resource(
-                "backing segment has invalid chunk identity or physical range",
-            ));
-        }
+        validate_segment_range(chunk_ordinal, chunk_generation, offset_bytes, length_bytes)?;
         Ok(Self {
             chunk: BackingChunkIdentity::from_parts(
                 pool_id.clone(),
@@ -113,11 +105,80 @@ impl BackingSegment {
     }
 }
 
+fn validate_segment_range(
+    chunk_ordinal: u32,
+    chunk_generation: u64,
+    offset_bytes: u64,
+    length_bytes: u64,
+) -> Result<(), VNextError> {
+    if chunk_ordinal == 0
+        || chunk_generation == 0
+        || length_bytes == 0
+        || offset_bytes.checked_add(length_bytes).is_none()
+    {
+        return Err(invalid_resource(
+            "backing segment has invalid chunk identity or physical range",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn backing_segment_range(
     segments: &[BackingSegment],
     physical_offset_bytes: u64,
     size_bytes: u64,
 ) -> Result<Vec<BackingSegment>, VNextError> {
+    let mut projection = Vec::new();
+    visit_backing_segment_range(
+        segments,
+        physical_offset_bytes,
+        size_bytes,
+        |segment, offset, length| {
+            projection.push(BackingSegment::from_chunk(
+                segment.pool_id(),
+                segment.chunk_ordinal(),
+                segment.chunk_generation(),
+                offset,
+                length,
+            )?);
+            Ok(())
+        },
+    )?;
+    Ok(projection)
+}
+
+/// Validate the entire projection while comparing borrowed segments. Authority
+/// checks need equality, not an owned copy of the expected projection.
+pub(super) fn backing_segment_range_matches(
+    segments: &[BackingSegment],
+    physical_offset_bytes: u64,
+    size_bytes: u64,
+    evidence: &[BackingSegment],
+) -> Result<bool, VNextError> {
+    let mut expected = evidence.iter();
+    let mut matches = true;
+    visit_backing_segment_range(
+        segments,
+        physical_offset_bytes,
+        size_bytes,
+        |segment, offset, length| {
+            matches &= expected.next().is_some_and(|actual| {
+                actual.chunk() == segment.chunk()
+                    && actual.offset_bytes() == offset
+                    && actual.length_bytes() == length
+            });
+            Ok(())
+        },
+    )?;
+    Ok(matches && expected.next().is_none())
+}
+
+fn visit_backing_segment_range(
+    segments: &[BackingSegment],
+    physical_offset_bytes: u64,
+    size_bytes: u64,
+    mut visit: impl FnMut(&BackingSegment, u64, u64) -> Result<(), VNextError>,
+) -> Result<(), VNextError> {
     let physical_end = physical_offset_bytes
         .checked_add(size_bytes)
         .ok_or_else(|| invalid_resource("logical backing projection range overflows u64"))?;
@@ -128,7 +189,6 @@ pub(super) fn backing_segment_range(
     }
     let mut physical_cursor = 0_u64;
     let mut covered = 0_u64;
-    let mut projection = Vec::new();
     for segment in segments {
         if physical_cursor >= physical_end {
             break;
@@ -145,13 +205,13 @@ pub(super) fn backing_segment_range(
                 .checked_add(within_segment)
                 .ok_or_else(|| invalid_resource("backing projection offset overflows u64"))?;
             let length = overlap_end - overlap_start;
-            projection.push(BackingSegment::from_chunk(
-                segment.pool_id(),
+            validate_segment_range(
                 segment.chunk_ordinal(),
                 segment.chunk_generation(),
                 translated_offset,
                 length,
-            )?);
+            )?;
+            visit(segment, translated_offset, length)?;
             covered = covered.checked_add(length).ok_or_else(|| {
                 invalid_resource("logical backing projection coverage overflows u64")
             })?;
@@ -163,8 +223,11 @@ pub(super) fn backing_segment_range(
             "logical backing projection exceeds its physical extent",
         ));
     }
-    Ok(projection)
+    Ok(())
 }
+
+#[cfg(test)]
+mod projection_tests;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FreeExtent {

@@ -1,6 +1,9 @@
 mod vnext_device_operation_contract;
 mod vnext_device_operation_wave_contract;
 
+#[path = "vnext_device_operation_wave_contract/reusable_binding_projection.rs"]
+mod reusable_binding_projection;
+
 use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::*;
 
@@ -744,7 +747,8 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         vec![],
     );
 
-    let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
+    let timing = RecordingSubmissionTimingSink::default();
+    let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
         &providers,
         &fixture.resolved,
         &batch_identity,
@@ -753,11 +757,35 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         &[],
         &program,
         SubmissionExecutionPolicy::determinism_replayed(0xa5),
+        &timing,
         wave,
         &lane,
         &reaper,
     )
     .unwrap();
+    let (handle, attribution) = handle.into_parts();
+    assert!(attribution.is_none());
+    assert_eq!(
+        *timing.stages.lock().unwrap(),
+        vec![
+            SubmissionWaveDispatchStage::ContractValidateAndReserve,
+            SubmissionWaveDispatchStage::BackingAndInputEncode,
+            SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+            SubmissionWaveDispatchStage::NodeInvocationConstruct,
+            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+            SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+            SubmissionWaveDispatchStage::NodeInvocationConstruct,
+            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+            SubmissionWaveDispatchStage::ProviderNodeEncode,
+            SubmissionWaveDispatchStage::LaneReserve,
+            SubmissionWaveDispatchStage::DeviceRuntimeSubmit,
+            SubmissionWaveDispatchStage::CompletionArm,
+            SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,
+        ]
+    );
     assert!(!handle.receipt().has_materialized_participant_receipts());
 
     {

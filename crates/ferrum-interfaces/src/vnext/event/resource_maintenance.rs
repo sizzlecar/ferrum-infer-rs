@@ -146,7 +146,8 @@ impl BoundExecutionResourceMaintenance {
                 .iter()
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            if !boundary.reclaim_sufficient()
+            if !boundary.reclaim_attempted()
+                || !boundary.reclaim_sufficient()
                 || boundary.selected_bytes() != rebalance.reclaimed_bytes()
                 || selected.len() != boundary.selected_chunks().len()
                 || selected != reclaimed_chunk_ids

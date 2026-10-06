@@ -212,6 +212,7 @@ fn gated_delta_staging_keeps_its_own_width_format_and_f32_boundaries() {
         transform: None,
         transform_workspace: None,
         transformed_plan: TransformedLinearPlan::Single,
+        plain_plan: PlainLinearPlan::Single,
         weight_region: 1,
         output_region: 2,
         input_offset_bytes: 0,

@@ -111,7 +111,52 @@ impl EngineInner {
     /// the preceding step. Resource pressure therefore has one authority and
     /// is surfaced to the scheduler before another request is dispatched.
     async fn process_batch_plan_runtime(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
-        let (prefill_ids, decode_ids) = self.classify_published_batch_sequences(batch)?;
+        let (mut prefill_ids, mut decode_ids) = self.classify_published_batch_sequences(batch)?;
+        if self.config.batching.prefill_decode_execution
+            == ferrum_types::PrefillDecodeExecution::Mixed
+            && !prefill_ids.is_empty()
+            && !decode_ids.is_empty()
+        {
+            match self
+                .run_plan_runtime_mixed_batch(batch, &prefill_ids, &decode_ids)
+                .await
+            {
+                Ok(super::mixed::MixedBatchDisposition::Completed) => return Ok(()),
+                Ok(super::mixed::MixedBatchDisposition::Split {
+                    prefill_ids: prefills,
+                    decode_ids: decodes,
+                }) => {
+                    prefill_ids = prefills;
+                    decode_ids = decodes;
+                }
+                Err(error) => {
+                    // An ordinary error may follow device submission. Replaying
+                    // either phase could advance KV/recurrent state twice.
+                    let resource_exhausted = is_resource_exhausted_error(&error);
+                    let message = error.to_string();
+                    let mut cleanup_errors = Vec::new();
+                    for rid in prefill_ids.iter().chain(&decode_ids) {
+                        let error = if resource_exhausted {
+                            FerrumError::resource_exhausted(message.clone())
+                        } else {
+                            FerrumError::backend(message.clone())
+                        };
+                        if let Err(cleanup_error) =
+                            self.complete_request_with_error(rid, error).await
+                        {
+                            cleanup_errors.push(format!("{rid}: {cleanup_error}"));
+                        }
+                    }
+                    if !cleanup_errors.is_empty() {
+                        return Err(FerrumError::internal(format!(
+                            "mixed execution failed: {message}; participant cleanup failures: {}",
+                            cleanup_errors.join("; ")
+                        )));
+                    }
+                    return Ok(());
+                }
+            }
+        }
 
         let mut per_request_prefill_ids = prefill_ids.clone();
         if prefill_ids.len() > 1 {

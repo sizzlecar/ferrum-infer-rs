@@ -13,6 +13,8 @@ mod prefix_rendezvous;
 mod prefix_restore;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
 mod pressure;
+mod slo;
+pub use slo::SchedulerSloSnapshot;
 
 #[cfg(test)]
 mod historical_replay_tests;
@@ -60,7 +62,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
 
@@ -74,6 +76,7 @@ struct ContinuousBatchRuntimeConfig {
     prefill_first_until_active: Option<usize>,
     prefill_step_chunk: Option<usize>,
     active_decode_prefill_chunk: Option<usize>,
+    active_decode_prefill_token_budget: Option<usize>,
     scheduler_none_prof: bool,
 }
 
@@ -84,6 +87,9 @@ impl ContinuousBatchRuntimeConfig {
             prefill_first_until_active: config.prefill_first_until_active,
             prefill_step_chunk: config.prefill_step_chunk,
             active_decode_prefill_chunk: config.active_decode_prefill_chunk,
+            active_decode_prefill_token_budget: config
+                .active_decode_prefill_token_budget
+                .filter(|budget| *budget > 0),
             scheduler_none_prof: config.scheduler_none_prof,
         }
     }
@@ -431,6 +437,8 @@ pub struct ContinuousBatchRequest {
     pub prefill_tokens: usize,
     /// Number of decode tokens generated
     pub decode_tokens: usize,
+    /// Keep recompute after the first output outside the TTFT deadline.
+    slo_first_token_emitted: bool,
     /// Phase-independent logical progress and resident-work state.
     logical_work_frontier: LogicalWorkFrontier,
     /// Optional restore state for this admission, separate from compute work.
@@ -481,6 +489,7 @@ impl ContinuousBatchRequest {
             phase: RequestPhase::Waiting,
             prefill_tokens: 0,
             decode_tokens: 0,
+            slo_first_token_emitted: false,
             logical_work_frontier: LogicalWorkFrontier::default(),
             prefix_restore: PrefixRestoreState::default(),
             prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState::default(),
@@ -812,6 +821,9 @@ pub struct ContinuousBatchScheduler {
 
     /// Runtime env-derived switches parsed once at scheduler construction.
     runtime_config: ContinuousBatchRuntimeConfig,
+
+    /// Present only when the typed SLO policy is enabled.
+    slo_controller: Option<Mutex<slo::SloController>>,
 }
 
 /// Continuous batching specific configuration
@@ -905,6 +917,9 @@ impl ContinuousBatchScheduler {
             cb_config.max_prefill_batch, cb_config.max_decode_batch
         );
         let runtime_config = ContinuousBatchRuntimeConfig::from_scheduler_config(&config);
+        let slo_controller = config
+            .slo
+            .map(|_| Mutex::new(slo::SloController::default()));
 
         Self {
             config,
@@ -953,7 +968,38 @@ impl ContinuousBatchScheduler {
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
             runtime_config,
+            slo_controller,
         }
+    }
+
+    /// Feed only completed, successful execution waves and their actual work.
+    /// Planned work, failures and no-progress retries must not train estimates.
+    pub fn record_execution_step(
+        &self,
+        prefill_tokens: usize,
+        decode_sequences: usize,
+        elapsed: Duration,
+    ) {
+        if let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) {
+            if targets.validate().is_ok() {
+                controller
+                    .lock()
+                    .record(targets, prefill_tokens, decode_sequences, elapsed);
+            }
+        }
+    }
+
+    pub fn slo_snapshot(&self) -> Option<SchedulerSloSnapshot> {
+        self.slo_controller
+            .as_ref()
+            .map(|controller| controller.lock().snapshot())
+    }
+
+    fn validate_slo(&self) -> Result<()> {
+        if let Some(targets) = self.config.slo {
+            targets.validate().map_err(FerrumError::scheduler)?;
+        }
+        Ok(())
     }
 
     /// Get number of active requests (prefilling + decoding)
@@ -1700,7 +1746,13 @@ impl ContinuousBatchScheduler {
     /// admitted prefills consume the budget first; a waiting request that does
     /// not fit seals the fair prefix instead of reserving unused authority.
     pub fn fill_first_dynamic_admission_limit(&self, hint: &BatchHint, target: usize) -> usize {
-        if !self.fill_first_initial_cohort_armed.load(Ordering::Acquire) {
+        if !self.fill_first_initial_cohort_armed.load(Ordering::Acquire)
+            || (self
+                .runtime_config
+                .active_decode_prefill_token_budget
+                .is_some()
+                && self.decoding_count() > 0)
+        {
             return 0;
         }
         let mut remaining_tokens = hint.max_tokens;
@@ -2950,7 +3002,10 @@ impl ContinuousBatchScheduler {
         if scheduled_decode_count < self.decode_pressure_prefill_cap_threshold(hint)
             && !capacity_deferred_decode_backpressure
         {
-            return None;
+            // An explicit iteration budget protects even one decoder. It also
+            // provides a bounded request frontier for the existing capacity-
+            // deferred recompute path when no narrower chunk policy applies.
+            return self.runtime_config.active_decode_prefill_token_budget;
         }
         Some(self.default_active_decode_prefill_chunk())
     }
@@ -3013,6 +3068,39 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    fn prioritize_ttft(&self, queue: &mut VecDeque<ContinuousBatchRequest>) {
+        let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) else {
+            return;
+        };
+        let prefill_cost = controller.lock().prefill_ms_per_token().unwrap_or(0.0);
+        let now = chrono::Utc::now();
+        let urgency_window_ms = targets.tpot_ms.min(targets.itl_ms);
+        let slack = |request: &ContinuousBatchRequest| {
+            let age_ms = (now - request.inner.submitted_at)
+                .to_std()
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0;
+            targets.ttft_ms - age_ms - self.remaining_prefill_tokens(request) as f64 * prefill_cost
+        };
+        // Keep non-urgent work stable. Only requests that are within one decode
+        // interval of exhausting their estimated TTFT slack move ahead. Waiting
+        // admission retains its existing FIFO and capacity/fairness barriers.
+        queue.make_contiguous().sort_by(|left, right| {
+            let left_slack = slack(left);
+            let right_slack = slack(right);
+            match (
+                left_slack <= urgency_window_ms,
+                right_slack <= urgency_window_ms,
+            ) {
+                (true, true) => left_slack.total_cmp(&right_slack),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => std::cmp::Ordering::Equal,
+            }
+        });
+    }
+
     fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
         let remaining = if req.prefill_tokens == 0 {
             self.prompt_token_estimate(req)
@@ -3063,7 +3151,9 @@ impl ContinuousBatchScheduler {
                 .max(1);
             return Self::apply_prefill_execution_chunk_ceiling(req, tokens);
         }
-        let tokens = if self.cb_config.enable_chunked_prefill {
+        // An enabled latency policy must be able to enforce its aggregate
+        // budget even if a caller disabled the optional static chunk policy.
+        let tokens = if self.cb_config.enable_chunked_prefill || self.config.slo.is_some() {
             remaining.min(step_tokens_remaining).max(1)
         } else {
             remaining.max(1)
@@ -3100,10 +3190,14 @@ impl ContinuousBatchScheduler {
         let target_chunks =
             self.active_decode_prefill_target_chunks(hint, scheduled_decode_count, prefill_backlog);
 
+        let existing_budget = chunk
+            .saturating_mul(target_chunks)
+            .min(remaining_step_tokens);
         Some(
-            chunk
-                .saturating_mul(target_chunks)
-                .min(remaining_step_tokens),
+            self.runtime_config
+                .active_decode_prefill_token_budget
+                .map(|budget| budget.min(existing_budget))
+                .unwrap_or(existing_budget),
         )
     }
 
@@ -3180,6 +3274,8 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
+        slo_static_prefill_tokens_remaining: &mut Option<usize>,
+        slo_prefill_limited: &mut bool,
         active_decode_prefill_chunks_remaining: &mut Option<usize>,
         capacity_deferred_mixed_recompute_slots_remaining: &mut Option<usize>,
         active_decode_prefill_chunk: Option<usize>,
@@ -3193,6 +3289,7 @@ impl ContinuousBatchScheduler {
         }
 
         let mut prefill_queue = self.prefill_queue.write();
+        self.prioritize_ttft(&mut prefill_queue);
         for req in prefill_queue.iter_mut() {
             if batch_requests.len() >= hint.max_batch_size {
                 break;
@@ -3252,6 +3349,17 @@ impl ContinuousBatchScheduler {
                 prefill_step_chunk,
                 step_tokens_remaining,
             );
+            if let Some(static_remaining) = *slo_static_prefill_tokens_remaining {
+                // Count adaptation only when this runnable request would have
+                // received more work under the original static limits.
+                let static_chunk_tokens = self.prefill_budget_tokens(
+                    req,
+                    active_decode_prefill_chunk,
+                    prefill_step_chunk,
+                    static_remaining.min(hint.max_tokens.saturating_sub(*total_tokens)),
+                );
+                *slo_prefill_limited |= prefill_chunk_tokens < static_chunk_tokens;
+            }
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
@@ -3274,6 +3382,9 @@ impl ContinuousBatchScheduler {
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
                 if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(prefill_chunk_tokens);
+                }
+                if let Some(remaining) = slo_static_prefill_tokens_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
                 }
                 if let Some(remaining) = active_decode_prefill_chunks_remaining.as_mut() {
@@ -3535,6 +3646,10 @@ impl ContinuousBatchScheduler {
         hint: BatchHint,
         mut waiting_admission: WaitingAdmissionMode<'_>,
     ) -> Result<Option<BatchPlan>> {
+        self.validate_slo()?;
+        if let Some(controller) = &self.slo_controller {
+            controller.lock().begin_iteration();
+        }
         let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
         self.metrics_tracker.record_iteration();
 
@@ -3556,6 +3671,12 @@ impl ContinuousBatchScheduler {
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
         let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
+            && !(self.config.slo.is_some() && decoding_count > 0)
+            && !(self
+                .runtime_config
+                .active_decode_prefill_token_budget
+                .is_some()
+                && decoding_count > 0)
             && (self.config.prefix_rendezvous_max_wait_ms.is_none()
                 || self.prefix_held_waiting_count() == 0)
             && prefill_first_target > 0
@@ -3587,6 +3708,50 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
+        let mut slo_static_prefill_tokens_remaining = None;
+        let mut slo_prefill_limited = false;
+        let dynamic_prefill_budget =
+            if let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) {
+                let live_limit = hint.max_tokens.saturating_sub(total_tokens);
+                let static_limit = active_decode_prefill_tokens_remaining
+                    .map_or(live_limit, |limit| limit.min(live_limit));
+                // Follow the existing prefill-queue -> controller lock order.
+                // Waiting admission stays unchanged; once admitted, a request
+                // participates with its real remaining work and chunk ceiling.
+                let prefill_queue = self.prefill_queue.read();
+                let now = chrono::Utc::now();
+                let active_prefills = prefill_queue
+                    .iter()
+                    // Recompute after visible output has no first-token deadline.
+                    .filter(|request| !request.slo_first_token_emitted)
+                    .map(|request| slo::PrefillTtftWork {
+                        remaining_tokens: self.remaining_prefill_tokens(request),
+                        chunk_cap: self.prefill_budget_tokens(
+                            request,
+                            active_decode_prefill_chunk,
+                            prefill_step_chunk,
+                            static_limit,
+                        ),
+                        age_ms: (now - request.inner.submitted_at)
+                            .to_std()
+                            .unwrap_or_default()
+                            .as_secs_f64()
+                            * 1000.0,
+                    });
+                let budget = controller.lock().budget(
+                    targets,
+                    scheduled_decode_count,
+                    static_limit,
+                    active_prefills,
+                );
+                slo_static_prefill_tokens_remaining = budget.map(|_| static_limit);
+                budget
+            } else {
+                None
+            };
+        if let Some(budget) = dynamic_prefill_budget {
+            active_decode_prefill_tokens_remaining = Some(budget);
+        }
         let mut active_decode_prefill_chunks_remaining = self.active_decode_prefill_budget_chunks(
             &hint,
             scheduled_decode_count,
@@ -3641,6 +3806,8 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut slo_static_prefill_tokens_remaining,
+            &mut slo_prefill_limited,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -3731,6 +3898,8 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut slo_static_prefill_tokens_remaining,
+            &mut slo_prefill_limited,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -3810,6 +3979,11 @@ impl ContinuousBatchScheduler {
         }
 
         let batch_id = BatchId::new();
+        if let Some(controller) = &self.slo_controller {
+            controller.lock().mark_adapted_prefill(
+                slo_prefill_limited && batch_requests.len() > scheduled_decode_count,
+            );
+        }
         let max_seq_len = batch_requests
             .iter()
             .map(|r| r.request.sampling_params.max_tokens)
@@ -3862,6 +4036,13 @@ impl ContinuousBatchScheduler {
 
         // Promote to decode
         self.promote_to_decode(request_id);
+        if self.config.slo.is_some() {
+            if let Some(request) = self.decode_queue.write().requests.get_mut(request_id) {
+                // Legacy chunked prefill may already have promoted the request;
+                // record the first output here, after sampling actually finished.
+                request.slo_first_token_emitted = true;
+            }
+        }
         if found {
             if let Some(progress) = progress {
                 self.record_pressure_frontier_progress(request_id, progress);
@@ -4062,6 +4243,7 @@ impl Scheduler for ContinuousBatchScheduler {
     }
 
     async fn submit(&self, request: InferenceRequest) -> Result<RequestId> {
+        self.validate_slo()?;
         let request_id = request.id.clone();
         debug!(
             "Submitting request {} to continuous batch scheduler",
@@ -4455,6 +4637,9 @@ mod tests {
     use super::*;
     use ferrum_types::{ModelId, SamplingParams};
 
+    mod active_decode_budget;
+    mod slo_policy;
+
     fn create_test_request(priority: Priority) -> InferenceRequest {
         InferenceRequest {
             id: RequestId::new(),
@@ -4521,6 +4706,48 @@ mod tests {
         let scheduler = ContinuousBatchScheduler::new(config);
         assert_eq!(scheduler.waiting_count(), 0);
         assert_eq!(scheduler.active_count(), 0);
+    }
+
+    #[test]
+    fn slo_first_output_marker_survives_recompute_and_stays_disabled_by_default() {
+        for enabled in [false, true] {
+            let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+                slo: enabled.then_some(ferrum_types::SchedulerSloConfig {
+                    ttft_ms: 1000.0,
+                    tpot_ms: 100.0,
+                    itl_ms: 120.0,
+                }),
+                ..SchedulerConfig::default()
+            });
+            let request = activate_decode_requests(&scheduler, 1).remove(0);
+            assert_eq!(
+                scheduler.decode_queue.read().requests[&request].slo_first_token_emitted,
+                enabled
+            );
+            scheduler.update_decode_progress(&request, 8);
+            assert!(scheduler.defer_decode_to_waiting_for_capacity(&request, 1));
+            assert!(scheduler.promote_to_prefill_with_empty_retry(&request, None));
+            assert_eq!(
+                scheduler
+                    .prefill_queue
+                    .read()
+                    .iter()
+                    .find(|entry| entry.inner.request.id == request)
+                    .unwrap()
+                    .slo_first_token_emitted,
+                enabled
+            );
+            scheduler.mark_prefill_complete(&request, 18);
+            assert_eq!(
+                scheduler.decode_queue.read().requests[&request].slo_first_token_emitted,
+                enabled
+            );
+            scheduler.update_decode_progress(&request, 9);
+            assert_eq!(
+                scheduler.decode_queue.read().requests[&request].slo_first_token_emitted,
+                enabled
+            );
+        }
     }
 
     #[test]

@@ -6,17 +6,20 @@ use super::{
     ResolvedTensorLayout, ResourceId, ResourceWorkShape, Serialize, StateInitialization,
     VNextError,
 };
+use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct DynamicBackingPoolId(String);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DynamicBackingPoolId(Arc<str>);
 
 impl DynamicBackingPoolId {
     pub(super) fn from_compatibility(key: &PoolCompatibilityKey) -> Result<Self, VNextError> {
-        Ok(Self(format!(
-            "dynamic-pool/sha256/{}",
-            canonical_fingerprint(key, "fingerprint dynamic pool compatibility")?
-        )))
+        Ok(Self(
+            format!(
+                "dynamic-pool/sha256/{}",
+                canonical_fingerprint(key, "fingerprint dynamic pool compatibility")?
+            )
+            .into(),
+        ))
     }
 
     pub(super) fn validate(&self) -> Result<(), VNextError> {
@@ -36,12 +39,21 @@ impl DynamicBackingPoolId {
     }
 }
 
+impl Serialize for DynamicBackingPoolId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 impl<'de> Deserialize<'de> for DynamicBackingPoolId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let id = Self(String::deserialize(deserializer)?);
+        let id = Self(String::deserialize(deserializer)?.into());
         id.validate().map_err(serde::de::Error::custom)?;
         Ok(id)
     }

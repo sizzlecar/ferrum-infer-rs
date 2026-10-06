@@ -67,6 +67,7 @@ const PROVIDER_ID: &str = "provider.cuda.causal_paged_attention.f16";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.causal_paged_attention.f16";
 const GEMMA4_PROVIDER_ID: &str = "provider.cuda.gemma4_causal_paged_attention.f16";
 const GEMMA4_ESTIMATOR_ID: &str = "resource-estimator.cuda.gemma4_causal_paged_attention.f16";
+mod batch_decode;
 #[cfg(test)]
 #[path = "causal_attention/int8_tests.rs"]
 mod int8_tests;
@@ -193,6 +194,7 @@ struct CausalAttentionFunctions {
     native: CudaNativeBlockKernels,
     rms_norm: CudaFunction,
     prepare: CudaFunction,
+    gather_decode_lengths: CudaFunction,
     attention: CudaFunction,
     grouped_attention: CudaFunction,
     varlen_addressed: CudaFunction,
@@ -269,6 +271,22 @@ impl CudaCausalPagedAttentionProvider {
         )
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master_gguf_f16_projections(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = ferrum_interfaces::vnext::causal_paged_attention_f32_master_gguf_f16_projections_contract()
+            .map_err(contract_error)?;
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &contract,
+            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+            CausalAttentionSemantics::Standard,
+            CausalPrecision::F32Master,
+        )
+    }
+
     /// Builds the CUDA provider for Gemma 4's sandwich-normalized attention.
     ///
     /// The contract and capability are supplied by the registration layer so
@@ -321,16 +339,29 @@ impl CudaCausalPagedAttentionProvider {
             ));
         }
 
+        let rounded_gguf = super::gguf_f16_projection::is_operation(&contract.descriptor().id);
+        let provider_id = if rounded_gguf {
+            "provider.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
+        } else {
+            precision.provider_id(semantics)
+        };
+        let estimator_id = if rounded_gguf {
+            "resource-estimator.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
+        } else {
+            precision.estimator_id(semantics)
+        };
         let source = include_str!("causal_attention.rs");
         let mut provider_sources = vec![
             source.as_bytes(),
             include_bytes!("causal_attention/precision.rs"),
+            include_bytes!("causal_attention/batch_decode.rs"),
+            include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),
-            precision.provider_id(semantics).as_bytes(),
+            provider_id.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
             crate::ptx::PAGED_VARLEN_ATTENTION_VLLM.as_bytes(),
@@ -361,11 +392,13 @@ impl CudaCausalPagedAttentionProvider {
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
-            precision.estimator_id(semantics).as_bytes(),
+            estimator_id.as_bytes(),
+            include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
             include_bytes!("causal_attention/precision.rs"),
+            include_bytes!("causal_attention/batch_decode.rs"),
             semantics.fingerprint_tag(),
         ]);
         let mut provider_capabilities = BTreeSet::from([capability]);
@@ -469,8 +502,13 @@ impl CudaCausalPagedAttentionProvider {
                 .map_err(contract_error)?,
             );
         }
+        let accepted_weight_formats = super::gguf_f16_projection::provider_formats(
+            &contract.descriptor().id,
+            accepted_weight_formats,
+        )
+        .map_err(contract_error)?;
         let mut descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(precision.provider_id(semantics)).map_err(contract_error)?,
+            ProviderId::new(provider_id).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -484,7 +522,7 @@ impl CudaCausalPagedAttentionProvider {
             accepted_weight_formats,
             accepted_quantization_formats,
             storage_bindings(semantics).map_err(contract_error)?,
-            precision.estimator_id(semantics),
+            estimator_id,
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )
@@ -568,6 +606,11 @@ impl CudaCausalPagedAttentionProvider {
                     PREPARE_FUNCTION
                 },
                 "causal attention prepare",
+            )?,
+            gather_decode_lengths: load_function(
+                &attention_module,
+                "vnext_causal_gather_decode_lengths",
+                "causal attention decode length gather",
             )?,
             attention: load_function(
                 &attention_module,
@@ -687,17 +730,12 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
         .map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
+                projection
+                    .workspace_reservation_bytes()
+                    .map_err(invalid_plan)?,
                 shape
                     .attention_policy_scratch_bytes(self.attention_policy)
-                    .and_then(|bytes| {
-                        bytes
-                            .checked_add(projection.workspace_reservation_bytes()?)
-                            .ok_or_else(|| {
-                                "causal attention fixed scratch size overflows".to_owned()
-                            })
-                    })
                     .map_err(invalid_plan)?,
-                0,
                 shape
                     .scratch_bytes_per_token()
                     .and_then(|bytes| {
@@ -729,6 +767,10 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
+    fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
+        ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -1422,6 +1464,7 @@ impl CausalAttentionShape {
         statistics
             .checked_mul(2)
             .and_then(|bytes| bytes.checked_add(temporary))
+            .and_then(|bytes| bytes.checked_add(SCRATCH_ALIGNMENT))
             .ok_or_else(|| "causal attention vLLM scratch size overflows".to_owned())
     }
 
@@ -1694,18 +1737,36 @@ struct VllmScratchLayout {
     exp_sums: u64,
     max_logits: u64,
     temporary_output: u64,
+    sequence_lengths: u64,
+    participants: u64,
 }
 
 impl ScratchLayout {
+    #[cfg(test)]
     fn new(
         shape: CausalAttentionShape,
         total_tokens: u64,
         projection: CausalProjection,
         attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, String> {
+        Self::for_participants(shape, total_tokens, 1, projection, attention_policy)
+    }
+
+    fn for_participants(
+        shape: CausalAttentionShape,
+        total_tokens: u64,
+        participant_count: usize,
+        projection: CausalProjection,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, String> {
         if total_tokens == 0 {
             return Err("causal attention scratch cannot be sized for empty work".to_owned());
         }
+        if participant_count == 0 || participant_count as u64 > total_tokens {
+            return Err("causal attention scratch has an invalid participant count".into());
+        }
+        let participants = u64::try_from(participant_count)
+            .map_err(|_| "causal attention scratch participant count exceeds u64")?;
         let mut offset = 0;
         let projection_workspace_bytes = projection.workspace_bytes()?;
         let projection_workspace_reservation_bytes = projection.workspace_reservation_bytes()?;
@@ -1726,8 +1787,10 @@ impl ScratchLayout {
         let query = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let context = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let projected = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
-        let attention_policy_scratch_bytes =
-            shape.attention_policy_scratch_bytes(attention_policy)?;
+        let attention_policy_scratch_bytes = shape
+            .attention_policy_scratch_bytes(attention_policy)?
+            .checked_mul(participants)
+            .ok_or("causal attention batch scratch size overflows")?;
         let vllm = if attention_policy_scratch_bytes == 0 {
             None
         } else {
@@ -1736,19 +1799,34 @@ impl ScratchLayout {
                 .query_heads
                 .checked_mul(partitions)
                 .ok_or_else(|| "causal attention vLLM partition rows overflow".to_owned())?;
-            let exp_sums = reserve_elements(&mut offset, rows, std::mem::size_of::<f32>() as u64)?;
-            let max_logits =
-                reserve_elements(&mut offset, rows, std::mem::size_of::<f32>() as u64)?;
-            let temporary_output = reserve_elements(
-                &mut offset,
+            // Reserve per-owner aligned capacities; the native batched ABI
+            // writes dense arrays using the selected common partition count.
+            let statistics = aligned_bytes(rows, 4)?
+                .checked_mul(participants)
+                .ok_or("causal attention batch statistics overflow")?;
+            let temporary = aligned_bytes(
                 rows.checked_mul(shape.head_dim)
-                    .ok_or_else(|| "causal attention vLLM temporary rows overflow".to_owned())?,
-                ElementType::F16.size_bytes(),
+                    .ok_or("causal attention vLLM temporary rows overflow")?,
+                2,
+            )?
+            .checked_mul(participants)
+            .ok_or("causal attention batch temporary overflow")?;
+            let exp_sums = reserve_elements(&mut offset, statistics, 1)?;
+            let max_logits = reserve_elements(&mut offset, statistics, 1)?;
+            let temporary_output = reserve_elements(&mut offset, temporary, 1)?;
+            let sequence_lengths = reserve_elements(
+                &mut offset,
+                participants
+                    .checked_mul(SCRATCH_ALIGNMENT)
+                    .ok_or("causal attention batch lengths overflow")?,
+                1,
             )?;
             Some(VllmScratchLayout {
                 exp_sums,
                 max_logits,
                 temporary_output,
+                sequence_lengths,
+                participants,
             })
         };
         let token_bytes = shape
@@ -2013,7 +2091,13 @@ fn encode_attention(
     let program_binding = invocation.program_binding().cloned();
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens, projection, attention_policy)?;
+    let layout = ScratchLayout::for_participants(
+        shape,
+        total_tokens,
+        invocation.participants().len(),
+        projection,
+        attention_policy,
+    )?;
     let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
@@ -2338,6 +2422,13 @@ fn encode_attention(
         .map(CausalAttentionKernelPath::operation)
         .unwrap_or(COMPUTE_MIXED_OPERATION);
     let packed_enabled = packed.is_some();
+    let batch_decode = batch_decode::BatchDecode::for_launches(
+        &launches,
+        packed_enabled,
+        binding_layout,
+        shape,
+        layout,
+    )?;
     let compute_dispatch_count = physical_dispatch_count(
         launches.iter().map(|launch| launch.path),
         shape.output_gate,
@@ -2418,6 +2509,8 @@ fn encode_attention(
                 .u64(layout.vllm.map_or(0, |vllm| vllm.exp_sums))
                 .u64(layout.vllm.map_or(0, |vllm| vllm.max_logits))
                 .u64(layout.vllm.map_or(0, |vllm| vllm.temporary_output))
+                .u64(layout.vllm.map_or(0, |vllm| vllm.sequence_lengths))
+                .u64(layout.vllm.map_or(0, |vllm| vllm.participants))
                 .u64(binding_layout.required_bytes)
                 .u64(binding_layout.slot_bytes)
                 .u64(launches.len() as u64);
@@ -2457,6 +2550,7 @@ fn encode_attention(
                     binding_layout,
                     &shared,
                     packed,
+                    batch_decode.as_ref(),
                     &launches,
                     regions,
                 )?;
@@ -2553,6 +2647,16 @@ fn physical_dispatch_count(
     packed: bool,
 ) -> u64 {
     let paths = paths.into_iter().collect::<Vec<_>>();
+    if batch_decode::eligible(paths.iter().copied(), packed) {
+        return 6
+            + u64::from(post_attention_norm)
+            + paths.len() as u64
+            + 1
+            + batch_decode::group_ranges(&paths)
+                .map(|range| paths[range.start].attention_dispatch_count())
+                .sum::<u64>()
+            + if output_gate { paths.len() as u64 } else { 0 };
+    }
     let packed_fallback = packed
         && paths.len() > 1
         && paths.first().is_some_and(|path| path.is_fallback())
@@ -2804,6 +2908,7 @@ fn enqueue_packed_attention(
     binding_layout: BindingLayout,
     shared: &SharedRegions,
     packed: PackedCausalAttentionLaunch,
+    batch_decode: Option<&batch_decode::BatchDecode>,
     launches: &[CausalAttentionLaunch],
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -2872,7 +2977,21 @@ fn enqueue_packed_attention(
         )?;
     }
 
-    if let Some(packed_fallback) = packed_fallback_launch(launches, binding_layout)
+    if let Some(batch_decode) = batch_decode {
+        batch_decode.enqueue(
+            stream,
+            functions,
+            launches,
+            binding.device_ptr(),
+            binding_layout,
+            cuda,
+            layout,
+            scratch_base,
+            regions[shared.query_norm].device_ptr(),
+            regions[shared.key_norm].device_ptr(),
+            logical.output_gate,
+        )?;
+    } else if let Some(packed_fallback) = packed_fallback_launch(launches, binding_layout)
         .map_err(CudaDeviceRuntimeError::contract)?
     {
         let launch = launches[0];
@@ -4947,13 +5066,13 @@ mod tests {
 
         assert_eq!(physical_dispatch_count([v1], false, false, false), 8);
         assert_eq!(physical_dispatch_count([v1; 4], false, false, false), 32);
-        assert_eq!(physical_dispatch_count([v1; 4], false, false, true), 14);
+        assert_eq!(physical_dispatch_count([v1; 4], false, false, true), 12);
         assert_eq!(physical_dispatch_count([v2; 4], true, false, false), 40);
-        assert_eq!(physical_dispatch_count([v2; 4], true, false, true), 22);
-        assert_eq!(physical_dispatch_count([v1; 32], true, false, true), 102);
-        assert_eq!(physical_dispatch_count([v2; 32], true, false, true), 134);
+        assert_eq!(physical_dispatch_count([v2; 4], true, false, true), 17);
+        assert_eq!(physical_dispatch_count([v1; 32], true, false, true), 72);
+        assert_eq!(physical_dispatch_count([v2; 32], true, false, true), 73);
         assert_eq!(physical_dispatch_count([v1], false, true, false), 9);
-        assert_eq!(physical_dispatch_count([v1; 4], false, true, true), 15);
+        assert_eq!(physical_dispatch_count([v1; 4], false, true, true), 13);
         assert_eq!(
             physical_dispatch_count([token_fallback; 4], false, false, false),
             32

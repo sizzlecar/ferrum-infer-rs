@@ -18,12 +18,16 @@ use super::buffer_view::{
     ValueBindingPhysicalCoverage,
 };
 use super::foundation::invalid_operation;
-use super::resolved_value::resource_uses_packed_batch_coordinates;
 use super::{
     AttributeId, BatchOperationIdentity, BatchOperationNodeIdentity, ElementType,
     OperationBufferView, OperationDescriptor, OperationProviderDescriptor, ResolvedValueBinding,
-    ResolvedValueRole,
+    ResolvedValueRole, ReusableBindingResources,
 };
+
+mod view_coverage;
+#[cfg(test)]
+pub(crate) use view_coverage::test_only_backing_window_coverage;
+use view_coverage::FullyCoveredOperationViews;
 
 pub(super) enum OperationInvocationResources<'a, R: DeviceRuntime> {
     Invocation(&'a InvocationResourceLease<R>),
@@ -262,6 +266,93 @@ struct PreparedOperationResource {
     source: PreparedOperationResourceSource,
 }
 
+/// An immutable projection of the complete per-node recipe. Semantic binding
+/// metadata is unchanged; each retained component maps to its actual compact
+/// physical view index, including mixed-lifetime composite values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedReusableBindingProjection {
+    view_indices: Vec<Option<usize>>,
+    retained_bindings: Vec<bool>,
+    view_count: usize,
+}
+
+impl PreparedReusableBindingProjection {
+    fn new(
+        mut retained_resources: Vec<bool>,
+        binding_component_views: &[Vec<usize>],
+        binding_view: Option<usize>,
+    ) -> Self {
+        if let Some(index) = binding_view {
+            retained_resources[index] = true;
+        }
+        // A value is indivisible: retain its entire component closure. Iterate
+        // to a fixed point because distinct values may alias one component.
+        loop {
+            let mut changed = false;
+            for components in binding_component_views {
+                if components.iter().any(|index| retained_resources[*index]) {
+                    for index in components {
+                        changed |= !retained_resources[*index];
+                        retained_resources[*index] = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let retained_bindings = binding_component_views
+            .iter()
+            .map(|components| components.iter().any(|index| retained_resources[*index]))
+            .collect();
+        let mut view_count = 0;
+        let view_indices = retained_resources
+            .into_iter()
+            .map(|retained| {
+                retained.then(|| {
+                    let index = view_count;
+                    view_count += 1;
+                    index
+                })
+            })
+            .collect();
+        Self {
+            view_indices,
+            retained_bindings,
+            view_count,
+        }
+    }
+}
+
+#[cfg(test)]
+mod reusable_binding_projection_tests {
+    use super::PreparedReusableBindingProjection;
+
+    #[test]
+    fn retains_complete_aliasing_component_closure_and_remaps_in_resource_order() {
+        let projection = PreparedReusableBindingProjection::new(
+            vec![false, false, true, false, false, false, false],
+            &[vec![0, 1], vec![1, 2], vec![3], vec![6]],
+            Some(5),
+        );
+        assert_eq!(
+            projection.view_indices,
+            [Some(0), Some(1), Some(2), None, None, Some(3), None]
+        );
+        assert_eq!(projection.retained_bindings, [true, true, false, false]);
+        assert_eq!(projection.view_count, 4);
+    }
+
+    #[test]
+    fn binding_workspace_alone_does_not_materialize_captured_values() {
+        let projection =
+            PreparedReusableBindingProjection::new(vec![false; 4], &[vec![0], vec![1, 2]], Some(3));
+        assert_eq!(projection.view_indices, [None, None, None, Some(0)]);
+        assert_eq!(projection.retained_bindings, [false, false]);
+        assert_eq!(projection.view_count, 1);
+    }
+}
+
 /// Immutable per-node recipe compiled while the runtime registry is bound to
 /// an exact plan. Static catalog, operation, provider, and resource-shape
 /// proofs terminate here; dispatch retains only live authority and buffer
@@ -274,6 +365,7 @@ pub(super) struct PreparedOperationDispatchBinding {
     scratch_view: Option<usize>,
     binding_view: Option<usize>,
     persistent_view: Option<usize>,
+    reusable_binding_projection: Option<PreparedReusableBindingProjection>,
 }
 
 impl PreparedOperationDispatchBinding {
@@ -281,6 +373,7 @@ impl PreparedOperationDispatchBinding {
         resolved: &dyn ExecutablePlanView,
         provider: &OperationProviderDescriptor,
         node_id: &NodeId,
+        reusable_resources: ReusableBindingResources,
     ) -> Result<Self, VNextError> {
         let plan = resolved.execution_plan();
         let (node_index, node) = plan
@@ -431,6 +524,26 @@ impl PreparedOperationDispatchBinding {
         let persistent_view = persistent_resource
             .map(|resource| view_index_for(resource, "persistent"))
             .transpose()?;
+        let reusable_binding_projection =
+            (reusable_resources == ReusableBindingResources::RequestStateAndBinding).then(|| {
+                let retained_resources = resources
+                    .iter()
+                    .map(|resource| match resource.source {
+                        PreparedOperationResourceSource::PlanStatic { .. } => false,
+                        PreparedOperationResourceSource::Dynamic { descriptor_index } => {
+                            matches!(
+                                memory.dynamic_descriptors()[descriptor_index].lifetime(),
+                                AllocationLifetime::Request | AllocationLifetime::Sequence
+                            )
+                        }
+                    })
+                    .collect();
+                PreparedReusableBindingProjection::new(
+                    retained_resources,
+                    &binding_component_views,
+                    binding_view,
+                )
+            });
         Ok(Self {
             node_index,
             resources,
@@ -438,6 +551,7 @@ impl PreparedOperationDispatchBinding {
             scratch_view,
             binding_view,
             persistent_view,
+            reusable_binding_projection,
         })
     }
 
@@ -489,6 +603,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         resources: OperationInvocationResources<'a, R>,
         active_binding: &TrustedActiveSequenceBinding,
         participant_index: usize,
+        reusable_bindings_only: bool,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -572,8 +687,28 @@ impl<'a, B> OperationInvocation<'a, B> {
             ));
         }
         let provider_resources = node.provider_resources();
-        let mut views = Vec::with_capacity(prepared.resources.len());
-        for resource in &prepared.resources {
+        let projection = reusable_bindings_only
+            .then_some(prepared.reusable_binding_projection.as_ref())
+            .flatten();
+        let map_view = |index: usize| match projection {
+            Some(projection) => projection.view_indices[index],
+            None => Some(index),
+        };
+        let scratch_view = prepared.scratch_view.and_then(map_view);
+        let binding_view = prepared.binding_view.and_then(map_view);
+        let persistent_view = prepared.persistent_view.and_then(map_view);
+        let mut views = Vec::with_capacity(
+            projection.map_or(prepared.resources.len(), |projection| projection.view_count),
+        );
+        for (resource_index, resource) in prepared.resources.iter().enumerate() {
+            let Some(view_index) = map_view(resource_index) else {
+                continue;
+            };
+            if view_index != views.len() {
+                return Err(invalid_operation(
+                    "prepared resource projection is not canonical",
+                ));
+            }
             let resource_id = &resource.resource_id;
             match resource.source {
                 PreparedOperationResourceSource::PlanStatic { slot_index } => {
@@ -608,13 +743,29 @@ impl<'a, B> OperationInvocation<'a, B> {
                             )
                         })?;
                     let descriptor_lifetime = descriptor.lifetime();
-                    let packed_batch_coordinates = resource_uses_packed_batch_coordinates(
-                        memory,
-                        descriptor.base_resource_id(),
-                    )?;
-                    let backing = resources.backing_view(resource_id).or_else(|_| {
-                        resources.participant_backing_view(participant_index, resource_id)
-                    })?;
+                    let packed_batch_coordinates =
+                        matches!(descriptor.demand(), DynamicResourceDemand::Tokens { .. })
+                            && matches!(
+                                descriptor_lifetime,
+                                AllocationLifetime::Step | AllocationLifetime::Invocation
+                            );
+                    // The immutable descriptor already establishes the owner.
+                    // Request/Sequence state cannot live in shared Step or
+                    // Invocation backing. Do not scan both shared arenas and
+                    // allocate a missing-resource error before every state view.
+                    let backing = match descriptor_lifetime {
+                        AllocationLifetime::Request | AllocationLifetime::Sequence => {
+                            resources.participant_backing_view(participant_index, resource_id)?
+                        }
+                        AllocationLifetime::Step | AllocationLifetime::Invocation => {
+                            resources.backing_view(resource_id)?
+                        }
+                        AllocationLifetime::Plan => {
+                            return Err(invalid_operation(format!(
+                                "plan-lifetime resource `{resource_id}` cannot use dynamic backing"
+                            )))
+                        }
+                    };
                     let expected_backing_bytes = match descriptor.lifetime() {
                         AllocationLifetime::Invocation => descriptor
                             .evaluate_request_bytes_for_shape(
@@ -736,29 +887,21 @@ impl<'a, B> OperationInvocation<'a, B> {
             }
         }
 
-        for view in &views {
-            view.validate_runtime(runtime, lease_identity)?;
-            let translated = view.translate(0, view.descriptor().size_bytes)?;
-            let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
-                total
-                    .checked_add(region.length_bytes())
-                    .ok_or_else(|| invalid_operation("translated operation regions overflow u64"))
-            })?;
-            if translated_bytes != view.descriptor().size_bytes {
-                return Err(invalid_operation(format!(
-                    "operation resource `{}` is not fully backed by physical regions",
-                    view.resource_id()
-                )));
-            }
-        }
+        let covered_views = FullyCoveredOperationViews::validate(&views, runtime, lease_identity)?;
         if node.values().len() != prepared.binding_component_views.len() {
             return Err(invalid_operation(
                 "prepared value-binding recipe differs from its plan node",
             ));
         }
-        for (binding, component_views) in
-            node.values().iter().zip(&prepared.binding_component_views)
+        for (binding_index, (binding, component_views)) in node
+            .values()
+            .iter()
+            .zip(&prepared.binding_component_views)
+            .enumerate()
         {
+            if projection.is_some_and(|projection| !projection.retained_bindings[binding_index]) {
+                continue;
+            }
             if binding.storage().components().len() != component_views.len() {
                 return Err(invalid_operation(
                     "prepared component recipe differs from its value binding",
@@ -767,7 +910,10 @@ impl<'a, B> OperationInvocation<'a, B> {
             for (component, view_index) in
                 binding.storage().components().iter().zip(component_views)
             {
-                let view = views.get(*view_index).ok_or_else(|| {
+                let projected_index = map_view(*view_index).ok_or_else(|| {
+                    invalid_operation("reusable binding projection omits a retained component")
+                })?;
+                let view = views.get(projected_index).ok_or_else(|| {
                     invalid_operation("value binding lacks a committed resource view")
                 })?;
                 if view.resource_id() != component.resource_id() {
@@ -810,41 +956,37 @@ impl<'a, B> OperationInvocation<'a, B> {
                     provider_resources.value_alignment_bytes(),
                 )?;
                 if coverage == ValueBindingPhysicalCoverage::CanonicalComponent {
-                    let translated =
-                        view.translate(component.offset_bytes(), component.length_bytes())?;
-                    let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
-                        total.checked_add(region.length_bytes()).ok_or_else(|| {
-                            invalid_operation("translated value-binding regions overflow u64")
-                        })
-                    })?;
-                    if translated_bytes != component.length_bytes() {
-                        return Err(invalid_operation(format!(
-                            "resource `{}` does not physically cover its value binding",
-                            component.resource_id()
-                        )));
-                    }
+                    covered_views.validate_subrange(
+                        projected_index,
+                        component.offset_bytes(),
+                        component.length_bytes(),
+                    )?;
                 }
             }
         }
         validate_workspace(
-            &views,
-            prepared.scratch_view,
+            &covered_views,
+            scratch_view,
             BufferUsage::Scratch,
-            provider_resources.scratch(),
+            provider_resources
+                .scratch()
+                .filter(|_| projection.is_none() || scratch_view.is_some()),
             "scratch",
         )?;
         validate_workspace(
-            &views,
-            prepared.binding_view,
+            &covered_views,
+            binding_view,
             BufferUsage::Binding,
             provider_resources.binding(),
             "binding",
         )?;
         validate_workspace(
-            &views,
-            prepared.persistent_view,
+            &covered_views,
+            persistent_view,
             BufferUsage::Persistent,
-            provider_resources.persistent(),
+            provider_resources
+                .persistent()
+                .filter(|_| projection.is_none() || persistent_view.is_some()),
             "persistent",
         )?;
         Ok(Self {
@@ -856,9 +998,9 @@ impl<'a, B> OperationInvocation<'a, B> {
             bindings: node.values(),
             attributes: node.attributes(),
             work: node.work(),
-            scratch_view: prepared.scratch_view,
-            binding_view: prepared.binding_view,
-            persistent_view: prepared.persistent_view,
+            scratch_view,
+            binding_view,
+            persistent_view,
             work_shape: resources.work_shape()?,
             claimed_backing_fingerprint: resources.backing_fingerprint(),
         })
@@ -950,6 +1092,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             node_identity,
             OperationInvocationResources::Invocation(resources),
             active_bindings.iter(),
+            false,
         )
     }
 
@@ -976,6 +1119,36 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             node_identity,
             OperationInvocationResources::Wave { wave, node_index },
             active_bindings,
+            false,
+        )
+    }
+
+    /// Used only after dispatch validates the live resident program and only
+    /// for nodes inside that program's resident compute segment.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_reusable_wave_node<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: I,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::from_resources(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Wave { wave, node_index },
+            active_bindings,
+            true,
         )
     }
 
@@ -988,6 +1161,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         node_identity: &'a BatchOperationNodeIdentity,
         resources: OperationInvocationResources<'a, R>,
         active_bindings: I,
+        reusable_bindings_only: bool,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -1039,6 +1213,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     resources,
                     active_binding,
                     index,
+                    reusable_bindings_only,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1171,7 +1346,7 @@ fn select_workspace_resource<'a>(
 }
 
 fn validate_workspace<B>(
-    views: &[OperationBufferView<'_, B>],
+    views: &FullyCoveredOperationViews<'_, '_, B>,
     index: Option<usize>,
     usage: BufferUsage,
     requirement: Option<&ProviderWorkspaceRequirement>,
@@ -1183,7 +1358,7 @@ fn validate_workspace<B>(
             "{kind} workspace presence differs from the operation contract"
         ))),
         (Some(requirement), Some(index)) => {
-            let descriptor = views[index].descriptor();
+            let descriptor = views.descriptor(index)?;
             let required_bytes = requirement.minimum_bytes()?;
             if descriptor.usage != usage
                 || descriptor.element_type != ElementType::U8
@@ -1195,17 +1370,7 @@ fn validate_workspace<B>(
                     "{kind} workspace descriptor is invalid"
                 )));
             }
-            let translated = views[index].translate(0, required_bytes)?;
-            let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
-                total.checked_add(region.length_bytes()).ok_or_else(|| {
-                    invalid_operation(format!("{kind} workspace region coverage overflows u64"))
-                })
-            })?;
-            if translated_bytes != required_bytes {
-                return Err(invalid_operation(format!(
-                    "{kind} workspace is not fully backed by physical regions"
-                )));
-            }
+            views.validate_subrange(index, 0, required_bytes)?;
             Ok(())
         }
     }

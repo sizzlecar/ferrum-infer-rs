@@ -432,10 +432,10 @@ impl EngineInner {
         Ok(planned)
     }
 
-    pub(super) async fn run_plan_runtime_prefill(
+    pub(super) fn prepare_plan_runtime_prefill(
         &self,
         scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
-    ) -> Result<()> {
+    ) -> Result<Option<PlanRuntimePrefillInput>> {
         use ferrum_interfaces::model_executor::PrefillChunk;
 
         let request_id = &scheduled.request.id;
@@ -449,7 +449,7 @@ impl EngineInner {
                 )
             })
         else {
-            return Ok(());
+            return Ok(None);
         };
         let chunk = PrefillChunk::new(
             scheduled.tokens_processed,
@@ -461,13 +461,25 @@ impl EngineInner {
             input_tokens.len(),
         )?;
         let chunk = self.plan_prompt_tail_prefill_chunk(request_id, chunk, original_prompt)?;
-        let input_token_count = input_tokens.len();
-        let input = PlanRuntimePrefillInput::new(
+        PlanRuntimePrefillInput::new(
             request_id.clone(),
             input_tokens,
             maximum_sequence_tokens,
             chunk,
-        )?;
+        )
+        .map(Some)
+    }
+
+    pub(super) async fn run_plan_runtime_prefill(
+        &self,
+        scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
+    ) -> Result<()> {
+        let Some(input) = self.prepare_plan_runtime_prefill(scheduled)? else {
+            return Ok(());
+        };
+        let request_id = &input.request_id;
+        let input_token_count = input.input_tokens.len();
+        let chunk = input.chunk;
 
         match self
             .model_executor
@@ -614,7 +626,7 @@ impl EngineInner {
         }
     }
 
-    async fn commit_plan_runtime_prefill_completion(
+    pub(super) async fn commit_plan_runtime_prefill_completion(
         &self,
         request_id: &RequestId,
         input_token_count: usize,
@@ -813,7 +825,7 @@ impl EngineInner {
         self.model_executor.discard_plan_runtime_prefill(authority)
     }
 
-    fn discard_plan_runtime_prefill_completions(
+    pub(super) fn discard_plan_runtime_prefill_completions(
         &self,
         completions: impl IntoIterator<
             Item = ferrum_interfaces::model_executor::PlanRuntimePrefillCompletion,
@@ -855,41 +867,15 @@ impl EngineInner {
         let mut work = Vec::with_capacity(scheduled.len());
         let mut inputs = Vec::with_capacity(scheduled.len());
         for scheduled in scheduled {
-            let request_id = &scheduled.request.id;
-            let Some((input_tokens, maximum_sequence_tokens, original_prompt)) =
-                self.sequences.read().get(request_id).map(|sequence| {
-                    (
-                        sequence.prefill_context_tokens(),
-                        sequence.model_maximum_sequence_tokens(),
-                        sequence.generated_tokens.is_empty(),
-                    )
-                })
-            else {
+            let Some(input) = self.prepare_plan_runtime_prefill(scheduled)? else {
                 continue;
             };
-            let planned_chunk = PrefillChunk::new(
-                scheduled.tokens_processed,
-                scheduled.tokens_to_process.ok_or_else(|| {
-                    FerrumError::scheduler(format!(
-                        "PlanRuntime prefill for {request_id} has no scheduled token budget"
-                    ))
-                })?,
-                input_tokens.len(),
-            )?;
-            let planned_chunk =
-                self.plan_prompt_tail_prefill_chunk(request_id, planned_chunk, original_prompt)?;
-            let input_token_count = input_tokens.len();
-            inputs.push(PlanRuntimePrefillInput::new(
-                request_id.clone(),
-                input_tokens,
-                maximum_sequence_tokens,
-                planned_chunk,
-            )?);
             work.push(Work {
-                request_id: request_id.clone(),
-                input_token_count,
-                planned_chunk,
+                request_id: input.request_id.clone(),
+                input_token_count: input.input_tokens.len(),
+                planned_chunk: input.chunk,
             });
+            inputs.push(input);
         }
         if inputs.len() < 2 {
             return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(

@@ -53,6 +53,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear.metal"),
     include_str!("linear/small_batch.rs"),
     include_str!("linear/small_batch.metal"),
+    include_str!("linear/plain_prefill.rs"),
     include_str!("linear/staged_prefill.rs"),
     include_str!("linear/transformed_prefill.rs"),
     include_str!("hadamard.rs"),
@@ -87,9 +88,11 @@ const SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES: u32 = 1024;
 const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
 const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
 
+mod plain_prefill;
 mod small_batch;
 pub(super) mod staged_prefill;
 mod transformed_prefill;
+use plain_prefill::PlainLinearPlan;
 use transformed_prefill::TransformedLinearPlan;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
@@ -1036,11 +1039,16 @@ pub(super) struct LinearLaunch {
     // Prepared with the retained workspace; encoding and physical accounting
     // consume this same decision without reselecting the partition.
     transformed_plan: TransformedLinearPlan,
+    plain_plan: PlainLinearPlan,
 }
 
 impl LinearLaunch {
     pub(super) fn dispatch_count(self) -> u64 {
-        self.transformed_plan.projection_dispatch_count() + u64::from(self.transform.is_some())
+        if self.transform.is_some() {
+            self.transformed_plan.projection_dispatch_count() + 1
+        } else {
+            self.plain_plan.dispatch_count()
+        }
     }
 
     pub(super) fn bind_hadamard_workspace(
@@ -1862,7 +1870,7 @@ fn linear_launch_typed(
     if !matches!(activation_type, ElementType::F16 | ElementType::F32) {
         return Err("Metal linear activation ABI supports only F16 or F32".to_owned());
     }
-    Ok(LinearLaunch {
+    let mut launch = LinearLaunch {
         input_region,
         weight_region: part.region,
         output_region,
@@ -1873,6 +1881,7 @@ fn linear_launch_typed(
         transform: part.transform,
         transform_workspace: None,
         transformed_plan: TransformedLinearPlan::Single,
+        plain_plan: PlainLinearPlan::Single,
         params: LinearParams {
             rows: checked_u32(rows, "Metal linear row count")?,
             in_features: checked_u32(in_features, "Metal linear input width")?,
@@ -1880,7 +1889,9 @@ fn linear_launch_typed(
             output_stride: checked_u32(output_stride, "Metal linear output stride")?,
             output_column_offset: part.output_offset,
         },
-    })
+    };
+    launch.plain_plan = PlainLinearPlan::for_launch(launch);
+    Ok(launch)
 }
 
 pub(super) fn validate_launch_regions(
@@ -2009,6 +2020,20 @@ pub(super) fn dispatch_linear(
         dispatch_transformed_linear(pipelines, encoder, regions, launch);
         return;
     }
+    if let Some([head, tail]) = launch.plain_plan.parts(launch) {
+        dispatch_single_plain_linear(pipelines, encoder, regions, head);
+        dispatch_single_plain_linear(pipelines, encoder, regions, tail);
+    } else {
+        dispatch_single_plain_linear(pipelines, encoder, regions, launch);
+    }
+}
+
+fn dispatch_single_plain_linear(
+    pipelines: &MetalLinearPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    launch: LinearLaunch,
+) {
     let (pipeline, dispatch_kind) =
         pipelines.plain_linear_dispatch(launch.format, launch.activation_type, launch.params);
     encoder.set_compute_pipeline_state(pipeline);
@@ -2715,6 +2740,9 @@ mod pq2_prefill_tests;
 
 #[cfg(test)]
 mod microbench;
+
+#[cfg(test)]
+mod plain_prefill_tests;
 
 #[cfg(test)]
 mod tests {

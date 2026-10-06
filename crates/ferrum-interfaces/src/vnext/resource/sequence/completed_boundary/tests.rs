@@ -600,6 +600,55 @@ fn commit_validates_all_frames_before_publishing_any_completed_frontier() {
 }
 
 #[test]
+fn on_demand_reusable_trim_waits_for_tracked_fence_terminal() {
+    let harness = BoundaryHarness::new(1);
+    harness
+        .harness
+        .runtime
+        .set_reusable_catalog_lifetime(ReusableExecutionCatalogLifetime::OnDemandBounded);
+    harness.harness.runtime.set_reusable_resident_executables(1);
+    harness
+        .harness
+        .runtime
+        .set_fence_behavior(TestFenceBehavior::Pending);
+    let epoch_before = harness.lane.reusable_execution_epoch();
+    let step = harness.step(vec![span(&[7], 0..1)]);
+    let reaper = CompletionReaper::new();
+    let handle = submit_through_reaper(&harness, prepared_wave(&step), &reaper);
+
+    assert_eq!(harness.lane.in_flight_count(), 1);
+    assert!(!harness
+        .lane
+        .trim_reusable_executables_if_quiescent()
+        .unwrap());
+    assert_eq!(harness.harness.runtime.reusable_trim_calls(), 0);
+    assert_eq!(harness.lane.reusable_execution_epoch(), epoch_before);
+
+    harness
+        .harness
+        .runtime
+        .set_fence_behavior(TestFenceBehavior::Succeeded);
+    let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+        panic!("successful fixture fence must be terminal");
+    };
+    assert!(matches!(
+        receipt.disposition(),
+        OperationCompletionDisposition::Succeeded
+    ));
+    assert_eq!(harness.lane.in_flight_count(), 0);
+    assert!(harness
+        .lane
+        .trim_reusable_executables_if_quiescent()
+        .unwrap());
+    assert_eq!(harness.harness.runtime.reusable_trim_calls(), 1);
+    assert_eq!(harness.lane.reusable_execution_epoch(), epoch_before + 1);
+    step.try_retire_normal().unwrap();
+    drop(handle);
+    drop(reaper);
+    harness.close();
+}
+
+#[test]
 fn real_reaper_keeps_pending_unproven_then_signs_full_plan_before_frame_commit() {
     let harness = BoundaryHarness::new(1);
     let step = harness.step(vec![span(&[3, 5], 0..2)]);

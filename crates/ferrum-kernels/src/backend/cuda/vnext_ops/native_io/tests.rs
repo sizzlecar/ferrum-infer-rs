@@ -1,4 +1,6 @@
 use super::*;
+
+mod packed_projection;
 use crate::gguf_blocks::{
     fixtures::{oracle_blocks, FORMATS},
     GgufBlockFormat,

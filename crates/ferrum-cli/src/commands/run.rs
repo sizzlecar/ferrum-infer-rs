@@ -869,6 +869,19 @@ pub struct RunCommand {
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
 
+    /// Native plan-runtime prefill/decode execution: split (default) or mixed.
+    /// Applies only to native plan runtimes; legacy execution follows its existing policy.
+    #[arg(long, value_enum)]
+    pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
+
+    /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
+    #[arg(long, value_name = "TARGETS")]
+    pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
+
+    /// Cap total prefill tokens per scheduler iteration with active decode; 0 disables.
+    #[arg(long, value_name = "N")]
+    pub scheduler_active_decode_prefill_token_budget: Option<usize>,
+
     /// Sequence fit gate used before prefill admission.
     #[arg(long, value_enum)]
     pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
@@ -949,7 +962,7 @@ pub struct RunCommand {
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
-    /// Product observability detail level.
+    /// Product observability detail level. Basic without artifact paths collects timing metrics only.
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
@@ -980,6 +993,7 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    let scheduler_slo = config.resolve_scheduler_slo(cmd.scheduler_slo)?;
     if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Run,
@@ -1073,6 +1087,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    engine_config.scheduler.slo = scheduler_slo;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
     // Family candidates and startup sizing must see the same KV request as
@@ -1302,6 +1317,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     crate::commands::serve::write_resolved_execution_config(
         cmd.effective_config_json.as_deref(),
         engine.cache_metrics_snapshot().as_ref(),
+        engine.config().scheduler.slo,
     )?;
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
@@ -2687,6 +2703,17 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        "FERRUM_PREFILL_DECODE_EXECUTION",
+        cmd.prefill_decode_execution
+            .map(crate::commands::PrefillDecodeExecutionArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+        cmd.scheduler_active_decode_prefill_token_budget,
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         "FERRUM_SEQUENCE_FIT_POLICY",
         cmd.sequence_fit_policy
             .map(crate::commands::SequenceFitPolicyArg::as_runtime_value),
@@ -2904,6 +2931,9 @@ mod tests {
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
+            prefill_decode_execution: None,
+            scheduler_slo: None,
+            scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
             prefix_rendezvous_max_wait_ms: None,
             batched_graph: false,
@@ -3007,6 +3037,68 @@ mod tests {
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_active_decode_prefill_token_budget_has_cli_authority_and_explicit_disable() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+
+        let default = TestCli::try_parse_from(["ferrum", "test-model"]).unwrap();
+        assert!(run_startup_cli_runtime_entries(&default.run, None)
+            .iter()
+            .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET"));
+        for (value, expected) in [("96", Some(96)), ("0", None)] {
+            let parsed = TestCli::try_parse_from([
+                "ferrum",
+                "test-model",
+                "--scheduler-active-decode-prefill-token-budget",
+                value,
+                "--prefill-decode-execution",
+                "mixed",
+            ])
+            .unwrap();
+            let snapshot = RuntimeConfigSnapshot::from_entries(run_startup_cli_runtime_entries(
+                &parsed.run,
+                None,
+            ));
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET")
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::Cli);
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.scheduler.active_decode_prefill_token_budget = Some(256);
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(
+                engine.scheduler.active_decode_prefill_token_budget,
+                expected
+            );
+            assert_eq!(
+                engine.batching.prefill_decode_execution,
+                ferrum_types::PrefillDecodeExecution::Mixed
+            );
+            let execution = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_PREFILL_DECODE_EXECUTION")
+                .unwrap();
+            assert_eq!(execution.source, RuntimeConfigSource::Cli);
+        }
+        assert!(TestCli::try_parse_from([
+            "ferrum",
+            "test-model",
+            "--scheduler-active-decode-prefill-token-budget",
+            "many",
+        ])
+        .is_err());
     }
 
     #[test]
