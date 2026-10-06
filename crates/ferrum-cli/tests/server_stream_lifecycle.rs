@@ -230,13 +230,19 @@ async fn exercise_live_lifecycle(require_slo: bool) {
                 128
             )
         );
-        // A second visible update lets decode execute before the late prefill
-        // arrives, so the SLO-aware scheduler can use actual decode feedback.
+        // A second visible update supplies decode feedback. It does not by
+        // itself guarantee enough independent work shapes for the affine fit.
         let warmup_updates = if require_slo { 2 } else { 1 };
         tokio::join!(
             cancelled.wait_for_content(warmup_updates),
             survivor.wait_for_content(warmup_updates)
         );
+        if require_slo {
+            eprintln!(
+                "scheduler SLO before late prefill={}",
+                health(&client, &origin).await["scheduler"]["slo"]
+            );
+        }
         let prompt = format!(
             "Read this list then repeat its colors: {}",
             "red green blue. ".repeat(256)
@@ -247,7 +253,13 @@ async fn exercise_live_lifecycle(require_slo: bool) {
         // The peer and a newly admitted long prefill remain independent.
         drop(cancelled);
         tokio::join!(survivor.finish(128), newcomer.finish(32));
-        assert_drained(&client, &origin).await;
+        let after_late = assert_drained(&client, &origin).await;
+        if require_slo {
+            eprintln!(
+                "scheduler SLO after late prefill={}",
+                after_late["scheduler"]["slo"]
+            );
+        }
         let followup_count = 3;
         let followups = (0..followup_count).map(|_| async {
             Stream::start(&client, &origin, model, "List the primary colors.", 8)
