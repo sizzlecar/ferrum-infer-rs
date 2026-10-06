@@ -130,10 +130,12 @@ M4 定位重跑 r6 仍失败：长 prefill 到达前只有 4 个反馈波，仿�
 | G32 Off / split | 4 | 34.47 / 117.13 | 13.18 / 14.33 | 12.83 / 29.33 | 287.582 | 三项通过 |
 | c068 静态 / mixed / chunk 256、budget 256 | 4 | 42.40 / 172.28 | 14.58 / 15.73 | 14.52 / 25.00 | 257.073 | TPOT 超标 |
 | c068 动态 / mixed / chunk 256、budget 256 | 4 | 59.62 / 190.49 | 14.84 / 16.07 | 14.68 / 24.44 | 252.926 | TPOT 超标 |
+| c068 静态 / split / 默认分块与预算 | 4 | 33.03 / 116.93 | 14.92 / 16.83 | 14.64 / 30.35 | 254.597 | TPOT 超标 |
+| c068 动态 / split / 默认分块与预算 | 4 | 55.49 / 136.97 | 15.01 / 16.78 | 14.68 / 29.89 | 251.890 | TPOT 超标 |
 
-这四格各 64/64 完成、错误/拒绝/坏输出/协议异常为 0，TTFT/TPOT 各 64 样本；前三格均有 19740 个文本事件 / 19676 个间隔，末格 19742 / 19678。各格均有 8 个 event/usage 不一致，无缺失 usage 或观测到的 coalescing。旧 G32 整个 C2/C4 服务生命周期峰值为 NVML 22315 MiB / RSS 6153984 KiB；chunk 256 静态/动态各自含加载和 C4 的峰值为 20089 / 20088 MiB、6072716 / 6072688 KiB。GPU allocated 和 OS footprint 未采集，各口径不相加。客户端、服务端及 guard 均 exit 0，排空且原服务恢复。
+这六格各 64/64 完成、错误/拒绝/坏输出/协议异常为 0，TTFT/TPOT 各 64 样本；仅 chunk 256 动态格为 19742 个文本事件 / 19678 个间隔，其余各格为 19740 / 19676。各格均有 8 个 event/usage 不一致，无缺失 usage 或观测到的 coalescing。旧 G32 整个 C2/C4 服务生命周期峰值为 NVML 22315 MiB / RSS 6153984 KiB；chunk 256 静态/动态各自含加载和 C4 的峰值为 20089 / 20088 MiB、6072716 / 6072688 KiB；新版 split 静态/动态为 20481 / 20480 MiB、6073236 / 6073136 KiB。GPU allocated 和 OS footprint 未采集，各口径不相加。客户端、服务端及 guard 均 exit 0，排空且原服务恢复。
 
-旧版已扫描达标 G 至少为 **287.582 tok/s@C4**，高于新版默认 mixed 的 168.545；C1 恢复不能证明 P1 完成。旧 split / 新 mixed 差异仍需独立核查；单组 chunk 256 / budget 256 未恢复 C4，不扩展成大规模参数搜索。证据见仓库外 [旧 G32 并发摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/g32-c2c4-r1/summary.json)与 [chunk 256 对照摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/fixed-boundary-chunk256-c4-r1/summary.json)。
+旧版已扫描达标 G 至少为 **287.582 tok/s@C4**，高于新版默认 mixed 的 168.545；C1 恢复不能证明 P1 完成。新版单独改回 split 或采用 chunk 256 / budget 256 均未恢复 C4，不能将差距归因于 mixed 配置；停止扩大参数搜索，核查旧版输出投影合批路径是否漏移植。证据见仓库外 [旧 G32 并发摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/g32-c2c4-r1/summary.json)、[chunk 256 对照摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/fixed-boundary-chunk256-c4-r1/summary.json)与 [split 对照摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/cuda/fixed-boundary-split-c4-r1/summary.json)。
 
 ## 首轮 M4 数据
 
@@ -154,5 +156,7 @@ a890 的最长请求 TTFT 为 4972.05ms，4/64 请求 TTFT 超过 3400ms；TTFT/
 两版本存在明确配置差异：a890 为 Auto→`qwen3_5.f32-master`、mixed、active-decode chunk 128 / budget 256；旧 G32 为 `f16-head`、split、budget 0。两者 effective reusable execution 均为 0。此表用于报告现状，不能单独归因于 SLO 开关。a890 本轮实际动态 prefill 步数为 0，故本格也不能代替已有混合请求 E2E 的动态使用验证。完整结果见仓库外 [M4 C1 摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/slo-sharegpt-c1-r1-summary.json)。
 
 本次 llama.cpp 补齐同 64 样本参考：最长 954/966 token 请求 TTFT 为 4970.64ms，3/64 请求超过 3400ms；TTFT/TPOT 各 64 样本，19740 个可见文本事件 / 19676 个间隔，9 个 event/usage 不一致，无 coalescing、缺失 usage 或协议/机械输出检查异常。使用相同 GGUF、模板、长度政策和 Rust 客户端，固定 unified KV 为 32 slots × 4096、batch 2048 / ubatch 512、Flash Attention 开启、缓存关闭；Ferrum 采用自身动态 KV 及 8GiB runtime budget，保留实现差异。llama 主机内存采样 6423 次，RSS 峰值 11856625664 B、physical footprint 6357181608 B；Metal 分配采样 6426 次、错误 0、完整覆盖加载至关闭。各内存口径不相加，a890 缺少设备分配量，不能据此声称设备内存优势。guard / 客户端 exit 0，端口释放。同负载两实现都失败支持当前 TTFT 瓶颈判断，但仍不等于硬件物理不可能；没有放宽阈值或缩短输入。证据见仓库外 [M4 llama.cpp 同负载摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/llama-sharegpt-c1-r1-summary.json)。
+
+M4 `c068` Off 的 C8 kernel 诊断已结束，8 预热 + 8 测量全部完成、错误/拒绝 0；使用不同于主表的短选择，instrumentation 改变执行边界，不用于 SLO 或 G 结论。仅取首个 fingerprint 的 484 条原始 native 记录作有界摘要：Metal GPU 时间戳区间合计 9444.07ms，SwiGLU 占 59.31%、gated delta 占 32.30%、causal attention 占 7.43%。缺少 physical submission 总记录和阶段标签，command index 有 8 个内部缺口，故这些比例只描述该组已观察记录，不能证明完整 submission、代表性 decode/prefill 或全局 GPU 忙碌率；host gap 与权重带宽亦缺测。两份约 8.34GB 原始文件留在 M4，精确路径/大小/hash、小子集及现有 Rust 摘要器输出见仓库外 [Metal 采样摘要](/Users/chejinxuan/ferrum-handoffs/20261006-throughput-p0/metal/native-profile-r8-c8-r1-summary.json)。服务已清理，不为补指标扩大采集。
 
 原始报告、完整命令和配置位于仓库外 `~/ferrum-handoffs/20261006-throughput-p0/`（CUDA 旧版基线为 `cuda/c1-r1/`，静态候选为 `cuda/run-smoke-r2/`、`cuda/candidate-serve-r1/`，本机静态/动态功能为 `local-smoke/`、`local-slo-smoke/`，M4 为 `metal/`）。上述 CUDA 测量已结束并恢复原服务，M4 两轮主负载服务均已清理。a890 与 c068 CUDA 主负载首轮均未见动态收益；M4 相同主负载 C1 仍因 TTFT 未达标。
