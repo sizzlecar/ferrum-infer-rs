@@ -44,6 +44,8 @@ M4 最终运行源码为 `fe46d6b5`，保留 `bc85eec2` 的既有静态结果作
 
 RN 实机启动先后暴露缺失的 KV 操作别名和静态权重归属支持，分别在 `2c4237d8` / `504d290d` 补齐既有直接依赖，未绕过检查；两次失败日志保留，原服务均已恢复。`a890afc9` 将仿射统计衰减从 0.8 调整为 0.99，延长稀少 prefill 观测的保留时间。停止追加合成负载调参，主负载改为同一 RN/mixed 二进制与固定容量的静态/动态 C1→C2→C4→C8 对比；本轮只改变 SLO 开关，尚无该候选的主负载收益结论。
 
+`504d290d` 的 CUDA RN 自然 `run` 与动态断流 E2E 已通过：21/32 输入/输出 token 正常 stop；E2E 实际动态 prefill 步 0→1，资源排空，原服务恢复且健康。最终归属补丁通过 workspace 全目标检查/测试（4625 通过、0 失败、73 ignored）、Clippy 和 Metal 编译；0.99 的既有 SLO 定向测试也通过。但 `a890afc9` 的 M4 自然 `run` 通过后，同一动态 E2E 因实际动态 prefill 步仍为 0 而失败（反馈波 142、预算更新 2）。请求已完成并排空，现有起止快照不足以定位何时形成可用模型；保留失败，不用旧版通过结果替代。证据为仓库外 `cuda/rn-affine-r3/functional-r1/summary.json` 与 `metal/slo-r5-summary.json`。
+
 ## 首轮 CUDA 5090 数据
 
 以下均为单次探索：32 预热 + 64 测量请求、C1。Qwen3.5-9B Q4_K_M，FP16 KV，context 2048、服务 slots 32、batch 2048；容量在扫描中固定。ShareGPT seed 42，首轮用户/参考答案长度回放，输入 4–1024、最少输出 4、总长含 32-token 模板预留 ≤2048，ignore_eos、thinking off、temperature 0、top_p 1、repetition penalty 1。两臂相同完整选择 hash：`03676b00ee0b9e8407f59e3fb531eeff99dde5ccc9e59844b6abf7d22f1d5df2`。
