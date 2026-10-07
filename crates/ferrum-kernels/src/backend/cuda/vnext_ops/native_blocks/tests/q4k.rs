@@ -55,6 +55,23 @@ impl<T: Scalar> Fixture<T> {
                 block[scale_offset..scale_offset + 2].copy_from_slice(&0_u16.to_le_bytes());
             }
         }
+        Self::for_encoded_weights(stream, format, rows, inputs, outputs, dense_input, encoded)
+    }
+
+    pub(super) fn for_encoded_weights(
+        stream: &Arc<CudaStream>,
+        format: GgufBlockFormat,
+        rows: usize,
+        inputs: usize,
+        outputs: usize,
+        dense_input: bool,
+        encoded: Vec<u8>,
+    ) -> Self {
+        assert_eq!(inputs % format.block_values(), 0);
+        assert_eq!(
+            encoded.len(),
+            outputs * (inputs / format.block_values()) * format.block_bytes()
+        );
         let mut decoded = vec![0.0; inputs * outputs];
         format.decode(&encoded, &mut decoded).unwrap();
         let guard = T::from_f32(-12345.0);

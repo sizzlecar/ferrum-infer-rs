@@ -14,8 +14,22 @@ pub(super) mod weights;
 // Must match the bounded row tile instantiated by vnext_gguf_linear_tiled_*.
 const LINEAR_ROW_TILE: u32 = 8;
 
+// Small Q8_0 grids benefit from independent rows. Keep the measured lower-K
+// boundary and a conservative four-block-per-SM limit; wider grids retain
+// generic T8 reuse. u64 covers the complete u32 launch-shape product.
+fn q8_0_f16_row_tile(rows: u32, inputs: u32, outputs: u32, multiprocessors: u32) -> u32 {
+    let tiled_grid =
+        u64::from(outputs).div_ceil(4) * u64::from(rows).div_ceil(u64::from(LINEAR_ROW_TILE));
+    if rows == 1 || (inputs >= 1024 && tiled_grid < 4 * u64::from(multiprocessors)) {
+        1
+    } else {
+        LINEAR_ROW_TILE
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CudaNativeBlockKernels {
+    multiprocessors: u32,
     pub linear_f16: CudaFunction,
     pub linear_f32: CudaFunction,
     linear_tiled_f16: CudaFunction,
@@ -24,10 +38,19 @@ pub(super) struct CudaNativeBlockKernels {
     linear_tiled_f32_f16: CudaFunction,
     linear_q4k_f16: CudaFunction,
     linear_q4k_tiled_f16: CudaFunction,
+    linear_q8_0_f16: CudaFunction,
+    #[cfg(test)]
+    linear_q8_0_tiled_f16: CudaFunction,
     linear_q5k_f16: CudaFunction,
     linear_q5k_tiled_f16: CudaFunction,
     linear_iq4xs_f16: CudaFunction,
     linear_iq4xs_tiled_f16: CudaFunction,
+    #[cfg(test)]
+    linear_iq4xs_constant_f16: CudaFunction,
+    #[cfg(test)]
+    linear_iq4xs_constant_tiled_f16: CudaFunction,
+    #[cfg(test)]
+    iq4xs_register_decode: CudaFunction,
     linear_q6k_f16: CudaFunction,
     linear_q6k_tiled_f16: CudaFunction,
     linear_q6k_f32: CudaFunction,
@@ -137,6 +160,14 @@ impl CudaNativeBlockKernels {
         }
     }
     pub(super) fn load(context: &Arc<CudaContext>) -> Result<Self, CudaDeviceRuntimeError> {
+        use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
+        let multiprocessors = context
+            .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map_err(|error| CudaDeviceRuntimeError::driver("native GGUF SM count", error))?;
+        let multiprocessors = u32::try_from(multiprocessors)
+            .ok()
+            .filter(|&count| count > 0)
+            .ok_or_else(|| CudaDeviceRuntimeError::contract("native GGUF SM count is invalid"))?;
         let module = context
             .load_module(Ptx::from_src(crate::ptx::VNEXT_GGUF.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("native GGUF module load", error))?;
@@ -146,6 +177,7 @@ impl CudaNativeBlockKernels {
                 .map_err(|error| CudaDeviceRuntimeError::driver("native GGUF function load", error))
         };
         Ok(Self {
+            multiprocessors,
             linear_f16: load("vnext_gguf_linear_f16")?,
             linear_f32: load("vnext_gguf_linear_f32")?,
             linear_tiled_f16: load("vnext_gguf_linear_tiled_f16")?,
@@ -154,10 +186,19 @@ impl CudaNativeBlockKernels {
             linear_tiled_f32_f16: load("vnext_gguf_linear_tiled_f32_f16")?,
             linear_q4k_f16: load("vnext_gguf_linear_q4k_f16")?,
             linear_q4k_tiled_f16: load("vnext_gguf_linear_q4k_tiled_f16")?,
+            linear_q8_0_f16: load("vnext_gguf_linear_q8_0_f16")?,
+            #[cfg(test)]
+            linear_q8_0_tiled_f16: load("vnext_gguf_linear_q8_0_tiled_f16")?,
             linear_q5k_f16: load("vnext_gguf_linear_q5k_f16")?,
             linear_q5k_tiled_f16: load("vnext_gguf_linear_q5k_tiled_f16")?,
             linear_iq4xs_f16: load("vnext_gguf_linear_iq4xs_f16")?,
             linear_iq4xs_tiled_f16: load("vnext_gguf_linear_iq4xs_tiled_f16")?,
+            #[cfg(test)]
+            linear_iq4xs_constant_f16: load("vnext_gguf_linear_iq4xs_constant_f16")?,
+            #[cfg(test)]
+            linear_iq4xs_constant_tiled_f16: load("vnext_gguf_linear_iq4xs_constant_tiled_f16")?,
+            #[cfg(test)]
+            iq4xs_register_decode: load("vnext_gguf_iq4xs_register_decode")?,
             linear_q6k_f16: load("vnext_gguf_linear_q6k_f16")?,
             linear_q6k_tiled_f16: load("vnext_gguf_linear_q6k_tiled_f16")?,
             linear_q6k_f32: load("vnext_gguf_linear_q6k_f32")?,
@@ -254,18 +295,28 @@ impl CudaNativeBlockKernels {
                 "CUDA native linear launch extent is invalid",
             ));
         }
-        let row_tile = if rows > 1 { LINEAR_ROW_TILE } else { 1 };
         let q4k =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K);
+        let q8_0 =
+            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q8_0);
         let q5k =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q5K);
         let iq4xs =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Iq4Xs);
         let q6k =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q6K);
+        let row_tile = if q8_0 && input_type == ElementType::F16 && output_type == ElementType::F16
+        {
+            q8_0_f16_row_tile(rows, part.columns, part.rows, self.multiprocessors)
+        } else if rows > 1 {
+            LINEAR_ROW_TILE
+        } else {
+            1
+        };
         let kernel = match (input_type, output_type, row_tile > 1) {
             (ElementType::F16, ElementType::F16, false) if q4k => &self.linear_q4k_f16,
             (ElementType::F16, ElementType::F16, true) if q4k => &self.linear_q4k_tiled_f16,
+            (ElementType::F16, ElementType::F16, false) if q8_0 => &self.linear_q8_0_f16,
             (ElementType::F16, ElementType::F16, false) if q5k => &self.linear_q5k_f16,
             (ElementType::F16, ElementType::F16, true) if q5k => &self.linear_q5k_tiled_f16,
             (ElementType::F16, ElementType::F16, false) if iq4xs => &self.linear_iq4xs_f16,

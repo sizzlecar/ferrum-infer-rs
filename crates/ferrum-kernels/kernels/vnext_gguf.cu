@@ -78,6 +78,28 @@ __device__ __forceinline__ float native_block_value(const byte* b, unsigned i, u
     return NAN;
 }
 
+// A register-only selection from the same signed-byte codebook. Use the lower
+// three bits for byte selection, and the GGUF code's fourth bit to select the
+// upper half of the sixteen-entry table separately.
+__device__ __forceinline__ int native_iq4_register_value(unsigned code) {
+    const unsigned low = __byte_perm(IQ4_NL_PACKED_0, IQ4_NL_PACKED_1, code & 7u);
+    const unsigned high = __byte_perm(IQ4_NL_PACKED_2, IQ4_NL_PACKED_3, code & 7u);
+    const unsigned selected = (code & 8u) ? high : low;
+    return int(selected & 255u) - int((selected & 128u) << 1);
+}
+
+__device__ __forceinline__ float native_iq4xs_register_block_value(const byte* b, unsigned i) {
+    // Match case 23's byte-safe loads and FP32 expression exactly. Only the
+    // integer codebook lookup changes; generic/embedding/control stay intact.
+    const unsigned group = i / 32;
+    const unsigned scales_h = unsigned(b[2]) | (unsigned(b[3]) << 8);
+    const unsigned lo = (b[4 + group / 2] >> (4 * (group % 2))) & 15;
+    const unsigned hi = (scales_h >> (2 * group)) & 3;
+    const int scale = int(lo | (hi << 4)) - 32;
+    const unsigned q = (b[8 + group * 16 + i % 16] >> (4 * ((i % 32) / 16))) & 15;
+    return (native_half(b, 0) * float(scale)) * float(native_iq4_register_value(q));
+}
+
 template<typename Input, typename Output, unsigned RowTile>
 __device__ void native_linear(const Input* x, const byte* w, Output* y,
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset,
@@ -181,11 +203,56 @@ extern "C" __global__ void vnext_gguf_linear_q4k_##suffix(const half* x, const b
 NATIVE_Q4K_LINEAR(f16, 1)
 NATIVE_Q4K_LINEAR(tiled_f16, 8)
 
+// Q8_0 has one signed byte per lane and one F16 scale per 32-value block.
+// Fix the physical stride without changing coefficient reconstruction, each
+// lane's K order, cross-row reuse, or the final warp reduction.
+template<unsigned RowTile>
+__device__ void native_q8_0_linear(const half* x, const byte* w, half* y,
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
+    const unsigned row = blockIdx.y * RowTile;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned column = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= rows || column >= outputs) return;
+    const unsigned blocks = inputs / 32;
+    const byte* weights = w + size_t(column) * blocks * 34;
+    float sums[RowTile] = {};
+    for (unsigned block = 0; block < blocks; ++block) {
+        const byte* source = weights + size_t(block) * 34;
+        const unsigned i = block * 32 + lane;
+        // Keep the byte-safe scale load: matrix views can have odd offsets.
+        const float weight = native_half(source, 0)
+            * float(static_cast<signed char>(source[2 + lane]));
+        #pragma unroll
+        for (unsigned r = 0; r < RowTile; ++r) {
+            if (row + r < rows) sums[r] += float(x[size_t(row + r) * inputs + i]) * weight;
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && row + r < rows)
+            y[size_t(row + r) * stride + offset + column] = half(sums[r]);
+    }
+}
+
+#define NATIVE_Q8_0_LINEAR(suffix, tile) \
+extern "C" __global__ void vnext_gguf_linear_q8_0_##suffix(const half* x, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
+    unsigned format, unsigned values, unsigned bytes) { \
+    if (format != 8 || values != 32 || bytes != 34 || inputs % 32 != 0) return; \
+    native_q8_0_linear<tile>(x, w, y, rows, inputs, outputs, stride, offset); \
+}
+NATIVE_Q8_0_LINEAR(f16, 1)
+NATIVE_Q8_0_LINEAR(tiled_f16, 8)
+#undef NATIVE_Q8_0_LINEAR
+
 // Fix a 256-value block's format and byte stride without changing reconstructed
 // F32 coefficients, each lane's K order, or the final warp reduction. Byte-safe
 // coefficient loads preserve odd-offset views. F32 operands remain F32: the
 // Q6_K output head must not acquire an intermediate half rounding here.
-template<typename Input, typename Output, unsigned RowTile, unsigned Format, unsigned BlockBytes>
+template<typename Input, typename Output, unsigned RowTile, unsigned Format, unsigned BlockBytes,
+    bool RegisterIq4 = false>
 __device__ void native_fixed256_linear(const Input* x, const byte* w, Output* y,
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
     const unsigned row = blockIdx.y * RowTile;
@@ -201,7 +268,12 @@ __device__ void native_fixed256_linear(const Input* x, const byte* w, Output* y,
         for (unsigned group = 0; group < 8; ++group) {
             const unsigned local = group * 32 + lane;
             const unsigned i = block * 256 + local;
-            const float weight = native_block_value(source, local, Format);
+            float weight;
+            if constexpr (Format == 23 && RegisterIq4) {
+                weight = native_iq4xs_register_block_value(source, local);
+            } else {
+                weight = native_block_value(source, local, Format);
+            }
             #pragma unroll
             for (unsigned r = 0; r < RowTile; ++r) {
                 if (row + r < rows) sums[r] += float(x[size_t(row + r) * inputs + i]) * weight;
@@ -217,22 +289,34 @@ __device__ void native_fixed256_linear(const Input* x, const byte* w, Output* y,
     }
 }
 
-#define NATIVE_FIXED256_LINEAR(Input, Output, name, Format, BlockBytes, suffix, tile) \
+#define NATIVE_FIXED256_LINEAR(Input, Output, name, Format, BlockBytes, suffix, tile, register_iq4) \
 extern "C" __global__ void vnext_gguf_linear_##name##_##suffix(const Input* x, const byte* w, Output* y, \
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
     unsigned format, unsigned values, unsigned bytes) { \
     if (format != Format || values != 256 || bytes != BlockBytes || inputs % 256 != 0) return; \
-    native_fixed256_linear<Input, Output, tile, Format, BlockBytes>(x, w, y, rows, inputs, outputs, stride, offset); \
+    native_fixed256_linear<Input, Output, tile, Format, BlockBytes, register_iq4>(x, w, y, rows, inputs, outputs, stride, offset); \
 }
-NATIVE_FIXED256_LINEAR(half, half, q5k, 13, 176, f16, 1)
-NATIVE_FIXED256_LINEAR(half, half, q5k, 13, 176, tiled_f16, 8)
-NATIVE_FIXED256_LINEAR(half, half, iq4xs, 23, 136, f16, 1)
-NATIVE_FIXED256_LINEAR(half, half, iq4xs, 23, 136, tiled_f16, 8)
-NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, f16, 1)
-NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, tiled_f16, 8)
-NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, f32, 1)
-NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, tiled_f32, 8)
+NATIVE_FIXED256_LINEAR(half, half, q5k, 13, 176, f16, 1, false)
+NATIVE_FIXED256_LINEAR(half, half, q5k, 13, 176, tiled_f16, 8, false)
+NATIVE_FIXED256_LINEAR(half, half, iq4xs, 23, 136, f16, 1, true)
+NATIVE_FIXED256_LINEAR(half, half, iq4xs, 23, 136, tiled_f16, 8, true)
+// Same-binary controls reproduce the previous fixed-format IQ4_XS route.
+NATIVE_FIXED256_LINEAR(half, half, iq4xs_constant, 23, 136, f16, 1, false)
+NATIVE_FIXED256_LINEAR(half, half, iq4xs_constant, 23, 136, tiled_f16, 8, false)
+NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, f16, 1, false)
+NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, tiled_f16, 8, false)
+NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, f32, 1, false)
+NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, tiled_f32, 8, false)
 #undef NATIVE_FIXED256_LINEAR
+
+// Diagnostic entrypoint checks reconstruction before multiplication/half
+// rounding can hide a wrong codebook entry or a tiny signed-scale result.
+extern "C" __global__ void vnext_gguf_iq4xs_register_decode(
+    const byte* input, float* output, unsigned count) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        output[i] = native_iq4xs_register_block_value(input + size_t(i / 256) * 136, i % 256);
+}
 
 #define NATIVE_EMBEDDING(T, suffix) \
 extern "C" __global__ void vnext_gguf_embedding_##suffix(const unsigned* tokens, const byte* w, T* y, \

@@ -26,6 +26,17 @@ pub fn write_tables(out_dir: &Path) {
         write!(&mut source, "{value},").unwrap();
     }
     source.push_str("\n};\n");
+    // Literal register operands share the CPU/Metal reconstruction table. Keep
+    // the indexed constant table above for the generic/control CUDA kernels.
+    for (index, values) in iq4nl_values::IQ4_NL_VALUES.chunks_exact(4).enumerate() {
+        let packed = values
+            .iter()
+            .enumerate()
+            .fold(0_u32, |packed, (byte, value)| {
+                packed | (u32::from(*value as u8) << (8 * byte))
+            });
+        writeln!(source, "#define IQ4_NL_PACKED_{index} 0x{packed:08x}u").unwrap();
+    }
     let path = out_dir.join("vnext_gguf_codebooks.cuh");
     if fs::read_to_string(&path).ok().as_deref() != Some(source.as_str()) {
         fs::write(&path, source).expect("write native GGUF codebooks");

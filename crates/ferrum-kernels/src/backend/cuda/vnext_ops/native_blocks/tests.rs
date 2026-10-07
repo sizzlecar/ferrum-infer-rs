@@ -7,7 +7,9 @@ use cudarc::driver::{CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidA
 use half::f16;
 
 mod format_specialization;
+mod iq4xs_register;
 mod q4k;
+mod q8_0;
 
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {
     if format == GgufBlockFormat::Pq2_0 {
