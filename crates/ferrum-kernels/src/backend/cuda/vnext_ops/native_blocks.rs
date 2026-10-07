@@ -24,6 +24,12 @@ pub(super) struct CudaNativeBlockKernels {
     linear_tiled_f32_f16: CudaFunction,
     linear_q4k_f16: CudaFunction,
     linear_q4k_tiled_f16: CudaFunction,
+    linear_q5k_f16: CudaFunction,
+    linear_q5k_tiled_f16: CudaFunction,
+    linear_iq4xs_f16: CudaFunction,
+    linear_iq4xs_tiled_f16: CudaFunction,
+    linear_q6k_f16: CudaFunction,
+    linear_q6k_tiled_f16: CudaFunction,
     linear_q6k_f32: CudaFunction,
     linear_q6k_tiled_f32: CudaFunction,
     hadamard: hadamard::CudaHadamardKernels,
@@ -148,6 +154,12 @@ impl CudaNativeBlockKernels {
             linear_tiled_f32_f16: load("vnext_gguf_linear_tiled_f32_f16")?,
             linear_q4k_f16: load("vnext_gguf_linear_q4k_f16")?,
             linear_q4k_tiled_f16: load("vnext_gguf_linear_q4k_tiled_f16")?,
+            linear_q5k_f16: load("vnext_gguf_linear_q5k_f16")?,
+            linear_q5k_tiled_f16: load("vnext_gguf_linear_q5k_tiled_f16")?,
+            linear_iq4xs_f16: load("vnext_gguf_linear_iq4xs_f16")?,
+            linear_iq4xs_tiled_f16: load("vnext_gguf_linear_iq4xs_tiled_f16")?,
+            linear_q6k_f16: load("vnext_gguf_linear_q6k_f16")?,
+            linear_q6k_tiled_f16: load("vnext_gguf_linear_q6k_tiled_f16")?,
             linear_q6k_f32: load("vnext_gguf_linear_q6k_f32")?,
             linear_q6k_tiled_f32: load("vnext_gguf_linear_q6k_tiled_f32")?,
             hadamard: hadamard::CudaHadamardKernels::load(&module)?,
@@ -245,11 +257,21 @@ impl CudaNativeBlockKernels {
         let row_tile = if rows > 1 { LINEAR_ROW_TILE } else { 1 };
         let q4k =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K);
+        let q5k =
+            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q5K);
+        let iq4xs =
+            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Iq4Xs);
         let q6k =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q6K);
         let kernel = match (input_type, output_type, row_tile > 1) {
             (ElementType::F16, ElementType::F16, false) if q4k => &self.linear_q4k_f16,
             (ElementType::F16, ElementType::F16, true) if q4k => &self.linear_q4k_tiled_f16,
+            (ElementType::F16, ElementType::F16, false) if q5k => &self.linear_q5k_f16,
+            (ElementType::F16, ElementType::F16, true) if q5k => &self.linear_q5k_tiled_f16,
+            (ElementType::F16, ElementType::F16, false) if iq4xs => &self.linear_iq4xs_f16,
+            (ElementType::F16, ElementType::F16, true) if iq4xs => &self.linear_iq4xs_tiled_f16,
+            (ElementType::F16, ElementType::F16, false) if q6k => &self.linear_q6k_f16,
+            (ElementType::F16, ElementType::F16, true) if q6k => &self.linear_q6k_tiled_f16,
             (ElementType::F32, ElementType::F32, false) if q6k => &self.linear_q6k_f32,
             (ElementType::F32, ElementType::F32, true) if q6k => &self.linear_q6k_tiled_f32,
             (ElementType::F16, ElementType::F16, false) => &self.linear_f16,

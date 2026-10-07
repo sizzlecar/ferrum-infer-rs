@@ -6,6 +6,7 @@ use crate::gguf_blocks::{
 use cudarc::driver::{CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 use half::f16;
 
+mod format_specialization;
 mod q4k;
 
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {
@@ -83,11 +84,14 @@ fn native_block_decoding_matches_shared_ggml_oracle_on_cuda() {
 
 trait Scalar: DeviceRepr + ValidAsZeroBits + Copy + std::fmt::Debug {
     const ROUNDING: f64;
+    const ELEMENT_TYPE: ferrum_interfaces::vnext::ElementType;
     fn from_f32(value: f32) -> Self;
     fn as_f32(self) -> f32;
 }
 impl Scalar for f32 {
     const ROUNDING: f64 = f32::EPSILON as f64;
+    const ELEMENT_TYPE: ferrum_interfaces::vnext::ElementType =
+        ferrum_interfaces::vnext::ElementType::F32;
     fn from_f32(value: f32) -> Self {
         value
     }
@@ -97,6 +101,8 @@ impl Scalar for f32 {
 }
 impl Scalar for f16 {
     const ROUNDING: f64 = 0.0009765625;
+    const ELEMENT_TYPE: ferrum_interfaces::vnext::ElementType =
+        ferrum_interfaces::vnext::ElementType::F16;
     fn from_f32(value: f32) -> Self {
         f16::from_f32(value)
     }
