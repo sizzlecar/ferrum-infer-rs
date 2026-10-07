@@ -1,10 +1,10 @@
 # 热门模型 P0：结果与转向决定（2026-10-07）
 
-[目标与里程碑](goal-popular-models-concurrency.zh.md)：**停止扩充44格，保留13格；CUDA C8与Metal C4/C8诊断已采集，转入P1热点修复。** 首里程碑是RTX5090上27B同GGUF的C4/C8/C16/C32逐档追平llama.cpp；第4周重评后续范围和承诺。
+[目标与里程碑](goal-popular-models-concurrency.zh.md)：**13格基线封存，P1首轮CUDA C8复测完成，尚未追平llama.cpp。** 停止扩充44格；首里程碑仍是RTX5090上27B同GGUF的C4/C8/C16/C32逐档追平，第4周重评扩展。
 
 ## 已测结果
 
-模型均为Qwen3.8-27B UD-Q4_K_M，同硬件跨引擎使用同一文件。CUDA为RTX5090 32GB，Metal为M1 Max 32GB；Ferrum推理版本冻结，llama.cpp为b11429。固定ShareGPT、pool208、seed42，输入4–1024、输入加参考输出及模板预留不超过2048；输出按参考长度、ignore_eos、thinking off、贪心。每格预热8；正式C4/C8各32、C16为64、C32为128，均一次成功探索，取同一选择的前缀。
+模型均为Qwen3.8-27B UD-Q4_K_M，同硬件跨引擎使用同一文件。CUDA为RTX5090 32GB，Metal为M1 Max 32GB；13格保留冻结Ferrum基线，P1候选另列，llama.cpp为b11429。固定ShareGPT、pool208、seed42，输入4–1024、输入加参考输出及模板预留不超过2048；输出按参考长度、ignore_eos、thinking off、贪心。每格预热8；正式C4/C8各32、C16为64、C32为128，均一次成功探索，取同一选择的前缀。
 
 服务容量固定：Metal16槽、CUDA32槽，每请求2048、FP16 KV、全GPU。llama共享KV16384；Ferrum动态KV，Metal utilization1.0、CUDA0.9。总KV及预算策略不同，不能把主机内存差值视为等容量下的节省。Metal Ferrum C8重试与llama C16使用1800秒单请求timeout；其余表内结果为600秒。timeout不是SLO阈值，Ferrum C8原600秒失败保留。
 
@@ -21,6 +21,7 @@
 | CUDA / Ferrum / 27B / C4 | 637.959 / 8413.991 | 97.366 / 162.883 | 92.385 / 198.642 | 33.591733 | 18,034 MiB（NVML全卡） | 未提供 | 未提供 | 32/0/0；1 | unknown |
 | CUDA / llama.cpp / 27B / C8 | 126.935 / 585.610 | 29.005 / 32.475 | 26.310 / 92.286 | 225.204408 | 22,212 MiB（NVML全卡） | 未提供 | 未提供 | 32/0/0；1 | unknown |
 | CUDA / Ferrum / 27B / C8 | 749.334 / 11959.664 | 132.401 / 207.660 | 121.207 / 450.456 | 44.399208 | 18,748 MiB（NVML全卡） | 未提供 | 未提供 | 32/0/0；1 | unknown |
+| CUDA / Ferrum P1 r1复测 / 27B / C8 | 569.149 / 9258.453 | 104.986 / 164.373 | 96.844 / 342.911 | 55.605035 | 18,756 MiB（NVML全卡） | 未提供 | 未提供 | 32/0/0；1 | unknown |
 | CUDA / llama.cpp / 27B / C16 | 139.638 / 1291.395 | 44.217 / 48.839 | 39.092 / 129.246 | 302.624067 | 22,210 MiB（NVML全卡） | 未提供 | 未提供 | 64/0/0；1 | unknown |
 | CUDA / Ferrum / 27B / C16 | 940.480 / 20568.832 | 260.429 / 320.730 | 210.219 / 1006.224 | 50.371303 | 20,438 MiB（NVML全卡） | 未提供 | 未提供 | 64/0/0；1 | unknown |
 | CUDA / llama.cpp / 27B / C32 | 147.768 / 2332.627 | 75.373 / 90.288 | 66.511 / 201.783 | 382.626783 | 22,223 MiB（NVML全卡） | 未提供 | 未提供 | 128/0/0；1 | unknown |
@@ -28,31 +29,32 @@
 
 TPOT截止最后可见文本，按usage输出token减一归一；ITL是相邻非空可见SSE文本事件间隔，保留事件/usage不一致及可见停顿，严格单token诊断另存。表内coalescing观测均为0；TTFT/TPOT样本数等于成功请求数，协议质量计数全0，不等于语义正确。
 
-Metal内存是整个client窗口（含预热）的宿主采样峰，五格采集无缺失/错误；RSS与footprint重叠、不能相加，也不是Metal设备分配。CUDA是250ms采样的全卡NVML已用峰，覆盖启动至关闭，含驱动等分配；逐进程与宿主值未提供。均为采样下界，不是瞬时真峰。S未声明，全部SLO unknown；一次探索没有跨重复方差或置信区间。
+Metal内存是含预热client窗口的宿主采样峰，五格无缺失/错误；RSS与footprint重叠、不能相加，也不是设备分配。CUDA是250ms全卡NVML峰，覆盖启动至关闭、含驱动；逐进程N/A、宿主值未提供。观测峰值仅为瞬时真峰下界。S未声明，全部SLO unknown；单次探索无重复方差或置信区间。
 
 ## 热点证据与P1决定
 
-同并发Ferrum/llama吞吐比：CUDA C4/C8/C16/C32为 **0.228 / 0.197 / 0.166 / 0.153**，Metal C4/C8为 **0.971 / 0.587**。Metal Ferrum C8较C4下降29.2%，尾延迟增大；C8两引擎deadline不同，Ferrum原600秒的29成功/3超时仍保留。C16只有llama，不填比值。
+冻结基线Ferrum/llama吞吐比：CUDA C4/C8/C16/C32为 **0.228 / 0.197 / 0.166 / 0.153**，Metal C4/C8为 **0.971 / 0.587**。Metal Ferrum C8较C4下降29.2%、尾延迟增大；两引擎deadline不同，原600秒29成功/3超时保留。Metal C16只有llama。
 
-独立诊断不增加主表样本；GPU时间为窗口内kernel时长之和，非墙钟或完整请求耗时：
+**P1 r1：** Q5_K/IQ4_XS/Q6_K F16格式特化的CUDA正确性与配对微基准通过；C8三方8条预热＋32条正式样本逐项一致，正式各9,704输出token，负载配置与客户端二进制不变。候选吞吐较旧Ferrum **+25.24%**，三项P99均降低，但吞吐仍仅llama的 **24.69%**、三项P99均更差，尚未完成追平，SLO仍unknown。
+
+独立profile不增加主表样本。CUDA decode按源码、argmax拓扑和实际shape交叉归因；窗口内kernel时长之和不是墙钟，也不用于推算完整迭代数或不同shape的加速比。
 
 | 采集范围 | 实测热点与边界 |
 | --- | --- |
-| CUDA Ferrum第二20秒窗口，C8 decode graph replay（源码/拓扑交叉归因） | decode切片GPU合计7.183689秒。generic `vnext_gguf_linear_tiled_f16` 25,374次/5.692941秒（79.25%）；Q4_K特化6,659次/1.046307秒（14.57%）；Q6_K head 64次/0.148005秒（2.06%）。窗口边界不完整，不推算完整轮数。 |
-| 同窗大M prefill | generic 393次/9.632992秒，Q4_K 103次/2.374407秒。与小行数replay分开统计。 |
-| CUDA llama同C8冻结负载20秒 | 最高单项IQ4_XS `mul_mat_vec_q<23,8>`为36,624次/1.587秒（10.1%）；另有按格式特化的`mul_mat_q`。窗口形状不同，不用平均kernel耗时互算倍数。 |
-| Metal C4/C8短pilot | 各8请求、选择器输入256/输出16、无预热、单次；代表性host frame为346.451/844.941ms，第二批prefill12.419秒阻塞已有输出；本短负载未新增压缩/swapout，不能据此排除长负载内存压力。实际48 recurrent+16 causal层均packed8，仅attention需2,176个encoder interval，超过2,048容量：C8缺完整逐核GPU时间，完整GPU根因未证实。 |
+| 优化前CUDA Ferrum r2，20秒窗口 | C8 decode合计7.183689秒：generic `vnext_gguf_linear_tiled_f16`占79.25%、Q4_K特化14.57%、Q6_K head 2.06%。llama参考窗口最高单项IQ4_XS `mul_mat_vec_q<23,8>`占10.1%；两窗shape不同。 |
+| P1候选CUDA，20秒窗口内8路decode | 合计9.877187秒：IQ4_XS特化28.48%、Q5_K特化21.83%、remaining generic21.81%、Q4_K19.05%。generic中96个Q8_0 `[48,5120]`矩阵对应的投影占整个decode的13.62%；小grid利用不足尚属假说，未测得occupancy。 |
+| 同候选大M prefill | M969–976的线性核合计6.743218秒：IQ4_XS35.12%、Q5_K28.81%、Q4_K25.22%。与7/8路decode及未分类的eager小M分开，旧generic79.25%不再代表候选热点。 |
 
-**P1顺序：** ① CUDA混合格式小batch优先generic路径Q5_K/IQ4_XS，尚未按格式分账；再按占比处理Q4_K/Q6_K head，另处理大M prefill。② Metal先补计时容量，再核M4/M8分派：IQ4_XS/部分Q5_K走M32 tile，Q3_K/IQ3_S/IQ4_NL缺跨行解码复用，部分Q4/Q6已有2×B4；同时处理prefill阻塞。③ 35B支持单列：Metal Q6_K专家启动失败、CUDA AWQ/混合BF16 provider缺口，不按耗时排名。vLLM未测，不声称差距。
+**Metal计时容量已修复。** 固定16槽、各8请求的random256/output16短诊断，C4/C8已归因的GPU命令计时齐全。27次M4/15次M8的host均值344.353/860.917ms，GPU encoder区间和均值298.474/793.996ms；**FFN占后者增量的74.91%**。其中Q3_K/IQ3_S/IQ4_NL的17个矩阵每forward合计43.0→215.6ms，IQ4_XS的85个合计72.2→217.6ms。这是encoder/投影归因，**不是逐shader时间**；合成短诊断不能替代ShareGPT性能或排除长负载内存压力，prefill阻塞另行归因。
 
-不恢复44格或启动CT探索；保留llama C16，已停止的Ferrum C16不计结果。profile只确定修复优先级，优化收益仍需同机、同样本复测。
+**下一步：** CUDA优先IQ4_XS、窄输出Q8_0及大M prefill，按相同shape验证；Metal先验证上述三种稀有格式M8复用2×B4，再单独对照IQ4_XS的2×B4与M32 tile，并处理prefill阻塞。保留重建和数值规则，以真实后端正确性、配对微基准和同负载复测验收。35B的Metal Q6_K专家及CUDA AWQ/混合BF16缺口单列；vLLM未测。
+
+不恢复44格或启动CT探索；已停止的Metal Ferrum C16不计结果。P1只完成首步，四档追平及重复验收仍待完成。
 
 ## 质量与边界
 
 CUDA GGUF质量回放已完成：固定64题、自然EOS、max512、贪心；llama/Ferrum均64题完成、请求错误0，各45题length截断。本轮不作性能比较。两边64题均已逐题审阅，发现明确错误，例如都将5km用时23:30错写为4:42/mile和2:55/km，实际应为4:42/km。HTTP成功、可读或无退化循环不等于质量通过；截断、事实未知与明确错误分别记录。原始输出ID：14/64整序列相同，位置匹配10,366/27,868（37.1968%，分母为各对较长序列之和）。64对缺实际prompt ID对齐证据，不能据此认定数值正确或错误。
 
-35B、CT与vLLM未完成的支持和对照留待P1，不阻塞当前profiling。
+以上64题属于冻结基线。P1新旧Ferrum的单例run实际31个prompt ID、44个完整输出ID均相同；不等于候选64题质量认证。35B、CT与vLLM未完成的支持和对照留待后续。
 
-首里程碑只对CUDA27B同GGUF四档追平负责，同时报告延迟、错误和质量。旧第2周全面超过、第6周达到vLLM80%的承诺已撤销；第4周重评扩展，长期模型范围保留。
-
-完整报告、profile、pins、失败历史与逐题审阅均在库外证据根：`/private/tmp/ferrum-popular-models-p0-20261007/`。
+证据根为`/private/tmp/ferrum-popular-models-p0-20261007/`；当前分析见`analysis/metal-p1-r1/profile-analysis.json`与`analysis/cuda-p1-r1/candidate-profile/kernel-phase-summary.json`，完整报告与历史均留库外。

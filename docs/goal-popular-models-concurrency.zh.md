@@ -1,6 +1,6 @@
 # Ferrum 目标：先追平CUDA27B，再重评扩展（2026-10-07）
 
-路线已根据[P0实测与profiling](performance-popular-models-p0.zh.md)调整：停止扩充44格，保留13格；CUDA27B C8对照与Metal C4/C8诊断已采集，P1先修CUDA混合格式小batch与大M prefill，再处理Metal计时容量、分派和prefill阻塞。详细profile与过程证据在库外归档。
+路线已根据[P0实测与profiling](performance-popular-models-p0.zh.md)调整：停止扩充44格，保留13格基线；P1首轮CUDA格式特化与C8复测完成，仍未追平llama.cpp。候选CUDA热点已分账，Metal计时容量已修复并取得完整观测区间；后续处理量化分派、大M prefill与阻塞。详细证据在库外归档，目标未完成。
 
 ## 1. 当前里程碑与长期范围
 
@@ -15,11 +15,11 @@
 ## 2. P0现状与诊断结论
 
 - **13格封存，不再填44格。** Metal llama C16保留；已停止的Ferrum C16未完成、不计结果。不启动已备CT短测或探索，35B/vLLM准备不阻塞当前修复。
-- **CUDA热点已有窗口证据。** C8 decode切片中generic线性核占79.25%、Q4_K特化14.57%、Q6_K head 2.06%；大M prefill也以量化矩阵核为主。llama同负载已采到按格式特化的矩阵核。次数与耗时见P0页，完整清单在库外；不以不同形状均值推算加速倍数，不把窗口当完整迭代。
-- **Metal短pilot复现C8退化，但逐核计时不完整。** C4/C8各8请求、选择器输入256/输出16，无预热、单次诊断；代表性host frame346.451/844.941ms，第二批prefill12.419秒阻塞已有输出，本短负载未新增压缩/swapout，长负载内存压力仍未排除。实际48 recurrent+16 causal层均packed8，仅attention需2,176个encoder interval，超过2,048容量；不能宣称完整GPU根因已经证实。
+- **CUDA候选热点已重新分账。** 20秒窗口内8路decode：IQ4_XS特化28.48%、Q5_K21.83%、remaining generic21.81%、Q4_K19.05%；96个Q8_0 `[48,5120]`投影占全部decode的13.62%，小grid利用不足仍是假说。优化前generic79.25%仅描述旧Ferrum r2。大M prefill单列，不以不同shape窗口推算加速倍数或完整迭代数。
+- **Metal计时缺口已修复，FFN超线性成本已定位。** 固定16槽的短诊断中，C4/C8已归因的GPU命令计时齐全；C8 decode为2,774–2,775、最大prefill3,544，低于4,096上限。27次M4/15次M8的host包围均值344.353/860.917ms，每forward GPU encoder区间和均值298.474/793.996ms；FFN占GPU区间和增量的74.91%。这是encoder归因，逐shader时间仍缺。prefill及尾部单独归因，不混入主ShareGPT性能；长负载内存压力仍未排除。
 - **64题×两引擎质量已完成并逐题审阅。** 两边均64完成、0请求错误、45题length截断；guard退出0、服务恢复已核验。存在明确语义错误，不判质量通过。原始输出ID为14/64整序列相同、10,366/27,868位置匹配（37.1968%）；64对缺实际prompt ID对齐证据，不能证明数值正确或错误。
 
-P0保留一页结果、以上限定范围的热点证据、逐题质量和原始ID比较；剩余计时缺口明确进入P1，不再以填格、下载完成或短测通过代替工程进展。
+P0保留一页结果、以上限定范围的热点证据、逐题质量和原始ID比较；逐shader采集和复测仍属后续工作，不以填格、下载完成或短测通过代替工程进展。
 
 ## 3. 对照与复测口径
 
@@ -35,8 +35,8 @@ TTFT取首个可见输出；TPOT截止最后可见文本，按usage输出token�
 
 P1按现有证据排序，修复覆盖受影响的run与serve，收益必须同机复测：
 
-1. **CUDA混合格式小batch与大M prefill。** generic路径优先核查Q5_K/IQ4_XS，尚未按格式分账；再按占比处理Q4_K/Q6_K head，另处理大M prefill。按实际shape核对分派、访存与launch，向CUDA27B四档同GGUF追平推进。
-2. **Metal计时容量、M4/M8分派与prefill阻塞。** 先让C8完整计时可观测，再核查IQ4_XS/部分Q5_K的M32 tile与Q3_K/IQ3_S/IQ4_NL缺跨行解码复用的路径；Q4/Q6部分已有2×B4，不笼统认定所有格式都未合批。已有prefill阻塞证据与待补GPU证据分开，修复后复测C4/C8。
+1. **CUDA首步完成，追平未完成。** Q5_K/IQ4_XS/Q6_K F16格式特化已通过真实CUDA正确性与配对微基准。C8同8条预热＋32条正式样本、正式9,704输出token复测为55.605 tok/s，较旧Ferrum+25.24%；三项P99均降低，但吞吐仍仅llama的24.69%、三项P99均更差，SLO unknown。新旧Ferrum单例run的31个prompt ID、44个完整输出ID相同，不是候选64题质量认证。下一步优先IQ4_XS、窄输出Q8_0及大M prefill，以相同shape验证，继续四档追平及重复验收。
+2. **Metal按已测FFN成本验证M8分派。** Q3_K/IQ3_S/IQ4_NL的17个矩阵每forward由M4的43.0增至M8的215.6ms；IQ4_XS的85个由72.2增至217.6ms。先验证前三格式复用2×B4，再单独比较IQ4_XS的2×B4与当前M32 tile；部分Q4/Q6及收缩Q5_K已有拆分。保留权重重建与数值规则，覆盖真实Metal正确性及配对微基准，再做同负载C4/C8和run/serve质量复测。prefill阻塞单独处理；计时修复本身不算性能收益。
 3. **35B支持缺口单列，不作耗时排名。** Metal目标GGUF的Q6_K专家实际启动失败；CUDA AWQ/混合BF16专家为格式/provider缺口，未实跑组合仍标未验证。支持项不能替代27B首里程碑进展。
 
 第4周评审完整四档吞吐比、尾延迟、错误、质量及回归，再决定35B扩展、vLLM比较和自动SLO配置。达不到预期则重评目标与路线，不追加无profile依据的零散补丁，不在尚无vLLM实测时预设第6周比例。
