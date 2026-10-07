@@ -2030,6 +2030,20 @@ impl CudaDeviceRuntime {
         }
         // vNext owns all cross-stream ordering through explicit commands and
         // fences. Per-slice implicit events would create a second authority.
+        if major * 10 + minor < 61
+            || !super::vnext_ops::q8act_g32_profile_compiled(
+                ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+            )
+        {
+            for profile in [
+                ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta,
+                ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
+            ] {
+                config
+                    .capabilities
+                    .retain(|capability| capability.as_str() != profile.capability_id());
+            }
+        }
         unsafe {
             context.disable_event_tracking();
         }

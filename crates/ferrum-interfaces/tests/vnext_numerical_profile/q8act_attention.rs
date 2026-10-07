@@ -203,14 +203,29 @@ fn q8_attention_wire_rejects_undeclared_ports_and_affine_arithmetic() {
 #[test]
 fn causal_q8_profile_validates_f32_program_boundary_without_relabeling_projection_ports() {
     let selected = Q8ActAttentionProfile::Causal;
+    let kv_tensor = tensor(ElementType::F16, vec![2, 4, 256]);
+    let kv_state = StateSpec {
+        id: id("state.kv"),
+        value_id: id("value.input-8"),
+        capacity_demand: StateCapacityDemand::TokenScaled {
+            bytes_per_token: kv_tensor.byte_len().unwrap(),
+            maximum_tokens: 2048,
+        },
+        tensor: kv_tensor,
+        lifetime: StateLifetime::Sequence,
+        initialization: StateInitialization::None,
+        checkpoint: StateCheckpointCapability::Unsupported,
+    };
     let mut profile = NumericalExecutionProfile {
         id: id("fixture.attention-q8"),
         version: ContractVersion::new(1, 0),
         family_id: id("family.fixture.attention-q8"),
         primary_activation: id("value.output"),
         boundaries: BTreeMap::from([(id("value.output"), ElementType::F32)]),
-        states: vec![],
-        kv_storage: vec![],
+        states: vec![kv_state.clone()],
+        kv_storage: vec![KvStateStorage::F16 {
+            state: kv_state.id.clone(),
+        }],
         operations: vec![NumericalOperationContract {
             operation_id: id(selected.operation_id()),
             version: ContractVersion::new(1, 0),
@@ -249,11 +264,11 @@ fn causal_q8_profile_validates_f32_program_boundary_without_relabeling_projectio
     ] {
         attributes.insert(id(key), SemanticValue::Bool(value));
     }
-    // Static program validation only. Provider tests exercise actual KV/state
-    // resources; the external inputs here deliberately have no inferred values.
+    // Static validation retains the real KV state contract. Provider tests
+    // exercise the allocation and contents; other inputs remain external.
     let program = ModelProgram::new(
         profile.family_id.clone(),
-        inputs.clone(),
+        inputs[..8].to_vec(),
         vec![ProgramBlock {
             id: id("block.attention"),
             nodes: vec![ProgramNode {
@@ -266,7 +281,7 @@ fn causal_q8_profile_validates_f32_program_boundary_without_relabeling_projectio
                 attributes,
             }],
         }],
-        vec![],
+        vec![kv_state],
         vec![],
         vec![id("value.output")],
     )

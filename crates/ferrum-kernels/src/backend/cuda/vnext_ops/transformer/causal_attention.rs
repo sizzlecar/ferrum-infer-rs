@@ -76,6 +76,8 @@ mod int8_tests;
 mod numerical_tests;
 mod precision;
 use super::native_matrix;
+use super::q8act_attention::PreparedAttentionProjections;
+use crate::backend::cuda::vnext_ops::native_blocks::q8act::{PackedActivation, Q8ActKernels};
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
 use ferrum_interfaces::vnext::{
     causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
@@ -86,6 +88,7 @@ use ferrum_interfaces::vnext::{
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
 };
+use ferrum_interfaces::vnext::{ProjectionRole, Q8ActAttentionProfile};
 use precision::CausalPrecision;
 const PREPARE_FUNCTION: &str = "vnext_causal_prepare_f16";
 const ATTENTION_FUNCTION: &str = "vnext_causal_attention_f16";
@@ -132,6 +135,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     attention_policy: AttentionExecutionPolicy,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
+    q8act: bool,
     #[cfg(feature = "vllm-marlin")]
     projection_runtime: MarlinProjectionRuntime,
 }
@@ -192,6 +196,7 @@ impl CausalAttentionSemantics {
 #[derive(Clone)]
 struct CausalAttentionFunctions {
     native: CudaNativeBlockKernels,
+    q8act: Option<Q8ActKernels>,
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     gather_decode_lengths: CudaFunction,
@@ -205,6 +210,20 @@ struct CausalAttentionFunctions {
 }
 
 impl CudaCausalPagedAttentionProvider {
+    pub(in crate::backend::cuda::vnext_ops) fn new_q8act(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let profile = Q8ActAttentionProfile::Causal;
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &profile.contract().map_err(contract_error)?,
+            profile.capability_id(),
+            CausalAttentionSemantics::Standard,
+            CausalPrecision::F32Master,
+        )
+    }
     pub(in crate::backend::cuda::vnext_ops) fn new_int8_kv(
         runtime: &CudaDeviceRuntime,
         attention_policy: AttentionExecutionPolicy,
@@ -340,12 +359,26 @@ impl CudaCausalPagedAttentionProvider {
         }
 
         let rounded_gguf = super::gguf_f16_projection::is_operation(&contract.descriptor().id);
-        let provider_id = if rounded_gguf {
+        let q8act =
+            contract.descriptor().id.as_str() == Q8ActAttentionProfile::Causal.operation_id();
+        if q8act
+            && (semantics != CausalAttentionSemantics::Standard
+                || precision != CausalPrecision::F32Master)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "Q8act attention requires its standard F32-master/F16-KV contract",
+            ));
+        }
+        let provider_id = if q8act {
+            "provider.cuda.causal_paged_attention.f32-master.q4k-q5k-iq4xs-q8act-g32"
+        } else if rounded_gguf {
             "provider.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
         } else {
             precision.provider_id(semantics)
         };
-        let estimator_id = if rounded_gguf {
+        let estimator_id = if q8act {
+            "resource-estimator.cuda.causal_paged_attention.f32-master.q4k-q5k-iq4xs-q8act-g32"
+        } else if rounded_gguf {
             "resource-estimator.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
         } else {
             precision.estimator_id(semantics)
@@ -353,6 +386,8 @@ impl CudaCausalPagedAttentionProvider {
         let source = include_str!("causal_attention.rs");
         let mut provider_sources = vec![
             source.as_bytes(),
+            include_bytes!("q8act_attention.rs"),
+            include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("causal_attention/precision.rs"),
             include_bytes!("causal_attention/batch_decode.rs"),
             include_bytes!("gguf_f16_projection.rs"),
@@ -392,6 +427,8 @@ impl CudaCausalPagedAttentionProvider {
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
+            include_bytes!("q8act_attention.rs"),
+            include_bytes!("../native_blocks/q8act.rs"),
             estimator_id.as_bytes(),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("native_matrix.rs"),
@@ -593,6 +630,9 @@ impl CudaCausalPagedAttentionProvider {
             })?;
         let functions = CausalAttentionFunctions {
             native: CudaNativeBlockKernels::load(runtime.context())?,
+            q8act: q8act
+                .then(|| Q8ActKernels::load_attention(runtime.context()))
+                .transpose()?,
             rms_norm: load_function(
                 &rms_module,
                 precision.rms_kernel(),
@@ -659,6 +699,7 @@ impl CudaCausalPagedAttentionProvider {
             attention_policy,
             semantics,
             precision,
+            q8act,
             #[cfg(feature = "vllm-marlin")]
             projection_runtime: MarlinProjectionRuntime::query(runtime)?,
         })
@@ -722,6 +763,22 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
         )?;
         let shape = CausalAttentionShape::from_attributes_for(request.attributes(), self.semantics)
             .map_err(invalid_plan)?;
+        let q8act = self
+            .q8act
+            .then(|| {
+                PreparedAttentionProjections::prepare(
+                    Q8ActAttentionProfile::Causal,
+                    request.values(),
+                )
+            })
+            .transpose()
+            .map_err(invalid_plan)?;
+        let pack_per_token = q8act
+            .as_ref()
+            .map_or(0, PreparedAttentionProjections::bytes_per_token);
+        let pack_slop = q8act
+            .as_ref()
+            .map_or(0, PreparedAttentionProjections::alignment_slop);
         let projection = CausalProjection::from_values(
             request.values(),
             #[cfg(feature = "vllm-marlin")]
@@ -732,6 +789,11 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             ProviderWorkspaceSizeFormula::affine(
                 projection
                     .workspace_reservation_bytes()
+                    .and_then(|bytes| {
+                        bytes
+                            .checked_add(pack_slop)
+                            .ok_or_else(|| "causal pack scratch alignment overflows".into())
+                    })
                     .map_err(invalid_plan)?,
                 shape
                     .attention_policy_scratch_bytes(self.attention_policy)
@@ -741,6 +803,7 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
                     .and_then(|bytes| {
                         bytes
                             .checked_add(projection.transform_bytes_per_token())
+                            .and_then(|bytes| bytes.checked_add(pack_per_token))
                             .ok_or_else(|| "causal Hadamard scratch size overflows".to_owned())
                     })
                     .map_err(invalid_plan)?,
@@ -759,10 +822,12 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
-        Ok(
-            estimate(&self.descriptor, request.input_fingerprint(), Some(scratch))
-                .with_binding(binding),
-        )
+        let estimate = estimate(&self.descriptor, request.input_fingerprint(), Some(scratch))
+            .with_binding(binding);
+        Ok(match q8act {
+            Some(plan) => estimate.with_projection_numerics(plan.into_numerics()),
+            None => estimate,
+        })
     }
 }
 
@@ -2066,6 +2131,16 @@ fn encode_attention(
         return Err("CUDA causal attention received another or empty operation".to_owned());
     }
     let first = &invocation.participants()[0];
+    let q8act = functions
+        .q8act
+        .as_ref()
+        .map(|_| {
+            PreparedAttentionProjections::from_invocation(
+                Q8ActAttentionProfile::Causal,
+                &invocation,
+            )
+        })
+        .transpose()?;
     let shape = CausalAttentionShape::from_attributes_for(first.attributes(), semantics)?;
     let projection = CausalProjection::from_values(
         first.bindings(),
@@ -2099,6 +2174,9 @@ fn encode_attention(
         attention_policy,
     )?;
     let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
+    let required_bytes = q8act.as_ref().map_or(Ok(layout.required_bytes), |plan| {
+        plan.required_bytes(layout.required_bytes, total_tokens)
+    })?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
@@ -2142,10 +2220,7 @@ fn encode_attention(
             .transpose()?,
         scratch: {
             let index = compute_regions.len();
-            compute_regions.push(super::shared_scratch_region(
-                &invocation,
-                layout.required_bytes,
-            )?);
+            compute_regions.push(super::shared_scratch_region(&invocation, required_bytes)?);
             index
         },
         binding: {
@@ -2157,6 +2232,21 @@ fn encode_attention(
             index
         },
     };
+
+    if let Some(plan) = &q8act {
+        for (role, weight) in [
+            (ProjectionRole::CausalQuery, &shared.query_weight),
+            (ProjectionRole::CausalKey, &shared.key_weight),
+            (ProjectionRole::CausalValue, &shared.value_weight),
+            (ProjectionRole::CausalOutput, &shared.output_weight),
+        ] {
+            if let SharedProjectionWeight::Native(matrix) = weight {
+                plan.validate_parts(role, &matrix.parts)?;
+            } else if plan.projection(role)?.has_staged_leaf() {
+                return Err("staged causal projection is not a native matrix".into());
+            }
+        }
+    }
 
     let packed = if input_packed && output_packed && invocation.participants().len() > 1 {
         let input_region = compute_regions.len();
@@ -2444,9 +2534,20 @@ fn encode_attention(
                 .ok_or_else(|| "causal projection dispatch count overflows".to_owned())
         })?
     };
+    let pack_dispatches = q8act
+        .as_ref()
+        .map_or(Ok(0), PreparedAttentionProjections::pack_count)?
+        .checked_mul(if packed_enabled {
+            1
+        } else {
+            launches.len() as u64
+        })
+        .ok_or("causal Q8act pack dispatch count overflows")?;
     let compute_dispatch_count = compute_dispatch_count
         .checked_add(projection_extra)
+        .and_then(|count| count.checked_add(pack_dispatches))
         .ok_or_else(|| "causal compute dispatch count overflows".to_owned())?;
+    let q8_replay_bytes = q8act.as_ref().map(|plan| plan.replay_bytes()).transpose()?;
     let replay_key = (!shape.int8_kv || has_compiled_program_slot)
         .then_some(())
         .filter(|_| {
@@ -2458,6 +2559,11 @@ fn encode_attention(
             let replay_key =
                 CudaCommandReplayKeyBuilder::new(provider_fingerprint, compute_operation)
                     .bytes(projection.replay_tag().as_bytes());
+            let replay_key = if let Some(bytes) = &q8_replay_bytes {
+                replay_key.bytes(bytes).u64(required_bytes)
+            } else {
+                replay_key
+            };
             let replay_key = shared.query_weight.bind_replay_abi(replay_key);
             let replay_key = shared.key_weight.bind_replay_abi(replay_key);
             let replay_key = shared.value_weight.bind_replay_abi(replay_key);
@@ -2549,6 +2655,7 @@ fn encode_attention(
                     layout,
                     binding_layout,
                     &shared,
+                    q8act.as_ref(),
                     packed,
                     batch_decode.as_ref(),
                     &launches,
@@ -2557,8 +2664,17 @@ fn encode_attention(
             } else {
                 for launch in &launches {
                     enqueue_attention(
-                        stream, blas, &functions, projection, shape, cuda, layout, &shared,
-                        *launch, regions,
+                        stream,
+                        blas,
+                        &functions,
+                        projection,
+                        shape,
+                        cuda,
+                        layout,
+                        &shared,
+                        q8act.as_ref(),
+                        *launch,
+                        regions,
                     )?;
                 }
             }
@@ -2907,6 +3023,7 @@ fn enqueue_packed_attention(
     layout: ScratchLayout,
     binding_layout: BindingLayout,
     shared: &SharedRegions,
+    q8act: Option<&PreparedAttentionProjections>,
     packed: PackedCausalAttentionLaunch,
     batch_decode: Option<&batch_decode::BatchDecode>,
     launches: &[CausalAttentionLaunch],
@@ -2939,43 +3056,21 @@ fn enqueue_packed_attention(
         cuda.hidden_size,
         cuda.epsilon,
     )?;
-    for (weight, destination, out_features, operation) in [
-        (
-            &shared.query_weight,
-            query_raw,
-            cuda.query_projection_features,
-            "packed causal attention Q GEMM",
-        ),
-        (
-            &shared.key_weight,
-            key_raw,
-            cuda.kv_features,
-            "packed causal attention K GEMM",
-        ),
-        (
-            &shared.value_weight,
-            value_raw,
-            cuda.kv_features,
-            "packed causal attention V GEMM",
-        ),
-    ] {
-        launch_causal_projection(
-            stream,
-            blas,
-            projection,
-            weight,
-            &functions.native,
-            normalized,
-            destination,
-            scratch,
-            layout,
-            regions,
-            packed.tokens_i32,
-            out_features,
-            cuda.hidden_size,
-            operation,
-        )?;
-    }
+    launch_causal_qkv(
+        stream,
+        blas,
+        functions,
+        projection,
+        shared,
+        q8act,
+        normalized,
+        [query_raw, key_raw, value_raw],
+        scratch,
+        layout,
+        regions,
+        packed.tokens_i32,
+        cuda,
+    )?;
 
     if let Some(batch_decode) = batch_decode {
         batch_decode.enqueue(
@@ -3111,6 +3206,8 @@ fn enqueue_packed_attention(
         cuda.hidden_size,
         cuda.query_features,
         "packed causal attention output GEMM",
+        q8act.map(|plan| (plan, ProjectionRole::CausalOutput, None)),
+        functions.q8act.as_ref(),
     )?;
     let residual_branch = if logical.post_attention_norm {
         let norm_region = shared.post_attention_norm.ok_or_else(|| {
@@ -3157,6 +3254,7 @@ fn enqueue_attention(
     cuda: CudaCausalAttentionShape,
     layout: ScratchLayout,
     shared: &SharedRegions,
+    q8act: Option<&PreparedAttentionProjections>,
     launch: CausalAttentionLaunch,
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -3193,43 +3291,21 @@ fn enqueue_attention(
         cuda.hidden_size,
         cuda.epsilon,
     )?;
-    for (weight, destination, out_features, operation) in [
-        (
-            &shared.query_weight,
-            query_raw,
-            cuda.query_projection_features,
-            "causal attention Q GEMM",
-        ),
-        (
-            &shared.key_weight,
-            key_raw,
-            cuda.kv_features,
-            "causal attention K GEMM",
-        ),
-        (
-            &shared.value_weight,
-            value_raw,
-            cuda.kv_features,
-            "causal attention V GEMM",
-        ),
-    ] {
-        launch_causal_projection(
-            stream,
-            blas,
-            projection,
-            weight,
-            &functions.native,
-            normalized,
-            destination,
-            scratch,
-            layout,
-            regions,
-            launch.tokens_i32,
-            out_features,
-            cuda.hidden_size,
-            operation,
-        )?;
-    }
+    launch_causal_qkv(
+        stream,
+        blas,
+        functions,
+        projection,
+        shared,
+        q8act,
+        normalized,
+        [query_raw, key_raw, value_raw],
+        scratch,
+        layout,
+        regions,
+        launch.tokens_i32,
+        cuda,
+    )?;
     launch_prepare(
         stream,
         &functions.prepare,
@@ -3284,6 +3360,8 @@ fn enqueue_attention(
         cuda.hidden_size,
         cuda.query_features,
         "causal attention output GEMM",
+        q8act.map(|plan| (plan, ProjectionRole::CausalOutput, None)),
+        functions.q8act.as_ref(),
     )?;
     let residual_branch = if logical.post_attention_norm {
         let norm_region = shared.post_attention_norm.ok_or_else(|| {
@@ -3321,6 +3399,90 @@ fn enqueue_attention(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn launch_causal_qkv(
+    stream: &CudaStream,
+    blas: &CudaBlas,
+    functions: &CausalAttentionFunctions,
+    projection: CausalProjection,
+    shared: &SharedRegions,
+    q8act: Option<&PreparedAttentionProjections>,
+    input: u64,
+    outputs: [u64; 3],
+    scratch: &CudaBufferRegion,
+    layout: ScratchLayout,
+    regions: &[CudaBufferRegion],
+    rows: i32,
+    cuda: CudaCausalAttentionShape,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let consume = |packed: Option<&PackedActivation>| {
+        for (index, (role, weight, width, label)) in [
+            (
+                ProjectionRole::CausalQuery,
+                &shared.query_weight,
+                cuda.query_projection_features,
+                "causal attention Q GEMM",
+            ),
+            (
+                ProjectionRole::CausalKey,
+                &shared.key_weight,
+                cuda.kv_features,
+                "causal attention K GEMM",
+            ),
+            (
+                ProjectionRole::CausalValue,
+                &shared.value_weight,
+                cuda.kv_features,
+                "causal attention V GEMM",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            launch_causal_projection(
+                stream,
+                blas,
+                projection,
+                weight,
+                &functions.native,
+                input,
+                outputs[index],
+                scratch,
+                layout,
+                regions,
+                rows,
+                width,
+                cuda.hidden_size,
+                label,
+                q8act.map(|plan| (plan, role, packed)),
+                functions.q8act.as_ref(),
+            )?;
+        }
+        Ok(())
+    };
+    if let Some(plan) = q8act {
+        let kernels = functions
+            .q8act
+            .as_ref()
+            .ok_or_else(|| CudaDeviceRuntimeError::contract("Q8act QKV plan has no kernels"))?;
+        let rows = u32::try_from(rows)
+            .map_err(|_| CudaDeviceRuntimeError::contract("invalid QKV rows"))?;
+        let k = u32::try_from(cuda.hidden_size)
+            .map_err(|_| CudaDeviceRuntimeError::contract("invalid QKV K"))?;
+        let required = plan
+            .needs_pack(&[
+                ProjectionRole::CausalQuery,
+                ProjectionRole::CausalKey,
+                ProjectionRole::CausalValue,
+            ])
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        let (workspace, bytes) = plan.workspace(scratch, layout.required_bytes, u64::from(rows))?;
+        kernels.with_packed_input(stream, required, input, rows, k, workspace, bytes, consume)
+    } else {
+        consume(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn launch_causal_projection(
     stream: &CudaStream,
     blas: &CudaBlas,
@@ -3336,7 +3498,74 @@ fn launch_causal_projection(
     output_features: i32,
     input_features: i32,
     operation: &'static str,
+    q8act: Option<(
+        &PreparedAttentionProjections,
+        ProjectionRole,
+        Option<&PackedActivation>,
+    )>,
+    q8_kernels: Option<&Q8ActKernels>,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    if let Some((plan, role, packed)) = q8act {
+        let retained = plan
+            .projection(role)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        if let SharedProjectionWeight::Native(matrix) = weight {
+            let kernels = q8_kernels.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("retained causal Q8act plan has no implementation")
+            })?;
+            let rows = u32::try_from(rows)
+                .map_err(|_| CudaDeviceRuntimeError::contract("invalid causal projection rows"))?;
+            let stride = u32::try_from(output_features)
+                .map_err(|_| CudaDeviceRuntimeError::contract("invalid causal projection width"))?;
+            let pointers = regions
+                [matrix.first_region..matrix.first_region + weights::region_count(&matrix.parts)]
+                .iter()
+                .map(CudaBufferRegion::device_ptr)
+                .collect::<Vec<_>>();
+            let transform = layout
+                .transform_workspace
+                .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                .transpose()?
+                .unwrap_or(0);
+            return if let Some(packed) = packed {
+                kernels.launch_with_packed(
+                    native,
+                    stream,
+                    retained,
+                    &matrix.parts,
+                    &pointers,
+                    input,
+                    output,
+                    rows,
+                    stride,
+                    Some(packed),
+                    transform,
+                )
+            } else {
+                let (workspace, bytes) =
+                    plan.workspace(scratch, layout.required_bytes, u64::from(rows))?;
+                kernels.launch(
+                    native,
+                    stream,
+                    retained,
+                    &matrix.parts,
+                    &pointers,
+                    input,
+                    output,
+                    rows,
+                    stride,
+                    workspace,
+                    bytes,
+                    transform,
+                )
+            };
+        }
+        if retained.has_staged_leaf() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "staged causal leaf has no native physical projection",
+            ));
+        }
+    }
     match *weight {
         SharedProjectionWeight::Native(ref matrix) => native_matrix::launch(
             stream,

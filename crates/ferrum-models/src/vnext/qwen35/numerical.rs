@@ -5,8 +5,9 @@
 use super::*;
 use ferrum_interfaces::vnext::{
     CheckpointInputDependency, DeclaredProjectionArithmetic, KvStateStorage, KvStorageFormat,
-    NumericalOperationContract, NumericalProfileId, ProjectionRole, Q8ActSwiGluProfile,
-    StateCheckpointCapability, StateCheckpointContents, StateCheckpointContract,
+    NumericalOperationContract, NumericalProfileId, ProjectionRole, Q8ActAttentionProfile,
+    Q8ActSwiGluProfile, StateCheckpointCapability, StateCheckpointContents,
+    StateCheckpointContract,
 };
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
@@ -15,6 +16,8 @@ pub const F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.ffn-iq4xs-q8act-g32";
 pub const F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.ffn-q4k-q5k-iq4xs-q8act-g32";
+pub const F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.ffn-attention-q4k-q5k-iq4xs-q8act-g32";
 const F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-f16-projections";
 pub const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID: &str =
@@ -22,6 +25,8 @@ pub const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID: &str =
 pub const F16_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.int8-kv";
 pub const F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.int8-kv";
 
+#[cfg(test)]
+mod q8act_attention_tests;
 #[cfg(test)]
 mod q8act_tests;
 
@@ -41,6 +46,9 @@ pub(super) fn profiles(
         .filter(|&profile| q8act_ffn_eligible_for(config, &text, profile))
         .map(|profile| q8act_ffn_profile(&f32, profile))
         .collect::<Result<Vec<_>, _>>()?;
+    let q8act_attention = q8act_attention_eligible(config, &text)
+        .then(|| q8act_attention_profile(&f32))
+        .transpose()?;
     // Qualification covers both physical encoding and recurrent parameter ABI.
     // In particular, an unquantized negative-rate source must not silently
     // acquire the as-yet unqualified F16 behavior merely because it has no blocks.
@@ -80,7 +88,98 @@ pub(super) fn profiles(
     // Explicit opt-in: Auto retains its existing numerical policy.
     profiles.extend(rn_fragment);
     profiles.extend(q8act);
+    profiles.extend(q8act_attention);
     FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 2), profiles, automatic)
+}
+
+pub(super) fn q8act_attention_eligible(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+) -> bool {
+    config.weight_format == FamilyWeightFormat::GgufNative
+        && text.moe.is_none()
+        && config.recurrent_weight_abi == RecurrentWeightAbi::NegativeRateInterleaved
+        && config.gguf_hadamard.is_none()
+        && config.weights.iter().any(|weight| {
+            if !weight
+                .layer_index
+                .is_some_and(|layer| (layer as usize) < text.num_hidden_layers)
+            {
+                return false;
+            }
+            let (kind, role) = match weight.role.as_str() {
+                "linear_attn_qkv" | "linear_attn_z" | "linear_attn_a" | "linear_attn_b" => (
+                    Q8ActAttentionProfile::GatedDelta,
+                    ProjectionRole::GatedDeltaInput,
+                ),
+                "linear_attn_out" => (
+                    Q8ActAttentionProfile::GatedDelta,
+                    ProjectionRole::GatedDeltaOutput,
+                ),
+                "self_attn_q" => (Q8ActAttentionProfile::Causal, ProjectionRole::CausalQuery),
+                "self_attn_k" => (Q8ActAttentionProfile::Causal, ProjectionRole::CausalKey),
+                "self_attn_v" => (Q8ActAttentionProfile::Causal, ProjectionRole::CausalValue),
+                "self_attn_o" => (Q8ActAttentionProfile::Causal, ProjectionRole::CausalOutput),
+                _ => return false,
+            };
+            let layer = weight.layer_index.unwrap() as usize;
+            let expected = match kind {
+                Q8ActAttentionProfile::GatedDelta => Qwen35LayerType::LinearAttention,
+                Q8ActAttentionProfile::Causal => Qwen35LayerType::FullAttention,
+            };
+            if text.layer_types.get(layer) != Some(&expected) {
+                return false;
+            }
+            let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
+                return false;
+            };
+            let [n, k] = weight.dimensions.as_slice() else {
+                return false;
+            };
+            matches!(
+                kind.arithmetic()
+                    .declared_projection_arithmetic(role, Some(spec), *k, *n, false),
+                Ok(DeclaredProjectionArithmetic::Staged(_))
+            )
+        })
+}
+
+fn q8act_attention_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    // The established FFN contract is reused verbatim, not broadened in place.
+    let mut profile = q8act_ffn_profile(master, Q8ActSwiGluProfile::Q4KQ5KIq4Xs)?;
+    profile.id = NumericalProfileId::new(
+        F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
+    )
+    .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    for (base, kind) in [
+        (
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            Q8ActAttentionProfile::GatedDelta,
+        ),
+        (
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            Q8ActAttentionProfile::Causal,
+        ),
+    ] {
+        if let Some(operation) = profile
+            .operations
+            .iter_mut()
+            .find(|op| op.operation_id.as_str() == base)
+        {
+            operation.operation_id = operation_id(kind.operation_id())?;
+            operation.version = ContractVersion::new(1, 0);
+            operation.multiplication_type = None;
+            operation.accumulation_type = None;
+            operation.composite_arithmetic = Some(kind.arithmetic());
+        }
+    }
+    profile
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    profile.validate()?;
+    Ok(profile)
 }
 
 pub(super) fn q8act_profile_kind(id: &str) -> Option<Q8ActSwiGluProfile> {

@@ -72,6 +72,7 @@ mod hadamard;
 mod numerical;
 pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
+    F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
     F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID,
@@ -359,6 +360,14 @@ impl Qwen35OperationProfile {
         ..Self::F32_MASTER
     };
 
+    const F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32: Self = Self {
+        linear_attention: OperationSelection::new(
+            ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID, 1, 0),
+        causal_attention: OperationSelection::new(
+            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID, 1, 0),
+        ..Self::F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32
+    };
+
     const F16_INT8_KV: Self = Self {
         causal_attention: OperationSelection::new(
             CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
@@ -385,6 +394,9 @@ impl Qwen35OperationProfile {
             }
             F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32)
+            }
+            F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32)
             }
             F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8)
@@ -858,6 +870,20 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     "Q8act FFN requires its exact declared dense native GGUF/F16-KV profile",
                 ));
             }
+        }
+        if profile.id.as_str()
+            == F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID
+            && (!numerical::q8act_attention_eligible(config, &text)
+                || profile
+                    .kv_storage
+                    .iter()
+                    .any(|state| state.format() != KvStorageFormat::F16)
+                || numerical::profiles(&self.family_id, config)?.resolve(&profile.id)? != profile)
+        {
+            return Err(invalid_config(
+                "numerical_profile",
+                "Q8act attention requires its exact declared dense native GGUF/F16-KV profile",
+            ));
         }
         if profile.id.as_str() == F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID {
             if !numerical::gguf_rn_f16_fragment_eligible(config, &text)

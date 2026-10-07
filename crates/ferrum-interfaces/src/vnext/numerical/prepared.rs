@@ -5,7 +5,8 @@ use super::{
 };
 use crate::vnext::{
     ElementType, PhysicalWeightLayout, PhysicalWeightPadding, ResolvedValueBinding,
-    ResolvedValueRole, ResolvedWeightBinding, WeightEncoding, WeightId, DENSE_SWIGLU_OPERATION_ID,
+    ResolvedValueRole, ResolvedWeightBinding, WeightEncoding, WeightId,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
 };
 use serde::{Deserialize, Serialize};
@@ -120,19 +121,26 @@ impl PreparedProjectionNumerics {
         values: &[ResolvedValueBinding],
     ) -> Result<Self, String> {
         contract.validate()?;
-        let ports = match contract.strict_base.operation_id.as_str() {
-            DENSE_SWIGLU_OPERATION_ID => [
-                (ProjectionRole::SwiGluGateUp, 1, 3),
-                (ProjectionRole::SwiGluDown, 2, 2),
-            ],
-            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID => [
-                (ProjectionRole::GatedDeltaInput, 2, 2),
-                (ProjectionRole::GatedDeltaOutput, 7, 2),
-            ],
-            _ => return Err("unsupported strict projection base".into()),
-        };
+        let ports: &[(ProjectionRole, u32, usize)] =
+            match contract.strict_base.operation_id.as_str() {
+                DENSE_SWIGLU_OPERATION_ID => &[
+                    (ProjectionRole::SwiGluGateUp, 1, 3),
+                    (ProjectionRole::SwiGluDown, 2, 2),
+                ],
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID => &[
+                    (ProjectionRole::GatedDeltaInput, 2, 2),
+                    (ProjectionRole::GatedDeltaOutput, 7, 2),
+                ],
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID => &[
+                    (ProjectionRole::CausalQuery, 2, 2),
+                    (ProjectionRole::CausalKey, 3, 2),
+                    (ProjectionRole::CausalValue, 4, 2),
+                    (ProjectionRole::CausalOutput, 5, 2),
+                ],
+                _ => return Err("unsupported strict projection base".into()),
+            };
         let mut projections = Vec::new();
-        for (role, ordinal, rank) in ports {
+        for &(role, ordinal, rank) in ports {
             let mut matching = values.iter().filter(|value| {
                 value.role() == ResolvedValueRole::Input && value.ordinal() == ordinal
             });

@@ -125,13 +125,16 @@ impl PackLayout {
 
 // Only the pack owner creates this view. Equal byte extents do not make the
 // group-major and word-major layouts interchangeable; rows/K are also part
-// of the physical order. Each projection repacks its input before leaf reuse.
-struct PackedActivation {
+// of the physical order. The owner scopes reuse to consumers of the same input
+// on the same stream; callers cannot create, clone or retain this view.
+pub(in crate::backend::cuda::vnext_ops) struct PackedActivation {
     order: QwordOrder,
     rows: u32,
     k: u32,
     scales: u64,
     words: u64,
+    input: u64,
+    stream: usize,
 }
 
 impl PackedActivation {
@@ -158,6 +161,8 @@ impl PackedActivation {
             k,
             scales: workspace,
             words,
+            input: 0,
+            stream: 0,
         })
     }
 
@@ -195,6 +200,11 @@ struct KernelPair {
 }
 
 impl Q8ActKernels {
+    /// Attention has its own numerical operation identity. It uses this exact
+    /// physical format bundle; the retained attention contract owns routing.
+    pub fn load_attention(context: &Arc<CudaContext>) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::load_for_profile(context, Q8ActSwiGluProfile::Q4KQ5KIq4Xs)
+    }
     pub fn load(context: &Arc<CudaContext>) -> Result<Self, CudaDeviceRuntimeError> {
         Self::load_for_profile(context, Q8ActSwiGluProfile::Iq4Xs)
     }
@@ -305,11 +315,61 @@ impl Q8ActKernels {
         workspace_bytes: u64,
         transform_scratch: u64,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        self.validate_launch(
+            projection,
+            parts,
+            weights,
+            input,
+            output,
+            rows,
+            output_stride,
+        )?;
+        let k = u32::try_from(projection.input_features())
+            .map_err(|_| CudaDeviceRuntimeError::contract("Q8act K exceeds u32"))?;
+        self.with_packed_input(
+            stream,
+            projection.has_staged_leaf(),
+            input,
+            rows,
+            k,
+            workspace,
+            workspace_bytes,
+            |packed| {
+                self.launch_validated_with_packed(
+                    strict,
+                    stream,
+                    projection,
+                    parts,
+                    weights,
+                    input,
+                    output,
+                    rows,
+                    output_stride,
+                    packed,
+                    transform_scratch,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_launch(
+        &self,
+        projection: &PreparedProjection,
+        parts: &[weights::MatrixPart],
+        weights: &[u64],
+        input: u64,
+        output: u64,
+        rows: u32,
+        output_stride: u32,
+    ) -> Result<(), CudaDeviceRuntimeError> {
         Self::validate_parts_for_profile(self.profile, projection, parts)
             .map_err(CudaDeviceRuntimeError::contract)?;
         if rows == 0
             || rows > u16::MAX as u32
             || weights.len() != weights::region_count(parts)
+            || input == 0
+            || output == 0
             || input % 2 != 0
             || output % 2 != 0
         {
@@ -326,11 +386,33 @@ impl Q8ActKernels {
                 "Q8act output part exceeds stride",
             ));
         }
-        let k = u32::try_from(projection.input_features())
-            .map_err(|_| CudaDeviceRuntimeError::contract("Q8act K exceeds u32"))?;
-        let packed = if projection.has_staged_leaf() {
-            let packed = PackedActivation::new(self.order, rows, k, workspace, workspace_bytes)
+        Ok(())
+    }
+
+    /// Reuse is scoped to one pack and one ordered stream. In particular this
+    /// is not an activation cache across waves or distinct normalization inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_packed_input<R>(
+        &self,
+        stream: &CudaStream,
+        required: bool,
+        input: u64,
+        rows: u32,
+        k: u32,
+        workspace: u64,
+        workspace_bytes: u64,
+        consume: impl FnOnce(Option<&PackedActivation>) -> Result<R, CudaDeviceRuntimeError>,
+    ) -> Result<R, CudaDeviceRuntimeError> {
+        let packed = if required {
+            if input == 0 || input % 2 != 0 || rows == 0 || rows > u16::MAX as u32 {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "invalid Q8act pack input or rows",
+                ));
+            }
+            let mut packed = PackedActivation::new(self.order, rows, k, workspace, workspace_bytes)
                 .map_err(CudaDeviceRuntimeError::contract)?;
+            packed.input = input;
+            packed.stream = stream.cu_stream() as usize;
             let groups = u64::from(rows) * u64::from(k / 32);
             let blocks = u32::try_from(groups.div_ceil(4))
                 .map_err(|_| CudaDeviceRuntimeError::contract("Q8act pack grid overflows"))?;
@@ -355,14 +437,78 @@ impl Q8ActKernels {
         } else {
             None
         };
+        consume(packed.as_ref())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_with_packed(
+        &self,
+        strict: &CudaNativeBlockKernels,
+        stream: &CudaStream,
+        projection: &PreparedProjection,
+        parts: &[weights::MatrixPart],
+        weights: &[u64],
+        input: u64,
+        output: u64,
+        rows: u32,
+        output_stride: u32,
+        packed: Option<&PackedActivation>,
+        transform_scratch: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        self.validate_launch(
+            projection,
+            parts,
+            weights,
+            input,
+            output,
+            rows,
+            output_stride,
+        )?;
+        self.launch_validated_with_packed(
+            strict,
+            stream,
+            projection,
+            parts,
+            weights,
+            input,
+            output,
+            rows,
+            output_stride,
+            packed,
+            transform_scratch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_validated_with_packed(
+        &self,
+        strict: &CudaNativeBlockKernels,
+        stream: &CudaStream,
+        projection: &PreparedProjection,
+        parts: &[weights::MatrixPart],
+        weights: &[u64],
+        input: u64,
+        output: u64,
+        rows: u32,
+        output_stride: u32,
+        packed: Option<&PackedActivation>,
+        transform_scratch: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let k = u32::try_from(projection.input_features())
+            .map_err(|_| CudaDeviceRuntimeError::contract("Q8act K exceeds u32"))?;
         for (index, (part, leaf)) in parts.iter().zip(projection.leaves()).enumerate() {
             if leaf.is_staged() {
-                let packed = packed.as_ref().ok_or_else(|| {
+                let packed = packed.ok_or_else(|| {
                     CudaDeviceRuntimeError::contract("eligible Q8act leaf has no packed input")
                 })?;
                 packed
                     .validate_for(self.order, rows, k)
                     .map_err(CudaDeviceRuntimeError::contract)?;
+                if packed.input != input || packed.stream != stream.cu_stream() as usize {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "Q8act packed input identity or stream differs",
+                    ));
+                }
                 let pair = self
                     .pairs
                     .iter()

@@ -11,7 +11,12 @@ mod q4k_reference;
 #[path = "../../../native_blocks/tests/q8dot/q5k_reference.rs"]
 mod q5k_reference;
 
-fn affine_matrix(format: MatrixFormat, n: usize, k: usize, salt: usize) -> (Vec<u8>, Vec<f32>) {
+pub(super) fn affine_matrix(
+    format: MatrixFormat,
+    n: usize,
+    k: usize,
+    salt: usize,
+) -> (Vec<u8>, Vec<f32>) {
     let MatrixFormat::Block(f @ (GgufBlockFormat::Q4K | GgufBlockFormat::Q5K)) = format else {
         return matrix(format, n, k, salt);
     };
@@ -60,7 +65,7 @@ fn affine_matrix(format: MatrixFormat, n: usize, k: usize, salt: usize) -> (Vec<
 }
 
 #[derive(Default)]
-struct Errors {
+pub(super) struct Errors {
     outputs: usize,
     implementation: f64,
     activation_quantization: f64,
@@ -69,7 +74,7 @@ struct Errors {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assert_staged_projection(
+pub(super) fn assert_staged_projection(
     input: &[f16],
     bytes: &[u8],
     decoded: &[f32],

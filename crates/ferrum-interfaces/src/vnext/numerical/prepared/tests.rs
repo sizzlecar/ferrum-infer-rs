@@ -1,6 +1,82 @@
 use super::*;
 use crate::vnext::*;
 
+#[test]
+fn prepared_attention_q8act_preserves_causal_slots_shapes_and_fallbacks() {
+    let policy = Q8ActAttentionProfile::Causal.arithmetic();
+    let values = vec![
+        binding(2, &[Some("quantization.gguf.iq4-xs")], 256, 512, false),
+        binding(3, &[Some("quantization.gguf.q4-k")], 256, 64, false),
+        binding(4, &[Some("quantization.gguf.q6-k")], 256, 64, false),
+        binding(5, &[Some("quantization.gguf.q5-k")], 512, 256, false),
+    ];
+    let prepared = PreparedProjectionNumerics::prepare(&policy, &values).unwrap();
+    for (role, ordinal, k, n, staged) in [
+        (ProjectionRole::CausalQuery, 2, 256, 512, true),
+        (ProjectionRole::CausalKey, 3, 256, 64, true),
+        (ProjectionRole::CausalValue, 4, 256, 64, false),
+        (ProjectionRole::CausalOutput, 5, 512, 256, true),
+    ] {
+        let projection = prepared.projection(role).unwrap();
+        assert_eq!(
+            (
+                projection.weight_input_ordinal(),
+                projection.input_features(),
+                projection.output_features()
+            ),
+            (ordinal, k, n)
+        );
+        assert_eq!(projection.has_staged_leaf(), staged);
+        assert_eq!(
+            projection.leaves()[0].component_id(),
+            &id::<WeightId>(&format!("component.{ordinal}.0"))
+        );
+    }
+    assert!(matches!(
+        prepared
+            .projection(ProjectionRole::CausalValue)
+            .unwrap()
+            .leaves()[0]
+            .route(),
+        PreparedProjectionRoute::StrictBase {
+            reason: StrictProjectionReason::FormatNotDeclared
+        }
+    ));
+    let wire = serde_json::to_value(&prepared).unwrap();
+    let roundtrip: PreparedProjectionNumerics = serde_json::from_value(wire.clone()).unwrap();
+    roundtrip.validate_bindings(&policy, &values).unwrap();
+    let mut tampered = wire;
+    tampered["projections"][0]["weight_input_ordinal"] = 3.into();
+    assert!(
+        serde_json::from_value::<PreparedProjectionNumerics>(tampered)
+            .unwrap()
+            .validate_bindings(&policy, &values)
+            .is_err()
+    );
+    let mut changed = values.clone();
+    changed[0] = binding(2, &[Some("quantization.gguf.iq4-xs")], 256, 512, true);
+    assert!(prepared.validate_bindings(&policy, &changed).is_err());
+    assert!(PreparedProjectionNumerics::prepare(&policy, &values[..3]).is_err());
+    let mut duplicate = values.clone();
+    duplicate.push(values[1].clone());
+    assert!(PreparedProjectionNumerics::prepare(&policy, &duplicate).is_err());
+    let mut partial = policy;
+    partial
+        .projections
+        .retain(|projection| projection.role != ProjectionRole::CausalKey);
+    let partial = PreparedProjectionNumerics::prepare(&partial, &values).unwrap();
+    assert!(matches!(
+        partial
+            .projection(ProjectionRole::CausalKey)
+            .unwrap()
+            .leaves()[0]
+            .route(),
+        PreparedProjectionRoute::StrictBase {
+            reason: StrictProjectionReason::UnmodifiedProjection
+        }
+    ));
+}
+
 fn id<T: TryFrom<String>>(s: &str) -> T
 where
     T::Error: std::fmt::Debug,

@@ -1,0 +1,373 @@
+use super::*;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Path {
+    Eager,
+    Warm,
+    Replay,
+    EagerBoundary,
+}
+
+pub struct BatchObservation {
+    pub values: BTreeMap<(u32, String), Vec<u8>>,
+    types: BTreeMap<String, ElementType>,
+}
+
+impl BatchObservation {
+    pub fn assert_same(&self, other: &Self) {
+        assert_eq!(
+            self.values, other.values,
+            "same-policy output/state/KV bits"
+        );
+        for ((_, name), bytes) in &self.values {
+            let values: Vec<f32> = match self.types[name] {
+                ElementType::F16 => bytes
+                    .chunks_exact(2)
+                    .map(|v| f16::from_le_bytes(v.try_into().unwrap()).to_f32())
+                    .collect(),
+                ElementType::F32 => bytes
+                    .chunks_exact(4)
+                    .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                    .collect(),
+                other => panic!("unexpected state dtype: {other:?}"),
+            };
+            assert!(
+                !values.is_empty() && values.iter().all(|v| v.is_finite()),
+                "{name}: non-finite/empty observation"
+            );
+            assert!(
+                values.iter().any(|v| *v != 0.0),
+                "{name}: fixture must exercise nonzero data"
+            );
+        }
+    }
+
+    pub fn dump(&self, kind: AttentionKind, rows: u32, range: Range<usize>, path: Path) {
+        let observations: Vec<_> = self.values.iter().map(|((participant, name), bytes)| {
+            serde_json::json!({"participant":participant,"value":name,"bytes":bytes.len(),
+                "sha256":format!("{:x}",Sha256::digest(bytes)),
+                // Small output dumps preserve actual F32 bit patterns. State
+                // hashes cover every compared valid element, not just a sample.
+                "output_bits":if name == "output" { Some(bytes.chunks_exact(4).map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>()) } else { None }})
+        }).collect();
+        println!(
+            "{}",
+            serde_json::json!({"kind":"attention_provider_observation","attention":format!("{kind:?}"),
+            "participants":rows,"source_start":range.start,"source_end":range.end,"path":format!("{path:?}"),"values":observations})
+        );
+    }
+}
+
+impl Fixture {
+    pub fn execute_participants(
+        &self,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        range: Range<usize>,
+        path: Path,
+    ) -> BatchObservation {
+        assert_eq!(sessions.len(), tokens.len());
+        let participants = sessions.len() as u32;
+        let batch = ExecutionBatchParticipants::new(sessions.to_vec()).unwrap();
+        let spans = tokens
+            .iter()
+            .map(|t| token_span(Arc::clone(t), range.clone()))
+            .collect();
+        let mut request = StepResourceAdmissionRequest::new(
+            batch.bind_work_shape(spans).unwrap(),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+        if let Some(bucket) = &self.reusable_bucket {
+            request = request.with_reusable_execution_bucket(bucket.clone());
+        }
+        let step = loop {
+            match batch.try_begin_step(request.clone(), &self.lane).unwrap() {
+                StepResourceAdmissionDecision::Admitted(step) => break step,
+                StepResourceAdmissionDecision::BackingDeferred(d) => {
+                    require_progress(d.maintain().unwrap())
+                }
+                StepResourceAdmissionDecision::Deferred(reason) => require_progress(
+                    self.resources
+                        .maintain_for_admission_deferred(&reason)
+                        .unwrap(),
+                ),
+                StepResourceAdmissionDecision::PermanentRejected(reason) => {
+                    panic!("batch admission: {reason:?}")
+                }
+            }
+        };
+        let wave = loop {
+            match step
+                .try_prepare_full_plan_submission_wave(
+                    Arc::new(step.work_shape().clone()),
+                    AdmissionFitPolicy::ImmediateOnly,
+                    AdmissionPressureAction::WaitForRelease,
+                )
+                .unwrap()
+            {
+                StepSubmissionWaveAdmissionDecision::Prepared(wave) => break wave,
+                StepSubmissionWaveAdmissionDecision::BackingDeferred(d) => {
+                    require_progress(d.maintain().unwrap())
+                }
+                StepSubmissionWaveAdmissionDecision::Deferred(reason) => require_progress(
+                    self.resources
+                        .maintain_for_admission_deferred(&reason)
+                        .unwrap(),
+                ),
+                other => panic!("batch wave rejected: {:?}", std::mem::discriminant(&other)),
+            }
+        };
+        let active: Vec<_> = sessions
+            .iter()
+            .map(|s| TrustedActiveSequenceBinding::from_session(s).unwrap())
+            .collect();
+        let executable = self.compilation.executable();
+        let plan = executable.execution_plan();
+        let identity = OperationDispatch::bind_submission_wave_identity(
+            executable,
+            active.iter(),
+            &wave,
+            &self.lane,
+        )
+        .unwrap();
+        let uploads: Vec<_> = tokens
+            .iter()
+            .enumerate()
+            .map(|(participant, t)| {
+                SubmissionWaveInputUpload::new(
+                    id("node.embedding"),
+                    participant as u32,
+                    0,
+                    range.start as u64 * 4,
+                    HostTransferLayout::new(ElementType::U32, range.len() as u64).unwrap(),
+                    t[range.clone()]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let attention = plan
+            .payload()
+            .nodes()
+            .iter()
+            .find(|n| n.id().as_str() == "node.attention")
+            .unwrap();
+        let output = attention
+            .values()
+            .iter()
+            .find(|v| v.role() == ResolvedValueRole::Output && v.ordinal() == 0)
+            .unwrap();
+        let component = &output.storage().components()[0];
+        let mut names = BTreeMap::from([(component.resource_id().clone(), "output".to_owned())]);
+        let mut readbacks = vec![CompletionReadbackBatchRequest::new(
+            (0..participants)
+                .map(|p| {
+                    CompletionReadbackRequest::new(
+                        attention.id().clone(),
+                        p,
+                        component.resource_id().clone(),
+                        component.offset_bytes(),
+                        HostTransferLayout::new(ElementType::F32, range.len() as u64 * HIDDEN)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()];
+        let mut types = BTreeMap::from([("output".to_owned(), ElementType::F32)]);
+        for state in &self.states {
+            let value = attention
+                .values()
+                .iter()
+                .find(|v| v.value_id() == &state.value_id)
+                .unwrap();
+            let component = &value.storage().components()[0];
+            let bytes = match state.capacity_demand {
+                StateCapacityDemand::FixedPerScope => state.tensor.byte_len().unwrap(),
+                StateCapacityDemand::TokenScaled { .. } => {
+                    assert_eq!(state.id.as_str(), "state.kv");
+                    assert_eq!(state.tensor.element_type, ElementType::F16);
+                    assert_eq!(state.tensor.dimensions, vec![2, 2, 128]);
+                    // The real F16 KV provider uses VllmBlocks16 for these
+                    // dimensions. Read complete physical blocks, then select
+                    // all valid K/V positions; padding is not numerical state.
+                    range.end.div_ceil(16) as u64 * 16 * 2 * 2 * 128 * 2
+                }
+            };
+            names.insert(component.resource_id().clone(), state.id.to_string());
+            types.insert(state.id.to_string(), state.tensor.element_type);
+            readbacks.push(
+                CompletionReadbackBatchRequest::new(
+                    (0..participants)
+                        .map(|p| {
+                            CompletionReadbackRequest::new_typed(
+                                attention.id().clone(),
+                                p,
+                                component.resource_id().clone(),
+                                BufferUsage::State,
+                                component.offset_bytes(),
+                                HostTransferLayout::new(
+                                    state.tensor.element_type,
+                                    bytes / state.tensor.element_type.size_bytes(),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+        }
+        let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+            self.providers.providers(),
+            executable,
+            &wave,
+            &self.lane,
+        )
+        .unwrap();
+        // Eager boundaries are part of a reusable program, not a missing
+        // program ID. Inspect the actual sealed catalog after submission.
+        let attention_index = wave
+            .nodes()
+            .iter()
+            .position(|n| n.node_id() == attention.id())
+            .unwrap() as u32;
+        let handle = if matches!(path, Path::Replay) {
+            let program_id = program_id
+                .as_ref()
+                .expect("single-token attention must authorize reusable topology");
+            let catalog = self.lane.reusable_execution_catalog().unwrap();
+            let program = catalog
+                .programs()
+                .iter()
+                .find(|p| p.program_id() == program_id)
+                .expect("actual warmed reusable program");
+            assert!(
+                program.is_determinism_ready(),
+                "replay must have complete bindings"
+            );
+            assert!(
+                !program
+                    .eager_boundary_node_indices()
+                    .contains(&attention_index),
+                "single-token attention must belong to a resident segment"
+            );
+            let bindings: Vec<_> = plan
+                .payload()
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.binding_resource().is_some())
+                .map(|(i, _)| i as u32)
+                .collect();
+            assert_eq!(program.per_wave_binding_node_indices(), bindings);
+            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
+                self.providers.providers(),
+                executable,
+                &identity,
+                active.iter(),
+                DeviceTimingMode::Off,
+                &uploads,
+                program,
+                SubmissionExecutionPolicy::determinism_replayed(0xa5),
+                wave,
+                &self.lane,
+                &self.reaper,
+            )
+            .unwrap()
+        } else {
+            let policy = if matches!(path, Path::Eager) {
+                SubmissionExecutionPolicy::determinism_eager(0x5a)
+            } else {
+                SubmissionExecutionPolicy::adaptive()
+            };
+            OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
+                self.providers.providers(),
+                executable,
+                &identity,
+                active.iter(),
+                DeviceTimingMode::Off,
+                &uploads,
+                policy,
+                wave,
+                &self.lane,
+                &self.reaper,
+            )
+            .unwrap()
+        };
+        let receipt = match handle
+            .wait_with_readback_collection(
+                CompletionReadbackCollectionRequest::new(readbacks).unwrap(),
+            )
+            .unwrap()
+        {
+            CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
+            other => panic!("attention readback did not terminate: {other:?}"),
+        };
+        if matches!(path, Path::EagerBoundary) {
+            let program_id = program_id
+                .as_ref()
+                .expect("bucket-backed multi-token wave has a topology identity");
+            let catalog = self.lane.reusable_execution_catalog().unwrap();
+            let program = catalog
+                .programs()
+                .iter()
+                .find(|p| p.program_id() == program_id)
+                .expect("actual multi-token catalog evidence");
+            assert!(
+                program
+                    .eager_boundary_node_indices()
+                    .contains(&attention_index),
+                "multi-token FP16 KV must retain its EagerBoundary"
+            );
+        }
+        let mut values = BTreeMap::new();
+        for disposition in receipt.dispositions() {
+            let CompletionReadbackDisposition::Succeeded(result) = disposition else {
+                panic!("attention readback failed: {disposition:?}")
+            };
+            let name = names[result.request().resource_id()].clone();
+            let bytes = if name == "state.kv" {
+                valid_kv_positions(result.bytes(), range.end)
+            } else {
+                result.bytes().to_vec()
+            };
+            assert!(values
+                .insert((result.request().participant_index(), name), bytes)
+                .is_none());
+        }
+        assert_eq!(values.len(), participants as usize * names.len());
+        drop((receipt, handle, identity, active));
+        step.try_retire_normal().unwrap();
+        BatchObservation { values, types }
+    }
+}
+
+/// Canonical token/K-or-V/head/dim ordering from this fixture's real vLLM
+/// blocks16 F16 state ABI. Reads every valid position, including later blocks.
+fn valid_kv_positions(bytes: &[u8], tokens: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(tokens * 1024);
+    for token in 0..tokens {
+        let block = token / 16 * (2 * 2 * 128 * 16);
+        for kv in 0..2 {
+            for head in 0..2 {
+                for dim in 0..128 {
+                    let offset = block
+                        + if kv == 0 {
+                            head * 128 * 16 + (dim / 8) * 16 * 8 + (token % 16) * 8 + dim % 8
+                        } else {
+                            2 * 128 * 16 + head * 128 * 16 + dim * 16 + token % 16
+                        };
+                    output.extend_from_slice(&bytes[offset * 2..offset * 2 + 2]);
+                }
+            }
+        }
+    }
+    output
+}

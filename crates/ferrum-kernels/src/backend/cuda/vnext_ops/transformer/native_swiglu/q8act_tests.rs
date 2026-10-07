@@ -7,6 +7,7 @@ use ferrum_interfaces::vnext::*;
 use half::f16;
 use weights::{MatrixFormat, MatrixPart};
 
+mod attention;
 mod three_format;
 
 fn id<T: TryFrom<String>>(s: &str) -> T

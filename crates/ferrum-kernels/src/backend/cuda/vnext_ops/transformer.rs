@@ -89,6 +89,7 @@ mod native_linear;
 mod native_matrix;
 mod native_swiglu;
 mod precision;
+mod q8act_attention;
 mod q8act_swiglu;
 mod rn_fragment_swiglu;
 pub(super) use q8act_swiglu::CudaQ8ActSwiGluProvider;

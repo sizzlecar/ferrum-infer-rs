@@ -122,6 +122,7 @@ pub fn cuda_vnext_runtime_config(
         include_bytes!("vnext_ops/transformer/gguf_f16_projection.rs"),
         include_bytes!("vnext_ops/transformer/rn_fragment_swiglu.rs"),
         include_bytes!("vnext_ops/transformer/q8act_swiglu.rs"),
+        include_bytes!("vnext_ops/transformer/q8act_attention.rs"),
         include_bytes!("vnext_ops/native_blocks/q8act.rs"),
         include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/plan.rs"),
         include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/weights.rs"),
@@ -295,6 +296,14 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
     ] {
         if q8act_g32_profile_compiled(profile) {
+            capabilities.insert(CapabilityId::new(profile.capability_id())?);
+        }
+    }
+    if q8act_g32_profile_compiled(ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs) {
+        for profile in [
+            ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta,
+            ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
+        ] {
             capabilities.insert(CapabilityId::new(profile.capability_id())?);
         }
     }
@@ -583,6 +592,32 @@ pub fn cuda_vnext_operation_registry(
         providers
     };
     let mut providers = providers;
+    for profile in [
+        ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta,
+        ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
+    ] {
+        if runtime
+            .descriptor()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == profile.capability_id())
+        {
+            contracts.push(Box::new(profile.contract().map_err(contract_error)?));
+            match profile {
+                ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta => {
+                    providers.push(Box::new(
+                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_q8act(runtime)?,
+                    ))
+                }
+                ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal => providers.push(
+                    Box::new(transformer::CudaCausalPagedAttentionProvider::new_q8act(
+                        runtime,
+                        runtime.attention_execution_policy(),
+                    )?),
+                ),
+            }
+        }
+    }
     for profile in [
         ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
         ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
