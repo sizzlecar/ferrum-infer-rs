@@ -2,7 +2,7 @@
 
 制定于 2026-10-07。本文件承接 [`goal-slo-throughput.zh.md`](goal-slo-throughput.zh.md)（已随 #402 合入 main），沿用其中的公式、指标口径和"按并发扫描"的测量方式。
 
-执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。尚未完成 P0，不将格式支持或基线准备当作吞吐验收。
+执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。新口径 Metal 全 GPU 探索队列已启动，首格为 27B llama.cpp C4，尚无新格完成；CUDA 客户端与生命周期 guard 已构建并通过测试，尚未加载模型或执行服务切换。尚未完成 P0，不将格式支持或基线准备当作吞吐验收。
 
 ## 1. 目标
 
