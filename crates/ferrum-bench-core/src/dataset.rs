@@ -72,6 +72,10 @@ pub struct ShareGptDatasetEvidence {
     pub counts: ShareGptCounts,
     pub prompt_seed: u64,
     pub sampling: String,
+    /// Explicit reservoir size before shuffling and taking the dispatched prefix.
+    /// None preserves sampling exactly the requested warmup + measured count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_pool_size: Option<u32>,
     pub ignore_eos: bool,
     pub enable_thinking: Option<bool>,
     pub repeats: Vec<ShareGptSelection>,

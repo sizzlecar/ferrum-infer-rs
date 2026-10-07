@@ -1,6 +1,6 @@
 # 热门模型并发 P0（2026-10-07，进行中）
 
-[目标](goal-popular-models-concurrency.zh.md)尚未完成。当前以 `main` 的 `0680840becae342e481df4ac0705c43fc08633a7` 采集基线，用户已调整矩阵：Metal 12 格、CUDA 32 格，共 44 格，目前新口径 0/44。旧 3 格退出新比较：llama.cpp C1/C4 实际仅 49/66 层在 GPU，不能作公平基线；Ferrum C4 也须按新容量与请求数重测。旧队列已因口径调整终止，进程清理完成；不是产品失败。未修改产品代码，也未进入 P1。原工作区的旧 SLO 修改保留。按用户最新决定，Metal 仅比较 llama.cpp，vLLM 仅在 CUDA 测试。
+[目标](goal-popular-models-concurrency.zh.md)尚未完成。当前以 `main` 的 `0680840becae342e481df4ac0705c43fc08633a7` 采集基线，用户已调整矩阵：Metal 12 格、CUDA 32 格，共 44 格，目前新口径 0/44。旧 3 格退出新比较：llama.cpp C1/C4 实际仅 49/66 层在 GPU，不能作公平基线；Ferrum C4 也须按新容量与请求数重测。旧队列已因口径调整终止，进程清理完成；不是产品失败。推理服务与内核仍冻结在 main，尚未进入 P1。为跨请求数复用同一批样本，仅基准客户端增加显式 `--sharegpt-selection-pool-size`；Metal/CPU 两种构建的13项 ShareGPT 测试均通过。原工作区的旧 SLO 修改保留。按用户最新决定，Metal 仅比较 llama.cpp，vLLM 仅在 CUDA 测试。
 
 ## 固定输入与对照
 
@@ -44,10 +44,10 @@ Rust提取均在 `analysis/primary-summaries/`：`metal-dense-llama-c1-r4.jsonl`
 
 | 后端 / 模型 | Ferrum GGUF | llama.cpp GGUF | Ferrum AWQ / vLLM（仅 CUDA） |
 | --- | --- | --- | --- |
-| CUDA / 27B | 待运行 | 待运行 | CT的399组头部与实际 weight_shape 已核对，未实跑；helper连接正常，正在准备 |
+| CUDA / 27B | 待运行 | 待运行 | CT的399组头部与实际 weight_shape 已核对；helper正常，模型下载/客户端构建中，未实跑 |
 | CUDA / 35B-A3B | provider 格式缺口，未实跑 | 待下载与运行 | AWQ及混合BF16专家支持缺口，未实跑；vLLM 待部署 |
-| M1 Max / 27B | run 1槽默认0.9通过；serve 32槽显式1.0短测试通过；主负载C4已完成 | 全GPU32槽OOM；新16槽全GPU两条短请求通过，待并发短测；旧CPU卸载队列已停止 | 不适用 |
-| M1 Max / 35B-A3B | run（1槽）与serve（32槽）均实测失败：混合 MoE provider 不接受 Q6_K | 32槽自动放置OOM；固定16层GPU/32槽短测试通过，未完成主负载 | 不适用 |
+| M1 Max / 27B | 旧32槽短测/C4仅保留历史；新探索固定16槽，待新版客户端启动 | 全GPU32槽OOM；16槽66/66层GPU，C16饱和短测32/32成功；旧CPU卸载队列已停止 | 不适用 |
+| M1 Max / 35B-A3B | run（1槽）与serve（32槽）均实测失败：混合 MoE provider 不接受 Q6_K | 全GPU16槽短测OOM；8槽语义短测通过但并发OOM；7槽41/41层GPU，C16短测32/32成功；固定7槽待主负载 | 不适用 |
 
 - Ferrum CUDA 27B：399组实际CT量化头部的dtype、布局和配置维度均匹配现有路径，未发现头部层面的阻塞；BF16 scales会转为F16，比较时须披露该精度差异。399 个 `weight_shape` 实际值已通过 6,384B 范围读取核对，零不匹配（`analysis/cuda-ct-dense-weight-shapes.json`）；尚未验证完整权重payload、分片hash或CUDA加载/计算。证据为 `metadata/dense-ct-headers/` 与 `analysis/cuda-ct-dense-gap.json`，只计元数据审计完成。
 - Ferrum CUDA 35B：`qwen35_config.rs` 不接受原生AWQ。固定头部确认第0层768个专家张量均为BF16，第1层768组三元组为I32 qweight/qzeros与F16 scales；qweight为 `[K,N/8]`，不同于现有GPTQ的 `[K/8,N]`，router为F32、共享专家为BF16。现有CUDA routed/shared MoE仅GPTQ/FP8 Marlin，因此除AWQ零点与repack外，还需按层选择dense专家路径；GGUF亦未覆盖。证据为 `metadata/awq-moe-headers/` 与 `analysis/cuda-awq-moe-gap.json`；payload、完整hash及CUDA实机行为未验证，不计实机失败。
@@ -59,9 +59,11 @@ Rust提取均在 `analysis/primary-summaries/`：`metal-dense-llama-c1-r4.jsonl`
 - 旧队列 `metal-primary-remaining-combined-v2/serve.guard.json` 的 llama C4、Ferrum C4 已完成，llama C8 在途时收到新口径后停止。guard16832 收到 SIGTERM 并完成清理，session83720 退出1，原 server21379/client21431 已消失。保留所有旧报告与部分日志；终止原因为用户调整方案，不计产品失败或新矩阵完成。仓库外 Rust guard v2 仍保留已声明作业时限和 `NO_PROXY/no_proxy`，不以超时或代理中断重测已完成格。
 - 27B容量比较说明：两引擎均声明32槽、每请求输入与请求输出合计最多2048 token、FP16 KV，但总KV策略不同。Ferrum的KV/状态池按总运行时字节预算动态增长，2048不是共享池大小；llama.cpp显式预留共享16384-token KV池。Ferrum启动检查覆盖单序列完整上下文及32序列各一个已提交token的decode状态，不表示能同时容纳32个完整2048上下文；已完成C4也不证明该极限容量。Ferrum全Metal与llama的49层GPU加CPU放置同样是有意配置差异。审计证据为 `analysis/metal-kv-capacity-comparison.json`；其余并发能力和实际错误仍须由主负载验证。
 - 35B llama.cpp保持32槽/共享KV16384/每槽2048/FP16KV：`--gpu-layers auto --fit on` 实选41/41层GPU，在warmup发生Metal OOM，首个请求HTTP500，guard退出1（`metal-moe-llama-fit-smoke/`）。随后改为 `--gpu-layers 16 --fit off --no-repack`，实选16/41层GPU、其余CPU；算术回答42（3个usage输出token），KV解释为两句话（39个usage输出token），均自然stop，流式含有效 `[DONE]`，guard退出0（`metal-moe-llama-gpu16-smoke/`）。启动日志为KV CPU192+GPU128MiB、递归状态CPU1273+GPU737MiB、Metal模型映射19914.65MiB及compute207.02MiB；这些不是驻留峰值或主负载结果。
+- 新全GPU容量短测：llama.cpp显式 `--gpu-layers all --fit off`，共享KV16384/每请求2048/FP16、batch2048/ubatch512固定。27B16槽32请求/C16随机128输入+32输出全部成功；35B8槽在第8槽加入prefill后Metal OOM，32请求失败（不是仅启动失败），随后只减槽位，4/6/7槽均32/32成功，8槽失败与7槽通过形成相邻边界。新探索采用27B16槽、35B7槽，客户端仍扫C4/8/16，C高于槽位时排队。短测不计主矩阵、不证明所有长上下文组合；证据分别 `metal-fullgpu-capacity-saturated-r1/` 与 `metal-moe-fullgpu-slots{4,6,7}-saturation-r1/`。
+- 新采样客户端：固定pool208（8预热+最多200正式）、seed42、官方35B tokenizer及原长度过滤，每格仅取所需前缀。不同请求数的完整selection SHA应不同，但实际样本前缀须相同；同格跨引擎SHA完全一致。原选择器会随请求总数重新reservoir抽样，因此不能只改数量并声称跨C同样本。改动限Rust基准参数/选择器/报告元数据；本机13项最小测试与workspace fmt通过，远端CPU客户端同13项通过，release构建/绑定中。推理二进制单独冻结，旧Metal SHA不变，CUDA服务器release SHA为 `efad1116ee4fac2f5a3b9302315cf3fffa00fc28d4b113d6156e46d0eed58c86`。尚未执行本次完整workspace check/test/clippy，不据此声明PR已验证。
 - 主机：已确认本机为 M1 Max/32GiB/macOS15.1.1。CUDA 按指定 helper 经本机→Mini→WSL 已实测连接正常；此前“主机认证阻塞”记录撤回。RTX 5090 为32607MiB，原 waifugemma4 PID4162656 active/running，占用18502MiB，8081健康检查HTTP200。私钥仅在Mini。直接docker权限不足，由helper既有sudo路径准备引擎；测量仍由guard停止并恢复原服务。
 - 测量：仓库外Rust `analysis/report-reader/` 的last-visible读取通过2项测试，已成功读取上述三格原生报告；历史schema缺字段仍被明确拒绝。`analysis/quality-replay/` 的collector已通过7项测试、fmt与锁定离线release构建，pin未变；独立原始ID比较工具通过8项测试、fmt和release构建，有1条unused `token_record` helper警告，证据为 `analysis/quality-replay/comparison-validation.json`。真实64题质量/一致率套件仍未运行；其余主负载、设备峰值与质量证据待完成，短测试不替代验收。
 
-下一步先完成各模型全 GPU 槽位短测，再按新冻结容量和请求口径重测；CUDA 准备与本机测试并行，并补真实64题质量/一致率；P0 尚缺完整运行矩阵、两后端各自对照的 profile 与按耗时排序的缺口表。Qwen3.5-9B 的 #402 CUDA C4/C8 回归基线仍为284.688/414.436 tok/s，不以本轮结果替代回归。已取消的 vllm-metal 环境及其uv下载缓存已删除以释放磁盘，仓库外小型元数据保留；不再测试或下载Metal vLLM权重，不属于当前验收范围。
+下一步绑定新版基准客户端并按新全GPU固定容量和请求口径重测；CUDA 准备与本机测试并行，并补真实64题质量/一致率；P0 尚缺完整运行矩阵、两后端各自对照的 profile 与按耗时排序的缺口表。Qwen3.5-9B 的 #402 CUDA C4/C8 回归基线仍为284.688/414.436 tok/s，不以本轮结果替代回归。已取消的 vllm-metal 环境及其uv下载缓存已删除以释放磁盘，仓库外小型元数据保留；不再测试或下载Metal vLLM权重，不属于当前验收范围。
 
 独立工作区：`/private/tmp/ferrum-popular-models-20261007`；全部过程、配置、元数据、下载和日志在仓库外 `/private/tmp/ferrum-popular-models-p0-20261007/`。恢复工作须核验进程/会话的当前状态，不能仅凭这些路径判断任务仍在运行。

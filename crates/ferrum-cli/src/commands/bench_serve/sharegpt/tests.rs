@@ -173,6 +173,122 @@ fn sharegpt_selection_is_without_replacement_and_identical_across_concurrency() 
 }
 
 #[test]
+fn sharegpt_selection_pool_cli_requires_a_positive_size() {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Arguments {
+        #[command(flatten)]
+        sharegpt: ShareGptArgs,
+    }
+
+    let parsed =
+        Arguments::try_parse_from(["bench-serve", "--sharegpt-selection-pool-size", "17"]).unwrap();
+    assert_eq!(parsed.sharegpt.sharegpt_selection_pool_size, Some(17));
+    assert!(
+        Arguments::try_parse_from(["bench-serve", "--sharegpt-selection-pool-size", "0",]).is_err()
+    );
+}
+
+#[test]
+fn sharegpt_fixed_pool_preserves_sample_prefix_across_request_counts() {
+    let records = (0..40)
+        .map(|i| record(&i.to_string(), 4 + i % 7, 4 + i % 11))
+        .collect::<Vec<_>>();
+    let mut fixture = Fixture::records(&records);
+    fixture.command.warmup_requests = 3;
+    fixture.command.num_prompts = 14;
+    fixture.command.sharegpt.sharegpt_selection_pool_size = Some(17);
+    let full = prepare(&fixture.command).unwrap().unwrap();
+    let full = &full[0];
+    let full_samples = &full.evidence.repeats[0].samples;
+    assert_eq!(full.evidence.selection_pool_size, Some(17));
+    assert_eq!(
+        full_samples
+            .iter()
+            .map(|sample| sample.source_record_index)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        17
+    );
+    for (measured, concurrency) in [(2, 1), (7, 4), (14, 8)] {
+        fixture.command.num_prompts = measured;
+        fixture.command.concurrency = concurrency;
+        let short = prepare(&fixture.command).unwrap().unwrap();
+        let short = &short[0];
+        let count = (fixture.command.warmup_requests + measured) as usize;
+        let samples = &short.evidence.repeats[0].samples;
+        assert_eq!(samples, &full_samples[..count]);
+        assert_eq!(short.prompts.len(), count);
+        for (actual, expected) in short.prompts.iter().zip(&full.prompts) {
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(actual.sha256, expected.sha256);
+            assert_eq!(actual.input_tokens, expected.input_tokens);
+            assert_eq!(actual.output_budget, expected.output_budget);
+        }
+        assert_eq!(samples[2].phase, BenchmarkPhase::Warmup);
+        assert_eq!(samples[2].request_index, 2);
+        assert_eq!(samples[3].phase, BenchmarkPhase::Measured);
+        assert_eq!(samples[3].request_index, 0);
+        assert_eq!(
+            short.evidence.repeats[0].selection_sha256,
+            sha256_hex(&serde_json::to_vec(samples).unwrap())
+        );
+    }
+    fixture.command.num_prompts = 14;
+    fixture.command.sharegpt.sharegpt_selection_pool_size = None;
+    let legacy = prepare(&fixture.command).unwrap().unwrap();
+    assert_eq!(legacy[0].evidence.repeats, full.evidence.repeats);
+    let legacy_json = serde_json::to_value(&legacy[0].evidence).unwrap();
+    assert!(legacy_json.get("selection_pool_size").is_none());
+    let decoded: ShareGptDatasetEvidence = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(decoded.selection_pool_size, None);
+}
+
+#[test]
+fn sharegpt_fixed_pool_rejects_invalid_bounds_and_insufficient_eligible_records() {
+    let mut fixture = Fixture::records(&[
+        record("one", 4, 4),
+        record("two", 5, 5),
+        record("three", 6, 6),
+    ]);
+    fixture.command.warmup_requests = 1;
+    fixture.command.num_prompts = 2;
+    for pool_size in [0, 2] {
+        fixture.command.sharegpt.sharegpt_selection_pool_size = Some(pool_size);
+        assert!(validate(&fixture.command).is_err());
+    }
+    fixture.command.sharegpt.sharegpt_selection_pool_size = Some(4);
+    let error = prepare(&fixture.command).err().unwrap().to_string();
+    assert!(error.contains("3 eligible records"));
+    assert!(error.contains("4 distinct selection-pool records"));
+    fixture.command.sharegpt.sharegpt_selection_pool_size = Some(3);
+    assert!(prepare(&fixture.command).is_ok());
+    fixture.command.dataset = "random".into();
+    assert!(validate(&fixture.command).is_err());
+    fixture.command.dataset = "sharegpt".into();
+    fixture.command.num_prompts = u32::MAX;
+    assert!(validate(&fixture.command).is_err());
+}
+
+#[test]
+fn sharegpt_repeat_evidence_rejects_different_selection_pools() {
+    let mut fixture = Fixture::records(&[
+        record("one", 4, 4),
+        record("two", 5, 5),
+        record("three", 6, 6),
+    ]);
+    fixture.command.warmup_requests = 0;
+    fixture.command.num_prompts = 1;
+    fixture.command.sharegpt.sharegpt_selection_pool_size = Some(2);
+    let (_, first) = load(&fixture.command, &fixture.tokenizer, 0, 1).unwrap();
+    fixture.command.sharegpt.sharegpt_selection_pool_size = Some(3);
+    let (_, next) = load(&fixture.command, &fixture.tokenizer, 1, 1).unwrap();
+    let mut evidence = Some(first);
+    assert!(append_evidence(&mut evidence, next).is_err());
+}
+
+#[test]
 fn sharegpt_explicit_fixed_output_changes_only_the_declared_budget_and_filter() {
     let mut fixture = Fixture::records(&[record("long-answer", 4, 20)]);
     fixture.command.sharegpt.sharegpt_max_total_tokens = 12;
