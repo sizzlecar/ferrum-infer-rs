@@ -55,7 +55,12 @@ fn native_swiglu_packed_rows_preserve_larger_participant_batches() {
     assert!(native_matrix::single_launch_rows(u64::MAX).is_none());
 }
 
-fn matrix(format: MatrixFormat, rows: usize, columns: usize, salt: usize) -> (Vec<u8>, Vec<f32>) {
+pub(super) fn matrix(
+    format: MatrixFormat,
+    rows: usize,
+    columns: usize,
+    salt: usize,
+) -> (Vec<u8>, Vec<f32>) {
     match format {
         MatrixFormat::DenseF16 => {
             let values = (0..rows * columns)
@@ -195,6 +200,10 @@ fn native_swiglu_mixed_matrices_match_stage_oracles_on_cuda() {
                 hidden as u32,
                 intermediate as u32,
                 0,
+                None,
+                None,
+                0,
+                0,
             )
             .unwrap();
             drop((gg, ag, yg));
@@ -311,6 +320,10 @@ fn native_swiglu_packed_rows_match_independent_source_slices_on_cuda() {
             count as u32,
             hidden as u32,
             intermediate as u32,
+            0,
+            None,
+            None,
+            0,
             0,
         )
         .unwrap();

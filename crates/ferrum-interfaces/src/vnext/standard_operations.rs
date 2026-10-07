@@ -2,6 +2,8 @@ mod gguf_f16_projections;
 pub use gguf_f16_projections::*;
 mod rn_f16_fragment;
 pub use rn_f16_fragment::*;
+mod q8act_swiglu;
+pub use q8act_swiglu::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;

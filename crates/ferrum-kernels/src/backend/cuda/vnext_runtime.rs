@@ -2016,6 +2016,18 @@ impl CudaDeviceRuntime {
         if major < 8 || !super::vnext_ops::rn_fragment_mma_compiled() {
             config.capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
         }
+        let minor = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(|error| CudaDeviceRuntimeError::driver("DP4A compute capability", error))?;
+        for profile in [
+            ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
+            ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+        ] {
+            if major * 10 + minor < 61 || !super::vnext_ops::q8act_g32_profile_compiled(profile) {
+                config
+                    .capabilities
+                    .retain(|capability| capability.as_str() != profile.capability_id());
+            }
+        }
         // vNext owns all cross-stream ordering through explicit commands and
         // fences. Per-slice implicit events would create a second authority.
         unsafe {

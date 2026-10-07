@@ -309,6 +309,360 @@ NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, f32, 1, false)
 NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, tiled_f32, 8, false)
 #undef NATIVE_FIXED256_LINEAR
 
+// Reused from Ferrum 498e404f. Explicit staged providers load the declared
+// IQ4_XS/Q4_K/Q5_K G32 exports; the DP4A4 controls remain diagnostic.
+// This is not strict native_linear or llama's Q8_1 numerical policy.
+//
+// Pack ABI: x[rows][inputs] F16; scales[rows][inputs/32] F32;
+// qwords[rows][inputs/32][8] u32. Each word contains four signed int8 values,
+// with the lower K index in its least-significant byte. Inputs must be a
+// multiple of 32. Launch 128 threads and ceil(rows*(inputs/32)/4) blocks.
+// Typed pointers retain their natural alignment; caller owns all extents.
+template<bool WordMajor>
+__device__ void prototype_q8_f32scale_pack(
+    const half* x, float* scales, unsigned* qwords, unsigned rows, unsigned inputs) {
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1
+        || gridDim.y != 1 || gridDim.z != 1 || inputs == 0 || inputs % 32 != 0) return;
+    const unsigned lane = threadIdx.x % 32;
+    const size_t group = size_t(blockIdx.x) * 4 + threadIdx.x / 32;
+    if (group >= size_t(rows) * (inputs / 32)) return; // Whole-warp exit.
+    const float value = __half2float(x[group * 32 + lane]);
+    const bool finite = isfinite(value);
+    const bool invalid_group = __ballot_sync(0xffffffff, !finite) != 0;
+    float maximum = finite ? fabsf(value) : 0.0f;
+    for (unsigned step = 16; step != 0; step /= 2)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, step));
+    // F16's smallest nonzero magnitude / 127 remains a normal F32 number.
+    // Explicit RN division and roundf define scale rounding and ties-away
+    // integer rounding independently of the device's default conversion mode.
+    const float scale = invalid_group ? NAN
+        : maximum == 0.0f ? 0.0f : __fdiv_rn(maximum, 127.0f);
+    int q = 0;
+    if (!invalid_group && maximum != 0.0f) {
+        const float rounded = roundf(__fdiv_rn(value, scale));
+        q = int(fmaxf(-127.0f, fminf(127.0f, rounded)));
+    }
+    if (lane == 0) scales[group] = scale;
+    // Every lane participates in the shuffle; only the four-lane leaders store.
+    const unsigned q0 = unsigned(q) & 255;
+    const unsigned q1 = __shfl_down_sync(0xffffffff, q0, 1, 4);
+    const unsigned q2 = __shfl_down_sync(0xffffffff, q0, 2, 4);
+    const unsigned q3 = __shfl_down_sync(0xffffffff, q0, 3, 4);
+    if (lane % 4 == 0) {
+        const unsigned groups = inputs / 32;
+        const size_t destination = WordMajor
+            ? ((group / groups) * 8 + lane / 4) * groups + group % groups
+            : group * 8 + lane / 4;
+        qwords[destination] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+    }
+}
+
+extern "C" __global__ void vnext_gguf_q8_f32scale_pack_f16_prototype(
+    const half* x, float* scales, unsigned* qwords, unsigned rows, unsigned inputs) {
+    prototype_q8_f32scale_pack<false>(x, scales, qwords, rows, inputs);
+}
+
+// Alternate physical ABI: qwords[row][word][group], same allocation.
+// The pack's stores are less contiguous; inclusive and pack-only costs matter.
+extern "C" __global__ void vnext_gguf_q8_f32scale_pack_word_major_f16_prototype(
+    const half* x, float* scales, unsigned* qwords, unsigned rows, unsigned inputs) {
+    prototype_q8_f32scale_pack<true>(x, scales, qwords, rows, inputs);
+}
+
+__device__ __forceinline__ int prototype_signed_dot4(unsigned a, unsigned b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(static_cast<int>(a), static_cast<int>(b), 0);
+#else
+    // Keep older production PTX targets buildable. The SM89 experiment uses
+    // the DP4A branch; this fallback makes no performance capability claim.
+    int result = 0;
+    #pragma unroll
+    for (unsigned byte_index = 0; byte_index < 4; ++byte_index) {
+        int av = int((a >> (8 * byte_index)) & 255);
+        int bv = int((b >> (8 * byte_index)) & 255);
+        if (av >= 128) av -= 256;
+        if (bv >= 128) bv -= 256;
+        result += av * bv;
+    }
+    return result;
+#endif
+}
+
+// Matmul ABI: packed buffers above, native Q4_K weights[outputs][inputs/256]
+// with 144-byte blocks, and y[rows][stride] F16 written at offset..offset+outputs.
+// Launch (ceil(outputs/4), ceil(rows/RowTile), 1) blocks of (128,1,1).
+// A warp owns one output column; its four 8-lane subgroups process four K32
+// groups. Each lane loads four byte-safe Q4 coefficients and one packed Q8 word.
+// Each lane applies F32 scaling before the final warp reduction. Weights are
+// shared across RowTile activation rows, without per-group integer shuffles.
+template<unsigned RowTile>
+__device__ void prototype_q4k_q8_linear(const float* scales, const unsigned* qwords,
+    const byte* w, half* y, unsigned rows, unsigned inputs, unsigned outputs,
+    unsigned stride, unsigned offset) {
+    const size_t first_row = size_t(blockIdx.y) * RowTile;
+    const size_t column = size_t(blockIdx.x) * 4 + threadIdx.x / 32;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned subgroup = lane / 8;
+    const unsigned word = lane % 8;
+    if (first_row >= rows || column >= outputs) return; // Whole-warp exit.
+    const unsigned groups = inputs / 32;
+    const byte* weights = w + column * size_t(inputs / 256) * 144;
+    float sums[RowTile] = {};
+    for (unsigned base = 0; base < groups; base += 4) {
+        const unsigned group = base + subgroup; // inputs%256: no partial group.
+        const unsigned local_group = group % 8;
+        const byte* block = weights + size_t(group / 8) * 144;
+        unsigned packed_weight = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned code = (block[16 + (local_group / 2) * 32 + word * 4 + j]
+                >> (4 * (local_group % 2))) & 15;
+            packed_weight |= code << (j * 8);
+        }
+        const byte* s = block + 4;
+        const unsigned scale6 = local_group < 4 ? s[local_group] & 63
+            : (s[local_group + 4] & 15) | ((s[local_group - 4] >> 6) << 4);
+        const unsigned min6 = local_group < 4 ? s[local_group + 4] & 63
+            : (s[local_group + 4] >> 4) | ((s[local_group] >> 6) << 4);
+        const float a = native_half(block, 0) * float(scale6);
+        const float b = native_half(block, 2) * float(min6);
+        #pragma unroll
+        for (unsigned r = 0; r < RowTile; ++r) {
+            if (first_row + r < rows) { // Uniform condition within each warp.
+                const size_t packed_group = (first_row + r) * groups + group;
+                const unsigned packed_x = qwords[packed_group * 8 + word];
+                const int dot = prototype_signed_dot4(packed_weight, packed_x);
+                const int sum = prototype_signed_dot4(0x01010101u, packed_x);
+                // Four signed activations: |dot|<=4*15*127; |sum|<=4*127.
+                const float d = scales[packed_group];
+                // Independent approximate policy, no unquantized sum
+                // correction. The source is built with --fmad=false.
+                sums[r] += d * (a * float(dot) - b * float(sum));
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && first_row + r < rows)
+            y[(first_row + r) * stride + offset + column] = half(sums[r]);
+    }
+}
+
+#define PROTOTYPE_Q4K_Q8_LINEAR(suffix, tile) \
+extern "C" __global__ void vnext_gguf_q4k_q8_f32scale_dp4a_##suffix##_prototype( \
+    const float* scales, const unsigned* qwords, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) { \
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 \
+        || inputs == 0 || inputs % 256 != 0 || offset > stride || outputs > stride - offset) return; \
+    prototype_q4k_q8_linear<tile>(scales, qwords, w, y, rows, inputs, outputs, stride, offset); \
+}
+PROTOTYPE_Q4K_Q8_LINEAR(lane_f16, 1)
+PROTOTYPE_Q4K_Q8_LINEAR(lane_tiled_f16, 8)
+
+// Extend the retained lane mapping to IQ4_XS without changing its pack ABI or
+// activation arithmetic. Only the byte-safe weight-code/scale reconstruction
+// differs; the current register codebook supplies signed int8 coefficients.
+template<unsigned RowTile>
+__device__ void prototype_iq4xs_q8_linear(const float* scales, const unsigned* qwords,
+    const byte* w, half* y, unsigned rows, unsigned inputs, unsigned outputs,
+    unsigned stride, unsigned offset) {
+    const size_t first_row = size_t(blockIdx.y) * RowTile;
+    const size_t column = size_t(blockIdx.x) * 4 + threadIdx.x / 32;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned subgroup = lane / 8;
+    const unsigned word = lane % 8;
+    if (first_row >= rows || column >= outputs) return;
+    const unsigned groups = inputs / 32;
+    const byte* weights = w + column * size_t(inputs / 256) * 136;
+    float sums[RowTile] = {};
+    for (unsigned base = 0; base < groups; base += 4) {
+        const unsigned group = base + subgroup;
+        const unsigned local_group = group % 8;
+        const byte* block = weights + size_t(group / 8) * 136;
+        unsigned packed_weight = 0;
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned local = word * 4 + j;
+            const unsigned index = (block[8 + local_group * 16 + local % 16]
+                >> (4 * (local / 16))) & 15;
+            packed_weight |= (unsigned(native_iq4_register_value(index)) & 255u) << (j * 8);
+        }
+        const unsigned high = unsigned(block[2]) | (unsigned(block[3]) << 8);
+        const unsigned low = (block[4 + local_group / 2] >> (4 * (local_group % 2))) & 15;
+        const int group_scale = int(low | (((high >> (2 * local_group)) & 3) << 4)) - 32;
+        const float a = native_half(block, 0) * float(group_scale);
+        #pragma unroll
+        for (unsigned r = 0; r < RowTile; ++r) {
+            if (first_row + r < rows) {
+                const size_t packed_group = (first_row + r) * groups + group;
+                const unsigned packed_x = qwords[packed_group * 8 + word];
+                const int dot = prototype_signed_dot4(packed_weight, packed_x);
+                // Four signed codebook/activation products fit exactly in I32.
+                sums[r] += scales[packed_group] * (a * float(dot));
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && first_row + r < rows)
+            y[(first_row + r) * stride + offset + column] = half(sums[r]);
+    }
+}
+
+#define PROTOTYPE_IQ4XS_Q8_LINEAR(suffix, tile) \
+extern "C" __global__ void vnext_gguf_iq4xs_q8_f32scale_dp4a_##suffix##_prototype( \
+    const float* scales, const unsigned* qwords, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) { \
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 \
+        || inputs == 0 || inputs % 256 != 0 || offset > stride || outputs > stride - offset) return; \
+    prototype_iq4xs_q8_linear<tile>(scales, qwords, w, y, rows, inputs, outputs, stride, offset); \
+}
+PROTOTYPE_IQ4XS_Q8_LINEAR(lane_f16, 1)
+PROTOTYPE_IQ4XS_Q8_LINEAR(lane_tiled_f16, 8)
+#undef PROTOTYPE_IQ4XS_Q8_LINEAR
+#undef PROTOTYPE_Q4K_Q8_LINEAR
+
+// R2 test-only mapping: one lane owns a complete K32 scale group. Keep R1's
+// dot4/rescale kernels above as controls; this changes FP32 association and
+// therefore makes no cross-route bitwise-equivalence claim.
+__device__ __forceinline__ int prototype_signed_dot4_accumulate(
+    unsigned a, unsigned b, int accumulator) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(static_cast<int>(a), static_cast<int>(b), accumulator);
+#else
+    return accumulator + prototype_signed_dot4(a, b);
+#endif
+}
+
+template<unsigned Format, unsigned BlockBytes, unsigned RowTile, bool WordMajor = false>
+__device__ void prototype_group32_q8_linear(const float* scales, const unsigned* qwords,
+    const byte* w, half* y, unsigned rows, unsigned inputs, unsigned outputs,
+    unsigned stride, unsigned offset) {
+    const size_t first_row = size_t(blockIdx.y) * RowTile;
+    const size_t column = size_t(blockIdx.x) * 4 + threadIdx.x / 32;
+    const unsigned lane = threadIdx.x % 32;
+    if (first_row >= rows || column >= outputs) return;
+    const unsigned groups = inputs / 32;
+    const byte* weights = w + column * size_t(inputs / 256) * BlockBytes;
+    float sums[RowTile] = {};
+    for (unsigned group = lane; group < groups; group += 32) {
+        const unsigned local_group = group % 8;
+        const byte* block = weights + size_t(group / 8) * BlockBytes;
+        unsigned packed_weights[8];
+        #pragma unroll
+        for (unsigned word = 0; word < 8; ++word) {
+            unsigned packed = 0;
+            #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const unsigned local = word * 4 + j;
+                unsigned code;
+                if constexpr (Format == 23) {
+                    const unsigned index = (block[8 + local_group * 16 + local % 16]
+                        >> (4 * (local / 16))) & 15;
+                    code = unsigned(native_iq4_register_value(index)) & 255u;
+                } else {
+                    constexpr unsigned low_offset = Format == 13 ? 48 : 16;
+                    code = (block[low_offset + (local_group / 2) * 32 + local]
+                        >> (4 * (local_group % 2))) & 15;
+                    if constexpr (Format == 13)
+                        code |= ((block[16 + local] >> local_group) & 1u) << 4;
+                }
+                packed |= code << (j * 8);
+            }
+            packed_weights[word] = packed;
+        }
+        float a, b = 0.0f;
+        if constexpr (Format == 23) {
+            const unsigned high = unsigned(block[2]) | (unsigned(block[3]) << 8);
+            const unsigned low = (block[4 + local_group / 2] >> (4 * (local_group % 2))) & 15;
+            const int group_scale = int(low | (((high >> (2 * local_group)) & 3) << 4)) - 32;
+            a = native_half(block, 0) * float(group_scale);
+        } else {
+            const byte* s = block + 4;
+            const unsigned scale6 = local_group < 4 ? s[local_group] & 63
+                : (s[local_group + 4] & 15) | ((s[local_group - 4] >> 6) << 4);
+            const unsigned min6 = local_group < 4 ? s[local_group + 4] & 63
+                : (s[local_group + 4] >> 4) | ((s[local_group] >> 6) << 4);
+            a = native_half(block, 0) * float(scale6);
+            b = native_half(block, 2) * float(min6);
+        }
+        // Packed weight words and both coefficients are reused across the
+        // bounded row tile. Only activations and accumulators vary by row.
+        #pragma unroll
+        for (unsigned r = 0; r < RowTile; ++r) {
+            if (first_row + r < rows) {
+                const size_t packed_group = (first_row + r) * groups + group;
+                int dot = 0, sum = 0;
+                #pragma unroll
+                for (unsigned word = 0; word < 8; ++word) {
+                    const size_t word_index = WordMajor
+                        ? ((first_row + r) * 8 + word) * groups + group
+                        : packed_group * 8 + word;
+                    const unsigned packed_x = qwords[word_index];
+                    dot = prototype_signed_dot4_accumulate(packed_weights[word], packed_x, dot);
+                    if constexpr (Format == 12 || Format == 13)
+                        sum = prototype_signed_dot4_accumulate(0x01010101u, packed_x, sum);
+                }
+                // I32 never spans scale groups: IQ4 |dot|<=32*127*127,
+                // Q4 |dot|<=32*15*127, Q5 |dot|<=32*31*127=125984;
+                // |sum|<=32*127. Conversion to F32 is
+                // exact at these magnitudes. Rescale once per complete group.
+                const float d = scales[packed_group];
+                if constexpr (Format == 12 || Format == 13)
+                    sums[r] += d * (a * float(dot) - b * float(sum));
+                else
+                    sums[r] += d * (a * float(dot));
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && first_row + r < rows)
+            y[(first_row + r) * stride + offset + column] = half(sums[r]);
+    }
+}
+
+#define PROTOTYPE_GROUP32_Q8_LINEAR(name, format, bytes, suffix, tile) \
+extern "C" __global__ void vnext_gguf_##name##_q8_f32scale_dp4a_group32_##suffix##_prototype( \
+    const float* scales, const unsigned* qwords, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) { \
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 \
+        || inputs == 0 || inputs % 256 != 0 || offset > stride || outputs > stride - offset) return; \
+    prototype_group32_q8_linear<format, bytes, tile>(scales, qwords, w, y, rows, inputs, outputs, stride, offset); \
+}
+PROTOTYPE_GROUP32_Q8_LINEAR(q4k, 12, 144, f16, 1)
+PROTOTYPE_GROUP32_Q8_LINEAR(q4k, 12, 144, tiled_f16, 8)
+PROTOTYPE_GROUP32_Q8_LINEAR(q5k, 13, 176, f16, 1)
+PROTOTYPE_GROUP32_Q8_LINEAR(q5k, 13, 176, tiled_f16, 8)
+PROTOTYPE_GROUP32_Q8_LINEAR(iq4xs, 23, 136, f16, 1)
+PROTOTYPE_GROUP32_Q8_LINEAR(iq4xs, 23, 136, tiled_f16, 8)
+#undef PROTOTYPE_GROUP32_Q8_LINEAR
+
+// IQ4_XS/Q4_K/Q5_K word-major ABI. Arithmetic, lane ownership and
+// row tiling are identical to the retained group-major G32 implementation.
+#define PROTOTYPE_WORD_MAJOR_Q8(name, format, bytes, suffix, tile) \
+extern "C" __global__ void vnext_gguf_##name##_q8_f32scale_dp4a_group32_word_major_##suffix##_prototype( \
+    const float* scales, const unsigned* qwords, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) { \
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 \
+        || inputs == 0 || inputs % 256 != 0 || offset > stride || outputs > stride - offset) return; \
+    prototype_group32_q8_linear<format, bytes, tile, true>(scales, qwords, w, y, rows, inputs, outputs, stride, offset); \
+}
+PROTOTYPE_WORD_MAJOR_Q8(iq4xs, 23, 136, f16, 1)
+PROTOTYPE_WORD_MAJOR_Q8(iq4xs, 23, 136, tiled_f16, 8)
+PROTOTYPE_WORD_MAJOR_Q8(q4k, 12, 144, f16, 1)
+PROTOTYPE_WORD_MAJOR_Q8(q4k, 12, 144, tiled_f16, 8)
+PROTOTYPE_WORD_MAJOR_Q8(q5k, 13, 176, f16, 1)
+PROTOTYPE_WORD_MAJOR_Q8(q5k, 13, 176, tiled_f16, 8)
+#undef PROTOTYPE_WORD_MAJOR_Q8
+
+
 // Diagnostic entrypoint checks reconstruction before multiplication/half
 // rounding can hide a wrong codebook entry or a tiny signed-scale result.
 extern "C" __global__ void vnext_gguf_iq4xs_register_decode(

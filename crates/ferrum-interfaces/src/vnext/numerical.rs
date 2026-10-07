@@ -7,12 +7,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ContractVersion, ElementType, ModelFamilyId, ModelProgram, OperationId, ProgramValueId,
-    ResolvedTensorSpec, StateSpec, VNextError,
+    ContractVersion, ElementType, ModelFamilyId, ModelProgram, OperationContract, OperationId,
+    ProgramValueId, ResolvedTensorSpec, StateSpec, VNextError,
 };
 
 mod kv_storage;
 pub use kv_storage::KvStateStorage;
+mod arithmetic;
+pub use arithmetic::*;
+mod composite;
+pub use composite::*;
+mod prepared;
+pub use prepared::*;
 
 /// The referenced operation version defines its internal ordering and rounding
 /// points. Arithmetic types are explicit here; copying/indexing operations have
@@ -25,6 +31,15 @@ pub struct NumericalOperationContract {
     pub version: ContractVersion,
     pub multiplication_type: Option<ElementType>,
     pub accumulation_type: Option<ElementType>,
+    /// Ordered mixed arithmetic, when a single floating-point pair cannot
+    /// describe the operation. Legacy declarations omit this field entirely.
+    /// With stages present both legacy arithmetic fields must be `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_arithmetic: Option<StagedNumericalArithmetic>,
+    /// Strict fused semantics with explicitly scoped projection overrides.
+    /// Mutually exclusive with stages and the legacy arithmetic pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite_arithmetic: Option<CompositeNumericalArithmetic>,
 }
 
 /// A complete numerical choice declared by a family before program generation.
@@ -86,16 +101,46 @@ impl NumericalExecutionProfile {
         }
         let mut operation_ids = BTreeSet::new();
         for operation in &self.operations {
-            if operation.version.major == 0
-                || !operation_ids.insert(&operation.operation_id)
-                || operation
-                    .multiplication_type
-                    .is_some_and(|dtype| !floating(dtype))
+            if operation.version.major == 0 || !operation_ids.insert(&operation.operation_id) {
+                return Err(invalid(
+                    &self.family_id,
+                    "operation contracts need unique identities and valid versions",
+                ));
+            }
+            if let Some(composite) = &operation.composite_arithmetic {
+                if operation.staged_arithmetic.is_some()
+                    || operation.multiplication_type.is_some()
+                    || operation.accumulation_type.is_some()
+                {
+                    return Err(invalid(&self.family_id, "composite arithmetic cannot also declare whole-operation stages or an arithmetic pair"));
+                }
+                composite
+                    .validate()
+                    .map_err(|reason| invalid(&self.family_id, reason))?;
+                if operation.operation_id == composite.strict_base.operation_id
+                    && operation.version.major <= composite.strict_base.version.major
+                {
+                    return Err(invalid(&self.family_id, "projection overrides need a distinct operation identity or a breaking major version from the strict base"));
+                }
+            } else if let Some(staged) = &operation.staged_arithmetic {
+                if operation.multiplication_type.is_some() || operation.accumulation_type.is_some()
+                {
+                    return Err(invalid(
+                        &self.family_id,
+                        "staged arithmetic cannot also declare a single-stage arithmetic pair",
+                    ));
+                }
+                staged
+                    .validate()
+                    .map_err(|reason| invalid(&self.family_id, reason))?;
+            } else if operation
+                .multiplication_type
+                .is_some_and(|dtype| !floating(dtype))
                 || operation
                     .accumulation_type
                     .is_some_and(|dtype| !floating(dtype))
             {
-                return Err(invalid(&self.family_id, "operation contracts need unique identities, valid versions and floating-point arithmetic types"));
+                return Err(invalid(&self.family_id, "single-stage operation arithmetic must remain floating-point; integer arithmetic requires explicit stages"));
             }
         }
         let mut state_ids = BTreeSet::new();
@@ -155,12 +200,13 @@ impl NumericalExecutionProfile {
         let contracts: BTreeMap<_, _> = self
             .operations
             .iter()
-            .map(|operation| (&operation.operation_id, operation.version))
+            .map(|operation| (&operation.operation_id, operation))
             .collect();
         let mut used_operations = BTreeSet::new();
         let mut outputs = BTreeSet::new();
         for node in program.blocks().iter().flat_map(|block| &block.nodes) {
-            if contracts.get(&node.operation_id) != Some(&node.required_version) {
+            let contract = contracts.get(&node.operation_id);
+            if contract.map(|operation| operation.version) != Some(node.required_version) {
                 return Err(invalid(
                     &self.family_id,
                     format!(
@@ -168,6 +214,79 @@ impl NumericalExecutionProfile {
                         node.id
                     ),
                 ));
+            }
+            if let Some(output_type) = contract
+                .and_then(|operation| operation.staged_arithmetic.as_ref())
+                .and_then(StagedNumericalArithmetic::output_type)
+            {
+                if node
+                    .outputs
+                    .iter()
+                    .any(|output| self.boundaries.get(output) != Some(&output_type))
+                {
+                    return Err(invalid(
+                        &self.family_id,
+                        format!(
+                            "node {} output boundary differs from its staged output rounding",
+                            node.id
+                        ),
+                    ));
+                }
+            }
+            if let Some(composite) =
+                contract.and_then(|operation| operation.composite_arithmetic.as_ref())
+            {
+                let base = composite
+                    .base_contract()
+                    .map_err(|reason| invalid(&self.family_id, reason))?;
+                let descriptor = base.descriptor();
+                descriptor
+                    .attributes
+                    .validate_values(&node.attributes, "composite.strict_base")
+                    .map_err(|error| invalid(&self.family_id, error.to_string()))?;
+                if node.inputs.len() != descriptor.inputs.len()
+                    || node.outputs.len() != descriptor.outputs.len()
+                {
+                    return Err(invalid(
+                        &self.family_id,
+                        format!("node {} arity differs from its strict base", node.id),
+                    ));
+                }
+                // The fused result follows the base signature, NOT a local
+                // projection's F16 store (GDN's external result is F32).
+                for (output, port) in node.outputs.iter().zip(&descriptor.outputs) {
+                    if !self
+                        .boundaries
+                        .get(output)
+                        .is_some_and(|dtype| port.element_types().contains(dtype))
+                    {
+                        return Err(invalid(
+                            &self.family_id,
+                            format!(
+                                "node {} output boundary differs from its strict base",
+                                node.id
+                            ),
+                        ));
+                    }
+                }
+                // Earlier node outputs have known numerical boundaries here.
+                // External inputs/weight encodings still require the compiler's
+                // full typed signature and real provider qualification.
+                for (input, port) in node.inputs.iter().zip(&descriptor.inputs) {
+                    if self
+                        .boundaries
+                        .get(input)
+                        .is_some_and(|dtype| !port.element_types().contains(dtype))
+                    {
+                        return Err(invalid(
+                            &self.family_id,
+                            format!(
+                                "node {} input boundary differs from its strict base",
+                                node.id
+                            ),
+                        ));
+                    }
+                }
             }
             used_operations.insert(&node.operation_id);
             outputs.extend(&node.outputs);

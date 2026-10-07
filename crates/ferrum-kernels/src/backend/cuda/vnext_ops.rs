@@ -121,6 +121,8 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer/native_swiglu.rs").as_bytes(),
         include_bytes!("vnext_ops/transformer/gguf_f16_projection.rs"),
         include_bytes!("vnext_ops/transformer/rn_fragment_swiglu.rs"),
+        include_bytes!("vnext_ops/transformer/q8act_swiglu.rs"),
+        include_bytes!("vnext_ops/native_blocks/q8act.rs"),
         include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/plan.rs"),
         include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/weights.rs"),
         include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/execution.rs"),
@@ -206,6 +208,16 @@ pub(crate) fn rn_fragment_mma_compiled() -> bool {
     transformer::compiled_mma_target(crate::ptx::VNEXT_GGUF)
 }
 
+pub(crate) fn q8act_g32_compiled() -> bool {
+    native_blocks::q8act::compiled(crate::ptx::VNEXT_GGUF)
+}
+
+pub(crate) fn q8act_g32_profile_compiled(
+    profile: ferrum_interfaces::vnext::Q8ActSwiGluProfile,
+) -> bool {
+    native_blocks::q8act::compiled_for_profile(crate::ptx::VNEXT_GGUF, profile)
+}
+
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     let capabilities = [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
@@ -278,6 +290,14 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         capabilities
     };
     let mut capabilities = capabilities;
+    for profile in [
+        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
+        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+    ] {
+        if q8act_g32_profile_compiled(profile) {
+            capabilities.insert(CapabilityId::new(profile.capability_id())?);
+        }
+    }
     if !rn_fragment_mma_compiled() {
         capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
     }
@@ -563,6 +583,22 @@ pub fn cuda_vnext_operation_registry(
         providers
     };
     let mut providers = providers;
+    for profile in [
+        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
+        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+    ] {
+        if runtime
+            .descriptor()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == profile.capability_id())
+        {
+            contracts.push(Box::new(profile.contract().map_err(contract_error)?));
+            providers.push(Box::new(transformer::CudaQ8ActSwiGluProvider::new(
+                runtime, profile,
+            )?));
+        }
+    }
     if runtime.descriptor().capabilities.iter().any(|capability| {
         capability.as_str()
             == ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID

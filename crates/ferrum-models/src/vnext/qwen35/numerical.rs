@@ -4,19 +4,26 @@
 
 use super::*;
 use ferrum_interfaces::vnext::{
-    CheckpointInputDependency, KvStateStorage, KvStorageFormat, NumericalOperationContract,
-    NumericalProfileId, StateCheckpointCapability, StateCheckpointContents,
-    StateCheckpointContract,
+    CheckpointInputDependency, DeclaredProjectionArithmetic, KvStateStorage, KvStorageFormat,
+    NumericalOperationContract, NumericalProfileId, ProjectionRole, Q8ActSwiGluProfile,
+    StateCheckpointCapability, StateCheckpointContents, StateCheckpointContract,
 };
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
+pub const F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.ffn-iq4xs-q8act-g32";
+pub const F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.ffn-q4k-q5k-iq4xs-q8act-g32";
 const F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-f16-projections";
 pub const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8";
 pub const F16_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.int8-kv";
 pub const F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.int8-kv";
+
+#[cfg(test)]
+mod q8act_tests;
 
 pub(super) fn profiles(
     family_id: &ModelFamilyId,
@@ -29,6 +36,11 @@ pub(super) fn profiles(
     let rn_fragment = gguf_rn_f16_fragment_eligible(config, &text)
         .then(|| gguf_rn_f16_fragment_profile(&f32))
         .transpose()?;
+    let q8act = [Q8ActSwiGluProfile::Iq4Xs, Q8ActSwiGluProfile::Q4KQ5KIq4Xs]
+        .into_iter()
+        .filter(|&profile| q8act_ffn_eligible_for(config, &text, profile))
+        .map(|profile| q8act_ffn_profile(&f32, profile))
+        .collect::<Result<Vec<_>, _>>()?;
     // Qualification covers both physical encoding and recurrent parameter ABI.
     // In particular, an unquantized negative-rate source must not silently
     // acquire the as-yet unqualified F16 behavior merely because it has no blocks.
@@ -67,7 +79,83 @@ pub(super) fn profiles(
     }
     // Explicit opt-in: Auto retains its existing numerical policy.
     profiles.extend(rn_fragment);
+    profiles.extend(q8act);
     FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 2), profiles, automatic)
+}
+
+pub(super) fn q8act_profile_kind(id: &str) -> Option<Q8ActSwiGluProfile> {
+    match id {
+        F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => Some(Q8ActSwiGluProfile::Iq4Xs),
+        F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => {
+            Some(Q8ActSwiGluProfile::Q4KQ5KIq4Xs)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn q8act_ffn_eligible_for(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+    profile: Q8ActSwiGluProfile,
+) -> bool {
+    let arithmetic = profile.arithmetic();
+    config.weight_format == FamilyWeightFormat::GgufNative
+        && text.moe.is_none()
+        && config.recurrent_weight_abi == RecurrentWeightAbi::NegativeRateInterleaved
+        // Family registration admits only the unrotated source ABI.
+        // The provider still declares strict fallback for transformed leaves.
+        && config.gguf_hadamard.is_none()
+        && config.weights.iter().any(|weight| {
+            if !weight.layer_index.is_some_and(|layer| (layer as usize) < text.num_hidden_layers) {
+                return false;
+            }
+            let role = match weight.role.as_str() {
+                "mlp_gate" | "mlp_up" => ProjectionRole::SwiGluGateUp,
+                "mlp_down" => ProjectionRole::SwiGluDown,
+                _ => return false,
+            };
+            let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
+                return false;
+            };
+            let [n, k] = weight.dimensions.as_slice() else { return false; };
+            matches!(arithmetic.declared_projection_arithmetic(role, Some(spec), *k, *n, false),
+                Ok(DeclaredProjectionArithmetic::Staged(_)))
+        })
+}
+
+fn q8act_ffn_profile(
+    master: &NumericalExecutionProfile,
+    kind: Q8ActSwiGluProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = master.clone();
+    let profile_id = match kind {
+        Q8ActSwiGluProfile::Iq4Xs => F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
+        Q8ActSwiGluProfile::Q4KQ5KIq4Xs => {
+            F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID
+        }
+    };
+    profile.id = NumericalProfileId::new(profile_id)
+        .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let ffn = profile
+        .operations
+        .iter_mut()
+        .find(|op| op.operation_id.as_str() == DENSE_SWIGLU_OPERATION_ID)
+        .ok_or_else(|| {
+            invalid_config(
+                "numerical_profile.operations",
+                "Q8act FFN contract is missing",
+            )
+        })?;
+    ffn.operation_id = operation_id(kind.operation_id())?;
+    ffn.version = ContractVersion::new(1, 0);
+    ffn.multiplication_type = None;
+    ffn.accumulation_type = None;
+    ffn.composite_arithmetic = Some(kind.arithmetic());
+    profile
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    profile.validate()?;
+    Ok(profile)
 }
 
 /// This is a declared source/ABI combination, not full-model quality approval.
@@ -271,6 +359,8 @@ fn profile(
                     version: selection.version,
                     multiplication_type: multiply,
                     accumulation_type: accumulate,
+                    staged_arithmetic: None,
+                    composite_arithmetic: None,
                 },
             );
             Ok(())

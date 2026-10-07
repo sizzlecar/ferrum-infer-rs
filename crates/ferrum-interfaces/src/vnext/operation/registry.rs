@@ -433,6 +433,7 @@ pub struct OperationResourceEstimate {
     scratch: Option<ProviderWorkspaceRequirement>,
     binding: Option<ProviderWorkspaceRequirement>,
     persistent: Option<ProviderWorkspaceRequirement>,
+    projection_numerics: Option<crate::vnext::PreparedProjectionNumerics>,
 }
 
 impl OperationResourceEstimate {
@@ -455,12 +456,25 @@ impl OperationResourceEstimate {
             scratch,
             binding: None,
             persistent,
+            projection_numerics: None,
         }
     }
 
     pub fn with_binding(mut self, binding: ProviderWorkspaceRequirement) -> Self {
         self.binding = Some(binding);
         self
+    }
+
+    pub fn with_projection_numerics(
+        mut self,
+        numerics: crate::vnext::PreparedProjectionNumerics,
+    ) -> Self {
+        self.projection_numerics = Some(numerics);
+        self
+    }
+
+    pub fn projection_numerics(&self) -> Option<&crate::vnext::PreparedProjectionNumerics> {
+        self.projection_numerics.as_ref()
     }
 
     pub fn estimator_id(&self) -> &str {

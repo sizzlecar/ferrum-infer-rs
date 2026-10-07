@@ -51,6 +51,7 @@ fn provider_resources(provider: &str) -> ProviderResourcePlan {
         scratch: None,
         binding: None,
         persistent: None,
+        projection_numerics: None,
     }
 }
 

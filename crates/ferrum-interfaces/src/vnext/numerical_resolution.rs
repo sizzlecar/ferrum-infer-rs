@@ -33,6 +33,17 @@ pub struct NumericalProfileResolution {
     parts: NumericalProfileResolutionWire,
 }
 
+/// Prepared inventory, not execution occurrence counts or numerical validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedNodeProjectionNumerics {
+    pub node_id: super::NodeId,
+    pub operation_id: super::OperationId,
+    pub provider_id: super::ProviderId,
+    pub provider_implementation_fingerprint: String,
+    pub numerics: super::PreparedProjectionNumerics,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NumericalProfileResolutionWire {
@@ -49,6 +60,8 @@ pub(crate) struct NumericalProfileResolutionWire {
     runtime_policy_fingerprint: String,
     execution_plan_hash: String,
     rejected: Vec<NumericalProfileRejection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prepared_projection_numerics: Vec<PreparedNodeProjectionNumerics>,
 }
 
 fn invalid(reason: impl Into<String>) -> VNextError {
@@ -126,6 +139,23 @@ impl NumericalProfileResolution {
                 runtime_policy_fingerprint,
                 execution_plan_hash: plan.plan_hash().as_str().to_owned(),
                 rejected,
+                prepared_projection_numerics: payload
+                    .nodes()
+                    .iter()
+                    .filter_map(|node| {
+                        node.provider_resources()
+                            .projection_numerics()
+                            .map(|numerics| PreparedNodeProjectionNumerics {
+                                node_id: node.id().clone(),
+                                operation_id: node.operation_id().clone(),
+                                provider_id: node.provider_resources().provider_id().clone(),
+                                provider_implementation_fingerprint: node
+                                    .provider_implementation_fingerprint()
+                                    .to_owned(),
+                                numerics: numerics.clone(),
+                            })
+                    })
+                    .collect(),
             },
         })
     }

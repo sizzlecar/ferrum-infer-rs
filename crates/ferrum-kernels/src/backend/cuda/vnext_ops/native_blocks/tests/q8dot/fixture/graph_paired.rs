@@ -1,0 +1,326 @@
+//! Same frozen kernels in balanced direct/graph timing, with direct pack-only
+//! observations. R2's test and its implicit event-tracking setting stay intact.
+
+use super::*;
+use cudarc::driver::sys;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+const ITERATIONS: u32 = 32;
+const WARM_ROUNDS: usize = 4;
+
+// A test-local adapter of vnext_replay.rs's raw capture/instantiate/upload
+// lifecycle. Its private production helper also owns DeviceCommands/BLAS;
+// these test-only functions are deliberately not registered as production ops.
+// The caller keeps all Fixture allocations alive and fixed until this drops.
+pub(super) struct Captured {
+    graph: sys::CUgraph,
+    executable: sys::CUgraphExec,
+    stream: Arc<CudaStream>,
+    pub(super) node_count: usize,
+}
+
+impl Captured {
+    pub(super) fn new(stream: &Arc<CudaStream>, enqueue: impl FnOnce()) -> Self {
+        stream.context().bind_to_thread().unwrap();
+        stream.synchronize().unwrap();
+        let begin = unsafe {
+            sys::cuStreamBeginCapture_v2(
+                stream.cu_stream(),
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )
+        };
+        assert_eq!(begin, sys::CUresult::CUDA_SUCCESS, "begin graph capture");
+        // Always end capture, including a launch-builder panic. No allocation,
+        // copy, event timing or synchronization occurs inside this closure.
+        let encoded = catch_unwind(AssertUnwindSafe(enqueue));
+        let mut captured = Self {
+            graph: std::ptr::null_mut(),
+            executable: std::ptr::null_mut(),
+            stream: Arc::clone(stream),
+            node_count: 0,
+        };
+        let end = unsafe { sys::cuStreamEndCapture(stream.cu_stream(), &mut captured.graph) };
+        let mut state = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED;
+        let query = unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut state) };
+        if query != sys::CUresult::CUDA_SUCCESS
+            || state != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+        {
+            // Terminate an invalidated capture before any possible unwind or
+            // buffer destruction. Do not resume testing an uncleared stream.
+            let mut abandoned = std::ptr::null_mut();
+            unsafe {
+                sys::cuStreamEndCapture(stream.cu_stream(), &mut abandoned);
+                if !abandoned.is_null() {
+                    sys::cuGraphDestroy(abandoned);
+                }
+            }
+            let retry = unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut state) };
+            assert_eq!(retry, sys::CUresult::CUDA_SUCCESS, "query capture cleanup");
+            assert_eq!(
+                state,
+                sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
+                "capture cleanup did not terminate the stream"
+            );
+        }
+        if let Err(panic) = encoded {
+            resume_unwind(panic);
+        }
+        assert_eq!(end, sys::CUresult::CUDA_SUCCESS, "end graph capture");
+        assert!(!captured.graph.is_null(), "empty captured graph");
+        let nodes = unsafe {
+            sys::cuGraphGetNodes(
+                captured.graph,
+                std::ptr::null_mut(),
+                &mut captured.node_count,
+            )
+        };
+        assert_eq!(nodes, sys::CUresult::CUDA_SUCCESS, "read graph node count");
+        // Match current vNext flags=0 and prepare/upload outside replay. Avoid
+        // cudarc end_capture/AUTO_FREE_ON_LAUNCH on Blackwell + CUDA 13.
+        let instantiate = unsafe {
+            sys::cuGraphInstantiateWithFlags(&mut captured.executable, captured.graph, 0)
+        };
+        assert_eq!(
+            instantiate,
+            sys::CUresult::CUDA_SUCCESS,
+            "instantiate graph"
+        );
+        assert!(!captured.executable.is_null());
+        let upload = unsafe { sys::cuGraphUpload(captured.executable, stream.cu_stream()) };
+        assert_eq!(upload, sys::CUresult::CUDA_SUCCESS, "upload graph");
+        stream.synchronize().unwrap();
+        captured
+    }
+
+    pub(super) fn launch(&self) {
+        let status = unsafe { sys::cuGraphLaunch(self.executable, self.stream.cu_stream()) };
+        assert_eq!(status, sys::CUresult::CUDA_SUCCESS, "replay graph");
+    }
+}
+
+impl Drop for Captured {
+    fn drop(&mut self) {
+        if self.stream.context().bind_to_thread().is_err() {
+            return;
+        }
+        // Graph resources die before Fixture buffers; pending work must finish.
+        let _ = self.stream.synchronize();
+        unsafe {
+            if !self.executable.is_null() {
+                sys::cuGraphExecDestroy(self.executable);
+            }
+            if !self.graph.is_null() {
+                sys::cuGraphDestroy(self.graph);
+            }
+        }
+    }
+}
+
+fn prepare(
+    case: &mut Fixture,
+    stream: &Arc<CudaStream>,
+    experiment: &Experiment,
+    route: Option<Route>,
+) {
+    case.reset(stream);
+    if route.is_some_and(|r| !r.includes_quantization()) {
+        case.pack(stream, experiment);
+    }
+    stream.synchronize().unwrap();
+}
+
+fn enqueue(
+    case: &mut Fixture,
+    stream: &Arc<CudaStream>,
+    kernels: &CudaNativeBlockKernels,
+    experiment: &Experiment,
+    route: Option<Route>,
+    tile: u32,
+) {
+    for _ in 0..ITERATIONS {
+        if route.is_none_or(Route::includes_quantization) {
+            case.pack(stream, experiment);
+        }
+        if let Some(route) = route {
+            case.multiply(stream, kernels, experiment, route, tile);
+        }
+    }
+}
+
+pub(super) fn measure(stream: &Arc<CudaStream>, launch: impl FnOnce()) -> (f64, f64) {
+    let wall = std::time::Instant::now();
+    let start = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    launch();
+    let end = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    end.synchronize().unwrap();
+    (
+        wall.elapsed().as_secs_f64() * 1e9,
+        f64::from(start.elapsed_ms(&end).unwrap()) * 1e6,
+    )
+}
+
+pub(super) fn balanced_route(pair: usize, position: usize, count: usize) -> usize {
+    let rotation = pair % count;
+    if pair / count % 2 == 0 {
+        (rotation + position) % count
+    } else {
+        (rotation + count - position) % count
+    }
+}
+
+#[test]
+#[ignore = "balanced direct/graph GPU timing; coordinate exclusive CUDA access"]
+fn q8dot_balanced_direct_graph_and_pack_microbench() {
+    run_formats(&[GgufBlockFormat::Iq4Xs, GgufBlockFormat::Q4K], &Route::ALL);
+}
+
+#[test]
+#[ignore = "Q5-only balanced direct/graph GPU timing; coordinate exclusive CUDA access"]
+fn q5_q8_group32_balanced_direct_graph_and_pack_microbench() {
+    run_formats(&[GgufBlockFormat::Q5K], &Route::Q5);
+}
+
+fn run_formats(formats: &[GgufBlockFormat], routes: &[Route]) {
+    // Two Latin cycles (forward/reverse); Q5 has three routes and six pairs,
+    // while the existing two-format diagnostic keeps five routes/ten pairs.
+    let pairs = 2 * routes.len();
+    let context = CudaContext::new(0).expect("Q8 graph diagnostic requires CUDA");
+    // Match vnext_runtime::new before creating streams or allocating buffers.
+    // SAFETY: one test thread and one stream own every buffer and explicit fence.
+    unsafe { context.disable_event_tracking() };
+    let stream = context.new_stream().unwrap();
+    let kernels = CudaNativeBlockKernels::load(&context).unwrap();
+    let experiment = Experiment::load(&context);
+    for &format in formats {
+        for (inputs, outputs) in [(5120, 6144), (5120, 17408), (17408, 5120)] {
+            for rows in [1, 8] {
+                let tile = if rows == 1 { 1 } else { 8 };
+                let mut case = Fixture::new(&stream, format, rows, inputs, outputs);
+                let mut stable = vec![None; routes.len()];
+                // Warm every kernel before capture. These allocations stay fixed;
+                // graphs are declared after case and explicitly dropped first.
+                let graphs = routes
+                    .iter()
+                    .copied()
+                    .map(|route| {
+                        case.run(&stream, &kernels, &experiment, route, tile, 1);
+                        case.validate(&stream, route);
+                        prepare(&mut case, &stream, &experiment, Some(route));
+                        Captured::new(&stream, || {
+                            enqueue(&mut case, &stream, &kernels, &experiment, Some(route), tile);
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                prepare(&mut case, &stream, &experiment, None);
+                let pack_graph = Captured::new(&stream, || {
+                    enqueue(&mut case, &stream, &kernels, &experiment, None, tile);
+                });
+                for round in 0..WARM_ROUNDS + pairs {
+                    let formal = round.checked_sub(WARM_ROUNDS);
+                    let pair = formal.unwrap_or(round);
+                    for position in 0..routes.len() {
+                        let index = balanced_route(pair, position, routes.len());
+                        let route = routes[index];
+                        for mode_position in 0..2 {
+                            let graph_mode = (pair + index + mode_position) % 2 == 1;
+                            prepare(&mut case, &stream, &experiment, Some(route));
+                            let (wall_ns, gpu_ns) = measure(&stream, || {
+                                if graph_mode {
+                                    graphs[index].launch();
+                                } else {
+                                    enqueue(
+                                        &mut case,
+                                        &stream,
+                                        &kernels,
+                                        &experiment,
+                                        Some(route),
+                                        tile,
+                                    );
+                                }
+                            });
+                            let (bits, errors) = case.validate(&stream, route);
+                            if let Some(reference) = &stable[index] {
+                                assert_eq!(
+                                    &bits, reference,
+                                    "direct/graph changed {route:?} output bits"
+                                );
+                            } else {
+                                stable[index] = Some(bits);
+                            }
+                            if formal.is_some() {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "experiment":"activation_q8_balanced_direct_graph",
+                                        "format":format!("{format:?}"),"input":inputs,"output":outputs,"rows":rows,"row_tile":tile,
+                                        "route":route.name(),"integer_partial_values":route.integer_partial_values(),
+                                        "mode":if graph_mode {"graph_replay"} else {"direct"},"event_tracking":false,
+                                        "pair":pair,"order":position,"mode_order":mode_position,
+                                        "warm_rounds":WARM_ROUNDS,"measured_pairs":pairs,"iterations":ITERATIONS,
+                                        "graph_nodes":if graph_mode {Some(graphs[index].node_count)} else {None},
+                                        "graph_replays":if graph_mode {1} else {0},
+                                        "quantization_included":route.includes_quantization(),"wall_ns":wall_ns,"gpu_ns":gpu_ns,"errors":errors
+                                    })
+                                );
+                            }
+                        }
+                    }
+                    // Pack-only is a separate observation after the balanced
+                    // projection routes, never a difference of two elapsed times.
+                    for mode_position in 0..2 {
+                        let graph_mode = (pair + mode_position) % 2 == 1;
+                        prepare(&mut case, &stream, &experiment, None);
+                        // reset deliberately leaves NaNs in logical output and
+                        // sentinels in guards. Preserve both bitwise; comparing
+                        // the whole allocation to one sentinel is incorrect.
+                        let output_before = stream
+                            .clone_dtoh(&case.output_gpu)
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>();
+                        let (wall_ns, gpu_ns) = measure(&stream, || {
+                            if graph_mode {
+                                pack_graph.launch();
+                            } else {
+                                enqueue(&mut case, &stream, &kernels, &experiment, None, tile);
+                            }
+                        });
+                        case.validate_pack(&stream);
+                        assert_eq!(
+                            stream
+                                .clone_dtoh(&case.output_gpu)
+                                .unwrap()
+                                .iter()
+                                .map(|x| x.to_bits())
+                                .collect::<Vec<_>>(),
+                            output_before,
+                            "pack-only overwrote output"
+                        );
+                        if formal.is_some() {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "experiment":"activation_q8_pack_only",
+                                    "format_context":format!("{format:?}"),"input":inputs,"output_context":outputs,"rows":rows,
+                                    "mode":if graph_mode {"graph_replay"} else {"direct"},"event_tracking":false,
+                                    "pair":pair,"mode_order":mode_position,"warm_rounds":WARM_ROUNDS,
+                                    "measured_pairs":pairs,"iterations":ITERATIONS,
+                                    "graph_nodes":if graph_mode {Some(pack_graph.node_count)} else {None},
+                                    "graph_replays":if graph_mode {1} else {0},"wall_ns":wall_ns,"gpu_ns":gpu_ns,
+                                    "validation":"all qwords/scale bits, guards, input/weight immutability and untouched output"
+                                })
+                            );
+                        }
+                    }
+                }
+                drop(pack_graph);
+                drop(graphs);
+            }
+        }
+    }
+}

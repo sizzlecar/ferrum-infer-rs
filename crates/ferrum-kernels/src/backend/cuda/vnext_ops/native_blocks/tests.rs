@@ -10,6 +10,7 @@ mod format_specialization;
 mod iq4xs_register;
 mod q4k;
 mod q8_0;
+mod q8dot;
 
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {
     if format == GgufBlockFormat::Pq2_0 {

@@ -233,6 +233,12 @@ impl PlanNodeResolution {
                 &estimator_input_fingerprint,
             )?;
             let estimate = estimators[0].estimate_resources(estimate_request)?;
+            validate_projection_numerics(
+                family,
+                &program_node.operation_id,
+                &values,
+                estimate.projection_numerics(),
+            )?;
             let provider_resources = ProviderResourcePlan::from_provider_output(
                 descriptor,
                 &estimator_input_fingerprint,
@@ -323,5 +329,30 @@ impl PlanNodeResolution {
         &self,
     ) -> &BTreeMap<ProviderId, PlanProviderRejectReason> {
         &self.provider_resolution_rejections
+    }
+}
+
+pub(super) fn validate_projection_numerics(
+    family: &PreparedModelFamily,
+    operation: &crate::vnext::OperationId,
+    values: &[ResolvedValueBinding],
+    prepared: Option<&crate::vnext::PreparedProjectionNumerics>,
+) -> Result<(), VNextError> {
+    let contract = family
+        .numerical_profile()
+        .operations
+        .iter()
+        .find(|contract| &contract.operation_id == operation)
+        .ok_or_else(|| {
+            invalid_plan("provider numerical operation is absent from the family profile")
+        })?;
+    match (contract.composite_arithmetic.as_ref(), prepared) {
+        (Some(contract), Some(prepared)) => prepared
+            .validate_bindings(contract, values)
+            .map_err(invalid_plan),
+        (None, None) => Ok(()),
+        _ => Err(invalid_plan(
+            "provider must resolve exactly the declared composite projection arithmetic",
+        )),
     }
 }

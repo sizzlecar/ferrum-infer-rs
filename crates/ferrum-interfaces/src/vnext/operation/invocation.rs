@@ -588,6 +588,7 @@ pub struct OperationInvocation<'a, B> {
     persistent_view: Option<usize>,
     work_shape: &'a BatchWorkShape,
     claimed_backing_fingerprint: &'a str,
+    projection_numerics: Option<&'a crate::vnext::PreparedProjectionNumerics>,
 }
 
 impl<'a, B> OperationInvocation<'a, B> {
@@ -1003,6 +1004,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             persistent_view,
             work_shape: resources.work_shape()?,
             claimed_backing_fingerprint: resources.backing_fingerprint(),
+            projection_numerics: provider_resources.projection_numerics(),
         })
     }
 
@@ -1020,6 +1022,10 @@ impl<'a, B> OperationInvocation<'a, B> {
 
     pub fn provider_id(&self) -> &ProviderId {
         self.provider_id
+    }
+
+    pub fn projection_numerics(&self) -> Option<&crate::vnext::PreparedProjectionNumerics> {
+        self.projection_numerics
     }
 
     pub fn views(&self) -> &[OperationBufferView<'a, B>] {
