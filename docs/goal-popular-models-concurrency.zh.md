@@ -2,7 +2,7 @@
 
 制定于 2026-10-07。本文件承接 [`goal-slo-throughput.zh.md`](goal-slo-throughput.zh.md)（已随 #402 合入 main），沿用其中的公式、指标口径和"按并发扫描"的测量方式。
 
-执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。新口径 Metal 全 GPU 探索队列已启动，首格为 27B llama.cpp C4，尚无新格完成；CUDA 客户端与生命周期 guard 已构建并通过测试，尚未加载模型或执行服务切换。尚未完成 P0，不将格式支持或基线准备当作吞吐验收。
+执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。新口径已完成 **3/44** 格：Metal 27B llama.cpp/Ferrum C4，以及CUDA 27B llama.cpp C4，各32个正式请求成功、零错误。Metal C4的Ferrum/llama吞吐比为0.971，本次未超过；仅一次探索重复，SLO unknown。当前Metal继续llama C8、CUDA继续Ferrum C4。CUDA两引擎run/serve短测均已通过，原服务在当前主队列结束后仍须由guard恢复核验。尚未完成 P0，不将短测或单格结果当作完整验收。
 
 ## 1. 目标
 
