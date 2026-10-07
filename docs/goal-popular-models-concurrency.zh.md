@@ -2,7 +2,9 @@
 
 制定于 2026-10-07。本文件承接 [`goal-slo-throughput.zh.md`](goal-slo-throughput.zh.md)（已随 #402 合入 main），沿用其中的公式、指标口径和"按并发扫描"的测量方式。
 
-执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。新口径已完成 **11/44** 格：Metal 27B llama.cpp C4/C8及Ferrum C4，CUDA 27B两引擎GGUF C4/C8/C16/C32共8格，正式请求全部成功、零错误。Ferrum/llama吞吐比为Metal C4的0.971；CUDA C4/C8/C16/C32依次0.228/0.197/0.166/0.153，本次均未超过。仅一次探索重复，SLO unknown。CUDA队列guard退出0，原服务已 `restored_verified`，下载已恢复。Metal Ferrum C8原尝试已自行结束：29成功/3超时，guard退出1，另记失败格、不增加成功数；1800秒边界的六格队列已启动，结果待完成。尚未完成P0，短测与局部探索不替代完整验收。
+执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。新口径已完成 **12/44** 格：Metal 27B两引擎C4/C8，以及CUDA 27B两引擎GGUF C4/C8/C16/C32共8格，主表正式请求全部成功、零错误。Ferrum/llama吞吐比为Metal C4/C8的0.971/0.587；CUDA C4/C8/C16/C32依次0.228/0.197/0.166/0.153，本次均未超过。Metal C8的Ferrum重试使用1800秒单请求边界，llama仍为600秒，旧Ferrum 29成功/3超时记录保留；边界差异不等于SLO阈值变更。仅一次成功探索重复，SLO unknown。Metal队列已进入llama C16。CUDA主队列guard退出0并完成过 `restored_verified`；当前64题质量guard已进入Ferrum阶段，原服务暂由该guard停服，须待本轮恢复核验。
+
+CUDA 27B CT检查点15/15项已完成下载receipt与final stat核对，冻结的ready snapshot及run/serve bound配置已上传，尚未模型执行。GGUF质量回放的llama已64/64 HTTP成功且保留完整真实输出ID，但45题触及512-token上限；逐题人工审阅已落盘，记录到明确算术等错误，Ferrum结果未完，不能宣称质量通过或token一致率。vLLM镜像r7/r8/r9反复命中同一损坏ingest文件；root确认无人占用后仅隔离该目录，r10正按原digest重新下载，镜像仍未就绪。尚未完成P0，这些准备与质量进度不增加性能格数。
 
 ## 1. 目标
 
