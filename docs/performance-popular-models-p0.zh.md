@@ -1,6 +1,6 @@
 # 热门模型 P0：结果与转向决定（2026-10-07）
 
-[目标与里程碑](goal-popular-models-concurrency.zh.md)已调整：**停止扩充原44格矩阵，保留已完成的13格，立即转入有界profiling。** 不再等模型下载或补齐支持后才定位差距。首个工程里程碑是RTX5090上27B同GGUF的C4/C8/C16/C32逐档追平llama.cpp；第4周根据实测重新决定后续范围和承诺。
+[目标与里程碑](goal-popular-models-concurrency.zh.md)：**停止扩充44格，保留13格；CUDA C8与Metal C4/C8诊断已采集，转入P1热点修复。** 首里程碑是RTX5090上27B同GGUF的C4/C8/C16/C32逐档追平llama.cpp；第4周重评后续范围和承诺。
 
 ## 已测结果
 
@@ -30,21 +30,29 @@ TPOT截止最后可见文本，按usage输出token减一归一；ITL是相邻非
 
 Metal内存是整个client窗口（含预热）的宿主采样峰，五格采集无缺失/错误；RSS与footprint重叠、不能相加，也不是Metal设备分配。CUDA是250ms采样的全卡NVML已用峰，覆盖启动至关闭，含驱动等分配；逐进程与宿主值未提供。均为采样下界，不是瞬时真峰。S未声明，全部SLO unknown；一次探索没有跨重复方差或置信区间。
 
-## 差距与决定
+## 热点证据与P1决定
 
-- 同并发Ferrum/llama吞吐比：CUDA C4/C8/C16/C32为 **0.228 / 0.197 / 0.166 / 0.153**；Metal C4/C8为 **0.971 / 0.587**，均未追平。Metal C16仅有llama结果，不填比值；硬件之间不互算比值。
-- Metal Ferrum从C4的10.221降至C8的7.240 tok/s，约下降29.2%，TPOT/ITL尾延迟同时增大。C8比较使用Ferrum1800秒重试与llama600秒结果；原Ferrum尝试29成功/3超时，不能用后来成功覆盖或认定相同deadline下都成功。尚不能归因于某个内核、换页或降频。
-- **立即profile CUDA27B C8：Ferrum对llama，同GGUF与冻结负载。** 比较实际kernel名称、次数、GPU耗时、每轮launch、CPU等待及同步，区分prefill/decode。Q4_K内核只是候选假设，未经profile证实；vLLM尚无实测，不报告确定差距。
-- **立即查Metal C8退化：** 比较Ferrum C4/C8及同负载llama C8，采集有时间/磁盘上限的trace。只有实际kernel证据才可报告shader次数/耗时，encoder耗时不能冒充每kernel耗时；profile开销与主表性能分开。
-- **停止扩充44格。** 保留完成的llama C16；Metal旧队列已主动SIGTERM，Ferrum C16未完成、不计结果。CUDA64题质量回放已完成且原服务恢复核验通过，接下来转profile，**不再启动已备CT短测或四格探索**。下载不作为profile前置条件，正式采集前暂停重下载等干扰。
-- **35B支持缺口直接转P1。** Metal混合MoE的Q6_K专家已实测启动失败；CUDA原生AWQ与混合BF16专家存在格式/provider缺口，未实跑部分不写成实机失败。按profile及支持缺口集中修复，不等35B矩阵填完。
+同并发Ferrum/llama吞吐比：CUDA C4/C8/C16/C32为 **0.228 / 0.197 / 0.166 / 0.153**，Metal C4/C8为 **0.971 / 0.587**。Metal Ferrum C8较C4下降29.2%，尾延迟增大；C8两引擎deadline不同，Ferrum原600秒的29成功/3超时仍保留。C16只有llama，不填比值。
+
+独立诊断不增加主表样本；GPU时间为窗口内kernel时长之和，非墙钟或完整请求耗时：
+
+| 采集范围 | 实测热点与边界 |
+| --- | --- |
+| CUDA Ferrum第二20秒窗口，C8 decode graph replay（源码/拓扑交叉归因） | decode切片GPU合计7.183689秒。generic `vnext_gguf_linear_tiled_f16` 25,374次/5.692941秒（79.25%）；Q4_K特化6,659次/1.046307秒（14.57%）；Q6_K head 64次/0.148005秒（2.06%）。窗口边界不完整，不推算完整轮数。 |
+| 同窗大M prefill | generic 393次/9.632992秒，Q4_K 103次/2.374407秒。与小行数replay分开统计。 |
+| CUDA llama同C8冻结负载20秒 | 最高单项IQ4_XS `mul_mat_vec_q<23,8>`为36,624次/1.587秒（10.1%）；另有按格式特化的`mul_mat_q`。窗口形状不同，不用平均kernel耗时互算倍数。 |
+| Metal C4/C8短pilot | 各8请求、选择器输入256/输出16、无预热、单次；代表性host frame为346.451/844.941ms，第二批prefill12.419秒阻塞已有输出；本短负载未新增压缩/swapout，不能据此排除长负载内存压力。实际48 recurrent+16 causal层均packed8，仅attention需2,176个encoder interval，超过2,048容量：C8缺完整逐核GPU时间，完整GPU根因未证实。 |
+
+**P1顺序：** ① CUDA混合格式小batch优先generic路径Q5_K/IQ4_XS，尚未按格式分账；再按占比处理Q4_K/Q6_K head，另处理大M prefill。② Metal先补计时容量，再核M4/M8分派：IQ4_XS/部分Q5_K走M32 tile，Q3_K/IQ3_S/IQ4_NL缺跨行解码复用，部分Q4/Q6已有2×B4；同时处理prefill阻塞。③ 35B支持单列：Metal Q6_K专家启动失败、CUDA AWQ/混合BF16 provider缺口，不按耗时排名。vLLM未测，不声称差距。
+
+不恢复44格或启动CT探索；保留llama C16，已停止的Ferrum C16不计结果。profile只确定修复优先级，优化收益仍需同机、同样本复测。
 
 ## 质量与边界
 
-CUDA GGUF质量回放已完成：固定64题、自然EOS、max512、贪心；llama/Ferrum均64题完成、请求错误0，各45题length截断。guard退出0且原服务恢复核验通过；本轮不作性能比较。逐题审阅发现明确错误，例如llama与Ferrum都将5km用时23:30错写为4:42/mile和2:55/km，实际应为4:42/km。HTTP成功、可读或无退化循环不等于质量通过；截断、事实未知与明确错误分别记录。原始输出ID：14/64整序列相同，位置匹配10,366/27,868（37.1968%，分母为各对较长序列之和）。64对缺实际prompt ID对齐证据，不能据此认定数值正确或错误。
+CUDA GGUF质量回放已完成：固定64题、自然EOS、max512、贪心；llama/Ferrum均64题完成、请求错误0，各45题length截断。本轮不作性能比较。两边64题均已逐题审阅，发现明确错误，例如都将5km用时23:30错写为4:42/mile和2:55/km，实际应为4:42/km。HTTP成功、可读或无退化循环不等于质量通过；截断、事实未知与明确错误分别记录。原始输出ID：14/64整序列相同，位置匹配10,366/27,868（37.1968%，分母为各对较长序列之和）。64对缺实际prompt ID对齐证据，不能据此认定数值正确或错误。
 
 35B、CT与vLLM未完成的支持和对照留待P1，不阻塞当前profiling。
 
-P0接下来交付实测热点排序、输出质量结论和修复优先级。首里程碑只对CUDA27B同GGUF四档追平负责，同时报告延迟、错误和质量。撤销旧“第2周两个模型全面超过、第6周达到vLLM80%”承诺；第4周重评35B、Metal、vLLM对照及SLO-aware计划，长期模型范围保留。
+首里程碑只对CUDA27B同GGUF四档追平负责，同时报告延迟、错误和质量。旧第2周全面超过、第6周达到vLLM80%的承诺已撤销；第4周重评扩展，长期模型范围保留。
 
-完整报告、命令、pins、失败历史、生命周期、逐题审阅及压缩前两页快照均在库外证据根：`/private/tmp/ferrum-popular-models-p0-20261007/`。本页只留结果和决定；历史PID、下载及服务状态不能替代执行前实时检查。
+完整报告、profile、pins、失败历史与逐题审阅均在库外证据根：`/private/tmp/ferrum-popular-models-p0-20261007/`。
