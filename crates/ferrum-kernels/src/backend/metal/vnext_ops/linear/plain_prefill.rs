@@ -52,6 +52,17 @@ impl PlainLinearPlan {
             {
                 4
             }
+            // These native formats otherwise decode each coefficient once
+            // per row. Reuse the existing B4 lane sums twice, preserving F32
+            // reconstruction and reduction. Paired measurements support wide
+            // K>=1024 projections; short K and narrow N retain scalar GEMV.
+            (
+                LinearPhysicalFormat::Native(
+                    GgufBlockFormat::Q3K | GgufBlockFormat::Iq3S | GgufBlockFormat::Iq4Nl,
+                ),
+                ElementType::F16,
+                8,
+            ) if launch.params.in_features >= 1024 => 4,
             _ => return None,
         };
         let input_bytes = u64::from(prefix_rows)
@@ -97,3 +108,6 @@ impl PlainLinearPlan {
         Some([head, tail])
     }
 }
+
+#[cfg(test)]
+mod native_groups_tests;
