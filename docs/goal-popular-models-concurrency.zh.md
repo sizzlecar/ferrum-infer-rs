@@ -1,58 +1,43 @@
 # Ferrum 目标：先追平CUDA27B，再重评扩展（2026-10-07）
 
-路线已根据[P0实测与profiling](performance-popular-models-p0.zh.md)调整：停止扩充44格，保留13格基线；P1首轮CUDA格式特化与C8复测完成，仍未追平llama.cpp。候选CUDA热点已分账，Metal计时容量已修复并取得完整观测区间；后续处理量化分派、大M prefill与阻塞。详细证据在库外归档，目标未完成。
+依据[P0结果与决定](performance-popular-models-p0.zh.md)转入P1修复。热点、数值与历史留结果页及库外证据；目标尚未完成。
 
-## 1. 当前里程碑与长期范围
+## 1. 首里程碑与范围
 
-**首个工程里程碑：RTX5090上Qwen3.8-27B，Ferrum在C4/C8/C16/C32同一GGUF、同一冻结ShareGPT负载下，逐档输出吞吐不低于llama.cpp。** 同时报告TTFT、TPOT、可见ITL的P50/P99、显存/内存、错误、样本数、重复及输出质量，不能以吞吐追平隐藏延迟或质量退化。有SLO约束时按约束验收，尚未声明S时保持unknown。
+**RTX5090上Qwen3.8-27B：Ferrum在C4/C8/C16/C32使用同一GGUF、同一冻结ShareGPT负载，逐档输出吞吐不低于llama.cpp。** 同时报告TTFT、TPOT、可见ITL的P50/P99、显存/内存、错误、样本、重复及质量，不能用吞吐追平掩盖延迟或质量退化；有SLO时按约束验收，未声明S时保持unknown。
 
-第4周根据热点修复、四档吞吐/延迟和质量证据重新决定后续范围、优先级及工期。撤销原“第2周两个模型全面超过llama、第6周达到vLLM80%”时间承诺，不再承诺整条路线7–9周完成。vLLM尚无同机实测，不能以未经测量的差距制定比例进度。
+第4周按四档吞吐、尾延迟、质量与回归重评范围、优先级及工期。撤销“第2周两个模型全面超过llama、第6周达到vLLM80%”承诺；整条路线不再承诺7–9周，vLLM未同机实测不设比例进度。
 
-长期范围仍是Qwen3.8-27B dense与Qwen3.6-35B-A3B MoE，均属于Qwen3.5架构族并含混合注意力。架构识别不等于所有量化/provider组合可运行：35B支持缺口直接进入P1，不等待其P0矩阵完整。Qwen3.5-9B仅用于合并前C4/C8回归，不低于#402基线。Gemma 4和gpt-oss仍留下一版，不扩充模型名单。
+长期范围仍为Qwen3.8-27B dense与Qwen3.6-35B-A3B MoE，均属Qwen3.5架构族。35B量化/provider支持缺口直接进入P1，不等待P0矩阵完整；Gemma 4、gpt-oss留下一版。Qwen3.5-9B只作合并前C4/C8回归，不低于#402基线。
 
-目标机器保持RTX5090 32GB与本机M1 Max 32GB；M4 Mac mini16GB只作9B回归。Metal只对照llama.cpp，vLLM仅考虑CUDA。Ferrum/llama必须用同一GGUF；将来Ferrum/vLLM比较必须用同一检查点，不用GGUF对其他格式的比值替代。vLLM比例、35B/Metal扩展及发布承诺由第4周重评确定。
+机器保持RTX5090 32GB与M1 Max 32GB，M4 Mac mini16GB只作9B回归。Metal只对照llama.cpp，vLLM仅考虑CUDA。Ferrum/llama须用同一GGUF；将来Ferrum/vLLM须用同一检查点，不以跨格式比值替代。35B/Metal扩展、vLLM与发布安排留第4周重评。
 
-## 2. P0现状与诊断结论
+## 2. 当前P1方向
 
-- **13格封存，不再填44格。** Metal llama C16保留；已停止的Ferrum C16未完成、不计结果。不启动已备CT短测或探索，35B/vLLM准备不阻塞当前修复。
-- **CUDA候选热点已重新分账。** 20秒窗口内8路decode：IQ4_XS特化28.48%、Q5_K21.83%、remaining generic21.81%、Q4_K19.05%；96个Q8_0 `[48,5120]`投影占全部decode的13.62%，小grid利用不足仍是假说。优化前generic79.25%仅描述旧Ferrum r2。大M prefill单列，不以不同shape窗口推算加速倍数或完整迭代数。
-- **Metal计时缺口已修复，FFN超线性成本已定位。** 固定16槽的短诊断中，C4/C8已归因的GPU命令计时齐全；C8 decode为2,774–2,775、最大prefill3,544，低于4,096上限。27次M4/15次M8的host包围均值344.353/860.917ms，每forward GPU encoder区间和均值298.474/793.996ms；FFN占GPU区间和增量的74.91%。这是encoder归因，逐shader时间仍缺。prefill及尾部单独归因，不混入主ShareGPT性能；长负载内存压力仍未排除。
-- **64题×两引擎质量已完成并逐题审阅。** 两边均64完成、0请求错误、45题length截断；guard退出0、服务恢复已核验。存在明确语义错误，不判质量通过。原始输出ID为14/64整序列相同、10,366/27,868位置匹配（37.1968%）；64对缺实际prompt ID对齐证据，不能证明数值正确或错误。
+CUDA R5 C8为65.84 tok/s，仍仅llama的29.23%；较R2吞吐+16.28%，TPOT和可见ITL P99下降，但TTFT P99上升。下一步重做候选profile，再验证量化线性核与大M prefill；单次探索不能称显著或全面改善。
 
-P0保留一页结果、以上限定范围的热点证据、逐题质量和原始ID比较；逐shader采集和复测仍属后续工作，不以填格、下载完成或短测通过代替工程进展。
+Metal R2 C4近中性，C8吞吐改善但仍比C4慢19.84%，TTFT P99略升；实测剩余热点IQ4_XS的M8路径优先，prefill阻塞另查。encoder计时不是逐shader时间，长负载内存压力仍未排除。
 
-## 3. 对照与复测口径
+35B未实跑的组合仍标未验证，支持工作不替代27B首里程碑。不恢复44格或启动CT探索，不以准备工作代替同负载收益与质量证据。
 
-继续固定ShareGPT、pool208、seed42及选择器；输入4–1024 token，输入加参考输出与模板预留不超过2048；参考输出长度、ignore_eos、thinking off、temperature0。不同并发取同一冻结选择前缀，同格跨引擎样本一致。探索预热8、正式max(32,4×C)、一次重复；验收CUDA每格200正式、两次重复，Metal扩展若恢复则正式max(64,4×C)、两次重复。预热独立计数，profiler采集不混入主负载性能。
+## 3. 对照、复测与质量口径
 
-CUDA固定32槽，当前27B Metal固定16槽；每请求2048、FP16 KV、全GPU，扫描期间不随并发改容量。llama开启continuous batching/flash attention，关闭prompt cache；Ferrum动态KV与llama共享KV差异如实披露。不改系统内存上限，不把CPU卸载混入全GPU基线。采集前核对实际放置，暂停同机重下载、编译等干扰，由既有guard独占生命周期并恢复原服务。
+固定ShareGPT、pool208、seed42及选择器；输入4–1024 token，输入加参考输出和模板预留不超过2048。性能负载按参考输出长度、ignore_eos、thinking off、temperature0；不同并发取同一冻结选择前缀，同格跨引擎样本一致。
 
-TTFT取首个可见输出；TPOT截止最后可见文本，按usage输出token减一归一；主ITL为相邻非空SSE文本事件间隔。保留可见停顿、披露coalescing，严格单token资格另作诊断。吞吐只计成功usage输出tokens并除以完整正式窗口；错误、拒绝、样本和内存采样范围同时报告。超时边界不是SLO阈值。
+探索：预热8、正式max(32,4×C)、一次重复。验收：CUDA每格200正式、两次重复；Metal扩展若恢复，正式max(64,4×C)、两次重复。预热独立计数，profiler及合成诊断不混入主ShareGPT结果。
 
-质量回放保持每模型固定64题、贪心和自然EOS；保存输出、停止原因、截断与逐题审阅。HTTP成功、可读文本或完整ID不证明语义正确。原始输出ID只作描述性比较；缺实际prompt ID对齐时不推断数值正确性，不通过重新分词补造ID；截断不计完整答案通过。不同格式不要求逐token相同，但须披露量化差异并检查语义质量。
+CUDA固定32槽，当前27B Metal固定16槽；每请求2048、FP16 KV、全GPU，扫描不随并发改容量。llama开启continuous batching/flash attention，关闭prompt cache；披露Ferrum动态KV与llama共享KV差异。不改系统内存上限，不把CPU卸载混入全GPU基线；采集前确认放置、暂停同机编译与重下载，由既有guard独占生命周期并恢复原服务。
 
-## 4. P1与后续SLO-aware
+TTFT取首个可见输出；TPOT为首末可见文本时间差除以usage输出token减一；主ITL为相邻非空SSE文本事件间隔。保留可见停顿并披露coalescing，严格单token资格另报。吞吐为成功usage输出tokens/完整正式窗口；同时报告错误、拒绝、样本和内存采样范围。超时边界不是SLO阈值，单次探索不证明显著收益。
 
-P1按现有证据排序，修复覆盖受影响的run与serve，收益必须同机复测：
+质量回放每模型固定64题、贪心、自然EOS；保存原始输出与ID、停止原因、截断和逐题审阅。HTTP成功、可读或完整ID不证明语义正确，截断不算完整答复通过。报告整序列相等及位置匹配；位置分母为各对较长序列之和。缺实际prompt ID对齐时不推断数值正确性，不重新分词补造ID、不静默去掉EOS；不同格式披露量化差异并检查语义，不要求逐token相同。
 
-1. **CUDA首步完成，追平未完成。** Q5_K/IQ4_XS/Q6_K F16格式特化已通过真实CUDA正确性与配对微基准。C8同8条预热＋32条正式样本、正式9,704输出token复测为55.605 tok/s，较旧Ferrum+25.24%；三项P99均降低，但吞吐仍仅llama的24.69%、三项P99均更差，SLO unknown。新旧Ferrum单例run的31个prompt ID、44个完整输出ID相同，不是候选64题质量认证。下一步优先IQ4_XS、窄输出Q8_0及大M prefill，以相同shape验证，继续四档追平及重复验收。
-2. **Metal按已测FFN成本验证M8分派。** Q3_K/IQ3_S/IQ4_NL的17个矩阵每forward由M4的43.0增至M8的215.6ms；IQ4_XS的85个由72.2增至217.6ms。先验证前三格式复用2×B4，再单独比较IQ4_XS的2×B4与当前M32 tile；部分Q4/Q6及收缩Q5_K已有拆分。保留权重重建与数值规则，覆盖真实Metal正确性及配对微基准，再做同负载C4/C8和run/serve质量复测。prefill阻塞单独处理；计时修复本身不算性能收益。
-3. **35B支持缺口单列，不作耗时排名。** Metal目标GGUF的Q6_K专家实际启动失败；CUDA AWQ/混合BF16专家为格式/provider缺口，未实跑组合仍标未验证。支持项不能替代27B首里程碑进展。
+## 4. SLO与验收纪律
 
-第4周评审完整四档吞吐比、尾延迟、错误、质量及回归，再决定35B扩展、vLLM比较和自动SLO配置。达不到预期则重评目标与路线，不追加无profile依据的零散补丁，不在尚无vLLM实测时预设第6周比例。
+长期保留[既有SLO目标](goal-slo-throughput.zh.md)：最大化输出吞吐，同时满足事先声明的TTFT、TPOT和可见ITL P99阈值，错误与拒绝为0。违反任一必需SLO的吞吐提升不算成功优化；缺阈值或延迟证据不能证明SLO通过。
 
-长期保留完整SLO-aware方向，沿用[既有SLO目标](goal-slo-throughput.zh.md)的约束形式：
+进入该阶段前冻结每模型/机器的S：S_TPOT取llama单请求TPOT的2倍，S_ITL取S_TPOT的3倍，S_TTFT取最长prompt单请求prefill时间加事先声明余量；不得看到Ferrum结果后改S。当前S未声明，保持unknown。自动配置、容量与调度，以及相对手调/vLLM的验收比例和工期，由第4周按证据重评。
 
-```text
-G(θ) = max over C of 成功输出tokens / 测量时间
-约束：P99(TTFT) ≤ S_TTFT，P99(TPOT) ≤ S_TPOT，P99(可见SSE ITL) ≤ S_ITL，错误 = 拒绝 = 0
-目标：max over θ of G(θ)
-```
+先测后改，保留数值规则，以真实后端正确性、配对微基准、同负载复测和质量验收；共享改动覆盖run/serve，入口特定改动说明范围。按架构/声明能力实现，不加模型名特例；测试与基准用Rust，复用缓存。合并前完成仓库规定检查，区分编译、协议、语义与性能结论。
 
-进入该阶段前按已定规则冻结每模型/机器的S：S_TPOT取llama单请求TPOT的2倍，S_ITL取S_TPOT的3倍，S_TTFT取最长prompt单请求prefill时间加事先声明的余量。不得看到Ferrum结果后改S。当前无新模型S，不宣称SLO通过。自动选配置、容量管理、调度及相对手调/vLLM的验收比例和时间，留第4周后按证据重新确定。
-
-## 5. 工作规则
-
-先测后改，同一文件/样本、同机复测，不降低质量或换容易样本。共享推理改动覆盖run与serve，入口特定改动说明范围；按架构/声明能力处理，禁止模型名特例。可复用测试与基准逻辑写Rust，复用已有缓存，不搭建新的包装或认证框架。合并前完成相应正确性与后端检查，编译、协议、语义和性能结论分开。
-
-仓库仅保留本目标页与P0一页结果/决定；完整命令、pins、日志、profile、失败历史和旧文档快照在P0页的库外证据根。目标未达成前不把局部成功写成完成，不承诺未经测量的工期或比例。
+仓库仅保留本目标页与P0一页结果/决定；命令、pins、日志、profile、失败历史和完整质量记录留库外。局部成功不等于目标完成。
