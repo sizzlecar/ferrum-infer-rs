@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 mod compiler;
 #[path = "vnext_numerical_profile/composite.rs"]
 mod composite;
+#[path = "vnext_numerical_profile/q8act_attention.rs"]
+mod q8act_attention;
 #[path = "vnext_numerical_profile/q8act_profiles.rs"]
 mod q8act_profiles;
 #[path = "vnext_numerical_profile/staged.rs"]

@@ -1,8 +1,9 @@
 //! Local projection arithmetic inside an otherwise unchanged strict operation.
 //!
 //! These are declarations, not provider registrations or evidence that a leaf
-//! was executed. Schema 1 binds only the projection ports of the two standard
-//! operations below. Nonlinearities, normalization, recurrent state, residuals
+//! was executed. Schema 1 binds SwiGLU and gated-delta projection ports;
+//! schema 2 binds the F32-master causal attention projection ports.
+//! Nonlinearities, normalization, recurrent state, residuals
 //! and conversions outside those ports retain the referenced base semantics.
 
 use std::collections::BTreeSet;
@@ -11,13 +12,17 @@ use serde::{Deserialize, Serialize};
 
 use super::{AffineMinCorrection, NumericalArithmeticStage, StagedNumericalArithmetic};
 use crate::vnext::{
-    dense_swiglu_contract, gated_delta_recurrent_attention_f32_master_contract,
-    BlockQuantizationSpec, ContractVersion, ElementType, OperationContract, OperationId,
-    StandardOperationContract, DENSE_SWIGLU_OPERATION_ID,
+    causal_paged_attention_f32_master_contract, dense_swiglu_contract,
+    gated_delta_recurrent_attention_f32_master_contract, BlockQuantizationSpec, ContractVersion,
+    ElementType, OperationContract, OperationId, StandardOperationContract,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
 };
 
 pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION: u32 = 1;
+/// A separate version for causal projection roles; schema 1 retains its
+/// original set of accepted bases and ports.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +38,10 @@ pub enum ProjectionRole {
     SwiGluDown,
     GatedDeltaInput,
     GatedDeltaOutput,
+    CausalQuery,
+    CausalKey,
+    CausalValue,
+    CausalOutput,
 }
 
 /// Logical K/N eligibility is independent of token count, concurrency, device
@@ -134,12 +143,19 @@ pub enum DeclaredProjectionArithmetic<'a> {
 
 impl CompositeNumericalArithmetic {
     pub(super) fn base_contract(&self) -> Result<StandardOperationContract, String> {
-        let contract = match self.strict_base.operation_id.as_str() {
-            DENSE_SWIGLU_OPERATION_ID => dense_swiglu_contract(),
-            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID => {
-                gated_delta_recurrent_attention_f32_master_contract()
+        let contract = match (self.schema_version, self.strict_base.operation_id.as_str()) {
+            (COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION, DENSE_SWIGLU_OPERATION_ID) => {
+                dense_swiglu_contract()
             }
-            _ => return Err("composite schema 1 requires a supported standard strict base".into()),
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION,
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => gated_delta_recurrent_attention_f32_master_contract(),
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2,
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => causal_paged_attention_f32_master_contract(),
+            _ => return Err("composite schema requires its supported standard strict base".into()),
         }
         .map_err(|error| error.to_string())?;
         if contract.descriptor().version != self.strict_base.version {
@@ -162,12 +178,28 @@ impl CompositeNumericalArithmetic {
                 GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
                 ProjectionRole::GatedDeltaOutput,
             ) => Ok((7, 2)),
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalQuery) => {
+                Ok((2, 2))
+            }
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalKey) => {
+                Ok((3, 2))
+            }
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalValue) => {
+                Ok((4, 2))
+            }
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalOutput) => {
+                Ok((5, 2))
+            }
             _ => Err("projection role does not belong to the declared strict base".into()),
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2
+        ) {
             return Err(
                 "unsupported composite arithmetic schema version; explicit migration required"
                     .into(),
@@ -200,15 +232,14 @@ impl CompositeNumericalArithmetic {
                         .into(),
                 );
             }
-            // These two versioned bases round both internal linear boundaries
-            // to F16. In particular GDN's surrounding hidden/state path is F32.
+            // Every supported base rounds both internal linear boundaries to
+            // F16. Attention's surrounding hidden/state path remains F32.
             if projection.activation_input_type != ElementType::F16
                 || projection.activation_output_type != ElementType::F16
                 || projection.leaves.is_empty()
             {
                 return Err(
-                    "schema 1 projection overrides require F16 internal ports and nonempty leaves"
-                        .into(),
+                    "projection overrides require F16 internal ports and nonempty leaves".into(),
                 );
             }
             let mut formats = BTreeSet::new();

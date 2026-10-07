@@ -4,6 +4,8 @@ mod rn_f16_fragment;
 pub use rn_f16_fragment::*;
 mod q8act_swiglu;
 pub use q8act_swiglu::*;
+mod q8act_attention;
+pub use q8act_attention::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
