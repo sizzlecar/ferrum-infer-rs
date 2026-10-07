@@ -2,7 +2,7 @@
 
 制定于 2026-10-07。本文件承接 [`goal-slo-throughput.zh.md`](goal-slo-throughput.zh.md)（已随 #402 合入 main），沿用其中的公式、指标口径和"按并发扫描"的测量方式。
 
-执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。新口径已完成 **8/44** 格：Metal 27B llama.cpp C4/C8及Ferrum C4，CUDA 27B llama.cpp/Ferrum C4、C8，以及CUDA llama.cpp C16；C4/C8各32个、C16为64个正式请求，全部成功、零错误。Ferrum/llama吞吐比为Metal C4的0.971、CUDA C4的0.228及C8的0.197，本次均未超过；仅一次探索重复，SLO unknown。当前Metal继续Ferrum C8、CUDA继续Ferrum C16。CUDA两引擎run/serve短测均已通过，原服务在当前主队列结束后仍须由guard恢复核验。尚未完成 P0，不将短测或局部结果当作完整验收。
+执行进度见 [P0 结果页](performance-popular-models-p0.zh.md)。新口径已完成 **11/44** 格：Metal 27B llama.cpp C4/C8及Ferrum C4，CUDA 27B两引擎GGUF C4/C8/C16/C32共8格，正式请求全部成功、零错误。Ferrum/llama吞吐比为Metal C4的0.971；CUDA C4/C8/C16/C32依次0.228/0.197/0.166/0.153，本次均未超过。仅一次探索重复，SLO unknown。CUDA队列guard退出0，原服务已 `restored_verified`，下载已恢复。Metal Ferrum C8原尝试已自行结束：29成功/3超时，guard退出1，另记失败格、不增加成功数；1800秒边界的六格队列已启动，结果待完成。尚未完成P0，短测与局部探索不替代完整验收。
 
 ## 1. 目标
 
