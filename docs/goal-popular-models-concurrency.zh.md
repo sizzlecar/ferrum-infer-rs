@@ -8,7 +8,7 @@
 
 按顺序完成三层目标，模型范围为第 3 节。Metal 只对照 llama.cpp；vLLM 仅在 CUDA 上测试，第 2 层及第 3 层的 vLLM 比值仅在 CUDA 验收。
 
-1. **并发超过 llama.cpp**：同机、同一模型文件、同一负载下，C = 4、8、16、32 每一档的输出吞吐都高于 llama.cpp。
+1. **并发超过 llama.cpp**：同机、同一模型文件、同一负载下，Metal 的 C = 4、8、16，CUDA 的 C = 4、8、16、32，每一档的输出吞吐都高于 llama.cpp。
 2. **CUDA 吞吐达到 vLLM 的 80%**：CUDA 上 C = 8、16、32 每一档的输出吞吐都不低于 vLLM 的 80%。
 3. **完整可用的 SLO-aware**：在适用的前两层目标基础上，用户只给出模型和阈值 S，Ferrum 自动选好配置；两个后端按公式算出的得分 G 不低于手调最优配置，CUDA 还须不低于 vLLM 同条件 G 的 80%；默认命令直接达到，不需要手写参数。
 
@@ -61,8 +61,8 @@ Qwen3.5-9B（同架构，当前优化最充分：5090 上静态配置 C4 达标�
 
 ## 4. 对照方法与测量口径
 
-- **负载**：沿用旧文档固定的 ShareGPT 选择（输入 4–1024 token，输出长度取参考答案并开启 ignore_eos，thinking 关闭，temperature 0）。C 取 1、4、8、16、32，扫描期间服务容量固定。探索阶段每格 64 个请求，验收阶段每格至少 200 个请求、跑 2 次。第 3 层另加一个长 prompt 负载（ShareGPT 中输入 1K–4K token 的长度分档），用来检验调度。
-- **llama.cpp**：固定一个发行版本，用同一个 GGUF 文件。参数为 `--parallel` 不小于 32、开启 continuous batching 和 flash attention、FP16 KV、关闭 prompt cache。
+- **负载**：沿用旧文档固定的 ShareGPT 选择（输入 4–1024 token，输出长度取参考答案并开启 ignore_eos，thinking 关闭，temperature 0）。删除 C1；Metal 测 C = 4、8、16，CUDA 测 C = 4、8、16、32。两台机器并行，同一机器内串行测量；扫描期间服务容量固定。每格预热 8 个请求。探索阶段正式请求数为 max(32, 4×C)，跑 1 次；验收阶段 M1 Max 每格正式请求数为 max(64, 4×C)，CUDA 每格 200 个正式请求，均跑 2 次。样本数不同的格使用同一冻结选择的前缀，同格跨引擎完全相同；预热与正式请求分开计数。第 3 层另加一个长 prompt 负载（ShareGPT 中输入 1K–4K token 的长度分档），用来检验调度。
+- **llama.cpp**：固定一个发行版本，用同一个 GGUF 文件。开启 continuous batching 和 flash attention、FP16 KV、关闭 prompt cache。CUDA 固定 32 槽；M1 Max 先用短测试确定各模型全 GPU 能承载的最大槽位，再对两个引擎固定该容量扫描 C = 4、8、16。客户端并发可以高于槽位并排队，不为每格改容量。必须核对实际 GPU 放置；部分层在 CPU 的结果不能作为公平基线。
 - **vLLM（CUDA）**：固定版本的 Docker 镜像（需支持 Blackwell）。模型用 vLLM 最擅长的 4bit 格式：两个模型都用社区 AWQ INT4 检查点（如 `cyankiwi/Qwen3.8-27B-AWQ-INT4`、`QuantTrio/Qwen3.6-35B-A3B-AWQ`，P0 固定具体版本）。FP8 版本在 32GB 显存放不下 35B-A3B，不作为对照。Ferrum 跑同一份检查点，80% 目标按同一份检查点计算；Ferrum 的 GGUF 结果另列，只用于和 llama.cpp 比较。Ferrum 不支持该检查点格式时，先补支持，不改用别的格式凑数。
 - **Metal 对照**：仅 Ferrum 与 llama.cpp，同一个 GGUF 文件；不测试 vllm-metal 或 MLX 格式。
 - **每一格都要报告**：TTFT、TPOT、可见 ITL 的 P50/P99，输出吞吐，显存/内存峰值，错误数，样本数，以及完整的版本、命令和配置。
@@ -85,7 +85,7 @@ Qwen3.5-9B（同架构，当前优化最充分：5090 上静态配置 C4 达标�
 
 1. 准备对照引擎：在 5090 上部署 vLLM 的 Docker 镜像和 llama.cpp，在 M1 Max 上部署 llama.cpp；下载第 3 节的模型文件，记录 hash。
 2. 确认 Ferrum 能在两个后端正常 `run` 和 `serve` 两个模型，包括 CUDA 上加载 AWQ INT4 的 35B-A3B。跑不起来的列入缺口清单，不在这一步修复。
-3. C 取 1、4、8、16、32，每格 64 个请求。每个模型 CUDA 含 Ferrum GGUF、llama.cpp GGUF、Ferrum AWQ、vLLM AWQ 四组；Metal 含 Ferrum GGUF、llama.cpp GGUF 两组。因此总计 2 个模型 × (4+2) 组 × 5 个并发档 = 60 格。
+3. 删除 C1。Metal 测 C = 4、8、16；CUDA 测 C = 4、8、16、32。每格预热 8 个、正式 max(32, 4×C) 个请求、跑 1 次。每模型 CUDA 含 Ferrum GGUF、llama.cpp GGUF、Ferrum AWQ、vLLM AWQ 四组；Metal 含 Ferrum GGUF、llama.cpp GGUF 两组。因此共 2 × (4×4 + 2×3) = 44 格（Metal 12、CUDA 32）；不可运行格明确列为支持缺口。已完成的旧 3 格不计入新矩阵：llama.cpp 两格有 CPU 卸载，Ferrum 一格容量和请求口径不同，均按新口径重测。
 4. 对差距最大的两三格做 profiler 对比（CUDA 用 nsys，Metal 用 GPU capture）：CUDA 的 Ferrum 对 vLLM，Metal 的 Ferrum 对 llama.cpp，对比 kernel 名称、调用次数、耗时和每轮启动次数。
 
 退出条件：交出一张差距表（两后端每格 Ferrum 与 llama.cpp 的比值，CUDA 另含同检查点 vLLM 比值）和按耗时排序的缺口清单。
@@ -111,7 +111,7 @@ Qwen3.5-9B（同架构，当前优化最充分：5090 上静态配置 C4 达标�
 
 ### P3 验收与发布（≤1 周）
 
-- 两台机器、2 个模型，跑完整矩阵：每格至少 200 个请求、跑 2 次；CUDA 表含 Ferrum、llama.cpp、vLLM，Metal 表只含 Ferrum、llama.cpp。Qwen3.5-9B 按回归要求单独核对。
+- 两台机器并行、2 个模型，跑上述完整并发矩阵。每格预热 8 个请求；M1 Max 每格正式 max(64, 4×C) 个，CUDA 每格正式 200 个，均跑 2 次。CUDA 表含 Ferrum、llama.cpp、vLLM，Metal 表只含 Ferrum、llama.cpp。Qwen3.5-9B 按回归要求单独核对。
 - README 只写实测范围内的结论，为每个模型写好可以直接运行的命令。
 - 通过 release 流程发布安装包。
 
@@ -130,7 +130,7 @@ Qwen3.5-9B（同架构，当前优化最充分：5090 上静态配置 C4 达标�
 - 32GB 放不下的模型。
 - Gemma 4 和 gpt-oss：推迟到下一版，见第 3 节。
 - 启动校准、每波搜索或认证式规划（旧 SLO 线已经证明不可行）。
-- 只优化单请求速度。C1 的结果照常报告，但这一版的目标是并发。
+- 只优化单请求速度。C1 已从性能矩阵移除；短测试不计入矩阵完成数。
 
 ## 9. 用户决定（2026-10-07 已确认）
 
@@ -140,6 +140,8 @@ Qwen3.5-9B（同架构，当前优化最充分：5090 上静态配置 C4 达标�
 4. S 按以下规则，在 P2 开始前为每个模型、每台机器算出具体数值并写进本节：S_TPOT 取该机器上 llama.cpp 单请求 TPOT 的 2 倍，S_ITL 取 S_TPOT 的 3 倍，S_TTFT 取最长 prompt 单请求 prefill 时间再加余量。算出后不再根据 Ferrum 的结果调整。
 5. 工期约 7–9 周（P0 2 天、P1 4–6 周、P2 2 周、P3 1 周）。P1 第 4 周检查点如果还不到 vLLM 的 50%，停下来重新评估，不追加零散补丁。
 6. 2026-10-07 更新：Metal 只与 llama.cpp 比较，vLLM 只在 CUDA 环境测试；取消 Metal 的 vllm-metal/MLX 对照准备和比值要求。两后端其余性能与 SLO 目标保留。
+
+7. 2026-10-07 更新：采用第 4 节的新请求数、预热、并发档和全 GPU 固定槽位口径；M1 Max 与 CUDA 并行执行。用户估计探索 M1 Max 两模型约 3–5 小时、CUDA 约 1–2 小时，实际时间按新全 GPU 结果更新，不将准备或旧 CPU 卸载结果计为完成。CUDA 统一使用 `~/ferrum-handoffs/20261006-g32/ssh-via-tailscale-mini.cjs`，经 Mac mini 的本地密钥进入 WSL。
 
 ## 10. 数据来源（2026-10-07 查询）
 
