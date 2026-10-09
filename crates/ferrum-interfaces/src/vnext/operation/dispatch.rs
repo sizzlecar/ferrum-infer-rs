@@ -1556,6 +1556,17 @@ impl OperationDispatch {
                 "replay-required submission requires one sealed reusable execution program",
             )));
         }
+        if S::ENABLED && timing_sink.wants_submission_wave_structure() {
+            timing_sink.record_submission_wave_structure(
+                wave.structure_observation(
+                    reusable_execution_authority
+                        .as_ref()
+                        .map(|authority| authority.program_id.clone()),
+                    lane.reusable_execution_epoch(),
+                    reusable_program.is_some(),
+                ),
+            );
+        }
         wave.begin_dispatch()
             .map_err(SubmissionWaveDispatchError::Contract)?;
         let mut completion =

@@ -31,6 +31,9 @@ use super::{
 use crate::vnext::ReusableExecutionBucketSpec;
 use std::time::{Duration, Instant};
 
+mod structure_observation;
+pub use structure_observation::SubmissionWaveStructureObservation;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepResourceAdmissionProfilePhase {
     AuthorityAndPolicyValidate,

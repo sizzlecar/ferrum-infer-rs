@@ -62,6 +62,7 @@ use super::{
 
 mod backing_maintenance;
 mod composition;
+mod decode_structure;
 mod determinism;
 mod invocation_constructor_timing;
 mod invocation_preparation;
@@ -1403,6 +1404,7 @@ impl VNextReusableExecutionCatalogMissLedger {
 struct VNextExecutorMetrics {
     prefix_cache: Arc<prefix_cache::PrefixCacheMetrics>,
     invocation_preparation: invocation_preparation::PreparationMetrics,
+    decode_structure: decode_structure::DecodeStructureMetrics,
     prefill_operations: AtomicU64,
     prefill_frontier_narrowings: AtomicU64,
     decode_operations: AtomicU64,
@@ -2482,6 +2484,7 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
 struct VNextWaveTimingSink<'metrics> {
     aggregate: &'metrics VNextWaveTimingMetrics,
     phase: &'metrics VNextWaveTimingMetrics,
+    structure_attempt: Option<&'metrics decode_structure::DecodeStructureAttempt<'metrics>>,
 }
 
 impl DeviceSubmissionTimingSink for VNextWaveTimingSink<'_> {
@@ -2499,6 +2502,20 @@ impl DeviceSubmissionTimingSink for VNextWaveTimingSink<'_> {
 }
 
 impl SubmissionWaveDispatchTimingSink for VNextWaveTimingSink<'_> {
+    fn wants_submission_wave_structure(&self) -> bool {
+        self.structure_attempt
+            .is_some_and(|attempt| attempt.wants_observation())
+    }
+
+    fn record_submission_wave_structure(
+        &self,
+        observation: ferrum_interfaces::vnext::SubmissionWaveStructureObservation,
+    ) {
+        if let Some(attempt) = self.structure_attempt {
+            attempt.observe(observation);
+        }
+    }
+
     fn record_invocation_construct_breakdown(
         &self,
         breakdown: InvocationConstructorTimingBreakdown,
@@ -2800,6 +2817,7 @@ impl VNextExecutorMetrics {
     fn reset_after_startup(&self) {
         self.prefix_cache.reset();
         self.invocation_preparation.reset();
+        self.decode_structure.reset();
         for counter in [
             &self.prefill_operations,
             &self.prefill_frontier_narrowings,
@@ -6542,6 +6560,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence: &VNextSequence<R>,
         target: ResourceWorkShape,
     ) -> Result<VNextExecutionCapacityDecision<()>> {
+        let structure_preparation = self
+            .host_dispatch_timing_enabled()
+            .then(|| self.metrics.decode_structure.preparation());
         let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
         let mut maintenance_receipts = Vec::new();
@@ -6564,7 +6585,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             {
                 SequenceResourceExtensionDecision::Current(_)
                 | SequenceResourceExtensionDecision::Extended(_) => {
-                    return Ok(VNextExecutionCapacityDecision::Ready(()))
+                    if let Some(boundary) = structure_preparation {
+                        boundary.hand_off();
+                    }
+                    return Ok(VNextExecutionCapacityDecision::Ready(()));
                 }
                 SequenceResourceExtensionDecision::RetryRequired(_) => {
                     if rechecks >= MAX_EXTENSION_RECHECKS {
@@ -7258,6 +7282,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        structure_attempt: Option<&decode_structure::DecodeStructureAttempt<'_>>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7502,6 +7527,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let timing_sink = VNextWaveTimingSink {
                 aggregate: &self.metrics.wave_timing,
                 phase: phase_timing,
+                structure_attempt,
             };
             let device_timing_mode = self.device_timing_mode();
             let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
@@ -7732,6 +7758,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if retries < MAX_DEFINITELY_NOT_SUBMITTED_RETRIES =>
                 {
                     retries += 1;
+                    if let Some(attempt) = structure_attempt {
+                        attempt.retry();
+                    }
                     if reusable_program_stats.is_some() {
                         self.metrics
                             .direct_reusable_fallbacks
@@ -7856,6 +7885,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         span: TokenSpanWork,
         logits_policy: &LogitsReturnPolicy,
     ) -> Result<ExecutorSamplingOutput> {
+        let structure_preparation = self
+            .host_dispatch_timing_enabled()
+            .then(|| self.metrics.decode_structure.preparation());
         // The Step retains its original work Arc. Adding evidence only to a
         // later wave would leave the completed-state proof without tokens.
         let span = self.retain_checkpoint_token_evidence(span, tokens)?;
@@ -7875,6 +7907,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             PreparedVNextPrefill { step, wave }
         };
+        if let Some(boundary) = structure_preparation {
+            boundary.hand_off();
+        }
         self.execute_prepared_step(
             sequence,
             tokens,
@@ -7895,6 +7930,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
     ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
+        let structure_preparation = self
+            .host_dispatch_timing_enabled()
+            .then(|| self.metrics.decode_structure.preparation());
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
@@ -7997,6 +8035,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 },
             )
             .collect::<Vec<_>>();
+        if let Some(boundary) = structure_preparation {
+            boundary.hand_off();
+        }
         self.execute_prepared_participants(&participants, prepared, kind)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
@@ -8031,6 +8072,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
     ) -> Result<Vec<ExecutorSamplingOutput>> {
+        let structure_attempt = if self.host_dispatch_timing_enabled() {
+            match kind {
+                VNextExecutionWaveKind::Decode => Some(self.metrics.decode_structure.begin()),
+                _ => {
+                    self.metrics.decode_structure.nondecode();
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
@@ -8108,6 +8160,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 kind,
                 output_mode,
                 token_mask_residency.plans(),
+                structure_attempt.as_ref(),
             );
             (token_mask_residency, dispatch)
         };
@@ -8580,6 +8633,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics.record_failure(message.clone());
                     Err(FerrumError::backend(message))
                 } else {
+                    if let Some(attempt) = structure_attempt {
+                        attempt.complete();
+                    }
                     Ok(logits)
                 }
             }
@@ -9917,6 +9973,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "resident_usage_source": "dynamic_pools",
             }),
         );
+        snapshot["counters"]["decode_structure"] = self.metrics.decode_structure.snapshot();
         snapshot
     }
 }
@@ -10068,6 +10125,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        self.metrics.decode_structure.reset();
         self.device_timing_mode
             .store(sink.device_timing_mode() as u8, Ordering::Release);
         *self.event_sink.write() = Some(sink);
@@ -10978,6 +11036,7 @@ mod tests {
         let sink = VNextWaveTimingSink {
             aggregate: &aggregate,
             phase: &decode,
+            structure_attempt: None,
         };
         let mut observation = DeviceReusableExecutionObservation::default();
         observation.observe_candidate_segment();
@@ -11351,6 +11410,7 @@ mod tests {
         let sink = VNextWaveTimingSink {
             aggregate: &aggregate,
             phase: &decode,
+            structure_attempt: None,
         };
         let stages = [
             (

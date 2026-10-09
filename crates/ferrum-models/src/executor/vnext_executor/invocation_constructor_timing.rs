@@ -167,6 +167,7 @@ mod tests {
         let sink = VNextWaveTimingSink {
             aggregate: &metrics.wave_timing,
             phase: &metrics.decode_wave_timing,
+            structure_attempt: None,
         };
         sink.record_invocation_construct_breakdown(success());
         sink.record_invocation_construct_breakdown(InvocationConstructorTimingBreakdown {
@@ -204,6 +205,7 @@ mod tests {
         VNextWaveTimingSink {
             aggregate: &metrics.wave_timing,
             phase: &metrics.prefill_wave_timing,
+            structure_attempt: None,
         }
         .record_invocation_construct_breakdown(success());
         metrics.reset_after_startup();

@@ -286,6 +286,16 @@ pub struct InvocationConstructorTimingBreakdown {
 pub trait SubmissionWaveDispatchTimingSink: DeviceSubmissionTimingSink {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration);
 
+    fn wants_submission_wave_structure(&self) -> bool {
+        false
+    }
+
+    fn record_submission_wave_structure(
+        &self,
+        _observation: crate::vnext::SubmissionWaveStructureObservation,
+    ) {
+    }
+
     fn record_invocation_construct_breakdown(
         &self,
         _breakdown: InvocationConstructorTimingBreakdown,

@@ -11,6 +11,8 @@ use vnext_device_operation_wave_contract::prepare_wave;
 
 #[path = "coverage_tests.rs"]
 mod coverage_tests;
+#[path = "decode_structure_tests.rs"]
+mod decode_structure_tests;
 #[path = "descriptor_agreement_tests.rs"]
 mod descriptor_agreement_tests;
 
