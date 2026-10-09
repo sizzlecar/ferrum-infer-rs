@@ -41,7 +41,7 @@ fn assert_causal_rows(observation: &BatchObservation, ranges: &[Range<usize>], u
                 range.start as i32,
                 1,
                 range.end as i32,
-                participant as i32,
+                i32::try_from(observation.caller_to_canonical_participant[participant]).unwrap(),
                 0
             ]
         );

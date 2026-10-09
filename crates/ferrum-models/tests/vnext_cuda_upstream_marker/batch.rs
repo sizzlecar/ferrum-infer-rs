@@ -32,6 +32,8 @@ pub struct BatchObservation {
     pub values: BTreeMap<(u32, String), Vec<u8>>,
     types: BTreeMap<String, ElementType>,
     pub binding_rows: Option<Vec<Vec<u8>>>,
+    /// Observations use caller order; raw rows retain the device's row index.
+    pub caller_to_canonical_participant: Vec<u32>,
     pub segment_published: bool,
     pub participant_frames: Vec<ExecutionFrameId>,
 }
@@ -156,6 +158,30 @@ impl Fixture {
         assert_eq!(sessions.len(), ranges.len());
         let participants = sessions.len() as u32;
         let batch = ExecutionBatchParticipants::new(sessions.to_vec()).unwrap();
+        // Admission canonicalizes session order, which can differ from caller
+        // order after slots are released and reused. Move each session's token
+        // and range inputs together; restore caller order only in observations.
+        let caller_indices: Vec<_> = batch
+            .sessions()
+            .iter()
+            .map(|canonical| {
+                sessions
+                    .iter()
+                    .position(|session| Arc::ptr_eq(session, canonical))
+                    .expect("batch retains the exact supplied sessions")
+            })
+            .collect();
+        let canonical_tokens: Vec<_> = caller_indices
+            .iter()
+            .map(|&index| Arc::clone(&tokens[index]))
+            .collect();
+        let canonical_ranges: Vec<_> = caller_indices
+            .iter()
+            .map(|&index| ranges[index].clone())
+            .collect();
+        let sessions = batch.sessions();
+        let tokens = canonical_tokens.as_slice();
+        let ranges = canonical_ranges.as_slice();
         let spans = tokens
             .iter()
             .zip(ranges)
@@ -567,8 +593,9 @@ impl Fixture {
             };
             let name = names[result.request().resource_id()].clone();
             let participant = result.request().participant_index() as usize;
+            let caller_participant = caller_indices[participant];
             if name == "binding_parameters" {
-                binding_rows.as_mut().unwrap()[participant] = result.bytes().to_vec();
+                binding_rows.as_mut().unwrap()[caller_participant] = result.bytes().to_vec();
                 continue;
             }
             let bytes = if name == "state.kv" {
@@ -577,7 +604,13 @@ impl Fixture {
                 result.bytes().to_vec()
             };
             assert!(values
-                .insert((result.request().participant_index(), name), bytes)
+                .insert(
+                    (
+                        u32::try_from(caller_participant).expect("validated participant count"),
+                        name,
+                    ),
+                    bytes,
+                )
                 .is_none());
         }
         assert_eq!(
@@ -586,11 +619,18 @@ impl Fixture {
         );
         drop((receipt, handle, identity, active));
         let retirement = step.try_retire_normal().unwrap();
-        let participant_frames = retirement
+        let canonical_frames: Vec<_> = retirement
             .participants()
             .iter()
             .map(|participant| participant.assignment().frame_id())
             .collect();
+        let mut participant_frames = canonical_frames.clone();
+        let mut caller_to_canonical_participant = vec![0; caller_indices.len()];
+        for (canonical, &caller) in caller_indices.iter().enumerate() {
+            participant_frames[caller] = canonical_frames[canonical];
+            caller_to_canonical_participant[caller] =
+                u32::try_from(canonical).expect("validated participant count");
+        }
         let segment_published = ready_segment
             .map(|ready| ready.publish(&retirement).unwrap())
             .unwrap_or(false);
@@ -598,6 +638,7 @@ impl Fixture {
             values,
             types,
             binding_rows,
+            caller_to_canonical_participant,
             segment_published,
             participant_frames,
         }

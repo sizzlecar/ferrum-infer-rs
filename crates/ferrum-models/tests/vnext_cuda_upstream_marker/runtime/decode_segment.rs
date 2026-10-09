@@ -85,7 +85,8 @@ fn check_binding_controls(
                         range.start as i32,
                         1,
                         range.end as i32,
-                        participant as i32,
+                        i32::try_from(observation.caller_to_canonical_participant[participant])
+                            .unwrap(),
                         0
                     ]
                 );
@@ -109,11 +110,11 @@ fn check_binding_controls(
             .iter()
             .zip(observations[1].binding_rows.as_ref().unwrap())
         {
-            assert_eq!(
-                &left[..24],
-                &right[..24],
-                "all live control bytes, including numerical status"
-            );
+            // The participant index belongs to each runtime's own canonical
+            // layout and was checked above. Compare the other five controls,
+            // including numerical status, without rewriting either raw row.
+            assert_eq!(&left[..16], &right[..16]);
+            assert_eq!(&left[20..24], &right[20..24]);
         }
     }
     // Pointer payloads intentionally differ between independent allocations.
