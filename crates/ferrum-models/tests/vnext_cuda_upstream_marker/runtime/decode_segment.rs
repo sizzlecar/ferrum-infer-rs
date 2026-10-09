@@ -1,4 +1,4 @@
-//! Independent Sparse histories exercise actual whole-segment publication,
+//! Independent same-upload-policy histories exercise whole-segment publication,
 //! fresh requests and a physical KV extent change after an observed hot wave.
 use super::*;
 use ferrum_types::{InvocationPreparationStrategy, ProgramBindingUploadStrategy};
@@ -69,6 +69,7 @@ fn check_binding_controls(
     kind: AttentionKind,
     observations: &[BatchObservation],
     ranges: &[Range<usize>],
+    upload_strategy: ProgramBindingUploadStrategy,
 ) {
     for observation in observations {
         let rows = observation.binding_rows.as_ref().unwrap();
@@ -94,6 +95,18 @@ fn check_binding_controls(
                 assert!(row[24..live_end]
                     .chunks_exact(8)
                     .all(|v| u64::from_ne_bytes(v.try_into().unwrap()) != 0));
+                if upload_strategy == ProgramBindingUploadStrategy::UniformLivePrefix {
+                    let maximum_live_end = ranges
+                        .iter()
+                        .map(|range| 24 + range.end.div_ceil(16) * 8)
+                        .max()
+                        .unwrap();
+                    assert!(row[live_end..maximum_live_end]
+                        .iter()
+                        .all(|&byte| byte == 0));
+                    // The remaining model-capacity tail is not uploaded and
+                    // has no cross-runtime value or zeroing requirement.
+                }
             } else {
                 assert_eq!(row.len(), 16);
                 assert!(row
@@ -121,19 +134,72 @@ fn check_binding_controls(
     // These are real post-upload row readbacks, not a same-wave host-byte oracle.
 }
 
-fn compare(kind: AttentionKind) {
+fn upload_snapshot(fixture: &Fixture) -> DeviceProgramBindingUploadSnapshot {
+    fixture
+        ._composition
+        ._runtime
+        .program_binding_upload_snapshot()
+        .expect("the real CUDA runtime exposes typed upload observations")
+}
+
+fn check_uniform_uploads(
+    kind: AttentionKind,
+    uploads: DeviceProgramBindingUploadSnapshot,
+    ranges: &[Range<usize>],
+    logical_row_bytes: usize,
+) {
+    assert!(uploads.attempted_preludes > 0);
+    assert_eq!(uploads.failed_preludes, 0);
+    assert_eq!(uploads.succeeded_preludes, uploads.attempted_preludes);
+    assert_eq!(
+        uploads.successful_upload_bytes,
+        uploads.planned_upload_bytes
+    );
+    assert!(uploads.successful_1d_copies + uploads.successful_2d_copies > 0);
+    if kind == AttentionKind::Causal {
+        // This fixture uses FP16 VllmBlocks16: six controls, followed by all
+        // actual KV addresses. INT8 scale-table coverage is not claimed here.
+        let live: Vec<u64> = ranges
+            .iter()
+            .map(|range| 24 + u64::try_from(range.end.div_ceil(16)).unwrap() * 8)
+            .collect();
+        let maximum_live = *live.iter().max().unwrap();
+        let participants = u64::try_from(ranges.len()).unwrap();
+        assert_eq!(
+            uploads.live_payload_bytes,
+            uploads.attempted_preludes * live.iter().sum::<u64>()
+        );
+        assert_eq!(
+            uploads.planned_upload_bytes,
+            uploads.attempted_preludes * participants * maximum_live
+        );
+        assert_eq!(
+            uploads.logical_arena_bytes,
+            uploads.attempted_preludes * participants * u64::try_from(logical_row_bytes).unwrap()
+        );
+        assert!(maximum_live < u64::try_from(logical_row_bytes).unwrap());
+        assert!(uploads.planned_upload_bytes < uploads.logical_arena_bytes);
+    } else {
+        assert_eq!(uploads.planned_upload_bytes, uploads.live_payload_bytes);
+    }
+}
+
+fn compare(
+    kind: AttentionKind,
+    upload_strategy: ProgramBindingUploadStrategy,
+    maximum_tokens: u64,
+) {
     let modes = [
         InvocationPreparationStrategy::IdentityProjection,
         InvocationPreparationStrategy::DecodeSegment,
     ];
-    let maximum_tokens = 8192;
     let fixtures = modes.map(|mode| {
         Fixture::for_family_with_segment_oracle(
             kind,
             true,
             2,
             Family::new(kind).with_maximum_tokens(maximum_tokens),
-            ProgramBindingUploadStrategy::Sparse,
+            upload_strategy,
             if mode == InvocationPreparationStrategy::DecodeSegment {
                 SegmentBindingOracleMode::CompareReference
             } else {
@@ -230,6 +296,9 @@ fn compare(kind: AttentionKind) {
                 ._composition
                 ._runtime
                 .segment_binding_oracle_audited_nodes();
+            let uploads_before = (upload_strategy
+                == ProgramBindingUploadStrategy::UniformLivePrefix)
+                .then(|| upload_snapshot(fixture));
             let observation = fixture.execute_participant_ranges_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
@@ -242,6 +311,11 @@ fn compare(kind: AttentionKind) {
                 Some(row_bytes),
             );
             let stats = sinks[arm].last();
+            let uploads = uploads_before.map(|before| {
+                let uploads = upload_snapshot(fixture).checked_since(before).unwrap();
+                check_uniform_uploads(kind, uploads, &ranges, row_bytes);
+                uploads
+            });
             let program_id = observation
                 .reusable_program_id
                 .as_ref()
@@ -315,6 +389,7 @@ fn compare(kind: AttentionKind) {
             println!(
                 "{}",
                 serde_json::json!({"kind":"decode_segment_wave", "attention":format!("{kind:?}"), "strategy":modes[arm],
+                "upload_strategy":upload_strategy, "uploads":uploads, "logical_row_bytes":row_bytes,
                 "ranges":ranges, "physical_kv_pages":pages, "reusable_program_id":program_id,
                 "program_immediate_pages":program_id.immediate_pages(), "published":observation.segment_published,
                 "hits":stats.segment_hits, "misses":stats.segment_misses, "encoded_nodes":stats.segment_encoded_nodes,
@@ -323,7 +398,7 @@ fn compare(kind: AttentionKind) {
             observations.push(observation);
         }
         observations[0].assert_same(&observations[1]);
-        check_binding_controls(kind, &observations, &ranges);
+        check_binding_controls(kind, &observations, &ranges, upload_strategy);
     }
     assert!(
         hot_before_growth > 0,
@@ -373,6 +448,9 @@ fn compare(kind: AttentionKind) {
                 assert_ne!(session.sequence_authority(), old_authorities[arm][index]);
                 fixture.extend(session, Arc::from(&t[..=position]));
             }
+            let uploads_before = (upload_strategy
+                == ProgramBindingUploadStrategy::UniformLivePrefix)
+                .then(|| upload_snapshot(fixture));
             let output = fixture.execute_participants_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
@@ -388,6 +466,14 @@ fn compare(kind: AttentionKind) {
                 &sinks[arm],
             );
             let stats = sinks[arm].last();
+            if let Some(before) = uploads_before {
+                check_uniform_uploads(
+                    kind,
+                    upload_snapshot(fixture).checked_since(before).unwrap(),
+                    &[position..position + 1, position..position + 1],
+                    row_bytes,
+                );
+            }
             assert_eq!(stats.parts_materialized, 0);
             if arm == 1 {
                 fresh_hits += stats.segment_hits;
@@ -420,6 +506,8 @@ fn compare(kind: AttentionKind) {
     println!(
         "{}",
         serde_json::json!({"kind":"decode_segment_actual_cuda", "attention":format!("{kind:?}"),
+        "upload_strategy":upload_strategy, "maximum_context_tokens":maximum_tokens, "logical_row_bytes":row_bytes,
+        "kv_scope":"FP16; no INT8 scale-table GPU coverage", "upload_counter_scope":"successful typed prelude API calls within each joint/fresh wave; no GPU-completion inference",
         "participants":2, "lead_waves":lead, "joint_waves":joint_waves, "fresh_request_waves":8,
         "hot_before_extent_change":hot_before_growth, "hot_after_extent_change":hot_after_growth,
         "publications":publications, "fresh_request_hits":fresh_hits, "full_output_and_valid_state_equal":true,
@@ -430,11 +518,41 @@ fn compare(kind: AttentionKind) {
 #[test]
 #[ignore = "requires exclusive CUDA and actual whole-segment publication/replay"]
 fn decode_segment_gdn_matches_ip_across_fresh_frames_and_requests() {
-    compare(AttentionKind::GatedDelta);
+    compare(
+        AttentionKind::GatedDelta,
+        ProgramBindingUploadStrategy::Sparse,
+        8192,
+    );
 }
 
 #[test]
 #[ignore = "requires exclusive CUDA and actual whole-segment publication/replay"]
 fn decode_segment_causal_matches_ip_across_hot_physical_kv_extension() {
-    compare(AttentionKind::Causal);
+    compare(
+        AttentionKind::Causal,
+        ProgramBindingUploadStrategy::Sparse,
+        8192,
+    );
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA and actual whole-segment publication/replay"]
+fn decode_segment_uniform_prefix_gdn_matches_ip_across_fresh_frames_and_requests() {
+    compare(
+        AttentionKind::GatedDelta,
+        ProgramBindingUploadStrategy::UniformLivePrefix,
+        8192,
+    );
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA, FP16 KV and actual whole-segment publication/replay"]
+fn decode_segment_uniform_prefix_causal_matches_ip_across_hot_physical_kv_extension() {
+    // The model ABI reserves 131096 bytes per row. Actual request ceilings are
+    // still only 77/17 tokens; model capacity must not become upload length.
+    compare(
+        AttentionKind::Causal,
+        ProgramBindingUploadStrategy::UniformLivePrefix,
+        262_144,
+    );
 }
