@@ -1,5 +1,7 @@
+use ferrum_types::InvocationPreparationStrategy;
 use serde::{ser::SerializeSeq, Serialize, Serializer};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use super::super::{
@@ -143,14 +145,14 @@ impl BatchOperationNodeIdentity {
             .map(BatchOperationParticipantIdentity::participant_index);
         if participants.is_empty()
             || participants.iter().enumerate().any(|(index, participant)| {
+                let identity = participant.identity().projection();
                 participant_start.and_then(|start| start.checked_add(index as u32))
                     != Some(participant.participant_index())
                     || participant.node_key().node_id() != &node_id
-                    || participant.identity().parts().frame_id
-                        != Some(participant.node_key().frame_id())
-                    || participant.identity().parts().node_id.as_ref() != Some(&node_id)
-                    || participant.identity().parts().operation_id.as_ref() != Some(&operation_id)
-                    || participant.identity().parts().provider_id.as_ref() != Some(&provider_id)
+                    || identity.frame_id != Some(participant.node_key().frame_id())
+                    || identity.node_id != Some(&node_id)
+                    || identity.operation_id != Some(&operation_id)
+                    || identity.provider_id != Some(&provider_id)
             })
             || participants
                 .windows(2)
@@ -571,7 +573,8 @@ impl BatchOperationIdentity {
             return nodes.get(node_index).map(|node| node.participants().len());
         }
         let recipe = self.data.deferred_recipe.as_ref()?;
-        (node_index < recipe.topology.node_count()).then_some(recipe.participant_seeds.len())
+        (node_index < recipe.topology.node_count())
+            .then_some(recipe.participant_seeds.as_slice().len())
     }
 
     pub fn node_id_at(&self, node_index: usize) -> Option<&NodeId> {
@@ -653,10 +656,45 @@ impl BatchOperationIdentity {
             return Ok(identity);
         }
         let identity = recipe.materialize_node(node_index)?;
-        let _ = slot.set(identity);
+        if slot.set(identity).is_ok() {
+            if let Some(counts) = &recipe.projection_counts {
+                counts.projected_identities.fetch_add(
+                    recipe.participant_seeds.as_slice().len() as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        }
         slot.get().ok_or_else(|| {
             invalid_operation("compiled physical batch node identity publication failed")
         })
+    }
+
+    /// Cumulative preparation for this fresh wave. Full reports zero projection work.
+    /// This does not count observations that occur after the snapshot is taken.
+    pub fn preparation_snapshot(&self) -> super::InvocationPreparationStats {
+        self.data
+            .deferred_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.projection_counts.as_ref())
+            .map_or_else(Default::default, |counts| {
+                super::InvocationPreparationStats {
+                    projected_identities: counts.projected_identities.load(Ordering::Relaxed),
+                    parts_materialized: counts.materializations.load(Ordering::Relaxed),
+                }
+            })
+    }
+
+    pub(super) fn preparation_strategy(&self) -> InvocationPreparationStrategy {
+        if self
+            .data
+            .deferred_recipe
+            .as_ref()
+            .is_some_and(|recipe| recipe.projection_counts.is_some())
+        {
+            InvocationPreparationStrategy::IdentityProjection
+        } else {
+            InvocationPreparationStrategy::Full
+        }
     }
 
     pub fn nodes(&self) -> &[BatchOperationNodeIdentity] {
@@ -702,10 +740,29 @@ impl BatchOperationIdentity {
 struct DeferredBatchOperationIdentityRecipe {
     topology: CompiledSubmissionWaveIdentity,
     work_shape_fingerprint: String,
-    participant_seeds: Vec<SubmissionWaveParticipantIdentitySeed>,
+    participant_seeds: ParticipantIdentitySeeds,
+    projection_counts: Option<IdentityProjectionCounts>,
     node_identities: Box<[OnceLock<BatchOperationNodeIdentity>]>,
 }
 
+#[derive(Debug)]
+enum ParticipantIdentitySeeds {
+    Full(Vec<SubmissionWaveParticipantIdentitySeed>),
+    Projected(Arc<[SubmissionWaveParticipantIdentitySeed]>),
+}
+impl ParticipantIdentitySeeds {
+    fn as_slice(&self) -> &[SubmissionWaveParticipantIdentitySeed] {
+        match self {
+            Self::Full(seeds) => seeds,
+            Self::Projected(seeds) => seeds,
+        }
+    }
+}
+#[derive(Debug)]
+struct IdentityProjectionCounts {
+    projected_identities: AtomicU64,
+    materializations: Arc<AtomicU64>,
+}
 impl DeferredBatchOperationIdentityRecipe {
     fn work_shape_fingerprint(&self) -> &str {
         &self.work_shape_fingerprint
@@ -720,22 +777,37 @@ impl DeferredBatchOperationIdentityRecipe {
             .node_at(node_index)
             .ok_or_else(|| invalid_operation("compiled wave node index is out of bounds"))?;
         let participant_start = node_index
-            .checked_mul(self.participant_seeds.len())
+            .checked_mul(self.participant_seeds.as_slice().len())
             .and_then(|value| u32::try_from(value).ok())
             .ok_or_else(|| {
                 invalid_operation("compiled wave participant index space exceeds u32")
             })?;
         let participants = self
             .participant_seeds
+            .as_slice()
             .iter()
             .enumerate()
             .map(|(local_index, seed)| {
                 let local_index = u32::try_from(local_index)
                     .expect("compiled wave participant count was validated");
                 let frame = seed.frame();
-                let identity = seed
-                    .operation_identity(&self.topology, node_index)
-                    .ok_or_else(|| invalid_operation("compiled wave node identity disappeared"))?;
+                let identity = match &self.participant_seeds {
+                    ParticipantIdentitySeeds::Full(_) => {
+                        seed.operation_identity(&self.topology, node_index)
+                    }
+                    ParticipantIdentitySeeds::Projected(seeds) => seed.projected_identity(
+                        seeds,
+                        local_index as usize,
+                        &self.topology,
+                        node_index,
+                        &self
+                            .projection_counts
+                            .as_ref()
+                            .expect("projected seeds have counters")
+                            .materializations,
+                    ),
+                }
+                .ok_or_else(|| invalid_operation("compiled wave node identity disappeared"))?;
                 Ok(BatchOperationParticipantIdentity::new(
                     participant_start
                         .checked_add(local_index)
@@ -771,6 +843,7 @@ impl BatchOperationIdentity {
         claimed_backing_fingerprint: String,
         work_shape_fingerprint: String,
         participant_seeds: Vec<SubmissionWaveParticipantIdentitySeed>,
+        strategy: InvocationPreparationStrategy,
     ) -> Result<Self, VNextError> {
         let participant_count = participant_seeds.len();
         let participant_projection_count = topology
@@ -828,6 +901,13 @@ impl BatchOperationIdentity {
             },
             "compiled physical batch identity encode failed",
         )?;
+        if strategy == InvocationPreparationStrategy::IdentityProjection {
+            for seed in &participant_seeds {
+                seed.operation_identity(&topology, 0).ok_or_else(|| {
+                    invalid_operation("compiled participant seed has no first node")
+                })?;
+            }
+        }
         let node_identities = std::iter::repeat_with(OnceLock::new)
             .take(topology.node_count())
             .collect::<Vec<_>>()
@@ -850,7 +930,19 @@ impl BatchOperationIdentity {
             DeferredBatchOperationIdentityRecipe {
                 topology,
                 work_shape_fingerprint,
-                participant_seeds,
+                participant_seeds: match strategy {
+                    InvocationPreparationStrategy::Full => {
+                        ParticipantIdentitySeeds::Full(participant_seeds)
+                    }
+                    InvocationPreparationStrategy::IdentityProjection => {
+                        ParticipantIdentitySeeds::Projected(participant_seeds.into())
+                    }
+                },
+                projection_counts: (strategy == InvocationPreparationStrategy::IdentityProjection)
+                    .then(|| IdentityProjectionCounts {
+                        projected_identities: AtomicU64::new(0),
+                        materializations: Arc::new(AtomicU64::new(0)),
+                    }),
                 node_identities,
             },
             fingerprint,

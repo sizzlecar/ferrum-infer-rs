@@ -1040,6 +1040,54 @@ impl OperationDispatch {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_inputs_and_preparation<'binding, R, I, S, P>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        strategy: ferrum_types::InvocationPreparationStrategy,
+        timing_sink: &S,
+        preparation_sink: &P,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+        P: super::InvocationPreparationSink,
+    {
+        let _observation = super::preparation::PreparationObservation {
+            identity: batch_identity,
+            sink: preparation_sink,
+        };
+        if batch_identity.preparation_strategy() != strategy {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "identity preparation strategy differs from the fresh wave binding",
+            )));
+        }
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            None,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
     /// Executes one complete plan-derived determinism restore through eager
     /// provider commands. The returned profiled handle retains physical path
     /// attribution for the hardware artifact.
@@ -1275,6 +1323,55 @@ impl OperationDispatch {
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
         S: SubmissionWaveDispatchTimingSink,
     {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            Some(reusable_program),
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_reusable_wave_with_inputs_and_preparation<'binding, R, I, S, P>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: &DeviceReusableExecutionProgram,
+        execution_policy: SubmissionExecutionPolicy,
+        strategy: ferrum_types::InvocationPreparationStrategy,
+        timing_sink: &S,
+        preparation_sink: &P,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+        P: super::InvocationPreparationSink,
+    {
+        let _observation = super::preparation::PreparationObservation {
+            identity: batch_identity,
+            sink: preparation_sink,
+        };
+        if batch_identity.preparation_strategy() != strategy {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "identity preparation strategy differs from the fresh wave binding",
+            )));
+        }
         Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,

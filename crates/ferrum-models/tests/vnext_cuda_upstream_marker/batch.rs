@@ -1,4 +1,24 @@
 use super::*;
+use ferrum_types::InvocationPreparationStrategy;
+
+struct NoHostTiming;
+impl DeviceSubmissionTimingSink for NoHostTiming {
+    const ENABLED: bool = false;
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {
+        unreachable!()
+    }
+}
+impl SubmissionWaveDispatchTimingSink for NoHostTiming {
+    fn record(&self, _: SubmissionWaveDispatchStage, _: std::time::Duration) {
+        unreachable!()
+    }
+}
+struct NoPreparation;
+impl InvocationPreparationSink for NoPreparation {
+    fn record_preparation(&self, _: InvocationPreparationStats) {
+        // Existing fixture callers do not observe preparation diagnostics.
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Path {
@@ -80,6 +100,29 @@ impl Fixture {
         range: Range<usize>,
         path: Path,
     ) -> BatchObservation {
+        self.execute_participants_with_preparation(
+            lane,
+            reaper,
+            sessions,
+            tokens,
+            range,
+            path,
+            InvocationPreparationStrategy::Full,
+            &NoPreparation,
+        )
+    }
+
+    pub fn execute_participants_with_preparation<P: InvocationPreparationSink>(
+        &self,
+        lane: &Arc<ExecutionLane<Runtime>>,
+        reaper: &Arc<CompletionReaper<Runtime>>,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        range: Range<usize>,
+        path: Path,
+        preparation_strategy: InvocationPreparationStrategy,
+        preparation_sink: &P,
+    ) -> BatchObservation {
         assert_eq!(sessions.len(), tokens.len());
         let participants = sessions.len() as u32;
         let batch = ExecutionBatchParticipants::new(sessions.to_vec()).unwrap();
@@ -139,12 +182,27 @@ impl Fixture {
             .collect();
         let executable = self.compilation.executable();
         let plan = executable.execution_plan();
-        let identity = OperationDispatch::bind_submission_wave_identity(
-            executable,
-            active.iter(),
-            &wave,
-            lane,
-        )
+        let identity = match preparation_strategy {
+            InvocationPreparationStrategy::Full => {
+                OperationDispatch::bind_submission_wave_identity(
+                    executable,
+                    active.iter(),
+                    &wave,
+                    lane,
+                )
+            }
+            InvocationPreparationStrategy::IdentityProjection => {
+                let topology =
+                    OperationDispatch::compile_submission_wave_identity(executable, lane).unwrap();
+                OperationDispatch::bind_compiled_submission_wave_identity_with_preparation(
+                    &topology,
+                    active.iter(),
+                    &wave,
+                    lane,
+                    preparation_strategy,
+                )
+            }
+        }
         .unwrap();
         let uploads: Vec<_> = tokens
             .iter()
@@ -366,7 +424,7 @@ impl Fixture {
                 "retained_plan_dependencies":program.retained_plan_dependencies().len(),
                 "segments":program.segments()})
             );
-            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
+            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                 self.providers.providers(),
                 executable,
                 &identity,
@@ -375,18 +433,23 @@ impl Fixture {
                 &uploads,
                 program,
                 SubmissionExecutionPolicy::determinism_replayed(0xa5),
+                preparation_strategy,
+                &NoHostTiming,
+                preparation_sink,
                 wave,
                 lane,
                 reaper,
             )
             .unwrap()
+            .into_parts()
+            .0
         } else {
             let policy = if matches!(path, Path::Eager) {
                 SubmissionExecutionPolicy::determinism_eager(0x5a)
             } else {
                 SubmissionExecutionPolicy::adaptive()
             };
-            OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
+            OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                 self.providers.providers(),
                 executable,
                 &identity,
@@ -394,11 +457,16 @@ impl Fixture {
                 DeviceTimingMode::Off,
                 &uploads,
                 policy,
+                preparation_strategy,
+                &NoHostTiming,
+                preparation_sink,
                 wave,
                 lane,
                 reaper,
             )
             .unwrap()
+            .into_parts()
+            .0
         };
         let receipt = match handle
             .wait_with_readback_collection(

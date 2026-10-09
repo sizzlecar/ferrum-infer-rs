@@ -38,9 +38,9 @@ use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
-    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RequestId, Result,
-    ReusableExecutionCaptureConfig, ReusableExecutionPreparationMode, SchedulingPolicy,
-    SequenceFitPolicy, TokenId, VNextDiagnosticFault,
+    InvocationPreparationStrategy, ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint,
+    RequestId, Result, ReusableExecutionCaptureConfig, ReusableExecutionPreparationMode,
+    SchedulingPolicy, SequenceFitPolicy, TokenId, VNextDiagnosticFault,
     MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH,
 };
 use parking_lot::{Mutex, RwLock};
@@ -63,6 +63,7 @@ use super::{
 mod backing_maintenance;
 mod composition;
 mod determinism;
+mod invocation_preparation;
 mod mixed_batch;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
@@ -531,6 +532,7 @@ pub struct VNextExecutorConfig {
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
+    pub invocation_preparation_strategy: InvocationPreparationStrategy,
     pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
@@ -793,6 +795,7 @@ impl VNextExecutorConfig {
             startup_memory_plan: engine.runtime.startup_memory_plan.clone(),
             static_initialization,
             runtime_policy,
+            invocation_preparation_strategy: engine.runtime.invocation_preparation_strategy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
@@ -1398,6 +1401,7 @@ impl VNextReusableExecutionCatalogMissLedger {
 #[derive(Default)]
 struct VNextExecutorMetrics {
     prefix_cache: Arc<prefix_cache::PrefixCacheMetrics>,
+    invocation_preparation: invocation_preparation::PreparationMetrics,
     prefill_operations: AtomicU64,
     prefill_frontier_narrowings: AtomicU64,
     decode_operations: AtomicU64,
@@ -2767,6 +2771,7 @@ impl VNextExecutorMetrics {
 
     fn reset_after_startup(&self) {
         self.prefix_cache.reset();
+        self.invocation_preparation.reset();
         for counter in [
             &self.prefill_operations,
             &self.prefill_frontier_narrowings,
@@ -4505,6 +4510,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     runtime: Arc<R>,
     providers: BoundOperationProviderSet<R>,
     policy: ResolvedRuntimePolicy,
+    invocation_preparation_strategy: InvocationPreparationStrategy,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
     submission_wave_identity: CompiledSubmissionWaveIdentity,
@@ -5062,6 +5068,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             runtime,
             providers,
             policy: config.runtime_policy,
+            invocation_preparation_strategy: config.invocation_preparation_strategy,
             plan_resources,
             lane,
             submission_wave_identity,
@@ -7453,11 +7460,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .wave_identity_bind
                     .start_if(timing_enabled);
                 let _phase_timing = phase_timing.wave_identity_bind.start_if(timing_enabled);
-                OperationDispatch::bind_compiled_submission_wave_identity(
+                OperationDispatch::bind_compiled_submission_wave_identity_with_preparation(
                     &self.submission_wave_identity,
                     active_bindings(),
                     &wave,
                     &self.lane,
+                    self.invocation_preparation_strategy,
                 )
             } {
                 Ok(identity) => identity,
@@ -7578,7 +7586,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
                 if let Some(reusable_program) = reusable_program {
                     if timing_enabled {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
@@ -7587,14 +7595,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             &uploads,
                             reusable_program,
                             execution_policy,
+                            self.invocation_preparation_strategy,
                             &timing_sink,
+                            &self.metrics.invocation_preparation,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
                         .map(ProfiledSubmissionHandle::into_parts)
                     } else {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
@@ -7602,14 +7612,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             device_timing_mode,
                             &uploads,
                             reusable_program,
+                            execution_policy,
+                            self.invocation_preparation_strategy,
+                            &invocation_preparation::DisabledTiming,
+                            &self.metrics.invocation_preparation,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
-                        .map(|completion| (completion, None))
+                        .map(|profiled| (profiled.into_parts().0, None))
                     }
                 } else if timing_enabled {
-                    OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
@@ -7617,25 +7631,31 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         device_timing_mode,
                         &uploads,
                         execution_policy,
+                        self.invocation_preparation_strategy,
                         &timing_sink,
+                        &self.metrics.invocation_preparation,
                         wave,
                         &self.lane,
                         &self.reaper,
                     )
                     .map(ProfiledSubmissionHandle::into_parts)
                 } else {
-                    OperationDispatch::encode_and_submit_wave_with_inputs(
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
                         active_bindings(),
                         device_timing_mode,
                         &uploads,
+                        execution_policy,
+                        self.invocation_preparation_strategy,
+                        &invocation_preparation::DisabledTiming,
+                        &self.metrics.invocation_preparation,
                         wave,
                         &self.lane,
                         &self.reaper,
                     )
-                    .map(|completion| (completion, None))
+                    .map(|profiled| (profiled.into_parts().0, None))
                 }
             };
             match submission {
@@ -9840,6 +9860,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // values, including disabled/zero, so text-LCP fallback cannot stand in
         // for sequence checkpoint reuse on this executor.
         fields.extend(self.prefix_cache_metrics_snapshot());
+        fields.insert(
+            "invocation_preparation".to_owned(),
+            self.metrics.invocation_preparation.snapshot(),
+        );
+        fields.insert(
+            "invocation_preparation_strategy".to_owned(),
+            serde_json::json!(self.invocation_preparation_strategy),
+        );
         fields.insert(
             "attention_execution_policy".to_owned(),
             serde_json::json!(self.policy.attention_execution()),

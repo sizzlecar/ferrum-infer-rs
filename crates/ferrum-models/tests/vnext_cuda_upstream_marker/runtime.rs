@@ -13,6 +13,8 @@ mod extra_all_rows;
 mod extra_prefill;
 #[path = "runtime/hybrid.rs"]
 mod hybrid;
+#[path = "runtime/identity_projection.rs"]
+mod identity_projection;
 #[path = "runtime/prefill.rs"]
 mod prefill;
 #[path = "runtime/replay_bindings.rs"]

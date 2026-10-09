@@ -631,7 +631,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         R: DeviceRuntime<Buffer = B>,
     {
         let plan = resolved.execution_plan();
-        let parts = identity.parts();
+        let parts = identity.projection();
         let participant = resources.participant(participant_index)?;
         let participant_backing = resources.participant_backing_snapshot(participant_index)?;
         let participant_frame = resources
@@ -659,30 +659,27 @@ impl<'a, B> OperationInvocation<'a, B> {
             || !device_agreements[1].matches(runtime.descriptor(), resolved.capabilities().device())
             || runtime.descriptor().runtime_implementation_fingerprint
                 != plan.payload().device_runtime_implementation_fingerprint()
-            || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
-            || parts.plan_hash.as_ref() != Some(plan.plan_hash())
+            || parts.plan_id != Some(plan.payload().plan_id())
+            || parts.plan_hash != Some(plan.plan_hash())
             || parts.frame_id != Some(participant_frame.frame_id())
             || parts.node_invocation_id.is_none()
-            || parts.node_id.as_ref() != Some(node.id())
-            || parts.operation_id.as_ref() != Some(node.operation_id())
-            || parts.provider_id.as_ref() != Some(node.selection().selected_provider())
-            || parts.device_id.as_ref() != Some(plan.payload().device_id())
-            || parts.run_id != *active_binding.run_id()
-            || parts.request_id != *active_binding.request_id()
-            || parts.transaction_id.as_ref()
-                != lease_identity.map(|identity| identity.transaction_id())
-            || parts.resource_pool_id != active_binding.static_pool_id()
-            || parts.resource_pool_identity_fingerprint.as_deref() != pool_fingerprint
-            || parts.provisioning_run_id.as_ref()
-                != lease_identity.map(|identity| identity.run_id())
-            || parts.provisioning_request_id.as_ref()
-                != lease_identity.map(|identity| identity.request_id())
+            || parts.node_id != Some(node.id())
+            || parts.operation_id != Some(node.operation_id())
+            || parts.provider_id != Some(node.selection().selected_provider())
+            || parts.device_id != Some(plan.payload().device_id())
+            || parts.run_id != active_binding.run_id()
+            || parts.request_id != active_binding.request_id()
+            || parts.transaction_id != lease_identity.map(|identity| identity.transaction_id())
+            || parts.resource_pool_id != active_binding.static_pool_id().as_ref()
+            || parts.resource_pool_identity_fingerprint != pool_fingerprint
+            || parts.provisioning_run_id != lease_identity.map(|identity| identity.run_id())
+            || parts.provisioning_request_id != lease_identity.map(|identity| identity.request_id())
             || parts.active_sequence_slot != Some(active_binding.sequence_authority().sparse_id())
             || parts.admission_generation != Some(active_binding.sequence_authority().generation())
             || parts.activation_epoch != Some(active_binding.activation_epoch())
-            || parts.runtime_implementation_fingerprint.as_deref()
+            || parts.runtime_implementation_fingerprint
                 != Some(active_binding.runtime_implementation_fingerprint())
-            || parts.active_sequence_fingerprint.as_deref() != Some(active_binding.fingerprint())
+            || parts.active_sequence_fingerprint != Some(active_binding.fingerprint())
             || parts.completed_sequence_fingerprint.is_some()
             || parts.aborted_sequence_fingerprint.is_some()
             || active_binding.plan().plan_id() != plan.payload().plan_id()

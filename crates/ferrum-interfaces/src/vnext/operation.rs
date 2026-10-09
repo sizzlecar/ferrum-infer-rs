@@ -48,7 +48,9 @@ pub use checkpoint::{
     ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
     PROVIDER_CHECKPOINT_CONTRACT_VERSION,
 };
+pub(crate) use compiled_identity::CompiledOperationIdentity;
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
+mod preparation;
 pub use descriptor::{
     OperationContract, OperationDescriptor, OracleSpec, ProfilePhase, ProviderRequirement,
     ResourcePresenceRequirement, ResourceRequirements,
@@ -80,6 +82,7 @@ pub use identity::{
     BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
 };
 pub use invocation::{BatchedOperationInvocation, OperationInvocation};
+pub use preparation::{InvocationPreparationSink, InvocationPreparationStats};
 pub use provider::{
     EngineProviderDescriptor, ExecutionDeterminismRequirement, OperationFailure,
     OperationProviderDescriptor, ProviderCompatibilityRejectReason, ProviderCompatibilityRejection,

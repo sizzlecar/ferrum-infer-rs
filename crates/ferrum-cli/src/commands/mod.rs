@@ -18,6 +18,21 @@ impl PrefillDecodeExecutionArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InvocationPreparationStrategyArg {
+    Full,
+    IdentityProjection,
+}
+
+impl InvocationPreparationStrategyArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::IdentityProjection => "identity-projection",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
@@ -78,6 +93,13 @@ mod tests {
     }
 
     impl TestCli {
+        fn preparation_strategy(self) -> Option<InvocationPreparationStrategyArg> {
+            match self.command {
+                TestCommand::Run(command) => command.invocation_preparation_strategy,
+                TestCommand::Serve(command) => command.invocation_preparation_strategy,
+            }
+        }
+
         fn execution(self) -> Option<PrefillDecodeExecutionArg> {
             match self.command {
                 TestCommand::Run(command) => command.prefill_decode_execution,
@@ -161,6 +183,42 @@ mod tests {
                 command,
                 "test-model",
                 "--prefill-decode-execution",
+                "automatic"
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn invocation_preparation_cli_values_and_default_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .preparation_strategy(),
+                None
+            );
+            for (value, expected) in [
+                ("full", InvocationPreparationStrategyArg::Full),
+                (
+                    "identity-projection",
+                    InvocationPreparationStrategyArg::IdentityProjection,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--invocation-preparation-strategy",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.preparation_strategy(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--invocation-preparation-strategy",
                 "automatic"
             ])
             .is_err());

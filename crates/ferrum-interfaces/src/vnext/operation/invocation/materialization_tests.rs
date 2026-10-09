@@ -330,3 +330,6 @@ fn shared_materialization_preserves_unequal_participant_token_windows() {
         assert_eq!(ranges[2].immediate_token_range(), 4..6);
     });
 }
+
+#[path = "identity_projection_tests.rs"]
+mod identity_projection_tests;

@@ -72,6 +72,34 @@ impl PrefillDecodeExecution {
     }
 }
 
+/// Host invocation preparation for native plan runtimes. Identity projection
+/// borrows compiled identity metadata while preserving per-invocation validation.
+/// It does not change resource preparation or device execution policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InvocationPreparationStrategy {
+    #[default]
+    Full,
+    IdentityProjection,
+}
+
+impl InvocationPreparationStrategy {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::IdentityProjection => "identity-projection",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "identity-projection" => Ok(Self::IdentityProjection),
+            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+        }
+    }
+}
+
 /// Explicit one-shot faults used to prove product-path failure attribution.
 /// These are never inferred and remain disabled in normal execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +222,9 @@ pub struct RuntimeKnobs {
     pub prefix_state_cache_enabled: bool,
     pub recurrent_state_max_slots: Option<usize>,
     pub attention_execution_policy: AttentionExecutionPolicy,
+    /// Host invocation preparation policy; full preparation is the default.
+    #[serde(default)]
+    pub invocation_preparation_strategy: InvocationPreparationStrategy,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -326,6 +357,14 @@ impl EngineConfig {
             self.runtime.attention_execution_policy =
                 AttentionExecutionPolicy::parse_runtime_value(value)
                     .map_err(|reason| format!("FERRUM_ATTENTION_POLICY: {reason}"))?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+        {
+            self.runtime.invocation_preparation_strategy =
+                InvocationPreparationStrategy::parse_runtime_value(value).map_err(|reason| {
+                    format!("FERRUM_INVOCATION_PREPARATION_STRATEGY: {reason}")
+                })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =
@@ -1271,6 +1310,53 @@ impl Default for BatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invocation_preparation_defaults_to_full_and_rejects_unknown_overrides() {
+        let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.invocation_preparation_strategy,
+            InvocationPreparationStrategy::Full
+        );
+        let mut legacy = serde_json::to_value(&config.runtime).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("invocation_preparation_strategy");
+        let restored: RuntimeKnobs = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.invocation_preparation_strategy,
+            InvocationPreparationStrategy::Full
+        );
+        for strategy in [
+            InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::Full,
+        ] {
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    key,
+                    strategy.as_runtime_value(),
+                )]))
+                .unwrap();
+            assert_eq!(config.runtime.invocation_preparation_strategy, strategy);
+            assert_eq!(
+                serde_json::to_value(strategy).unwrap(),
+                strategy.as_runtime_value()
+            );
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                .unwrap();
+            assert_eq!(config.runtime.invocation_preparation_strategy, strategy);
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "automatic"
+            )]))
+            .unwrap_err()
+            .contains(key));
+    }
 
     #[test]
     fn prefill_decode_execution_defaults_to_split_and_validates_runtime_overrides() {

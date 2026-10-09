@@ -874,6 +874,10 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
+    /// Host invocation preparation policy for native plan runtimes (default: full).
+    #[arg(long, value_enum)]
+    pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -2707,6 +2711,12 @@ fn run_startup_cli_runtime_entries(
         cmd.prefill_decode_execution
             .map(crate::commands::PrefillDecodeExecutionArg::as_runtime_value),
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+        cmd.invocation_preparation_strategy
+            .map(crate::commands::InvocationPreparationStrategyArg::as_runtime_value),
+    );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
         "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
@@ -2901,6 +2911,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invocation_preparation_run_override_reaches_engine_config() {
+        use crate::commands::InvocationPreparationStrategyArg;
+        use ferrum_types::InvocationPreparationStrategy;
+        let mut command = test_run_cmd();
+        let config_entries = crate::config::RuntimeCliConfig {
+            invocation_preparation_strategy: Some(
+                InvocationPreparationStrategy::IdentityProjection,
+            ),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, expected) in [
+            (None, InvocationPreparationStrategy::IdentityProjection),
+            (
+                Some(InvocationPreparationStrategyArg::Full),
+                InvocationPreparationStrategy::Full,
+            ),
+            (
+                Some(InvocationPreparationStrategyArg::IdentityProjection),
+                InvocationPreparationStrategy::IdentityProjection,
+            ),
+        ] {
+            command.invocation_preparation_strategy = option;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.invocation_preparation_strategy, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if option.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
+            );
+        }
+    }
+
     fn test_run_cmd() -> RunCommand {
         RunCommand {
             model: Some("tinyllama".to_string()),
@@ -2932,6 +2990,7 @@ mod tests {
             max_num_seqs: None,
             max_num_batched_tokens: None,
             prefill_decode_execution: None,
+            invocation_preparation_strategy: None,
             scheduler_slo: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,

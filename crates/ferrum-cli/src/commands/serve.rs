@@ -127,6 +127,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
+    /// Host invocation preparation policy for native plan runtimes (default: full).
+    #[arg(long, value_enum)]
+    pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -410,6 +414,7 @@ async fn execute_with_compatibility(
         max_num_seqs,
         max_num_batched_tokens,
         prefill_decode_execution,
+        invocation_preparation_strategy,
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
@@ -859,6 +864,10 @@ async fn execute_with_compatibility(
         profile_concurrency,
         profile_runtime_flags_json.as_deref(),
         layer_split_pipeline_mode,
+    );
+    push_invocation_preparation_strategy_cli_entry(
+        &mut startup_cli_runtime_entries,
+        invocation_preparation_strategy,
     );
     startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
@@ -1564,6 +1573,17 @@ pub(crate) fn runtime_preset_entries(
         .iter()
         .map(|(key, value)| RuntimeConfigEntry::new(*key, *value, source))
         .collect())
+}
+
+fn push_invocation_preparation_strategy_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+        strategy.map(crate::commands::InvocationPreparationStrategyArg::as_runtime_value),
+    );
 }
 
 fn serve_cli_runtime_entries(
@@ -2499,6 +2519,54 @@ fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invocation_preparation_serve_override_reaches_engine_config() {
+        use crate::commands::InvocationPreparationStrategyArg;
+        use ferrum_types::InvocationPreparationStrategy;
+        let config_entries = crate::config::RuntimeCliConfig {
+            invocation_preparation_strategy: Some(
+                InvocationPreparationStrategy::IdentityProjection,
+            ),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, expected) in [
+            (None, InvocationPreparationStrategy::IdentityProjection),
+            (
+                Some(InvocationPreparationStrategyArg::Full),
+                InvocationPreparationStrategy::Full,
+            ),
+            (
+                Some(InvocationPreparationStrategyArg::IdentityProjection),
+                InvocationPreparationStrategy::IdentityProjection,
+            ),
+        ] {
+            let mut cli = Vec::new();
+            push_invocation_preparation_strategy_cli_entry(&mut cli, option);
+            let snapshot = merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                cli,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.invocation_preparation_strategy, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if option.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
+            );
+        }
+    }
 
     #[test]
     fn serve_prefix_rendezvous_is_explicit_and_rejects_zero_wait() {

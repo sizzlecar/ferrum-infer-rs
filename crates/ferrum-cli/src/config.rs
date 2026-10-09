@@ -246,6 +246,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub prefill_decode_execution: Option<ferrum_types::PrefillDecodeExecution>,
 
+    /// Host invocation preparation policy for native plan runtimes.
+    #[serde(default)]
+    pub invocation_preparation_strategy: Option<ferrum_types::InvocationPreparationStrategy>,
+
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -468,6 +472,12 @@ impl RuntimeCliConfig {
             "FERRUM_ATTENTION_POLICY",
             self.attention_policy
                 .map(AttentionExecutionPolicy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+            self.invocation_preparation_strategy
+                .map(ferrum_types::InvocationPreparationStrategy::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1090,6 +1100,25 @@ mod tests {
         );
         assert_eq!(config.server.port, 8000);
         assert!(config.models.default_model.is_none());
+    }
+
+    #[test]
+    fn invocation_preparation_config_file_parses_explicit_strategy() {
+        let config: CliConfig = toml::from_str(
+            "[runtime]\ninvocation_preparation_strategy = \"identity-projection\"\n",
+        )
+        .unwrap();
+        let entries = config.runtime.runtime_config_entries();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+            .unwrap();
+        assert_eq!(entry.effective_value, "identity-projection");
+        assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\ninvocation_preparation_strategy = \"automatic\"\n"
+        )
+        .is_err());
     }
 
     #[test]
