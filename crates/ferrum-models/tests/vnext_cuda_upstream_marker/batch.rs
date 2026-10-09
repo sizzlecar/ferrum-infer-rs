@@ -32,6 +32,8 @@ pub struct BatchObservation {
     pub values: BTreeMap<(u32, String), Vec<u8>>,
     types: BTreeMap<String, ElementType>,
     pub binding_rows: Option<Vec<Vec<u8>>>,
+    pub segment_published: bool,
+    pub participant_frames: Vec<ExecutionFrameId>,
 }
 
 impl BatchObservation {
@@ -220,7 +222,8 @@ impl Fixture {
                     lane,
                 )
             }
-            InvocationPreparationStrategy::IdentityProjection => {
+            InvocationPreparationStrategy::IdentityProjection
+            | InvocationPreparationStrategy::DecodeSegment => {
                 let topology =
                     OperationDispatch::compile_submission_wave_identity(executable, lane).unwrap();
                 OperationDispatch::bind_compiled_submission_wave_identity_with_preparation(
@@ -527,6 +530,7 @@ impl Fixture {
             .into_parts()
             .0
         };
+        let segment_publication = handle.take_segment_binding_publication();
         let receipt = match handle
             .wait_with_readback_collection(
                 CompletionReadbackCollectionRequest::new(readbacks).unwrap(),
@@ -536,6 +540,8 @@ impl Fixture {
             CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
             other => panic!("attention readback did not terminate: {other:?}"),
         };
+        let ready_segment =
+            segment_publication.and_then(|ticket| ticket.bind_completion(receipt.completion()));
         if matches!(path, Path::EagerBoundary) {
             let program_id = program_id
                 .as_ref()
@@ -579,11 +585,21 @@ impl Fixture {
             participants as usize * (names.len() - usize::from(binding_rows.is_some()))
         );
         drop((receipt, handle, identity, active));
-        step.try_retire_normal().unwrap();
+        let retirement = step.try_retire_normal().unwrap();
+        let participant_frames = retirement
+            .participants()
+            .iter()
+            .map(|participant| participant.assignment().frame_id())
+            .collect();
+        let segment_published = ready_segment
+            .map(|ready| ready.publish(&retirement).unwrap())
+            .unwrap_or(false);
         BatchObservation {
             values,
             types,
             binding_rows,
+            segment_published,
+            participant_frames,
         }
     }
 }

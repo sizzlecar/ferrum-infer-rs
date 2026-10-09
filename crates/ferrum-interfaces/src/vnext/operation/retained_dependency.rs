@@ -6,10 +6,12 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use super::foundation::invalid_operation;
-use super::{BatchedOperationInvocation, ResolvedValueRole, TensorAccess};
+use super::{BatchedOperationInvocation, ResolvedValueBinding, ResolvedValueRole, TensorAccess};
+use crate::vnext::resource::SegmentPlanResourceView;
 use crate::vnext::{
-    AllocationLifetime, BufferDescriptor, BufferUsage, DeviceBufferRetention, ElementType, NodeId,
-    ProviderId, ResourceTransactionIdentity, VNextError, WeightId,
+    AllocationLifetime, BufferDescriptor, BufferUsage, DeviceBufferRetention,
+    DeviceReusableAddressScope, ElementType, NodeId, ProviderId, ResourceTransactionIdentity,
+    VNextError, WeightId,
 };
 
 /// Exact subranges authorized by a live invocation. Source offsets are relative
@@ -75,6 +77,12 @@ pub struct RetainedPlanDependencyAuthority {
 pub struct EncodedRetainedPlanDependency<C> {
     pub(super) authority: RetainedPlanDependencyAuthority,
     pub(crate) command: C,
+}
+
+impl<C> EncodedRetainedPlanDependency<C> {
+    pub(crate) fn identity(&self) -> &RetainedPlanDependencyIdentity {
+        &self.authority.identity
+    }
 }
 
 impl RetainedPlanDependencyAuthority {
@@ -183,6 +191,137 @@ impl<B> BatchedOperationInvocation<'_, B> {
         }
         issued.ok_or_else(|| invalid_operation("retained dependency has no participants"))
     }
+}
+
+/// The operation layer binds these immutable declarations to the exact Plan
+/// before issuing a segment. Both views must come from this wave's bulk Plan
+/// lease observation, which already proved every participant shares that lease.
+/// The destination is this node's declared persistent allocation; the scope is
+/// newly created for this node in this attempt, never retained by a cold recipe.
+pub(super) struct SegmentPlanDependencyInput<'a, 'lease, B> {
+    pub scope: &'a Arc<()>,
+    pub node: &'a NodeId,
+    pub provider: &'a ProviderId,
+    pub binding: &'a ResolvedValueBinding,
+    pub source: &'a SegmentPlanResourceView<'lease, B>,
+    pub destination: &'a SegmentPlanResourceView<'lease, B>,
+    pub persistent_preserve: bool,
+}
+
+/// Issue only from freshly checked Plan views. This preserves the invocation
+/// path's source/component/range checks without rebuilding participant views
+/// or rechecking the same shared immutable Plan allocation for each participant.
+pub(super) fn issue_segment_plan_dependency<B>(
+    input: SegmentPlanDependencyInput<'_, '_, B>,
+    spec: RetainedPlanDependencySpec<'_>,
+) -> Result<RetainedPlanDependencyAuthority, VNextError> {
+    if !input.persistent_preserve
+        || spec.validation_identity.is_empty()
+        || !spec.alignment_bytes.is_power_of_two()
+    {
+        return Err(invalid_operation("retained Plan dependency requires owned Plan Preserve storage and a validation identity"));
+    }
+    let binding = input.binding;
+    if binding.role() != ResolvedValueRole::Input || binding.ordinal() != spec.input_ordinal {
+        return Err(invalid_operation(
+            "retained dependency weight input is absent",
+        ));
+    }
+    if binding.usage() != BufferUsage::Weights || binding.access() != TensorAccess::Read {
+        return Err(invalid_operation(
+            "retained dependency source must be a read-only weight input",
+        ));
+    }
+    let component = binding
+        .storage()
+        .components()
+        .iter()
+        .find(|component| component.component_id() == Some(spec.component_id))
+        .ok_or_else(|| {
+            invalid_operation("retained dependency physical weight component is absent")
+        })?;
+    checked_range(
+        spec.source_offset_bytes,
+        spec.source_length_bytes,
+        component.length_bytes(),
+    )?;
+    let source_offset = component
+        .offset_bytes()
+        .checked_add(spec.source_offset_bytes)
+        .ok_or_else(|| invalid_operation("retained dependency weight offset overflows"))?;
+    let source = &input.source.leased;
+    let destination = &input.destination.leased;
+    if source.resource_id() != component.resource_id() {
+        return Err(invalid_operation(
+            "retained dependency weight view is absent",
+        ));
+    }
+    // Plan lifetime is guaranteed by prepare_segment_plan_views. Recheck the
+    // selected committed metadata and exact transaction/admission here so two
+    // individually valid observations from different Plans cannot be combined.
+    if source.committed_descriptor().usage != BufferUsage::Weights
+        || destination.committed_descriptor().usage != BufferUsage::Persistent
+        || destination.committed_descriptor().element_type != ElementType::U8
+        || destination.committed_descriptor().alignment_bytes < spec.alignment_bytes
+        || spec.persistent_offset_bytes % spec.alignment_bytes != 0
+        || spec.persistent_length_bytes % spec.alignment_bytes != 0
+        || source.resource_id() == destination.resource_id()
+        || !std::ptr::eq(source.identity(), destination.identity())
+        || !std::ptr::eq(source.admission(), destination.admission())
+        || source.identity() != destination.identity()
+        || source.admission() != destination.admission()
+    {
+        return Err(invalid_operation(
+            "retained dependency source/destination ownership, type, or alignment differs",
+        ));
+    }
+    let (source, source_retention) =
+        segment_dependency_range(input.source, source_offset, spec.source_length_bytes)?;
+    let (destination, destination_retention) = segment_dependency_range(
+        input.destination,
+        spec.persistent_offset_bytes,
+        spec.persistent_length_bytes,
+    )?;
+    Ok(RetainedPlanDependencyAuthority {
+        scope: Arc::clone(input.scope),
+        identity: RetainedPlanDependencyIdentity {
+            node: input.node.clone(),
+            provider: input.provider.clone(),
+            source,
+            destination,
+            component: spec.component_id.clone(),
+            input_ordinal: spec.input_ordinal,
+            validation_identity: spec.validation_identity.to_owned(),
+        },
+        _source_retention: source_retention,
+        _destination_retention: destination_retention,
+    })
+}
+
+fn segment_dependency_range<B>(
+    view: &SegmentPlanResourceView<'_, B>,
+    offset: u64,
+    length: u64,
+) -> Result<(RetainedPlanDependencyRange, DeviceBufferRetention), VNextError> {
+    let leased = &view.leased;
+    checked_range(offset, length, leased.committed_descriptor().size_bytes)?;
+    if leased.generation() == 0
+        || view.retention.reusable_address_scope() != Some(DeviceReusableAddressScope::Plan)
+    {
+        return Err(invalid_operation(
+            "retained dependency has no live Plan generation",
+        ));
+    }
+    Ok((
+        RetainedPlanDependencyRange {
+            descriptor: leased.committed_descriptor().clone(),
+            transaction: leased.identity().clone(),
+            generation: leased.generation(),
+            offset,
+            length,
+        },
+        view.retention.clone(),
+    ))
 }
 
 pub(super) fn checked_range(offset: u64, length: u64, available: u64) -> Result<(), VNextError> {

@@ -83,6 +83,7 @@ mod int8_tests;
 #[path = "causal_attention/numerical_tests.rs"]
 mod numerical_tests;
 mod precision;
+pub(in crate::backend::cuda::vnext_ops) mod segment_bindings;
 use super::native_matrix;
 use super::q8act_attention::PreparedAttentionProjections;
 use crate::backend::cuda::vnext_ops::native_blocks::q8act::{PackedActivation, Q8ActKernels};
@@ -448,6 +449,8 @@ impl CudaCausalPagedAttentionProvider {
             include_bytes!("causal_attention/batch_decode.rs"),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("native_matrix.rs"),
+            include_bytes!("causal_attention/segment_bindings.rs"),
+            include_bytes!("segment_bindings.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
@@ -1002,8 +1005,48 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.projection_runtime,
             invocation,
             EncodingTarget::Full,
+            None,
         )
         .and_then(Encoding::full)
+        .map_err(|message| {
+            OperationFailure::new(
+                identity,
+                ProfilePhase::Forward,
+                "cuda.causal_paged_attention.encode",
+                message.chars().take(2048).collect::<String>(),
+                false,
+            )
+            .expect("core-issued CUDA causal attention identity must be valid")
+        })
+    }
+
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<CudaDeviceCommand>,
+            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        let mut declaration = None;
+        let identity = invocation.participants()[0].identity().clone();
+        encode_attention(
+            &self.functions,
+            self.descriptor.provider_implementation_fingerprint(),
+            self.attention_policy,
+            self.program_binding_upload_strategy,
+            self.semantics,
+            self.precision,
+            self.descriptor.operation_id().as_str(),
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+            invocation,
+            EncodingTarget::Full,
+            Some(&mut declaration),
+        )
+        .and_then(|encoded| encoded.full().map(|operation| (operation, declaration)))
         .map_err(|message| {
             OperationFailure::new(
                 identity,
@@ -1054,6 +1097,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 self.projection_runtime,
                 invocation,
                 EncodingTarget::BindingsOnly,
+                None,
             )
             .and_then(Encoding::bindings)
             .map_err(|message| {
@@ -2288,7 +2332,9 @@ fn encode_attention(
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
+    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
+    let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     if invocation.participants().is_empty() || invocation.operation().id.as_str() != operation_id {
         return Err("CUDA causal attention received another or empty operation".to_owned());
     }
@@ -2741,7 +2787,7 @@ fn encode_attention(
 
     let upstream_bindings = q8act
         .as_ref()
-        .map(|projections| projections.upstream_bindings(&invocation))
+        .map(|projections| projections.upstream_bindings(&invocation, segment_validations.as_mut()))
         .transpose()?
         .unwrap_or_default();
     if target == EncodingTarget::BindingsOnly {
@@ -2753,6 +2799,15 @@ fn encode_attention(
             |encoded, dependency| encoded.with_retained_plan_dependency(dependency),
         );
         return Ok(Encoding::Bindings(bindings));
+    }
+
+    if let Some(declaration) = segment_declaration {
+        *declaration = segment_bindings::declare(
+            &invocation,
+            shape,
+            program_binding_upload_strategy,
+            segment_validations.unwrap_or_default(),
+        )?;
     }
 
     let q8act = q8act.map(PreparedAttentionProjections::into_owned);

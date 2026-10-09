@@ -1402,6 +1402,15 @@ pub(crate) enum FenceBehavior {
 
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) segment_metadata_enabled: bool,
+    pub(crate) segment_foreign_runtime_metadata: bool,
+    pub(crate) segment_encoder_enabled: bool,
+    pub(crate) segment_oracle_enabled: bool,
+    pub(crate) segment_regions: Vec<SegmentTestRegion>,
+    pub(crate) segment_entry: Option<DeviceReusableExecutionEntryIdentity>,
+    pub(crate) segment_entry_error: bool,
+    pub(crate) segment_entry_panic: bool,
+    pub(crate) segment_trim_released: usize,
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
@@ -1440,6 +1449,15 @@ pub(crate) struct RuntimeTrace {
     pub(crate) static_weight_import_seal_calls: u64,
     pub(crate) imported_component_count: usize,
     pub(crate) imported_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegmentTestRegion {
+    pub(crate) node: u32,
+    pub(crate) participant: usize,
+    pub(crate) region: usize,
+    pub(crate) descriptor: BufferDescriptor,
+    pub(crate) physical: Vec<(usize, std::ops::Range<u64>, u64)>,
 }
 
 pub(crate) struct TestRuntime {
@@ -1665,6 +1683,136 @@ impl DeviceRuntime for TestRuntime {
         } else {
             &self.descriptor
         }
+    }
+
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_>> {
+        let (enabled, foreign) = {
+            let trace = self.trace.lock().unwrap();
+            (
+                trace.segment_metadata_enabled,
+                trace.segment_foreign_runtime_metadata,
+            )
+        };
+        if !enabled {
+            return None;
+        }
+        if foreign {
+            // A real different runtime object with equal metadata; no resource
+            // or admission is minted for this intentionally invalid capability.
+            static FOREIGN: std::sync::OnceLock<TestRuntime> = std::sync::OnceLock::new();
+            let owner = FOREIGN.get_or_init(|| TestRuntime {
+                descriptor: self.descriptor.clone(),
+                alternate_descriptor: self.alternate_descriptor.clone(),
+                use_alternate_descriptor: AtomicBool::new(false),
+                descriptor_reads_until_drift: AtomicU64::new(0),
+                trace: Arc::new(Mutex::new(RuntimeTrace::default())),
+            });
+            return Some(ImmutableRuntimeMetadata::declare(owner, &self.descriptor));
+        }
+        Some(ImmutableRuntimeMetadata::declare(self, &self.descriptor))
+    }
+
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        buffer: &'a Self::Buffer,
+    ) -> Option<ImmutableBufferMetadata<'a, Self::Buffer>> {
+        self.trace
+            .lock()
+            .unwrap()
+            .segment_metadata_enabled
+            .then(|| ImmutableBufferMetadata::declare(self, buffer, &buffer.descriptor))
+    }
+
+    fn segment_binding_oracle_mode(&self) -> SegmentBindingOracleMode {
+        if self.trace.lock().unwrap().segment_oracle_enabled {
+            SegmentBindingOracleMode::CompareReference
+        } else {
+            SegmentBindingOracleMode::Disabled
+        }
+    }
+
+    fn encode_segment_bindings(
+        &self,
+        patch: PreparedSegmentBindingPatch<'_, Self::Buffer>,
+    ) -> Result<Option<Vec<EncodedSegmentBindingNode<Self::Command>>>, Self::Error> {
+        if !self.trace.lock().unwrap().segment_encoder_enabled {
+            return Ok(None);
+        }
+        let mut snapshots = Vec::new();
+        let mut encoded = Vec::new();
+        for node in patch.into_nodes() {
+            for participant in 0..node.participant_count() {
+                for region in 0..node.declaration().regions().len() {
+                    let value = node
+                        .region(participant, region)
+                        .map_err(|_| TestRuntimeError("segment region absent"))?;
+                    let mut covered = 0_u64;
+                    let physical = value
+                        .physical_regions()
+                        .iter()
+                        .map(|part| {
+                            let (buffer, range, _retention) = part.buffer_and_physical_range();
+                            assert!(
+                                range.start < range.end
+                                    && range.end <= buffer.descriptor.size_bytes
+                            );
+                            covered += range.end - range.start;
+                            (
+                                buffer as *const TestBuffer as usize,
+                                range,
+                                part.logical_offset_bytes(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(covered, value.descriptor().size_bytes);
+                    snapshots.push(SegmentTestRegion {
+                        node: node.node_index(),
+                        participant,
+                        region,
+                        descriptor: value.descriptor().clone(),
+                        physical,
+                    });
+                }
+            }
+            encoded.push(EncodedSegmentBindingNode {
+                node_index: node.node_index(),
+                bindings: EncodedReusableExecutionBindings::empty(),
+            });
+        }
+        self.trace.lock().unwrap().segment_regions = snapshots;
+        Ok(Some(encoded))
+    }
+
+    fn reusable_execution_entry_identity(
+        &self,
+        _stream: &Self::Stream,
+        _program: &DeviceReusableExecutionProgramId,
+    ) -> Result<Option<DeviceReusableExecutionEntryIdentity>, Self::Error> {
+        let (entry, error, panic) = {
+            let trace = self.trace.lock().unwrap();
+            (
+                trace.segment_entry.clone(),
+                trace.segment_entry_error,
+                trace.segment_entry_panic,
+            )
+        };
+        assert!(!panic, "injected entry inspection panic");
+        if error {
+            return Err(TestRuntimeError("injected entry inspection error"));
+        }
+        Ok(entry)
+    }
+
+    fn trim_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        let released = trace.segment_trim_released;
+        if released != 0 {
+            trace.segment_entry = None;
+        }
+        Ok(DeviceReusableExecutionTrim::new(released, 0))
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {

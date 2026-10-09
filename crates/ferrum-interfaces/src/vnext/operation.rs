@@ -23,6 +23,16 @@ pub use retained_dependency::{
     EncodedRetainedPlanDependency, RetainedPlanDependencyAuthority, RetainedPlanDependencyIdentity,
     RetainedPlanDependencySpec,
 };
+mod segment_binding;
+pub(crate) mod segment_compile;
+mod segment_dispatch;
+mod segment_oracle;
+pub use segment_binding::{
+    EncodedSegmentBindingNode, PreparedSegmentBindingNode, PreparedSegmentBindingPatch,
+    PreparedSegmentBindingRegion, SegmentBindingDeclaration, SegmentBindingDependency,
+    SegmentBindingOracleCommands, SegmentBindingOracleMode, SegmentBindingPhysicalRegion,
+    SegmentBindingRegionExtent, SegmentBindingRegionRequest, SegmentBindingRegionSelector,
+};
 mod semantic;
 mod storage_profile;
 mod tensor_contract;

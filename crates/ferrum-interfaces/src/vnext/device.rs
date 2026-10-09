@@ -10,6 +10,10 @@ use std::time::Duration;
 
 use ferrum_types::AttentionExecutionPolicy;
 
+mod immutable_metadata;
+pub use immutable_metadata::{
+    DeviceReusableExecutionEntryIdentity, ImmutableBufferMetadata, ImmutableRuntimeMetadata,
+};
 mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
 
@@ -3091,6 +3095,27 @@ pub struct EncodedReusableExecutionBindings<C> {
 }
 
 impl<C> EncodedReusableExecutionBindings<C> {
+    pub(crate) fn segment_binding_oracle_commands(
+        &self,
+    ) -> super::SegmentBindingOracleCommands<'_, C> {
+        super::SegmentBindingOracleCommands {
+            program_bindings: &self.program_bindings,
+            dynamic_bindings: &self.dynamic_bindings,
+            result_bindings: &self.result_bindings,
+            retained_dependencies: self
+                .retained_plan_dependencies
+                .iter()
+                .map(|d| &d.command)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn retained_dependency_identities(
+        &self,
+    ) -> impl Iterator<Item = &RetainedPlanDependencyIdentity> {
+        self.retained_plan_dependencies.iter().map(|d| d.identity())
+    }
+
     pub fn with_retained_plan_dependency(
         mut self,
         dependency: EncodedRetainedPlanDependency<C>,
@@ -3559,6 +3584,56 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn descriptor(&self) -> &DeviceDescriptor;
+
+    /// Optional lifetime-stable metadata bound to this exact runtime owner.
+    /// This is not resource admission or permission to reuse a prior wave.
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_>> {
+        None
+    }
+
+    /// Optional lifetime-stable metadata for this exact buffer facade and
+    /// runtime. Current pool ownership and each wave's windows remain checked.
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        _buffer: &'a Self::Buffer,
+    ) -> Option<ImmutableBufferMetadata<'a, Self::Buffer>> {
+        None
+    }
+
+    /// Identifies an exact resident entry, including replacement at the same
+    /// logical program ID. Unsupported runtimes use the complete encoder.
+    fn reusable_execution_entry_identity(
+        &self,
+        _stream: &Self::Stream,
+        _program_id: &DeviceReusableExecutionProgramId,
+    ) -> Result<Option<DeviceReusableExecutionEntryIdentity>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Encodes all declared binding boundaries of one resident segment from
+    /// freshly checked, retained physical facts. This runs after the core's
+    /// resource permit has been consumed; no pool guards cross this call.
+    fn encode_segment_bindings(
+        &self,
+        _patch: super::PreparedSegmentBindingPatch<'_, Self::Buffer>,
+    ) -> Result<Option<Vec<super::EncodedSegmentBindingNode<Self::Command>>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Explicit diagnostic selection, immutable after runtime construction.
+    fn segment_binding_oracle_mode(&self) -> super::SegmentBindingOracleMode {
+        super::SegmentBindingOracleMode::Disabled
+    }
+
+    /// Compare encoded bytes and metadata without enqueuing either view.
+    /// None means unsupported and is an error when the diagnostic is enabled.
+    fn compare_segment_binding_reference(
+        &self,
+        _actual: super::SegmentBindingOracleCommands<'_, Self::Command>,
+        _reference: super::SegmentBindingOracleCommands<'_, Self::Command>,
+    ) -> Result<Option<()>, Self::Error> {
+        Ok(None)
+    }
 
     /// Resolved attention provider-family policy installed by this runtime
     /// composition. `Auto` is never valid after composition.

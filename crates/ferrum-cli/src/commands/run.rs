@@ -875,6 +875,7 @@ pub struct RunCommand {
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
     /// Host invocation preparation policy for native plan runtimes (default: full).
+    /// Decode-segment requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
     /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).
@@ -2941,6 +2942,10 @@ mod tests {
             (
                 Some(InvocationPreparationStrategyArg::IdentityProjection),
                 InvocationPreparationStrategy::IdentityProjection,
+            ),
+            (
+                Some(InvocationPreparationStrategyArg::DecodeSegment),
+                InvocationPreparationStrategy::DecodeSegment,
             ),
         ] {
             command.invocation_preparation_strategy = option;

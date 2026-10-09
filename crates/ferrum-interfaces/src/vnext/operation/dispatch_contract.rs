@@ -239,6 +239,8 @@ pub enum SubmissionWaveDispatchStage {
     ContractValidateAndReserve,
     BackingAndInputEncode,
     ProviderNodeEncode,
+    SegmentHitProviderNodeEncode,
+    SegmentBindingPrepareAndEncode,
     NodeIdentityMaterialize,
     NodeInvocationConstruct,
     ProviderDynamicBindingEncode,
@@ -295,6 +297,16 @@ where
             sink,
             stage,
             started: S::ENABLED.then(Instant::now),
+        }
+    }
+
+    /// Record one parent interval and its selected-wave subset using the same
+    /// elapsed value. The subset overlaps its parent and is never additive.
+    pub(super) fn finish_with_subset(mut self, subset: SubmissionWaveDispatchStage) {
+        if let Some(started) = self.started.take() {
+            let elapsed = started.elapsed();
+            self.sink.record(self.stage, elapsed);
+            self.sink.record(subset, elapsed);
         }
     }
 }

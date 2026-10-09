@@ -963,6 +963,21 @@ pub(crate) fn fixture_with_token_scaled_paged_state_and_provider_behavior(
     )
 }
 
+pub(crate) fn fixture_with_token_scaled_paged_state_and_bucket(
+    bucket: ReusableExecutionBucketSpec,
+) -> Fixture {
+    fixture_with_configured_runtime_and_bucket(
+        TestStateProfile::token_scaled_sequence(),
+        ProviderBehavior::ProgramBinding,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+        ContractVersion::new(1, 0),
+        |_| {},
+        Some(bucket),
+    )
+}
+
 pub(crate) fn fixture_with_hybrid_state_and_provider_behavior(
     behavior: ProviderBehavior,
 ) -> Fixture {
@@ -1051,6 +1066,28 @@ fn fixture_with_configured_runtime(
     operation_version: ContractVersion,
     configure: impl FnOnce(&mut TestRuntime),
 ) -> Fixture {
+    fixture_with_configured_runtime_and_bucket(
+        state_profile,
+        behavior,
+        execution_semantics,
+        execution_determinism,
+        retain_determinism_outputs,
+        operation_version,
+        configure,
+        None,
+    )
+}
+
+fn fixture_with_configured_runtime_and_bucket(
+    state_profile: TestStateProfile,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+    retain_determinism_outputs: bool,
+    operation_version: ContractVersion,
+    configure: impl FnOnce(&mut TestRuntime),
+    bucket_override: Option<ReusableExecutionBucketSpec>,
+) -> Fixture {
     let scratch = if matches!(
         behavior,
         ProviderBehavior::ProgramBindingWithScratchTail
@@ -1068,7 +1105,7 @@ fn fixture_with_configured_runtime(
         operation_version,
     );
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
-        let (_, bucket) = reusable_policy();
+        let bucket = bucket_override.unwrap_or_else(|| reusable_policy().1);
         (
             policy_with_reusable_execution_determinism_and_storage(
                 Some(

@@ -103,6 +103,15 @@ const THREADS_PER_BLOCK: u32 = 256;
 const MAXIMUM_TOKENS_PER_LAUNCH: u64 = u16::MAX as u64;
 pub(super) const VNEXT_KV_PAGE_BYTES: u64 = 64 * 1024;
 
+pub(crate) fn encode_segment_bindings(
+    patch: ferrum_interfaces::vnext::PreparedSegmentBindingPatch<'_, CudaDeviceBuffer>,
+) -> Result<
+    Option<Vec<ferrum_interfaces::vnext::EncodedSegmentBindingNode<CudaDeviceCommand>>>,
+    CudaDeviceRuntimeError,
+> {
+    transformer::segment_bindings::encode(patch)
+}
+
 /// Typed CUDA runtime input for the currently installed vNext provider bundle.
 pub fn cuda_vnext_runtime_config(
     ordinal: usize,
@@ -114,6 +123,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime.rs").as_bytes(),
         q6_head_fingerprint.as_bytes(),
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
+        include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
         include_str!("../program_binding_rows.rs").as_bytes(),
         include_str!("../program_binding_upload.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
@@ -122,6 +132,9 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops.rs").as_bytes(),
         include_str!("vnext_ops/selection.rs").as_bytes(),
         include_str!("vnext_ops/transformer.rs").as_bytes(),
+        include_bytes!("vnext_ops/transformer/segment_bindings.rs"),
+        include_bytes!("vnext_ops/transformer/attention/segment_bindings.rs"),
+        include_bytes!("vnext_ops/transformer/causal_attention/segment_bindings.rs"),
         include_str!("vnext_ops/transformer/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_matrix.rs").as_bytes(),
@@ -1034,20 +1047,24 @@ impl CudaVNextComposition {
         requested_attention_policy: AttentionExecutionPolicy,
         purpose: CudaCompositionPurpose,
         upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
-        let runtime = Arc::new(match purpose {
-            CudaCompositionPurpose::Execution => {
-                CudaDeviceRuntime::new_with_program_binding_upload_strategy(
-                    config,
-                    upload_strategy,
-                )?
+        let runtime = Arc::new(
+            match purpose {
+                CudaCompositionPurpose::Execution => {
+                    CudaDeviceRuntime::new_with_program_binding_upload_strategy(
+                        config,
+                        upload_strategy,
+                    )?
+                }
+                CudaCompositionPurpose::NativeCatalogDeclaration => {
+                    CudaDeviceRuntime::new_for_native_catalog(config)?
+                }
             }
-            CudaCompositionPurpose::NativeCatalogDeclaration => {
-                CudaDeviceRuntime::new_for_native_catalog(config)?
-            }
-        });
+            .with_segment_binding_oracle(oracle),
+        );
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[allow(unused_mut)]
         let mut weight_materializers = vec![
@@ -1076,6 +1093,7 @@ impl CudaVNextComposition {
                 include_str!("vnext_runtime.rs").as_bytes(),
                 q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
+                include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
                 include_str!("../program_binding_rows.rs").as_bytes(),
                 include_str!("../program_binding_upload.rs").as_bytes(),
                 CUDA_ENGINE_PROVIDER_ID.as_bytes(),
@@ -1117,12 +1135,30 @@ impl CudaVNextComposition {
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_segment_binding_oracle(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+        )
+    }
+
+    /// Explicit test/diagnostic factory; normal product factories keep Disabled.
+    pub fn create_with_segment_binding_oracle(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let composition = Self::prepare(
             ordinal,
             device_id,
             requested_attention_policy,
             CudaCompositionPurpose::Execution,
             upload_strategy,
+            oracle,
         )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
@@ -1216,6 +1252,7 @@ pub fn cuda_validated_native_operator_catalog_input(
         requested_attention_policy,
         CudaCompositionPurpose::Execution,
         ProgramBindingUploadStrategy::Sparse,
+        ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
     )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
@@ -1238,6 +1275,7 @@ pub fn cuda_native_operator_catalog_input(
         requested_attention_policy,
         CudaCompositionPurpose::NativeCatalogDeclaration,
         ProgramBindingUploadStrategy::Sparse,
+        ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }

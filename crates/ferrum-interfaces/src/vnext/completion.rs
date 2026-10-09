@@ -27,6 +27,9 @@ use super::{
 
 mod readback_collection;
 pub use readback_collection::*;
+mod segment_binding_publication;
+use segment_binding_publication::SegmentBindingRecipeCache;
+pub use segment_binding_publication::{ReadySegmentBindingPublication, SegmentBindingPublication};
 mod completed_wave;
 pub(crate) use completed_wave::SuccessfulWaveCompletionSeal;
 mod state_transfer;
@@ -118,6 +121,7 @@ pub struct ExecutionLane<R: DeviceRuntime> {
     descriptor: DeviceDescriptor,
     fail_closed: AtomicBool,
     reusable_execution_epoch: AtomicU64,
+    segment_binding_recipe: OnceLock<SegmentBindingRecipeCache>,
     state: Mutex<ExecutionLaneState<R::Stream>>,
 }
 
@@ -158,6 +162,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             descriptor,
             fail_closed: AtomicBool::new(false),
             reusable_execution_epoch: AtomicU64::new(1),
+            segment_binding_recipe: OnceLock::new(),
             state: Mutex::new(ExecutionLaneState {
                 stream,
                 in_flight: 0,
@@ -412,6 +417,8 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                     self.reusable_execution_epoch
                         .store(next_epoch, Ordering::Release);
                 }
+                drop(state);
+                self.clear_segment_binding_recipe()?;
                 Ok(true)
             }
             Ok(Ok(_)) => {
@@ -1968,6 +1975,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             receipt: Some(receipt),
             record_receipt: Some(record_receipt),
             submission_may_have_happened: false,
+            segment_binding_candidate: None,
             finished: false,
         })
     }
@@ -3481,6 +3489,7 @@ impl<R: DeviceRuntime> IndeterminateSubmissionHandle<R> {
 pub struct CompletionHandle<R: DeviceRuntime> {
     reaper: Weak<CompletionReaper<R>>,
     receipt: SubmittedOperationReceipt,
+    segment_binding_publication: Option<Arc<Mutex<Option<SegmentBindingPublication<R>>>>>,
 }
 
 impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
@@ -3488,6 +3497,7 @@ impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
         Self {
             reaper: Weak::clone(&self.reaper),
             receipt: self.receipt.clone(),
+            segment_binding_publication: self.segment_binding_publication.clone(),
         }
     }
 }
@@ -3569,6 +3579,7 @@ pub(crate) struct CompletionReservation<R: DeviceRuntime> {
     receipt: Option<SubmittedOperationReceipt>,
     record_receipt: Option<SubmittedOperationReceipt>,
     submission_may_have_happened: bool,
+    segment_binding_candidate: Option<SegmentBindingPublication<R>>,
     finished: bool,
 }
 
@@ -3716,9 +3727,17 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         };
         drop(record);
         self.finished = true;
+        let segment_binding_publication = if transition.is_ok() {
+            self.segment_binding_candidate
+                .take()
+                .map(|candidate| Arc::new(Mutex::new(Some(candidate))))
+        } else {
+            None
+        };
         let handle = CompletionHandle {
             reaper: Arc::downgrade(&self.reaper),
             receipt,
+            segment_binding_publication,
         };
         match transition {
             Ok(()) => Ok(handle),

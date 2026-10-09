@@ -21,6 +21,7 @@ impl PrefillDecodeExecutionArg {
 pub enum InvocationPreparationStrategyArg {
     Full,
     IdentityProjection,
+    DecodeSegment,
 }
 
 impl InvocationPreparationStrategyArg {
@@ -28,6 +29,7 @@ impl InvocationPreparationStrategyArg {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::DecodeSegment => "decode-segment",
         }
     }
 }
@@ -224,6 +226,10 @@ mod tests {
                 (
                     "identity-projection",
                     InvocationPreparationStrategyArg::IdentityProjection,
+                ),
+                (
+                    "decode-segment",
+                    InvocationPreparationStrategyArg::DecodeSegment,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

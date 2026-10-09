@@ -223,7 +223,23 @@ impl OperationProvider<CudaDeviceRuntime> for CudaQ6MmqF32LastTokenProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode::encode(self, invocation)
+        encode::encode(self, invocation, None)
+            .map_err(|e| provider_failure(identity, "cuda.q6_f32_head.encode", e))
+    }
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<CudaDeviceCommand>,
+            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        let mut declaration = None;
+        let identity = invocation.participants()[0].identity().clone();
+        encode::encode(self, invocation, Some(&mut declaration))
+            .map(|operation| (operation, declaration))
             .map_err(|e| provider_failure(identity, "cuda.q6_f32_head.encode", e))
     }
     fn encode_reusable_execution_bindings(
@@ -241,6 +257,7 @@ pub(super) fn fingerprint() -> String {
     implementation_fingerprint(&[
         include_bytes!("q6_head.rs"),
         include_bytes!("q6_head/encode.rs"),
+        include_bytes!("transformer/segment_bindings.rs"),
         include_bytes!("native_io.rs"),
         include_bytes!("../vnext_ops.rs"),
         include_bytes!("native_blocks.rs"),

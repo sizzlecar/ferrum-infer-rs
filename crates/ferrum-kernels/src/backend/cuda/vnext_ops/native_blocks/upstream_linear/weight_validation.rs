@@ -225,6 +225,56 @@ impl WeightValidation {
         Ok(authority.encode(self.dynamic_command()?))
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn segment_declaration(
+        self: &Arc<Self>,
+        input_ordinal: u32,
+        component_id: &ferrum_interfaces::vnext::WeightId,
+        persistent_offset_bytes: u64,
+    ) -> crate::backend::cuda::vnext_ops::transformer::segment_bindings::ValidationRecipe {
+        use ferrum_interfaces::vnext::SegmentBindingDependency;
+        crate::backend::cuda::vnext_ops::transformer::segment_bindings::ValidationRecipe {
+            state: self.clone(),
+            declaration: SegmentBindingDependency {
+                input_ordinal,
+                component_id: component_id.clone(),
+                source_offset_bytes: 0,
+                source_length_bytes: self.identity.weight_bytes,
+                persistent_offset_bytes,
+                persistent_length_bytes: 4,
+                alignment_bytes: 4,
+                validation_identity: format!(
+                    "{}:{}:{}:{}:{}:{}:{}:{}",
+                    self.identity.implementation,
+                    self.identity.native_operator,
+                    self.identity.algorithm,
+                    self.identity.format,
+                    self.identity.inputs,
+                    self.identity.outputs,
+                    self.identity.padded_outputs,
+                    self.identity.weight_bytes,
+                ),
+            },
+            weight_element_type: self.weights.element_type(),
+        }
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn validate_segment_owners(
+        &self,
+        weights: &CudaBufferRegion,
+        flag: &CudaBufferRegion,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        if weights.plan_backing_identity()? != self.weights.plan_backing_identity()?
+            || flag.plan_backing_identity()? != self.flag.plan_backing_identity()?
+            || weights.length_bytes() != self.weights.length_bytes()
+            || flag.length_bytes() != self.flag.length_bytes()
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "segment retained dependency differs from the cold Plan owners",
+            ));
+        }
+        Ok(())
+    }
+
     /// Always attach outside capture, including replay submissions. This safe
     /// command belongs in the independently authorized Plan dependency prefix;
     /// it must never be captured into a reusable compute segment.

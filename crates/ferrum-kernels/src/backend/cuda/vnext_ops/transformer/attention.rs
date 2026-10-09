@@ -66,6 +66,7 @@ use crate::marlin_fp8_materializer::{
 
 mod native_projection;
 mod precision;
+pub(in crate::backend::cuda::vnext_ops) mod segment_bindings;
 use super::q8act_attention::PreparedAttentionProjections;
 use crate::backend::cuda::vnext_ops::native_blocks::q8act::Q8ActKernels;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
@@ -210,6 +211,8 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
+            include_bytes!("attention/segment_bindings.rs"),
+            include_bytes!("segment_bindings.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
@@ -640,8 +643,45 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             self.projection_runtime,
             invocation,
             EncodingTarget::Full,
+            None,
         )
         .and_then(Encoding::full)
+        .map_err(|message| {
+            OperationFailure::new(
+                identity,
+                ProfilePhase::Forward,
+                "cuda.gated_delta_recurrent_attention.encode",
+                message.chars().take(2048).collect::<String>(),
+                false,
+            )
+            .expect("core-issued CUDA attention identity must be valid")
+        })
+    }
+
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<CudaDeviceCommand>,
+            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        let mut declaration = None;
+        let identity = invocation.participants()[0].identity().clone();
+        encode_attention(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.functions,
+            self.precision,
+            self.execution_capabilities,
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+            invocation,
+            EncodingTarget::Full,
+            Some(&mut declaration),
+        )
+        .and_then(|encoded| encoded.full().map(|operation| (operation, declaration)))
         .map_err(|message| {
             OperationFailure::new(
                 identity,
@@ -689,6 +729,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
                 self.projection_runtime,
                 invocation,
                 EncodingTarget::BindingsOnly,
+                None,
             )
             .and_then(Encoding::bindings)
             .map_err(|message| {
@@ -1579,7 +1620,9 @@ fn encode_attention(
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
+    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
+    let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     if invocation.participants().is_empty()
         || invocation.operation().id.as_str() != precision.operation()
     {
@@ -1900,7 +1943,7 @@ fn encode_attention(
 
     let upstream_bindings = q8act
         .as_ref()
-        .map(|projections| projections.upstream_bindings(&invocation))
+        .map(|projections| projections.upstream_bindings(&invocation, segment_validations.as_mut()))
         .transpose()?
         .unwrap_or_default();
     let participant_count = u32::try_from(invocation.participants().len())
@@ -1984,6 +2027,11 @@ fn encode_attention(
             |encoded, dependency| encoded.with_retained_plan_dependency(dependency),
         );
         return Ok(Encoding::Bindings(bindings));
+    }
+
+    if let Some(declaration) = segment_declaration {
+        *declaration =
+            segment_bindings::declare(&invocation, segment_validations.unwrap_or_default())?;
     }
 
     let q8act = q8act.map(PreparedAttentionProjections::into_owned);

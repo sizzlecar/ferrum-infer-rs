@@ -371,6 +371,7 @@ impl<'a> PreparedAttentionProjections<'a> {
     pub fn upstream_bindings(
         &self,
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+        mut segment: Option<&mut Vec<super::super::segment_bindings::ValidationRecipe>>,
     ) -> Result<Vec<EncodedRetainedPlanDependency<CudaDeviceCommand>>, String> {
         let mut bindings = Vec::new();
         for projection in self.upstream.iter().flat_map(|s| s.launches.iter()) {
@@ -391,6 +392,13 @@ impl<'a> PreparedAttentionProjections<'a> {
                         .ok_or("validation without selected native leaf")?
                         .geometry()
                         .algorithm;
+                    if let Some(segment) = segment.as_deref_mut() {
+                        segment.push(validation.segment_declaration(
+                            retained.weight_input_ordinal(),
+                            &leaf.part.component_id,
+                            flag_offset(first_leaf, i as u64, algorithm)?,
+                        ));
+                    }
                     bindings.push(
                         validation
                             .retained_dependency(

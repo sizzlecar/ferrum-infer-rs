@@ -2557,7 +2557,7 @@ impl FerrumConfigBuilder {
             strategy.as_runtime_value(),
             source,
             source_key,
-            ["full", "identity-projection"],
+            ["full", "identity-projection", "decode-segment"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5344,6 +5344,16 @@ mod tests {
     fn invocation_preparation_records_full_default_and_explicit_sources() {
         let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
         for (value, runtime_source, source) in [
+            (
+                Some("decode-segment"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+            (
+                Some("decode-segment"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
             (
                 None,
                 RuntimeConfigSource::Default,

@@ -2120,6 +2120,8 @@ struct VNextWaveTimingMetrics {
     contract_validate_reserve: AtomicDurationMetrics,
     backing_input_encode: AtomicDurationMetrics,
     provider_node_encode: AtomicDurationMetrics,
+    segment_hit_provider_node_encode: AtomicDurationMetrics,
+    segment_binding_prepare_encode: AtomicDurationMetrics,
     node_identity_materialize: AtomicDurationMetrics,
     node_invocation_construct: AtomicDurationMetrics,
     provider_dynamic_binding_encode: AtomicDurationMetrics,
@@ -2229,12 +2231,14 @@ impl VNextWaveTimingMetrics {
                     "contract_validate_reserve": self.contract_validate_reserve.snapshot(),
                     "backing_input_encode": self.backing_input_encode.snapshot(),
                     "provider_node_encode": self.provider_node_encode.snapshot(),
+                    "segment_hit_provider_node_encode": self.segment_hit_provider_node_encode.snapshot(),
                     "provider_node_encode_breakdown": {
                         "collection": "profile_attached_only",
                         "identity_materialize": self.node_identity_materialize.snapshot(),
                         "invocation_construct": self.node_invocation_construct.snapshot(),
                         "dynamic_binding_encode": self.provider_dynamic_binding_encode.snapshot(),
                         "binding_validate_coalesce": self.binding_validate_coalesce.snapshot(),
+                        "segment_binding_prepare_encode": self.segment_binding_prepare_encode.snapshot(),
                     },
                     "lane_reserve_submit_arm": self.lane_reserve_submit_arm.snapshot(),
                     "lane_reserve_submit_arm_breakdown": {
@@ -2263,6 +2267,7 @@ impl VNextWaveTimingMetrics {
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
                 "provider_node_encode children sample node or patch operations, not waves; compare total_ns over parent wave samples rather than adding child averages",
+                "segment_hit_provider_node_encode is the overlapping subset of fully encoded hit waves, not an additive stage; segment_binding_prepare_encode measures hot-path attempts, including unsupported or failed attempts",
                 "identity_materialize includes one bulk identity materialization on eager waves; dynamic_binding_encode covers reusable binding payloads only; eager provider compute encoding and command assembly remain in the parent residual",
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
@@ -2286,6 +2291,8 @@ impl VNextWaveTimingMetrics {
             &self.contract_validate_reserve,
             &self.backing_input_encode,
             &self.provider_node_encode,
+            &self.segment_hit_provider_node_encode,
+            &self.segment_binding_prepare_encode,
             &self.node_identity_materialize,
             &self.node_invocation_construct,
             &self.provider_dynamic_binding_encode,
@@ -2438,6 +2445,12 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
             }
             SubmissionWaveDispatchStage::ProviderNodeEncode => {
                 self.provider_node_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentHitProviderNodeEncode => {
+                self.segment_hit_provider_node_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode => {
+                self.segment_binding_prepare_encode.record(elapsed)
             }
             SubmissionWaveDispatchStage::NodeIdentityMaterialize => {
                 self.node_identity_materialize.record(elapsed)
@@ -8213,6 +8226,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
+        // Take the optional hint before the completion handle moves to the
+        // worker. The ticket owns no Step or Sequence resources.
+        let segment_publication = completion.take_segment_binding_publication();
         let reaper = Arc::clone(&self.reaper);
         let observation = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
@@ -8339,6 +8355,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             self.metrics.record_failure(message.clone());
             return Err(FerrumError::resource_exhausted(message));
         }
+        // Only this successful, non-diagnostic terminal may qualify a hint.
+        // Readback/output/event/retirement failures below still discard it.
+        let ready_segment_publication =
+            segment_publication.and_then(|ticket| ticket.bind_completion(receipt.completion()));
         let processed = (|| -> Result<(
             Vec<ExecutorSamplingOutput>,
             u64,
@@ -8554,13 +8574,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         drop(receipt);
         match step.try_retire_normal() {
-            Ok(_) => {
+            Ok(retirement) => {
                 self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
                 if let Some(error) = execution_event_error {
                     let message = format!("vNext execution event emission failed: {error}");
                     self.metrics.record_failure(message.clone());
                     Err(FerrumError::backend(message))
                 } else {
+                    if let Some(ready) = ready_segment_publication {
+                        // Publication checks exact retirement and current entry.
+                        // A stale or cancelled hint cannot fail a completed wave.
+                        let _ = ready.publish(&retirement);
+                    }
                     Ok(logits)
                 }
             }

@@ -4,7 +4,9 @@ use super::*;
 pub(super) fn encode(
     provider: &CudaQ6MmqF32LastTokenProvider,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
+    let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     let precision = TokenPrecision::F32;
     transformer::ensure_invocation(&invocation, OPERATION)?;
     let first = &invocation.participants()[0];
@@ -142,6 +144,9 @@ pub(super) fn encode(
                     )
                     .map_err(|e| e.to_string())?;
                 if dependency_parts.insert(index) {
+                    if let Some(segment) = segment_validations.as_mut() {
+                        segment.push(state.segment_declaration(1, &part.component_id, offset));
+                    }
                     dependencies.push(
                         state
                             .retained_dependency(&invocation, 1, &part.component_id, offset)
@@ -168,6 +173,13 @@ pub(super) fn encode(
             }
         }
         plans.push(selected);
+    }
+    if let Some(declaration) = segment_declaration {
+        *declaration = Some(super::super::transformer::segment_bindings::declaration(
+            super::super::transformer::segment_bindings::DynamicRecipe::PlanDependencies,
+            Vec::new(),
+            segment_validations.unwrap_or_default(),
+        )?);
     }
     let kernels = provider.strict.clone();
     let command = CudaDeviceCommand::replayable_operation(

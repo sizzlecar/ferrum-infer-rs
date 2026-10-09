@@ -69,7 +69,7 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         }
     }
 
-    fn program_binding_node(self) -> Option<ProgramBindingNodeBinding> {
+    pub(super) fn program_binding_node(self) -> Option<ProgramBindingNodeBinding> {
         match self {
             Self::Invocation(_) => None,
             Self::Wave { wave, node_index } => wave.nodes().get(node_index).and_then(|node| {
@@ -116,7 +116,7 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         }
     }
 
-    fn participant_backing_snapshot(
+    pub(super) fn participant_backing_snapshot(
         self,
         index: usize,
     ) -> Result<&'a Arc<SequenceBackingSnapshot<R>>, VNextError> {
@@ -230,7 +230,7 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         }
     }
 
-    fn plan_evidence_matches(
+    pub(super) fn plan_evidence_matches(
         self,
         expected: &TrustedPlanRuntimeEvidence,
     ) -> Result<bool, VNextError> {
@@ -610,6 +610,225 @@ pub struct OperationInvocation<'a, B> {
     projection_numerics: Option<&'a crate::vnext::PreparedProjectionNumerics>,
 }
 
+/// Checks this fresh wave's common participant authority once. The private
+/// compiled identity recipe shares the same participant seeds across nodes;
+/// the private resource wave shares one PreparedParticipantAuthority. No
+/// buffer views or provider invocations are constructed by this gate.
+pub(super) fn validate_segment_wave_authority<'binding, R, I>(
+    runtime: &R,
+    resolved: &dyn ExecutablePlanView,
+    batch_identity: &BatchOperationIdentity,
+    wave: &PreparedStepSubmissionWave<R>,
+    active_bindings: I,
+) -> Result<(), VNextError>
+where
+    R: DeviceRuntime,
+    I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+{
+    let first = wave
+        .nodes()
+        .first()
+        .ok_or_else(|| invalid_operation("segment authority requires a nonempty prepared wave"))?;
+    let resources = OperationInvocationResources::Wave {
+        wave,
+        node_index: 0,
+    };
+    let count = resources.participant_count()?;
+    let plan = resolved.execution_plan();
+    // DecodeSegment is only issued by from_compiled_wave, whose immutable
+    // recipe derives every node from one shared participant-seed array. A
+    // general materialized batch must keep the original per-node validation.
+    if batch_identity.preparation_strategy()
+        != ferrum_types::InvocationPreparationStrategy::DecodeSegment
+        || count == 0
+        || count != active_bindings.len()
+        || count != first.participant_frames().len()
+        || count != first.participant_session_identities().len()
+        || batch_identity.node_count() != wave.nodes().len()
+        || batch_identity.batch_step_id() != wave.batch_step_id()
+        || batch_identity.batch_invocation_id() != wave.batch_invocation_id()
+        || batch_identity.lane_id() != wave.execution_lane_id()
+        || batch_identity.claimed_backing_fingerprint() != wave.fingerprint()
+        || batch_identity.plan_id() != plan.payload().plan_id()
+        || batch_identity.plan_hash() != plan.plan_hash()
+        || batch_identity.device_id() != plan.payload().device_id()
+        || batch_identity.runtime_implementation_fingerprint()
+            != plan.payload().device_runtime_implementation_fingerprint()
+    {
+        return Err(invalid_operation(
+            "segment identity differs from its fresh wave authority",
+        ));
+    }
+    for (index, prepared) in wave.nodes().iter().enumerate() {
+        let node = plan
+            .payload()
+            .nodes()
+            .get(prepared.plan_node_index())
+            .ok_or_else(|| {
+                invalid_operation("segment authority node is absent from the immutable plan")
+            })?;
+        // These borrowed fields reside in the same private Arc allocation.
+        // Equality alone would not establish that session/frame mutations
+        // cannot differ between nodes while this wave is being consumed.
+        if !std::ptr::eq(prepared.plan_evidence_ref(), first.plan_evidence_ref())
+            || !std::ptr::eq(prepared.participant_frames(), first.participant_frames())
+            || !std::ptr::eq(prepared.work_shape(), first.work_shape())
+            || prepared.participant_count() != first.participant_count()
+            || prepared.participant_session_identities().len() != count
+            || prepared.node_id() != node.id()
+            || batch_identity.node_id_at(index) != Some(node.id())
+            || batch_identity.operation_id_at(index) != Some(node.operation_id())
+            || batch_identity.provider_id_at(index) != Some(node.selection().selected_provider())
+            || batch_identity.node_participant_count(index) != Some(count)
+            || batch_identity.work_shape_fingerprint_at(index)
+                != Some(prepared.work_shape().fingerprint())
+        {
+            return Err(invalid_operation(
+                "segment nodes do not share one exact participant and plan authority",
+            ));
+        }
+    }
+    let first_identity = batch_identity.materialize_node(0)?;
+    if first_identity.participants().len() != count
+        || first_identity
+            .participants()
+            .iter()
+            .zip(first.participant_frames())
+            .any(|(participant, frame)| {
+                let key = participant.node_key();
+                key.sequence_authority() != frame.sequence_authority()
+                    || key.request_authority() != frame.request_authority()
+                    || key.frame_id() != frame.frame_id()
+                    || key.node_id() != first.node_id()
+            })
+    {
+        return Err(invalid_operation(
+            "segment participant node keys differ from the current frame",
+        ));
+    }
+    let node = &plan.payload().nodes()[first.plan_node_index()];
+    let mut device_agreements = [
+        DeviceDescriptorAgreement::default(),
+        DeviceDescriptorAgreement::default(),
+    ];
+    for (index, (participant, binding)) in first_identity
+        .participants()
+        .iter()
+        .zip(active_bindings)
+        .enumerate()
+    {
+        validate_prepared_participant_authority(
+            runtime,
+            resolved,
+            node,
+            participant.identity(),
+            first.node_id(),
+            resources,
+            binding,
+            index,
+            &mut device_agreements,
+        )?;
+    }
+    Ok(())
+}
+
+// Shared by the ordinary constructor and the one-per-wave segment authority
+// gate. Keep this closure's getter/error order identical for the generic path.
+#[allow(clippy::too_many_arguments)]
+fn validate_prepared_participant_authority<'runtime, 'a, R: DeviceRuntime>(
+    runtime: &'runtime R,
+    resolved: &'a dyn ExecutablePlanView,
+    node: &PlanNode,
+    identity: &ExecutionIdentityEnvelope,
+    node_id: &NodeId,
+    resources: OperationInvocationResources<'a, R>,
+    active_binding: &TrustedActiveSequenceBinding,
+    participant_index: usize,
+    device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
+) -> Result<
+    (
+        &'a Arc<AdmittedSequenceResources<R>>,
+        &'a Arc<SequenceBackingSnapshot<R>>,
+    ),
+    VNextError,
+> {
+    let plan = resolved.execution_plan();
+    let parts = identity.projection();
+    let participant = resources.participant(participant_index)?;
+    let participant_backing = resources.participant_backing_snapshot(participant_index)?;
+    let participant_frame = resources
+        .participant_frames()?
+        .get(participant_index)
+        .ok_or_else(|| invalid_operation("operation participant frame is missing"))?;
+    let participant_session = resources.participant_session_identity(participant_index)?;
+    let static_lease = participant.static_provisioning();
+    let lease_identity = static_lease.map(|lease| lease.identity());
+    let admission = active_binding.plan().static_provisioning_binding();
+    let pool_fingerprint = active_binding.static_pool_identity_fingerprint_ref();
+    let memory = plan.payload().memory();
+    if resources.participant_count()? != resources.prepared_participant_count()?
+        || resources.node_id()? != node_id
+        || participant_frame.sequence_authority() != participant.sequence_authority()
+        || participant_frame.request_authority() != participant.request_authority()
+        || !resources.plan_evidence_matches(active_binding.plan())?
+        || resources.coordinator_id()? != active_binding.coordinator_id()
+        || participant.sequence_authority() != active_binding.sequence_authority()
+        || participant.run_id() != active_binding.run_id()
+        || participant.request_id() != active_binding.request_id()
+        || !active_binding.matches_sequence_session(participant_session.0, participant_session.1)
+        || !device_agreements[0].matches(runtime.descriptor(), resolved.device())
+        || !device_agreements[1].matches(runtime.descriptor(), resolved.capabilities().device())
+        || runtime.descriptor().runtime_implementation_fingerprint
+            != plan.payload().device_runtime_implementation_fingerprint()
+        || parts.plan_id != Some(plan.payload().plan_id())
+        || parts.plan_hash != Some(plan.plan_hash())
+        || parts.frame_id != Some(participant_frame.frame_id())
+        || parts.node_invocation_id.is_none()
+        || parts.node_id != Some(node.id())
+        || parts.operation_id != Some(node.operation_id())
+        || parts.provider_id != Some(node.selection().selected_provider())
+        || parts.device_id != Some(plan.payload().device_id())
+        || parts.run_id != active_binding.run_id()
+        || parts.request_id != active_binding.request_id()
+        || parts.transaction_id != lease_identity.map(|identity| identity.transaction_id())
+        || parts.resource_pool_id != active_binding.static_pool_id().as_ref()
+        || parts.resource_pool_identity_fingerprint != pool_fingerprint
+        || parts.provisioning_run_id != lease_identity.map(|identity| identity.run_id())
+        || parts.provisioning_request_id != lease_identity.map(|identity| identity.request_id())
+        || parts.active_sequence_slot != Some(active_binding.sequence_authority().sparse_id())
+        || parts.admission_generation != Some(active_binding.sequence_authority().generation())
+        || parts.activation_epoch != Some(active_binding.activation_epoch())
+        || parts.runtime_implementation_fingerprint
+            != Some(active_binding.runtime_implementation_fingerprint())
+        || parts.active_sequence_fingerprint != Some(active_binding.fingerprint())
+        || parts.completed_sequence_fingerprint.is_some()
+        || parts.aborted_sequence_fingerprint.is_some()
+        || active_binding.plan().plan_id() != plan.payload().plan_id()
+        || active_binding.plan().plan_hash() != plan.plan_hash()
+        || active_binding.plan().device_id() != plan.payload().device_id()
+        || active_binding.plan().runtime_implementation_fingerprint()
+            != plan.payload().device_runtime_implementation_fingerprint()
+        || active_binding.runtime_implementation_fingerprint()
+            != runtime.descriptor().runtime_implementation_fingerprint
+        || active_binding.static_provisioning_identity() != lease_identity
+        || admission != static_lease.map(|lease| lease.admission())
+        || admission.is_some_and(|admission| {
+            admission.device_capacity_bytes() != memory.device_capacity_bytes()
+                || admission.usable_capacity_bytes() != memory.usable_capacity_bytes()
+                || admission.plan_static_bytes() != memory.static_bytes()
+                || admission.maximum_active_sequences() != memory.maximum_active_sequences()
+        })
+        || parts.resource_id.is_some()
+        || parts.resource_generation.is_some()
+        || parts.resource_batch_fingerprint.is_some()
+    {
+        return Err(invalid_operation(
+            "operation invocation does not close over the runtime device, selected plan, node, provider, request, and lease transaction",
+        ));
+    }
+    Ok((participant, participant_backing))
+}
+
 impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
     fn from_prepared<'runtime, R>(
@@ -630,81 +849,21 @@ impl<'a, B> OperationInvocation<'a, B> {
     where
         R: DeviceRuntime<Buffer = B>,
     {
+        let (participant, participant_backing) = validate_prepared_participant_authority(
+            runtime,
+            resolved,
+            node,
+            identity,
+            node_id,
+            resources,
+            active_binding,
+            participant_index,
+            device_agreements,
+        )?;
         let plan = resolved.execution_plan();
-        let parts = identity.projection();
-        let participant = resources.participant(participant_index)?;
-        let participant_backing = resources.participant_backing_snapshot(participant_index)?;
-        let participant_frame = resources
-            .participant_frames()?
-            .get(participant_index)
-            .ok_or_else(|| invalid_operation("operation participant frame is missing"))?;
-        let participant_session = resources.participant_session_identity(participant_index)?;
         let static_lease = participant.static_provisioning();
         let lease_identity = static_lease.map(|lease| lease.identity());
-        let admission = active_binding.plan().static_provisioning_binding();
-        let pool_fingerprint = active_binding.static_pool_identity_fingerprint_ref();
         let memory = plan.payload().memory();
-        if resources.participant_count()? != resources.prepared_participant_count()?
-            || resources.node_id()? != node_id
-            || participant_frame.sequence_authority() != participant.sequence_authority()
-            || participant_frame.request_authority() != participant.request_authority()
-            || !resources.plan_evidence_matches(active_binding.plan())?
-            || resources.coordinator_id()? != active_binding.coordinator_id()
-            || participant.sequence_authority() != active_binding.sequence_authority()
-            || participant.run_id() != active_binding.run_id()
-            || participant.request_id() != active_binding.request_id()
-            || !active_binding
-                .matches_sequence_session(participant_session.0, participant_session.1)
-            || !device_agreements[0].matches(runtime.descriptor(), resolved.device())
-            || !device_agreements[1].matches(runtime.descriptor(), resolved.capabilities().device())
-            || runtime.descriptor().runtime_implementation_fingerprint
-                != plan.payload().device_runtime_implementation_fingerprint()
-            || parts.plan_id != Some(plan.payload().plan_id())
-            || parts.plan_hash != Some(plan.plan_hash())
-            || parts.frame_id != Some(participant_frame.frame_id())
-            || parts.node_invocation_id.is_none()
-            || parts.node_id != Some(node.id())
-            || parts.operation_id != Some(node.operation_id())
-            || parts.provider_id != Some(node.selection().selected_provider())
-            || parts.device_id != Some(plan.payload().device_id())
-            || parts.run_id != active_binding.run_id()
-            || parts.request_id != active_binding.request_id()
-            || parts.transaction_id != lease_identity.map(|identity| identity.transaction_id())
-            || parts.resource_pool_id != active_binding.static_pool_id().as_ref()
-            || parts.resource_pool_identity_fingerprint != pool_fingerprint
-            || parts.provisioning_run_id != lease_identity.map(|identity| identity.run_id())
-            || parts.provisioning_request_id != lease_identity.map(|identity| identity.request_id())
-            || parts.active_sequence_slot != Some(active_binding.sequence_authority().sparse_id())
-            || parts.admission_generation != Some(active_binding.sequence_authority().generation())
-            || parts.activation_epoch != Some(active_binding.activation_epoch())
-            || parts.runtime_implementation_fingerprint
-                != Some(active_binding.runtime_implementation_fingerprint())
-            || parts.active_sequence_fingerprint != Some(active_binding.fingerprint())
-            || parts.completed_sequence_fingerprint.is_some()
-            || parts.aborted_sequence_fingerprint.is_some()
-            || active_binding.plan().plan_id() != plan.payload().plan_id()
-            || active_binding.plan().plan_hash() != plan.plan_hash()
-            || active_binding.plan().device_id() != plan.payload().device_id()
-            || active_binding.plan().runtime_implementation_fingerprint()
-                != plan.payload().device_runtime_implementation_fingerprint()
-            || active_binding.runtime_implementation_fingerprint()
-                != runtime.descriptor().runtime_implementation_fingerprint
-            || active_binding.static_provisioning_identity() != lease_identity
-            || admission != static_lease.map(|lease| lease.admission())
-            || admission.is_some_and(|admission| {
-                admission.device_capacity_bytes() != memory.device_capacity_bytes()
-                    || admission.usable_capacity_bytes() != memory.usable_capacity_bytes()
-                    || admission.plan_static_bytes() != memory.static_bytes()
-                    || admission.maximum_active_sequences() != memory.maximum_active_sequences()
-            })
-            || parts.resource_id.is_some()
-            || parts.resource_generation.is_some()
-            || parts.resource_batch_fingerprint.is_some()
-        {
-            return Err(invalid_operation(
-                "operation invocation does not close over the runtime device, selected plan, node, provider, request, and lease transaction",
-            ));
-        }
         let provider_resources = node.provider_resources();
         let projection = reusable_bindings_only
             .then_some(prepared.reusable_binding_projection.as_ref())

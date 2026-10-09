@@ -74,13 +74,15 @@ impl PrefillDecodeExecution {
 
 /// Host invocation preparation for native plan runtimes. Identity projection
 /// borrows compiled identity metadata while preserving per-invocation validation.
-/// It does not change resource preparation or device execution policy.
+/// DecodeSegment enables supported CUDA decode segments; unsupported or cold
+/// segments retain the full preparation path. Full remains the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InvocationPreparationStrategy {
     #[default]
     Full,
     IdentityProjection,
+    DecodeSegment,
 }
 
 impl InvocationPreparationStrategy {
@@ -88,14 +90,22 @@ impl InvocationPreparationStrategy {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::DecodeSegment => "decode-segment",
         }
+    }
+
+    pub const fn uses_identity_projection(self) -> bool {
+        matches!(self, Self::IdentityProjection | Self::DecodeSegment)
     }
 
     pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
-            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+            "decode-segment" => Ok(Self::DecodeSegment),
+            _ => Err(format!(
+                "expected full, identity-projection or decode-segment; got {raw:?}"
+            )),
         }
     }
 }
@@ -1371,6 +1381,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::DecodeSegment,
             InvocationPreparationStrategy::Full,
         ] {
             config

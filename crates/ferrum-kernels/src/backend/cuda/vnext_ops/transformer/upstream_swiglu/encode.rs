@@ -33,7 +33,9 @@ pub(super) fn encode(
     provider: &CudaUpstreamSwiGluProvider,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
+    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
+    let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     ensure_invocation(&invocation, provider.profile.operation_id())?;
     let first = &invocation.participants()[0];
     let prepared = first
@@ -219,6 +221,7 @@ pub(super) fn encode(
             &persistent,
             0,
             &mut bindings,
+            &mut segment_validations,
         )?;
         let down_leaves = prepare_leaves(
             target,
@@ -234,6 +237,7 @@ pub(super) fn encode(
             &persistent,
             gate_up.parts.len() as u64,
             &mut bindings,
+            &mut segment_validations,
         )?;
         if target == EncodingTarget::BindingsOnly {
             // All live matrix, scratch, range and dependency checks above are
@@ -285,6 +289,13 @@ pub(super) fn encode(
             |encoded, dependency| encoded.with_retained_plan_dependency(dependency),
         );
         return Ok(Encoding::Bindings(bindings));
+    }
+    if let Some(declaration) = segment_declaration {
+        *declaration = Some(super::super::segment_bindings::declaration(
+            super::super::segment_bindings::DynamicRecipe::PlanDependencies,
+            Vec::new(),
+            segment_validations.unwrap_or_default(),
+        )?);
     }
     let mut key = CudaCommandReplayKeyBuilder::new(
         provider.descriptor.provider_implementation_fingerprint(),
@@ -424,6 +435,7 @@ fn prepare_leaves(
     persistent: &CudaBufferRegion,
     first_leaf: u64,
     bindings: &mut Vec<EncodedRetainedPlanDependency<CudaDeviceCommand>>,
+    segment: &mut Option<Vec<super::super::segment_bindings::ValidationRecipe>>,
 ) -> Result<Vec<Leaf>, String> {
     let projection = prepared
         .projection(role)
@@ -470,6 +482,13 @@ fn prepare_leaves(
                         flag,
                     )
                     .map_err(|e| e.to_string())?;
+                if let Some(segment) = segment.as_mut() {
+                    segment.push(state.segment_declaration(
+                        projection.weight_input_ordinal(),
+                        &part.component_id,
+                        offset,
+                    ));
+                }
                 bindings.push(
                     state
                         .retained_dependency(

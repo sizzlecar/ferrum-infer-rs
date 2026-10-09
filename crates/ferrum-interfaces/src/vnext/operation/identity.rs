@@ -680,21 +680,116 @@ impl BatchOperationIdentity {
                 super::InvocationPreparationStats {
                     projected_identities: counts.projected_identities.load(Ordering::Relaxed),
                     parts_materialized: counts.materializations.load(Ordering::Relaxed),
+                    segment_hits: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.hits.load(Ordering::Relaxed)),
+                    segment_misses: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.misses.load(Ordering::Relaxed)),
+                    segment_encoded_nodes: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.encoded_nodes.load(Ordering::Relaxed)),
+                    segment_dynamic_resource_requests: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.dynamic_resource_requests.load(Ordering::Relaxed)),
+                    segment_unique_physical_buffers: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.unique_physical_buffers.load(Ordering::Relaxed)),
+                    segment_no_resident_program: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.no_resident_program.load(Ordering::Relaxed)),
+                    segment_no_cached_recipe: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.no_cached_recipe.load(Ordering::Relaxed)),
+                    segment_immutable_capability_unavailable: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| {
+                            s.immutable_capability_unavailable.load(Ordering::Relaxed)
+                        }),
+                    segment_unsupported_encoder: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.unsupported_encoder.load(Ordering::Relaxed)),
+                    segment_incomplete_declarations: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.incomplete_declarations.load(Ordering::Relaxed)),
                 }
             })
     }
 
-    pub(super) fn preparation_strategy(&self) -> InvocationPreparationStrategy {
-        if self
+    /// A hit records a successful complete segment preparation/encoding, not
+    /// submission or GPU completion. Cold/unsupported fallbacks record misses.
+    pub(super) fn record_segment_preparation(
+        &self,
+        hit: bool,
+        nodes: u64,
+        resources: u64,
+        buffers: u64,
+    ) {
+        let Some(counts) = self
             .data
             .deferred_recipe
             .as_ref()
-            .is_some_and(|recipe| recipe.projection_counts.is_some())
-        {
-            InvocationPreparationStrategy::IdentityProjection
-        } else {
-            InvocationPreparationStrategy::Full
+            .and_then(|recipe| recipe.projection_counts.as_ref())
+            .and_then(|counts| counts.segment.as_ref())
+        else {
+            return;
+        };
+        let add = |counter: &AtomicU64, value| {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            });
+        };
+        add(if hit { &counts.hits } else { &counts.misses }, 1);
+        if hit {
+            add(&counts.encoded_nodes, nodes);
+            add(&counts.dynamic_resource_requests, resources);
+            add(&counts.unique_physical_buffers, buffers);
         }
+    }
+
+    pub(super) fn record_segment_miss_reason(
+        &self,
+        reason: super::preparation::SegmentPreparationMissReason,
+    ) {
+        use super::preparation::SegmentPreparationMissReason as Reason;
+        let Some(counts) = self
+            .data
+            .deferred_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.projection_counts.as_ref())
+            .and_then(|counts| counts.segment.as_ref())
+        else {
+            return;
+        };
+        let counter = match reason {
+            Reason::NoResidentProgram => &counts.no_resident_program,
+            Reason::NoCachedRecipe => &counts.no_cached_recipe,
+            Reason::ImmutableCapabilityUnavailable => &counts.immutable_capability_unavailable,
+            Reason::UnsupportedEncoder => &counts.unsupported_encoder,
+            Reason::IncompleteDeclarations => &counts.incomplete_declarations,
+        };
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        });
+    }
+
+    pub(super) fn preparation_strategy(&self) -> InvocationPreparationStrategy {
+        self.data
+            .deferred_recipe
+            .as_ref()
+            .map_or(InvocationPreparationStrategy::Full, |recipe| {
+                recipe.strategy
+            })
     }
 
     pub fn nodes(&self) -> &[BatchOperationNodeIdentity] {
@@ -738,6 +833,7 @@ impl BatchOperationIdentity {
 
 #[derive(Debug)]
 struct DeferredBatchOperationIdentityRecipe {
+    strategy: InvocationPreparationStrategy,
     topology: CompiledSubmissionWaveIdentity,
     work_shape_fingerprint: String,
     participant_seeds: ParticipantIdentitySeeds,
@@ -762,6 +858,20 @@ impl ParticipantIdentitySeeds {
 struct IdentityProjectionCounts {
     projected_identities: AtomicU64,
     materializations: Arc<AtomicU64>,
+    segment: Option<Box<SegmentPreparationCounts>>,
+}
+#[derive(Debug, Default)]
+struct SegmentPreparationCounts {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    encoded_nodes: AtomicU64,
+    dynamic_resource_requests: AtomicU64,
+    unique_physical_buffers: AtomicU64,
+    no_resident_program: AtomicU64,
+    no_cached_recipe: AtomicU64,
+    immutable_capability_unavailable: AtomicU64,
+    unsupported_encoder: AtomicU64,
+    incomplete_declarations: AtomicU64,
 }
 impl DeferredBatchOperationIdentityRecipe {
     fn work_shape_fingerprint(&self) -> &str {
@@ -901,7 +1011,7 @@ impl BatchOperationIdentity {
             },
             "compiled physical batch identity encode failed",
         )?;
-        if strategy == InvocationPreparationStrategy::IdentityProjection {
+        if strategy.uses_identity_projection() {
             for seed in &participant_seeds {
                 seed.operation_identity(&topology, 0).ok_or_else(|| {
                     invalid_operation("compiled participant seed has no first node")
@@ -928,21 +1038,26 @@ impl BatchOperationIdentity {
             lane_id,
             claimed_backing_fingerprint,
             DeferredBatchOperationIdentityRecipe {
+                strategy,
                 topology,
                 work_shape_fingerprint,
                 participant_seeds: match strategy {
                     InvocationPreparationStrategy::Full => {
                         ParticipantIdentitySeeds::Full(participant_seeds)
                     }
-                    InvocationPreparationStrategy::IdentityProjection => {
+                    InvocationPreparationStrategy::IdentityProjection
+                    | InvocationPreparationStrategy::DecodeSegment => {
                         ParticipantIdentitySeeds::Projected(participant_seeds.into())
                     }
                 },
-                projection_counts: (strategy == InvocationPreparationStrategy::IdentityProjection)
-                    .then(|| IdentityProjectionCounts {
+                projection_counts: strategy.uses_identity_projection().then(|| {
+                    IdentityProjectionCounts {
                         projected_identities: AtomicU64::new(0),
                         materializations: Arc::new(AtomicU64::new(0)),
-                    }),
+                        segment: (strategy == InvocationPreparationStrategy::DecodeSegment)
+                            .then(|| Box::new(SegmentPreparationCounts::default())),
+                    }
+                }),
                 node_identities,
             },
             fingerprint,

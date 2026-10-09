@@ -18,7 +18,8 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_interfaces::vnext::{
     DeviceCommandPhase, DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
-    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionCapture, DeviceReusableExecutionEntryIdentity,
+    DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
     DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
@@ -855,11 +856,22 @@ struct CudaExecutableProgramSegment {
     logical_commands: Option<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct CudaExecutableProgram {
     descriptor: DeviceReusableExecutionProgram,
     segments: Vec<CudaExecutableProgramSegment>,
+    // Lazily issued only for the opt-in recipe consumer. Keeping this token
+    // alive does not retain a graph or authorize a missing cache entry.
+    recipe_owner: OnceLock<DeviceReusableExecutionEntryIdentity>,
 }
+
+impl PartialEq for CudaExecutableProgram {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor && self.segments == other.segments
+    }
+}
+
+impl Eq for CudaExecutableProgram {}
 
 impl CudaExecutableProgram {
     fn validate_monotonic_update(&self, next: &Self) -> Result<(), CudaReplayError> {
@@ -1014,6 +1026,7 @@ impl CudaExecutableProgram {
         Ok(Some(Self {
             descriptor,
             segments,
+            recipe_owner: OnceLock::new(),
         }))
     }
 }
@@ -1332,6 +1345,16 @@ impl CudaExecutableCache {
         report.captured_segments = captured.len();
         for (key, entry) in captured {
             let previous = self.entries.insert(key, entry);
+            if previous.is_some() {
+                // Preserve the original insertion/fallback behavior. An
+                // actual replacement only invalidates the optional recipe
+                // capability, even if program metadata is byte-identical.
+                for program in self.programs.values_mut() {
+                    if program.segments.iter().any(|segment| segment.key == key) {
+                        program.recipe_owner = OnceLock::new();
+                    }
+                }
+            }
             debug_assert!(previous.is_none());
         }
         for key in upload_keys {
@@ -1598,12 +1621,16 @@ impl CudaExecutableCache {
             detail: error.to_string(),
             eager_fallback_safe: false,
         })?;
-        let program = CudaExecutableProgram {
+        let mut program = CudaExecutableProgram {
             descriptor,
             segments,
+            recipe_owner: OnceLock::new(),
         };
         if let Some(current) = self.programs.get(capture.program_id()) {
             current.validate_monotonic_update(&program)?;
+            if current == &program {
+                program.recipe_owner = current.recipe_owner.clone();
+            }
         }
         // Preserve resident identities across updates. With on-demand work,
         // do not retain an unbounded history of empty program tombstones.
@@ -1667,6 +1694,31 @@ impl CudaExecutableCache {
             .collect::<Vec<_>>();
         catalog.sort_by(|left, right| left.program_id().cmp(right.program_id()));
         Ok(catalog)
+    }
+
+    /// Exact current entry identity, queried under the owning stream lock.
+    /// The caller must compare a freshly queried token, not a retained token's
+    /// strong count; eviction and recapture can preserve all numeric IDs.
+    pub(crate) fn recipe_program_owner(
+        &self,
+        program_id: &DeviceReusableExecutionProgramId,
+    ) -> Option<DeviceReusableExecutionEntryIdentity> {
+        let program = self.programs.get(program_id)?;
+        if !program.descriptor.is_determinism_ready()
+            || program.segments.is_empty()
+            || program
+                .segments
+                .iter()
+                .any(|segment| !self.entries.contains_key(&segment.key))
+        {
+            return None;
+        }
+        Some(
+            program
+                .recipe_owner
+                .get_or_init(DeviceReusableExecutionEntryIdentity::new)
+                .clone(),
+        )
     }
 
     pub(crate) fn launch_program_segment(

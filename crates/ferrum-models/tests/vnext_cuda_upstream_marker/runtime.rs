@@ -5,6 +5,8 @@ include!("../vnext_checkpoint_continuation/runtime.rs");
 #[path = "batch.rs"]
 mod batch;
 pub use batch::{BatchObservation, Path};
+#[path = "runtime/decode_segment.rs"]
+mod decode_segment;
 #[path = "runtime/extra.rs"]
 mod extra;
 #[path = "runtime/extra_all_rows.rs"]
@@ -50,6 +52,24 @@ impl Fixture {
         definition: Family,
         upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
     ) -> Self {
+        Self::for_family_with_segment_oracle(
+            kind,
+            reusable,
+            participants,
+            definition,
+            upload_strategy,
+            SegmentBindingOracleMode::Disabled,
+        )
+    }
+
+    fn for_family_with_segment_oracle(
+        kind: AttentionKind,
+        reusable: bool,
+        participants: u32,
+        definition: Family,
+        upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
+        oracle: SegmentBindingOracleMode,
+    ) -> Self {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let attention_arithmetic = definition.attention_arithmetic();
@@ -62,11 +82,12 @@ impl Fixture {
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
         let (runtime, registry, materializers, catalog) =
-            CudaVNextComposition::create_with_program_binding_upload_strategy(
+            CudaVNextComposition::create_with_segment_binding_oracle(
                 0,
                 id(format!("device.cuda.upstream-marker.{kind:?}")),
                 ferrum_types::AttentionExecutionPolicy::Portable,
                 upload_strategy,
+                oracle,
             )
             .unwrap()
             .into_parts();

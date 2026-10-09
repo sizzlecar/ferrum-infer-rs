@@ -51,6 +51,9 @@ mod sequence_state_transfer_tests;
 #[path = "sequence/completed_boundary/tests.rs"]
 mod completed_boundary_tests;
 
+#[path = "segment_permit_tests.rs"]
+mod segment_permit_tests;
+
 static NEXT_TEST_DEVICE: AtomicU64 = AtomicU64::new(1);
 const DYNAMIC_POOL_CONCURRENT_WORKERS: usize = 1;
 const MAX_DYNAMIC_POOL_TEST_WORKERS: usize = 2;

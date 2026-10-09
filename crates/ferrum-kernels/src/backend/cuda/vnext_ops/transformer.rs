@@ -93,6 +93,7 @@ mod q8act_attention;
 mod q8act_swiglu;
 mod replay_encoding;
 mod rn_fragment_swiglu;
+pub(in crate::backend::cuda::vnext_ops) mod segment_bindings;
 mod upstream_swiglu;
 pub(super) use q8act_swiglu::CudaQ8ActSwiGluProvider;
 pub(super) use upstream_swiglu::CudaUpstreamSwiGluProvider;

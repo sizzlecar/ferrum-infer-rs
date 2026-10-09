@@ -899,6 +899,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
         validate_program_binding_upload_strategy(config, false)?;
+        validate_invocation_preparation_strategy(config, false)?;
         let vocab_size = config
             .engine_config
             .model
@@ -1138,6 +1139,21 @@ where
     }
 }
 
+fn validate_invocation_preparation_strategy(
+    config: &ComponentConfig,
+    plan_runtime: bool,
+) -> Result<()> {
+    if config.engine_config.runtime.invocation_preparation_strategy
+        == ferrum_types::InvocationPreparationStrategy::DecodeSegment
+        && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime)
+    {
+        return Err(FerrumError::unsupported(
+            "decode-segment invocation preparation requires a CUDA plan runtime",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_program_binding_upload_strategy(
     config: &ComponentConfig,
     plan_runtime: bool,
@@ -1195,6 +1211,7 @@ fn create_registered_vnext_executor(
     use ferrum_models::vnext::ProductionExecutionKind;
 
     validate_program_binding_upload_strategy(config, true)?;
+    validate_invocation_preparation_strategy(config, true)?;
     validate_registered_vnext_backend(
         registration.execution_kind(),
         &config.device,
@@ -1390,6 +1407,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use ferrum_models::weight_format::WeightFormat;
 
         validate_program_binding_upload_strategy(config, true)?;
+        validate_invocation_preparation_strategy(config, true)?;
         // Try to load model from path
         let checkpoint_capture_enabled = config
             .engine_config
@@ -1474,6 +1492,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             }
         }
         validate_program_binding_upload_strategy(config, false)?;
+        validate_invocation_preparation_strategy(config, false)?;
         if checkpoint_capture_enabled {
             return Err(FerrumError::unsupported(
                 "vNext checkpoint capture requires a registered vNext model package",
@@ -1949,6 +1968,57 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     mod mixed_batch_tests;
+
+    #[test]
+    fn invocation_preparation_decode_segment_requires_cuda_plan_runtime() {
+        use ferrum_types::InvocationPreparationStrategy;
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                for strategy in [
+                    InvocationPreparationStrategy::Full,
+                    InvocationPreparationStrategy::IdentityProjection,
+                ] {
+                    config.engine_config.runtime.invocation_preparation_strategy = strategy;
+                    validate_invocation_preparation_strategy(&config, plan_runtime).unwrap();
+                }
+                config.engine_config.runtime.invocation_preparation_strategy =
+                    InvocationPreparationStrategy::DecodeSegment;
+                assert_eq!(
+                    validate_invocation_preparation_strategy(&config, plan_runtime).is_ok(),
+                    plan_runtime && matches!(config.device, Device::CUDA(_))
+                );
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_invocation_preparation_strategy(&config, true).is_err());
+        }
+    }
+
+    #[test]
+    fn invocation_preparation_decode_segment_rejects_unsupported_factories_before_loading() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.invocation_preparation_strategy =
+            ferrum_types::InvocationPreparationStrategy::DecodeSegment;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        let error = tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("decode-segment invocation preparation requires a CUDA plan runtime"));
+        config.device = Device::CUDA(0);
+        let error = tokio_test::block_on(StubExecutorFactory.create(&config))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("decode-segment invocation preparation requires a CUDA plan runtime"));
+    }
 
     #[test]
     fn program_binding_upload_requires_cuda_plan_runtime() {

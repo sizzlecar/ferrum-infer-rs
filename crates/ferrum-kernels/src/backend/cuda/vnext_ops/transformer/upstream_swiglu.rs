@@ -50,6 +50,7 @@ impl CudaUpstreamSwiGluProvider {
             include_bytes!("../native_blocks/upstream_linear.rs"),
             include_bytes!("../native_blocks/upstream_linear/preparation.rs"),
             include_bytes!("../native_blocks/upstream_linear/weight_validation.rs"),
+            include_bytes!("segment_bindings.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("../../../../native_ops/upstream_linear.rs"),
@@ -278,15 +279,47 @@ impl OperationProvider<CudaDeviceRuntime> for CudaUpstreamSwiGluProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode::encode(self, invocation, replay_encoding::EncodingTarget::Full)
-            .and_then(replay_encoding::Encoding::full)
-            .map_err(|message| {
-                provider_failure(
-                    identity,
-                    "cuda.dense_swiglu.upstream-marker-v2.encode",
-                    message,
-                )
-            })
+        encode::encode(
+            self,
+            invocation,
+            replay_encoding::EncodingTarget::Full,
+            None,
+        )
+        .and_then(replay_encoding::Encoding::full)
+        .map_err(|message| {
+            provider_failure(
+                identity,
+                "cuda.dense_swiglu.upstream-marker-v2.encode",
+                message,
+            )
+        })
+    }
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<CudaDeviceCommand>,
+            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        let mut declaration = None;
+        let identity = invocation.participants()[0].identity().clone();
+        encode::encode(
+            self,
+            invocation,
+            replay_encoding::EncodingTarget::Full,
+            Some(&mut declaration),
+        )
+        .and_then(|encoded| encoded.full().map(|operation| (operation, declaration)))
+        .map_err(|message| {
+            provider_failure(
+                identity,
+                "cuda.dense_swiglu.upstream-marker-v2.encode",
+                message,
+            )
+        })
     }
     fn encode_reusable_execution_bindings(
         &self,
@@ -299,6 +332,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaUpstreamSwiGluProvider {
             self,
             invocation,
             replay_encoding::EncodingTarget::BindingsOnly,
+            None,
         )
         .and_then(replay_encoding::Encoding::bindings)
         .map_err(|message| {
