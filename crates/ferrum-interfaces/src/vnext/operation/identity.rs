@@ -680,20 +680,32 @@ impl BatchOperationIdentity {
                 super::InvocationPreparationStats {
                     projected_identities: counts.projected_identities.load(Ordering::Relaxed),
                     parts_materialized: counts.materializations.load(Ordering::Relaxed),
+                    borrowed_dependency_comparisons: counts
+                        .borrowed_dependency_comparisons
+                        .load(Ordering::Relaxed),
                 }
             })
     }
 
     pub(super) fn preparation_strategy(&self) -> InvocationPreparationStrategy {
-        if self
+        self.data
+            .deferred_recipe
+            .as_ref()
+            .map_or(InvocationPreparationStrategy::Full, |recipe| {
+                recipe.strategy
+            })
+    }
+
+    pub(super) fn record_borrowed_dependency_comparisons(&self, comparisons: u64) {
+        if let Some(counts) = self
             .data
             .deferred_recipe
             .as_ref()
-            .is_some_and(|recipe| recipe.projection_counts.is_some())
+            .and_then(|recipe| recipe.projection_counts.as_ref())
         {
-            InvocationPreparationStrategy::IdentityProjection
-        } else {
-            InvocationPreparationStrategy::Full
+            counts
+                .borrowed_dependency_comparisons
+                .fetch_add(comparisons, Ordering::Relaxed);
         }
     }
 
@@ -738,6 +750,7 @@ impl BatchOperationIdentity {
 
 #[derive(Debug)]
 struct DeferredBatchOperationIdentityRecipe {
+    strategy: InvocationPreparationStrategy,
     topology: CompiledSubmissionWaveIdentity,
     work_shape_fingerprint: String,
     participant_seeds: ParticipantIdentitySeeds,
@@ -762,6 +775,7 @@ impl ParticipantIdentitySeeds {
 struct IdentityProjectionCounts {
     projected_identities: AtomicU64,
     materializations: Arc<AtomicU64>,
+    borrowed_dependency_comparisons: AtomicU64,
 }
 impl DeferredBatchOperationIdentityRecipe {
     fn work_shape_fingerprint(&self) -> &str {
@@ -901,7 +915,7 @@ impl BatchOperationIdentity {
             },
             "compiled physical batch identity encode failed",
         )?;
-        if strategy == InvocationPreparationStrategy::IdentityProjection {
+        if strategy != InvocationPreparationStrategy::Full {
             for seed in &participant_seeds {
                 seed.operation_identity(&topology, 0).ok_or_else(|| {
                     invalid_operation("compiled participant seed has no first node")
@@ -928,21 +942,25 @@ impl BatchOperationIdentity {
             lane_id,
             claimed_backing_fingerprint,
             DeferredBatchOperationIdentityRecipe {
+                strategy,
                 topology,
                 work_shape_fingerprint,
                 participant_seeds: match strategy {
                     InvocationPreparationStrategy::Full => {
                         ParticipantIdentitySeeds::Full(participant_seeds)
                     }
-                    InvocationPreparationStrategy::IdentityProjection => {
+                    InvocationPreparationStrategy::IdentityProjection
+                    | InvocationPreparationStrategy::BorrowedDependency => {
                         ParticipantIdentitySeeds::Projected(participant_seeds.into())
                     }
                 },
-                projection_counts: (strategy == InvocationPreparationStrategy::IdentityProjection)
-                    .then(|| IdentityProjectionCounts {
+                projection_counts: (strategy != InvocationPreparationStrategy::Full).then(|| {
+                    IdentityProjectionCounts {
                         projected_identities: AtomicU64::new(0),
                         materializations: Arc::new(AtomicU64::new(0)),
-                    }),
+                        borrowed_dependency_comparisons: AtomicU64::new(0),
+                    }
+                }),
                 node_identities,
             },
             fingerprint,

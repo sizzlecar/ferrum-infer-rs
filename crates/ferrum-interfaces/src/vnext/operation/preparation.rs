@@ -4,6 +4,9 @@
 pub struct InvocationPreparationStats {
     pub projected_identities: u64,
     pub parts_materialized: u64,
+    /// Later-participant comparisons in successfully issued dependency authorities.
+    /// A subsequent provider/dispatch failure does not undo an issued authority.
+    pub borrowed_dependency_comparisons: u64,
 }
 
 pub trait InvocationPreparationSink {

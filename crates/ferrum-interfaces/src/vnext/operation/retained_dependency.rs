@@ -62,6 +62,40 @@ pub(super) struct RetainedPlanDependencyRange {
     pub length: u64,
 }
 
+/// A range whose original validation has succeeded, borrowed only for this call.
+/// It owns no authority and cannot outlive the actual admitted view.
+pub(super) struct BorrowedDependencyRange<'a> {
+    pub descriptor: &'a BufferDescriptor,
+    pub transaction: &'a ResourceTransactionIdentity,
+    pub generation: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub retention: &'a DeviceBufferRetention,
+}
+
+impl BorrowedDependencyRange<'_> {
+    pub(super) fn into_owned(self) -> (RetainedPlanDependencyRange, DeviceBufferRetention) {
+        (
+            RetainedPlanDependencyRange {
+                descriptor: self.descriptor.clone(),
+                transaction: self.transaction.clone(),
+                generation: self.generation,
+                offset: self.offset,
+                length: self.length,
+            },
+            self.retention.clone(),
+        )
+    }
+
+    fn matches(&self, owned: &RetainedPlanDependencyRange) -> bool {
+        self.descriptor == &owned.descriptor
+            && self.transaction == &owned.transaction
+            && self.generation == owned.generation
+            && self.offset == owned.offset
+            && self.length == owned.length
+    }
+}
+
 /// No public constructor: only a validated, live invocation can issue this
 /// authority. The ownership remains alive even if a backend command forgets
 /// to retain its borrowed source view.
@@ -100,6 +134,9 @@ impl<B> BatchedOperationInvocation<'_, B> {
             return Err(invalid_operation("retained Plan dependency requires owned Plan Preserve storage and a validation identity"));
         }
         let mut issued = None;
+        let borrowed = self.batch_identity().preparation_strategy()
+            == ferrum_types::InvocationPreparationStrategy::BorrowedDependency;
+        let mut comparisons = 0_u64;
         for participant in self.participants() {
             let binding = participant
                 .bindings()
@@ -150,6 +187,32 @@ impl<B> BatchedOperationInvocation<'_, B> {
                     "retained dependency source/destination ownership, type, or alignment differs",
                 ));
             }
+            if let Some(previous) = issued.as_ref().filter(|_| borrowed) {
+                let previous: &RetainedPlanDependencyAuthority = previous;
+                // Preserve the source-then-destination validation order. Only
+                // the temporary owned representation is omitted for later P.
+                let source =
+                    source.borrowed_dependency_range(source_offset, spec.source_length_bytes)?;
+                let destination = destination.borrowed_dependency_range(
+                    spec.persistent_offset_bytes,
+                    spec.persistent_length_bytes,
+                )?;
+                let expected = &previous.identity;
+                if self.node_id() != &expected.node
+                    || self.provider_id() != &expected.provider
+                    || !source.matches(&expected.source)
+                    || !destination.matches(&expected.destination)
+                    || spec.component_id != &expected.component
+                    || spec.input_ordinal != expected.input_ordinal
+                    || spec.validation_identity != expected.validation_identity
+                {
+                    return Err(invalid_operation(
+                        "retained dependency participants do not share exact Plan allocations",
+                    ));
+                }
+                comparisons = comparisons.saturating_add(1);
+                continue;
+            }
             let (source, source_retention) =
                 source.retained_dependency_range(source_offset, spec.source_length_bytes)?;
             let (destination, destination_retention) = destination.retained_dependency_range(
@@ -181,7 +244,15 @@ impl<B> BatchedOperationInvocation<'_, B> {
                 });
             }
         }
-        issued.ok_or_else(|| invalid_operation("retained dependency has no participants"))
+        let issued =
+            issued.ok_or_else(|| invalid_operation("retained dependency has no participants"))?;
+        // One update per successful authority, never per participant or failed
+        // attempt. No authority or scope is reused by a later invocation.
+        if borrowed {
+            self.batch_identity()
+                .record_borrowed_dependency_comparisons(comparisons);
+        }
+        Ok(issued)
     }
 }
 

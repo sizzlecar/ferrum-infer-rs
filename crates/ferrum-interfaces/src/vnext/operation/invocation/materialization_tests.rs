@@ -9,6 +9,8 @@ use std::time::Instant;
 use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::prepare_wave;
 
+#[path = "borrowed_dependency_tests.rs"]
+mod borrowed_dependency_tests;
 #[path = "coverage_tests.rs"]
 mod coverage_tests;
 #[path = "descriptor_agreement_tests.rs"]

@@ -7,6 +7,7 @@ pub(super) struct PreparationMetrics {
     dispatch_attempts: AtomicU64,
     projected_identities: AtomicU64,
     parts_materialized: AtomicU64,
+    borrowed_dependency_comparisons: AtomicU64,
 }
 
 impl InvocationPreparationSink for PreparationMetrics {
@@ -16,6 +17,8 @@ impl InvocationPreparationSink for PreparationMetrics {
             .fetch_add(stats.projected_identities, Ordering::Relaxed);
         self.parts_materialized
             .fetch_add(stats.parts_materialized, Ordering::Relaxed);
+        self.borrowed_dependency_comparisons
+            .fetch_add(stats.borrowed_dependency_comparisons, Ordering::Relaxed);
     }
 }
 
@@ -25,6 +28,7 @@ impl PreparationMetrics {
             &self.dispatch_attempts,
             &self.projected_identities,
             &self.parts_materialized,
+            &self.borrowed_dependency_comparisons,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -38,6 +42,8 @@ impl PreparationMetrics {
             "dispatch_attempts": self.dispatch_attempts.load(Ordering::Relaxed),
             "projected_identities": self.projected_identities.load(Ordering::Relaxed),
             "parts_materialized": self.parts_materialized.load(Ordering::Relaxed),
+            "borrowed_dependency_comparisons": self.borrowed_dependency_comparisons.load(Ordering::Relaxed),
+            "borrowed_dependency_scope": "later_participant_comparisons_in_successfully_issued_authorities_through_dispatch_return; failed_authority_attempts_excluded; later_dispatch_failure_does_not_undo_issuance; not_GPU_completion",
         })
     }
 }
@@ -63,32 +69,38 @@ mod tests {
         metrics.record_preparation(InvocationPreparationStats {
             projected_identities: 5,
             parts_materialized: 2,
+            borrowed_dependency_comparisons: 7,
         });
         metrics.record_preparation(InvocationPreparationStats {
             projected_identities: 3,
             parts_materialized: 0,
+            borrowed_dependency_comparisons: 3,
         });
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot["dispatch_attempts"], 2);
         assert_eq!(snapshot["projected_identities"], 8);
         assert_eq!(snapshot["parts_materialized"], 2);
+        assert_eq!(snapshot["borrowed_dependency_comparisons"], 10);
         executor_metrics.reset_after_startup();
         let reset = metrics.snapshot();
         for field in [
             "dispatch_attempts",
             "projected_identities",
             "parts_materialized",
+            "borrowed_dependency_comparisons",
         ] {
             assert_eq!(reset[field], 0);
         }
         metrics.record_preparation(InvocationPreparationStats {
             projected_identities: 1,
             parts_materialized: 1,
+            borrowed_dependency_comparisons: 2,
         });
         let next = metrics.snapshot();
         assert_eq!(next["dispatch_attempts"], 1);
         assert_eq!(next["projected_identities"], 1);
         assert_eq!(next["parts_materialized"], 1);
+        assert_eq!(next["borrowed_dependency_comparisons"], 2);
     }
 
     #[test]
@@ -125,6 +137,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::BorrowedDependency,
             InvocationPreparationStrategy::Full,
         ] {
             engine

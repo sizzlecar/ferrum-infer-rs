@@ -855,6 +855,15 @@ impl<'a, B> OperationBufferView<'a, B> {
         ),
         VNextError,
     > {
+        self.borrowed_dependency_range(offset, length)
+            .map(|range| range.into_owned())
+    }
+
+    pub(super) fn borrowed_dependency_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<super::retained_dependency::BorrowedDependencyRange<'_>, VNextError> {
         super::retained_dependency::checked_range(offset, length, self.descriptor.size_bytes)?;
         let OperationBufferSource::Static { view, retention } = &self.source else {
             return Err(invalid_operation(
@@ -869,16 +878,14 @@ impl<'a, B> OperationBufferView<'a, B> {
                 "retained dependency has no live Plan generation",
             ));
         }
-        Ok((
-            super::retained_dependency::RetainedPlanDependencyRange {
-                descriptor: self.descriptor.clone(),
-                transaction: view.identity().clone(),
-                generation: view.generation(),
-                offset,
-                length,
-            },
-            retention.clone(),
-        ))
+        Ok(super::retained_dependency::BorrowedDependencyRange {
+            descriptor: &self.descriptor,
+            transaction: view.identity(),
+            generation: view.generation(),
+            offset,
+            length,
+            retention,
+        })
     }
 
     pub fn translate(

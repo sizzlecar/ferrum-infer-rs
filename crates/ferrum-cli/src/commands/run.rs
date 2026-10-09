@@ -2933,6 +2933,10 @@ mod tests {
                 Some(InvocationPreparationStrategyArg::IdentityProjection),
                 InvocationPreparationStrategy::IdentityProjection,
             ),
+            (
+                Some(InvocationPreparationStrategyArg::BorrowedDependency),
+                InvocationPreparationStrategy::BorrowedDependency,
+            ),
         ] {
             command.invocation_preparation_strategy = option;
             let snapshot = crate::commands::serve::merge_runtime_config_sources(

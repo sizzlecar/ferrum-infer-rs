@@ -2546,7 +2546,7 @@ impl FerrumConfigBuilder {
             strategy.as_runtime_value(),
             source,
             source_key,
-            ["full", "identity-projection"],
+            ["full", "identity-projection", "borrowed-dependency"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5293,6 +5293,11 @@ mod tests {
     fn invocation_preparation_records_full_default_and_explicit_sources() {
         let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
         for (value, runtime_source, source) in [
+            (
+                Some("borrowed-dependency"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
             (
                 None,
                 RuntimeConfigSource::Default,

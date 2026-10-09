@@ -81,6 +81,7 @@ pub enum InvocationPreparationStrategy {
     #[default]
     Full,
     IdentityProjection,
+    BorrowedDependency,
 }
 
 impl InvocationPreparationStrategy {
@@ -88,6 +89,7 @@ impl InvocationPreparationStrategy {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::BorrowedDependency => "borrowed-dependency",
         }
     }
 
@@ -95,7 +97,10 @@ impl InvocationPreparationStrategy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
-            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+            "borrowed-dependency" => Ok(Self::BorrowedDependency),
+            _ => Err(format!(
+                "expected full, identity-projection or borrowed-dependency; got {raw:?}"
+            )),
         }
     }
 }
@@ -1331,6 +1336,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::BorrowedDependency,
             InvocationPreparationStrategy::Full,
         ] {
             config

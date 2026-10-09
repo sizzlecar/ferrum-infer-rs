@@ -5,6 +5,8 @@ include!("../vnext_checkpoint_continuation/runtime.rs");
 #[path = "batch.rs"]
 mod batch;
 pub use batch::{BatchObservation, Path};
+#[path = "runtime/borrowed_dependency.rs"]
+mod borrowed_dependency;
 #[path = "runtime/extra.rs"]
 mod extra;
 #[path = "runtime/extra_all_rows.rs"]
