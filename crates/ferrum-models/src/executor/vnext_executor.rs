@@ -2122,6 +2122,10 @@ struct VNextWaveTimingMetrics {
     provider_node_encode: AtomicDurationMetrics,
     segment_hit_provider_node_encode: AtomicDurationMetrics,
     segment_binding_prepare_encode: AtomicDurationMetrics,
+    segment_fresh_authority_windows: AtomicDurationMetrics,
+    segment_backing_permit_metadata: AtomicDurationMetrics,
+    segment_node_dependencies_regions: AtomicDurationMetrics,
+    segment_backend_encode_validate: AtomicDurationMetrics,
     node_identity_materialize: AtomicDurationMetrics,
     node_invocation_construct: AtomicDurationMetrics,
     provider_dynamic_binding_encode: AtomicDurationMetrics,
@@ -2239,6 +2243,7 @@ impl VNextWaveTimingMetrics {
                         "dynamic_binding_encode": self.provider_dynamic_binding_encode.snapshot(),
                         "binding_validate_coalesce": self.binding_validate_coalesce.snapshot(),
                         "segment_binding_prepare_encode": self.segment_binding_prepare_encode.snapshot(),
+                        "segment_binding_prepare_encode_breakdown": self.segment_binding_prepare_encode_breakdown(),
                     },
                     "lane_reserve_submit_arm": self.lane_reserve_submit_arm.snapshot(),
                     "lane_reserve_submit_arm_breakdown": {
@@ -2268,6 +2273,8 @@ impl VNextWaveTimingMetrics {
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
                 "provider_node_encode children sample node or patch operations, not waves; compare total_ns over parent wave samples rather than adding child averages",
                 "segment_hit_provider_node_encode is the overlapping subset of fully encoded hit waves, not an additive stage; segment_binding_prepare_encode measures hot-path attempts, including unsupported or failed attempts",
+                "segment_binding_prepare_encode children are mutually exclusive host intervals within that parent, not additional work; early returns record only entered stages and panic skips the active stage; compare child totals and sample counts before calculating shares",
+                "segment preparation includes pool lock waits, allocations and backend host calls, not pure CPU; errors may include local cleanup in the active child; successful parent residual includes timer transitions, sink recording, final local cleanup and dispatch result map/accounting; snapshots are not atomic",
                 "identity_materialize includes one bulk identity materialization on eager waves; dynamic_binding_encode covers reusable binding payloads only; eager provider compute encoding and command assembly remain in the parent residual",
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
@@ -2275,6 +2282,16 @@ impl VNextWaveTimingMetrics {
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
             ],
+        })
+    }
+
+    fn segment_binding_prepare_encode_breakdown(&self) -> serde_json::Value {
+        serde_json::json!({
+            "collection": "profile_attached_only",
+            "fresh_authority_and_windows": self.segment_fresh_authority_windows.snapshot(),
+            "backing_permit_and_metadata": self.segment_backing_permit_metadata.snapshot(),
+            "node_dependencies_and_regions": self.segment_node_dependencies_regions.snapshot(),
+            "backend_encode_and_validate": self.segment_backend_encode_validate.snapshot(),
         })
     }
 
@@ -2293,6 +2310,10 @@ impl VNextWaveTimingMetrics {
             &self.provider_node_encode,
             &self.segment_hit_provider_node_encode,
             &self.segment_binding_prepare_encode,
+            &self.segment_fresh_authority_windows,
+            &self.segment_backing_permit_metadata,
+            &self.segment_node_dependencies_regions,
+            &self.segment_backend_encode_validate,
             &self.node_identity_materialize,
             &self.node_invocation_construct,
             &self.provider_dynamic_binding_encode,
@@ -2451,6 +2472,18 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
             }
             SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode => {
                 self.segment_binding_prepare_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows => {
+                self.segment_fresh_authority_windows.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata => {
+                self.segment_backing_permit_metadata.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions => {
+                self.segment_node_dependencies_regions.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate => {
+                self.segment_backend_encode_validate.record(elapsed)
             }
             SubmissionWaveDispatchStage::NodeIdentityMaterialize => {
                 self.node_identity_materialize.record(elapsed)
@@ -11381,6 +11414,22 @@ mod tests {
                 SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 "binding_validate_coalesce",
             ),
+            (
+                SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+                "segment_binding_prepare_encode_breakdown/fresh_authority_and_windows",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+                "segment_binding_prepare_encode_breakdown/node_dependencies_and_regions",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
+                "segment_binding_prepare_encode_breakdown/backend_encode_and_validate",
+            ),
         ];
         for (index, (stage, _)) in stages.iter().enumerate() {
             sink.record(*stage, Duration::from_nanos(100 + index as u64));
@@ -11395,19 +11444,25 @@ mod tests {
             let snapshot = child(metrics);
             assert_eq!(snapshot["collection"], "profile_attached_only");
             for (index, (_, field)) in stages.iter().enumerate() {
-                assert_eq!(snapshot[field]["samples"], 2);
-                assert_eq!(snapshot[field]["total_ns"], 300 + 2 * index as u64);
+                let sample = snapshot.pointer(&format!("/{field}")).unwrap();
+                assert_eq!(sample["samples"], 2);
+                assert_eq!(sample["total_ns"], 300 + 2 * index as u64);
             }
             // Recording a nested interval does not invent a parent wave sample.
             assert_eq!(metrics.snapshot()["submitted_wave_total"]["samples"], 0);
             metrics.reset();
             for (_, field) in stages {
-                assert_eq!(child(metrics)[field]["samples"], 0);
-                assert_eq!(child(metrics)[field]["total_ns"], 0);
+                let snapshot = child(metrics);
+                let sample = snapshot.pointer(&format!("/{field}")).unwrap();
+                assert_eq!(sample["samples"], 0);
+                assert_eq!(sample["total_ns"], 0);
             }
         }
         for (_, field) in stages {
-            assert_eq!(child(&other_phase)[field]["samples"], 0);
+            assert_eq!(
+                child(&other_phase).pointer(&format!("/{field}/samples")),
+                Some(&serde_json::json!(0))
+            );
         }
     }
 

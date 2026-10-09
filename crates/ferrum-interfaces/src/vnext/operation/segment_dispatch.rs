@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::buffer_view::sequence_execution_shape;
+use super::dispatch_contract::SubmissionWaveDispatchStageTimer;
 use super::foundation::invalid_operation;
 use super::invocation::{validate_segment_wave_authority, OperationInvocationResources};
 use super::preparation::SegmentPreparationMissReason;
@@ -90,6 +91,7 @@ fn validate_buffer<'a, R: DeviceRuntime>(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(super) fn encode_segment_wave<'binding, R, I>(
     runtime: &R,
     resolved: &dyn ExecutablePlanView,
@@ -102,6 +104,35 @@ where
     R: DeviceRuntime,
     I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
 {
+    encode_segment_wave_with_timing(
+        runtime,
+        resolved,
+        identity,
+        wave,
+        active,
+        recipe,
+        &super::dispatch_contract::DisabledSubmissionWaveDispatchTimingSink,
+    )
+}
+
+pub(super) fn encode_segment_wave_with_timing<'binding, R, I, S>(
+    runtime: &R,
+    resolved: &dyn ExecutablePlanView,
+    identity: &BatchOperationIdentity,
+    wave: &PreparedStepSubmissionWave<R>,
+    active: I,
+    recipe: &CompiledSegmentBindingRecipe,
+    timing_sink: &S,
+) -> Result<Option<(Vec<SegmentEncodedNode<R::Command>>, SegmentPreparationFacts)>, VNextError>
+where
+    R: DeviceRuntime,
+    I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    S: SubmissionWaveDispatchTimingSink,
+{
+    let authority_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+    );
     let Some(capability) = runtime.immutable_runtime_metadata() else {
         identity.record_segment_miss_reason(
             SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
@@ -402,6 +433,11 @@ where
         }
         node_windows.push(regions);
     }
+    drop(authority_stage);
+    let backing_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+    );
     let backing = if requests.is_empty() {
         None
     } else {
@@ -445,6 +481,11 @@ where
             }
         }
     }
+    drop(backing_stage);
+    let node_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+    );
     let mut scopes = Vec::with_capacity(recipe.nodes.len());
     let mut patches = Vec::with_capacity(recipe.nodes.len());
     for (compiled, windows) in recipe.nodes.iter().zip(node_windows) {
@@ -528,6 +569,11 @@ where
         });
         scopes.push(scope);
     }
+    drop(node_stage);
+    let _backend_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
+    );
     let Some(encoded) = runtime
         .encode_segment_bindings(PreparedSegmentBindingPatch { nodes: patches })
         .map_err(|error| {

@@ -1727,13 +1727,14 @@ impl OperationDispatch {
                 timing_sink,
                 SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode,
             );
-            super::segment_dispatch::encode_segment_wave(
+            super::segment_dispatch::encode_segment_wave_with_timing(
                 runtime,
                 resolved,
                 batch_identity,
                 completion.wave(),
                 active_bindings.clone(),
                 recipe,
+                timing_sink,
             )
             .map_err(SubmissionWaveDispatchError::Contract)?
             .map(|(nodes, facts)| {

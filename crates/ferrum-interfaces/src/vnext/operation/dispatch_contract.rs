@@ -241,6 +241,10 @@ pub enum SubmissionWaveDispatchStage {
     ProviderNodeEncode,
     SegmentHitProviderNodeEncode,
     SegmentBindingPrepareAndEncode,
+    SegmentFreshAuthorityAndWindows,
+    SegmentBackingPermitAndMetadata,
+    SegmentNodeDependenciesAndRegions,
+    SegmentBackendEncodeAndValidate,
     NodeIdentityMaterialize,
     NodeInvocationConstruct,
     ProviderDynamicBindingEncode,
@@ -357,6 +361,10 @@ mod submission_wave_dispatch_timing_tests {
             SubmissionWaveDispatchStage::NodeInvocationConstruct,
             SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+            SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+            SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+            SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
         ] {
             let timer = SubmissionWaveDispatchStageTimer::start(&DisabledPanicSink, stage);
             assert!(timer.started.is_none());

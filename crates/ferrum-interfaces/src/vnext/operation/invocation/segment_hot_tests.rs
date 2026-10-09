@@ -2,8 +2,40 @@
 //! TestRuntime records typed facts; it does not simulate CUDA computation.
 use super::*;
 use crate::vnext::operation::segment_compile::CompiledSegmentBindingRecipe;
-use crate::vnext::operation::segment_dispatch::encode_segment_wave;
+use crate::vnext::operation::segment_dispatch::{
+    encode_segment_wave, encode_segment_wave_with_timing,
+};
 use vnext_device_operation_wave_contract::{setup_with_fixture, teardown, wave_active_bindings};
+
+#[derive(Default)]
+struct SegmentTiming(std::sync::Mutex<Vec<SubmissionWaveDispatchStage>>);
+
+impl SegmentTiming {
+    fn take(&self) -> Vec<SubmissionWaveDispatchStage> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+impl DeviceSubmissionTimingSink for SegmentTiming {
+    const ENABLED: bool = true;
+
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {
+        panic!("segment preparation does not submit device commands");
+    }
+}
+
+impl SubmissionWaveDispatchTimingSink for SegmentTiming {
+    fn record(&self, stage: SubmissionWaveDispatchStage, _: std::time::Duration) {
+        self.0.lock().unwrap().push(stage);
+    }
+}
+
+const SEGMENT_PHASES: [SubmissionWaveDispatchStage; 4] = [
+    SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+    SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+    SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+    SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
+];
 
 fn compile(
     fixture: &Fixture,
@@ -162,16 +194,19 @@ fn segment_hot_matches_real_state_binding_and_plan_workspace_views_and_fresh_sco
             trace.segment_metadata_enabled = true;
             trace.segment_encoder_enabled = true;
         }
-        let (first, facts) = encode_segment_wave(
+        let timing = SegmentTiming::default();
+        let (first, facts) = encode_segment_wave_with_timing(
             fixture.runtime.as_ref(),
             &fixture.resolved,
             &identity,
             &wave,
             active.iter(),
             &recipe,
+            &timing,
         )
         .unwrap()
         .unwrap();
+        assert_eq!(timing.take(), SEGMENT_PHASES);
         assert_eq!(
             fixture.runtime_trace.lock().unwrap().segment_regions,
             expected
@@ -247,17 +282,20 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
     let active = wave_active_bindings(&wave, &session);
     let identity = super::segment_authority_tests::segment_identity(&fixture, &wave, &active);
     let recipe = compile(&fixture, &wave);
+    let timing = SegmentTiming::default();
     let run = || {
-        encode_segment_wave(
+        encode_segment_wave_with_timing(
             fixture.runtime.as_ref(),
             &fixture.resolved,
             &identity,
             &wave,
             active.iter(),
             &recipe,
+            &timing,
         )
     };
     assert!(run().unwrap().is_none());
+    assert_eq!(timing.take(), SEGMENT_PHASES[..1]);
     assert!(!oracle(&fixture, &wave, &identity, &active, &recipe).is_empty());
     fixture
         .runtime_trace
@@ -268,6 +306,7 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         run().unwrap().is_none(),
         "unsupported encoder retains old path"
     );
+    assert_eq!(timing.take(), SEGMENT_PHASES);
     fixture
         .runtime_trace
         .lock()
@@ -279,6 +318,7 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         .unwrap()
         .segment_foreign_runtime_metadata = true;
     assert!(run().is_err());
+    assert_eq!(timing.take(), SEGMENT_PHASES[..1]);
     fixture
         .runtime_trace
         .lock()
@@ -293,12 +333,14 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         run().is_err(),
         "Some capability cannot hide the actual getter"
     );
+    assert_eq!(timing.take(), SEGMENT_PHASES[..2]);
     fixture
         .runtime_trace
         .lock()
         .unwrap()
         .tamper_buffer_descriptor = false;
     assert!(run().unwrap().is_some());
+    assert_eq!(timing.take(), SEGMENT_PHASES);
     drop(identity);
     drop(active);
     drop(wave);
