@@ -25,6 +25,8 @@ use super::{
 };
 
 mod descriptor_agreement;
+mod wave_agreement;
+pub(super) use wave_agreement::WaveInvocationAgreements;
 #[cfg(test)]
 mod materialization_tests;
 use descriptor_agreement::DeviceDescriptorAgreement;
@@ -612,7 +614,7 @@ pub struct OperationInvocation<'a, B> {
 
 impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
-    fn from_prepared<'runtime, R>(
+    fn from_prepared<'runtime, 'binding, R>(
         runtime: &'runtime R,
         resolved: &'a dyn ExecutablePlanView,
         prepared: &PreparedOperationDispatchBinding,
@@ -621,11 +623,12 @@ impl<'a, B> OperationInvocation<'a, B> {
         identity: &'a ExecutionIdentityEnvelope,
         node_id: &'a NodeId,
         resources: OperationInvocationResources<'a, R>,
-        active_binding: &TrustedActiveSequenceBinding,
+        active_binding: &'binding TrustedActiveSequenceBinding,
         participant_index: usize,
         reusable_bindings_only: bool,
         shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
         device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
+        mut wave_agreements: Option<&mut WaveInvocationAgreements<'a, 'binding, R>>,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -644,59 +647,73 @@ impl<'a, B> OperationInvocation<'a, B> {
         let admission = active_binding.plan().static_provisioning_binding();
         let pool_fingerprint = active_binding.static_pool_identity_fingerprint_ref();
         let memory = plan.payload().memory();
-        if resources.participant_count()? != resources.prepared_participant_count()?
+        let common_agreement = wave_agreements.as_deref_mut().is_some_and(|agreements| {
+            agreements.matches(resources, identity, participant_index, plan, active_binding)
+        });
+        if (!common_agreement
+            && resources.participant_count()? != resources.prepared_participant_count()?)
             || resources.node_id()? != node_id
-            || participant_frame.sequence_authority() != participant.sequence_authority()
-            || participant_frame.request_authority() != participant.request_authority()
-            || !resources.plan_evidence_matches(active_binding.plan())?
-            || resources.coordinator_id()? != active_binding.coordinator_id()
-            || participant.sequence_authority() != active_binding.sequence_authority()
-            || participant.run_id() != active_binding.run_id()
-            || participant.request_id() != active_binding.request_id()
-            || !active_binding
-                .matches_sequence_session(participant_session.0, participant_session.1)
+            || (!common_agreement
+                && (participant_frame.sequence_authority() != participant.sequence_authority()
+                    || participant_frame.request_authority() != participant.request_authority()
+                    || !resources.plan_evidence_matches(active_binding.plan())?
+                    || resources.coordinator_id()? != active_binding.coordinator_id()
+                    || participant.sequence_authority() != active_binding.sequence_authority()
+                    || participant.run_id() != active_binding.run_id()
+                    || participant.request_id() != active_binding.request_id()
+                    || !active_binding
+                        .matches_sequence_session(participant_session.0, participant_session.1)))
             || !device_agreements[0].matches(runtime.descriptor(), resolved.device())
             || !device_agreements[1].matches(runtime.descriptor(), resolved.capabilities().device())
             || runtime.descriptor().runtime_implementation_fingerprint
                 != plan.payload().device_runtime_implementation_fingerprint()
-            || parts.plan_id != Some(plan.payload().plan_id())
-            || parts.plan_hash != Some(plan.plan_hash())
-            || parts.frame_id != Some(participant_frame.frame_id())
+            || (!common_agreement
+                && (parts.plan_id != Some(plan.payload().plan_id())
+                    || parts.plan_hash != Some(plan.plan_hash())
+                    || parts.frame_id != Some(participant_frame.frame_id())))
             || parts.node_invocation_id.is_none()
             || parts.node_id != Some(node.id())
             || parts.operation_id != Some(node.operation_id())
             || parts.provider_id != Some(node.selection().selected_provider())
-            || parts.device_id != Some(plan.payload().device_id())
-            || parts.run_id != active_binding.run_id()
-            || parts.request_id != active_binding.request_id()
-            || parts.transaction_id != lease_identity.map(|identity| identity.transaction_id())
-            || parts.resource_pool_id != active_binding.static_pool_id().as_ref()
-            || parts.resource_pool_identity_fingerprint != pool_fingerprint
-            || parts.provisioning_run_id != lease_identity.map(|identity| identity.run_id())
-            || parts.provisioning_request_id != lease_identity.map(|identity| identity.request_id())
-            || parts.active_sequence_slot != Some(active_binding.sequence_authority().sparse_id())
-            || parts.admission_generation != Some(active_binding.sequence_authority().generation())
-            || parts.activation_epoch != Some(active_binding.activation_epoch())
-            || parts.runtime_implementation_fingerprint
-                != Some(active_binding.runtime_implementation_fingerprint())
-            || parts.active_sequence_fingerprint != Some(active_binding.fingerprint())
-            || parts.completed_sequence_fingerprint.is_some()
-            || parts.aborted_sequence_fingerprint.is_some()
-            || active_binding.plan().plan_id() != plan.payload().plan_id()
-            || active_binding.plan().plan_hash() != plan.plan_hash()
-            || active_binding.plan().device_id() != plan.payload().device_id()
-            || active_binding.plan().runtime_implementation_fingerprint()
-                != plan.payload().device_runtime_implementation_fingerprint()
+            || (!common_agreement
+                && (parts.device_id != Some(plan.payload().device_id())
+                    || parts.run_id != active_binding.run_id()
+                    || parts.request_id != active_binding.request_id()
+                    || parts.transaction_id
+                        != lease_identity.map(|identity| identity.transaction_id())
+                    || parts.resource_pool_id != active_binding.static_pool_id().as_ref()
+                    || parts.resource_pool_identity_fingerprint != pool_fingerprint
+                    || parts.provisioning_run_id
+                        != lease_identity.map(|identity| identity.run_id())
+                    || parts.provisioning_request_id
+                        != lease_identity.map(|identity| identity.request_id())
+                    || parts.active_sequence_slot
+                        != Some(active_binding.sequence_authority().sparse_id())
+                    || parts.admission_generation
+                        != Some(active_binding.sequence_authority().generation())
+                    || parts.activation_epoch != Some(active_binding.activation_epoch())
+                    || parts.runtime_implementation_fingerprint
+                        != Some(active_binding.runtime_implementation_fingerprint())
+                    || parts.active_sequence_fingerprint != Some(active_binding.fingerprint())
+                    || parts.completed_sequence_fingerprint.is_some()
+                    || parts.aborted_sequence_fingerprint.is_some()
+                    || active_binding.plan().plan_id() != plan.payload().plan_id()
+                    || active_binding.plan().plan_hash() != plan.plan_hash()
+                    || active_binding.plan().device_id() != plan.payload().device_id()
+                    || active_binding.plan().runtime_implementation_fingerprint()
+                        != plan.payload().device_runtime_implementation_fingerprint()))
             || active_binding.runtime_implementation_fingerprint()
                 != runtime.descriptor().runtime_implementation_fingerprint
-            || active_binding.static_provisioning_identity() != lease_identity
-            || admission != static_lease.map(|lease| lease.admission())
-            || admission.is_some_and(|admission| {
-                admission.device_capacity_bytes() != memory.device_capacity_bytes()
-                    || admission.usable_capacity_bytes() != memory.usable_capacity_bytes()
-                    || admission.plan_static_bytes() != memory.static_bytes()
-                    || admission.maximum_active_sequences() != memory.maximum_active_sequences()
-            })
+            || (!common_agreement
+                && (active_binding.static_provisioning_identity() != lease_identity
+                    || admission != static_lease.map(|lease| lease.admission())
+                    || admission.is_some_and(|admission| {
+                        admission.device_capacity_bytes() != memory.device_capacity_bytes()
+                            || admission.usable_capacity_bytes() != memory.usable_capacity_bytes()
+                            || admission.plan_static_bytes() != memory.static_bytes()
+                            || admission.maximum_active_sequences()
+                                != memory.maximum_active_sequences()
+                    })))
             || parts.resource_id.is_some()
             || parts.resource_generation.is_some()
             || parts.resource_batch_fingerprint.is_some()
@@ -1023,6 +1040,12 @@ impl<'a, B> OperationInvocation<'a, B> {
                 .filter(|_| projection.is_none() || persistent_view.is_some()),
             "persistent",
         )?;
+        let work_shape = resources.work_shape()?;
+        if !common_agreement {
+            if let Some(agreements) = wave_agreements {
+                agreements.stage(resources, identity, participant_index, plan, active_binding);
+            }
+        }
         Ok(Self {
             identity,
             operation,
@@ -1035,7 +1058,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             scratch_view,
             binding_view,
             persistent_view,
-            work_shape: resources.work_shape()?,
+            work_shape,
             claimed_backing_fingerprint: resources.backing_fingerprint(),
             projection_numerics: provider_resources.projection_numerics(),
         })
@@ -1212,6 +1235,71 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         R: DeviceRuntime<Buffer = B>,
         I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
+        Self::from_resources_with_agreements(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            resources,
+            active_bindings,
+            reusable_bindings_only,
+            share_materialization,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_wave_node_with_agreements<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: I,
+        reusable_bindings_only: bool,
+        agreements: Option<&mut WaveInvocationAgreements<'a, 'binding, R>>,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::from_resources_with_agreements(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Wave { wave, node_index },
+            active_bindings,
+            reusable_bindings_only,
+            true,
+            agreements,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_resources_with_agreements<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        resources: OperationInvocationResources<'a, R>,
+        active_bindings: I,
+        reusable_bindings_only: bool,
+        share_materialization: bool,
+        mut wave_agreements: Option<&mut WaveInvocationAgreements<'a, 'binding, R>>,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        if let Some(agreements) = wave_agreements.as_deref_mut() {
+            agreements.begin_node(batch_identity);
+        }
         let participant_count = resources.participant_count()?;
         let participant_frames = resources.participant_frames()?;
         if participant_count == 0
@@ -1281,11 +1369,21 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     reusable_bindings_only,
                     &mut shared_backings,
                     &mut device_agreements,
+                    wave_agreements.as_deref_mut(),
                 )
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>();
+        let participants = match participants {
+            Ok(participants) => participants,
+            Err(error) => {
+                if let Some(agreements) = wave_agreements {
+                    agreements.finish_node(false);
+                }
+                return Err(error);
+            }
+        };
         let program_binding = resources.program_binding_node();
-        Ok(Self {
+        let invocation = Self {
             batch_identity,
             node_identity,
             participants,
@@ -1295,7 +1393,11 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                 p.scope() == crate::vnext::ProviderWorkspaceScope::Plan
                     && p.reuse_policy() == crate::vnext::ProviderWorkspaceReusePolicy::Preserve
             }),
-        })
+        };
+        if let Some(agreements) = wave_agreements {
+            agreements.finish_node(true);
+        }
+        Ok(invocation)
     }
 
     pub fn batch_identity(&self) -> &BatchOperationIdentity {

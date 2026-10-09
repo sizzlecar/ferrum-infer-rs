@@ -959,6 +959,7 @@ impl OperationDispatch {
             None,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
+            None,
             wave,
             lane,
             reaper,
@@ -994,6 +995,7 @@ impl OperationDispatch {
             None,
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
+            None,
             wave,
             lane,
             reaper,
@@ -1034,6 +1036,7 @@ impl OperationDispatch {
             None,
             None,
             timing_sink,
+            None,
             wave,
             lane,
             reaper,
@@ -1062,9 +1065,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let agreement_counts = std::cell::Cell::new(super::InvocationPreparationStats::default());
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            agreements: &agreement_counts,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1082,6 +1087,7 @@ impl OperationDispatch {
             None,
             None,
             timing_sink,
+            Some(&agreement_counts),
             wave,
             lane,
             reaper,
@@ -1132,6 +1138,7 @@ impl OperationDispatch {
             Some(restore),
             None,
             &DisabledSubmissionWaveDispatchTimingSink,
+            None,
             wave,
             lane,
             reaper,
@@ -1217,6 +1224,7 @@ impl OperationDispatch {
             Some(restore),
             Some(reusable_program),
             &DisabledSubmissionWaveDispatchTimingSink,
+            None,
             wave,
             lane,
             reaper,
@@ -1260,6 +1268,7 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             &DisabledSubmissionWaveDispatchTimingSink,
+            None,
             wave,
             lane,
             reaper,
@@ -1296,6 +1305,7 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             &DisabledSubmissionWaveDispatchTimingSink,
+            None,
             wave,
             lane,
             reaper,
@@ -1334,6 +1344,7 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             timing_sink,
+            None,
             wave,
             lane,
             reaper,
@@ -1363,9 +1374,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let agreement_counts = std::cell::Cell::new(super::InvocationPreparationStats::default());
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            agreements: &agreement_counts,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1383,6 +1396,7 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             timing_sink,
+            Some(&agreement_counts),
             wave,
             lane,
             reaper,
@@ -1401,6 +1415,7 @@ impl OperationDispatch {
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
         reusable_program: Option<&DeviceReusableExecutionProgram>,
         timing_sink: &S,
+        agreement_counts: Option<&std::cell::Cell<super::InvocationPreparationStats>>,
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
@@ -1655,6 +1670,16 @@ impl OperationDispatch {
             timing_sink,
             SubmissionWaveDispatchStage::ProviderNodeEncode,
         );
+        let mut wave_agreements = (batch_identity.preparation_strategy()
+            == ferrum_types::InvocationPreparationStrategy::WaveAgreement)
+            .then(|| {
+                let mut agreements = super::invocation::WaveInvocationAgreements::new(
+                    batch_identity,
+                    completion.wave(),
+                );
+                agreements.observe(agreement_counts);
+                agreements
+            });
         let pre_provider_command_count = commands.len();
         let mut encoded_provider_command_count = 0_usize;
         let mut program_bindings = Vec::new();
@@ -1700,17 +1725,20 @@ impl OperationDispatch {
                             timing_sink,
                             SubmissionWaveDispatchStage::NodeInvocationConstruct,
                         );
-                        let invocation = BatchedOperationInvocation::from_reusable_wave_node(
-                            runtime,
-                            resolved,
-                            provider.dispatch(),
-                            batch_identity,
-                            node_identity,
-                            completion.wave(),
-                            binding_node_index,
-                            active_bindings.clone(),
-                        )
-                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        let invocation =
+                            BatchedOperationInvocation::from_wave_node_with_agreements(
+                                runtime,
+                                resolved,
+                                provider.dispatch(),
+                                batch_identity,
+                                node_identity,
+                                completion.wave(),
+                                binding_node_index,
+                                active_bindings.clone(),
+                                true,
+                                wave_agreements.as_mut(),
+                            )
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
                         drop(invocation_stage);
                         let expected_phase = invocation.operation().profile_phase;
                         let program_binding = invocation.program_binding().cloned();
@@ -1842,7 +1870,7 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::NodeInvocationConstruct,
                 );
-                let invocation = BatchedOperationInvocation::from_wave_node(
+                let invocation = BatchedOperationInvocation::from_wave_node_with_agreements(
                     runtime,
                     resolved,
                     provider.dispatch(),
@@ -1851,6 +1879,8 @@ impl OperationDispatch {
                     completion.wave(),
                     node_index,
                     active_bindings.clone(),
+                    false,
+                    wave_agreements.as_mut(),
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
                 drop(invocation_stage);
@@ -1944,7 +1974,7 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::NodeInvocationConstruct,
                 );
-                let invocation = BatchedOperationInvocation::from_wave_node(
+                let invocation = BatchedOperationInvocation::from_wave_node_with_agreements(
                     runtime,
                     resolved,
                     provider.dispatch(),
@@ -1953,6 +1983,8 @@ impl OperationDispatch {
                     completion.wave(),
                     node_index,
                     active_bindings.clone(),
+                    false,
+                    wave_agreements.as_mut(),
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
                 drop(invocation_stage);
@@ -2130,6 +2162,7 @@ impl OperationDispatch {
                 "wave encode command phases differ from provider-declared operation boundaries",
             )));
         }
+        drop(wave_agreements);
         drop(provider_stage);
 
         let lane_stage = SubmissionWaveDispatchStageTimer::start(

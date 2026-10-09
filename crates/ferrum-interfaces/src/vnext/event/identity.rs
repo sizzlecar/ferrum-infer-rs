@@ -161,6 +161,13 @@ impl Serialize for ExecutionIdentityEnvelope {
 }
 
 impl ExecutionIdentityEnvelope {
+    pub(crate) fn compiled_origin(&self) -> Option<&CompiledOperationIdentity> {
+        match &self.representation {
+            ExecutionIdentityRepresentation::Compiled(identity) => Some(identity),
+            ExecutionIdentityRepresentation::Owned(_) => None,
+        }
+    }
+
     pub fn new(parts: ExecutionIdentityParts) -> Result<Self, VNextError> {
         if parts.version != EXECUTION_IDENTITY_VERSION || parts.sequence == 0 {
             return Err(invalid_event(

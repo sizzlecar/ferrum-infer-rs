@@ -328,6 +328,19 @@ pub(crate) struct CompiledOperationIdentity {
 }
 
 impl CompiledOperationIdentity {
+    pub(super) fn has_origin(
+        &self,
+        seeds: &Arc<[SubmissionWaveParticipantIdentitySeed]>,
+        topology: &CompiledSubmissionWaveIdentity,
+        node_index: usize,
+        participant_index: usize,
+    ) -> bool {
+        Arc::ptr_eq(&self.seeds, seeds)
+            && Arc::ptr_eq(&self.topology.data, &topology.data)
+            && self.node_index == node_index
+            && self.participant_index == participant_index
+    }
+
     pub(crate) fn parts(&self) -> &ExecutionIdentityParts {
         self.parts.get_or_init(|| {
             let parts = self.seeds[self.participant_index]

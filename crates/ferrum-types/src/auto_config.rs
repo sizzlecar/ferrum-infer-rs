@@ -2546,7 +2546,7 @@ impl FerrumConfigBuilder {
             strategy.as_runtime_value(),
             source,
             source_key,
-            ["full", "identity-projection"],
+            ["full", "identity-projection", "wave-agreement"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5307,6 +5307,16 @@ mod tests {
                 Some("identity-projection"),
                 RuntimeConfigSource::Env,
                 AutoConfigSource::Env,
+            ),
+            (
+                Some("wave-agreement"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("wave-agreement"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
             ),
             (
                 Some("full"),

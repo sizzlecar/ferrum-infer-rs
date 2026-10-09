@@ -73,14 +73,15 @@ impl PrefillDecodeExecution {
 }
 
 /// Host invocation preparation for native plan runtimes. Identity projection
-/// borrows compiled identity metadata while preserving per-invocation validation.
-/// It does not change resource preparation or device execution policy.
+/// borrows compiled identity metadata; wave agreement additionally reuses validated
+/// immutable participant agreement within one wave. Live resource checks remain.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InvocationPreparationStrategy {
     #[default]
     Full,
     IdentityProjection,
+    WaveAgreement,
 }
 
 impl InvocationPreparationStrategy {
@@ -88,6 +89,7 @@ impl InvocationPreparationStrategy {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::WaveAgreement => "wave-agreement",
         }
     }
 
@@ -95,7 +97,10 @@ impl InvocationPreparationStrategy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
-            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+            "wave-agreement" => Ok(Self::WaveAgreement),
+            _ => Err(format!(
+                "expected full, identity-projection, or wave-agreement; got {raw:?}"
+            )),
         }
     }
 }
@@ -1331,6 +1336,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::WaveAgreement,
             InvocationPreparationStrategy::Full,
         ] {
             config
