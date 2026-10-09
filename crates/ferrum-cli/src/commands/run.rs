@@ -877,7 +877,7 @@ pub struct RunCommand {
     /// Host invocation preparation policy for native plan runtimes (default: full).
     #[arg(long, value_enum)]
     pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
-    /// CUDA plan-runtime binding upload policy (default: sparse).
+    /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
 
@@ -3039,19 +3039,19 @@ mod tests {
         use ferrum_types::ProgramBindingUploadStrategy;
         let mut command = test_run_cmd();
         let config_entries = crate::config::RuntimeCliConfig {
-            program_binding_upload_strategy: Some(ProgramBindingUploadStrategy::CompleteRows),
+            program_binding_upload_strategy: Some(ProgramBindingUploadStrategy::UniformLivePrefix),
             ..Default::default()
         }
         .runtime_config_entries();
         for (option, expected) in [
-            (None, ProgramBindingUploadStrategy::CompleteRows),
+            (None, ProgramBindingUploadStrategy::UniformLivePrefix),
             (
                 Some(ProgramBindingUploadStrategyArg::Sparse),
                 ProgramBindingUploadStrategy::Sparse,
             ),
             (
-                Some(ProgramBindingUploadStrategyArg::CompleteRows),
-                ProgramBindingUploadStrategy::CompleteRows,
+                Some(ProgramBindingUploadStrategyArg::UniformLivePrefix),
+                ProgramBindingUploadStrategy::UniformLivePrefix,
             ),
         ] {
             command.program_binding_upload_strategy = option;

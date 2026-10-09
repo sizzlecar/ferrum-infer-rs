@@ -513,21 +513,28 @@ impl CudaProgramBindingWrite {
         })
     }
 
-    /// Only the causal provider calls this after establishing its logical row
-    /// schema. Unused logical pointer entries are ignored by the kernels; this
-    /// does not authorize writing spare slot capacity or neighboring gaps.
-    pub(crate) fn complete_logical_row(
-        destination_offset_bytes: u64,
-        payload: Box<[u8]>,
+    /// Only the causal provider calls this after establishing writable logical
+    /// tails. The shared width is the largest complete live payload in this
+    /// node, never the logical row capacity or the physical arena capacity.
+    pub(crate) fn uniform_live_prefix(
+        writes: &mut [Self],
         logical_row_bytes: u64,
-    ) -> Result<Self, CudaDeviceRuntimeError> {
-        let mut write = Self::new(destination_offset_bytes, payload)?;
-        write.payload = crate::backend::program_binding_rows::complete_logical_row(
-            write.payload,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let width = crate::backend::program_binding_rows::uniform_live_prefix_width(
+            writes.iter().map(|write| write.payload.len()),
             logical_row_bytes,
         )
         .map_err(CudaDeviceRuntimeError::contract)?;
-        Ok(write)
+        for write in writes {
+            if write.payload.len() != width {
+                write.payload = crate::backend::program_binding_rows::pad_live_prefix(
+                    std::mem::take(&mut write.payload),
+                    width,
+                )
+                .map_err(CudaDeviceRuntimeError::contract)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4909,7 +4916,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_logical_rows_coalesce_without_rewriting_capacity_or_slot_gaps() {
+    fn uniform_live_prefixes_coalesce_without_rewriting_capacity_or_slot_gaps() {
         // Two active causal rows plus a dense GDN slot, with an unused-capacity
         // gap before that slot. The gap is not part of either upload strategy.
         let sparse = vec![
@@ -4917,11 +4924,12 @@ mod tests {
             program_binding_write(80, vec![2; 40]),
             program_binding_write(192, vec![3; 16]),
         ];
-        let complete = vec![
-            CudaProgramBindingWrite::complete_logical_row(16, vec![1; 32].into(), 64).unwrap(),
-            CudaProgramBindingWrite::complete_logical_row(80, vec![2; 40].into(), 64).unwrap(),
-            program_binding_write(192, vec![3; 16]),
+        let mut complete = vec![
+            program_binding_write(16, vec![1; 32]),
+            program_binding_write(80, vec![2; 40]),
         ];
+        CudaProgramBindingWrite::uniform_live_prefix(&mut complete, 64).unwrap();
+        complete.push(program_binding_write(192, vec![3; 16]));
         assert_eq!(
             complete
                 .iter()
@@ -4934,8 +4942,9 @@ mod tests {
         assert_eq!(sparse.len(), 3);
         assert_eq!(complete.len(), 2);
         assert_eq!(complete[0].destination_offset_bytes, 16);
-        assert_eq!(complete[0].row_count, 1);
-        assert_eq!(complete[0].payload.len(), 128);
+        assert_eq!(complete[0].row_count, 2);
+        assert_eq!(complete[0].row_bytes, 40);
+        assert_eq!(complete[0].payload.len(), 80);
         let mut actual = vec![0xa5; 256];
         for transfer in complete {
             for row in 0..transfer.row_count {
@@ -4948,10 +4957,10 @@ mod tests {
         }
         assert!(actual[..16].iter().all(|&byte| byte == 0xa5));
         assert_eq!(&actual[16..48], &[1; 32]);
-        assert!(actual[48..80].iter().all(|&byte| byte == 0));
+        assert!(actual[48..56].iter().all(|&byte| byte == 0));
+        assert!(actual[56..80].iter().all(|&byte| byte == 0xa5));
         assert_eq!(&actual[80..120], &[2; 40]);
-        assert!(actual[120..144].iter().all(|&byte| byte == 0));
-        assert!(actual[144..192].iter().all(|&byte| byte == 0xa5));
+        assert!(actual[120..192].iter().all(|&byte| byte == 0xa5));
         assert_eq!(&actual[192..208], &[3; 16]);
         assert!(actual[208..].iter().all(|&byte| byte == 0xa5));
     }
@@ -5222,6 +5231,93 @@ mod tests {
             transfers[1].payload.as_ref(),
             [vec![3; 8], vec![6; 8], vec![8; 8]].concat()
         );
+    }
+
+    #[test]
+    fn uniform_live_prefix_qwen_layout_limits_uploads_to_current_batch() {
+        const PARTICIPANTS: u64 = 32;
+        const LOGICAL_CAUSAL_ROW: u64 = 24 + 262_144 / 16 * 8;
+        let recurrent_slot = PARTICIPANTS * 16;
+        let group_capacity = 3 * recurrent_slot + PARTICIPANTS * LOGICAL_CAUSAL_ROW;
+        let arena_size = 16 * group_capacity;
+        let make_writes = |uniform: bool| {
+            let mut writes = Vec::new();
+            for group in 0..16 {
+                let base = group * group_capacity;
+                for recurrent in 0..3 {
+                    for participant in 0..PARTICIPANTS {
+                        writes.push(program_binding_write(
+                            base + recurrent * recurrent_slot + participant * 16,
+                            vec![1; 16],
+                        ));
+                    }
+                }
+                let mut causal = (0..PARTICIPANTS)
+                    .map(|participant| {
+                        program_binding_write(
+                            base + 3 * recurrent_slot + participant * LOGICAL_CAUSAL_ROW,
+                            vec![2; (24 + (participant + 1) * 8) as usize],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if uniform {
+                    CudaProgramBindingWrite::uniform_live_prefix(&mut causal, LOGICAL_CAUSAL_ROW)
+                        .unwrap();
+                }
+                writes.extend(causal);
+            }
+            writes
+        };
+        let sparse = make_writes(false);
+        let uniform = make_writes(true);
+        let live = |writes: &[CudaProgramBindingWrite]| {
+            writes
+                .iter()
+                .map(|write| write.live_payload_bytes)
+                .sum::<u64>()
+        };
+        assert_eq!(live(&sparse), live(&uniform));
+        let expected_upload = 48 * PARTICIPANTS * 16 + 16 * PARTICIPANTS * (24 + PARTICIPANTS * 8);
+        let mut expected = std::collections::BTreeMap::new();
+        for write in &uniform {
+            for (index, byte) in write.payload.iter().enumerate() {
+                assert!(expected
+                    .insert(write.destination_offset_bytes + index as u64, *byte)
+                    .is_none());
+            }
+        }
+        let sparse = coalesce_program_binding_transfers(sparse, arena_size).unwrap();
+        let uniform = coalesce_program_binding_transfers(uniform, arena_size).unwrap();
+        assert_eq!(sparse.len(), 32);
+        assert_eq!(uniform.len(), 17);
+        assert_eq!(
+            uniform
+                .iter()
+                .map(|transfer| transfer.payload.len() as u64)
+                .sum::<u64>(),
+            expected_upload
+        );
+        assert!(expected_upload < arena_size);
+        let mut actual = std::collections::BTreeMap::new();
+        for transfer in &uniform {
+            for row in 0..transfer.row_count {
+                let offset = transfer.destination_offset_bytes
+                    + row as u64 * transfer.destination_stride_bytes;
+                for byte in 0..transfer.row_bytes {
+                    assert!(actual
+                        .insert(
+                            offset + byte as u64,
+                            transfer.payload[row * transfer.row_bytes + byte]
+                        )
+                        .is_none());
+                }
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "all and only authorized live prefixes were copied"
+        );
+        eprintln!("uniform_live_prefix_layout sparse_calls={} uniform_calls={} sparse_bytes={} uniform_bytes={} arena_bytes={}", sparse.len(), uniform.len(), sparse.iter().map(|transfer| transfer.payload.len()).sum::<usize>(), expected_upload, arena_size);
     }
 
     #[test]

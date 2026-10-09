@@ -2620,13 +2620,16 @@ fn encode_attention(
                 if binding.host_binding != index {
                     return Err("CUDA causal binding payload order is not canonical".to_owned());
                 }
-                writes.push(causal_program_binding_write(
-                    program_binding_upload_strategy,
-                    binding.binding_offset,
-                    payload,
-                    binding_layout.slot_bytes,
-                )?);
+                writes.push(
+                    super::CudaProgramBindingWrite::new(binding.binding_offset, payload)
+                        .map_err(|error| error.to_string())?,
+                );
             }
+            prepare_causal_program_binding_writes(
+                program_binding_upload_strategy,
+                &mut writes,
+                binding_layout.slot_bytes,
+            )?;
             (
                 CudaDeviceCommand::program_binding_patch(
                     "vnext_causal_paged_attention_bindings",
@@ -3108,25 +3111,22 @@ fn validate_packed_token_ranges(
     Ok(())
 }
 
-// This provider owns the entire logical row: six control words followed by
-// the maximum-context address table. Kernels read only the current counts, and
-// the existing numerical-status word is reset by the unchanged live prefix.
-// No physical capacity beyond BindingLayout::required_bytes is authorized.
-fn causal_program_binding_write(
+// This provider owns the logical row tail. Preserve all actual control words
+// and addresses, including any scale addresses, and equalize only the complete
+// live prefix across this node's current participants. No stride, slot gap or
+// physical capacity is changed; consumers still read their actual counts.
+fn prepare_causal_program_binding_writes(
     strategy: ProgramBindingUploadStrategy,
-    offset: u64,
-    payload: Box<[u8]>,
+    writes: &mut [super::CudaProgramBindingWrite],
     logical_row_bytes: u64,
-) -> Result<super::CudaProgramBindingWrite, String> {
+) -> Result<(), String> {
     match strategy {
-        ProgramBindingUploadStrategy::Sparse => {
-            super::CudaProgramBindingWrite::new(offset, payload)
-        }
-        ProgramBindingUploadStrategy::CompleteRows => {
-            super::CudaProgramBindingWrite::complete_logical_row(offset, payload, logical_row_bytes)
+        ProgramBindingUploadStrategy::Sparse => Ok(()),
+        ProgramBindingUploadStrategy::UniformLivePrefix => {
+            super::CudaProgramBindingWrite::uniform_live_prefix(writes, logical_row_bytes)
+                .map_err(|error| error.to_string())
         }
     }
-    .map_err(|error| error.to_string())
 }
 
 fn encode_reusable_attention_bindings(
@@ -3207,16 +3207,22 @@ fn encode_reusable_attention_bindings(
             &pages,
             &scale_pages,
         )?;
-        writes.push(causal_program_binding_write(
-            program_binding_upload_strategy,
-            binding_layout.binding_offset(participant_index)?,
-            payload,
-            binding_layout.slot_bytes,
-        )?);
+        writes.push(
+            super::CudaProgramBindingWrite::new(
+                binding_layout.binding_offset(participant_index)?,
+                payload,
+            )
+            .map_err(|error| error.to_string())?,
+        );
         fence_dependencies.extend(pages);
         fence_dependencies.extend(scale_pages);
     }
 
+    prepare_causal_program_binding_writes(
+        program_binding_upload_strategy,
+        &mut writes,
+        binding_layout.slot_bytes,
+    )?;
     let numerical_status = shape.int8_kv.then(|| {
         (
             destination.clone(),

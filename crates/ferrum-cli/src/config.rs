@@ -249,7 +249,7 @@ pub struct RuntimeCliConfig {
     /// Host invocation preparation policy for native plan runtimes.
     #[serde(default)]
     pub invocation_preparation_strategy: Option<ferrum_types::InvocationPreparationStrategy>,
-    /// Program-binding upload policy; complete rows require a CUDA plan runtime.
+    /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: Option<ferrum_types::ProgramBindingUploadStrategy>,
 
@@ -1132,15 +1132,16 @@ mod tests {
 
     #[test]
     fn program_binding_upload_config_file_parses_explicit_strategy() {
-        let config: CliConfig =
-            toml::from_str("[runtime]\nprogram_binding_upload_strategy = \"complete-rows\"\n")
-                .unwrap();
+        let config: CliConfig = toml::from_str(
+            "[runtime]\nprogram_binding_upload_strategy = \"uniform-live-prefix\"\n",
+        )
+        .unwrap();
         let entries = config.runtime.runtime_config_entries();
         let entry = entries
             .iter()
             .find(|entry| entry.key == "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
             .unwrap();
-        assert_eq!(entry.effective_value, "complete-rows");
+        assert_eq!(entry.effective_value, "uniform-live-prefix");
         assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\nprogram_binding_upload_strategy = \"automatic\"\n"

@@ -5,8 +5,6 @@ include!("../vnext_checkpoint_continuation/runtime.rs");
 #[path = "batch.rs"]
 mod batch;
 pub use batch::{BatchObservation, Path};
-#[path = "runtime/complete_binding_rows.rs"]
-mod complete_binding_rows;
 #[path = "runtime/extra.rs"]
 mod extra;
 #[path = "runtime/extra_all_rows.rs"]
@@ -23,6 +21,8 @@ mod prefill;
 mod replay_bindings;
 #[path = "runtime/two_streams.rs"]
 mod two_streams;
+#[path = "runtime/uniform_binding_prefix.rs"]
+mod uniform_binding_prefix;
 
 impl Fixture {
     pub fn for_attention(kind: AttentionKind, reusable: bool, participants: u32) -> Self {

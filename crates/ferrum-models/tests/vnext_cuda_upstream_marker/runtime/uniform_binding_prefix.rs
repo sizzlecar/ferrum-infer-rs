@@ -17,9 +17,14 @@ fn snapshot(fixture: &Fixture) -> DeviceProgramBindingUploadSnapshot {
         .unwrap()
 }
 
-fn assert_causal_rows(observation: &BatchObservation, ranges: &[Range<usize>], complete: bool) {
+fn causal_live_bytes(range: &Range<usize>) -> usize {
+    24 + range.end.div_ceil(16) * 8
+}
+
+fn assert_causal_rows(observation: &BatchObservation, ranges: &[Range<usize>], uniform: bool) {
     let rows = observation.binding_rows.as_ref().unwrap();
     assert_eq!(rows.len(), ranges.len());
+    let maximum_live_bytes = ranges.iter().map(causal_live_bytes).max().unwrap();
     for (participant, (row, range)) in rows.iter().zip(ranges).enumerate() {
         // This real fixture selects the FP16 VllmBlocks16 ABI: six i32
         // controls followed by one u64 per live KV block. Address values are
@@ -44,22 +49,38 @@ fn assert_causal_rows(observation: &BatchObservation, ranges: &[Range<usize>], c
         assert!(row[24..live_end]
             .chunks_exact(8)
             .all(|v| u64::from_ne_bytes(v.try_into().unwrap()) != 0));
-        if complete {
+        if uniform {
             assert!(
-                row[live_end..].iter().all(|&v| v == 0),
-                "only explicitly authorized inactive logical-row bytes are zeroed"
+                row[live_end..maximum_live_bytes].iter().all(|&v| v == 0),
+                "only padding to this wave's maximum live prefix is zeroed"
             );
         }
+        // Bytes beyond maximum_live_bytes are not part of this upload. They
+        // need not be zero and are not compared between independent runtimes.
     }
 }
 
 fn compare(kind: AttentionKind) {
     let modes = [
         ProgramBindingUploadStrategy::Sparse,
-        ProgramBindingUploadStrategy::CompleteRows,
+        ProgramBindingUploadStrategy::UniformLivePrefix,
     ];
+    // Keep the existing numerical profile while making unused logical table
+    // capacity much larger than this fixture's real frontiers. The two arms
+    // must upload live data, not this 8192-token maximum's complete table.
+    let maximum_tokens = if kind == AttentionKind::Causal {
+        8192
+    } else {
+        MAX_TOKENS
+    };
     let fixtures = modes.map(|mode| {
-        Fixture::for_family_with_binding_upload(kind, true, 2, Family::new(kind), mode)
+        Fixture::for_family_with_binding_upload(
+            kind,
+            true,
+            2,
+            Family::new(kind).with_maximum_tokens(maximum_tokens),
+            mode,
+        )
     });
     // Advance one causal participant through a full 64-KiB physical KV page
     // before joint decode (64 tokens for this real 1024-byte/token fixture).
@@ -84,7 +105,7 @@ fn compare(kind: AttentionKind) {
             .enumerate()
             .map(|(p, tokens)| {
                 fixture.admit_with_ceiling(
-                    &format!("complete-binding-rows-{p}"),
+                    &format!("uniform-binding-prefix-{p}"),
                     Arc::from(&tokens[..1]),
                     tokens.len(),
                 )
@@ -109,9 +130,11 @@ fn compare(kind: AttentionKind) {
         observations[0].assert_same(&observations[1]);
     }
     let baselines = fixtures.each_ref().map(snapshot);
-    // The fixture's maximum 160 tokens gives ten u64 block addresses. Their
-    // 80-byte area is already aligned to the provider's 16-byte alignment.
-    let row_bytes = (kind == AttentionKind::Causal).then_some(24 + 10 * 8);
+    // F16 VllmBlocks16 has one u64 per logical block and a 16-byte-aligned
+    // address table after six controls. This gives a 4120-byte logical row
+    // while the joint frontiers require only 32..72 bytes per live payload.
+    let maximum_address_bytes = (maximum_tokens.div_ceil(16) * 8).div_ceil(16) * 16;
+    let row_bytes = (kind == AttentionKind::Causal).then_some(24 + maximum_address_bytes as usize);
     for position in 0..joint_waves {
         let ranges = [lead + position..lead + position + 1, position..position + 1];
         let path = if position < 2 {
@@ -185,9 +208,30 @@ fn compare(kind: AttentionKind) {
             assert!(uploads.successful_1d_copies + uploads.successful_2d_copies > 0);
             if kind == AttentionKind::Causal {
                 assert_causal_rows(&observation, &ranges, arm == 1);
-                if arm == 1 {
-                    assert!(uploads.planned_upload_bytes > uploads.live_payload_bytes);
-                }
+                let live_bytes = ranges.iter().map(causal_live_bytes).sum::<usize>() as u64;
+                let maximum_live_bytes = ranges.iter().map(causal_live_bytes).max().unwrap() as u64;
+                let planned_bytes = if arm == 1 {
+                    ranges.len() as u64 * maximum_live_bytes
+                } else {
+                    live_bytes
+                };
+                // These counters count typed enqueue attempts, not waves.
+                // In this fixture the only binding payload is this node's
+                // causal table, so its exact planned byte count is known.
+                assert_eq!(
+                    uploads.live_payload_bytes,
+                    uploads.attempted_preludes * live_bytes
+                );
+                assert_eq!(
+                    uploads.planned_upload_bytes,
+                    uploads.attempted_preludes * planned_bytes
+                );
+                assert_eq!(
+                    uploads.logical_arena_bytes,
+                    uploads.attempted_preludes * ranges.len() as u64 * row_bytes.unwrap() as u64
+                );
+                assert!(maximum_live_bytes < row_bytes.unwrap() as u64);
+                assert!(uploads.planned_upload_bytes < uploads.logical_arena_bytes);
             } else {
                 assert_eq!(
                     uploads.planned_upload_bytes, uploads.live_payload_bytes,
@@ -198,9 +242,12 @@ fn compare(kind: AttentionKind) {
             println!(
                 "{}",
                 serde_json::json!({
-                    "kind":"complete_binding_rows_wave", "attention":format!("{kind:?}"),
+                    "kind":"uniform_binding_prefix_wave", "attention":format!("{kind:?}"),
                     "strategy":modes[arm], "participant_ranges":ranges,
-                    "uploads":uploads, "captured_physical_kv_pages":physical_kv_pages, "logical_tail_zero_checked":kind == AttentionKind::Causal && arm == 1,
+                    "uploads":uploads, "captured_physical_kv_pages":physical_kv_pages,
+                    "logical_row_bytes":row_bytes,
+                    "maximum_live_prefix_bytes":row_bytes.map(|_| ranges.iter().map(causal_live_bytes).max().unwrap()),
+                    "uniform_prefix_zero_checked":kind == AttentionKind::Causal && arm == 1,
                     "causal_controls_and_status_zero_checked":kind == AttentionKind::Causal,
                 })
             );
@@ -220,10 +267,12 @@ fn compare(kind: AttentionKind) {
     }
     println!(
         "{}",
-        serde_json::json!({"kind":"complete_binding_rows_actual_cuda",
+        serde_json::json!({"kind":"uniform_binding_prefix_actual_cuda",
         "attention":format!("{kind:?}"), "participants":2, "joint_waves":joint_waves,
-        "lead_in_waves":lead, "full_output_and_state_equal":true,
-        "sparse":totals[0], "complete_rows":totals[1]})
+        "lead_in_waves":lead, "maximum_context_tokens":maximum_tokens,
+        "logical_row_bytes":row_bytes, "full_output_and_state_equal":true,
+        "counter_scope":"typed binding prelude attempts during joint waves; lead excluded",
+        "sparse":totals[0], "uniform_live_prefix":totals[1]})
     );
     for group in sessions {
         for session in group {
@@ -234,12 +283,12 @@ fn compare(kind: AttentionKind) {
 
 #[test]
 #[ignore = "requires exclusive CUDA, actual causal/FFN providers and resident replay"]
-fn complete_binding_rows_causal_matches_sparse_with_mixed_kv_lengths() {
+fn uniform_binding_prefix_causal_matches_sparse_with_mixed_kv_lengths() {
     compare(AttentionKind::Causal);
 }
 
 #[test]
 #[ignore = "requires exclusive CUDA, actual GDN/FFN providers and resident replay"]
-fn complete_binding_rows_gdn_matches_sparse_across_committed_frontiers() {
+fn uniform_binding_prefix_gdn_matches_sparse_across_committed_frontiers() {
     compare(AttentionKind::GatedDelta);
 }

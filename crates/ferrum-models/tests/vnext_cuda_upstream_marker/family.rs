@@ -101,6 +101,11 @@ impl Family {
     pub fn maximum_tokens(&self) -> u64 {
         self.maximum_tokens
     }
+    pub fn with_maximum_tokens(mut self, maximum_tokens: u64) -> Self {
+        assert!(maximum_tokens > 0);
+        self.maximum_tokens = maximum_tokens;
+        self
+    }
     pub fn attention_profile(&self) -> UpstreamMarkerV2Profile {
         self.selected
     }

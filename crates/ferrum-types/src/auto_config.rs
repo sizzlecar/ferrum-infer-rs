@@ -2583,13 +2583,13 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if strategy == crate::ProgramBindingUploadStrategy::CompleteRows
+        if strategy == crate::ProgramBindingUploadStrategy::UniformLivePrefix
             && (!self.is_cuda_backend()
                 || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
-                reason: "complete-rows requires a CUDA plan runtime".to_owned(),
+                reason: "uniform-live-prefix requires a CUDA plan runtime".to_owned(),
             });
         }
         Ok(self.decision(
@@ -2597,7 +2597,7 @@ impl FerrumConfigBuilder {
             strategy.as_runtime_value(),
             source,
             source_key,
-            ["sparse", "complete-rows"],
+            ["sparse", "uniform-live-prefix"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5421,12 +5421,12 @@ mod tests {
                 AutoConfigSource::Default,
             ),
             (
-                Some("complete-rows"),
+                Some("uniform-live-prefix"),
                 RuntimeConfigSource::ConfigFile,
                 AutoConfigSource::ConfigFile,
             ),
             (
-                Some("complete-rows"),
+                Some("uniform-live-prefix"),
                 RuntimeConfigSource::Env,
                 AutoConfigSource::Env,
             ),
@@ -5484,7 +5484,7 @@ mod tests {
         ] {
             let mut hardware = HardwareCapabilities::unknown();
             hardware.backend = backend.to_owned();
-            let error = FerrumConfigBuilder::new(snapshot(&[(key, "complete-rows")]))
+            let error = FerrumConfigBuilder::new(snapshot(&[(key, "uniform-live-prefix")]))
                 .with_hardware_capabilities(hardware)
                 .with_execution_resource_authority(authority)
                 .resolve()

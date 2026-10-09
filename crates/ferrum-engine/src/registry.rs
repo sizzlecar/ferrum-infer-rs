@@ -1143,11 +1143,11 @@ fn validate_program_binding_upload_strategy(
     plan_runtime: bool,
 ) -> Result<()> {
     if config.engine_config.runtime.program_binding_upload_strategy
-        == ferrum_types::ProgramBindingUploadStrategy::CompleteRows
+        == ferrum_types::ProgramBindingUploadStrategy::UniformLivePrefix
         && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime)
     {
         return Err(FerrumError::unsupported(
-            "complete-rows program-binding uploads require a CUDA plan runtime",
+            "uniform-live-prefix program-binding uploads require a CUDA plan runtime",
         ));
     }
     Ok(())
@@ -1961,7 +1961,7 @@ mod tests {
                     ProgramBindingUploadStrategy::Sparse;
                 validate_program_binding_upload_strategy(&config, plan_runtime).unwrap();
                 config.engine_config.runtime.program_binding_upload_strategy =
-                    ProgramBindingUploadStrategy::CompleteRows;
+                    ProgramBindingUploadStrategy::UniformLivePrefix;
                 assert_eq!(
                     validate_program_binding_upload_strategy(&config, plan_runtime).is_ok(),
                     plan_runtime && matches!(config.device, Device::CUDA(_))
@@ -1979,7 +1979,7 @@ mod tests {
     fn program_binding_upload_rejects_unsupported_factories_before_model_loading() {
         let mut engine = EngineConfig::default();
         engine.runtime.program_binding_upload_strategy =
-            ferrum_types::ProgramBindingUploadStrategy::CompleteRows;
+            ferrum_types::ProgramBindingUploadStrategy::UniformLivePrefix;
         let mut config = ComponentConfig::from_engine_config(&engine);
         config.device = Device::CPU;
         // No source or device allocation is necessary to reject this policy.

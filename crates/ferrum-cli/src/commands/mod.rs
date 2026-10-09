@@ -35,14 +35,14 @@ impl InvocationPreparationStrategyArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProgramBindingUploadStrategyArg {
     Sparse,
-    CompleteRows,
+    UniformLivePrefix,
 }
 
 impl ProgramBindingUploadStrategyArg {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
             Self::Sparse => "sparse",
-            Self::CompleteRows => "complete-rows",
+            Self::UniformLivePrefix => "uniform-live-prefix",
         }
     }
 }
@@ -258,8 +258,8 @@ mod tests {
             for (value, expected) in [
                 ("sparse", ProgramBindingUploadStrategyArg::Sparse),
                 (
-                    "complete-rows",
-                    ProgramBindingUploadStrategyArg::CompleteRows,
+                    "uniform-live-prefix",
+                    ProgramBindingUploadStrategyArg::UniformLivePrefix,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

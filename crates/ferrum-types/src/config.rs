@@ -100,29 +100,31 @@ impl InvocationPreparationStrategy {
     }
 }
 
-/// Upload policy for CUDA program-binding rows. Complete rows preserve the
-/// compiled row layout while replacing sparse per-field uploads.
+/// Upload policy for CUDA program bindings. Uniform live prefixes pad rows
+/// only to the largest live payload in the same node and current batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProgramBindingUploadStrategy {
     #[default]
     Sparse,
-    CompleteRows,
+    UniformLivePrefix,
 }
 
 impl ProgramBindingUploadStrategy {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
             Self::Sparse => "sparse",
-            Self::CompleteRows => "complete-rows",
+            Self::UniformLivePrefix => "uniform-live-prefix",
         }
     }
 
     pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "sparse" => Ok(Self::Sparse),
-            "complete-rows" => Ok(Self::CompleteRows),
-            _ => Err(format!("expected sparse or complete-rows; got {raw:?}")),
+            "uniform-live-prefix" => Ok(Self::UniformLivePrefix),
+            _ => Err(format!(
+                "expected sparse or uniform-live-prefix; got {raw:?}"
+            )),
         }
     }
 }
@@ -252,7 +254,7 @@ pub struct RuntimeKnobs {
     /// Host invocation preparation policy; full preparation is the default.
     #[serde(default)]
     pub invocation_preparation_strategy: InvocationPreparationStrategy,
-    /// Program-binding upload policy; complete rows require a CUDA plan runtime.
+    /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: ProgramBindingUploadStrategy,
 
@@ -1415,7 +1417,7 @@ mod tests {
             ProgramBindingUploadStrategy::Sparse
         );
         for strategy in [
-            ProgramBindingUploadStrategy::CompleteRows,
+            ProgramBindingUploadStrategy::UniformLivePrefix,
             ProgramBindingUploadStrategy::Sparse,
         ] {
             config
