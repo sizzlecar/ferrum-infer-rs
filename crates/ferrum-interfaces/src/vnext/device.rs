@@ -3587,7 +3587,10 @@ pub trait DeviceRuntime: Send + Sync + 'static {
 
     /// Optional lifetime-stable metadata bound to this exact runtime owner.
     /// This is not resource admission or permission to reuse a prior wave.
-    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_, Self>> {
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_, Self>>
+    where
+        Self: Sized,
+    {
         None
     }
 
@@ -3596,7 +3599,10 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn immutable_buffer_metadata<'a>(
         &'a self,
         _buffer: &'a Self::Buffer,
-    ) -> Option<ImmutableBufferMetadata<'a, Self>> {
+    ) -> Option<ImmutableBufferMetadata<'a, Self>>
+    where
+        Self: Sized,
+    {
         None
     }
 
