@@ -215,3 +215,156 @@ fn retained_materialization_rejects_generation_range_and_metadata_drift() {
         .revalidate_view(&authority, &pools.view(&authority).unwrap())
         .unwrap();
 }
+
+#[test]
+fn retained_materialization_rejects_equal_authority_clones_and_foreign_pools() {
+    let (harness, authority) = paged_window_fixture();
+    let pools = &harness.root.dynamic_pools;
+    let backing = pools.view(&authority).unwrap();
+    let equal_authority = authority.retained();
+    assert_eq!(authority.evidence(), equal_authority.evidence());
+    // Value equality cannot transfer the proof to another authority object.
+    assert!(pools.revalidate_view(&equal_authority, &backing).is_err());
+    pools.view(&equal_authority).unwrap();
+
+    let (foreign, foreign_authority) = paged_window_fixture();
+    assert_eq!(harness.pool_ids, foreign.pool_ids);
+    assert_ne!(
+        authority.evidence().pool_instance_id(),
+        foreign_authority.evidence().pool_instance_id()
+    );
+    // Even the exact original slice cannot authorize another live pool with
+    // equal string identifiers. The retained path must check pool instances.
+    assert!(foreign
+        .root
+        .dynamic_pools
+        .revalidate_view(&authority, &backing)
+        .is_err());
+    pools.revalidate_view(&authority, &backing).unwrap();
+}
+
+#[test]
+fn retained_materialization_rechecks_current_chunk_generation_bounds_and_identity() {
+    let (harness, authority) = paged_window_fixture();
+    let pools = &harness.root.dynamic_pools;
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let mut backing = pools.view(&authority).unwrap();
+    let index = 1;
+    let ordinal = authority.evidence().segments()[index].chunk_ordinal();
+    let original = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+
+    // Use an independently allocated backing to exercise current pool state,
+    // while keeping both real allocation grants alive throughout the test.
+    let (donor, _donor_authority) = paged_window_fixture();
+    let donor_pool = &donor.root.dynamic_pools.pools[&donor.pool_ids[0]];
+    let mut replacement = donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .remove(&ordinal)
+        .unwrap();
+    let donor_identity = replacement.backing.identity.clone();
+    let donor_descriptor = replacement.backing.descriptor.clone();
+    Arc::get_mut(&mut replacement.backing).unwrap().identity = BackingChunkIdentity::from_parts(
+        original.backing.identity.pool_id().clone(),
+        ordinal,
+        original.backing.identity.generation() + 1,
+    )
+    .unwrap();
+    // Make the retained chunk pointer agree with current state so rejection
+    // specifically requires comparing the live generation to authority.
+    backing.bindings[index].chunk = Arc::clone(&replacement.backing);
+    pool.state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+
+    let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    backing.bindings[index].chunk = Arc::clone(&original.backing);
+    let current = Arc::get_mut(&mut replacement.backing).unwrap();
+    current.identity = original.backing.identity.clone();
+    current.descriptor.size_bytes = original.backing.descriptor.size_bytes - 1;
+    backing.bindings[index].chunk = Arc::clone(&replacement.backing);
+    pool.state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    // Identity, retained segment and Arc now agree; only the live bounds fail.
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+
+    let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    backing.bindings[index].chunk = Arc::clone(&original.backing);
+    Arc::get_mut(&mut replacement.backing).unwrap().descriptor =
+        original.backing.descriptor.clone();
+    pool.state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    // Equal chunk identity and bounds cannot substitute a different allocation.
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+
+    let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    let current = Arc::get_mut(&mut replacement.backing).unwrap();
+    current.identity = donor_identity;
+    current.descriptor = donor_descriptor;
+    donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    pool.state.lock().unwrap().chunks.insert(ordinal, original);
+    pools.revalidate_view(&authority, &backing).unwrap();
+}
+
+#[test]
+fn first_materialization_still_checks_claim_membership_and_physical_projection() {
+    let (harness, mut authority) = paged_window_fixture();
+    let pools = &harness.root.dynamic_pools;
+    let original_claim = authority.evidence.physical_claim_identity.clone();
+    let different_claim = PhysicalBackingClaimIdentity::new(
+        original_claim.pool_id().clone(),
+        vec![ResourceId::new("resource.unclaimed").unwrap()],
+    )
+    .unwrap();
+    Arc::get_mut(&mut authority.evidence.allocation)
+        .unwrap()
+        .physical_claim_identity = different_claim.clone();
+    assert!(pools.view(&authority).is_err());
+    // Matching claim identities do not prove membership of this resource.
+    Arc::get_mut(&mut authority.segment_lease)
+        .unwrap()
+        .claim_identity = different_claim;
+    assert!(pools.view(&authority).is_err());
+    Arc::get_mut(&mut authority.segment_lease)
+        .unwrap()
+        .claim_identity = original_claim.clone();
+    Arc::get_mut(&mut authority.evidence.allocation)
+        .unwrap()
+        .physical_claim_identity = original_claim;
+
+    let original_segment = authority.evidence.segments[1].clone();
+    Arc::get_mut(&mut authority.evidence.allocation)
+        .unwrap()
+        .segments[1] = BackingSegment::from_chunk(
+        original_segment.pool_id(),
+        original_segment.chunk_ordinal(),
+        original_segment.chunk_generation(),
+        original_segment.offset_bytes() + 1,
+        original_segment.length_bytes() - 1,
+    )
+    .unwrap();
+    // This region fits its chunk but no longer equals the claimed projection.
+    assert!(pools.view(&authority).is_err());
+    Arc::get_mut(&mut authority.evidence.allocation)
+        .unwrap()
+        .segments[1] = original_segment;
+    let backing = pools.view(&authority).unwrap();
+    pools.revalidate_view(&authority, &backing).unwrap();
+}

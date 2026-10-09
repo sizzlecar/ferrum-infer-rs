@@ -11,6 +11,8 @@ use vnext_device_operation_wave_contract::prepare_wave;
 
 #[path = "coverage_tests.rs"]
 mod coverage_tests;
+#[path = "descriptor_agreement_tests.rs"]
+mod descriptor_agreement_tests;
 
 fn step_for(
     batch: &ExecutionBatchParticipants<TestRuntime>,
@@ -65,8 +67,20 @@ fn with_live_wave_spans(
         &[TrustedActiveSequenceBinding],
     ),
 ) {
+    with_live_wave_fixture(fixture(), lengths, run)
+}
+
+fn with_live_wave_fixture(
+    fixture: Fixture,
+    lengths: Vec<usize>,
+    run: impl FnOnce(
+        &Fixture,
+        &PreparedStepSubmissionWave<TestRuntime>,
+        &BatchOperationIdentity,
+        &[TrustedActiveSequenceBinding],
+    ),
+) {
     let width = lengths.len();
-    let fixture = fixture();
     let resources = (0..width)
         .map(|i| {
             logical_resources(
@@ -225,7 +239,7 @@ fn paired_live_wave_invocation_materialization() {
                 .bind(&fixture.resolved, wave.nodes()[0].node_id())
                 .unwrap();
             let node = identity.materialize_node(0).unwrap();
-            let make = |share| {
+            let make = |reference: bool| {
                 BatchedOperationInvocation::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
@@ -238,36 +252,44 @@ fn paired_live_wave_invocation_materialization() {
                     },
                     active.iter(),
                     false,
-                    share,
+                    !reference,
                 )
                 .unwrap()
             };
-            assert_eq!(snapshot(&make(false)), snapshot(&make(true)));
-            for round in 0..6 {
-                for share in if round % 2 == 0 {
-                    [false, true]
-                } else {
-                    [true, false]
-                } {
-                    let mut construct_ns = 0_u128;
-                    let mut total_ns = 0_u128;
-                    for _ in 0..128 {
-                        let start = Instant::now();
-                        let value = black_box(make(share));
-                        construct_ns += start.elapsed().as_nanos();
-                        black_box(value.participants().len());
-                        drop(value);
-                        total_ns += start.elapsed().as_nanos();
-                    }
-                    if round >= 2 {
-                        println!(
-                            "{}",
-                            serde_json::json!({"kind":"invocation_materialization_pair","physical_rows":width,"participants":width,"pair":round-2,"shared":share,"iterations":128,"construct_ns":construct_ns,"construct_and_drop_ns":total_ns,"scope":"same admitted wave; fresh per-call table; no encode/submit; host elapsed, not inference throughput"})
-                        );
-                    }
-                }
-            }
+            paired_invocation_elapsed("invocation_materialization_pair", width, make);
         });
+    }
+}
+
+fn paired_invocation_elapsed<'a>(
+    kind: &str,
+    width: usize,
+    make: impl Fn(bool) -> BatchedOperationInvocation<'a, TestBuffer>,
+) {
+    assert_eq!(snapshot(&make(false)), snapshot(&make(true)));
+    for round in 0..6 {
+        for reference in if round % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        } {
+            let mut construct_ns = 0_u128;
+            let mut total_ns = 0_u128;
+            for _ in 0..128 {
+                let start = Instant::now();
+                let value = black_box(make(reference));
+                construct_ns += start.elapsed().as_nanos();
+                black_box(value.participants().len());
+                drop(value);
+                total_ns += start.elapsed().as_nanos();
+            }
+            if round >= 2 {
+                println!(
+                    "{}",
+                    serde_json::json!({"kind":kind,"physical_rows":width,"participants":width,"pair":round-2,"reference":reference,"iterations":128,"construct_ns":construct_ns,"construct_and_drop_ns":total_ns,"scope":"same admitted wave; fresh per-call proofs; no encode/submit; host elapsed, not inference throughput"})
+                );
+            }
+        }
     }
 }
 

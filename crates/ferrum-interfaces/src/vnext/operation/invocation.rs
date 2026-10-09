@@ -24,8 +24,10 @@ use super::{
     ResolvedValueRole, ReusableBindingResources,
 };
 
+mod descriptor_agreement;
 #[cfg(test)]
 mod materialization_tests;
+use descriptor_agreement::DeviceDescriptorAgreement;
 mod view_coverage;
 #[cfg(test)]
 pub(crate) use view_coverage::test_only_backing_window_coverage;
@@ -610,8 +612,8 @@ pub struct OperationInvocation<'a, B> {
 
 impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
-    fn from_prepared<R>(
-        runtime: &R,
+    fn from_prepared<'runtime, R>(
+        runtime: &'runtime R,
         resolved: &'a dyn ExecutablePlanView,
         prepared: &PreparedOperationDispatchBinding,
         node: &'a PlanNode,
@@ -623,6 +625,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         participant_index: usize,
         reusable_bindings_only: bool,
         shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
+        device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -652,8 +655,8 @@ impl<'a, B> OperationInvocation<'a, B> {
             || participant.request_id() != active_binding.request_id()
             || !active_binding
                 .matches_sequence_session(participant_session.0, participant_session.1)
-            || runtime.descriptor() != resolved.device()
-            || runtime.descriptor() != resolved.capabilities().device()
+            || !device_agreements[0].matches(runtime.descriptor(), resolved.device())
+            || !device_agreements[1].matches(runtime.descriptor(), resolved.capabilities().device())
             || runtime.descriptor().runtime_implementation_fingerprint
                 != plan.payload().device_runtime_implementation_fingerprint()
             || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
@@ -1254,6 +1257,13 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         } else {
             Vec::new()
         };
+        // Borrowed equality proofs live only during this constructor. Each
+        // participant still obtains the current descriptor references; a
+        // changed operand must pass the complete comparison again.
+        let mut device_agreements = [
+            DeviceDescriptorAgreement::default(),
+            DeviceDescriptorAgreement::default(),
+        ];
         let participants = node_identity
             .participants()
             .iter()
@@ -1273,6 +1283,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     index,
                     reusable_bindings_only,
                     &mut shared_backings,
+                    &mut device_agreements,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;

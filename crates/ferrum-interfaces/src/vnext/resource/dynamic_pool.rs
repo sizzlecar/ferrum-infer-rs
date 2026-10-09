@@ -2195,7 +2195,7 @@ impl LogicalBackingSliceAuthority {
 
 pub struct LogicalBackingBufferView<'a, B> {
     pub(in crate::vnext::resource) bindings: Vec<LogicalBackingSegmentBinding<B>>,
-    pub(super) authorities: &'a [LogicalBackingSliceAuthority],
+    pub(super) authorities: super::dynamic_pool_set::ValidatedBackingAuthorities<'a>,
     pub(super) logical_size_bytes: u64,
     pub(super) capacity_size_bytes: u64,
     pub(super) alignment_bytes: u64,
@@ -2263,6 +2263,7 @@ impl<'a, B> LogicalBackingBufferView<'a, B> {
 
     pub fn committed_evidence_segments(&self) -> impl Iterator<Item = &BackingSegment> {
         self.authorities
+            .as_slice()
             .iter()
             .flat_map(|authority| authority.evidence.segments())
     }
@@ -2272,6 +2273,7 @@ impl<'a, B> LogicalBackingBufferView<'a, B> {
     pub fn slice(&self) -> &'a LogicalBackingSliceEvidence {
         &self
             .authorities
+            .as_slice()
             .first()
             .expect("logical backing views always contain an authority")
             .evidence

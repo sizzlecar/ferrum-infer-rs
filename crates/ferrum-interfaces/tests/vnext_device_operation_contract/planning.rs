@@ -896,6 +896,20 @@ pub(crate) fn fixture() -> Fixture {
     fixture_with_zero_state(false)
 }
 
+pub(crate) fn fixture_with_runtime_configuration(
+    configure: impl FnOnce(&mut TestRuntime),
+) -> Fixture {
+    fixture_with_configured_runtime(
+        TestStateProfile::from_zero_state(false),
+        ProviderBehavior::Success,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+        ContractVersion::new(1, 0),
+        configure,
+    )
+}
+
 pub(crate) fn fixture_with_zero_state(zero_state: bool) -> Fixture {
     fixture_with_provider_behavior(zero_state, ProviderBehavior::Success)
 }
@@ -1017,6 +1031,26 @@ fn fixture_with_provider_behavior_execution_semantics_retention_storage_and_oper
     retain_determinism_outputs: bool,
     operation_version: ContractVersion,
 ) -> Fixture {
+    fixture_with_configured_runtime(
+        state_profile,
+        behavior,
+        execution_semantics,
+        execution_determinism,
+        retain_determinism_outputs,
+        operation_version,
+        |_| {},
+    )
+}
+
+fn fixture_with_configured_runtime(
+    state_profile: TestStateProfile,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+    retain_determinism_outputs: bool,
+    operation_version: ContractVersion,
+    configure: impl FnOnce(&mut TestRuntime),
+) -> Fixture {
     let scratch = if matches!(
         behavior,
         ProviderBehavior::ProgramBindingWithScratchTail
@@ -1098,7 +1132,8 @@ fn fixture_with_provider_behavior_execution_semantics_retention_storage_and_oper
     )
     .plan_hash()
     .clone();
-    let (runtime, runtime_trace) = runtime(&catalog);
+    let (mut runtime, runtime_trace) = runtime(&catalog);
+    configure(Arc::get_mut(&mut runtime).expect("runtime has not been shared before provisioning"));
     let plan_resources = plan_runtime_resources(&plan, Arc::clone(&runtime));
     Fixture {
         registry,
