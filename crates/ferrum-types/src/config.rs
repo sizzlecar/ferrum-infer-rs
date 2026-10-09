@@ -74,13 +74,16 @@ impl PrefillDecodeExecution {
 
 /// Host invocation preparation for native plan runtimes. Identity projection
 /// borrows compiled identity metadata while preserving per-invocation validation.
-/// It does not change resource preparation or device execution policy.
+/// Steady recipes compile supported resident-node bindings from fresh checked
+/// resources, with identity projection for nodes without that capability.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InvocationPreparationStrategy {
     #[default]
     Full,
     IdentityProjection,
+    /// Use fresh checked resources with supported resident binding recipes.
+    SteadyRecipe,
 }
 
 impl InvocationPreparationStrategy {
@@ -88,6 +91,7 @@ impl InvocationPreparationStrategy {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::SteadyRecipe => "steady-recipe",
         }
     }
 
@@ -95,8 +99,15 @@ impl InvocationPreparationStrategy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
-            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+            "steady-recipe" => Ok(Self::SteadyRecipe),
+            _ => Err(format!(
+                "expected full, identity-projection or steady-recipe; got {raw:?}"
+            )),
         }
+    }
+
+    pub const fn uses_identity_projection(self) -> bool {
+        matches!(self, Self::IdentityProjection | Self::SteadyRecipe)
     }
 }
 
@@ -1331,6 +1342,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::SteadyRecipe,
             InvocationPreparationStrategy::Full,
         ] {
             config

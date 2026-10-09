@@ -2636,7 +2636,7 @@ where
         }))
     }
 
-    fn validate_authority(
+    pub(super) fn validate_authority(
         pool: &DynamicBackingPool<R>,
         authority: &LogicalBackingSliceAuthority,
     ) -> Result<(), VNextError> {

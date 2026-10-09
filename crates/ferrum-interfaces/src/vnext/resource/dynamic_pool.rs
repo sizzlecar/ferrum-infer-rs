@@ -2211,6 +2211,13 @@ pub(crate) struct LogicalBackingSegmentBinding<B> {
 }
 
 impl<B> LogicalBackingSegmentBinding<B> {
+    pub(crate) fn retained_clone(&self) -> Self {
+        Self {
+            segment: self.segment.clone(),
+            chunk: Arc::clone(&self.chunk),
+            retention: self.retention.clone(),
+        }
+    }
     pub(crate) fn segment(&self) -> &BackingSegment {
         &self.segment
     }

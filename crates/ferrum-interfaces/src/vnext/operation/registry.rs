@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::super::{
     BatchWorkShape, ClaimedSubmissionWaveBacking, ContractVersion, DeviceDescriptor,
@@ -604,6 +604,25 @@ pub enum ReusableBindingResources {
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
+    /// Optional cold declaration. The invocation has passed the original full
+    /// checks. Returning a declaration does not publish it: core waits for
+    /// successful execution and the exact resident entry confirmation.
+    fn declare_steady_recipe(
+        &self,
+        _invocation: &BatchedOperationInvocation<'_, R::Buffer>,
+    ) -> Result<Option<super::SteadyRecipeDeclaration>, OperationFailure> {
+        Ok(None)
+    }
+
+    /// Encodes a fresh core-issued physical table after all pool permits have
+    /// been released. Mutable backend services and fresh dependency issuance
+    /// remain part of this call. Only supporting providers override it.
+    fn encode_steady_recipe(
+        &self,
+        _patch: super::PreparedSteadyRecipePatch<'_, R::Buffer>,
+    ) -> Option<Result<EncodedReusableExecutionBindings<R::Command>, OperationFailure>> {
+        None
+    }
     /// Opts a binding-only encoder into a smaller physical view projection.
     /// The default preserves the full invocation, including for providers
     /// whose binding encoder delegates to `encode_selected`.
@@ -771,6 +790,7 @@ where
             provider.reusable_binding_resources(),
         )?;
         Ok(BoundOperationProvider {
+            steady_owner: OnceLock::new(),
             provider: BoundOperationProviderSource::Borrowed(provider.as_ref()),
             plan_id: plan.payload().plan_id().clone(),
             plan_hash: plan.plan_hash().clone(),
@@ -803,6 +823,7 @@ where
                     provider.reusable_binding_resources(),
                 )?;
                 Ok(BoundOperationProvider {
+                    steady_owner: OnceLock::new(),
                     provider: BoundOperationProviderSource::Owned(Arc::clone(provider)),
                     plan_id: plan.payload().plan_id().clone(),
                     plan_hash: plan.plan_hash().clone(),
@@ -910,6 +931,7 @@ pub struct BoundOperationProvider<'registry, R>
 where
     R: DeviceRuntime,
 {
+    steady_owner: OnceLock<Arc<()>>,
     provider: BoundOperationProviderSource<'registry, R>,
     plan_id: PlanId,
     plan_hash: PlanHash,
@@ -921,6 +943,9 @@ impl<R> BoundOperationProvider<'_, R>
 where
     R: DeviceRuntime,
 {
+    pub(super) fn steady_owner(&self) -> &Arc<()> {
+        self.steady_owner.get_or_init(|| Arc::new(()))
+    }
     pub(super) fn provider(&self) -> &dyn OperationProvider<R> {
         self.provider.provider()
     }

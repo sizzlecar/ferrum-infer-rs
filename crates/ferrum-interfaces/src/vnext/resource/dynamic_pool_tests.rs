@@ -36,6 +36,9 @@ mod plan_fit_tests;
 #[path = "operation_view_coverage_tests.rs"]
 mod operation_view_coverage_tests;
 
+#[path = "steady_recipe_pool_tests.rs"]
+mod steady_recipe_pool_tests;
+
 #[path = "checkpoint/tests.rs"]
 mod checkpoint_backing_tests;
 

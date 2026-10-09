@@ -1402,6 +1402,12 @@ pub(crate) enum FenceBehavior {
 
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) immutable_metadata_enabled: bool,
+    pub(crate) tamper_buffer_resource: Option<ResourceId>,
+    pub(crate) steady_recipe_entry: Option<DeviceReusableExecutionEntryIdentity>,
+    pub(crate) steady_recipe_entry_error: bool,
+    pub(crate) steady_recipe_entry_panic: bool,
+    pub(crate) steady_recipe_trim_released: usize,
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
@@ -1650,6 +1656,57 @@ impl DeviceRuntime for TestRuntime {
     type Fence = TestFence;
     type Error = TestRuntimeError;
 
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_>> {
+        self.trace
+            .lock()
+            .unwrap()
+            .immutable_metadata_enabled
+            .then(|| ImmutableRuntimeMetadata::declare(self, &self.descriptor))
+    }
+
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        buffer: &'a Self::Buffer,
+    ) -> Option<ImmutableBufferMetadata<'a, Self::Buffer>> {
+        self.trace
+            .lock()
+            .unwrap()
+            .immutable_metadata_enabled
+            .then(|| ImmutableBufferMetadata::declare(self, buffer, &buffer.descriptor))
+    }
+
+    fn reusable_execution_entry_identity(
+        &self,
+        _stream: &Self::Stream,
+        _program: &DeviceReusableExecutionProgramId,
+    ) -> Result<Option<DeviceReusableExecutionEntryIdentity>, Self::Error> {
+        let (entry, error, panic) = {
+            let trace = self.trace.lock().unwrap();
+            (
+                trace.steady_recipe_entry.clone(),
+                trace.steady_recipe_entry_error,
+                trace.steady_recipe_entry_panic,
+            )
+        };
+        assert!(!panic, "injected steady entry inspection panic");
+        if error {
+            return Err(TestRuntimeError("injected steady entry inspection error"));
+        }
+        Ok(entry)
+    }
+
+    fn trim_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        let released = trace.steady_recipe_trim_released;
+        if released != 0 {
+            trace.steady_recipe_entry = None;
+        }
+        Ok(DeviceReusableExecutionTrim::new(released, 0))
+    }
+
     fn descriptor(&self) -> &DeviceDescriptor {
         if self
             .descriptor_reads_until_drift
@@ -1698,6 +1755,11 @@ impl DeviceRuntime for TestRuntime {
             }
         }
         if self.trace.lock().unwrap().tamper_buffer_descriptor {
+            descriptor.size_bytes += 1;
+        }
+        if self.trace.lock().unwrap().tamper_buffer_resource.as_ref()
+            == Some(&descriptor.resource_id)
+        {
             descriptor.size_bytes += 1;
         }
         descriptor

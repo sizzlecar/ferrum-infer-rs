@@ -136,6 +136,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/native_io.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks/weights.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
+        include_bytes!("vnext_ops/transformer/attention/steady_recipe.rs"),
         include_str!("vnext_ops/transformer/attention/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention/native_projection.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
@@ -159,6 +160,8 @@ pub fn cuda_vnext_runtime_config(
             include_bytes!("vnext_ops/transformer/upstream_swiglu.rs").as_slice(),
             include_bytes!("vnext_ops/transformer/upstream_swiglu/encode.rs").as_slice(),
             include_bytes!("vnext_ops/transformer/q8act_attention/upstream.rs").as_slice(),
+            include_bytes!("vnext_ops/transformer/q8act_attention/upstream/steady_recipe.rs")
+                .as_slice(),
             include_bytes!("vnext_ops/native_blocks/upstream_linear.rs").as_slice(),
             include_bytes!("vnext_ops/native_blocks/upstream_linear/preparation.rs").as_slice(),
             include_bytes!("vnext_ops/native_blocks/upstream_linear/weight_validation.rs")

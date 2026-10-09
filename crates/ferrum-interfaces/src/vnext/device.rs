@@ -10,6 +10,11 @@ use std::time::Duration;
 
 use ferrum_types::AttentionExecutionPolicy;
 
+mod immutable_metadata;
+pub use immutable_metadata::{
+    DeviceReusableExecutionEntryIdentity, ImmutableBufferMetadata, ImmutableRuntimeMetadata,
+};
+
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
     EncodedRetainedPlanDependency, ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope,
@@ -530,6 +535,15 @@ pub enum DeviceReusableAddressScope {
 }
 
 impl DeviceBufferRetention {
+    /// A cold recipe may identify the captured allocation without keeping a
+    /// request, slot lease or allocation alive. Numeric IDs are insufficient.
+    pub(crate) fn weak_allocation_owner(&self) -> std::sync::Weak<dyn Send + Sync> {
+        Arc::downgrade(
+            self._secondary_owner
+                .as_ref()
+                .unwrap_or(&self._primary_owner),
+        )
+    }
     pub(crate) fn plan<T>(owner: Arc<T>) -> Self
     where
         T: Send + Sync + 'static,
@@ -3568,6 +3582,30 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error>;
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor;
+
+    /// Explicit immutable metadata capability. Dynamic implementations retain
+    /// the original getter/check path through the default `None`.
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_>> {
+        None
+    }
+
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        _buffer: &'a Self::Buffer,
+    ) -> Option<ImmutableBufferMetadata<'a, Self::Buffer>> {
+        None
+    }
+
+    /// Called only at the existing quiescent catalog boundary. An identity is
+    /// valid only for the exact current complete program entry, never merely
+    /// for a matching program ID after recapture.
+    fn reusable_execution_entry_identity(
+        &self,
+        _stream: &Self::Stream,
+        _program: &DeviceReusableExecutionProgramId,
+    ) -> Result<Option<DeviceReusableExecutionEntryIdentity>, Self::Error> {
+        Ok(None)
+    }
 
     /// Begins an optional all-or-nothing static-weight import transaction.
     /// Returning `None` selects the portable zero-and-upload path. The default

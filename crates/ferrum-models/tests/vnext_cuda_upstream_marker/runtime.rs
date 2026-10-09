@@ -19,6 +19,8 @@ mod identity_projection;
 mod prefill;
 #[path = "runtime/replay_bindings.rs"]
 mod replay_bindings;
+#[path = "runtime/steady_recipe.rs"]
+mod steady_recipe;
 #[path = "runtime/two_streams.rs"]
 mod two_streams;
 

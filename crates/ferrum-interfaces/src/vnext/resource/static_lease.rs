@@ -65,6 +65,9 @@ pub struct LeasedBufferView<'a, B> {
 }
 
 impl<'a, B> LeasedBufferView<'a, B> {
+    pub(crate) fn buffer_for_lease(&self) -> &'a B {
+        self.buffer
+    }
     pub fn identity(&self) -> &ResourceTransactionIdentity {
         self.identity
     }

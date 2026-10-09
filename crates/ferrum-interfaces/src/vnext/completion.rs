@@ -28,6 +28,7 @@ use super::{
 mod readback_collection;
 pub use readback_collection::*;
 mod completed_wave;
+mod steady_recipe;
 pub(crate) use completed_wave::SuccessfulWaveCompletionSeal;
 mod state_transfer;
 pub(crate) use state_transfer::*;
@@ -118,6 +119,7 @@ pub struct ExecutionLane<R: DeviceRuntime> {
     descriptor: DeviceDescriptor,
     fail_closed: AtomicBool,
     reusable_execution_epoch: AtomicU64,
+    steady_recipes: OnceLock<steady_recipe::SteadyRecipeCache<R>>,
     state: Mutex<ExecutionLaneState<R::Stream>>,
 }
 
@@ -158,6 +160,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             descriptor,
             fail_closed: AtomicBool::new(false),
             reusable_execution_epoch: AtomicU64::new(1),
+            steady_recipes: OnceLock::new(),
             state: Mutex::new(ExecutionLaneState {
                 stream,
                 in_flight: 0,
@@ -389,7 +392,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 .trim_reusable_executables(&mut state.stream)
                 .map(Some)
         }));
-        match trimmed {
+        let result = match trimmed {
             Ok(Ok(None))
                 if self.current_descriptor_matches_snapshot()
                     && self.runtime.stream_state(&state.stream) == StreamState::Ready =>
@@ -435,7 +438,14 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                     "device runtime panicked while trimming reusable executables",
                 ))
             }
+        };
+        drop(state);
+        if matches!(&result, Ok(true)) {
+            // Cold provider state may release resources or reenter the lane.
+            // Drop it only after the native/stream critical section has ended.
+            self.clear_steady_recipes()?;
         }
+        result
     }
 
     pub(crate) fn runtime(&self) -> &R {

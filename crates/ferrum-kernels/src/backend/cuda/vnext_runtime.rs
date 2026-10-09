@@ -3591,6 +3591,33 @@ impl DeviceRuntime for CudaDeviceRuntime {
         buffer.descriptor.clone()
     }
 
+    fn immutable_runtime_metadata(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::ImmutableRuntimeMetadata<'_>> {
+        // The descriptor is installed once by the runtime constructor. Stream,
+        // allocator, quarantine and graph-cache state are not this capability.
+        Some(ferrum_interfaces::vnext::ImmutableRuntimeMetadata::declare(
+            self,
+            &self.descriptor,
+        ))
+    }
+
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        buffer: &'a Self::Buffer,
+    ) -> Option<ferrum_interfaces::vnext::ImmutableBufferMetadata<'a, Self::Buffer>> {
+        if buffer.runtime_instance != self.runtime_instance {
+            return None;
+        }
+        // The exact facade owns an immutable descriptor and allocation Arc.
+        // This does not certify a pool's current chunk, lease or logical window.
+        Some(ferrum_interfaces::vnext::ImmutableBufferMetadata::declare(
+            self,
+            buffer,
+            &buffer.descriptor,
+        ))
+    }
+
     fn encode_static_weight_transform(
         &self,
         request: StaticWeightTransformRequest<'_, '_, Self::Buffer>,
@@ -3707,6 +3734,21 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .executable_cache
             .catalog()
             .map_err(CudaDeviceRuntimeError::contract)
+    }
+
+    fn reusable_execution_entry_identity(
+        &self,
+        stream: &Self::Stream,
+        program: &ferrum_interfaces::vnext::DeviceReusableExecutionProgramId,
+    ) -> Result<Option<ferrum_interfaces::vnext::DeviceReusableExecutionEntryIdentity>, Self::Error>
+    {
+        self.validate_stream(stream)?;
+        if !stream.state.is_quiescent() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA recipe entry inspection requires its quiescent owning stream",
+            ));
+        }
+        Ok(stream.executable_cache.recipe_program_owner(program))
     }
 
     fn encode_reusable_execution(

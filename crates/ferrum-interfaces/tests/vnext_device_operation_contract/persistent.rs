@@ -189,6 +189,14 @@ pub(crate) fn fixture_with_retained_dependencies(
     bytes: u64,
     dependency_mode: DependencyMode,
 ) -> Fixture {
+    fixture_with_retained_dependencies_and_bucket(bytes, dependency_mode, None)
+}
+
+pub(crate) fn fixture_with_retained_dependencies_and_bucket(
+    bytes: u64,
+    dependency_mode: DependencyMode,
+    bucket: Option<ReusableExecutionBucketSpec>,
+) -> Fixture {
     let original = catalog();
     let mut operation = operation();
     operation.resources.persistent = ResourcePresenceRequirement::Required;
@@ -247,8 +255,16 @@ pub(crate) fn fixture_with_retained_dependencies(
         if matches!(dependency_mode, DependencyMode::None) {
             (policy(), None)
         } else {
-            let (policy, bucket) = reusable_policy();
-            (policy, Some(bucket))
+            let (original_policy, original_bucket) = reusable_policy();
+            match bucket {
+                Some(bucket) => (
+                    policy_with_reusable_execution(Some(
+                        ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap(),
+                    )),
+                    Some(bucket),
+                ),
+                None => (original_policy, Some(original_bucket)),
+            }
         };
     let (resolved, plan) = planning::resolved_model_plan_with_zero_state_and_policy(
         &registry,

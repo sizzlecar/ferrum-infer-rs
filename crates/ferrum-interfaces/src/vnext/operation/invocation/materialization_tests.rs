@@ -338,3 +338,6 @@ mod identity_projection_tests;
 
 #[path = "constructor_timing_tests.rs"]
 mod constructor_timing_tests;
+
+#[path = "steady_recipe_tests.rs"]
+mod steady_recipe_tests;

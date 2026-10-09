@@ -66,6 +66,7 @@ use crate::marlin_fp8_materializer::{
 
 mod native_projection;
 mod precision;
+mod steady_recipe;
 use super::q8act_attention::PreparedAttentionProjections;
 use crate::backend::cuda::vnext_ops::native_blocks::q8act::Q8ActKernels;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
@@ -204,6 +205,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             source.as_bytes(),
             precision.operation().as_bytes(),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("attention/steady_recipe.rs"),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
@@ -586,6 +588,66 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
+    fn declare_steady_recipe(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::vnext::SteadyRecipeDeclaration>, OperationFailure> {
+        if !self.precision.upstream()
+            || invocation.program_binding().is_none()
+            || invocation.participants().is_empty()
+            || invocation
+                .participant_token_ranges()
+                .iter()
+                .any(|range| range.immediate_tokens() != 1)
+        {
+            return Ok(None);
+        }
+        let identity = invocation.participants()[0].identity().clone();
+        let small_hybrid = self
+            .functions
+            .upstream
+            .as_ref()
+            .map(|runtime| runtime.g32_binding_only(invocation))
+            .transpose()
+            .map_err(|message| {
+                provider_failure(
+                    identity.clone(),
+                    "cuda.attention.declare_steady_recipe",
+                    message,
+                )
+            })?
+            .unwrap_or(false);
+        if small_hybrid {
+            return Ok(None);
+        }
+        let mut declaration = None;
+        encode_attention(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.functions,
+            self.precision,
+            self.execution_capabilities,
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+            invocation,
+            EncodingTarget::BindingsOnly,
+            Some(&mut declaration),
+        )
+        .map_err(|message| {
+            provider_failure(identity, "cuda.attention.declare_steady_recipe", message)
+        })?;
+        Ok(declaration)
+    }
+
+    fn encode_steady_recipe(
+        &self,
+        patch: ferrum_interfaces::vnext::PreparedSteadyRecipePatch<'_, CudaDeviceBuffer>,
+    ) -> Option<Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure>> {
+        let identity = patch.node_identity().participants()[0].identity().clone();
+        Some(steady_recipe::encode(patch).map_err(|message| {
+            provider_failure(identity, "cuda.attention.encode_steady_recipe", message)
+        }))
+    }
+
     fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
         if self.precision.upstream() {
             ferrum_interfaces::vnext::ReusableBindingResources::All
@@ -638,8 +700,9 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             self.execution_capabilities,
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
-            invocation,
+            &invocation,
             EncodingTarget::Full,
+            None,
         )
         .and_then(Encoding::full)
         .map_err(|message| {
@@ -687,8 +750,9 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
                 self.execution_capabilities,
                 #[cfg(feature = "vllm-marlin")]
                 self.projection_runtime,
-                invocation,
+                &invocation,
                 EncodingTarget::BindingsOnly,
+                None,
             )
             .and_then(Encoding::bindings)
             .map_err(|message| {
@@ -1577,8 +1641,9 @@ fn encode_attention(
     precision: AttentionPrecision,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
-    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
+    cold_recipe: Option<&mut Option<ferrum_interfaces::vnext::SteadyRecipeDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
         || invocation.operation().id.as_str() != precision.operation()
@@ -1978,6 +2043,15 @@ fn encode_attention(
     if target == EncodingTarget::BindingsOnly {
         if !has_compiled_program_slot {
             return Err("binding-only attention encoding requires a compiled slot".into());
+        }
+        if let Some(output) = cold_recipe {
+            *output = steady_recipe::declare_from_prepared(
+                invocation,
+                q8act.as_ref(),
+                &compute_regions[shared.scratch],
+                required_bytes,
+                binding_layout.required_bytes,
+            )?;
         }
         let bindings = upstream_bindings.into_iter().fold(
             EncodedReusableExecutionBindings::empty().with_program_binding(binding_command),

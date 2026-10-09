@@ -72,6 +72,34 @@ pub struct RetainedPlanDependencyAuthority {
     _destination_retention: DeviceBufferRetention,
 }
 
+/// Plan-only data after the complete original invocation check. No old node
+/// scope is retained. A fresh issuer may use it only after validating current
+/// Plan owners and declarations for every participant in the new table.
+#[derive(Clone)]
+pub(super) struct RetainedPlanDependencyTemplate {
+    identity: RetainedPlanDependencyIdentity,
+    source_retention: DeviceBufferRetention,
+    destination_retention: DeviceBufferRetention,
+}
+
+impl RetainedPlanDependencyTemplate {
+    pub(super) fn from_authority(authority: RetainedPlanDependencyAuthority) -> Self {
+        Self {
+            identity: authority.identity,
+            source_retention: authority._source_retention,
+            destination_retention: authority._destination_retention,
+        }
+    }
+    pub(super) fn issue(&self, scope: &Arc<()>) -> RetainedPlanDependencyAuthority {
+        RetainedPlanDependencyAuthority {
+            scope: scope.clone(),
+            identity: self.identity.clone(),
+            _source_retention: self.source_retention.clone(),
+            _destination_retention: self.destination_retention.clone(),
+        }
+    }
+}
+
 pub struct EncodedRetainedPlanDependency<C> {
     pub(super) authority: RetainedPlanDependencyAuthority,
     pub(crate) command: C,

@@ -1023,6 +1023,7 @@ where
         )?;
         Ok(StepSubmissionWaveAdmissionDecision::Prepared(
             PreparedStepSubmissionWave {
+                steady_recipe_candidates: Vec::new(),
                 claimed_backing,
                 initializations: None,
                 request_state_hazards,
@@ -1721,6 +1722,10 @@ pub struct PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
+    steady_recipe_candidates: Vec<(
+        std::sync::Weak<ExecutionLane<R>>,
+        Arc<crate::vnext::SealedNodeRecipe<R>>,
+    )>,
     // Drop wave backing and participant flights before releasing the Step.
     claimed_backing: ClaimedSubmissionWaveBacking,
     initializations: Option<PreparedBackingInitializations>,
@@ -1767,7 +1772,22 @@ where
         &self,
         seal: &crate::vnext::SuccessfulWaveCompletionSeal,
     ) -> Result<(), VNextError> {
-        super::record_completed_wave(self, seal)
+        super::record_completed_wave(self, seal)?;
+        for (lane, recipe) in &self.steady_recipe_candidates {
+            if let Some(lane) = lane.upgrade() {
+                lane.record_successful_steady_recipe(Arc::clone(recipe))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_steady_recipe(
+        &mut self,
+        lane: &Arc<ExecutionLane<R>>,
+        recipe: Arc<crate::vnext::SealedNodeRecipe<R>>,
+    ) {
+        self.steady_recipe_candidates
+            .push((Arc::downgrade(lane), recipe));
     }
 
     pub fn claimed_backing(&self) -> &ClaimedSubmissionWaveBacking {
@@ -1811,6 +1831,83 @@ where
 
     pub fn has_shared_step_backing(&self) -> bool {
         self.step.claimed_backing().has_shared_physical_claims()
+    }
+
+    pub(crate) fn steady_backing_authorities(
+        &self,
+        node_index: usize,
+        participant_index: usize,
+        resource_id: &ResourceId,
+        lifetime: AllocationLifetime,
+    ) -> Result<&[LogicalBackingSliceAuthority], VNextError> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| invalid_resource("steady node index is out of bounds"))?;
+        let participant = node
+            .participant_authority
+            .participants
+            .get(participant_index)
+            .ok_or_else(|| invalid_resource("steady participant index is out of bounds"))?;
+        if !std::ptr::eq(
+            participant.request.plan.dynamic_pools(),
+            node.participant_authority.participants[0]
+                .request
+                .plan
+                .dynamic_pools(),
+        ) {
+            return Err(invalid_resource(
+                "steady participants have different physical pool owners",
+            ));
+        }
+        match lifetime {
+            AllocationLifetime::Request => participant
+                .request
+                .backing_slices()
+                .iter()
+                .find(|a| a.resource_id() == resource_id)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Sequence => {
+                let snapshot =
+                    self.step
+                        .participant_backing_snapshot(BatchParticipantAuthority::new(
+                            participant.sequence_authority(),
+                            participant.request_authority(),
+                        ))?;
+                let authorities = snapshot.backing_slices_for(resource_id);
+                (!authorities.is_empty()).then_some(authorities)
+            }
+            AllocationLifetime::Step => self
+                .step
+                .backing_slices()
+                .iter()
+                .find(|a| a.resource_id() == resource_id)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Invocation => self
+                .claimed_backing
+                .backing_slices()
+                .iter()
+                .find(|a| a.resource_id() == resource_id)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Plan => None,
+        }
+        .ok_or_else(|| invalid_resource("steady resource has no exact current authority"))
+    }
+
+    pub(crate) fn steady_backing_batch(
+        &self,
+        node_index: usize,
+        groups: &[&[LogicalBackingSliceAuthority]],
+    ) -> Result<super::SteadyBackingBatch<R::Buffer>, VNextError> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| invalid_resource("steady node index is out of bounds"))?;
+        node.participant_authority.participants[0]
+            .request
+            .plan
+            .dynamic_pools()
+            .steady_backing_batch(groups)
     }
 
     pub(crate) fn backing_view(

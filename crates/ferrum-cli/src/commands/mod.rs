@@ -21,6 +21,8 @@ impl PrefillDecodeExecutionArg {
 pub enum InvocationPreparationStrategyArg {
     Full,
     IdentityProjection,
+    /// Use checked recipes for supported resident nodes, with identity projection elsewhere.
+    SteadyRecipe,
 }
 
 impl InvocationPreparationStrategyArg {
@@ -28,6 +30,7 @@ impl InvocationPreparationStrategyArg {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::SteadyRecipe => "steady-recipe",
         }
     }
 }
@@ -202,6 +205,10 @@ mod tests {
                 (
                     "identity-projection",
                     InvocationPreparationStrategyArg::IdentityProjection,
+                ),
+                (
+                    "steady-recipe",
+                    InvocationPreparationStrategyArg::SteadyRecipe,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

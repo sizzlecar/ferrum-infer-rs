@@ -19,6 +19,9 @@ use ferrum_interfaces::vnext::{
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+mod steady_recipe;
+pub(in crate::backend::cuda::vnext_ops::transformer) use steady_recipe::PlanOnlyRecipe;
+
 pub(in crate::backend::cuda::vnext_ops::transformer) struct Runtime {
     plans: UpstreamPlanFactory,
     profile: UpstreamMarkerV2Profile,
@@ -566,6 +569,7 @@ pub(in crate::backend::cuda::vnext_ops::transformer) fn fingerprint_sources() ->
 {
     vec![
         include_bytes!("upstream.rs"),
+        include_bytes!("upstream/steady_recipe.rs"),
         include_bytes!("../../native_blocks/upstream_linear.rs"),
         include_bytes!("../../native_blocks/upstream_linear/preparation.rs"),
         include_bytes!("../../native_blocks/upstream_linear/weight_validation.rs"),

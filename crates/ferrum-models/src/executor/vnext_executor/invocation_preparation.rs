@@ -1,5 +1,5 @@
-//! Accounting is scoped to identity preparation through dispatch return, including
-//! failed dispatch attempts. Later observation can materialize more owned parts.
+//! Identity and recipe preparation through dispatch return, including failures.
+//! Later observation can materialize parts; recipe preparation is not completion.
 use super::*;
 
 #[derive(Default)]
@@ -7,6 +7,10 @@ pub(super) struct PreparationMetrics {
     dispatch_attempts: AtomicU64,
     projected_identities: AtomicU64,
     parts_materialized: AtomicU64,
+    recipe_considered_nodes: AtomicU64,
+    recipe_prepared_nodes: AtomicU64,
+    recipe_fallback_nodes: AtomicU64,
+    recipe_invalid_nodes: AtomicU64,
 }
 
 impl InvocationPreparationSink for PreparationMetrics {
@@ -17,6 +21,17 @@ impl InvocationPreparationSink for PreparationMetrics {
         self.parts_materialized
             .fetch_add(stats.parts_materialized, Ordering::Relaxed);
     }
+
+    fn record_steady_recipe(&self, stats: SteadyRecipePreparationStats) {
+        for (counter, value) in [
+            (&self.recipe_considered_nodes, stats.considered_nodes),
+            (&self.recipe_prepared_nodes, stats.prepared_nodes),
+            (&self.recipe_fallback_nodes, stats.fallback_nodes),
+            (&self.recipe_invalid_nodes, stats.invalid_nodes),
+        ] {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
+    }
 }
 
 impl PreparationMetrics {
@@ -25,6 +40,10 @@ impl PreparationMetrics {
             &self.dispatch_attempts,
             &self.projected_identities,
             &self.parts_materialized,
+            &self.recipe_considered_nodes,
+            &self.recipe_prepared_nodes,
+            &self.recipe_fallback_nodes,
+            &self.recipe_invalid_nodes,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -38,6 +57,15 @@ impl PreparationMetrics {
             "dispatch_attempts": self.dispatch_attempts.load(Ordering::Relaxed),
             "projected_identities": self.projected_identities.load(Ordering::Relaxed),
             "parts_materialized": self.parts_materialized.load(Ordering::Relaxed),
+            "steady_recipe": {
+                "scope": "resident_node_preparation_through_dispatch_return_including_failures",
+                "prepared": "fresh_checked_resources_and_patch_encoding_succeeded_not_gpu_completion_or_recipe_publication",
+                "fallback": "unsupported_or_cold_node_uses_identity_projection",
+                "considered_nodes": self.recipe_considered_nodes.load(Ordering::Relaxed),
+                "prepared_nodes": self.recipe_prepared_nodes.load(Ordering::Relaxed),
+                "fallback_nodes": self.recipe_fallback_nodes.load(Ordering::Relaxed),
+                "invalid_nodes": self.recipe_invalid_nodes.load(Ordering::Relaxed),
+            },
         })
     }
 }
@@ -68,10 +96,27 @@ mod tests {
             projected_identities: 3,
             parts_materialized: 0,
         });
+        metrics.record_steady_recipe(SteadyRecipePreparationStats {
+            considered_nodes: 4,
+            prepared_nodes: 2,
+            fallback_nodes: 1,
+            invalid_nodes: 1,
+        });
+        metrics.record_steady_recipe(SteadyRecipePreparationStats {
+            considered_nodes: 3,
+            prepared_nodes: 1,
+            fallback_nodes: 2,
+            invalid_nodes: 0,
+        });
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot["dispatch_attempts"], 2);
         assert_eq!(snapshot["projected_identities"], 8);
         assert_eq!(snapshot["parts_materialized"], 2);
+        let recipe = &snapshot["steady_recipe"];
+        assert_eq!(recipe["considered_nodes"], 7);
+        assert_eq!(recipe["prepared_nodes"], 3);
+        assert_eq!(recipe["fallback_nodes"], 3);
+        assert_eq!(recipe["invalid_nodes"], 1);
         executor_metrics.reset_after_startup();
         let reset = metrics.snapshot();
         for field in [
@@ -81,14 +126,31 @@ mod tests {
         ] {
             assert_eq!(reset[field], 0);
         }
+        for field in [
+            "considered_nodes",
+            "prepared_nodes",
+            "fallback_nodes",
+            "invalid_nodes",
+        ] {
+            assert_eq!(reset["steady_recipe"][field], 0);
+        }
         metrics.record_preparation(InvocationPreparationStats {
             projected_identities: 1,
             parts_materialized: 1,
+        });
+        metrics.record_steady_recipe(SteadyRecipePreparationStats {
+            considered_nodes: 1,
+            prepared_nodes: 1,
+            ..Default::default()
         });
         let next = metrics.snapshot();
         assert_eq!(next["dispatch_attempts"], 1);
         assert_eq!(next["projected_identities"], 1);
         assert_eq!(next["parts_materialized"], 1);
+        assert_eq!(next["steady_recipe"]["considered_nodes"], 1);
+        assert_eq!(next["steady_recipe"]["prepared_nodes"], 1);
+        assert_eq!(next["steady_recipe"]["fallback_nodes"], 0);
+        assert_eq!(next["steady_recipe"]["invalid_nodes"], 0);
     }
 
     #[test]
@@ -125,6 +187,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::SteadyRecipe,
             InvocationPreparationStrategy::Full,
         ] {
             engine

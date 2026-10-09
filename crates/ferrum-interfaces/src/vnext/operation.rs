@@ -51,6 +51,7 @@ pub use checkpoint::{
 pub(crate) use compiled_identity::CompiledOperationIdentity;
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
 mod preparation;
+mod steady_recipe;
 pub use descriptor::{
     OperationContract, OperationDescriptor, OracleSpec, ProfilePhase, ProviderRequirement,
     ResourcePresenceRequirement, ResourceRequirements,
@@ -82,8 +83,11 @@ pub use identity::{
     BatchOperationIdentity, BatchOperationIdentityMaterializationSnapshot,
     BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
 };
+pub(crate) use invocation::steady_recipe::SealedNodeRecipe;
 pub use invocation::{BatchedOperationInvocation, OperationInvocation};
-pub use preparation::{InvocationPreparationSink, InvocationPreparationStats};
+pub use preparation::{
+    InvocationPreparationSink, InvocationPreparationStats, SteadyRecipePreparationStats,
+};
 pub use provider::{
     EngineProviderDescriptor, ExecutionDeterminismRequirement, OperationFailure,
     OperationProviderDescriptor, ProviderCompatibilityRejectReason, ProviderCompatibilityRejection,
@@ -105,6 +109,10 @@ pub use resolved_value::{
     ResolvedValueRole, ResolvedValueStorage,
 };
 pub use semantic::{AttributeId, AttributeValueKind, CanonicalRational, SemanticValue};
+pub use steady_recipe::{
+    CheckedSteadyRecipeRegion, PreparedSteadyRecipePatch, SteadyRecipeDeclaration,
+    SteadyRecipeDependency, SteadyRecipeRegionRequest, SteadyRecipeRegionSelector,
+};
 pub use storage_profile::{
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
     ElementType,

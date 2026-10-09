@@ -410,6 +410,21 @@ pub struct OperationPhysicalRegion<'a, B> {
 }
 
 impl<'a, B> OperationPhysicalRegion<'a, B> {
+    pub(super) fn from_checked_parts(
+        buffer: &'a B,
+        logical_offset_bytes: u64,
+        physical_offset_bytes: u64,
+        length_bytes: u64,
+        retention: DeviceBufferRetention,
+    ) -> Self {
+        Self {
+            buffer,
+            logical_offset_bytes,
+            physical_offset_bytes,
+            length_bytes,
+            retention,
+        }
+    }
     pub const fn logical_offset_bytes(&self) -> u64 {
         self.logical_offset_bytes
     }

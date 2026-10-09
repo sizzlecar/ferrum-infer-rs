@@ -191,7 +191,8 @@ impl Fixture {
                     lane,
                 )
             }
-            InvocationPreparationStrategy::IdentityProjection => {
+            InvocationPreparationStrategy::IdentityProjection
+            | InvocationPreparationStrategy::SteadyRecipe => {
                 let topology =
                     OperationDispatch::compile_submission_wave_identity(executable, lane).unwrap();
                 OperationDispatch::bind_compiled_submission_wave_identity_with_preparation(

@@ -177,6 +177,62 @@ pub(in crate::backend::cuda::vnext_ops) struct WeightValidation {
 }
 
 impl WeightValidation {
+    fn validation_identity(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}",
+            self.identity.implementation,
+            self.identity.native_operator,
+            self.identity.algorithm,
+            self.identity.format,
+            self.identity.inputs,
+            self.identity.outputs,
+            self.identity.padded_outputs,
+            self.identity.weight_bytes
+        )
+    }
+
+    pub fn steady_dependency_declaration(
+        &self,
+        input_ordinal: u32,
+        component_id: &ferrum_interfaces::vnext::WeightId,
+        persistent_offset_bytes: u64,
+    ) -> ferrum_interfaces::vnext::SteadyRecipeDependency {
+        ferrum_interfaces::vnext::SteadyRecipeDependency {
+            input_ordinal,
+            component_id: component_id.clone(),
+            source_offset_bytes: 0,
+            source_length_bytes: self.identity.weight_bytes,
+            persistent_offset_bytes,
+            persistent_length_bytes: 4,
+            alignment_bytes: 4,
+            validation_identity: self.validation_identity(),
+        }
+    }
+
+    pub fn steady_retained_dependency(
+        self: &Arc<Self>,
+        patch: &ferrum_interfaces::vnext::PreparedSteadyRecipePatch<
+            '_,
+            crate::backend::cuda::vnext_runtime::CudaDeviceBuffer,
+        >,
+        declaration: &ferrum_interfaces::vnext::SteadyRecipeDependency,
+    ) -> Result<
+        ferrum_interfaces::vnext::EncodedRetainedPlanDependency<CudaDeviceCommand>,
+        CudaDeviceRuntimeError,
+    > {
+        if declaration.validation_identity != self.validation_identity()
+            || declaration.source_length_bytes != self.identity.weight_bytes
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "fresh weight validation differs from the recipe declaration",
+            ));
+        }
+        let authority = patch
+            .retained_plan_dependency(declaration.as_spec())
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        Ok(authority.encode(self.dynamic_command()?))
+    }
+
     pub fn flag_span(&self) -> DeviceSpan {
         DeviceSpan {
             address: self.flag.device_ptr(),
@@ -199,17 +255,7 @@ impl WeightValidation {
         ferrum_interfaces::vnext::EncodedRetainedPlanDependency<CudaDeviceCommand>,
         CudaDeviceRuntimeError,
     > {
-        let identity = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
-            self.identity.implementation,
-            self.identity.native_operator,
-            self.identity.algorithm,
-            self.identity.format,
-            self.identity.inputs,
-            self.identity.outputs,
-            self.identity.padded_outputs,
-            self.identity.weight_bytes
-        );
+        let identity = self.validation_identity();
         let authority = invocation
             .retained_plan_dependency(ferrum_interfaces::vnext::RetainedPlanDependencySpec {
                 input_ordinal,

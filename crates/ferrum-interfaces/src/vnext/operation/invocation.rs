@@ -31,6 +31,7 @@ use super::{
 mod descriptor_agreement;
 #[cfg(test)]
 mod materialization_tests;
+pub(crate) mod steady_recipe;
 use descriptor_agreement::DeviceDescriptorAgreement;
 mod view_coverage;
 #[cfg(test)]

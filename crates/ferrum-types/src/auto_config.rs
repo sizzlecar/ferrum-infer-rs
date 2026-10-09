@@ -2546,7 +2546,7 @@ impl FerrumConfigBuilder {
             strategy.as_runtime_value(),
             source,
             source_key,
-            ["full", "identity-projection"],
+            ["full", "identity-projection", "steady-recipe"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5313,6 +5313,16 @@ mod tests {
                 RuntimeConfigSource::Cli,
                 AutoConfigSource::Cli,
             ),
+            (
+                Some("steady-recipe"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+            (
+                Some("steady-recipe"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
         ] {
             let snapshot = value
                 .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
@@ -5338,6 +5348,10 @@ mod tests {
                 .find(|decision| decision.selection == "invocation_preparation_strategy")
                 .unwrap();
             assert_eq!(decision.selected, expected);
+            assert!(decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate == expected));
             assert_eq!(decision.source, source);
             assert_eq!(decision.source_key.as_deref(), value.map(|_| key));
             let mut engine = crate::EngineConfig::default();

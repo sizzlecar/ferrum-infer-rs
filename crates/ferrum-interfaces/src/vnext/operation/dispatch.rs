@@ -962,6 +962,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -997,6 +998,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1037,6 +1039,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1085,6 +1088,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            Some(preparation_sink),
         )
     }
 
@@ -1135,6 +1139,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         Ok(SubmissionWaveDeterminismHandle::from_profiled_eager(
             profiled,
@@ -1220,6 +1225,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         SubmissionWaveDeterminismHandle::from_profiled_replayed(
             profiled,
@@ -1263,6 +1269,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1299,6 +1306,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1337,6 +1345,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1386,6 +1395,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            Some(preparation_sink),
         )
     }
 
@@ -1404,12 +1414,21 @@ impl OperationDispatch {
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
+        preparation_sink: Option<&dyn super::InvocationPreparationSink>,
     ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
         S: SubmissionWaveDispatchTimingSink,
     {
+        let steady_enabled = batch_identity.preparation_strategy()
+            == ferrum_types::InvocationPreparationStrategy::SteadyRecipe;
+        let mut steady_observation =
+            super::preparation::SteadyRecipeObservation::new(if steady_enabled {
+                preparation_sink
+            } else {
+                None
+            });
         let contract_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
             SubmissionWaveDispatchStage::ContractValidateAndReserve,
@@ -1567,6 +1586,21 @@ impl OperationDispatch {
                 ),
             );
         }
+        let steady_entry = if steady_enabled {
+            reusable_program
+                .map(|program| lane.try_reusable_execution_entry_identity(program.program_id()))
+                .transpose()
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .flatten()
+        } else {
+            None
+        };
+        let steady_epoch = if steady_enabled {
+            lane.reusable_execution_epoch()
+        } else {
+            0
+        };
+        let mut pending_steady_recipes = Vec::new();
         wave.begin_dispatch()
             .map_err(SubmissionWaveDispatchError::Contract)?;
         let mut completion =
@@ -1707,51 +1741,146 @@ impl OperationDispatch {
                             .materialize_node(binding_node_index)
                             .map_err(SubmissionWaveDispatchError::Contract)?;
                         drop(identity_stage);
+                        if steady_enabled {
+                            steady_observation.stats.considered_nodes += 1;
+                        }
                         let invocation_stage = SubmissionWaveDispatchStageTimer::start(
                             timing_sink,
                             SubmissionWaveDispatchStage::NodeInvocationConstruct,
                         );
-                        let invocation =
-                            BatchedOperationInvocation::from_reusable_wave_node_with_timing(
-                                runtime,
+                        let recipe = match &steady_entry {
+                            Some(entry) => lane
+                                .steady_recipe(
+                                    binding_node_index,
+                                    provider.steady_owner(),
+                                    reusable_program.program_id(),
+                                    entry,
+                                )
+                                .map_err(|error| {
+                                    steady_observation.stats.invalid_nodes += 1;
+                                    SubmissionWaveDispatchError::Contract(error)
+                                })?,
+                            None => None,
+                        };
+                        let patch = match recipe.as_ref().map(|recipe| {
+                            recipe.prepare(
+                                lane.runtime_arc(),
                                 resolved,
                                 provider.dispatch(),
                                 batch_identity,
                                 node_identity,
                                 completion.wave(),
-                                binding_node_index,
                                 active_bindings.clone(),
-                                timing_sink,
                             )
-                            .map_err(SubmissionWaveDispatchError::Contract)?;
-                        drop(invocation_stage);
-                        let expected_phase = invocation.operation().profile_phase;
-                        let program_binding = invocation.program_binding().cloned();
-                        let dependency_scope = invocation.retained_dependency_scope.clone();
-                        let binding_stage = SubmissionWaveDispatchStageTimer::start(
-                            timing_sink,
-                            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
-                        );
-                        let mut bindings = match provider
-                            .provider()
-                            .encode_reusable_execution_bindings(invocation)
-                        {
+                        }) {
+                            Some(Ok(patch)) => patch,
+                            Some(Err(error)) => {
+                                steady_observation.stats.invalid_nodes += 1;
+                                return Err(SubmissionWaveDispatchError::Contract(error));
+                            }
+                            None => None,
+                        };
+                        let mut cold_candidate = None;
+                        let (encoded, expected_phase, program_binding, dependency_scope) =
+                            if let Some(patch) = patch {
+                                let expected_phase = resolved
+                                    .capabilities()
+                                    .operation(node_identity.operation_id())
+                                    .map_err(SubmissionWaveDispatchError::Contract)?
+                                    .profile_phase;
+                                let program_binding = Some(patch.program_binding().clone());
+                                let dependency_scope = patch.dependency_scope.clone();
+                                drop(invocation_stage);
+                                let binding_stage = SubmissionWaveDispatchStageTimer::start(
+                                    timing_sink,
+                                    SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+                                );
+                                let encoded =
+                                    provider.provider().encode_steady_recipe(patch).ok_or_else(
+                                        || {
+                                            steady_observation.stats.invalid_nodes += 1;
+                                            SubmissionWaveDispatchError::Contract(invalid_operation(
+                                        "provider declared a steady recipe without its encoder"))
+                                        },
+                                    )?;
+                                if encoded.is_ok() {
+                                    steady_observation.stats.prepared_nodes += 1;
+                                } else {
+                                    steady_observation.stats.invalid_nodes += 1;
+                                }
+                                drop(binding_stage);
+                                (encoded, expected_phase, program_binding, dependency_scope)
+                            } else {
+                                if steady_enabled {
+                                    steady_observation.stats.fallback_nodes += 1;
+                                }
+                                let invocation = BatchedOperationInvocation::from_reusable_wave_node_with_timing(
+                                runtime, resolved, provider.dispatch(), batch_identity, node_identity,
+                                completion.wave(), binding_node_index, active_bindings.clone(), timing_sink)
+                                .map_err(|error| { if steady_enabled { steady_observation.stats.invalid_nodes += 1; }
+                                    SubmissionWaveDispatchError::Contract(error) })?;
+                                drop(invocation_stage);
+                                let expected_phase = invocation.operation().profile_phase;
+                                let program_binding = invocation.program_binding().cloned();
+                                let dependency_scope = invocation.retained_dependency_scope.clone();
+                                let binding_stage = SubmissionWaveDispatchStageTimer::start(
+                                    timing_sink,
+                                    SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+                                );
+                                if let Some(entry) = &steady_entry {
+                                    let declaration =
+                                        provider.provider().declare_steady_recipe(&invocation);
+                                    if declaration.is_err() {
+                                        steady_observation.stats.invalid_nodes += 1;
+                                    }
+                                    let declaration = match declaration {
+                                    Ok(declaration) => declaration,
+                                    Err(failure) if node_identity.contains_identity(failure.identity())
+                                        && failure.phase() == expected_phase => {
+                                        return Err(SubmissionWaveDispatchError::Provider(failure));
+                                    }
+                                    Err(_) => return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                                        "steady declaration failed with another node identity or profile phase"))),
+                                };
+                                    if let Some(declaration) = declaration {
+                                        cold_candidate = super::SealedNodeRecipe::seal(
+                                            lane.runtime_arc(),
+                                            resolved,
+                                            provider.dispatch(),
+                                            &invocation,
+                                            declaration,
+                                            provider.steady_owner(),
+                                            entry.clone(),
+                                            reusable_program.program_id().clone(),
+                                            lane.id(),
+                                            steady_epoch,
+                                            binding_node_index,
+                                        )
+                                        .map_err(|error| {
+                                            steady_observation.stats.invalid_nodes += 1;
+                                            SubmissionWaveDispatchError::Contract(error)
+                                        })?
+                                        .map(Arc::new);
+                                    }
+                                }
+                                let encoded = provider
+                                    .provider()
+                                    .encode_reusable_execution_bindings(invocation);
+                                if steady_enabled && encoded.is_err() {
+                                    steady_observation.stats.invalid_nodes += 1;
+                                }
+                                drop(binding_stage);
+                                (encoded, expected_phase, program_binding, dependency_scope)
+                            };
+                        let mut bindings = match encoded {
                             Ok(bindings) => bindings,
-                            Err(failure)
-                                if node_identity.contains_identity(failure.identity())
-                                    && failure.phase() == expected_phase =>
-                            {
+                            Err(failure) if node_identity.contains_identity(failure.identity())
+                                && failure.phase() == expected_phase => {
                                 return Err(SubmissionWaveDispatchError::Provider(failure));
                             }
-                            Err(_) => {
-                                return Err(SubmissionWaveDispatchError::Contract(
-                                    invalid_operation(
-                                        "reusable provider returned a failure for another node identity or profile phase",
-                                    ),
-                                ));
-                            }
+                            Err(_) => return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                                "reusable provider returned a failure for another node identity or profile phase"))),
                         };
-                        drop(binding_stage);
                         let validation_stage = SubmissionWaveDispatchStageTimer::start(
                             timing_sink,
                             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
@@ -1774,6 +1903,9 @@ impl OperationDispatch {
                         )
                         .map_err(SubmissionWaveDispatchError::Contract)?;
                         drop(validation_stage);
+                        if let Some(candidate) = cold_candidate {
+                            pending_steady_recipes.push(candidate);
+                        }
                         let (mut node_program_bindings, mut dynamic_bindings, mut result_bindings) =
                             bindings.into_parts();
                         program_bindings.append(&mut node_program_bindings);
@@ -2146,6 +2278,11 @@ impl OperationDispatch {
             )));
         }
         drop(provider_stage);
+        let steady_requires_entry =
+            steady_observation.stats.prepared_nodes != 0 || !pending_steady_recipes.is_empty();
+        for recipe in pending_steady_recipes {
+            completion.stage_steady_recipe(lane, recipe);
+        }
 
         let lane_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
@@ -2159,6 +2296,16 @@ impl OperationDispatch {
             .reserve_enqueue()
             .map_err(SubmissionWaveDispatchError::Contract)?;
         drop(lane_reserve_stage);
+        if steady_requires_entry {
+            let (Some(program), Some(entry)) = (reusable_program, steady_entry.as_ref()) else {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "steady prepared node lost its resident entry",
+                )));
+            };
+            lane_reservation
+                .validate_steady_recipe_entry(program.program_id(), entry, steady_epoch)
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+        }
 
         let device_submit_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
