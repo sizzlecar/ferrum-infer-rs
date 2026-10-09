@@ -230,16 +230,44 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
             };
             group_indices.push(index);
         }
-        let region_capacity = windows.iter().try_fold(0usize, |total, window| {
+        // This index lasts for one permit only. Resource indices distinguish
+        // current-wave requirements even when they borrow the same authority
+        // slice. Never merge merely overlapping windows or captured capacity.
+        let mut window_sources = Vec::new();
+        window_sources
+            .try_reserve_exact(windows.len())
+            .map_err(|_| invalid_resource("segment window index allocation failed"))?;
+        let mut unique_windows = BTreeMap::new();
+        let mut region_capacity = 0usize;
+        for (index, window) in windows.iter().enumerate() {
             let group = groups
                 .get(window.resource_index)
                 .ok_or_else(|| invalid_resource("segment window references an unknown resource"))?;
-            group.iter().try_fold(total, |total, authority| {
-                total
-                    .checked_add(authority.evidence.segments.len())
-                    .ok_or_else(|| invalid_resource("segment window capacity overflows usize"))
-            })
-        })?;
+            let key = (
+                window.resource_index,
+                window.offset_bytes,
+                window.length_bytes,
+                window.element_type,
+                window.alignment_bytes,
+            );
+            let source = match unique_windows.entry(key) {
+                std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    region_capacity =
+                        group.iter().try_fold(region_capacity, |total, authority| {
+                            total
+                                .checked_add(authority.evidence.segments.len())
+                                .ok_or_else(|| {
+                                    invalid_resource("segment window capacity overflows usize")
+                                })
+                        })?;
+                    entry.insert(index);
+                    index
+                }
+            };
+            window_sources.push(source);
+        }
+        drop(unique_windows);
         result
             .resources
             .try_reserve_exact(groups.len())
@@ -389,7 +417,15 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                     bindings: bindings.clone(),
                 });
             }
-            for window in windows {
+            for (index, window) in windows.iter().enumerate() {
+                let source = window_sources[index];
+                if source != index {
+                    // The first occurrence passed every typed and physical
+                    // check below while these same pool guards were held.
+                    // Alias its immutable facts, not its resource authority.
+                    result.windows.push(result.windows[source].clone());
+                    continue;
+                }
                 let resource = result.resources.get(window.resource_index).ok_or_else(|| {
                     invalid_resource("segment window references an unknown resource")
                 })?;
