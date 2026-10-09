@@ -62,6 +62,7 @@ native-op-artifact = []  # Internal build-graph marker, enabled by `cuda`.
                         # never compile third-party CUDA/C++.
 cuda-upstream-linear = ["cuda"] # Optional locked MMQ/MMVQ artifact; no default routing.
 cuda-upstream-extra-linear = ["cuda-upstream-linear"] # Independent locked extra-format artifact.
+cuda-upstream-q6-f32-linear = ["cuda-upstream-extra-linear"] # Independent locked Q6 F32 head artifact.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compatibility.
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

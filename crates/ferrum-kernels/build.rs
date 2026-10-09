@@ -567,6 +567,10 @@ fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
             CudaNativeBuildUnit::UpstreamLinear,
         ),
         (
+            "CARGO_FEATURE_CUDA_UPSTREAM_Q6_F32_LINEAR",
+            CudaNativeBuildUnit::UpstreamQ6F32Linear,
+        ),
+        (
             "CARGO_FEATURE_CUDA_UPSTREAM_EXTRA_LINEAR",
             CudaNativeBuildUnit::UpstreamExtraLinear,
         ),
@@ -778,6 +782,7 @@ fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
         CudaNativeBuildUnit::VllmPagedAttentionV2 => "vllm_paged_attn",
         CudaNativeBuildUnit::UpstreamLinear => "upstream_linear",
         CudaNativeBuildUnit::UpstreamExtraLinear => "upstream_extra_linear",
+        CudaNativeBuildUnit::UpstreamQ6F32Linear => "upstream_q6_f32_linear",
     };
     emit_cuda_build_summary(
         summary_artifact,

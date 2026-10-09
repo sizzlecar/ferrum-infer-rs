@@ -220,7 +220,9 @@ fn native(
             column_tile: 128,
             threads: 128,
             shared_bytes: 32768,
-            packed_guard_blocks: rows / 8 * 8,
+            // This CPU native-plan fixture includes cooperative-load padding;
+            // it is not the old, insufficient get_J_max-only allocation.
+            packed_guard_blocks: (rows / 8 * 8).max(16),
             blocks: 4,
             fixup: true,
         }
@@ -461,9 +463,16 @@ fn upstream_mmq_scratch_and_trusted_reconstruction_reject_tampering() {
         }
         assert_eq!(end, *scratch_bytes);
         assert_eq!(scratch[0].byte_len, u64::from(rows) * 512 * 4);
+        let UpstreamNativeGeometry::Mmq {
+            packed_guard_blocks,
+            ..
+        } = &n.geometry
+        else {
+            unreachable!()
+        };
         assert_eq!(
             scratch[1].byte_len,
-            u64::from(rows) * 512 * 144 / 128 + u64::from(rows / 8 * 8) * 144
+            u64::from(rows) * 512 * 144 / 128 + u64::from(*packed_guard_blocks) * 144
         );
         assert_eq!(scratch[2].byte_len, u64::from(rows) * 17 * 4);
         assert_eq!(scratch[3].byte_len, 4 * 8 * 128 * 4);
@@ -961,3 +970,47 @@ mod extra_prefill;
 
 #[path = "all_rows_tests.rs"]
 mod all_rows;
+
+#[test]
+fn upstream_mmq_tail_extent_allows_non_multiple_guard_and_rejects_short_read_span() {
+    let contract = UpstreamMarkerV2Profile::Causal.arithmetic();
+    let values = vec![
+        binding(2, &[Some("quantization.gguf.iq4-xs")], 512, 17, false),
+        binding(3, &[None], 512, 17, false),
+        binding(4, &[None], 512, 17, false),
+        binding(5, &[None], 512, 17, false),
+    ];
+    let prepared = PreparedProjectionNumerics::prepare(&contract, &values).unwrap();
+    let mut f = facts(2, UpstreamProjectionLayout::Columns, 17);
+    f.input_stride = 512;
+    f.input_available_bytes = 2 * 512 * 2;
+    f.weight_available_bytes = 17 * 2 * 136;
+    let mut n = native(2, f.layout, 17, true);
+    n.geometry = UpstreamNativeGeometry::Mmq {
+        padded_inputs: 512,
+        row_tile: 8,
+        column_tile: 128,
+        threads: 256,
+        shared_bytes: 32768,
+        packed_guard_blocks: 13,
+        blocks: 4,
+        fixup: true,
+    };
+    let wave = PreparedUpstreamProjectionWave::prepare(&prepared, &f, Some(&n)).unwrap();
+    assert!(matches!(
+        wave.route(),
+        PreparedUpstreamProjectionRoute::Selected { .. }
+    ));
+    if let UpstreamNativeGeometry::Mmq {
+        packed_guard_blocks,
+        ..
+    } = &mut n.geometry
+    {
+        *packed_guard_blocks = 12;
+    }
+    assert!(
+        PreparedUpstreamProjectionWave::prepare(&prepared, &f, Some(&n))
+            .unwrap_err()
+            .contains("cooperative tail reads")
+    );
+}

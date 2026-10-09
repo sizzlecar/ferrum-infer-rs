@@ -1887,6 +1887,8 @@ impl DeviceExecutionTiming {
 pub enum DeviceExecutionIntervalKind {
     Compute,
     Transfer,
+    /// Device ordering work, such as waiting on a previously published event.
+    Dependency,
 }
 
 impl DeviceExecutionIntervalKind {
@@ -1894,6 +1896,7 @@ impl DeviceExecutionIntervalKind {
         match self {
             Self::Compute => "compute",
             Self::Transfer => "transfer",
+            Self::Dependency => "dependency",
         }
     }
 }
@@ -2567,6 +2570,7 @@ pub struct DeviceNativeWorkAttribution {
     token_count: u64,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
+    dependency_wait_count: u64,
     reusable_graph_node_count: Option<u64>,
 }
 
@@ -2616,7 +2620,55 @@ impl DeviceNativeWorkAttribution {
         transfer_command_count: u64,
         reusable_graph_node_count: Option<u64>,
     ) -> Option<Self> {
-        if (compute_dispatch_count == 0 && transfer_command_count == 0)
+        Self::with_participant_range_and_dependencies(
+            command_index,
+            node_index,
+            command_phase,
+            native_op_id,
+            execution_path,
+            batching_form,
+            participant_start,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            transfer_command_count,
+            reusable_graph_node_count,
+            0,
+        )
+    }
+
+    /// Observe an eager dynamic binding's actual dependency waits after enqueue.
+    ///
+    /// Dependency waits carry no logical node or participant work. Conditional
+    /// preparation may also enqueue compute and transfers; those counters must
+    /// describe the work actually enqueued, not a preflight declaration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_participant_range_and_dependencies(
+        command_index: u32,
+        node_index: Option<u32>,
+        command_phase: DeviceCommandPhase,
+        native_op_id: DeviceNativeOperationId,
+        execution_path: DeviceExecutionPath,
+        batching_form: DeviceBatchingForm,
+        participant_start: u32,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+        reusable_graph_node_count: Option<u64>,
+        dependency_wait_count: u64,
+    ) -> Option<Self> {
+        if (compute_dispatch_count == 0
+            && transfer_command_count == 0
+            && dependency_wait_count == 0)
+            || (dependency_wait_count > 0
+                && (command_phase != DeviceCommandPhase::DynamicBinding
+                    || batching_form != DeviceBatchingForm::Scalar
+                    || node_index.is_some()
+                    || participant_start != 0
+                    || participant_count != 0
+                    || token_count != 0
+                    || execution_path != DeviceExecutionPath::Eager))
             || (node_index.is_some() && participant_count == 0)
             || participant_start.checked_add(participant_count).is_none()
             || (node_index.is_none() && participant_start != 0)
@@ -2637,6 +2689,7 @@ impl DeviceNativeWorkAttribution {
             token_count,
             compute_dispatch_count,
             transfer_command_count,
+            dependency_wait_count,
             reusable_graph_node_count,
         })
     }
@@ -2687,6 +2740,11 @@ impl DeviceNativeWorkAttribution {
 
     pub const fn transfer_command_count(&self) -> u64 {
         self.transfer_command_count
+    }
+
+    /// Successful device dependency-wait enqueues, excluding event recording.
+    pub const fn dependency_wait_count(&self) -> u64 {
+        self.dependency_wait_count
     }
 
     /// Actual native graph nodes captured for this replayed command.
@@ -4063,6 +4121,176 @@ mod execution_timing_tests {
             None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn native_dependency_wait_attribution_requires_eager_dynamic_binding() {
+        let row = |phase, node, start, participants, tokens, path, compute, transfers, waits| {
+            DeviceNativeWorkAttribution::with_participant_range_and_dependencies(
+                0,
+                node,
+                phase,
+                DeviceNativeOperationId::new("test.retained_validation").unwrap(),
+                path,
+                DeviceBatchingForm::Scalar,
+                start,
+                participants,
+                tokens,
+                compute,
+                transfers,
+                None,
+                waits,
+            )
+        };
+        for (compute, transfers) in [(1, 1), (0, 0)] {
+            let work = row(
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+                compute,
+                transfers,
+                1,
+            )
+            .unwrap();
+            assert_eq!(work.compute_dispatch_count(), compute);
+            assert_eq!(work.transfer_command_count(), transfers);
+            assert_eq!(work.dependency_wait_count(), 1);
+            assert_eq!(
+                serde_json::to_value(work).unwrap()["dependency_wait_count"],
+                1
+            );
+        }
+        for (phase, node, start, participants, tokens, path) in [
+            (
+                DeviceCommandPhase::Compute,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::Initialization,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::ResultBinding,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                Some(0),
+                0,
+                1,
+                1,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                1,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                1,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                0,
+                1,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Replayed,
+            ),
+        ] {
+            assert!(row(phase, node, start, participants, tokens, path, 0, 0, 1).is_none());
+        }
+        for form in [
+            DeviceBatchingForm::Packed,
+            DeviceBatchingForm::ParticipantLoop,
+        ] {
+            assert!(
+                DeviceNativeWorkAttribution::with_participant_range_and_dependencies(
+                    0,
+                    None,
+                    DeviceCommandPhase::DynamicBinding,
+                    DeviceNativeOperationId::new("test.retained_validation").unwrap(),
+                    DeviceExecutionPath::Eager,
+                    form,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    1,
+                )
+                .is_none()
+            );
+        }
+        assert!(row(
+            DeviceCommandPhase::DynamicBinding,
+            None,
+            0,
+            0,
+            0,
+            DeviceExecutionPath::Eager,
+            0,
+            0,
+            0,
+        )
+        .is_none());
+        assert!(DeviceNativeWorkAttribution::new(
+            0,
+            None,
+            DeviceCommandPhase::DynamicBinding,
+            DeviceNativeOperationId::new("test.retained_validation").unwrap(),
+            DeviceExecutionPath::Eager,
+            DeviceBatchingForm::Scalar,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn dependency_interval_remains_distinct_from_compute_and_transfer() {
+        let interval =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Dependency, 10, 25).unwrap();
+        assert_eq!(interval.kind().as_str(), "dependency");
+        assert_eq!(
+            serde_json::to_value(interval).unwrap()["kind"],
+            "dependency"
+        );
     }
 
     fn replay_test_program_id() -> DeviceReusableExecutionProgramId {

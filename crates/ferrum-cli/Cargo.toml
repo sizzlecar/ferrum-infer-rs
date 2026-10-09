@@ -108,6 +108,7 @@ metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/met
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
 cuda-upstream-linear = ["cuda", "ferrum-kernels/cuda-upstream-linear"] # Explicit locked upstream quantized projection artifact.
 cuda-upstream-extra-linear = ["cuda-upstream-linear", "ferrum-kernels/cuda-upstream-extra-linear"] # Independent locked extra-format artifact.
+cuda-upstream-q6-f32-linear = ["cuda-upstream-extra-linear", "ferrum-kernels/cuda-upstream-q6-f32-linear"] # Independent locked Q6 F32 head artifact.
 candle-cuda-compat = ["cuda", "ferrum-engine/candle-cuda-compat", "ferrum-kernels/candle-cuda-compat"]
 marlin = ["cuda"]  # backward compat alias
 vllm-marlin = ["cuda", "ferrum-kernels/vllm-marlin"]  # Phase 12 — vLLM gptq_marlin port (opt-in)

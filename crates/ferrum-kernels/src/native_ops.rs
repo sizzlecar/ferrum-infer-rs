@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub mod upstream_linear;
+pub mod upstream_q6_f32_linear;
 
 use ferrum_native_ops::{
     NativeOperatorArtifactFormat, NativeOperatorResolveError, NativeOperatorResolveRequest,

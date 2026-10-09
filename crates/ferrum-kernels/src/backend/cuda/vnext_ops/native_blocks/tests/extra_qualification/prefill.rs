@@ -114,6 +114,20 @@ fn extra_prefill_actual_pack_oracles_tails_fixup_and_marker_rows_on_cuda() {
             fixup_seen[c.routes[0].p.fixup as usize] = true;
             repeat(&s, &mut c);
         }
+        // No K padding can mask the cooperative reads beyond the final
+        // partial J32 tile. `case` calls the real native planner through
+        // PreparedUpstreamLinear, including the typed prefill ABI validator,
+        // before launching and checking every output against the pack oracle.
+        for m in [33, 34, 35] {
+            let mut c = case(&s, f, m, 512, 17);
+            fixup_seen[c.routes[0].p.fixup as usize] = true;
+            repeat(&s, &mut c);
+        }
+        // Validate native-returned plans for the affected model projection
+        // widths too; the small-N cases above execute the same tail boundary.
+        for (k, n) in [(5120, 17408), (17408, 5120)] {
+            prefill_plan(&s, f, 34, k, n);
+        }
         // Force a whole number of actual-SM waves, without a machine ID.
         let sm = request(&ctx, f, 33, 256, 17).sm_count;
         let n = sm.checked_mul(128).unwrap() as usize;

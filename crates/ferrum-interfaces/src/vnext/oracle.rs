@@ -1058,6 +1058,9 @@ pub fn compare_oracle_results(
     }
 
     match policy {
+        OracleSpec::OperationDefined => Err(invalid_oracle(
+            "operation-defined oracle requires operation-specific input and arithmetic evidence",
+        )),
         OracleSpec::Exact => Ok(actual
             .outputs
             .iter()

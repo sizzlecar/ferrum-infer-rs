@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.upstream-q6-f32-linear",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_120"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.last_token_dense_linear.f32.q6-d4-mmq-v1",
+      "provider_id": "provider.cuda.last_token_dense_linear.f32.q6-d4-mmq-v1",
+      "entrypoints": [
+        "ferrum_upstream_q6_f32_check_weights_v1",
+        "ferrum_upstream_q6_f32_dot_v1",
+        "ferrum_upstream_q6_f32_pack_v1",
+        "ferrum_upstream_q6_f32_plan_v1",
+        "ferrum_upstream_q6_f32_publish_v1"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_upstream_q6_f32_check_weights_v1",
+    "ferrum_upstream_q6_f32_dot_v1",
+    "ferrum_upstream_q6_f32_pack_v1",
+    "ferrum_upstream_q6_f32_plan_v1",
+    "ferrum_upstream_q6_f32_publish_v1"
+  ],
+  "license_files": [
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    },
+    {
+      "source_path": "native-operators/cuda/upstream-q6-f32-linear/llama-MIT.txt",
+      "output_path": "licenses/llama-MIT.txt"
+    }
+  ],
+  "cuda_toolkit": "12.8",
+  "cuda_runtime_min": "12.8",
+  "system_libraries": [
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}

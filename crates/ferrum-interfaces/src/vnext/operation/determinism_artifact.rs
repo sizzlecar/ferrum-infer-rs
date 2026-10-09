@@ -43,6 +43,7 @@ pub struct SubmissionWaveDeterminismArtifactPhysicalCommand {
     token_count: u64,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
+    dependency_wait_count: u64,
     reusable_graph_node_count: Option<u64>,
 }
 
@@ -235,6 +236,7 @@ impl SubmissionWaveDeterminismEvidence {
                     token_count: command.token_count(),
                     compute_dispatch_count: command.compute_dispatch_count(),
                     transfer_command_count: command.transfer_command_count(),
+                    dependency_wait_count: command.dependency_wait_count(),
                     reusable_graph_node_count: command.reusable_graph_node_count(),
                 })
             })

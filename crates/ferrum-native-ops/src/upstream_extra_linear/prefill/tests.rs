@@ -132,3 +132,74 @@ fn extra_prefill_plan_validates_d4_extents_and_nonmonotone_fixup() {
         }
     }
 }
+
+#[test]
+fn extra_prefill_plan_checks_cooperative_tail_extent_without_guard_rounding_assumptions() {
+    for format in [
+        UpstreamExtraLinearFormat::Q3K,
+        UpstreamExtraLinearFormat::Iq3S,
+        UpstreamExtraLinearFormat::Iq4Nl,
+    ] {
+        // Whole K512 rows expose the last cooperative load. K768 has a
+        // padded K1024 body: its logical K endpoint needs no extra block.
+        for (m, k, guard) in [
+            (33_u32, 512_u32, 35_u32),
+            (34, 512, 34),
+            (35, 512, 33),
+            (64, 512, 4),
+            (34, 5120, 34),
+            (34, 768, 0),
+        ] {
+            let n = 17;
+            let r = request(format, m, k, n);
+            let kp = k.div_ceil(512) * 512;
+            let blocks = device().multiprocessors;
+            let body = u64::from(m) * u64::from(kp) * 9 / 8;
+            let p = UpstreamLinearPlanV1 {
+                request: *r.as_raw(),
+                abi: 1,
+                size: size_of::<UpstreamLinearPlanV1>() as u32,
+                algorithm: 1,
+                pack_abi: 1,
+                padded_inputs: kp,
+                padded_outputs: n,
+                guard_blocks: guard,
+                j: 32,
+                i: 128,
+                nthreads: 256,
+                shared_bytes: 32768,
+                blocks,
+                tiles_y: 1,
+                fixup: 1,
+                weight_bytes: u64::from(n)
+                    * u64::from(k / format.block_elements())
+                    * u64::from(format.block_bytes()),
+                converted_bytes: u64::from(m) * u64::from(kp) * 4,
+                packed_bytes: body + u64::from(guard) * 144,
+                output_bytes: u64::from(m) * u64::from(n) * 4,
+                fixup_bytes: u64::from(blocks) * 16384,
+                ..Default::default()
+            };
+            r.validate_plan_identity(&p).unwrap();
+            if guard > 0 {
+                let short = UpstreamLinearPlanV1 {
+                    guard_blocks: guard - 1,
+                    packed_bytes: p.packed_bytes - 144,
+                    ..p
+                };
+                assert_eq!(r.validate_plan_identity(&short), Err(UpstreamLinearError::AbiMismatch), "{format:?} M{m} K{k}: matching fields cannot authorize an undersized cooperative tail");
+            }
+            let inconsistent = UpstreamLinearPlanV1 {
+                packed_bytes: p.packed_bytes - 1,
+                ..p
+            };
+            assert!(r.validate_plan_identity(&inconsistent).is_err());
+            let oversized = UpstreamLinearPlanV1 {
+                guard_blocks: 513,
+                packed_bytes: body + 513 * 144,
+                ..p
+            };
+            assert!(r.validate_plan_identity(&oversized).is_err());
+        }
+    }
+}

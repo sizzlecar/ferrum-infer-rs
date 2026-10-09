@@ -39,6 +39,33 @@ pub(super) fn descriptor(
     capability: &str,
     estimator: &str,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    descriptor_with_fingerprint(
+        runtime,
+        contract,
+        provider,
+        capability,
+        estimator,
+        implementation_fingerprint(&[
+            include_str!("native_io.rs").as_bytes(),
+            include_str!("../vnext_ops.rs").as_bytes(),
+            include_str!("native_blocks.rs").as_bytes(),
+            include_str!("native_blocks/hadamard.rs").as_bytes(),
+            include_str!("native_blocks/weights.rs").as_bytes(),
+            crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
+            crate::ptx::VNEXT_GGUF.as_bytes(),
+            provider.as_bytes(),
+        ]),
+    )
+}
+
+pub(super) fn descriptor_with_fingerprint(
+    runtime: &CudaDeviceRuntime,
+    contract: &dyn OperationContract,
+    provider: &str,
+    capability: &str,
+    estimator: &str,
+    fingerprint: String,
+) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
     use crate::gguf_blocks::GgufBlockFormat::*;
     transformer::provider_descriptor_with_formats(
         runtime,
@@ -56,16 +83,7 @@ pub(super) fn descriptor(
             .map(|format| QuantizationFormatId::new(format.format_id()))
             .collect::<Result<_, _>>()
             .map_err(contract_error)?,
-        implementation_fingerprint(&[
-            include_str!("native_io.rs").as_bytes(),
-            include_str!("../vnext_ops.rs").as_bytes(),
-            include_str!("native_blocks.rs").as_bytes(),
-            include_str!("native_blocks/hadamard.rs").as_bytes(),
-            include_str!("native_blocks/weights.rs").as_bytes(),
-            crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
-            crate::ptx::VNEXT_GGUF.as_bytes(),
-            provider.as_bytes(),
-        ]),
+        fingerprint,
     )
 }
 
@@ -86,7 +104,7 @@ pub(super) fn requires_native(
     })
 }
 
-fn retain_shared_weight(
+pub(super) fn retain_shared_weight(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     shape: &[u64; 2],
 ) -> Result<weights::MatrixWeight, String> {
@@ -122,7 +140,7 @@ fn retain_shared_weight(
     Ok(weight)
 }
 
-fn matrix_key(
+pub(super) fn matrix_key(
     fingerprint: &str,
     operation: &'static str,
     weight: &weights::MatrixWeight,
@@ -285,17 +303,17 @@ fn embedding_chunk_limit(part: &weights::MatrixPart) -> Result<u64, String> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct NativeProjectionRow {
-    input: u64,
-    input_bytes: u64,
-    output: u64,
-    output_bytes: u64,
+pub(super) struct NativeProjectionRow {
+    pub(super) input: u64,
+    pub(super) input_bytes: u64,
+    pub(super) output: u64,
+    pub(super) output_bytes: u64,
 }
 
 /// Only coalesce canonical decode rows whose retained windows form two exact
 /// physical matrices. Shared backing or logical token order alone is not proof:
 /// participant output windows can include alignment padding or be reordered.
-fn packed_projection_rows(
+pub(super) fn packed_projection_rows(
     precision: TokenPrecision,
     input_packed: bool,
     hidden: u64,
@@ -508,7 +526,7 @@ pub(super) fn encode_projection(
     .map_err(|error| error.to_string())
 }
 
-fn last_token(range: std::ops::Range<u64>) -> Result<u64, String> {
+pub(super) fn last_token(range: std::ops::Range<u64>) -> Result<u64, String> {
     if range.is_empty() {
         return Err("CUDA last-token projection cannot select from an empty span".into());
     }

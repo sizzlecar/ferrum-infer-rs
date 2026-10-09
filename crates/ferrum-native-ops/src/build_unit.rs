@@ -15,16 +15,18 @@ pub enum CudaNativeBuildUnit {
     VllmPagedAttentionV2,
     UpstreamLinear,
     UpstreamExtraLinear,
+    UpstreamQ6F32Linear,
 }
 
 impl CudaNativeBuildUnit {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Marlin,
         Self::VllmMarlin,
         Self::VllmMoeMarlin,
         Self::VllmPagedAttentionV2,
         Self::UpstreamLinear,
         Self::UpstreamExtraLinear,
+        Self::UpstreamQ6F32Linear,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -35,6 +37,7 @@ impl CudaNativeBuildUnit {
             Self::VllmPagedAttentionV2 => "vllm_paged_attention_v2",
             Self::UpstreamLinear => "upstream_linear",
             Self::UpstreamExtraLinear => "upstream_extra_linear",
+            Self::UpstreamQ6F32Linear => "upstream_q6_f32_linear",
         }
     }
 
@@ -46,6 +49,7 @@ impl CudaNativeBuildUnit {
             Self::VllmPagedAttentionV2 => "ferrum.cuda.vllm_paged_attention_v2",
             Self::UpstreamLinear => "ferrum.cuda.upstream_linear",
             Self::UpstreamExtraLinear => "ferrum.cuda.upstream_extra_linear",
+            Self::UpstreamQ6F32Linear => "ferrum.cuda.upstream-q6-f32-linear",
         }
     }
 
@@ -57,6 +61,13 @@ impl CudaNativeBuildUnit {
 
     pub const fn required_exports(self) -> &'static [&'static str] {
         match self {
+            Self::UpstreamQ6F32Linear => &[
+                "ferrum_upstream_q6_f32_check_weights_v1",
+                "ferrum_upstream_q6_f32_dot_v1",
+                "ferrum_upstream_q6_f32_pack_v1",
+                "ferrum_upstream_q6_f32_plan_v1",
+                "ferrum_upstream_q6_f32_publish_v1",
+            ],
             Self::UpstreamLinear => &[
                 "ferrum_upstream_mmq_cast_v1",
                 "ferrum_upstream_mmq_cast_v2",
@@ -337,5 +348,36 @@ mod tests {
             },
         ];
         assert!(resolve_views(&both, [CudaNativeBuildUnit::UpstreamLinear, extra]).is_ok());
+    }
+
+    #[test]
+    fn q6_f32_requires_its_own_operator_and_every_export() {
+        let q6 = CudaNativeBuildUnit::UpstreamQ6F32Linear;
+        let old = exports(CudaNativeBuildUnit::UpstreamLinear);
+        let old_artifact = [ArtifactView {
+            operator: CudaNativeBuildUnit::UpstreamLinear.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &old,
+        }];
+        assert!(matches!(
+            resolve_views(&old_artifact, [q6]),
+            Err(CudaNativeBuildCoverageError::MissingArtifact { .. })
+        ));
+        for missing in q6.required_exports() {
+            let available = q6
+                .required_exports()
+                .iter()
+                .filter(|e| *e != missing)
+                .map(|e| (*e).to_owned())
+                .collect::<Vec<_>>();
+            let artifact = [ArtifactView {
+                operator: q6.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &available,
+            }];
+            assert!(
+                matches!(resolve_views(&artifact,[q6]), Err(CudaNativeBuildCoverageError::MissingExport { export, .. }) if export == *missing)
+            );
+        }
     }
 }

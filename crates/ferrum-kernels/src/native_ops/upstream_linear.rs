@@ -23,7 +23,7 @@ pub struct DeviceSpan {
     pub bytes: u64,
 }
 impl DeviceSpan {
-    fn checked(self, required: u64, alignment: u64) -> Result<*mut c_void, Error> {
+    pub(super) fn checked(self, required: u64, alignment: u64) -> Result<*mut c_void, Error> {
         if required == 0 && self.bytes == 0 {
             return Ok(std::ptr::null_mut());
         }
@@ -38,7 +38,7 @@ impl DeviceSpan {
         Ok(self.address as usize as *mut c_void)
     }
 }
-fn distinct(spans: &[DeviceSpan]) -> Result<(), Error> {
+pub(super) fn distinct(spans: &[DeviceSpan]) -> Result<(), Error> {
     for (i, a) in spans.iter().enumerate() {
         for b in &spans[i + 1..] {
             if a.bytes != 0
@@ -52,7 +52,12 @@ fn distinct(spans: &[DeviceSpan]) -> Result<(), Error> {
     }
     Ok(())
 }
-fn strided_bytes(rows: u32, columns: u32, stride: u32, element: u64) -> Result<u64, Error> {
+pub(super) fn strided_bytes(
+    rows: u32,
+    columns: u32,
+    stride: u32,
+    element: u64,
+) -> Result<u64, Error> {
     if stride < columns {
         return Err(Error::Span);
     }

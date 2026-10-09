@@ -8,11 +8,38 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use cudarc::driver::{CudaEvent, CudaStream};
+use ferrum_interfaces::vnext::DeviceNativeOperationId;
 
 use crate::backend::cuda::vnext_runtime::{
-    CudaBufferRegion, CudaDeviceCommand, CudaDeviceRuntimeError, CudaPlanBackingIdentity,
+    CudaBufferRegion, CudaDependencyWork, CudaDeviceCommand, CudaDeviceRuntimeError,
+    CudaPlanBackingIdentity,
 };
 use crate::native_ops::upstream_linear::{Arithmetic, DeviceSpan, PreparedUpstreamLinear};
+use crate::native_ops::upstream_q6_f32_linear::PreparedQ6F32Linear;
+
+const RETAINED_WEIGHT_VALIDATION_OPERATION: DeviceNativeOperationId =
+    match DeviceNativeOperationId::new("upstream.retained_weight_validation") {
+        Some(identity) => identity,
+        None => panic!("retained weight validation operation identity must be portable"),
+    };
+
+enum ValidationPlan {
+    Upstream(Arc<PreparedUpstreamLinear>),
+    Q6F32(Arc<PreparedQ6F32Linear>),
+}
+impl ValidationPlan {
+    unsafe fn check_weights(
+        &self,
+        weights: DeviceSpan,
+        flag: DeviceSpan,
+        stream: *mut std::ffi::c_void,
+    ) -> Result<(), crate::native_ops::upstream_linear::Error> {
+        match self {
+            Self::Upstream(plan) => unsafe { plan.check_weights(weights, flag, stream) },
+            Self::Q6F32(plan) => unsafe { plan.check_weights(weights, flag, stream) },
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidationIdentity {
@@ -43,15 +70,61 @@ impl WeightValidationRegistry {
         weights: CudaBufferRegion,
         flag: CudaBufferRegion,
     ) -> Result<Arc<WeightValidation>, CudaDeviceRuntimeError> {
-        let error = CudaDeviceRuntimeError::contract;
-        let weight = weights.plan_backing_identity()?;
-        let flag_identity = flag.plan_backing_identity()?;
+        if native.arithmetic() != Arithmetic::MarkerV2 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "weight validation requires MarkerV2",
+            ));
+        }
         let geometry = native.geometry();
-        if native.arithmetic() != Arithmetic::MarkerV2
-            || implementation.is_empty()
-            || weight.runtime_instance != flag_identity.runtime_instance
+        let identity = ValidationIdentity {
+            weight: weights.plan_backing_identity()?,
+            implementation: implementation.to_owned(),
+            native_operator: native.operator(),
+            algorithm: geometry.algorithm,
+            format: geometry.request.format,
+            inputs: geometry.request.inputs,
+            outputs: geometry.request.outputs,
+            padded_outputs: geometry.padded_outputs,
+            weight_bytes: geometry.weight_bytes,
+        };
+        self.prepare_plan(ValidationPlan::Upstream(native), identity, weights, flag)
+    }
+
+    pub fn prepare_q6(
+        &self,
+        native: Arc<PreparedQ6F32Linear>,
+        implementation: &str,
+        weights: CudaBufferRegion,
+        flag: CudaBufferRegion,
+    ) -> Result<Arc<WeightValidation>, CudaDeviceRuntimeError> {
+        let geometry = native.geometry();
+        let identity = ValidationIdentity {
+            weight: weights.plan_backing_identity()?,
+            implementation: implementation.to_owned(),
+            native_operator: native.operator(),
+            algorithm: geometry.algorithm,
+            format: geometry.request.format,
+            inputs: geometry.request.inputs,
+            outputs: geometry.request.outputs,
+            padded_outputs: geometry.padded_outputs,
+            weight_bytes: geometry.weight_bytes,
+        };
+        self.prepare_plan(ValidationPlan::Q6F32(native), identity, weights, flag)
+    }
+
+    fn prepare_plan(
+        &self,
+        native: ValidationPlan,
+        identity: ValidationIdentity,
+        weights: CudaBufferRegion,
+        flag: CudaBufferRegion,
+    ) -> Result<Arc<WeightValidation>, CudaDeviceRuntimeError> {
+        let error = CudaDeviceRuntimeError::contract;
+        let flag_identity = flag.plan_backing_identity()?;
+        if identity.implementation.is_empty()
+            || identity.weight.runtime_instance != flag_identity.runtime_instance
             || weights.device_ptr() % 4 != 0
-            || weights.length_bytes() != geometry.weight_bytes
+            || weights.length_bytes() != identity.weight_bytes
             || flag.device_ptr() % 4 != 0
             || flag.length_bytes() != 4
         {
@@ -70,17 +143,6 @@ impl WeightValidationRegistry {
         if weights.device_ptr() < flag_end && flag.device_ptr() < weight_end {
             return Err(error("weight validation flag aliases immutable weights"));
         }
-        let identity = ValidationIdentity {
-            weight,
-            implementation: implementation.to_owned(),
-            native_operator: native.operator(),
-            algorithm: geometry.algorithm,
-            format: geometry.request.format,
-            inputs: geometry.request.inputs,
-            outputs: geometry.request.outputs,
-            padded_outputs: geometry.padded_outputs,
-            weight_bytes: geometry.weight_bytes,
-        };
         let mut flags = self
             .flags
             .lock()
@@ -108,7 +170,7 @@ impl WeightValidationRegistry {
 
 pub(in crate::backend::cuda::vnext_ops) struct WeightValidation {
     identity: ValidationIdentity,
-    native: Arc<PreparedUpstreamLinear>,
+    native: ValidationPlan,
     weights: CudaBufferRegion,
     flag: CudaBufferRegion,
     publication: Mutex<ScanPublication<CudaEvent>>,
@@ -168,14 +230,14 @@ impl WeightValidation {
     /// it must never be captured into a reusable compute segment.
     pub fn dynamic_command(self: &Arc<Self>) -> Result<CudaDeviceCommand, CudaDeviceRuntimeError> {
         let state = self.clone();
-        CudaDeviceCommand::operation(
-            "upstream MarkerV2 retained weight validation",
+        CudaDeviceCommand::conditional_dependency(
+            RETAINED_WEIGHT_VALIDATION_OPERATION,
             vec![self.weights.clone(), self.flag.clone()],
             move |stream, _regions| state.enqueue(stream),
         )
     }
 
-    fn enqueue(&self, stream: &CudaStream) -> Result<(), CudaDeviceRuntimeError> {
+    fn enqueue(&self, stream: &CudaStream) -> Result<CudaDependencyWork, CudaDeviceRuntimeError> {
         let mut publication = self.publication.lock().map_err(|_| {
             CudaDeviceRuntimeError::contract("weight validation publication poisoned")
         })?;
@@ -222,8 +284,9 @@ impl<E> ScanPublication<E> {
         scan_and_record: impl FnOnce() -> Result<E, Error>,
         wait: impl FnOnce(&E) -> Result<(), Error>,
         previous_failure: impl FnOnce() -> Error,
-    ) -> Result<(), Error> {
-        if matches!(self, Self::Pending) {
+    ) -> Result<CudaDependencyWork, Error> {
+        let scanned = matches!(self, Self::Pending);
+        if scanned {
             // Publish failure before any fallible or panicking enqueue. A
             // poisoned Mutex is also rejected by the caller, never recovered.
             *self = Self::Failed;
@@ -235,7 +298,11 @@ impl<E> ScanPublication<E> {
                     *self = Self::Failed;
                     return Err(error);
                 }
-                Ok(())
+                Ok(if scanned {
+                    CudaDependencyWork::ScanAndWait
+                } else {
+                    CudaDependencyWork::Wait
+                })
             }
             Self::Failed => Err(previous_failure()),
             Self::Pending => unreachable!(),
@@ -245,7 +312,7 @@ impl<E> ScanPublication<E> {
 
 #[cfg(test)]
 mod tests {
-    use super::ScanPublication;
+    use super::{CudaDependencyWork, ScanPublication};
     use std::cell::Cell;
 
     #[test]
@@ -253,8 +320,8 @@ mod tests {
         let scans = Cell::new(0);
         let waits = Cell::new(0);
         let mut state = ScanPublication::Pending;
-        for consumer in [0, 1, 0, 2] {
-            state
+        for (index, consumer) in [0, 1, 0, 2].into_iter().enumerate() {
+            let receipt = state
                 .ensure(
                     || {
                         scans.set(scans.get() + 1);
@@ -269,6 +336,14 @@ mod tests {
                     || "failed",
                 )
                 .unwrap();
+            assert_eq!(
+                receipt,
+                if index == 0 {
+                    CudaDependencyWork::ScanAndWait
+                } else {
+                    CudaDependencyWork::Wait
+                }
+            );
         }
         assert_eq!(scans.get(), 1);
         assert_eq!(waits.get(), 4);

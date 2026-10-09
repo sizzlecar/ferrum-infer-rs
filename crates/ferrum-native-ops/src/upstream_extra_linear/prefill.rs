@@ -77,6 +77,13 @@ impl UpstreamExtraLinearPrefillRequestV2 {
         } else {
             tiles
         };
+        // The fixed J32/256-thread loader copies complete thread batches,
+        // including inactive columns in the final tile. Guard blocks need
+        // neither fit within M nor be a multiple of eight. The read endpoint
+        // uses logical K; K512 padding already belongs to the packed body.
+        let last_column_tile = (m - 1) / 32 * 32;
+        let copy_bytes = (32_u64 * 36).div_ceil(256) * 256 * 4;
+        let read_end = ((k / 128 - 1) * m + last_column_tile) * 144 + copy_bytes;
         if p.j != 32
             || p.i != 128
             || p.nthreads != 256
@@ -86,13 +93,12 @@ impl UpstreamExtraLinearPrefillRequestV2 {
             || u64::from(p.padded_inputs) != kp
             || p.padded_outputs != r.outputs
             || p.guard_blocks > 512
-            || p.guard_blocks > r.rows
-            || p.guard_blocks % 8 != 0
             || u64::from(p.tiles_y) != tiles_y
             || u64::from(p.blocks) != blocks
             || (p.fixup == 1 && tiles % blocks == 0)
             || p.converted_bytes != 4 * m * kp
             || p.packed_bytes != m * kp * 9 / 8 + u64::from(p.guard_blocks) * 144
+            || p.packed_bytes < read_end
             || p.output_bytes != 4 * m * n
             || p.fixup_bytes != if p.fixup == 1 { blocks * 16384 } else { 0 }
             || p.ncols != 0

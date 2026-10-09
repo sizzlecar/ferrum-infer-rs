@@ -216,10 +216,21 @@ static int ferrum_test_mmq_plan(uint32_t format, uint32_t rows, uint32_t inputs,
     const bool fixup = config.stream_k && total_tiles%blocks != 0;
     const uint64_t padded = GGML_PAD(uint64_t(inputs), MATRIX_ROW_PADDING);
     if (uint64_t(rows)*padded*9/8 > INT_MAX) return -3;
-    const uint64_t guard_blocks = ggml_cuda_mmq_get_J_max(type, fallback, cc, rows);
+    // The pinned process_tile loader reads whole nthreads-sized batches of
+    // int32, including inactive J columns. Bound the final K128-block load;
+    // write-back row guards alone do not make those reads safe. K padding is
+    // already part of the packed body. Keep the upstream guard as a floor.
+    const uint64_t packed_body = uint64_t(rows)*padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ;
+    const uint64_t last_column_tile = (tiles_x - 1)*config.J;
+    const uint64_t load_ints = GGML_PAD(uint64_t(config.J)*MMQ_TILE_Y_K, uint64_t(config.nthreads));
+    const uint64_t read_end = ((uint64_t(inputs)/QK8_1_MMQ - 1)*rows + last_column_tile)*
+        sizeof(block_q8_1_mmq) + load_ints*sizeof(int);
+    const uint64_t read_tail = read_end > packed_body ? read_end - packed_body : 0;
+    const uint64_t read_guard_blocks = (read_tail + sizeof(block_q8_1_mmq) - 1)/sizeof(block_q8_1_mmq);
+    const uint64_t upstream_guard_blocks = ggml_cuda_mmq_get_J_max(type, fallback, cc, rows);
+    const uint64_t guard_blocks = std::max(upstream_guard_blocks, read_guard_blocks);
     if (guard_blocks > 512) return -3;
-    const uint64_t packed = uint64_t(rows)*padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ +
-        guard_blocks*sizeof(block_q8_1_mmq);
+    const uint64_t packed = packed_body + guard_blocks*sizeof(block_q8_1_mmq);
     *out = {1, format, rows, inputs, outputs, uint32_t(padded), uint32_t(config.J),
         uint32_t(config.I), uint32_t(config.nthreads), uint32_t(mmq_get_nbytes_shared(config, cc)),
         uint32_t(blocks), uint32_t(tiles_y), uint32_t(fixup), uint64_t(rows)*padded*sizeof(float),

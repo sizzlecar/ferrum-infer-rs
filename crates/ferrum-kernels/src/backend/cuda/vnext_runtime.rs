@@ -368,13 +368,75 @@ type EnqueueAction = Box<
         + 'static,
 >;
 
+/// Actual work returned only after a conditional dependency has been queued.
+/// The cold scan consists of a flag memset and a kernel; every consumer queues
+/// one stream wait, including the first consumer that publishes the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CudaDependencyWork {
+    ScanAndWait,
+    Wait,
+}
+
+impl CudaDependencyWork {
+    fn counts(self) -> (u64, u64, u64) {
+        match self {
+            Self::ScanAndWait => (1, 1, 1),
+            Self::Wait => (0, 0, 1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CudaEnqueuedWork {
+    Static,
+    Dependency(CudaDependencyWork),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CudaWorkDeclaration {
+    Static,
+    ConditionalDependency,
+}
+
+type ObservedEnqueueAction = Box<
+    dyn Fn(
+            &CudaStream,
+            &CudaBlas,
+            &[CudaBufferRegion],
+            &[Box<[u8]>],
+        ) -> Result<CudaEnqueuedWork, CudaDeviceRuntimeError>
+        + Send
+        + 'static,
+>;
+
+enum CudaEnqueueAction {
+    Static(EnqueueAction),
+    ConditionalDependency(ObservedEnqueueAction),
+}
+
 /// CUDA work captured by a reusable executable. Submission-scoped resource
 /// dependencies must stay on `CudaDeviceCommand` so a cached executable never
 /// retains request- or sequence-owned allocations.
 pub(crate) struct CudaCommandExecutable {
     regions: Vec<CudaBufferRegion>,
     host_storage: Vec<Box<[u8]>>,
-    enqueue: Mutex<EnqueueAction>,
+    work_declaration: CudaWorkDeclaration,
+    enqueue: Mutex<CudaEnqueueAction>,
+}
+
+impl CudaCommandExecutable {
+    fn static_work(
+        regions: Vec<CudaBufferRegion>,
+        host_storage: Vec<Box<[u8]>>,
+        enqueue: EnqueueAction,
+    ) -> Self {
+        Self {
+            regions,
+            host_storage,
+            work_declaration: CudaWorkDeclaration::Static,
+            enqueue: Mutex::new(CudaEnqueueAction::Static(enqueue)),
+        }
+    }
 }
 
 /// A snapshot of provider numerical status, retained by the submission rather
@@ -646,6 +708,49 @@ impl CudaDeviceCommand {
         )
     }
 
+    /// An eager retained-plan dependency whose cold scan is conditional on
+    /// shared event publication. Its enqueue receipt, never the declaration,
+    /// determines the physical work attributed to this submission.
+    pub(crate) fn conditional_dependency(
+        operation: DeviceNativeOperationId,
+        regions: Vec<CudaBufferRegion>,
+        enqueue: impl Fn(
+                &CudaStream,
+                &[CudaBufferRegion],
+            ) -> Result<CudaDependencyWork, CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let runtime_instance = common_runtime_instance(&regions)?;
+        Ok(Self {
+            runtime_instance,
+            operation: operation.as_str(),
+            batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
+            participant_count: 0,
+            token_count: 0,
+            compute_dispatch_count: 0,
+            transfer_command_count: 0,
+            executable: Some(Arc::new(CudaCommandExecutable {
+                regions,
+                host_storage: Vec::new(),
+                work_declaration: CudaWorkDeclaration::ConditionalDependency,
+                enqueue: Mutex::new(CudaEnqueueAction::ConditionalDependency(Box::new(
+                    move |stream, _blas, regions, _storage| {
+                        enqueue(stream, regions).map(CudaEnqueuedWork::Dependency)
+                    },
+                ))),
+            })),
+            fence_dependencies: Vec::new(),
+            replay_key: None,
+            reusable_address_scope: None,
+            replay_gap_reason: None,
+            program_binding_patch: None,
+            reusable_execution: None,
+            completion_checks: Vec::new(),
+        })
+    }
+
     pub(crate) fn replayable_operation(
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,
@@ -842,11 +947,11 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
-            executable: Some(Arc::new(CudaCommandExecutable {
+            executable: Some(Arc::new(CudaCommandExecutable::static_work(
                 regions,
                 host_storage,
-                enqueue: Mutex::new(Box::new(enqueue)),
-            })),
+                Box::new(enqueue),
+            ))),
             fence_dependencies,
             replay_key,
             reusable_address_scope,
@@ -885,11 +990,11 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
-            executable: Some(Arc::new(CudaCommandExecutable {
+            executable: Some(Arc::new(CudaCommandExecutable::static_work(
                 regions,
                 host_storage,
-                enqueue: Mutex::new(Box::new(enqueue)),
-            })),
+                Box::new(enqueue),
+            ))),
             fence_dependencies,
             replay_key,
             reusable_address_scope,
@@ -907,11 +1012,11 @@ impl CudaDeviceCommand {
         host_storage: Vec<Box<[u8]>>,
         enqueue: EnqueueAction,
     ) -> Self {
-        let executable = Arc::new(CudaCommandExecutable {
+        let executable = Arc::new(CudaCommandExecutable::static_work(
             regions,
             host_storage,
-            enqueue: Mutex::new(enqueue),
-        });
+            enqueue,
+        ));
         Self {
             runtime_instance,
             operation,
@@ -1056,15 +1161,15 @@ impl CudaDeviceCommand {
     ) -> Self {
         let participant_count = invocation.participant_count();
         let token_count = invocation.token_count();
-        let executable = Arc::new(CudaCommandExecutable {
-            regions: Vec::new(),
-            host_storage: Vec::new(),
-            enqueue: Mutex::new(Box::new(|_, _, _, _| {
+        let executable = Arc::new(CudaCommandExecutable::static_work(
+            Vec::new(),
+            Vec::new(),
+            Box::new(|_, _, _, _| {
                 Err(CudaDeviceRuntimeError::contract(
                     "direct reusable execution must be resolved by the owning stream cache",
                 ))
-            })),
-        });
+            }),
+        ));
         Self {
             runtime_instance,
             operation: "vnext_reusable_execution",
@@ -1300,10 +1405,10 @@ impl CudaDeviceCommand {
             ));
             host_storage.push(transfer.payload);
         }
-        let executable = Arc::new(CudaCommandExecutable {
+        let executable = Arc::new(CudaCommandExecutable::static_work(
             regions,
             host_storage,
-            enqueue: Mutex::new(Box::new(move |stream, _blas, regions, host_storage| {
+            Box::new(move |stream, _blas, regions, host_storage| {
                 if regions.len() != host_storage.len() || regions.len() != transfer_shapes.len() {
                     return Err(CudaDeviceRuntimeError::contract(
                         "CUDA sparse program binding transfer storage differs from its shape",
@@ -1353,8 +1458,8 @@ impl CudaDeviceCommand {
                         })?;
                 }
                 Ok(())
-            })),
-        });
+            }),
+        ));
         Ok(vec![Self {
             runtime_instance,
             operation: "vnext_program_binding_prelude",
@@ -1408,15 +1513,15 @@ impl CudaDeviceCommand {
                     )
                 })
         })?;
-        let executable = Arc::new(CudaCommandExecutable {
-            regions: Vec::new(),
-            host_storage: Vec::new(),
-            enqueue: Mutex::new(Box::new(move |stream, blas, _regions, _host_storage| {
+        let executable = Arc::new(CudaCommandExecutable::static_work(
+            Vec::new(),
+            Vec::new(),
+            Box::new(move |stream, blas, _regions, _host_storage| {
                 commands
                     .iter()
-                    .try_for_each(|command| command.enqueue(stream, blas))
-            })),
-        });
+                    .try_for_each(|command| command.enqueue(stream, blas).map(|_| ()))
+            }),
+        ));
         Ok(vec![Self {
             runtime_instance,
             operation: "vnext_program_binding_prelude",
@@ -1441,7 +1546,7 @@ impl CudaDeviceCommand {
         &self,
         stream: &CudaStream,
         blas: &CudaBlas,
-    ) -> Result<(), CudaDeviceRuntimeError> {
+    ) -> Result<CudaEnqueuedWork, CudaDeviceRuntimeError> {
         let executable = self.executable.as_ref().ok_or_else(|| {
             CudaDeviceRuntimeError::contract(
                 "uncoalesced CUDA program binding patch cannot enqueue",
@@ -1451,7 +1556,15 @@ impl CudaDeviceCommand {
             .enqueue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        enqueue(stream, blas, &executable.regions, &executable.host_storage)?;
+        let work = match &*enqueue {
+            CudaEnqueueAction::Static(enqueue) => {
+                enqueue(stream, blas, &executable.regions, &executable.host_storage)?;
+                CudaEnqueuedWork::Static
+            }
+            CudaEnqueueAction::ConditionalDependency(enqueue) => {
+                enqueue(stream, blas, &executable.regions, &executable.host_storage)?
+            }
+        };
         for check in self
             .completion_checks
             .iter()
@@ -1459,11 +1572,34 @@ impl CudaDeviceCommand {
         {
             check.enqueue(stream)?;
         }
-        Ok(())
+        Ok(work)
     }
 
     pub(crate) const fn replay_key(&self) -> Option<CudaCommandReplayKey> {
         self.replay_key
+    }
+
+    fn work_declaration(&self) -> CudaWorkDeclaration {
+        self.executable
+            .as_ref()
+            .map_or(CudaWorkDeclaration::Static, |executable| {
+                executable.work_declaration
+            })
+    }
+
+    fn interval_kind(&self, work: CudaEnqueuedWork) -> DeviceExecutionIntervalKind {
+        match work {
+            CudaEnqueuedWork::Dependency(CudaDependencyWork::ScanAndWait) => {
+                DeviceExecutionIntervalKind::Compute
+            }
+            CudaEnqueuedWork::Dependency(CudaDependencyWork::Wait) => {
+                DeviceExecutionIntervalKind::Dependency
+            }
+            CudaEnqueuedWork::Static if self.compute_dispatch_count > 0 => {
+                DeviceExecutionIntervalKind::Compute
+            }
+            CudaEnqueuedWork::Static => DeviceExecutionIntervalKind::Transfer,
+        }
     }
 
     pub(crate) fn reusable_execution_invocation(
@@ -1606,11 +1742,13 @@ fn cuda_submission_attribution(
     execution_paths: &[DeviceExecutionPath],
     reusable_graph_node_counts: Option<&[Option<u64>]>,
     replayed_segments: Vec<DeviceReplayedSegmentAttribution>,
+    observed_dependencies: Option<&[Option<CudaDependencyWork>]>,
 ) -> Result<DeviceSubmissionAttribution, CudaDeviceRuntimeError> {
     if command_phases.len() != commands.len()
         || command_node_indices.len() != commands.len()
         || execution_paths.len() != commands.len()
         || reusable_graph_node_counts.is_some_and(|counts| counts.len() != commands.len())
+        || observed_dependencies.is_some_and(|work| work.len() != commands.len())
     {
         return Err(CudaDeviceRuntimeError::contract(
             "CUDA command attribution differs from its submitted batch",
@@ -1628,7 +1766,31 @@ fn cuda_submission_attribution(
                         "CUDA command attribution has a non-portable native operation identity",
                     )
                 })?;
-            DeviceNativeWorkAttribution::with_participant_range(
+            let observed = observed_dependencies.and_then(|work| work[command_index as usize]);
+            let (compute, transfer, dependency) = match (command.work_declaration(), observed) {
+                (CudaWorkDeclaration::Static, None) => (
+                    command.compute_dispatch_count,
+                    command.transfer_command_count,
+                    0,
+                ),
+                (CudaWorkDeclaration::ConditionalDependency, Some(work)) => {
+                    validate_conditional_dependency(
+                        command,
+                        command_phases[command_index as usize],
+                        command_node_indices[command_index as usize],
+                        execution_paths[command_index as usize],
+                        reusable_graph_node_counts
+                            .and_then(|counts| counts[command_index as usize]),
+                    )?;
+                    work.counts()
+                }
+                _ => {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "CUDA observed dependency work differs from its declaration",
+                    ))
+                }
+            };
+            DeviceNativeWorkAttribution::with_participant_range_and_dependencies(
                 command_index,
                 command_node_indices[command_index as usize],
                 command_phases[command_index as usize],
@@ -1638,9 +1800,10 @@ fn cuda_submission_attribution(
                 command.participant_start,
                 command.participant_count,
                 command.token_count,
-                command.compute_dispatch_count,
-                command.transfer_command_count,
+                compute,
+                transfer,
                 reusable_graph_node_counts.and_then(|counts| counts[command_index as usize]),
+                dependency,
             )
             .ok_or_else(|| {
                 CudaDeviceRuntimeError::contract(
@@ -1652,6 +1815,97 @@ fn cuda_submission_attribution(
     DeviceSubmissionAttribution::with_replayed_segments(rows, replayed_segments).ok_or_else(|| {
         CudaDeviceRuntimeError::contract("CUDA submission attribution is empty or unordered")
     })
+}
+
+fn validate_conditional_dependency(
+    command: &CudaDeviceCommand,
+    phase: ferrum_interfaces::vnext::DeviceCommandPhase,
+    node_index: Option<u32>,
+    execution_path: DeviceExecutionPath,
+    graph_nodes: Option<u64>,
+) -> Result<(), CudaDeviceRuntimeError> {
+    use ferrum_interfaces::vnext::DeviceCommandPhase;
+    if phase != DeviceCommandPhase::DynamicBinding
+        || node_index.is_some()
+        || execution_path != DeviceExecutionPath::Eager
+        || graph_nodes.is_some()
+        || command.batching_form != DeviceBatchingForm::Scalar
+        || command.participant_start != 0
+        || command.participant_count != 0
+        || command.token_count != 0
+        || command.compute_dispatch_count != 0
+        || command.transfer_command_count != 0
+        || command.replay_key.is_some()
+        || command.reusable_address_scope.is_some()
+        || command.reusable_execution.is_some()
+        || command.program_binding_patch.is_some()
+        || !command.completion_checks.is_empty()
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA conditional dependency must remain an eager retained-plan prefix",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate encoded metadata before any enqueue. A conditional declaration
+/// authorizes its eager dependency, but does not claim that a scan occurred.
+fn validate_cuda_submission_attribution(
+    phases: &[ferrum_interfaces::vnext::DeviceCommandPhase],
+    node_indices: &[Option<u32>],
+    commands: &[CudaDeviceCommand],
+    paths: &[DeviceExecutionPath],
+    graph_counts: Option<&[Option<u64>]>,
+) -> Result<(), CudaDeviceRuntimeError> {
+    if phases.len() != commands.len()
+        || node_indices.len() != commands.len()
+        || paths.len() != commands.len()
+        || graph_counts.is_some_and(|counts| counts.len() != commands.len())
+        || commands.is_empty()
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA command attribution differs from its submitted batch",
+        ));
+    }
+    for (index, command) in commands.iter().enumerate() {
+        let native_op_id = DeviceNativeOperationId::new(command.operation).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA command attribution has a non-portable native operation identity",
+            )
+        })?;
+        let command_index = u32::try_from(index)
+            .map_err(|_| CudaDeviceRuntimeError::contract("CUDA command index exceeds u32"))?;
+        let graph_nodes = graph_counts.and_then(|counts| counts[index]);
+        if command.work_declaration() == CudaWorkDeclaration::ConditionalDependency {
+            validate_conditional_dependency(
+                command,
+                phases[index],
+                node_indices[index],
+                paths[index],
+                graph_nodes,
+            )?;
+        } else if DeviceNativeWorkAttribution::with_participant_range(
+            command_index,
+            node_indices[index],
+            phases[index],
+            native_op_id,
+            paths[index],
+            command.batching_form,
+            command.participant_start,
+            command.participant_count,
+            command.token_count,
+            command.compute_dispatch_count,
+            command.transfer_command_count,
+            graph_nodes,
+        )
+        .is_none()
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA command attribution has invalid native work metadata",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub struct CudaDeviceStream {
@@ -2131,6 +2385,18 @@ impl CudaDeviceRuntime {
         }
         let minor = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(|error| CudaDeviceRuntimeError::driver("DP4A compute capability", error))?;
+        let q6_head_capability =
+            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID;
+        if major >= 8 && matches!(purpose, CudaRuntimePurpose::NativeCatalogDeclaration) {
+            config.capabilities.insert(
+                CapabilityId::new(q6_head_capability)
+                    .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?,
+            );
+        } else if major < 8 || !super::vnext_ops::q6_mmq_f32_compiled() {
+            config
+                .capabilities
+                .retain(|cap| cap.as_str() != q6_head_capability);
+        }
         for profile in [
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
@@ -3654,6 +3920,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     Some(logical_work) => command.bind_core_logical_work(logical_work)?,
                     None => command,
                 };
+                if command.work_declaration() == CudaWorkDeclaration::ConditionalDependency {
+                    validate_conditional_dependency(
+                        &command,
+                        phase,
+                        node_index,
+                        DeviceExecutionPath::Eager,
+                        None,
+                    )?;
+                }
                 Ok((phase, node_index, command))
             })
             .collect::<Result<Vec<_>, CudaDeviceRuntimeError>>()
@@ -3772,13 +4047,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if let (Some(command_node_indices), Some(execution_paths)) =
             (&command_node_indices, &execution_paths)
         {
-            if let Err(error) = cuda_submission_attribution(
+            if let Err(error) = validate_cuda_submission_attribution(
                 &command_phases,
                 command_node_indices,
                 &commands,
                 execution_paths,
                 reusable_graph_node_counts.as_deref(),
-                Vec::new(),
             ) {
                 return Err(DefinitelyNotSubmitted::new(error));
             }
@@ -3942,6 +4216,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let mut command_spans =
             physical_span_attribution.then(|| Vec::with_capacity(commands.len()));
         let mut replayed_segments = logical_attribution.then(Vec::new);
+        // Off mode retains no per-command observation allocation. Receipts are
+        // values local to this enqueue; cached executables never hold them.
+        let mut observed_dependencies = native_attribution.then(|| vec![None; commands.len()]);
         let mut index = 0;
         let mut executable_candidate_index = 0;
         while index < commands.len() {
@@ -4159,10 +4436,20 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
                     .ok()
             });
-            if let Err(error) = commands[index].enqueue(&stream.stream, &stream.blas) {
-                stream.state.fail();
-                self.quarantine(stream, commands);
-                panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
+            let work = match commands[index].enqueue(&stream.stream, &stream.blas) {
+                Ok(work) => work,
+                Err(error) => {
+                    stream.state.fail();
+                    self.quarantine(stream, commands);
+                    panic!(
+                        "CUDA submission became indeterminate while enqueueing its batch: {error}"
+                    );
+                }
+            };
+            if let (Some(observed), CudaEnqueuedWork::Dependency(work)) =
+                (observed_dependencies.as_mut(), work)
+            {
+                observed[index] = Some(work);
             }
             if let Some(command_spans) = command_spans.as_mut() {
                 let command_end = stream
@@ -4170,11 +4457,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
                     .ok();
                 let command = &commands[index];
-                let interval_kind = if command.compute_dispatch_count > 0 {
-                    DeviceExecutionIntervalKind::Compute
-                } else {
-                    DeviceExecutionIntervalKind::Transfer
-                };
+                let interval_kind = command.interval_kind(work);
                 command_spans.push(
                     CudaExecutionSpanEventTiming::new(
                         index,
@@ -4223,6 +4506,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     execution_paths,
                     reusable_graph_node_counts.as_deref(),
                     replayed_segments.unwrap_or_default(),
+                    observed_dependencies.as_deref(),
                 )
             }) {
             None => None,
@@ -4921,11 +5205,11 @@ mod tests {
             token_count: 1,
             compute_dispatch_count: 1,
             transfer_command_count: 0,
-            executable: Some(Arc::new(CudaCommandExecutable {
-                regions: Vec::new(),
-                host_storage: Vec::new(),
-                enqueue: Mutex::new(Box::new(|_, _, _, _| Ok(()))),
-            })),
+            executable: Some(Arc::new(CudaCommandExecutable::static_work(
+                Vec::new(),
+                Vec::new(),
+                Box::new(|_, _, _, _| Ok(())),
+            ))),
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
@@ -4954,6 +5238,7 @@ mod tests {
             &[DeviceExecutionPath::Eager, DeviceExecutionPath::Replayed],
             Some(&[None, Some(2)]),
             Vec::new(),
+            None,
         )
         .unwrap();
 
@@ -4979,6 +5264,155 @@ mod tests {
         assert_eq!(binding.transfer_command_count(), 2);
     }
 
+    fn conditional_dependency_command() -> CudaDeviceCommand {
+        let mut command = command("test.retained_dependency");
+        command.participant_count = 0;
+        command.token_count = 0;
+        command.compute_dispatch_count = 0;
+        let executable = Arc::get_mut(command.executable.as_mut().unwrap()).unwrap();
+        executable.work_declaration = CudaWorkDeclaration::ConditionalDependency;
+        executable.enqueue = Mutex::new(CudaEnqueueAction::ConditionalDependency(Box::new(
+            |_, _, _, _| panic!("metadata preflight must not enqueue"),
+        )));
+        command
+    }
+
+    #[test]
+    fn cuda_conditional_dependency_requires_observed_work_and_keeps_cold_warm_counts() {
+        let commands = [conditional_dependency_command()];
+        let phases = [DeviceCommandPhase::DynamicBinding];
+        let nodes = [None];
+        let paths = [DeviceExecutionPath::Eager];
+        validate_cuda_submission_attribution(&phases, &nodes, &commands, &paths, None).unwrap();
+        assert!(cuda_submission_attribution(
+            &phases, &nodes, &commands, &paths, None, Vec::new(), None,
+        ).is_err(), "a declaration is not an observed receipt");
+        for (work, counts, interval) in [
+            (
+                CudaDependencyWork::ScanAndWait,
+                (1, 1, 1),
+                DeviceExecutionIntervalKind::Compute,
+            ),
+            (
+                CudaDependencyWork::Wait,
+                (0, 0, 1),
+                DeviceExecutionIntervalKind::Dependency,
+            ),
+        ] {
+            let attribution = cuda_submission_attribution(
+                &phases,
+                &nodes,
+                &commands,
+                &paths,
+                None,
+                Vec::new(),
+                Some(&[Some(work)]),
+            )
+            .unwrap();
+            let row = &attribution.commands()[0];
+            assert_eq!(
+                (
+                    row.compute_dispatch_count(),
+                    row.transfer_command_count(),
+                    row.dependency_wait_count()
+                ),
+                counts
+            );
+            assert_eq!(
+                commands[0].interval_kind(CudaEnqueuedWork::Dependency(work)),
+                interval
+            );
+        }
+        // Independent submission storage remains valid when a newer warm
+        // receipt is materialized before the earlier cold receipt.
+        let cold = [Some(CudaDependencyWork::ScanAndWait)];
+        let warm = [Some(CudaDependencyWork::Wait)];
+        let b = cuda_submission_attribution(
+            &phases,
+            &nodes,
+            &commands,
+            &paths,
+            None,
+            Vec::new(),
+            Some(&warm),
+        )
+        .unwrap();
+        let a = cuda_submission_attribution(
+            &phases,
+            &nodes,
+            &commands,
+            &paths,
+            None,
+            Vec::new(),
+            Some(&cold),
+        )
+        .unwrap();
+        assert_eq!(a.commands()[0].compute_dispatch_count(), 1);
+        assert_eq!(b.commands()[0].compute_dispatch_count(), 0);
+    }
+
+    #[test]
+    fn cuda_conditional_dependency_rejects_capture_logical_work_and_untyped_zero_work() {
+        for (phase, node, path) in [
+            (
+                DeviceCommandPhase::Compute,
+                None,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                Some(0),
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                DeviceExecutionPath::Replayed,
+            ),
+        ] {
+            assert!(validate_cuda_submission_attribution(
+                &[phase],
+                &[node],
+                &[conditional_dependency_command()],
+                &[path],
+                None
+            )
+            .is_err());
+        }
+        let check = |command| {
+            validate_cuda_submission_attribution(
+                &[DeviceCommandPhase::DynamicBinding],
+                &[None],
+                &[command],
+                &[DeviceExecutionPath::Eager],
+                None,
+            )
+        };
+        let mut logical = conditional_dependency_command();
+        logical.participant_count = 1;
+        assert!(check(logical).is_err());
+        let mut packed = conditional_dependency_command();
+        packed.batching_form = DeviceBatchingForm::Packed;
+        assert!(check(packed).is_err());
+        let mut untyped = command("test.zero");
+        untyped.compute_dispatch_count = 0;
+        assert!(check(untyped).is_err());
+        let static_command = [command("test.static")];
+        assert!(
+            cuda_submission_attribution(
+                &[DeviceCommandPhase::Compute],
+                &[Some(0)],
+                &static_command,
+                &[DeviceExecutionPath::Eager],
+                None,
+                Vec::new(),
+                Some(&[Some(CudaDependencyWork::Wait)]),
+            )
+            .is_err(),
+            "a conditional receipt cannot replace static work"
+        );
+    }
+
     #[test]
     fn core_logical_work_binds_node_workspace_zero_attribution() {
         let zero = || {
@@ -4997,6 +5431,7 @@ mod tests {
             &[DeviceExecutionPath::Eager],
             Some(&[None]),
             Vec::new(),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("invalid native work metadata"));
@@ -5011,6 +5446,7 @@ mod tests {
             &[DeviceExecutionPath::Eager],
             Some(&[None]),
             Vec::new(),
+            None,
         )
         .unwrap();
         let [command] = attribution.commands() else {
@@ -5045,6 +5481,7 @@ mod tests {
             &[DeviceExecutionPath::Eager],
             Some(&[None]),
             Vec::new(),
+            None,
         )
         .unwrap_err();
         assert!(error

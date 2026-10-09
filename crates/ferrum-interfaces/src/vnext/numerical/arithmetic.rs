@@ -98,9 +98,14 @@ pub enum FloatingStorageRounding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NumericalArithmeticStage {
+    Q6MmqF32Projection {
+        policy: super::Q6MmqF32Policy,
+    },
     /// A complete, separately versioned pipeline, including its final F16
     /// conversion. It is never mixed with the schema-1 five-stage sequence.
-    G32MmqPrefillProjection { policy: super::G32MmqPrefillPolicy },
+    G32MmqPrefillProjection {
+        policy: super::G32MmqPrefillPolicy,
+    },
     UpstreamProjection {
         policy: super::UpstreamProjectionPolicy,
     },
@@ -148,6 +153,7 @@ pub enum NumericalArithmeticStage {
 impl StagedNumericalArithmetic {
     pub(super) fn output_type(&self) -> Option<ElementType> {
         match self.stages.last() {
+            Some(NumericalArithmeticStage::Q6MmqF32Projection { .. }) => Some(ElementType::F32),
             Some(
                 NumericalArithmeticStage::UpstreamProjection { .. }
                 | NumericalArithmeticStage::G32MmqPrefillProjection { .. },
@@ -163,6 +169,12 @@ impl StagedNumericalArithmetic {
     /// Family registration still has to reproduce this declaration; operation
     /// and provider versions must implement it before any plan can execute it.
     pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version == super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION_Q6_MMQ_F32 {
+            return match self.stages.as_slice() {
+                [NumericalArithmeticStage::Q6MmqF32Projection { policy }] => policy.validate(),
+                _ => Err("Q6 F32 schema requires exactly one independent Q6 D4/MMQ policy".into()),
+            };
+        }
         if self.schema_version == NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ {
             return match self.stages.as_slice() {
                 [NumericalArithmeticStage::G32MmqPrefillProjection { policy }] => policy.validate(),

@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.upstream_extra_linear",
   "source_package_kind": "ferrum-native-upstream-extra-linear",
-  "source_package_revision": "marker-v2-extra-prefill-r1+d81235049384534c167caea52b85a694f6103d14",
+  "source_package_revision": "marker-v2-tail-safe-r1+d81235049384534c167caea52b85a694f6103d14",
   "upstream_sources": [
     {
       "repository": "https://github.com/ggml-org/llama.cpp.git",

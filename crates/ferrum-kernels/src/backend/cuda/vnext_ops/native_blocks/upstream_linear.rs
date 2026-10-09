@@ -185,7 +185,7 @@ impl UpstreamPlanFactory {
             ),
             _ => return Err("native format family is ambiguous".into()),
         }
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("{error}; family={family:?} algorithm={algorithm:?} format={format_code} rows={rows} inputs={inputs} outputs={outputs}"))?;
         let plan = Arc::new(plan);
         plans.insert(key, plan.clone());
         Ok(plan)

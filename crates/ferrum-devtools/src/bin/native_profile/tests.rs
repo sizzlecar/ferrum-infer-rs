@@ -88,6 +88,52 @@ fn shuffled_participant_copies_count_physical_command_and_subwork_once() {
 }
 
 #[test]
+fn dependency_waits_preserve_cold_and_warm_work_without_becoming_transfers() {
+    let mut cold = command("cold", 0, 0, 100);
+    cold.attributes.command_phase = Some("dynamic_binding".into());
+    cold.shape.physical_compute_dispatch_count = Some(1);
+    cold.shape.physical_transfer_command_count = Some(1);
+    cold.shape.physical_dependency_wait_count = Some(1);
+    let mut warm = cold.clone();
+    warm.attributes.physical_submission_fingerprint = Some("warm".into());
+    warm.shape.physical_compute_dispatch_count = Some(0);
+    warm.shape.physical_transfer_command_count = Some(0);
+    warm.shape.device_elapsed_ns = Some(25);
+    warm.backend_detail = Some(Detail {
+        device_intervals: Some(vec![Interval {
+            kind: "dependency".into(),
+            start_offset_ns: 0,
+            end_offset_ns: 25,
+            subwork_id: None,
+        }]),
+    });
+    let result = report(&[cold.clone(), warm.clone(), cold, warm]);
+    assert_eq!(result.counts.duplicate_native_records, 2);
+    let work = &result.native_work;
+    assert_eq!(work.timing.observed_compute_dispatch_count, 1);
+    assert_eq!(work.timing.observed_transfer_command_count, 1);
+    assert_eq!(work.timing.observed_dependency_wait_count, 2);
+    assert_eq!(work.timing.commands_missing_physical_work_counts, 0);
+    assert_eq!(work.interval_kinds["dependency"].measured_ns, 25);
+    assert_eq!(work.interval_kinds["compute"].measured_ns, 100);
+    assert!(!work.interval_kinds.contains_key("transfer"));
+    let value = serde_json::to_value(result).unwrap();
+    assert_eq!(
+        value["native_work"]["timing"]["observed_dependency_wait_count"],
+        2
+    );
+
+    let legacy = report(&[command("legacy", 0, 1, 30)]);
+    assert_eq!(
+        legacy
+            .native_work
+            .timing
+            .commands_missing_physical_work_counts,
+        1
+    );
+}
+
+#[test]
 fn conflicting_duplicate_timings_or_provider_metadata_are_errors() {
     let original = serde_json::to_value(command("shared", 0, 1, 100)).unwrap();
     let mut time_conflict = original.clone();

@@ -62,6 +62,8 @@ use super::vnext_runtime::{
 mod last_token_linear_tests;
 mod native_blocks;
 mod native_io;
+mod q6_head;
+pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
 mod transformer;
 use ferrum_interfaces::vnext::{
@@ -106,8 +108,10 @@ pub fn cuda_vnext_runtime_config(
     device_id: DeviceId,
     requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let q6_head_fingerprint = q6_head::fingerprint();
     let fingerprint_parts: Vec<&[u8]> = vec![
         include_str!("vnext_runtime.rs").as_bytes(),
+        q6_head_fingerprint.as_bytes(),
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
         include_str!("../reusable_execution.rs").as_bytes(),
@@ -270,6 +274,27 @@ fn upstream_profile_exports_present(exports: &[String], prefill: bool) -> bool {
             || exports
                 .iter()
                 .any(|export| export == "ferrum_upstream_mmq_prefill_plan_v1"))
+}
+
+pub(crate) fn q6_mmq_f32_compiled() -> bool {
+    cfg!(feature = "cuda-upstream-q6-f32-linear")
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator
+                    == ferrum_native_ops::upstream_q6_f32_linear::UPSTREAM_Q6_F32_LINEAR_OPERATOR
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && ["plan", "pack", "dot", "check_weights", "publish"]
+                        .iter()
+                        .all(|stage| {
+                            artifact
+                                .exports
+                                .iter()
+                                .any(|name| name == &format!("ferrum_upstream_q6_f32_{stage}_v1"))
+                        })
+            })
 }
 
 pub(crate) fn upstream_marker_v2_compiled() -> bool {
@@ -492,6 +517,11 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         capabilities
     };
     let mut capabilities = capabilities;
+    if q6_mmq_f32_compiled() {
+        capabilities.insert(CapabilityId::new(
+            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
+        )?);
+    }
     for profile in [
         ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
         ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
@@ -825,6 +855,15 @@ pub fn cuda_vnext_operation_registry(
         providers
     };
     let mut providers = providers;
+    if runtime.descriptor().capabilities.iter().any(|cap| {
+        cap.as_str() == ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID
+    }) {
+        contracts.push(Box::new(
+            ferrum_interfaces::vnext::last_token_dense_linear_q6_mmq_f32_contract()
+                .map_err(contract_error)?,
+        ));
+        providers.push(Box::new(CudaQ6MmqF32LastTokenProvider::new(runtime)?));
+    }
     for profile in [
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
@@ -1026,6 +1065,7 @@ impl CudaVNextComposition {
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
                 include_str!("vnext_runtime.rs").as_bytes(),
+                q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
                 CUDA_ENGINE_PROVIDER_ID.as_bytes(),
             ]),

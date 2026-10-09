@@ -8,6 +8,8 @@ mod q8act_attention;
 pub use q8act_attention::*;
 mod upstream_marker_v2;
 pub use upstream_marker_v2::*;
+mod q6_mmq_f32;
+pub use q6_mmq_f32::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;

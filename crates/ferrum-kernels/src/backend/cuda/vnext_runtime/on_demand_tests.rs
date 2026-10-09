@@ -82,10 +82,10 @@ impl CaptureHarness {
         // The fixture owns the same allocation for the cache lifetime. The
         // executable retains it so an evicted caller command cannot free it.
         command.reusable_address_scope = Some(DeviceReusableAddressScope::Plan);
-        command.executable = Some(Arc::new(CudaCommandExecutable {
-            regions: Vec::new(),
-            host_storage: Vec::new(),
-            enqueue: Mutex::new(Box::new(move |stream, _, _, _| {
+        command.executable = Some(Arc::new(CudaCommandExecutable::static_work(
+            Vec::new(),
+            Vec::new(),
+            Box::new(move |stream, _, _, _| {
                 let _retained_counter = &counter;
                 if reject_capture {
                     let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
@@ -108,8 +108,8 @@ impl CaptureHarness {
                 }
                 .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
                 Ok(())
-            })),
-        }));
+            }),
+        )));
         command
     }
 

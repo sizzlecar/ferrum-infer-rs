@@ -326,8 +326,7 @@ impl PreparedUpstreamProjectionWave {
                     || *threads == 0
                     || *threads > 1024
                     || *threads % 32 != 0
-                    || *packed_guard_blocks % 8 != 0
-                    || u64::from(*packed_guard_blocks) > m
+                    || *packed_guard_blocks > 512
                     || *blocks == 0
                     || *shared_bytes > native.maximum_dynamic_shared_bytes
                     || facts.layout != UpstreamProjectionLayout::Columns
@@ -335,12 +334,33 @@ impl PreparedUpstreamProjectionWave {
                     return Err("native MMQ geometry violates the declared dense ABI or shared-memory limit".into());
                 }
                 let pk = u64::from(*padded_inputs);
+                let packed_bytes = add(
+                    mul(mul(m, pk / 128)?, 144)?,
+                    mul(u64::from(*packed_guard_blocks), 144)?,
+                )?;
+                // The pinned loader copies complete thread batches, even for
+                // unused columns in the final row tile. A guard need not be a
+                // multiple of eight and can exceed M. Check the actual read
+                // endpoint; output write predicates do not protect these reads.
+                let tile = u64::from(*row_tile);
+                let last_tile = mul((m - 1) / tile, tile)?;
+                let copy_bytes = mul(round_up(mul(tile, 36)?, u64::from(*threads))?, 4)?;
+                let last_k_block = k
+                    .checked_div(128)
+                    .and_then(|v| v.checked_sub(1))
+                    .ok_or("MMQ requires a complete logical K128 block")?;
+                let read_end = add(
+                    mul(add(mul(last_k_block, m)?, last_tile)?, 144)?,
+                    copy_bytes,
+                )?;
+                if read_end > packed_bytes {
+                    return Err(
+                        "native MMQ packed extent does not cover cooperative tail reads".into(),
+                    );
+                }
                 (
                     pk,
-                    add(
-                        mul(mul(m, pk / 128)?, 144)?,
-                        mul(u64::from(*packed_guard_blocks), 144)?,
-                    )?,
+                    packed_bytes,
                     if *fixup {
                         mul(
                             mul(
