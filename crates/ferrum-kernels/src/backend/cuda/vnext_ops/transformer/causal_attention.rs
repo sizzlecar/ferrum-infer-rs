@@ -24,7 +24,11 @@ use ferrum_interfaces::vnext::{
 use ferrum_types::{AttentionExecutionPolicy, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use sha2::{Digest, Sha256};
 
-use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
+use super::replay_encoding::{Encoding, EncodingTarget};
+use super::{
+    attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16,
+    provider_failure,
+};
 #[cfg(feature = "vllm-marlin")]
 use super::{
     marlin_fp8_weights::resolve_marlin_fp8_weight,
@@ -47,6 +51,7 @@ use crate::backend::cuda::vllm_marlin::MarlinF16WeightType;
 use crate::backend::cuda::vllm_paged_attn::{
     dispatch_vnext_addressed_paged_attention_raw, VnextAddressedPagedAttentionKernel,
 };
+use crate::backend::cuda::vnext_ops::VALUE_ALIGNMENT_BYTES;
 use crate::backend::cuda::vnext_ops::{
     binding, contiguous_token_region, contract_error, implementation_fingerprint,
     DENSE_SAFETENSORS_FORMAT_ID, THREADS_PER_BLOCK, VNEXT_KV_PAGE_BYTES,
@@ -136,6 +141,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     q8act: bool,
+    upstream: bool,
     #[cfg(feature = "vllm-marlin")]
     projection_runtime: MarlinProjectionRuntime,
 }
@@ -197,6 +203,8 @@ impl CausalAttentionSemantics {
 struct CausalAttentionFunctions {
     native: CudaNativeBlockKernels,
     q8act: Option<Q8ActKernels>,
+
+    upstream: Option<Arc<super::q8act_attention::upstream::Runtime>>,
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     gather_decode_lengths: CudaFunction,
@@ -210,6 +218,32 @@ struct CausalAttentionFunctions {
 }
 
 impl CudaCausalPagedAttentionProvider {
+    pub(in crate::backend::cuda::vnext_ops) fn new_upstream(
+        runtime: &CudaDeviceRuntime,
+        profile: ferrum_interfaces::vnext::UpstreamMarkerV2Profile,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if !matches!(
+            profile,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows
+        ) {
+            return Err(CudaDeviceRuntimeError::contract("not a causal profile"));
+        }
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &profile.contract().map_err(contract_error)?,
+            profile.capability_id(),
+            CausalAttentionSemantics::Standard,
+            CausalPrecision::F32Master,
+        )
+    }
+
     pub(in crate::backend::cuda::vnext_ops) fn new_q8act(
         runtime: &CudaDeviceRuntime,
         attention_policy: AttentionExecutionPolicy,
@@ -361,7 +395,18 @@ impl CudaCausalPagedAttentionProvider {
         let rounded_gguf = super::gguf_f16_projection::is_operation(&contract.descriptor().id);
         let q8act =
             contract.descriptor().id.as_str() == Q8ActAttentionProfile::Causal.operation_id();
-        if q8act
+        let upstream_profile = [
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+        ]
+        .into_iter()
+        .find(|profile| profile.operation_id() == contract.descriptor().id.as_str());
+        let upstream = upstream_profile.is_some();
+        if (q8act || upstream)
             && (semantics != CausalAttentionSemantics::Standard
                 || precision != CausalPrecision::F32Master)
         {
@@ -369,14 +414,20 @@ impl CudaCausalPagedAttentionProvider {
                 "Q8act attention requires its standard F32-master/F16-KV contract",
             ));
         }
-        let provider_id = if q8act {
+        let upstream_provider_id = upstream_profile.map(|p| p.provider_id());
+        let provider_id = if let Some(id) = &upstream_provider_id {
+            id.as_str()
+        } else if q8act {
             "provider.cuda.causal_paged_attention.f32-master.q4k-q5k-iq4xs-q8act-g32"
         } else if rounded_gguf {
             "provider.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
         } else {
             precision.provider_id(semantics)
         };
-        let estimator_id = if q8act {
+        let upstream_estimator_id = upstream_profile.map(|p| p.estimator_id());
+        let estimator_id = if let Some(id) = &upstream_estimator_id {
+            id.as_str()
+        } else if q8act {
             "resource-estimator.cuda.causal_paged_attention.f32-master.q4k-q5k-iq4xs-q8act-g32"
         } else if rounded_gguf {
             "resource-estimator.cuda.causal_paged_attention.f32-master.gguf-f16-projections"
@@ -387,6 +438,7 @@ impl CudaCausalPagedAttentionProvider {
         let mut provider_sources = vec![
             source.as_bytes(),
             include_bytes!("q8act_attention.rs"),
+            include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("causal_attention/precision.rs"),
             include_bytes!("causal_attention/batch_decode.rs"),
@@ -424,6 +476,10 @@ impl CudaCausalPagedAttentionProvider {
         ]);
         provider_sources.push(attention_policy.as_runtime_value().as_bytes());
         provider_sources.push(semantics.fingerprint_tag());
+
+        if upstream {
+            provider_sources.extend(super::q8act_attention::upstream::fingerprint_sources());
+        }
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
@@ -630,7 +686,17 @@ impl CudaCausalPagedAttentionProvider {
             })?;
         let functions = CausalAttentionFunctions {
             native: CudaNativeBlockKernels::load(runtime.context())?,
-            q8act: q8act
+
+            upstream: upstream
+                .then(|| {
+                    super::q8act_attention::upstream::Runtime::new(
+                        runtime.context(),
+                        descriptor.provider_implementation_fingerprint(),
+                        upstream_profile.expect("upstream selected"),
+                    )
+                })
+                .transpose()?,
+            q8act: (q8act || upstream_profile.is_some_and(|p| p.hybrid()))
                 .then(|| Q8ActKernels::load_attention(runtime.context()))
                 .transpose()?,
             rms_norm: load_function(
@@ -700,6 +766,7 @@ impl CudaCausalPagedAttentionProvider {
             semantics,
             precision,
             q8act,
+            upstream,
             #[cfg(feature = "vllm-marlin")]
             projection_runtime: MarlinProjectionRuntime::query(runtime)?,
         })
@@ -773,6 +840,19 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             })
             .transpose()
             .map_err(invalid_plan)?;
+
+        let q8act = if let Some(runtime) = &self.functions.upstream {
+            Some(
+                PreparedAttentionProjections::prepare_upstream(
+                    Q8ActAttentionProfile::Causal,
+                    request.values(),
+                    runtime.clone(),
+                )
+                .map_err(invalid_plan)?,
+            )
+        } else {
+            q8act
+        };
         let pack_per_token = q8act
             .as_ref()
             .map_or(0, PreparedAttentionProjections::bytes_per_token);
@@ -792,6 +872,13 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
                     .and_then(|bytes| {
                         bytes
                             .checked_add(pack_slop)
+                            .and_then(|bytes| {
+                                bytes.checked_add(
+                                    q8act
+                                        .as_ref()
+                                        .map_or(0, PreparedAttentionProjections::fixed_bytes),
+                                )
+                            })
                             .ok_or_else(|| "causal pack scratch alignment overflows".into())
                     })
                     .map_err(invalid_plan)?,
@@ -822,8 +909,23 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
-        let estimate = estimate(&self.descriptor, request.input_fingerprint(), Some(scratch))
-            .with_binding(binding);
+        let persistent = q8act
+            .as_ref()
+            .map(PreparedAttentionProjections::persistent_requirement)
+            .transpose()
+            .map_err(invalid_plan)?
+            .flatten();
+        let estimate = OperationResourceEstimate::new(
+            self.descriptor.resource_estimator_id(),
+            self.descriptor.resource_estimator_version(),
+            self.descriptor
+                .resource_estimator_implementation_fingerprint(),
+            request.input_fingerprint(),
+            VALUE_ALIGNMENT_BYTES,
+            Some(scratch),
+            persistent,
+        )
+        .with_binding(binding);
         Ok(match q8act {
             Some(plan) => estimate.with_projection_numerics(plan.into_numerics()),
             None => estimate,
@@ -833,7 +935,11 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
 
 impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
     fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
-        ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+        if self.upstream {
+            ferrum_interfaces::vnext::ReusableBindingResources::All
+        } else {
+            ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+        }
     }
 
     fn reusable_execution_topology(
@@ -856,14 +962,15 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 9,
             ));
         }
+        let mut workspaces = vec![
+            ReusableExecutionWorkspaceAddress::Scratch,
+            ReusableExecutionWorkspaceAddress::Binding,
+        ];
+        if self.upstream {
+            workspaces.push(ReusableExecutionWorkspaceAddress::Persistent);
+        }
         if request
-            .reusable_address_scope(
-                &values,
-                &[
-                    ReusableExecutionWorkspaceAddress::Scratch,
-                    ReusableExecutionWorkspaceAddress::Binding,
-                ],
-            )?
+            .reusable_address_scope(&values, &workspaces)?
             .is_none()
         {
             return Ok(ReusableExecutionTopology::EagerBoundary);
@@ -887,7 +994,9 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
             invocation,
+            EncodingTarget::Full,
         )
+        .and_then(Encoding::full)
         .map_err(|message| {
             OperationFailure::new(
                 identity,
@@ -905,6 +1014,48 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        let small_hybrid = self
+            .functions
+            .upstream
+            .as_ref()
+            .map(|r| r.g32_binding_only(&invocation))
+            .transpose()
+            .map_err(|message| {
+                provider_failure(
+                    identity.clone(),
+                    "cuda.causal_paged_attention.hybrid_bindings",
+                    message,
+                )
+            })?
+            .unwrap_or(false);
+        if self.upstream && !small_hybrid {
+            if invocation.program_binding().is_none() {
+                // Preserve dynamic-binding placement without a compiled slot.
+                return self
+                    .encode_selected(invocation)
+                    .map(EncodedReusableExecutionBindings::from_operation);
+            }
+            return encode_attention(
+                &self.functions,
+                self.descriptor.provider_implementation_fingerprint(),
+                self.attention_policy,
+                self.semantics,
+                self.precision,
+                self.descriptor.operation_id().as_str(),
+                #[cfg(feature = "vllm-marlin")]
+                self.projection_runtime,
+                invocation,
+                EncodingTarget::BindingsOnly,
+            )
+            .and_then(Encoding::bindings)
+            .map_err(|message| {
+                provider_failure(
+                    identity,
+                    "cuda.causal_attention.upstream_reusable_bindings",
+                    message,
+                )
+            });
+        }
         encode_reusable_attention_bindings(
             invocation,
             self.semantics,
@@ -2126,7 +2277,8 @@ fn encode_attention(
     operation_id: &str,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
+    target: EncodingTarget,
+) -> Result<Encoding<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty() || invocation.operation().id.as_str() != operation_id {
         return Err("CUDA causal attention received another or empty operation".to_owned());
     }
@@ -2134,6 +2286,7 @@ fn encode_attention(
     let q8act = functions
         .q8act
         .as_ref()
+        .filter(|_| functions.upstream.is_none())
         .map(|_| {
             PreparedAttentionProjections::from_invocation(
                 Q8ActAttentionProfile::Causal,
@@ -2141,6 +2294,18 @@ fn encode_attention(
             )
         })
         .transpose()?;
+
+    let q8act = if let Some(runtime) = &functions.upstream {
+        Some(PreparedAttentionProjections::from_upstream_invocation(
+            Q8ActAttentionProfile::Causal,
+            &invocation,
+            runtime.clone(),
+            target.projection_preparation(),
+        )?)
+    } else {
+        q8act
+    };
+    let mut q8act = q8act;
     let shape = CausalAttentionShape::from_attributes_for(first.attributes(), semantics)?;
     let projection = CausalProjection::from_values(
         first.bindings(),
@@ -2505,6 +2670,97 @@ fn encode_attention(
         })
         .map_err(|error| error.to_string())?;
 
+    if let Some(plan) = q8act.as_mut().filter(|p| p.is_upstream()) {
+        let rows = if packed.is_some() {
+            vec![total_tokens]
+        } else {
+            launches.iter().map(|l| l.tokens).collect()
+        };
+        for rows in rows {
+            for (role, weight, input, output) in [
+                (
+                    ProjectionRole::CausalQuery,
+                    &shared.query_weight,
+                    layout.normalized,
+                    layout.query_raw,
+                ),
+                (
+                    ProjectionRole::CausalKey,
+                    &shared.key_weight,
+                    layout.normalized,
+                    layout.key_raw,
+                ),
+                (
+                    ProjectionRole::CausalValue,
+                    &shared.value_weight,
+                    layout.normalized,
+                    layout.value_raw,
+                ),
+                (
+                    ProjectionRole::CausalOutput,
+                    &shared.output_weight,
+                    layout.context,
+                    layout.projected,
+                ),
+            ] {
+                if let SharedProjectionWeight::Native(matrix) = weight {
+                    plan.prepare_upstream_projection(
+                        &invocation,
+                        role,
+                        &matrix.parts,
+                        &compute_regions[matrix.first_region
+                            ..matrix.first_region + weights::region_count(&matrix.parts)],
+                        &compute_regions[shared.scratch],
+                        input,
+                        output,
+                        u32::try_from(rows).map_err(|_| "causal rows exceed u32")?,
+                    )?;
+                } else if plan.projection(role)?.has_staged_leaf() {
+                    return Err(
+                        "upstream causal attention requires native physical projections".into(),
+                    );
+                }
+            }
+        }
+    }
+
+    let upstream_bindings = q8act
+        .as_ref()
+        .map(|projections| projections.upstream_bindings(&invocation))
+        .transpose()?
+        .unwrap_or_default();
+    if target == EncodingTarget::BindingsOnly {
+        if !has_compiled_program_slot {
+            return Err("binding-only attention encoding requires a compiled slot".into());
+        }
+        let bindings = upstream_bindings.into_iter().fold(
+            EncodedReusableExecutionBindings::empty().with_program_binding(binding_command),
+            |encoded, dependency| encoded.with_retained_plan_dependency(dependency),
+        );
+        return Ok(Encoding::Bindings(bindings));
+    }
+
+    let q8act = q8act.map(PreparedAttentionProjections::into_owned);
+    let upstream_work = {
+        let rows = if packed.is_some() {
+            vec![total_tokens]
+        } else {
+            launches.iter().map(|l| l.tokens).collect()
+        };
+        rows.into_iter().try_fold((0u64, 0u64), |(d, t), rows| {
+            let (extra, transfers) = q8act
+                .as_ref()
+                .map(|p| p.upstream_work(rows as u32))
+                .transpose()?
+                .unwrap_or_default();
+            Ok::<_, String>((
+                d.checked_add(extra)
+                    .ok_or("causal upstream dispatch overflow")?,
+                t.checked_add(transfers)
+                    .ok_or("causal upstream transfers overflow")?,
+            ))
+        })?
+    };
     let compute_operation = launches
         .first()
         .map(|launch| launch.path)
@@ -2534,19 +2790,28 @@ fn encode_attention(
                 .ok_or_else(|| "causal projection dispatch count overflows".to_owned())
         })?
     };
-    let pack_dispatches = q8act
-        .as_ref()
-        .map_or(Ok(0), PreparedAttentionProjections::pack_count)?
-        .checked_mul(if packed_enabled {
-            1
-        } else {
-            launches.len() as u64
-        })
-        .ok_or("causal Q8act pack dispatch count overflows")?;
+    let pack_dispatches = if packed_enabled {
+        q8act
+            .as_ref()
+            .map_or(Ok(0), |p| p.pack_count(total_tokens as u32))?
+    } else {
+        launches.iter().try_fold(0_u64, |n, launch| {
+            n.checked_add(
+                q8act
+                    .as_ref()
+                    .map_or(Ok(0), |p| p.pack_count(launch.tokens as u32))?,
+            )
+            .ok_or_else(|| "causal Q8act pack dispatch count overflows".to_owned())
+        })?
+    };
     let compute_dispatch_count = compute_dispatch_count
         .checked_add(projection_extra)
         .and_then(|count| count.checked_add(pack_dispatches))
         .ok_or_else(|| "causal compute dispatch count overflows".to_owned())?;
+
+    let compute_dispatch_count = compute_dispatch_count
+        .checked_add(upstream_work.0)
+        .ok_or("causal upstream dispatch overflow")?;
     let q8_replay_bytes = q8act.as_ref().map(|plan| plan.replay_bytes()).transpose()?;
     let replay_key = (!shape.int8_kv || has_compiled_program_slot)
         .then_some(())
@@ -2722,16 +2987,27 @@ fn encode_attention(
             participant_count,
             total_tokens,
             compute_dispatch_count,
-            0,
+            {
+                {
+                    upstream_work.1
+                }
+            },
         )
     })
     .map_err(|error| error.to_string())?;
 
-    Ok(attach_invocation_binding(
+    let operation = attach_invocation_binding(
         EncodedDeviceOperation::compute(compute_command),
         binding_command,
         has_compiled_program_slot,
-    ))
+    );
+
+    let operation = upstream_bindings
+        .into_iter()
+        .fold(operation, |op, binding| {
+            op.with_retained_plan_dependency(binding)
+        });
+    Ok(Encoding::Full(operation))
 }
 
 fn native_projection_extra_dispatches(shared: &SharedRegions, rows: u64) -> Result<u64, String> {
@@ -3459,7 +3735,7 @@ fn launch_causal_qkv(
         }
         Ok(())
     };
-    if let Some(plan) = q8act {
+    if let Some(plan) = q8act.filter(|p| !p.is_upstream_for_rows(rows as u32)) {
         let kernels = functions
             .q8act
             .as_ref()
@@ -3506,6 +3782,30 @@ fn launch_causal_projection(
     q8_kernels: Option<&Q8ActKernels>,
 ) -> Result<(), CudaDeviceRuntimeError> {
     if let Some((plan, role, packed)) = q8act {
+        if plan.is_upstream_for_rows(rows as u32)
+            && matches!(weight, SharedProjectionWeight::Native(_))
+        {
+            return plan.launch_upstream(
+                native,
+                stream,
+                role,
+                input,
+                output,
+                u32::try_from(rows).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("invalid upstream causal rows")
+                })?,
+                u32::try_from(output_features).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("invalid upstream causal stride")
+                })?,
+                scratch,
+                layout.required_bytes,
+                layout
+                    .transform_workspace
+                    .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                    .transpose()?
+                    .unwrap_or(0),
+            );
+        }
         let retained = plan
             .projection(role)
             .map_err(CudaDeviceRuntimeError::contract)?;

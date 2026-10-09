@@ -310,7 +310,7 @@ fn test_raw_config(state_profile: TestStateProfile) -> Value {
     }
 }
 
-fn resolved_model_plan_with_zero_state_and_policy(
+pub(super) fn resolved_model_plan_with_zero_state_and_policy(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     state_profile: TestStateProfile,
     runtime_policy: &ResolvedRuntimePolicy,

@@ -814,8 +814,9 @@ impl OperationDispatch {
                 &mut commands,
             )?;
         }
+        let dependency_scope = invocation.retained_dependency_scope.clone();
         let expected_phase = invocation.operation().profile_phase;
-        let operation = match provider.provider().encode_selected(invocation) {
+        let mut operation = match provider.provider().encode_selected(invocation) {
             Ok(operation) => operation,
             Err(failure)
                 if batch_identity.contains_identity(failure.identity())
@@ -833,6 +834,25 @@ impl OperationDispatch {
             return Err(OperationDispatchError::Contract(invalid_operation(
                 "operation encode completion runtime drifted",
             )));
+        }
+        let mut dependency_identities = Vec::new();
+        let mut dependency_commands = Vec::new();
+        let mut dependency_leases = Vec::new();
+        super::retained_dependency::append_dependencies(
+            &dependency_scope,
+            operation.take_retained_plan_dependencies(),
+            &mut dependency_identities,
+            &mut dependency_commands,
+            &mut dependency_leases,
+        )
+        .map_err(OperationDispatchError::Contract)?;
+        completion
+            .invocation()
+            .step_resources()
+            .retain_plan_dependencies(dependency_leases)
+            .map_err(OperationDispatchError::Contract)?;
+        for command in dependency_commands {
+            commands.push_dynamic_binding(command);
         }
         commands.push_operation(0, operation);
         let timing_mode = commands.timing_mode();
@@ -1541,6 +1561,9 @@ impl OperationDispatch {
         let pre_provider_command_count = commands.len();
         let mut encoded_provider_command_count = 0_usize;
         let mut program_bindings = Vec::new();
+        let mut retained_dependencies = Vec::new();
+        let mut retained_dependency_commands = Vec::new();
+        let mut retained_dependency_leases = Vec::new();
         let mut program_binding_resources = BTreeSet::new();
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
@@ -1594,11 +1617,12 @@ impl OperationDispatch {
                         drop(invocation_stage);
                         let expected_phase = invocation.operation().profile_phase;
                         let program_binding = invocation.program_binding().cloned();
+                        let dependency_scope = invocation.retained_dependency_scope.clone();
                         let binding_stage = SubmissionWaveDispatchStageTimer::start(
                             timing_sink,
                             SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
                         );
-                        let bindings = match provider
+                        let mut bindings = match provider
                             .provider()
                             .encode_reusable_execution_bindings(invocation)
                         {
@@ -1623,6 +1647,14 @@ impl OperationDispatch {
                             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                         );
                         let program_binding_count = bindings.program_binding_count();
+                        super::retained_dependency::append_dependencies(
+                            &dependency_scope,
+                            bindings.take_retained_plan_dependencies(),
+                            &mut retained_dependencies,
+                            &mut retained_dependency_commands,
+                            &mut retained_dependency_leases,
+                        )
+                        .map_err(SubmissionWaveDispatchError::Contract)?;
                         validate_program_binding_patch(
                             resolved,
                             node_identity,
@@ -1727,7 +1759,8 @@ impl OperationDispatch {
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
-                let operation = match provider.provider().encode_selected(invocation) {
+                let dependency_scope = invocation.retained_dependency_scope.clone();
+                let mut operation = match provider.provider().encode_selected(invocation) {
                     Ok(operation) => operation,
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())
@@ -1746,6 +1779,14 @@ impl OperationDispatch {
                     SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 );
                 let program_binding_count = operation.program_binding_count();
+                super::retained_dependency::append_dependencies(
+                    &dependency_scope,
+                    operation.take_retained_plan_dependencies(),
+                    &mut retained_dependencies,
+                    &mut retained_dependency_commands,
+                    &mut retained_dependency_leases,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
                 validate_program_binding_patch(
                     resolved,
                     node_identity,
@@ -1820,7 +1861,8 @@ impl OperationDispatch {
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
-                let operation = match provider.provider().encode_selected(invocation) {
+                let dependency_scope = invocation.retained_dependency_scope.clone();
+                let mut operation = match provider.provider().encode_selected(invocation) {
                     Ok(operation) => operation,
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())
@@ -1839,6 +1881,15 @@ impl OperationDispatch {
                     SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 );
                 let program_binding_count = operation.program_binding_count();
+                let retained_dependency_count = operation.retained_plan_dependency_count();
+                super::retained_dependency::append_dependencies(
+                    &dependency_scope,
+                    operation.take_retained_plan_dependencies(),
+                    &mut retained_dependencies,
+                    &mut retained_dependency_commands,
+                    &mut retained_dependency_leases,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
                 validate_program_binding_patch(
                     resolved,
                     node_identity,
@@ -1857,7 +1908,8 @@ impl OperationDispatch {
                             "provider operation command count overflows usize",
                         ))
                     })?;
-                let has_per_wave_bindings = program_binding_count > 0
+                let has_per_wave_bindings = retained_dependency_count > 0
+                    || program_binding_count > 0
                     || operation.dynamic_binding_count() > 0
                     || operation.result_binding_count() > 0;
                 encoded_provider_command_count = encoded_provider_command_count
@@ -1908,6 +1960,13 @@ impl OperationDispatch {
                 )));
             }
         }
+        if reusable_program.is_some_and(|program| {
+            program.retained_plan_dependencies() != retained_dependencies.as_slice()
+        }) {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "retained Plan dependency identities differ from the resident compute program",
+            )));
+        }
         let uncoalesced_program_binding_count = program_bindings.len();
         let coalesced_program_bindings = runtime
             .coalesce_program_bindings(program_bindings)
@@ -1926,11 +1985,20 @@ impl OperationDispatch {
         drop(validation_stage);
         encoded_provider_command_count = encoded_provider_command_count
             .checked_add(coalesced_program_bindings.len())
+            .and_then(|n| n.checked_add(retained_dependency_commands.len()))
             .ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
                     "coalesced program binding command count overflows usize",
                 ))
             })?;
+        completion
+            .wave()
+            .step_resources()
+            .retain_plan_dependencies(retained_dependency_leases)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+        for command in retained_dependency_commands {
+            commands.push_dynamic_binding(command);
+        }
         for command in coalesced_program_bindings {
             commands.push_dynamic_binding(command);
         }
@@ -1951,7 +2019,8 @@ impl OperationDispatch {
                             authority.eager_boundary_node_indices,
                             reusable_execution_binding_nodes,
                         )
-                        .map_err(SubmissionWaveDispatchError::Contract)?,
+                        .map_err(SubmissionWaveDispatchError::Contract)?
+                        .with_retained_plan_dependencies(retained_dependencies),
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
             }

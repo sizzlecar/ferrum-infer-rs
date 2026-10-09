@@ -863,6 +863,13 @@ struct CudaExecutableProgram {
 
 impl CudaExecutableProgram {
     fn validate_monotonic_update(&self, next: &Self) -> Result<(), CudaReplayError> {
+        self.descriptor
+            .validate_retained_plan_dependency_seal(&next.descriptor)
+            .map_err(|error| CudaReplayError {
+                stage: "update reusable execution program",
+                detail: error.to_string(),
+                eager_fallback_safe: false,
+            })?;
         if self.descriptor.program_id() != next.descriptor.program_id()
             || self.descriptor.node_count() != next.descriptor.node_count()
             || self.descriptor.eager_boundary_node_indices()
@@ -989,17 +996,7 @@ impl CudaExecutableProgram {
                     .any(|segment| segment.descriptor.contains_node(*node_index))
             })
             .collect::<Vec<_>>();
-        let capture = DeviceReusableExecutionCapture::new(
-            self.descriptor.program_id().clone(),
-            self.descriptor.node_count(),
-            self.descriptor.eager_boundary_node_indices().to_vec(),
-            binding_node_indices.clone(),
-        )
-        .map_err(|error| CudaReplayError {
-            stage: "evict reusable execution segment",
-            detail: error.to_string(),
-            eager_fallback_safe: false,
-        })?;
+        let capture = self.descriptor.reclassification_capture();
         let descriptor = DeviceReusableExecutionProgram::new(
             &capture,
             segments

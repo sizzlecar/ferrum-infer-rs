@@ -1,7 +1,7 @@
 use super::*;
 use ferrum_interfaces::vnext::{NumericalExecutionPolicy, TypedFamilyRegistration};
 
-fn source() -> Qwen35FamilyConfig {
+pub(super) fn source() -> Qwen35FamilyConfig {
     let mut config = super::super::tests::test_dense_gguf_config();
     config.hf_config["text_config"]["hidden_size"] = 256.into();
     let text = Qwen35FamilyProvider::text_config(&config).unwrap();

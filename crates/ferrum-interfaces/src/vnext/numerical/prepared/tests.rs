@@ -2,6 +2,50 @@ use super::*;
 use crate::vnext::*;
 
 #[test]
+fn prepared_projection_fingerprint_is_cached_without_changing_wire_or_trust() {
+    let policy = UpstreamMarkerV2Profile::Causal.arithmetic();
+    let values = vec![
+        binding(2, &[Some("quantization.gguf.iq4-xs")], 256, 512, false),
+        binding(3, &[Some("quantization.gguf.q4-k")], 256, 64, false),
+        binding(4, &[Some("quantization.gguf.q6-k")], 256, 64, false),
+        binding(5, &[Some("quantization.gguf.q5-k")], 512, 256, false),
+    ];
+    let prepared = PreparedProjectionNumerics::prepare(&policy, &values).unwrap();
+    let wire = serde_json::to_vec(&prepared).unwrap();
+    let expected = format!("{:x}", Sha256::digest(&wire));
+    assert!(prepared.data.fingerprint.get().is_none());
+    assert_eq!(prepared.fingerprint(), expected);
+    assert!(std::ptr::eq(
+        prepared.fingerprint().as_ptr(),
+        prepared.fingerprint().as_ptr()
+    ));
+    assert_eq!(serde_json::to_vec(&prepared).unwrap(), wire);
+    let restored: PreparedProjectionNumerics = serde_json::from_slice(&wire).unwrap();
+    assert!(restored.data.fingerprint.get().is_none());
+    assert_eq!(restored, prepared);
+    assert_eq!(restored.fingerprint(), expected);
+    restored.validate_bindings(&policy, &values).unwrap();
+
+    let mut changed = values.clone();
+    changed[2] = binding(4, &[Some("quantization.gguf.q4-k")], 256, 64, false);
+    let changed = PreparedProjectionNumerics::prepare(&policy, &changed).unwrap();
+    assert_ne!(changed.fingerprint(), expected);
+    let mut changed_policy = policy.clone();
+    changed_policy.projections.pop();
+    assert_ne!(
+        PreparedProjectionNumerics::prepare(&changed_policy, &values)
+            .unwrap()
+            .fingerprint(),
+        expected
+    );
+    let mut tampered: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    tampered["projections"][0]["output_features"] = 513.into();
+    let tampered: PreparedProjectionNumerics = serde_json::from_value(tampered).unwrap();
+    assert_ne!(tampered.fingerprint(), expected);
+    assert!(tampered.validate_bindings(&policy, &values).is_err());
+}
+
+#[test]
 fn prepared_attention_q8act_preserves_causal_slots_shapes_and_fallbacks() {
     let policy = Q8ActAttentionProfile::Causal.arithmetic();
     let values = vec![
@@ -84,7 +128,7 @@ where
     s.to_owned().try_into().unwrap()
 }
 
-fn binding(
+pub(in crate::vnext::numerical) fn binding(
     ordinal: u32,
     formats: &[Option<&str>],
     k: u64,
@@ -107,17 +151,26 @@ fn binding(
             },
             Some(name) => WeightEncoding::BlockQuantized(BlockQuantizationSpec {
                 format_id: id(name),
-                logical_values_per_block: 256,
+                logical_values_per_block: if *name == "quantization.gguf.iq4-nl" {
+                    32
+                } else {
+                    256
+                },
                 bytes_per_block: match *name {
                     "quantization.gguf.iq4-xs" => 136,
                     "quantization.gguf.q4-k" => 144,
                     "quantization.gguf.q5-k" => 176,
                     "quantization.gguf.q6-k" => 210,
+                    "quantization.gguf.q3-k" | "quantization.gguf.iq3-s" => 110,
+                    "quantization.gguf.iq4-nl" => 18,
                     _ => panic!("unknown fixture block ABI"),
                 },
             }),
         };
-        let columns = if format.is_some() { k / 256 } else { k };
+        let columns = match &encoding {
+            WeightEncoding::BlockQuantized(block) => k / u64::from(block.logical_values_per_block),
+            _ => k,
+        };
         components.push(ResolvedWeightComponentLayout::from_parts(
             component_id.clone(),
             if format.is_some() {
@@ -272,7 +325,7 @@ fn prepared_q8act_rejects_tampered_routes_offsets_policy_and_missing_ports() {
         binding(2, &[None], 256, 256, false),
     ];
     let good = PreparedProjectionNumerics::prepare(&policy, &values).unwrap();
-    let mutations: &[fn(&mut PreparedProjectionNumerics)] = &[
+    let mutations: &[fn(&mut PreparedProjectionNumericsData)] = &[
         |p| {
             p.projections[0].leaves[0].route = PreparedProjectionRoute::StrictBase {
                 reason: StrictProjectionReason::FormatNotDeclared,
@@ -292,8 +345,7 @@ fn prepared_q8act_rejects_tampered_routes_offsets_policy_and_missing_ports() {
         },
     ];
     for mutate in mutations {
-        let mut bad = good.clone();
-        mutate(&mut bad);
+        let bad = tamper(&good, mutate);
         assert!(bad.validate_bindings(&policy, &values).is_err());
     }
     assert!(PreparedProjectionNumerics::prepare(&policy, &values[..1]).is_err());
@@ -372,10 +424,11 @@ fn prepared_three_format_q8act_preserves_leaf_identity_and_old_policy_fallbacks(
             }
         );
     }
-    let mut changed = prepared.clone();
-    changed.projections[0].leaves[1].route = PreparedProjectionRoute::StrictBase {
-        reason: StrictProjectionReason::FormatNotDeclared,
-    };
+    let changed = tamper(&prepared, |data| {
+        data.projections[0].leaves[1].route = PreparedProjectionRoute::StrictBase {
+            reason: StrictProjectionReason::FormatNotDeclared,
+        };
+    });
     assert!(changed.validate_bindings(&selected, &values).is_err());
 
     let mixed = vec![
@@ -428,3 +481,19 @@ fn prepared_three_format_q8act_preserves_leaf_identity_and_old_policy_fallbacks(
         );
     }
 }
+
+// Mutations model untrusted wire data, never a live shared immutable object.
+fn tamper(
+    prepared: &PreparedProjectionNumerics,
+    mutate: impl FnOnce(&mut PreparedProjectionNumericsData),
+) -> PreparedProjectionNumerics {
+    let mut changed: PreparedProjectionNumerics =
+        serde_json::from_slice(&serde_json::to_vec(prepared).unwrap()).unwrap();
+    assert!(changed.data.fingerprint.get().is_none());
+    assert!(changed.data.static_contract_validation.get().is_none());
+    mutate(Arc::get_mut(&mut changed.data).unwrap());
+    changed
+}
+
+#[path = "sharing_tests.rs"]
+mod sharing;

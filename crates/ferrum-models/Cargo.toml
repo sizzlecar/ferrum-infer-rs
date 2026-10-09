@@ -97,6 +97,8 @@ default = []
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["ferrum-kernels/metal"]
 cuda = ["ferrum-kernels/cuda"]
+cuda-upstream-linear = ["cuda", "ferrum-kernels/cuda-upstream-linear"] # Explicit locked upstream projection artifact.
+cuda-upstream-extra-linear = ["cuda-upstream-linear", "ferrum-kernels/cuda-upstream-extra-linear"] # Independent locked extra-format artifact.
 candle-cuda-compat = [
     "cuda",
     "candle-core/cuda",

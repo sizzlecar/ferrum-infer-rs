@@ -563,6 +563,14 @@ fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
         ("CARGO_FEATURE_MARLIN", CudaNativeBuildUnit::Marlin),
         ("CARGO_FEATURE_VLLM_MARLIN", CudaNativeBuildUnit::VllmMarlin),
         (
+            "CARGO_FEATURE_CUDA_UPSTREAM_LINEAR",
+            CudaNativeBuildUnit::UpstreamLinear,
+        ),
+        (
+            "CARGO_FEATURE_CUDA_UPSTREAM_EXTRA_LINEAR",
+            CudaNativeBuildUnit::UpstreamExtraLinear,
+        ),
+        (
             "CARGO_FEATURE_VLLM_MOE_MARLIN",
             CudaNativeBuildUnit::VllmMoeMarlin,
         ),
@@ -768,6 +776,8 @@ fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
         CudaNativeBuildUnit::VllmMarlin => "vllm_marlin",
         CudaNativeBuildUnit::VllmMoeMarlin => "vllm_moe_marlin",
         CudaNativeBuildUnit::VllmPagedAttentionV2 => "vllm_paged_attn",
+        CudaNativeBuildUnit::UpstreamLinear => "upstream_linear",
+        CudaNativeBuildUnit::UpstreamExtraLinear => "upstream_extra_linear",
     };
     emit_cuda_build_summary(
         summary_artifact,

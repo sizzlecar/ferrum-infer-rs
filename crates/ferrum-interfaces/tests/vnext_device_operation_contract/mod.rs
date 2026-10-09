@@ -641,6 +641,10 @@ fn catalog_with_resource_options_execution_semantics_storage_and_operation_versi
     .unwrap()
 }
 
+#[path = "persistent.rs"]
+mod persistent;
+pub(crate) use persistent::*;
+
 pub(crate) struct TestOperationContract {
     pub(crate) descriptor: OperationDescriptor,
 }
@@ -1420,6 +1424,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
     pub(crate) tamper_buffer_descriptor: bool,
+    pub(crate) persistent_descriptor_fault: Option<PersistentDescriptorFault>,
     pub(crate) drift_on_submit: bool,
     pub(crate) next_fence: u64,
     pub(crate) submit_behavior: SubmitBehavior,
@@ -1682,6 +1687,16 @@ impl DeviceRuntime for TestRuntime {
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
         let mut descriptor = buffer.descriptor.clone();
+        if descriptor.usage == BufferUsage::Persistent {
+            match self.trace.lock().unwrap().persistent_descriptor_fault {
+                Some(PersistentDescriptorFault::Short) => descriptor.size_bytes = 16,
+                Some(PersistentDescriptorFault::Type) => descriptor.element_type = ElementType::F32,
+                Some(PersistentDescriptorFault::Identity) => {
+                    descriptor.resource_id = id("resource.foreign-persistent")
+                }
+                None => {}
+            }
+        }
         if self.trace.lock().unwrap().tamper_buffer_descriptor {
             descriptor.size_bytes += 1;
         }

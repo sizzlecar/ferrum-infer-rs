@@ -1,4 +1,5 @@
-use std::ops::Range;
+use std::ops::{Deref, Range};
+use std::sync::Arc;
 
 use super::super::{
     AllocationLifetime, BatchWorkShape, BufferDescriptor, BufferUsage, DeviceBufferRetention,
@@ -284,7 +285,29 @@ enum OperationBufferSource<'a, B> {
         view: LeasedBufferView<'a, B>,
         retention: DeviceBufferRetention,
     },
-    Backing(LogicalBackingBufferView<'a, B>),
+    Backing(OperationBacking<'a, B>),
+}
+
+/// Shared only by participants of one invocation construction. This is not
+/// cached authority: every consumer revalidates the live pool before receiving it.
+pub(crate) enum OperationBacking<'a, B> {
+    Owned(LogicalBackingBufferView<'a, B>),
+    Shared(Arc<LogicalBackingBufferView<'a, B>>),
+}
+
+impl<'a, B> From<LogicalBackingBufferView<'a, B>> for OperationBacking<'a, B> {
+    fn from(view: LogicalBackingBufferView<'a, B>) -> Self {
+        Self::Owned(view)
+    }
+}
+impl<'a, B> Deref for OperationBacking<'a, B> {
+    type Target = LogicalBackingBufferView<'a, B>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(view) => view,
+            Self::Shared(view) => view,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,6 +529,27 @@ fn validate_dynamic_binding_layout(
     coverage: OperationBufferCoverage,
 ) -> Result<(), VNextError> {
     let binding_count = binding_lengths.len();
+    let covered = binding_lengths.try_fold(0_u64, |total, length_bytes| {
+        total
+            .checked_add(length_bytes)
+            .ok_or_else(|| invalid_operation("backing segment coverage overflows u64"))
+    })?;
+    validate_dynamic_binding_coverage(
+        storage_kind,
+        logical_size_bytes,
+        binding_count,
+        covered,
+        coverage,
+    )
+}
+
+fn validate_dynamic_binding_coverage(
+    storage_kind: OperationBufferStorageKind,
+    logical_size_bytes: u64,
+    binding_count: usize,
+    covered: u64,
+    coverage: OperationBufferCoverage,
+) -> Result<(), VNextError> {
     if storage_kind == OperationBufferStorageKind::StaticContiguous {
         return Err(invalid_operation(
             "dynamic backing cannot claim static storage kind",
@@ -521,11 +565,6 @@ fn validate_dynamic_binding_layout(
             "contiguous dynamic storage requires one physical segment binding",
         ));
     }
-    let covered = binding_lengths.try_fold(0_u64, |total, length_bytes| {
-        total
-            .checked_add(length_bytes)
-            .ok_or_else(|| invalid_operation("backing segment coverage overflows u64"))
-    })?;
     let window_offset = match coverage {
         OperationBufferCoverage::Exact => 0,
         OperationBufferCoverage::BackingWindow { offset_bytes } => offset_bytes,
@@ -571,6 +610,14 @@ pub struct OperationBufferView<'a, B> {
 }
 
 impl<'a, B> OperationBufferView<'a, B> {
+    #[cfg(test)]
+    pub(super) fn shared_backing(&self) -> Option<&Arc<LogicalBackingBufferView<'a, B>>> {
+        match &self.source {
+            OperationBufferSource::Backing(OperationBacking::Shared(view)) => Some(view),
+            _ => None,
+        }
+    }
+
     pub(super) fn from_static(
         view: LeasedBufferView<'a, B>,
         retention: DeviceBufferRetention,
@@ -586,7 +633,7 @@ impl<'a, B> OperationBufferView<'a, B> {
 
     pub(super) fn from_backing_exact(
         descriptor: BufferDescriptor,
-        backing: LogicalBackingBufferView<'a, B>,
+        backing: impl Into<OperationBacking<'a, B>>,
         allocation_lifetime: AllocationLifetime,
     ) -> Self {
         Self::from_backing(
@@ -599,7 +646,7 @@ impl<'a, B> OperationBufferView<'a, B> {
 
     pub(crate) fn from_backing_prefix(
         descriptor: BufferDescriptor,
-        backing: LogicalBackingBufferView<'a, B>,
+        backing: impl Into<OperationBacking<'a, B>>,
         allocation_lifetime: AllocationLifetime,
     ) -> Self {
         Self::from_backing(
@@ -612,7 +659,7 @@ impl<'a, B> OperationBufferView<'a, B> {
 
     pub(super) fn from_backing_window(
         descriptor: BufferDescriptor,
-        backing: LogicalBackingBufferView<'a, B>,
+        backing: impl Into<OperationBacking<'a, B>>,
         offset_bytes: u64,
         allocation_lifetime: AllocationLifetime,
     ) -> Self {
@@ -626,13 +673,13 @@ impl<'a, B> OperationBufferView<'a, B> {
 
     fn from_backing(
         descriptor: BufferDescriptor,
-        backing: LogicalBackingBufferView<'a, B>,
+        backing: impl Into<OperationBacking<'a, B>>,
         coverage: OperationBufferCoverage,
         allocation_lifetime: AllocationLifetime,
     ) -> Self {
         Self {
             descriptor,
-            source: OperationBufferSource::Backing(backing),
+            source: OperationBufferSource::Backing(backing.into()),
             coverage,
             allocation_lifetime,
             packed_batch_coordinates: false,
@@ -644,6 +691,84 @@ impl<'a, B> OperationBufferView<'a, B> {
         self
     }
 
+    /// Checks the complete current view without constructing temporary physical
+    /// regions just to count their lengths. Every backing segment is checked,
+    /// including pages outside this participant's logical window. The caller
+    /// borrows this view only; no successful validation is retained across waves.
+    pub(super) fn validate_full_runtime_coverage<R>(
+        &self,
+        runtime: &R,
+        expected_static_identity: Option<&ResourceTransactionIdentity>,
+    ) -> Result<(), VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+    {
+        match &self.source {
+            OperationBufferSource::Static { view, .. } => {
+                let actual = runtime.buffer_descriptor(view.buffer());
+                if Some(view.identity()) != expected_static_identity
+                    || &actual != view.committed_descriptor()
+                    || view.generation() == 0
+                {
+                    return Err(invalid_operation(format!(
+                        "runtime descriptor differs from committed static resource `{}`",
+                        self.resource_id()
+                    )));
+                }
+            }
+            OperationBufferSource::Backing(backing) => {
+                let bindings = backing.segment_bindings();
+                let invalid_backing = || {
+                    invalid_operation(format!(
+                        "runtime descriptor differs from a committed backing chunk for `{}`",
+                        self.resource_id()
+                    ))
+                };
+                let mut evidence = backing.committed_evidence_segments();
+                let mut covered = 0_u64;
+                for binding in bindings {
+                    let segment = evidence.next().ok_or_else(&invalid_backing)?;
+                    let actual = runtime.buffer_descriptor(binding.buffer());
+                    if binding.segment() != segment
+                        || binding.chunk() != segment.chunk()
+                        || &actual != binding.descriptor()
+                        || segment
+                            .offset_bytes()
+                            .checked_add(segment.length_bytes())
+                            .is_none_or(|end| end > actual.size_bytes)
+                    {
+                        return Err(invalid_backing());
+                    }
+                    covered = covered.checked_add(segment.length_bytes()).ok_or_else(|| {
+                        invalid_operation("backing segment coverage overflows u64")
+                    })?;
+                }
+                if bindings.is_empty() || evidence.next().is_some() {
+                    return Err(invalid_backing());
+                }
+                // Exact mappings concatenate to precisely the logical extent;
+                // prefix/window mappings must contain the entire logical range.
+                // Together with the per-segment physical bounds above this is
+                // the same coverage proof as translating and summing regions.
+                validate_dynamic_binding_coverage(
+                    operation_storage_kind(backing.storage_profile().view()),
+                    self.descriptor.size_bytes,
+                    bindings.len(),
+                    covered,
+                    self.coverage,
+                )?;
+            }
+        }
+        if self.descriptor.size_bytes == 0 {
+            return Err(invalid_operation(
+                "operation logical buffer range is empty or outside its resource",
+            ));
+        }
+        Ok(())
+    }
+
+    // Keep the previous complete coverage algorithm as the test reference.
+    #[cfg(test)]
     pub(super) fn validate_runtime<R>(
         &self,
         runtime: &R,
@@ -717,6 +842,43 @@ impl<'a, B> OperationBufferView<'a, B> {
                 operation_storage_kind(view.storage_profile().view())
             }
         }
+    }
+
+    pub(super) fn retained_dependency_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<
+        (
+            super::retained_dependency::RetainedPlanDependencyRange,
+            DeviceBufferRetention,
+        ),
+        VNextError,
+    > {
+        super::retained_dependency::checked_range(offset, length, self.descriptor.size_bytes)?;
+        let OperationBufferSource::Static { view, retention } = &self.source else {
+            return Err(invalid_operation(
+                "retained dependency requires a committed static Plan lease",
+            ));
+        };
+        if view.generation() == 0
+            || retention.reusable_address_scope()
+                != Some(crate::vnext::DeviceReusableAddressScope::Plan)
+        {
+            return Err(invalid_operation(
+                "retained dependency has no live Plan generation",
+            ));
+        }
+        Ok((
+            super::retained_dependency::RetainedPlanDependencyRange {
+                descriptor: self.descriptor.clone(),
+                transaction: view.identity().clone(),
+                generation: view.generation(),
+                offset,
+                length,
+            },
+            retention.clone(),
+        ))
     }
 
     pub fn translate(

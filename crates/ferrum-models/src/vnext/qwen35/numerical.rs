@@ -10,6 +10,10 @@ use ferrum_interfaces::vnext::{
     StateCheckpointContract,
 };
 
+pub const F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.ffn-attention-q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-prefill";
+pub const F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.ffn-attention-q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill";
+pub const F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.ffn-attention-q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows";
+
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
 pub const F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
@@ -18,6 +22,12 @@ pub const F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.ffn-q4k-q5k-iq4xs-q8act-g32";
 pub const F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.ffn-attention-q4k-q5k-iq4xs-q8act-g32";
+pub const F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.ffn-attention-q4k-q5k-iq4xs-upstream-marker-v2";
+pub const F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID:
+    &str = "qwen3_5.f32-master.ffn-attention-q4k-q5k-iq4xs-upstream-marker-v2-prefill";
+pub const F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_NUMERICAL_PROFILE_ID:
+    &str = "qwen3_5.f32-master.ffn-attention-q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1";
 const F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-f16-projections";
 pub const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID: &str =
@@ -29,6 +39,9 @@ pub const F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.in
 mod q8act_attention_tests;
 #[cfg(test)]
 mod q8act_tests;
+mod upstream_marker_v2;
+pub(super) use upstream_marker_v2::eligible as upstream_marker_v2_eligible;
+pub(super) use upstream_marker_v2::extra_eligible as upstream_extra_marker_v2_eligible;
 
 pub(super) fn profiles(
     family_id: &ModelFamilyId,
@@ -48,6 +61,24 @@ pub(super) fn profiles(
         .collect::<Result<Vec<_>, _>>()?;
     let q8act_attention = q8act_attention_eligible(config, &text)
         .then(|| q8act_attention_profile(&f32))
+        .transpose()?;
+    let upstream_marker = upstream_marker_v2_eligible(config, &text)
+        .then(|| upstream_marker_v2::profile(&f32))
+        .transpose()?;
+    let upstream_prefill = upstream_marker_v2_eligible(config, &text)
+        .then(|| upstream_marker_v2::profile_for(&f32, true))
+        .transpose()?;
+    let hybrid = upstream_marker_v2_eligible(config, &text)
+        .then(|| upstream_marker_v2::hybrid_profile(&f32))
+        .transpose()?;
+    let upstream_extra = upstream_extra_marker_v2_eligible(config, &text)
+        .then(|| upstream_marker_v2::extra_profile(&f32))
+        .transpose()?;
+    let upstream_extra_prefill = upstream_extra_marker_v2_eligible(config, &text)
+        .then(|| upstream_marker_v2::extra_large_prefill_profile(&f32))
+        .transpose()?;
+    let upstream_extra_all_rows = upstream_extra_marker_v2_eligible(config, &text)
+        .then(|| upstream_marker_v2::extra_all_rows_profile(&f32))
         .transpose()?;
     // Qualification covers both physical encoding and recurrent parameter ABI.
     // In particular, an unquantized negative-rate source must not silently
@@ -89,6 +120,12 @@ pub(super) fn profiles(
     profiles.extend(rn_fragment);
     profiles.extend(q8act);
     profiles.extend(q8act_attention);
+    profiles.extend(upstream_marker);
+    profiles.extend(upstream_prefill);
+    profiles.extend(hybrid);
+    profiles.extend(upstream_extra);
+    profiles.extend(upstream_extra_prefill);
+    profiles.extend(upstream_extra_all_rows);
     FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 2), profiles, automatic)
 }
 

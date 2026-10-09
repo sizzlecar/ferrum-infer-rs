@@ -10,9 +10,11 @@ use crate::vnext::{
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::{Arc, OnceLock};
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -89,27 +91,88 @@ impl PreparedProjection {
 
 /// Deserializing this value does not establish trust. Plan construction and
 /// revalidation reconstruct it from the profile and exact physical bindings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct PreparedProjectionNumerics {
-    contract: CompositeNumericalArithmetic,
-    projections: Vec<PreparedProjection>,
+    data: Arc<PreparedProjectionNumericsData>,
 }
 
+// This data has no mutable production access and deliberately is not Clone:
+// callers cannot copy validated caches and then mutate their associated data.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "PreparedProjectionNumerics", deny_unknown_fields)]
+struct PreparedProjectionNumericsData {
+    contract: CompositeNumericalArithmetic,
+    projections: Vec<PreparedProjection>,
+    #[serde(skip)]
+    fingerprint: OnceLock<String>,
+    #[serde(skip)]
+    static_contract_validation: OnceLock<Result<(), String>>,
+}
+
+impl Serialize for PreparedProjectionNumerics {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.data.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PreparedProjectionNumerics {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Both skipped caches start empty. Deserialization establishes neither
+        // a valid static contract nor trust in physical bindings.
+        Ok(Self {
+            data: Arc::new(PreparedProjectionNumericsData::deserialize(deserializer)?),
+        })
+    }
+}
+
+impl PartialEq for PreparedProjectionNumerics {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
+            || (self.data.contract == other.data.contract
+                && self.data.projections == other.data.projections)
+    }
+}
+
+impl Eq for PreparedProjectionNumerics {}
+
 impl PreparedProjectionNumerics {
+    /// Stable identity of the declaration and exact physical projection leaves.
+    /// Cached only on this immutable prepared value; live backing, generation,
+    /// lease and per-wave shape authorization remain separate mandatory checks.
+    /// The cache is absent from the wire format and does not establish trust in
+    /// a deserialized value: callers must still use `validate_bindings`.
+    pub fn fingerprint(&self) -> &str {
+        self.data.fingerprint.get_or_init(|| {
+            let bytes = serde_json::to_vec(self)
+                .expect("prepared projection numerics has a canonical JSON representation");
+            format!("{:x}", Sha256::digest(bytes))
+        })
+    }
+
+    /// Memoizes only the immutable declaration check. This never validates
+    /// physical bindings, live views, wave ranges, leases, or native facts.
+    pub(super) fn validate_static_contract(&self) -> Result<(), String> {
+        self.data
+            .static_contract_validation
+            .get_or_init(|| self.data.contract.validate())
+            .clone()
+    }
+
     pub fn contract(&self) -> &CompositeNumericalArithmetic {
-        &self.contract
+        &self.data.contract
     }
     pub fn projections(&self) -> &[PreparedProjection] {
-        &self.projections
+        &self.data.projections
     }
     pub fn projection(&self, role: ProjectionRole) -> Option<&PreparedProjection> {
-        self.projections
+        self.data
+            .projections
             .iter()
             .find(|projection| projection.role == role)
     }
     pub fn staged_leaf_count(&self) -> usize {
-        self.projections
+        self.data
+            .projections
             .iter()
             .flat_map(|p| &p.leaves)
             .filter(|leaf| leaf.is_staged())
@@ -206,8 +269,12 @@ impl PreparedProjectionNumerics {
             });
         }
         Ok(Self {
-            contract: contract.clone(),
-            projections,
+            data: Arc::new(PreparedProjectionNumericsData {
+                contract: contract.clone(),
+                projections,
+                fingerprint: OnceLock::new(),
+                static_contract_validation: OnceLock::from(Ok(())),
+            }),
         })
     }
 

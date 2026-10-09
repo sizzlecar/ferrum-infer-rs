@@ -1,0 +1,431 @@
+{
+  "schema_version": 3,
+  "operator": "ferrum.cuda.upstream_linear",
+  "source_package": {
+    "kind": "ferrum-native-upstream-linear",
+    "revision": "marker-v2-prefill-j32-r1+d81235049384534c167caea52b85a694f6103d14",
+    "sha256": "4929902bd114118a50969b4b8f170002170abbf5c254939ea2f2bd4abdabbfbd"
+  },
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/ggml-org/llama.cpp.git",
+      "revision": "d81235049384534c167caea52b85a694f6103d14",
+      "license": "MIT"
+    }
+  ],
+  "translation_units": [
+    {
+      "path": "kernels/boundary.cu",
+      "sha256": "9899c5e50f1807545f73f206b078e0e0aeaf34810497282786c239d40b34365b"
+    },
+    {
+      "path": "kernels/mmq.cu",
+      "sha256": "2e02cc3d2db4359f386bf99bed2689b25bc5fe703638d2202694e41dedbfbba3"
+    },
+    {
+      "path": "kernels/mmvq.cu",
+      "sha256": "a578869fc6455e54e6d06018ab8b30f358ea69ecc7c0c0ddf81e5d6a2f8f58e8"
+    }
+  ],
+  "headers": [
+    {
+      "path": "kernels/abi.h",
+      "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+    },
+    {
+      "path": "kernels/boundary.h",
+      "sha256": "a329674a5e0b35bdab150db775b9e4793257b7359a9ce8dd8a5e70519e48d47d"
+    },
+    {
+      "path": "kernels/marker.cuh",
+      "sha256": "c9b6b880cc02000bd3518162e911a51106124f4017947ec7451d490830576416"
+    },
+    {
+      "path": "llama/ggml/include/ggml-alloc.h",
+      "sha256": "d114067f9099c4a0e2bbc0625c676d4894d9cf0ea27168ee072c7de0e71bb51d"
+    },
+    {
+      "path": "llama/ggml/include/ggml-backend.h",
+      "sha256": "5791edae1fb7622027621d15bc7a160198bd3b75ed8f96d06cb7b85e2b873756"
+    },
+    {
+      "path": "llama/ggml/include/ggml-cuda.h",
+      "sha256": "9cbfcea49f6da4d07f41dc22fa8dbf870825faaa2a68e34e65fe30ea6c41e042"
+    },
+    {
+      "path": "llama/ggml/include/ggml.h",
+      "sha256": "12ee71f99db7db9b353bc02b1fbb57c344ee17c01ac5fb7952b41a637a747ea9"
+    },
+    {
+      "path": "llama/ggml/include/gguf.h",
+      "sha256": "e56714aab702e5ce62ee587a409643c08f7e93e8fbb77f48ef7cc85075f96fa4"
+    },
+    {
+      "path": "llama/ggml/src/ggml-common.h",
+      "sha256": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/common.cuh",
+      "sha256": "cde04ff564d8523f0b2c1789ee43112c1feafc50e2c3757c888169fe0ba4ea56"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mma.cuh",
+      "sha256": "4acce516e9463607122f562a9cdab6aa1f25c37f937980701c20075c0149f615"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-ampere.cuh",
+      "sha256": "6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-blackwell.cuh",
+      "sha256": "8bec1e65a3a2a58fab1f406225f6ba2f1a4c38a19793dfa255baff69bc044d70"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-cdna.cuh",
+      "sha256": "314eeb8453834723d5224012f692f70673f86ecc42d2b6d6f2005a0fad124dbc"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-gcn.cuh",
+      "sha256": "f669a723fc19d1e650de33a2852a10472a5773b0c8a3cd5b96662bc4fe6ebfe3"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+      "sha256": "67a93b6d26d3e16e77fd285dd77e7cca7848fb0b0d68897c2ff1e8cc47102263"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh",
+      "sha256": "48bae44f1f0e667fa02fb898859eb18c03961bdbadf53c1e22d98801ed70affe"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna2.cuh",
+      "sha256": "758be2a33b89018841f432c15cd63009ad212d71eae888a04b4535cb64941aa7"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh",
+      "sha256": "5243cb07aded29b0bd3254cf9f9856989f53b133a73874388282a35c3990f0cd"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna3.cuh",
+      "sha256": "a1ac4f4fa799f2fb200ead23f3403bb0f729d41109b8967c6d76216768aae0cf"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna4.cuh",
+      "sha256": "e40c9c5fe85607db07ae351dd6ca13c92caaa238e2a62d5134877d9fbcb5c645"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-load-tiles.cuh",
+      "sha256": "7ac3ea766e5a7c4cd688e76a3f2aa350ab4a080eb5894892723a8a4af965a818"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq-vec-dot.cuh",
+      "sha256": "b76d31afe1e517c9ab10cf7accbc518b0c704dd076aaa17b9c9feb844c783921"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmq.cuh",
+      "sha256": "bc79d7cd87b6d8914ba11ee7da98bd3173687fb9a693ed6fbde3561064904169"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/mmvq.cuh",
+      "sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/quantize.cuh",
+      "sha256": "112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/unary.cuh",
+      "sha256": "a6903bb02577a33b79c738e62e425867f9122d1b4981a3b228062b4f978b2858"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/vecdotq.cuh",
+      "sha256": "200dad1a94624716460b019d7f2bb38777d7e1348109a5cc623d03ce69ba275a"
+    },
+    {
+      "path": "llama/ggml/src/ggml-cuda/vendors/cuda.h",
+      "sha256": "e7847065d5d741f892d2f1f7aaaa8f418a41e3b983d1e6f09010055d4d1c38d1"
+    },
+    {
+      "path": "llama/ggml/src/ggml-impl.h",
+      "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
+    }
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/boundary.cu",
+      "headers": [
+        {
+          "path": "kernels/abi.h",
+          "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+        },
+        {
+          "path": "kernels/boundary.h",
+          "sha256": "a329674a5e0b35bdab150db775b9e4793257b7359a9ce8dd8a5e70519e48d47d"
+        }
+      ],
+      "closure_sha256": "01cae1a5204dbf5e7bed860b60f08ecf315099ab54c36ca02e97b0c5a6b0c68e"
+    },
+    {
+      "translation_unit": "kernels/mmq.cu",
+      "headers": [
+        {
+          "path": "kernels/abi.h",
+          "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+        },
+        {
+          "path": "kernels/boundary.h",
+          "sha256": "a329674a5e0b35bdab150db775b9e4793257b7359a9ce8dd8a5e70519e48d47d"
+        },
+        {
+          "path": "kernels/marker.cuh",
+          "sha256": "c9b6b880cc02000bd3518162e911a51106124f4017947ec7451d490830576416"
+        },
+        {
+          "path": "llama/ggml/include/ggml-alloc.h",
+          "sha256": "d114067f9099c4a0e2bbc0625c676d4894d9cf0ea27168ee072c7de0e71bb51d"
+        },
+        {
+          "path": "llama/ggml/include/ggml-backend.h",
+          "sha256": "5791edae1fb7622027621d15bc7a160198bd3b75ed8f96d06cb7b85e2b873756"
+        },
+        {
+          "path": "llama/ggml/include/ggml-cuda.h",
+          "sha256": "9cbfcea49f6da4d07f41dc22fa8dbf870825faaa2a68e34e65fe30ea6c41e042"
+        },
+        {
+          "path": "llama/ggml/include/ggml.h",
+          "sha256": "12ee71f99db7db9b353bc02b1fbb57c344ee17c01ac5fb7952b41a637a747ea9"
+        },
+        {
+          "path": "llama/ggml/include/gguf.h",
+          "sha256": "e56714aab702e5ce62ee587a409643c08f7e93e8fbb77f48ef7cc85075f96fa4"
+        },
+        {
+          "path": "llama/ggml/src/ggml-common.h",
+          "sha256": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/common.cuh",
+          "sha256": "cde04ff564d8523f0b2c1789ee43112c1feafc50e2c3757c888169fe0ba4ea56"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mma.cuh",
+          "sha256": "4acce516e9463607122f562a9cdab6aa1f25c37f937980701c20075c0149f615"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-ampere.cuh",
+          "sha256": "6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-blackwell.cuh",
+          "sha256": "8bec1e65a3a2a58fab1f406225f6ba2f1a4c38a19793dfa255baff69bc044d70"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-cdna.cuh",
+          "sha256": "314eeb8453834723d5224012f692f70673f86ecc42d2b6d6f2005a0fad124dbc"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-gcn.cuh",
+          "sha256": "f669a723fc19d1e650de33a2852a10472a5773b0c8a3cd5b96662bc4fe6ebfe3"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+          "sha256": "67a93b6d26d3e16e77fd285dd77e7cca7848fb0b0d68897c2ff1e8cc47102263"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh",
+          "sha256": "48bae44f1f0e667fa02fb898859eb18c03961bdbadf53c1e22d98801ed70affe"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna2.cuh",
+          "sha256": "758be2a33b89018841f432c15cd63009ad212d71eae888a04b4535cb64941aa7"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh",
+          "sha256": "5243cb07aded29b0bd3254cf9f9856989f53b133a73874388282a35c3990f0cd"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna3.cuh",
+          "sha256": "a1ac4f4fa799f2fb200ead23f3403bb0f729d41109b8967c6d76216768aae0cf"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna4.cuh",
+          "sha256": "e40c9c5fe85607db07ae351dd6ca13c92caaa238e2a62d5134877d9fbcb5c645"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-load-tiles.cuh",
+          "sha256": "7ac3ea766e5a7c4cd688e76a3f2aa350ab4a080eb5894892723a8a4af965a818"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-vec-dot.cuh",
+          "sha256": "b76d31afe1e517c9ab10cf7accbc518b0c704dd076aaa17b9c9feb844c783921"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq.cuh",
+          "sha256": "bc79d7cd87b6d8914ba11ee7da98bd3173687fb9a693ed6fbde3561064904169"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/quantize.cuh",
+          "sha256": "112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/vecdotq.cuh",
+          "sha256": "200dad1a94624716460b019d7f2bb38777d7e1348109a5cc623d03ce69ba275a"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/vendors/cuda.h",
+          "sha256": "e7847065d5d741f892d2f1f7aaaa8f418a41e3b983d1e6f09010055d4d1c38d1"
+        },
+        {
+          "path": "llama/ggml/src/ggml-impl.h",
+          "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
+        }
+      ],
+      "closure_sha256": "e20a46828dc9c818f79d772fc08d474416b43d74467186a5f43e95abed737816"
+    },
+    {
+      "translation_unit": "kernels/mmvq.cu",
+      "headers": [
+        {
+          "path": "kernels/abi.h",
+          "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+        },
+        {
+          "path": "kernels/boundary.h",
+          "sha256": "a329674a5e0b35bdab150db775b9e4793257b7359a9ce8dd8a5e70519e48d47d"
+        },
+        {
+          "path": "kernels/marker.cuh",
+          "sha256": "c9b6b880cc02000bd3518162e911a51106124f4017947ec7451d490830576416"
+        },
+        {
+          "path": "llama/ggml/include/ggml-alloc.h",
+          "sha256": "d114067f9099c4a0e2bbc0625c676d4894d9cf0ea27168ee072c7de0e71bb51d"
+        },
+        {
+          "path": "llama/ggml/include/ggml-backend.h",
+          "sha256": "5791edae1fb7622027621d15bc7a160198bd3b75ed8f96d06cb7b85e2b873756"
+        },
+        {
+          "path": "llama/ggml/include/ggml-cuda.h",
+          "sha256": "9cbfcea49f6da4d07f41dc22fa8dbf870825faaa2a68e34e65fe30ea6c41e042"
+        },
+        {
+          "path": "llama/ggml/include/ggml.h",
+          "sha256": "12ee71f99db7db9b353bc02b1fbb57c344ee17c01ac5fb7952b41a637a747ea9"
+        },
+        {
+          "path": "llama/ggml/include/gguf.h",
+          "sha256": "e56714aab702e5ce62ee587a409643c08f7e93e8fbb77f48ef7cc85075f96fa4"
+        },
+        {
+          "path": "llama/ggml/src/ggml-common.h",
+          "sha256": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/common.cuh",
+          "sha256": "cde04ff564d8523f0b2c1789ee43112c1feafc50e2c3757c888169fe0ba4ea56"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mma.cuh",
+          "sha256": "4acce516e9463607122f562a9cdab6aa1f25c37f937980701c20075c0149f615"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-ampere.cuh",
+          "sha256": "6de9336a6c2f65c0ad83cbe9303dcd03e8cbb6185d15346133a31421000f6408"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-blackwell.cuh",
+          "sha256": "8bec1e65a3a2a58fab1f406225f6ba2f1a4c38a19793dfa255baff69bc044d70"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-cdna.cuh",
+          "sha256": "314eeb8453834723d5224012f692f70673f86ecc42d2b6d6f2005a0fad124dbc"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-gcn.cuh",
+          "sha256": "f669a723fc19d1e650de33a2852a10472a5773b0c8a3cd5b96662bc4fe6ebfe3"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+          "sha256": "67a93b6d26d3e16e77fd285dd77e7cca7848fb0b0d68897c2ff1e8cc47102263"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh",
+          "sha256": "48bae44f1f0e667fa02fb898859eb18c03961bdbadf53c1e22d98801ed70affe"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna2.cuh",
+          "sha256": "758be2a33b89018841f432c15cd63009ad212d71eae888a04b4535cb64941aa7"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh",
+          "sha256": "5243cb07aded29b0bd3254cf9f9856989f53b133a73874388282a35c3990f0cd"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna3.cuh",
+          "sha256": "a1ac4f4fa799f2fb200ead23f3403bb0f729d41109b8967c6d76216768aae0cf"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-config-rdna4.cuh",
+          "sha256": "e40c9c5fe85607db07ae351dd6ca13c92caaa238e2a62d5134877d9fbcb5c645"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-load-tiles.cuh",
+          "sha256": "7ac3ea766e5a7c4cd688e76a3f2aa350ab4a080eb5894892723a8a4af965a818"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq-vec-dot.cuh",
+          "sha256": "b76d31afe1e517c9ab10cf7accbc518b0c704dd076aaa17b9c9feb844c783921"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmq.cuh",
+          "sha256": "bc79d7cd87b6d8914ba11ee7da98bd3173687fb9a693ed6fbde3561064904169"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/mmvq.cuh",
+          "sha256": "b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/quantize.cuh",
+          "sha256": "112e190a096e1fa68d4c72ca2a450cb202586e3f2919c884f3e3316a8d5c57cd"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/unary.cuh",
+          "sha256": "a6903bb02577a33b79c738e62e425867f9122d1b4981a3b228062b4f978b2858"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/vecdotq.cuh",
+          "sha256": "200dad1a94624716460b019d7f2bb38777d7e1348109a5cc623d03ce69ba275a"
+        },
+        {
+          "path": "llama/ggml/src/ggml-cuda/vendors/cuda.h",
+          "sha256": "e7847065d5d741f892d2f1f7aaaa8f418a41e3b983d1e6f09010055d4d1c38d1"
+        },
+        {
+          "path": "llama/ggml/src/ggml-impl.h",
+          "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
+        }
+      ],
+      "closure_sha256": "34a99cf9f3ff1617d826ff027f1c80f2f5d51d9cb3339023e4c4dd6291030afd"
+    }
+  ],
+  "include_dirs": [
+    "kernels",
+    "llama/ggml/include",
+    "llama/ggml/src",
+    "llama/ggml/src/ggml-cuda",
+    "llama/include"
+  ],
+  "defines": [],
+  "nvcc_policy": {
+    "cpp_standard": "cpp17",
+    "optimization": "o3",
+    "use_fast_math": true,
+    "relaxed_constexpr": true,
+    "extended_lambda": true,
+    "host_position_independent_code": true,
+    "host_default_visibility": false
+  },
+  "architecture": "device_compute_capability",
+  "archive_file": "libferrum_upstream_linear.a"
+}

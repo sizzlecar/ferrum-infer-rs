@@ -60,6 +60,8 @@ native-op-artifact = []  # Internal build-graph marker, enabled by `cuda`.
                         # CUDA native units fail closed when the explicit
                         # artifact-set lock is absent or partial; product builds
                         # never compile third-party CUDA/C++.
+cuda-upstream-linear = ["cuda"] # Optional locked MMQ/MMVQ artifact; no default routing.
+cuda-upstream-extra-linear = ["cuda-upstream-linear"] # Independent locked extra-format artifact.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compatibility.
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

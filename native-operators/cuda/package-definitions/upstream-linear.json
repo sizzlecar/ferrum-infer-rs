@@ -1,0 +1,419 @@
+{
+  "schema_version": 1,
+  "operator": "ferrum.cuda.upstream_linear",
+  "operator_abi_version": "1",
+  "backend": "cuda",
+  "compute_capabilities": [
+    "sm_89"
+  ],
+  "provider_bindings": [
+    {
+      "operation_id": "operation.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
+      "provider_id": "provider.cuda.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
+      "provider_id": "provider.cuda.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-prefill",
+      "provider_id": "provider.cuda.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.causal_paged_attention.f32-master.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
+      "provider_id": "provider.cuda.causal_paged_attention.f32-master.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.causal_paged_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2",
+      "provider_id": "provider.cuda.causal_paged_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.causal_paged_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2-prefill",
+      "provider_id": "provider.cuda.causal_paged_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
+      "provider_id": "provider.cuda.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
+      "provider_id": "provider.cuda.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-prefill",
+      "provider_id": "provider.cuda.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
+      "provider_id": "provider.cuda.dense_swiglu.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu.q4k-q5k-iq4xs-upstream-marker-v2",
+      "provider_id": "provider.cuda.dense_swiglu.q4k-q5k-iq4xs-upstream-marker-v2",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu.q4k-q5k-iq4xs-upstream-marker-v2-prefill",
+      "provider_id": "provider.cuda.dense_swiglu.q4k-q5k-iq4xs-upstream-marker-v2-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
+      "provider_id": "provider.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
+      "provider_id": "provider.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-prefill",
+      "provider_id": "provider.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
+      "provider_id": "provider.cuda.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2",
+      "provider_id": "provider.cuda.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2-prefill",
+      "provider_id": "provider.cuda.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-upstream-marker-v2-prefill",
+      "entrypoints": [
+        "ferrum_upstream_mmq_cast_v1",
+        "ferrum_upstream_mmq_cast_v2",
+        "ferrum_upstream_mmq_check_weights_v2",
+        "ferrum_upstream_mmq_dot_v1",
+        "ferrum_upstream_mmq_pack_v1",
+        "ferrum_upstream_mmq_pack_v2",
+        "ferrum_upstream_mmq_plan_v1",
+        "ferrum_upstream_mmq_prefill_plan_v1",
+        "ferrum_upstream_mmvq_cast_v1",
+        "ferrum_upstream_mmvq_cast_v2",
+        "ferrum_upstream_mmvq_check_weights_v2",
+        "ferrum_upstream_mmvq_dot_v1",
+        "ferrum_upstream_mmvq_pack_v1",
+        "ferrum_upstream_mmvq_pack_v2",
+        "ferrum_upstream_mmvq_plan_v1"
+      ]
+    }
+  ],
+  "required_exports": [
+    "ferrum_upstream_mmq_cast_v1",
+    "ferrum_upstream_mmq_cast_v2",
+    "ferrum_upstream_mmq_check_weights_v2",
+    "ferrum_upstream_mmq_dot_v1",
+    "ferrum_upstream_mmq_pack_v1",
+    "ferrum_upstream_mmq_pack_v2",
+    "ferrum_upstream_mmq_plan_v1",
+    "ferrum_upstream_mmq_prefill_plan_v1",
+    "ferrum_upstream_mmvq_cast_v1",
+    "ferrum_upstream_mmvq_cast_v2",
+    "ferrum_upstream_mmvq_check_weights_v2",
+    "ferrum_upstream_mmvq_dot_v1",
+    "ferrum_upstream_mmvq_pack_v1",
+    "ferrum_upstream_mmvq_pack_v2",
+    "ferrum_upstream_mmvq_plan_v1"
+  ],
+  "license_files": [
+    {
+      "source_path": "LICENSE",
+      "output_path": "licenses/Ferrum-MIT.txt"
+    },
+    {
+      "source_path": "native-operators/cuda/upstream-linear/llama-MIT.txt",
+      "output_path": "licenses/llama-MIT.txt"
+    }
+  ],
+  "cuda_toolkit": "12.6",
+  "cuda_runtime_min": "12.6",
+  "system_libraries": [
+    "cuda_runtime",
+    "std_cxx"
+  ]
+}

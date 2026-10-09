@@ -149,6 +149,25 @@ pub fn cuda_vnext_runtime_config(
         crate::ptx::VNEXT_GGUF.as_bytes(),
         crate::ptx::GPT_OSS_ATTENTION.as_bytes(),
     ];
+    let fingerprint_parts = {
+        let mut fingerprint_parts = fingerprint_parts;
+        fingerprint_parts.extend([
+            include_bytes!("vnext_ops/transformer/upstream_swiglu.rs").as_slice(),
+            include_bytes!("vnext_ops/transformer/upstream_swiglu/encode.rs").as_slice(),
+            include_bytes!("vnext_ops/transformer/q8act_attention/upstream.rs").as_slice(),
+            include_bytes!("vnext_ops/native_blocks/upstream_linear.rs").as_slice(),
+            include_bytes!("vnext_ops/native_blocks/upstream_linear/preparation.rs").as_slice(),
+            include_bytes!("vnext_ops/native_blocks/upstream_linear/weight_validation.rs")
+                .as_slice(),
+            include_bytes!("../../native_ops/upstream_linear.rs").as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ferrum-native-ops/src/upstream_extra_linear/prefill.rs"
+            ))
+            .as_slice(),
+        ]);
+        fingerprint_parts
+    };
     #[cfg(feature = "vllm-moe-marlin")]
     let fingerprint_parts = {
         let mut fingerprint_parts = fingerprint_parts;
@@ -217,6 +236,188 @@ pub(crate) fn q8act_g32_profile_compiled(
     profile: ferrum_interfaces::vnext::Q8ActSwiGluProfile,
 ) -> bool {
     native_blocks::q8act::compiled_for_profile(crate::ptx::VNEXT_GGUF, profile)
+}
+
+const UPSTREAM_MARKER_V2_EXPORTS: &[&str] = &[
+    "ferrum_upstream_mmq_plan_v1",
+    "ferrum_upstream_mmq_pack_v1",
+    "ferrum_upstream_mmq_dot_v1",
+    "ferrum_upstream_mmq_cast_v1",
+    "ferrum_upstream_mmq_pack_v2",
+    "ferrum_upstream_mmq_cast_v2",
+    "ferrum_upstream_mmq_check_weights_v2",
+    "ferrum_upstream_mmvq_plan_v1",
+    "ferrum_upstream_mmvq_pack_v1",
+    "ferrum_upstream_mmvq_dot_v1",
+    "ferrum_upstream_mmvq_cast_v1",
+    "ferrum_upstream_mmvq_pack_v2",
+    "ferrum_upstream_mmvq_cast_v2",
+    "ferrum_upstream_mmvq_check_weights_v2",
+];
+
+fn upstream_marker_v2_exports_present(exports: &[String]) -> bool {
+    UPSTREAM_MARKER_V2_EXPORTS
+        .iter()
+        .all(|required| exports.iter().any(|export| export == required))
+}
+
+/// The build's locked and binary-validated inventory is the only source of
+/// linked symbol availability. Exact live provider/G03 identity is additionally
+/// checked by CudaVNextComposition::create before exposing execution.
+fn upstream_profile_exports_present(exports: &[String], prefill: bool) -> bool {
+    upstream_marker_v2_exports_present(exports)
+        && (!prefill
+            || exports
+                .iter()
+                .any(|export| export == "ferrum_upstream_mmq_prefill_plan_v1"))
+}
+
+pub(crate) fn upstream_marker_v2_compiled() -> bool {
+    upstream_profile_compiled(false)
+}
+pub(crate) fn upstream_profile_compiled(prefill: bool) -> bool {
+    cfg!(feature = "cuda-upstream-linear")
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && upstream_profile_exports_present(&artifact.exports, prefill)
+            })
+}
+
+fn upstream_extra_exports_present(exports: &[String]) -> bool {
+    ["mmq", "mmvq"].iter().all(|algorithm| {
+        [
+            "plan_v1",
+            "pack_v2",
+            "dot_v1",
+            "cast_v2",
+            "check_weights_v2",
+        ]
+        .iter()
+        .all(|stage| {
+            let required = format!("ferrum_upstream_extra_{algorithm}_{stage}");
+            exports.iter().any(|export| export == &required)
+        })
+    })
+}
+
+pub(crate) fn upstream_extra_compiled() -> bool {
+    upstream_extra_profile_compiled(false)
+}
+
+fn upstream_extra_profile_exports_present(exports: &[String], prefill: bool) -> bool {
+    upstream_extra_exports_present(exports)
+        && (!prefill
+            || exports
+                .iter()
+                .any(|export| export == "ferrum_upstream_extra_mmq_prefill_plan_v2"))
+}
+
+pub(crate) fn upstream_extra_profile_compiled(prefill: bool) -> bool {
+    cfg!(feature = "cuda-upstream-extra-linear")
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_extra_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && upstream_extra_profile_exports_present(&artifact.exports, prefill)
+            })
+}
+
+#[cfg(test)]
+mod upstream_marker_registration_tests {
+    use super::{
+        upstream_marker_v2_exports_present, upstream_profile_exports_present,
+        UPSTREAM_MARKER_V2_EXPORTS,
+    };
+
+    #[test]
+    fn extra_marker_capability_requires_its_own_complete_symbol_family() {
+        let exports = ["mmq", "mmvq"]
+            .into_iter()
+            .flat_map(|algorithm| {
+                [
+                    "plan_v1",
+                    "pack_v2",
+                    "dot_v1",
+                    "cast_v2",
+                    "check_weights_v2",
+                ]
+                .map(move |stage| format!("ferrum_upstream_extra_{algorithm}_{stage}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(super::upstream_extra_exports_present(&exports));
+        assert!(super::upstream_extra_profile_exports_present(
+            &exports, false
+        ));
+        assert!(!super::upstream_extra_profile_exports_present(
+            &exports, true
+        ));
+        let mut prefill = exports.clone();
+        // The historical v1 symbol was inert and is not large-row eligibility.
+        prefill.push("ferrum_upstream_extra_mmq_prefill_plan_v1".into());
+        assert!(!super::upstream_extra_profile_exports_present(
+            &prefill, true
+        ));
+        prefill.push("ferrum_upstream_extra_mmq_prefill_plan_v2".into());
+        assert!(super::upstream_extra_profile_exports_present(
+            &prefill, true
+        ));
+        for missing in &exports {
+            let incomplete = exports
+                .iter()
+                .filter(|name| *name != missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(!super::upstream_extra_exports_present(&incomplete));
+            let mut incomplete_prefill = incomplete;
+            incomplete_prefill.push("ferrum_upstream_extra_mmq_prefill_plan_v2".into());
+            assert!(!super::upstream_extra_profile_exports_present(
+                &incomplete_prefill,
+                true
+            ));
+        }
+        let base = exports
+            .iter()
+            .map(|name| name.replace("upstream_extra_", "upstream_"))
+            .collect::<Vec<_>>();
+        assert!(!super::upstream_extra_exports_present(&base));
+    }
+
+    #[test]
+    fn upstream_marker_capability_rejects_missing_v1_or_device_marker_exports() {
+        let exports = UPSTREAM_MARKER_V2_EXPORTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        assert!(upstream_marker_v2_exports_present(&exports));
+        assert!(upstream_profile_exports_present(&exports, false));
+        assert!(
+            !upstream_profile_exports_present(&exports, true),
+            "old artifact cannot qualify prefill"
+        );
+        let mut expanded = exports.clone();
+        expanded.push("ferrum_upstream_mmq_prefill_plan_v1".to_owned());
+        assert!(upstream_profile_exports_present(&expanded, true));
+        for missing in UPSTREAM_MARKER_V2_EXPORTS {
+            let incomplete = exports
+                .iter()
+                .filter(|name| name.as_str() != *missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(!upstream_marker_v2_exports_present(&incomplete));
+        }
+        assert!(!upstream_marker_v2_exports_present(&[
+            "ferrum_upstream_mmq_plan_v1".to_owned(),
+            "ferrum_upstream_mmq_plan_v1".to_owned(),
+        ]));
+    }
 }
 
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
@@ -305,6 +506,38 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
             ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
         ] {
             capabilities.insert(CapabilityId::new(profile.capability_id())?);
+        }
+    }
+    if upstream_marker_v2_compiled() {
+        for profile in [
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+        ] {
+            if upstream_profile_compiled(profile.prefill() || profile.hybrid())
+                && (!profile.extra() || upstream_extra_profile_compiled(profile.extra_prefill()))
+                && (!profile.hybrid()
+                    || q8act_g32_profile_compiled(
+                        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+                    ))
+            {
+                capabilities.insert(CapabilityId::new(profile.capability_id())?);
+            }
         }
     }
     if !rn_fragment_mma_compiled() {
@@ -593,6 +826,93 @@ pub fn cuda_vnext_operation_registry(
     };
     let mut providers = providers;
     for profile in [
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+    ] {
+        if runtime
+            .descriptor()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == profile.capability_id())
+        {
+            contracts.push(Box::new(profile.contract().map_err(contract_error)?));
+            match profile {
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows => {
+                    providers.push(Box::new(
+                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra_all_rows(runtime)?,
+                    ))
+                }
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill => {
+                    providers.push(Box::new(
+                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra_prefill(runtime)?,
+                    ))
+                }
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill => {
+                    providers.push(Box::new(
+                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra(
+                            runtime,
+                        )?,
+                    ))
+                }
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill => {
+                    providers.push(Box::new(
+                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_g32_mmq_prefill(
+                            runtime,
+                        )?,
+                    ))
+                }
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows => {
+                    providers.push(Box::new(transformer::CudaUpstreamSwiGluProvider::new(
+                        runtime, profile,
+                    )?))
+                }
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill => providers
+                    .push(Box::new(
+                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream(
+                            runtime,
+                            profile.prefill(),
+                        )?,
+                    )),
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows => {
+                    providers.push(Box::new(
+                        transformer::CudaCausalPagedAttentionProvider::new_upstream(
+                            runtime,
+                            profile,
+                            runtime.attention_execution_policy(),
+                        )?,
+                    ))
+                }
+            }
+        }
+    }
+    for profile in [
         ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta,
         ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
     ] {
@@ -659,15 +979,27 @@ pub struct CudaVNextComposition {
     catalog: CapabilityCatalog,
 }
 
+#[derive(Clone, Copy)]
+enum CudaCompositionPurpose {
+    Execution,
+    NativeCatalogDeclaration,
+}
+
 impl CudaVNextComposition {
     fn prepare(
         ordinal: usize,
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
+        purpose: CudaCompositionPurpose,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
-        let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
+        let runtime = Arc::new(match purpose {
+            CudaCompositionPurpose::Execution => CudaDeviceRuntime::new(config)?,
+            CudaCompositionPurpose::NativeCatalogDeclaration => {
+                CudaDeviceRuntime::new_for_native_catalog(config)?
+            }
+        });
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[allow(unused_mut)]
         let mut weight_materializers = vec![
@@ -720,7 +1052,12 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let composition = Self::prepare(ordinal, device_id, requested_attention_policy)?;
+        let composition = Self::prepare(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            CudaCompositionPurpose::Execution,
+        )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
     }
@@ -807,8 +1144,12 @@ pub fn cuda_validated_native_operator_catalog_input(
     device_id: DeviceId,
     requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
-    let composition =
-        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy)?;
+    let composition = CudaVNextComposition::prepare(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        CudaCompositionPurpose::Execution,
+    )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }
@@ -816,13 +1157,20 @@ pub fn cuda_validated_native_operator_catalog_input(
 /// Capture the exact provider identities needed to package a new native
 /// artifact set. Product composition uses [`CudaVNextComposition::create`]
 /// before family/profile selection and cannot bypass compiled-artifact validation.
+/// This output declares actual source-constructed provider contracts; it does
+/// not establish linked-artifact availability or numerical/GPU qualification.
+/// Native FFI planning and launches are never called on this catalog-only path.
 pub fn cuda_native_operator_catalog_input(
     ordinal: usize,
     device_id: DeviceId,
     requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
-    let composition =
-        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy)?;
+    let composition = CudaVNextComposition::prepare(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        CudaCompositionPurpose::NativeCatalogDeclaration,
+    )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }
 

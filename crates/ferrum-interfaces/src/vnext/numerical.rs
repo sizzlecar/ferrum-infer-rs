@@ -14,11 +14,15 @@ use super::{
 mod kv_storage;
 pub use kv_storage::KvStateStorage;
 mod arithmetic;
+mod g32_mmq;
 pub use arithmetic::*;
+pub use g32_mmq::*;
 mod composite;
 pub use composite::*;
 mod prepared;
 pub use prepared::*;
+mod upstream;
+pub use upstream::*;
 
 /// The referenced operation version defines its internal ordering and rounding
 /// points. Arithmetic types are explicit here; copying/indexing operations have

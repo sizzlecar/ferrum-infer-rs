@@ -103,6 +103,12 @@ pub struct CudaDeviceRuntimeConfig {
     pub dynamic_storage_profiles: BTreeSet<DynamicStorageProfile>,
 }
 
+#[derive(Clone, Copy)]
+enum CudaRuntimePurpose {
+    Execution,
+    NativeCatalogDeclaration,
+}
+
 #[derive(Debug)]
 pub enum CudaDeviceRuntimeError {
     Contract(String),
@@ -246,7 +252,60 @@ pub(crate) struct CudaBufferRegion {
     element_type: ElementType,
 }
 
+/// A retained allocation generation and its exact byte range. The allocation
+/// Arc, not a recyclable device address, establishes identity. Users of this
+/// key must keep the originating Plan-retained region alive for the entire key
+/// lifetime; a weak cache entry alone must never authorize memory reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CudaPlanBackingIdentity {
+    pub runtime_instance: u64,
+    allocation: usize,
+    byte_offset: u64,
+    byte_len: u64,
+}
+
 impl CudaBufferRegion {
+    /// Physical offset in the retained allocation, including nested slices.
+    /// This is shape/range evidence only; it does not confer Plan ownership.
+    pub(crate) fn backing_byte_offset(&self) -> u64 {
+        self.device_ptr - self._allocation.aligned_ptr
+    }
+
+    /// Restrict an already authorized range without changing its ownership or
+    /// reusable scope. In particular, a persistent flag slice cannot extend
+    /// into a neighbouring resource in the same underlying allocation.
+    pub(crate) fn subregion(
+        &self,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let device_ptr =
+            checked_subregion_address(self.device_ptr, self.length_bytes, offset, bytes)?;
+        Ok(Self {
+            device_ptr,
+            length_bytes: bytes,
+            ..self.clone()
+        })
+    }
+
+    pub(crate) fn plan_backing_identity(
+        &self,
+    ) -> Result<CudaPlanBackingIdentity, CudaDeviceRuntimeError> {
+        if self._core_retention.is_none()
+            || self.reusable_address_scope != Some(DeviceReusableAddressScope::Plan)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "static weight validation requires an actual Plan-retained region",
+            ));
+        }
+        Ok(CudaPlanBackingIdentity {
+            runtime_instance: self.runtime_instance,
+            allocation: Arc::as_ptr(&self._allocation) as usize,
+            byte_offset: self.backing_byte_offset(),
+            byte_len: self.length_bytes,
+        })
+    }
+
     pub(crate) const fn device_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
         self.device_ptr
     }
@@ -257,6 +316,44 @@ impl CudaBufferRegion {
 
     pub(crate) const fn element_type(&self) -> ElementType {
         self.element_type
+    }
+}
+
+fn checked_subregion_address(
+    address: u64,
+    length: u64,
+    offset: u64,
+    bytes: u64,
+) -> Result<u64, CudaDeviceRuntimeError> {
+    if bytes == 0
+        || offset.checked_add(bytes).is_none_or(|end| end > length)
+        || address.checked_add(length).is_none()
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA subregion is empty, overflows, or exceeds its retained parent range",
+        ));
+    }
+    address
+        .checked_add(offset)
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA subregion address overflow"))
+}
+
+#[cfg(test)]
+mod retained_subregion_tests {
+    use super::checked_subregion_address;
+
+    #[test]
+    fn cuda_retained_subregion_restricts_nested_flag_ranges_and_rejects_overflow() {
+        let parent = checked_subregion_address(0x1000, 32, 8, 16).unwrap();
+        assert_eq!(
+            checked_subregion_address(parent, 16, 12, 4).unwrap(),
+            0x1014
+        );
+        assert!(checked_subregion_address(parent, 16, 13, 4).is_err());
+        assert!(checked_subregion_address(parent, 16, 16, 0).is_err());
+        assert!(checked_subregion_address(parent, 16, u64::MAX, 4).is_err());
+        assert!(checked_subregion_address(u64::MAX - 1, 8, 0, 4).is_err());
+        assert_eq!(checked_subregion_address(0x1000, 4, 0, 4).unwrap(), 0x1000);
     }
 }
 
@@ -2001,7 +2098,23 @@ impl CudaDeviceRuntime {
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))
     }
 
-    pub fn new(mut config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+    pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_for_purpose(config, CudaRuntimePurpose::Execution)
+    }
+
+    /// Only the non-executing catalog exporter may use this constructor. Its
+    /// result is consumed into source declarations, never returned as a runtime
+    /// or used for family selection, admission, or kernel launches.
+    pub(super) fn new_for_native_catalog(
+        config: CudaDeviceRuntimeConfig,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_for_purpose(config, CudaRuntimePurpose::NativeCatalogDeclaration)
+    }
+
+    fn new_for_purpose(
+        mut config: CudaDeviceRuntimeConfig,
+        purpose: CudaRuntimePurpose,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         if !config.attention_execution_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA runtime requires a resolved attention execution policy",
@@ -2018,6 +2131,47 @@ impl CudaDeviceRuntime {
         }
         let minor = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(|error| CudaDeviceRuntimeError::driver("DP4A compute capability", error))?;
+        for profile in [
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+        ] {
+            if major >= 8 && matches!(purpose, CudaRuntimePurpose::NativeCatalogDeclaration) {
+                config.capabilities.insert(
+                    CapabilityId::new(profile.capability_id())
+                        .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?,
+                );
+            } else if major < 8
+                || !super::vnext_ops::upstream_profile_compiled(
+                    profile.prefill() || profile.hybrid(),
+                )
+                || (profile.extra()
+                    && !super::vnext_ops::upstream_extra_profile_compiled(profile.extra_prefill()))
+                || (profile.hybrid()
+                    && !super::vnext_ops::q8act_g32_profile_compiled(
+                        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+                    ))
+            {
+                config
+                    .capabilities
+                    .retain(|capability| capability.as_str() != profile.capability_id());
+            }
+        }
         for profile in [
             ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
             ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,

@@ -12,9 +12,10 @@ use ferrum_types::AttentionExecutionPolicy;
 
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
-    ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, PlanHash,
-    ReusableExecutionBucketId, ReusableExecutionCatalogLifetime, StaticWeightTransformPlan,
-    VNextError, WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
+    EncodedRetainedPlanDependency, ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope,
+    IdentifiedFailure, PlanHash, RetainedPlanDependencyIdentity, ReusableExecutionBucketId,
+    ReusableExecutionCatalogLifetime, StaticWeightTransformPlan, VNextError,
+    WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
 /// Backend-neutral device capability for an explicit cold-path reusable
@@ -1213,9 +1214,22 @@ pub struct DeviceReusableExecutionCapture {
     node_count: u32,
     eager_boundary_node_indices: Box<[u32]>,
     per_wave_binding_node_indices: Box<[u32]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    retained_plan_dependencies: Vec<RetainedPlanDependencyIdentity>,
 }
 
 impl DeviceReusableExecutionCapture {
+    pub(crate) fn with_retained_plan_dependencies(
+        mut self,
+        identities: Vec<RetainedPlanDependencyIdentity>,
+    ) -> Self {
+        self.retained_plan_dependencies = identities;
+        self
+    }
+    pub fn retained_plan_dependencies(&self) -> &[RetainedPlanDependencyIdentity] {
+        &self.retained_plan_dependencies
+    }
+
     pub fn new(
         program_id: DeviceReusableExecutionProgramId,
         node_count: u32,
@@ -1250,6 +1264,7 @@ impl DeviceReusableExecutionCapture {
             node_count,
             eager_boundary_node_indices: eager_boundary_node_indices.into_boxed_slice(),
             per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+            retained_plan_dependencies: Vec::new(),
         })
     }
 
@@ -1397,9 +1412,38 @@ pub struct DeviceReusableExecutionProgram {
     segments: Box<[DeviceReusableExecutionSegment]>,
     per_wave_binding_node_indices: Box<[u32]>,
     gaps: Box<[DeviceReusableExecutionProgramGap]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    retained_plan_dependencies: Vec<RetainedPlanDependencyIdentity>,
 }
 
 impl DeviceReusableExecutionProgram {
+    /// Reclassification (for example backend eviction) may change residency,
+    /// never the immutable Plan prerequisites of this same typed program.
+    pub fn reclassification_capture(&self) -> DeviceReusableExecutionCapture {
+        DeviceReusableExecutionCapture {
+            program_id: self.program_id.clone(),
+            node_count: self.node_count,
+            eager_boundary_node_indices: self.eager_boundary_node_indices.clone(),
+            per_wave_binding_node_indices: self.per_wave_binding_node_indices.clone(),
+            retained_plan_dependencies: self.retained_plan_dependencies.clone(),
+        }
+    }
+
+    pub fn validate_retained_plan_dependency_seal(&self, next: &Self) -> Result<(), VNextError> {
+        if self.program_id != next.program_id
+            || self.retained_plan_dependencies != next.retained_plan_dependencies
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "resident program changed its retained Plan dependency seal".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn retained_plan_dependencies(&self) -> &[RetainedPlanDependencyIdentity] {
+        &self.retained_plan_dependencies
+    }
+
     pub fn new(
         capture: &DeviceReusableExecutionCapture,
         segments: Vec<DeviceReusableExecutionSegment>,
@@ -1493,6 +1537,7 @@ impl DeviceReusableExecutionProgram {
             segments: segments.into_boxed_slice(),
             per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
             gaps: gaps.into_boxed_slice(),
+            retained_plan_dependencies: capture.retained_plan_dependencies.clone(),
         })
     }
 
@@ -2893,6 +2938,7 @@ impl DeviceSubmissionAttribution {
 /// either dynamic boundary into a reusable executable.
 #[must_use = "encoded device operations must be appended to a submission batch"]
 pub struct EncodedDeviceOperation<C> {
+    retained_plan_dependencies: Vec<EncodedRetainedPlanDependency<C>>,
     program_bindings: Vec<C>,
     dynamic_bindings: Vec<C>,
     compute: C,
@@ -2900,8 +2946,25 @@ pub struct EncodedDeviceOperation<C> {
 }
 
 impl<C> EncodedDeviceOperation<C> {
+    pub fn with_retained_plan_dependency(
+        mut self,
+        dependency: EncodedRetainedPlanDependency<C>,
+    ) -> Self {
+        self.retained_plan_dependencies.push(dependency);
+        self
+    }
+    pub fn retained_plan_dependency_count(&self) -> usize {
+        self.retained_plan_dependencies.len()
+    }
+    pub(crate) fn take_retained_plan_dependencies(
+        &mut self,
+    ) -> Vec<EncodedRetainedPlanDependency<C>> {
+        std::mem::take(&mut self.retained_plan_dependencies)
+    }
+
     pub fn compute(command: C) -> Self {
         Self {
+            retained_plan_dependencies: Vec::new(),
             program_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
             compute: command,
@@ -2942,6 +3005,10 @@ impl<C> EncodedDeviceOperation<C> {
     }
 
     pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, C, Vec<C>) {
+        assert!(
+            self.retained_plan_dependencies.is_empty(),
+            "retained dependency channel was not consumed by core"
+        );
         (
             self.program_bindings,
             self.dynamic_bindings,
@@ -2956,14 +3023,32 @@ impl<C> EncodedDeviceOperation<C> {
 /// and result bindings preserve their position around the segment launch.
 #[must_use = "reusable execution bindings must accompany their segment launch"]
 pub struct EncodedReusableExecutionBindings<C> {
+    retained_plan_dependencies: Vec<EncodedRetainedPlanDependency<C>>,
     program_bindings: Vec<C>,
     dynamic_bindings: Vec<C>,
     result_bindings: Vec<C>,
 }
 
 impl<C> EncodedReusableExecutionBindings<C> {
+    pub fn with_retained_plan_dependency(
+        mut self,
+        dependency: EncodedRetainedPlanDependency<C>,
+    ) -> Self {
+        self.retained_plan_dependencies.push(dependency);
+        self
+    }
+    pub fn retained_plan_dependency_count(&self) -> usize {
+        self.retained_plan_dependencies.len()
+    }
+    pub(crate) fn take_retained_plan_dependencies(
+        &mut self,
+    ) -> Vec<EncodedRetainedPlanDependency<C>> {
+        std::mem::take(&mut self.retained_plan_dependencies)
+    }
+
     pub fn empty() -> Self {
         Self {
+            retained_plan_dependencies: Vec::new(),
             program_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
             result_bindings: Vec::new(),
@@ -2985,10 +3070,12 @@ impl<C> EncodedReusableExecutionBindings<C> {
         self
     }
 
-    pub fn from_operation(operation: EncodedDeviceOperation<C>) -> Self {
+    pub fn from_operation(mut operation: EncodedDeviceOperation<C>) -> Self {
+        let retained_plan_dependencies = operation.take_retained_plan_dependencies();
         let (program_bindings, dynamic_bindings, _compute, result_bindings) =
             operation.into_parts();
         Self {
+            retained_plan_dependencies,
             program_bindings,
             dynamic_bindings,
             result_bindings,
@@ -3008,6 +3095,10 @@ impl<C> EncodedReusableExecutionBindings<C> {
     }
 
     pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, Vec<C>) {
+        assert!(
+            self.retained_plan_dependencies.is_empty(),
+            "retained dependency channel was not consumed by core"
+        );
         (
             self.program_bindings,
             self.dynamic_bindings,

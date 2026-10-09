@@ -23,6 +23,14 @@ pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION: u32 = 1;
 /// A separate version for causal projection roles; schema 1 retains its
 /// original set of accepted bases and ports.
 pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2: u32 = 2;
+/// Explicit per-wave upstream routes; old composite schemas do not accept them.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM: u32 = 3;
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ: u32 = 4;
+/// Separate upstream extra-format ABIs; legacy schemas retain their closed set.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA: u32 = 5;
+/// Six-format upstream with explicitly qualified extra-format MMQ prefill.
+/// Schema 6 is reserved for the independent k8 hybrid candidate.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,14 +71,23 @@ pub enum ProjectionBlockFormat {
     Q4K,
     Q5K,
     Iq4Xs,
+    Q3K,
+    Iq3S,
+    Iq4Nl,
 }
 
 impl ProjectionBlockFormat {
-    fn abi(self) -> (&'static str, u32, u32) {
+    pub const fn is_extra(self) -> bool {
+        matches!(self, Self::Q3K | Self::Iq3S | Self::Iq4Nl)
+    }
+    pub(super) fn abi(self) -> (&'static str, u32, u32) {
         match self {
             Self::Q4K => ("quantization.gguf.q4-k", 256, 144),
             Self::Q5K => ("quantization.gguf.q5-k", 256, 176),
             Self::Iq4Xs => ("quantization.gguf.iq4-xs", 256, 136),
+            Self::Q3K => ("quantization.gguf.q3-k", 256, 110),
+            Self::Iq3S => ("quantization.gguf.iq3-s", 256, 110),
+            Self::Iq4Nl => ("quantization.gguf.iq4-nl", 32, 18),
         }
     }
 
@@ -144,6 +161,27 @@ pub enum DeclaredProjectionArithmetic<'a> {
 impl CompositeNumericalArithmetic {
     pub(super) fn base_contract(&self) -> Result<StandardOperationContract, String> {
         let contract = match (self.schema_version, self.strict_base.operation_id.as_str()) {
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                DENSE_SWIGLU_OPERATION_ID,
+            ) => dense_swiglu_contract(),
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => gated_delta_recurrent_attention_f32_master_contract(),
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => causal_paged_attention_f32_master_contract(),
             (COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION, DENSE_SWIGLU_OPERATION_ID) => {
                 dense_swiglu_contract()
             }
@@ -199,6 +237,10 @@ impl CompositeNumericalArithmetic {
             self.schema_version,
             COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
         ) {
             return Err(
                 "unsupported composite arithmetic schema version; explicit migration required"
@@ -244,6 +286,17 @@ impl CompositeNumericalArithmetic {
             }
             let mut formats = BTreeSet::new();
             for leaf in &projection.leaves {
+                if leaf.format.is_extra()
+                    && !matches!(
+                        self.schema_version,
+                        COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                            | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                    )
+                {
+                    return Err(
+                        "extra weight formats require the separate upstream-extra schema".into(),
+                    );
+                }
                 if !formats.insert(leaf.format) {
                     return Err(
                         "a projection cannot declare competing leaves for the same block format"
@@ -251,6 +304,56 @@ impl CompositeNumericalArithmetic {
                     );
                 }
                 leaf.arithmetic.validate()?;
+                if self.schema_version == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ {
+                    let policy = leaf
+                        .arithmetic
+                        .g32_mmq_policy()
+                        .ok_or("hybrid composite requires its closed hybrid leaf arithmetic")?;
+                    if policy.format != leaf.format
+                        || leaf.shape.minimum_input_features != 256
+                        || leaf.shape.minimum_output_features != 1
+                        || leaf.shape.input_features_multiple != 256
+                    {
+                        return Err(
+                            "hybrid leaf format/shape differs from the exact G32/MMQ contract"
+                                .into(),
+                        );
+                    }
+                    continue;
+                }
+                if matches!(
+                    self.schema_version,
+                    COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                ) {
+                    let [NumericalArithmeticStage::UpstreamProjection { policy }] =
+                        leaf.arithmetic.stages.as_slice()
+                    else {
+                        return Err("upstream composite leaves require upstream arithmetic".into());
+                    };
+                    if leaf.format.is_extra()
+                        && (leaf.arithmetic.schema_version == super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL)
+                            != (self.schema_version == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL)
+                    {
+                        return Err("extra prefill leaf requires its separate composite schema".into());
+                    }
+                    if policy.format != leaf.format
+                        || leaf.shape.minimum_input_features == 0
+                        || leaf.shape.minimum_output_features == 0
+                        || leaf.shape.input_features_multiple == 0
+                        || leaf.shape.input_features_multiple % leaf.format.abi().1 != 0
+                        || (leaf.format.is_extra()
+                            && (leaf.shape.minimum_input_features < 256
+                                || leaf.shape.input_features_multiple % 256 != 0))
+                    {
+                        return Err("upstream leaf format or complete-block shape differs from its projection".into());
+                    }
+                    continue;
+                }
+                if leaf.arithmetic.schema_version != super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION {
+                    return Err("legacy composite schemas require legacy staged arithmetic".into());
+                }
                 let NumericalArithmeticStage::IntegerDot {
                     values_per_partial, ..
                 } = &leaf.arithmetic.stages[1]

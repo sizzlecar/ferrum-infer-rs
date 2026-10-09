@@ -14,7 +14,7 @@ use super::super::{
     TrustedPlanRuntimeEvidence, VNextError,
 };
 use super::buffer_view::{
-    sequence_execution_shape, validate_value_binding_physical_coverage,
+    sequence_execution_shape, validate_value_binding_physical_coverage, OperationBacking,
     ValueBindingPhysicalCoverage,
 };
 use super::foundation::invalid_operation;
@@ -24,6 +24,8 @@ use super::{
     ResolvedValueRole, ReusableBindingResources,
 };
 
+#[cfg(test)]
+mod materialization_tests;
 mod view_coverage;
 #[cfg(test)]
 pub(crate) use view_coverage::test_only_backing_window_coverage;
@@ -250,6 +252,21 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         match self {
             Self::Invocation(invocation) => invocation.backing_view(resource_id),
             Self::Wave { wave, node_index } => wave.backing_view(node_index, resource_id),
+        }
+    }
+
+    fn revalidate_backing_view(
+        self,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<(), VNextError> {
+        match self {
+            Self::Wave { wave, node_index } => {
+                wave.revalidate_backing_view(node_index, resource_id, retained)
+            }
+            Self::Invocation(_) => Err(invalid_operation(
+                "shared materialization requires one prepared wave",
+            )),
         }
     }
 }
@@ -605,6 +622,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         active_binding: &TrustedActiveSequenceBinding,
         participant_index: usize,
         reusable_bindings_only: bool,
+        shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -756,10 +774,25 @@ impl<'a, B> OperationInvocation<'a, B> {
                     // allocate a missing-resource error before every state view.
                     let backing = match descriptor_lifetime {
                         AllocationLifetime::Request | AllocationLifetime::Sequence => {
-                            resources.participant_backing_view(participant_index, resource_id)?
+                            OperationBacking::Owned(
+                                resources
+                                    .participant_backing_view(participant_index, resource_id)?,
+                            )
                         }
                         AllocationLifetime::Step | AllocationLifetime::Invocation => {
-                            resources.backing_view(resource_id)?
+                            if let Some(entry) = shared_backings.get_mut(resource_index) {
+                                let retained = if let Some(retained) = entry {
+                                    resources.revalidate_backing_view(resource_id, retained)?;
+                                    Arc::clone(retained)
+                                } else {
+                                    let retained = Arc::new(resources.backing_view(resource_id)?);
+                                    *entry = Some(Arc::clone(&retained));
+                                    retained
+                                };
+                                OperationBacking::Shared(retained)
+                            } else {
+                                OperationBacking::Owned(resources.backing_view(resource_id)?)
+                            }
                         }
                         AllocationLifetime::Plan => {
                             return Err(invalid_operation(format!(
@@ -1073,6 +1106,8 @@ pub struct BatchedOperationInvocation<'a, B> {
     node_identity: &'a BatchOperationNodeIdentity,
     participants: Vec<OperationInvocation<'a, B>>,
     program_binding: Option<ProgramBindingNodeBinding>,
+    pub(super) retained_dependency_scope: Arc<()>,
+    pub(super) retained_persistent_preserve: bool,
 }
 
 impl<'a, B> BatchedOperationInvocation<'a, B> {
@@ -1099,6 +1134,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             OperationInvocationResources::Invocation(resources),
             active_bindings.iter(),
             false,
+            true,
         )
     }
 
@@ -1126,6 +1162,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             OperationInvocationResources::Wave { wave, node_index },
             active_bindings,
             false,
+            true,
         )
     }
 
@@ -1155,6 +1192,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             OperationInvocationResources::Wave { wave, node_index },
             active_bindings,
             true,
+            true,
         )
     }
 
@@ -1168,6 +1206,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         resources: OperationInvocationResources<'a, R>,
         active_bindings: I,
         reusable_bindings_only: bool,
+        share_materialization: bool,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -1202,6 +1241,19 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         }
         let node = prepared.node(resolved, node_identity.node_id())?;
         let operation = resolved.capabilities().operation(node.operation_id())?;
+        // A new table for each node/wave construction, never stored in a Plan,
+        // lane or returned invocation. Only the immutable payload is shared;
+        // each later participant rechecks live pool authority before using it.
+        let mut shared_backings = if share_materialization
+            && participant_count > 1
+            && matches!(resources, OperationInvocationResources::Wave { .. })
+        {
+            (0..prepared.resources.len())
+                .map(|_| None)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let participants = node_identity
             .participants()
             .iter()
@@ -1220,6 +1272,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     active_binding,
                     index,
                     reusable_bindings_only,
+                    &mut shared_backings,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1229,6 +1282,11 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             node_identity,
             participants,
             program_binding,
+            retained_dependency_scope: Arc::new(()),
+            retained_persistent_preserve: node.provider_resources().persistent().is_some_and(|p| {
+                p.scope() == crate::vnext::ProviderWorkspaceScope::Plan
+                    && p.reuse_policy() == crate::vnext::ProviderWorkspaceReusePolicy::Preserve
+            }),
         })
     }
 

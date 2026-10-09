@@ -9,6 +9,13 @@ use super::{floating, ElementType};
 /// they are never inferred from an operation/profile/model name. New schemas
 /// require an explicit migration instead of ignoring unknown stages or fields.
 pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION: u32 = 1;
+/// Closed upstream projection policies. Schema 1 retains its original stages.
+pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM: u32 = 2;
+/// Exact G32 for local rows 1..32, MarkerV2 MMQ for rows 33..2048.
+pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ: u32 = 3;
+pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA: u32 = 4;
+/// Extra-format MMQ prefill; version 5 is reserved for the separate k8 hybrid.
+pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,6 +98,12 @@ pub enum FloatingStorageRounding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NumericalArithmeticStage {
+    /// A complete, separately versioned pipeline, including its final F16
+    /// conversion. It is never mixed with the schema-1 five-stage sequence.
+    G32MmqPrefillProjection { policy: super::G32MmqPrefillPolicy },
+    UpstreamProjection {
+        policy: super::UpstreamProjectionPolicy,
+    },
     ActivationQuantization {
         input_type: ElementType,
         code_type: ElementType,
@@ -135,6 +148,10 @@ pub enum NumericalArithmeticStage {
 impl StagedNumericalArithmetic {
     pub(super) fn output_type(&self) -> Option<ElementType> {
         match self.stages.last() {
+            Some(
+                NumericalArithmeticStage::UpstreamProjection { .. }
+                | NumericalArithmeticStage::G32MmqPrefillProjection { .. },
+            ) => Some(ElementType::F16),
             Some(NumericalArithmeticStage::OutputRounding { output_type, .. }) => {
                 Some(*output_type)
             }
@@ -146,6 +163,45 @@ impl StagedNumericalArithmetic {
     /// Family registration still has to reproduce this declaration; operation
     /// and provider versions must implement it before any plan can execute it.
     pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version == NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ {
+            return match self.stages.as_slice() {
+                [NumericalArithmeticStage::G32MmqPrefillProjection { policy }] => policy.validate(),
+                _ => Err("hybrid schema requires exactly one closed G32/MMQ policy".into()),
+            };
+        }
+        if matches!(
+            self.schema_version,
+            NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+        ) {
+            return match self.stages.as_slice() {
+                [NumericalArithmeticStage::UpstreamProjection { policy }] => {
+                    if policy.format.is_extra()
+                        != matches!(
+                            self.schema_version,
+                            NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                                | NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                        )
+                    {
+                        return Err("upstream format belongs to a different staged schema".into());
+                    }
+                    let extra_prefill = policy.format.is_extra()
+                        && policy
+                            .routes
+                            .iter()
+                            .any(|route| route.prefill_rows.is_some());
+                    if extra_prefill
+                        != (self.schema_version
+                            == NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL)
+                    {
+                        return Err("extra prefill requires its separate staged schema".into());
+                    }
+                    policy.validate()
+                }
+                _ => Err("upstream schema requires exactly one closed projection policy".into()),
+            };
+        }
         if self.schema_version != NUMERICAL_ARITHMETIC_SCHEMA_VERSION {
             return Err(
                 "unsupported staged arithmetic schema version; explicit migration required".into(),

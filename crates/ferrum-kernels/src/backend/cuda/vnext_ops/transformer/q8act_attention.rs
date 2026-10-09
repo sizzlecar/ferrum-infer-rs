@@ -1,5 +1,6 @@
 //! Retained local projection arithmetic shared by the two attention providers.
-//! No numerical choice is made from token count, launch success or model name.
+//! Old identities retain fixed arithmetic. Only the separately versioned hybrid
+//! declares a local-row selection; launch success and model names never select it.
 use super::super::binding;
 use super::super::native_blocks::q8act::{self, Q8ActKernels};
 use super::super::native_blocks::weights;
@@ -11,15 +12,19 @@ use ferrum_interfaces::vnext::{
     BatchedOperationInvocation, PreparedProjection, PreparedProjectionNumerics, ProjectionRole,
     Q8ActAttentionProfile, Q8ActSwiGluProfile, ResolvedValueBinding, ResolvedValueRole,
 };
+use std::borrow::Cow;
+
+pub(super) mod upstream;
 
 #[derive(Clone)]
-pub(super) struct PreparedAttentionProjections {
+pub(super) struct PreparedAttentionProjections<'a> {
     profile: Q8ActAttentionProfile,
-    numerics: PreparedProjectionNumerics,
+    numerics: Cow<'a, PreparedProjectionNumerics>,
     bytes_per_token: u64,
+    upstream: Option<upstream::State>,
 }
 
-impl PreparedAttentionProjections {
+impl<'a> PreparedAttentionProjections<'a> {
     pub fn prepare(
         profile: Q8ActAttentionProfile,
         values: &[ResolvedValueBinding],
@@ -50,8 +55,9 @@ impl PreparedAttentionProjections {
         let bytes_per_token = q8act::workspace_per_token(&numerics)?;
         Ok(Self {
             profile,
-            numerics,
+            numerics: Cow::Owned(numerics),
             bytes_per_token,
+            upstream: None,
         })
     }
 
@@ -82,20 +88,49 @@ impl PreparedAttentionProjections {
     }
 
     pub fn into_numerics(self) -> PreparedProjectionNumerics {
-        self.numerics
+        self.numerics.into_owned()
+    }
+
+    /// Compute closures outlive the invocation. The Full path is already owned;
+    /// this boundary also prevents a future borrowed preparation escaping encode.
+    pub fn into_owned(self) -> PreparedAttentionProjections<'static> {
+        PreparedAttentionProjections {
+            profile: self.profile,
+            numerics: Cow::Owned(self.numerics.into_owned()),
+            bytes_per_token: self.bytes_per_token,
+            upstream: self.upstream,
+        }
     }
     pub fn bytes_per_token(&self) -> u64 {
         self.bytes_per_token
     }
+    pub fn uses_g32(&self, rows: u32) -> bool {
+        self.upstream.as_ref().is_some_and(|s| s.uses_g32(rows))
+    }
+    pub fn is_upstream_for_rows(&self, rows: u32) -> bool {
+        self.is_upstream() && !self.uses_g32(rows)
+    }
+    pub fn is_upstream(&self) -> bool {
+        self.upstream.is_some()
+    }
+    pub fn persistent_requirement(
+        &self,
+    ) -> Result<Option<ferrum_interfaces::vnext::ProviderWorkspaceRequirement>, String> {
+        self.upstream_persistent_requirement()
+    }
+    pub fn fixed_bytes(&self) -> u64 {
+        self.upstream.as_ref().map_or(0, |s| s.fixed_bytes)
+    }
     pub fn alignment_slop(&self) -> u64 {
-        if self.bytes_per_token == 0 {
+        if self.bytes_per_token == 0 && self.fixed_bytes() == 0 {
             0
         } else {
             15
         }
     }
     pub fn required_bytes(&self, base: u64, rows: u64) -> Result<u64, String> {
-        appended_workspace(base, self.bytes_per_token, rows).map(|(_, _, end)| end)
+        let (_, _, end) = self.workspace_layout(base, rows)?;
+        Ok(end)
     }
     pub fn projection(&self, role: ProjectionRole) -> Result<&PreparedProjection, String> {
         self.numerics
@@ -107,6 +142,9 @@ impl PreparedAttentionProjections {
         role: ProjectionRole,
         parts: &[weights::MatrixPart],
     ) -> Result<(), String> {
+        if let Some(upstream) = &self.upstream {
+            return upstream.validate_parts(self.projection(role)?, parts);
+        }
         Q8ActKernels::validate_parts_for_profile(
             Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
             self.projection(role)?,
@@ -118,7 +156,10 @@ impl PreparedAttentionProjections {
             Ok(required || self.projection(role)?.has_staged_leaf())
         })
     }
-    pub fn pack_count(&self) -> Result<u64, String> {
+    pub fn pack_count(&self, rows: u32) -> Result<u64, String> {
+        if self.is_upstream_for_rows(rows) {
+            return Ok(0);
+        }
         use ProjectionRole::*;
         let groups: &[&[ProjectionRole]] = match self.profile {
             Q8ActAttentionProfile::GatedDelta => &[&[GatedDeltaInput], &[GatedDeltaOutput]],
@@ -137,7 +178,27 @@ impl PreparedAttentionProjections {
         Ok(key.bytes(&self.replay_bytes()?).u64(self.bytes_per_token))
     }
     pub fn replay_bytes(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(&self.numerics).map_err(|e| e.to_string())
+        let mut bytes = serde_json::to_vec(&self.numerics).map_err(|e| e.to_string())?;
+
+        if let Some(state) = &self.upstream {
+            state.append_replay_bytes(&mut bytes)?;
+        }
+        Ok(bytes)
+    }
+
+    fn workspace_layout(&self, base: u64, rows: u64) -> Result<(u64, u64, u64), String> {
+        if self.is_upstream() {
+            appended_workspace(
+                base,
+                self.bytes_per_token
+                    .checked_mul(rows)
+                    .and_then(|n| n.checked_add(self.fixed_bytes()))
+                    .ok_or("upstream attention workspace overflows")?,
+                1,
+            )
+        } else {
+            appended_workspace(base, self.bytes_per_token, rows)
+        }
     }
 
     /// Append one invocation-owned region after the ordinary attention layout.
@@ -148,7 +209,8 @@ impl PreparedAttentionProjections {
         base_bytes: u64,
         rows: u64,
     ) -> Result<(u64, u64), CudaDeviceRuntimeError> {
-        let (offset, bytes, required) = appended_workspace(base_bytes, self.bytes_per_token, rows)
+        let (offset, bytes, required) = self
+            .workspace_layout(base_bytes, rows)
             .map_err(CudaDeviceRuntimeError::contract)?;
         if scratch.length_bytes() < required {
             return Err(CudaDeviceRuntimeError::contract(

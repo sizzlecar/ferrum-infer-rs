@@ -100,6 +100,8 @@ impl Drop for TestStream {
 
 struct TestRuntime {
     descriptor: DeviceDescriptor,
+    descriptor_queries: AtomicU64,
+    descriptor_mismatch_buffer: std::sync::atomic::AtomicUsize,
     allocate_calls: AtomicU64,
     fail_on_call: AtomicU64,
     panic_on_call: AtomicU64,
@@ -165,6 +167,8 @@ impl TestRuntime {
                 capabilities: BTreeSet::new(),
                 dynamic_storage_profiles: profiles,
             },
+            descriptor_queries: AtomicU64::new(0),
+            descriptor_mismatch_buffer: std::sync::atomic::AtomicUsize::new(0),
             allocate_calls: AtomicU64::new(0),
             fail_on_call: AtomicU64::new(0),
             panic_on_call: AtomicU64::new(0),
@@ -341,7 +345,14 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
-        buffer.descriptor.clone()
+        self.descriptor_queries.fetch_add(1, Ordering::Relaxed);
+        let mut descriptor = buffer.descriptor.clone();
+        if self.descriptor_mismatch_buffer.load(Ordering::Relaxed)
+            == buffer as *const TestBuffer as usize
+        {
+            descriptor.size_bytes += 1;
+        }
+        descriptor
     }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {

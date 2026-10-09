@@ -34,6 +34,8 @@ where
     pub(super) batch_step_id: BatchStepId,
     pub(super) completed_boundary: Mutex<StepCompletedBoundarySlot>,
     pub(super) finalized: bool,
+    pub(super) retained_plan_dependencies:
+        Mutex<Vec<crate::vnext::RetainedPlanDependencyAuthority>>,
 }
 
 /// Canonical non-empty set selected by the scheduler for one continuous

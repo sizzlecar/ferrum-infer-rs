@@ -12,6 +12,8 @@ pub(crate) use iq3s_grid::IQ3_S_GRID;
 mod iq4nl_values;
 pub(crate) use iq4nl_values::IQ4_NL_VALUES;
 mod block_decode;
+#[cfg(test)]
+pub(crate) mod extra_upstream_oracle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufBlockFormat {

@@ -135,6 +135,25 @@ impl<R> StepResourceLease<R>
 where
     R: DeviceRuntime,
 {
+    /// Child completions, indeterminate submissions and quarantine all own this
+    /// step. Keep exact Plan dependencies until their last device use is reaped,
+    /// even if a backend prefix command drops its borrowed region too early.
+    pub(crate) fn retain_plan_dependencies(
+        &self,
+        leases: Vec<crate::vnext::RetainedPlanDependencyAuthority>,
+    ) -> Result<(), VNextError> {
+        let mut retained = self
+            .retained_plan_dependencies
+            .lock()
+            .map_err(|_| invalid_resource("Plan dependency retention lock poisoned"))?;
+        for lease in leases {
+            if !retained.iter().any(|old| old.identity == lease.identity) {
+                retained.push(lease);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn new(
         participants: Vec<AdmittedStepParticipant<R>>,
         execution_lane: Arc<ExecutionLane<R>>,
@@ -193,6 +212,7 @@ where
             reusable_execution_bucket,
             batch_step_id,
             completed_boundary: super::Mutex::new(super::StepCompletedBoundarySlot::default()),
+            retained_plan_dependencies: super::Mutex::new(Vec::new()),
             finalized: false,
         })
     }
@@ -505,6 +525,26 @@ where
         Err(invalid_resource(format!(
             "resource `{resource_id}` is not step-shared backing"
         )))
+    }
+
+    pub(crate) fn revalidate_backing_view(
+        &self,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<(), VNextError> {
+        let authority = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+            .ok_or_else(|| invalid_resource("retained resource is not step-shared backing"))?;
+        self.participants[0]
+            .session
+            .resources()
+            .request
+            .plan
+            .dynamic_pools()
+            .revalidate_view(authority, retained)
     }
 
     pub(crate) fn dynamic_descriptor(
@@ -1792,6 +1832,31 @@ where
                 .view(authority);
         }
         self.step.backing_view(resource_id)
+    }
+
+    pub(crate) fn revalidate_backing_view(
+        &self,
+        node_index: usize,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<(), VNextError> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?;
+        if let Some(authority) = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+        {
+            return node.participant_authority.participants[0]
+                .request
+                .plan
+                .dynamic_pools()
+                .revalidate_view(authority, retained);
+        }
+        self.step.revalidate_backing_view(resource_id, retained)
     }
 
     pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {

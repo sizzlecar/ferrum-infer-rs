@@ -105,3 +105,113 @@ fn full_coverage_proof_rejects_later_page_evidence_and_invalid_windows() {
         .is_err());
     }
 }
+
+#[test]
+fn full_coverage_checks_unused_later_pages_and_current_descriptors() {
+    let (harness, authority) = paged_window_fixture();
+    let pools = &harness.root.dynamic_pools;
+    let runtime = harness.runtime.as_ref();
+    // The one-byte prefix consumes only page0, but page2 remains part of the
+    // committed backing and must receive the same runtime checks in both arms.
+    let backing = pools.view(&authority).unwrap();
+    let last_buffer = backing.bindings[2].buffer() as *const TestBuffer as usize;
+    let before = runtime.descriptor_queries.load(Ordering::Relaxed);
+    test_only_backing_window_coverage(runtime, backing, 1, 0, &[(0, 1)]).unwrap();
+    // The helper compares reference and candidate, then constructs the proof.
+    // Each validator must visit ALL three current descriptors exactly once.
+    assert_eq!(
+        runtime.descriptor_queries.load(Ordering::Relaxed) - before,
+        3 * 3
+    );
+
+    for page in 1..3 {
+        let mut backing = pools.view(&authority).unwrap();
+        let segment = &backing.bindings[page].segment;
+        backing.bindings[page].segment = BackingSegment::from_chunk(
+            segment.pool_id(),
+            segment.chunk_ordinal(),
+            segment.chunk_generation() + 1,
+            segment.offset_bytes(),
+            segment.length_bytes(),
+        )
+        .unwrap();
+        assert!(test_only_backing_window_coverage(runtime, backing, 1, 0, &[(0, 1)]).is_err());
+    }
+    // Change the runtime descriptor only after legitimate materialization.
+    let backing = pools.view(&authority).unwrap();
+    runtime
+        .descriptor_mismatch_buffer
+        .store(last_buffer, Ordering::Relaxed);
+    assert!(test_only_backing_window_coverage(runtime, backing, 1, 0, &[(0, 1)]).is_err());
+    runtime
+        .descriptor_mismatch_buffer
+        .store(0, Ordering::Relaxed);
+    test_only_backing_window_coverage(runtime, pools.view(&authority).unwrap(), 1, 0, &[(0, 1)])
+        .unwrap();
+}
+
+#[test]
+fn full_coverage_matches_reference_across_paged_windows_and_invalid_extents() {
+    let (harness, authority) = paged_window_fixture();
+    for offset in [0, 1, 63, 64, 65, 127, 128, 191, 192, u64::MAX] {
+        for bytes in [0, 1, 2, 63, 64, 65, 96, 128, 192, 193, u64::MAX] {
+            let backing = harness.root.dynamic_pools.view(&authority).unwrap();
+            let result = test_only_backing_window_coverage(
+                harness.runtime.as_ref(),
+                backing,
+                bytes,
+                offset,
+                &[(0, bytes)],
+            );
+            let expected = bytes > 0 && offset.checked_add(bytes).is_some_and(|end| end <= 192);
+            assert_eq!(result.is_ok(), expected, "offset={offset} bytes={bytes}");
+        }
+    }
+}
+
+#[test]
+fn retained_materialization_rechecks_exact_authority_and_pool_poison() {
+    let (harness, authority) = paged_window_fixture();
+    let pools = &harness.root.dynamic_pools;
+    let backing = pools.view(&authority).unwrap();
+    pools.revalidate_view(&authority, &backing).unwrap();
+    let pool = Arc::clone(&pools.pools[&harness.pool_ids[0]]);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 64)
+        .unwrap();
+    let other = claim_size(pools, &pool, 64);
+    assert!(pools.revalidate_view(&other, &backing).is_err());
+    // A retained chunk keeps memory alive; it cannot make a poisoned pool usable.
+    pool.state.lock().unwrap().poisoned = true;
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+    pool.state.lock().unwrap().poisoned = false;
+    pools.revalidate_view(&authority, &backing).unwrap();
+}
+
+#[test]
+fn retained_materialization_rejects_generation_range_and_metadata_drift() {
+    let (harness, authority) = paged_window_fixture();
+    let pools = &harness.root.dynamic_pools;
+    let mut backing = pools.view(&authority).unwrap();
+    backing.logical_size_bytes -= 1;
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+    let mut backing = pools.view(&authority).unwrap();
+    let segment = &backing.bindings[1].segment;
+    backing.bindings[1].segment = BackingSegment::from_chunk(
+        segment.pool_id(),
+        segment.chunk_ordinal(),
+        segment.chunk_generation() + 1,
+        segment.offset_bytes(),
+        segment.length_bytes(),
+    )
+    .unwrap();
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+    let mut backing = pools.view(&authority).unwrap();
+    backing.bindings.pop();
+    assert!(pools.revalidate_view(&authority, &backing).is_err());
+    pools
+        .revalidate_view(&authority, &pools.view(&authority).unwrap())
+        .unwrap();
+}

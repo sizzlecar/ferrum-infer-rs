@@ -72,7 +72,13 @@ mod hadamard;
 mod numerical;
 pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
+    F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_NUMERICAL_PROFILE_ID,
+    F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_NUMERICAL_PROFILE_ID,
+    F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID,
+    F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
+    F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_NUMERICAL_PROFILE_ID,
+    F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
     F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID,
     F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID,
@@ -368,6 +374,44 @@ impl Qwen35OperationProfile {
         ..Self::F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32
     };
 
+    const F32_MASTER_UPSTREAM_MARKER_V2: Self = Self {
+        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
+        ..Self::F32_MASTER
+    };
+    const F32_MASTER_UPSTREAM_MARKER_V2_PREFILL: Self = Self {
+        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        ..Self::F32_MASTER
+    };
+    const F32_MASTER_UPSTREAM_EXTRA_MARKER_V2_PREFILL: Self = Self {
+        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        ..Self::F32_MASTER
+    };
+    const F32_MASTER_UPSTREAM_MARKER_V2_EXTRA_PREFILL: Self = Self {
+        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
+        ..Self::F32_MASTER
+    };
+    const F32_MASTER_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS: Self = Self {
+        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
+        ..Self::F32_MASTER
+    };
+
+    const F32_MASTER_G32_MMQ_PREFILL_MARKER_V1: Self = Self {
+        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
+        ..Self::F32_MASTER
+    };
+
     const F16_INT8_KV: Self = Self {
         causal_attention: OperationSelection::new(
             CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
@@ -387,6 +431,15 @@ impl Qwen35OperationProfile {
 
     fn for_profile(profile: &NumericalExecutionProfile) -> Result<Self, VNextError> {
         match profile.id.as_str() {
+            F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_UPSTREAM_MARKER_V2_EXTRA_PREFILL)
+            }
+            F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS)
+            }
+            F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_UPSTREAM_EXTRA_MARKER_V2_PREFILL)
+            }
             F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
             F32_MASTER_FFN_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => {
@@ -397,6 +450,15 @@ impl Qwen35OperationProfile {
             }
             F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32)
+            }
+            F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_UPSTREAM_MARKER_V2)
+            }
+            F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_G32_MMQ_PREFILL_MARKER_V1)
+            }
+            F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_UPSTREAM_MARKER_V2_PREFILL)
             }
             F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8)
@@ -884,6 +946,26 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 "numerical_profile",
                 "Q8act attention requires its exact declared dense native GGUF/F16-KV profile",
             ));
+        }
+        if matches!(profile.id.as_str(), F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_NUMERICAL_PROFILE_ID | F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID | F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_NUMERICAL_PROFILE_ID)
+            && (!numerical::upstream_marker_v2_eligible(config, &text)
+                || profile
+                    .kv_storage
+                    .iter()
+                    .any(|state| state.format() != KvStorageFormat::F16)
+                || numerical::profiles(&self.family_id, config)?.resolve(&profile.id)? != profile)
+        {
+            return Err(invalid_config(
+                "numerical_profile",
+                "upstream MarkerV2 requires its exact explicit dense native GGUF/F16-KV profile",
+            ));
+        }
+        if matches!(profile.id.as_str(), F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_NUMERICAL_PROFILE_ID | F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_NUMERICAL_PROFILE_ID | F32_MASTER_FFN_ATTENTION_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_NUMERICAL_PROFILE_ID)
+            && (!numerical::upstream_extra_marker_v2_eligible(config, &text)
+                || profile.kv_storage.iter().any(|state| state.format() != KvStorageFormat::F16)
+                || numerical::profiles(&self.family_id, config)?.resolve(&profile.id)? != profile)
+        {
+            return Err(invalid_config("numerical_profile", "upstream extra MarkerV2 requires its exact explicit dense native GGUF/F16-KV profile"));
         }
         if profile.id.as_str() == F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID {
             if !numerical::gguf_rn_f16_fragment_eligible(config, &text)

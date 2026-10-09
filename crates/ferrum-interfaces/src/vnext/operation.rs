@@ -18,6 +18,11 @@ pub(crate) use invocation::test_only_backing_window_coverage;
 mod provider;
 mod registry;
 mod resolved_value;
+pub(crate) mod retained_dependency;
+pub use retained_dependency::{
+    EncodedRetainedPlanDependency, RetainedPlanDependencyAuthority, RetainedPlanDependencyIdentity,
+    RetainedPlanDependencySpec,
+};
 mod semantic;
 mod storage_profile;
 mod tensor_contract;

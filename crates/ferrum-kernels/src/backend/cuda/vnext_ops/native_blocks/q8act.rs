@@ -266,6 +266,14 @@ impl Q8ActKernels {
         projection: &PreparedProjection,
         parts: &[weights::MatrixPart],
     ) -> Result<(), String> {
+        Self::validate_parts_for_formats(profile_formats(profile), projection, parts)
+    }
+
+    pub(super) fn validate_parts_for_formats(
+        staged_formats: &[GgufBlockFormat],
+        projection: &PreparedProjection,
+        parts: &[weights::MatrixPart],
+    ) -> Result<(), String> {
         if parts.len() != projection.leaves().len() {
             return Err("Q8act plan and matrix inventories differ".into());
         }
@@ -290,7 +298,7 @@ impl Q8ActKernels {
                 || part.transform.is_some() != leaf.has_weight_transform()
                 || (leaf.is_staged()
                     && (!matches!(part.format, weights::MatrixFormat::Block(format)
-                            if profile_formats(profile).contains(&format))
+                            if staged_formats.contains(&format))
                         || part.transform.is_some()))
             {
                 return Err("Q8act retained matrix differs from the prepared leaf decision".into());

@@ -19,7 +19,7 @@ fn causal_plan(
     formats: [GgufBlockFormat; 4],
     k: usize,
     n: usize,
-) -> (PreparedAttentionProjections, Vec<MatrixPart>) {
+) -> (PreparedAttentionProjections<'static>, Vec<MatrixPart>) {
     let parts = formats
         .into_iter()
         .enumerate()
@@ -47,7 +47,11 @@ fn attention_q8act_pack_groups_follow_retained_projection_eligibility() {
         ([Q4K, Q5K, Iq4Xs, Q4K], 2),
     ] {
         let (plan, parts) = causal_plan(formats, 256, 17);
-        assert_eq!(plan.pack_count().unwrap(), expected);
+        // The original G32 profile keeps its packing policy across the new
+        // hybrid's row boundary; only the new numerical identity may switch.
+        for rows in [1, 32, 33] {
+            assert_eq!(plan.pack_count(rows).unwrap(), expected);
+        }
         for (i, role) in [
             ProjectionRole::CausalQuery,
             ProjectionRole::CausalKey,

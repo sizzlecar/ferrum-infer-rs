@@ -6,6 +6,8 @@ mod q8act_swiglu;
 pub use q8act_swiglu::*;
 mod q8act_attention;
 pub use q8act_attention::*;
+mod upstream_marker_v2;
+pub use upstream_marker_v2::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;

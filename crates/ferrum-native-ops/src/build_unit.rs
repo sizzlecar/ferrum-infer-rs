@@ -13,14 +13,18 @@ pub enum CudaNativeBuildUnit {
     VllmMarlin,
     VllmMoeMarlin,
     VllmPagedAttentionV2,
+    UpstreamLinear,
+    UpstreamExtraLinear,
 }
 
 impl CudaNativeBuildUnit {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Marlin,
         Self::VllmMarlin,
         Self::VllmMoeMarlin,
         Self::VllmPagedAttentionV2,
+        Self::UpstreamLinear,
+        Self::UpstreamExtraLinear,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -29,6 +33,8 @@ impl CudaNativeBuildUnit {
             Self::VllmMarlin => "vllm_marlin",
             Self::VllmMoeMarlin => "vllm_moe_marlin",
             Self::VllmPagedAttentionV2 => "vllm_paged_attention_v2",
+            Self::UpstreamLinear => "upstream_linear",
+            Self::UpstreamExtraLinear => "upstream_extra_linear",
         }
     }
 
@@ -38,6 +44,8 @@ impl CudaNativeBuildUnit {
             Self::VllmMarlin => "ferrum.cuda.vllm_marlin",
             Self::VllmMoeMarlin => "ferrum.cuda.vllm_moe_marlin",
             Self::VllmPagedAttentionV2 => "ferrum.cuda.vllm_paged_attention_v2",
+            Self::UpstreamLinear => "ferrum.cuda.upstream_linear",
+            Self::UpstreamExtraLinear => "ferrum.cuda.upstream_extra_linear",
         }
     }
 
@@ -49,6 +57,38 @@ impl CudaNativeBuildUnit {
 
     pub const fn required_exports(self) -> &'static [&'static str] {
         match self {
+            Self::UpstreamLinear => &[
+                "ferrum_upstream_mmq_cast_v1",
+                "ferrum_upstream_mmq_cast_v2",
+                "ferrum_upstream_mmq_check_weights_v2",
+                "ferrum_upstream_mmq_dot_v1",
+                "ferrum_upstream_mmq_pack_v1",
+                "ferrum_upstream_mmq_pack_v2",
+                "ferrum_upstream_mmq_plan_v1",
+                "ferrum_upstream_mmvq_cast_v1",
+                "ferrum_upstream_mmvq_cast_v2",
+                "ferrum_upstream_mmvq_check_weights_v2",
+                "ferrum_upstream_mmvq_dot_v1",
+                "ferrum_upstream_mmvq_pack_v1",
+                "ferrum_upstream_mmvq_pack_v2",
+                "ferrum_upstream_mmvq_plan_v1",
+            ],
+            Self::UpstreamExtraLinear => &[
+                "ferrum_upstream_extra_mmq_cast_v1",
+                "ferrum_upstream_extra_mmq_cast_v2",
+                "ferrum_upstream_extra_mmq_check_weights_v2",
+                "ferrum_upstream_extra_mmq_dot_v1",
+                "ferrum_upstream_extra_mmq_pack_v1",
+                "ferrum_upstream_extra_mmq_pack_v2",
+                "ferrum_upstream_extra_mmq_plan_v1",
+                "ferrum_upstream_extra_mmvq_cast_v1",
+                "ferrum_upstream_extra_mmvq_cast_v2",
+                "ferrum_upstream_extra_mmvq_check_weights_v2",
+                "ferrum_upstream_extra_mmvq_dot_v1",
+                "ferrum_upstream_extra_mmvq_pack_v1",
+                "ferrum_upstream_extra_mmvq_pack_v2",
+                "ferrum_upstream_extra_mmvq_plan_v1",
+            ],
             Self::Marlin => &["marlin_cuda", "marlin_cuda_moe"],
             Self::VllmMarlin => &[
                 "ferrum_block_fp8_group128_repack",
@@ -260,5 +300,42 @@ mod tests {
                 export: "ferrum_vllm_marlin_moe_fp8_f16",
             }
         );
+    }
+    #[test]
+    fn extra_artifact_cannot_be_satisfied_by_original_operator_or_symbols() {
+        let old = exports(CudaNativeBuildUnit::UpstreamLinear);
+        let extra = CudaNativeBuildUnit::UpstreamExtraLinear;
+        let old_operator = [ArtifactView {
+            operator: CudaNativeBuildUnit::UpstreamLinear.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &old,
+        }];
+        assert!(matches!(
+            resolve_views(&old_operator, [extra]),
+            Err(CudaNativeBuildCoverageError::MissingArtifact { .. })
+        ));
+        let wrong_symbols = [ArtifactView {
+            operator: extra.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &old,
+        }];
+        assert!(matches!(
+            resolve_views(&wrong_symbols, [extra]),
+            Err(CudaNativeBuildCoverageError::MissingExport { .. })
+        ));
+        let new = exports(extra);
+        let both = [
+            ArtifactView {
+                operator: CudaNativeBuildUnit::UpstreamLinear.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &old,
+            },
+            ArtifactView {
+                operator: extra.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &new,
+            },
+        ];
+        assert!(resolve_views(&both, [CudaNativeBuildUnit::UpstreamLinear, extra]).is_ok());
     }
 }
