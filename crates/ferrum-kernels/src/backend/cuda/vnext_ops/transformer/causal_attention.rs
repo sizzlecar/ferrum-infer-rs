@@ -21,7 +21,10 @@ use ferrum_interfaces::vnext::{
     ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
 };
-use ferrum_types::{AttentionExecutionPolicy, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
+use ferrum_types::{
+    AttentionExecutionPolicy, ProgramBindingUploadStrategy,
+    CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
+};
 use sha2::{Digest, Sha256};
 
 use super::replay_encoding::{Encoding, EncodingTarget};
@@ -138,6 +141,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     descriptor: OperationProviderDescriptor,
     functions: CausalAttentionFunctions,
     attention_policy: AttentionExecutionPolicy,
+    program_binding_upload_strategy: ProgramBindingUploadStrategy,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     q8act: bool,
@@ -476,6 +480,7 @@ impl CudaCausalPagedAttentionProvider {
         ]);
         provider_sources.push(attention_policy.as_runtime_value().as_bytes());
         provider_sources.push(semantics.fingerprint_tag());
+        provider_sources.push(include_bytes!("../../../program_binding_rows.rs"));
 
         if upstream {
             provider_sources.extend(super::q8act_attention::upstream::fingerprint_sources());
@@ -763,6 +768,7 @@ impl CudaCausalPagedAttentionProvider {
             descriptor,
             functions,
             attention_policy,
+            program_binding_upload_strategy: runtime.program_binding_upload_strategy(),
             semantics,
             precision,
             q8act,
@@ -988,6 +994,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             &self.functions,
             self.descriptor.provider_implementation_fingerprint(),
             self.attention_policy,
+            self.program_binding_upload_strategy,
             self.semantics,
             self.precision,
             self.descriptor.operation_id().as_str(),
@@ -1039,6 +1046,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 &self.functions,
                 self.descriptor.provider_implementation_fingerprint(),
                 self.attention_policy,
+                self.program_binding_upload_strategy,
                 self.semantics,
                 self.precision,
                 self.descriptor.operation_id().as_str(),
@@ -1059,6 +1067,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         encode_reusable_attention_bindings(
             invocation,
             self.semantics,
+            self.program_binding_upload_strategy,
             self.descriptor.operation_id().as_str(),
         )
         .map_err(|message| {
@@ -2272,6 +2281,7 @@ fn encode_attention(
     functions: &CausalAttentionFunctions,
     provider_fingerprint: &str,
     attention_policy: AttentionExecutionPolicy,
+    program_binding_upload_strategy: ProgramBindingUploadStrategy,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     operation_id: &str,
@@ -2610,10 +2620,12 @@ fn encode_attention(
                 if binding.host_binding != index {
                     return Err("CUDA causal binding payload order is not canonical".to_owned());
                 }
-                writes.push(
-                    super::CudaProgramBindingWrite::new(binding.binding_offset, payload)
-                        .map_err(|error| error.to_string())?,
-                );
+                writes.push(causal_program_binding_write(
+                    program_binding_upload_strategy,
+                    binding.binding_offset,
+                    payload,
+                    binding_layout.slot_bytes,
+                )?);
             }
             (
                 CudaDeviceCommand::program_binding_patch(
@@ -3096,9 +3108,31 @@ fn validate_packed_token_ranges(
     Ok(())
 }
 
+// This provider owns the entire logical row: six control words followed by
+// the maximum-context address table. Kernels read only the current counts, and
+// the existing numerical-status word is reset by the unchanged live prefix.
+// No physical capacity beyond BindingLayout::required_bytes is authorized.
+fn causal_program_binding_write(
+    strategy: ProgramBindingUploadStrategy,
+    offset: u64,
+    payload: Box<[u8]>,
+    logical_row_bytes: u64,
+) -> Result<super::CudaProgramBindingWrite, String> {
+    match strategy {
+        ProgramBindingUploadStrategy::Sparse => {
+            super::CudaProgramBindingWrite::new(offset, payload)
+        }
+        ProgramBindingUploadStrategy::CompleteRows => {
+            super::CudaProgramBindingWrite::complete_logical_row(offset, payload, logical_row_bytes)
+        }
+    }
+    .map_err(|error| error.to_string())
+}
+
 fn encode_reusable_attention_bindings(
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     semantics: CausalAttentionSemantics,
+    program_binding_upload_strategy: ProgramBindingUploadStrategy,
     operation_id: &str,
 ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty() || invocation.operation().id.as_str() != operation_id {
@@ -3173,13 +3207,12 @@ fn encode_reusable_attention_bindings(
             &pages,
             &scale_pages,
         )?;
-        writes.push(
-            super::CudaProgramBindingWrite::new(
-                binding_layout.binding_offset(participant_index)?,
-                payload,
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        writes.push(causal_program_binding_write(
+            program_binding_upload_strategy,
+            binding_layout.binding_offset(participant_index)?,
+            payload,
+            binding_layout.slot_bytes,
+        )?);
         fence_dependencies.extend(pages);
         fence_dependencies.extend(scale_pages);
     }

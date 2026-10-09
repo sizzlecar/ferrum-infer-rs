@@ -877,6 +877,9 @@ pub struct RunCommand {
     /// Host invocation preparation policy for native plan runtimes (default: full).
     #[arg(long, value_enum)]
     pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
+    /// CUDA plan-runtime binding upload policy (default: sparse).
+    #[arg(long, value_enum)]
+    pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
 
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
@@ -2717,6 +2720,12 @@ fn run_startup_cli_runtime_entries(
         cmd.invocation_preparation_strategy
             .map(crate::commands::InvocationPreparationStrategyArg::as_runtime_value),
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+        cmd.program_binding_upload_strategy
+            .map(crate::commands::ProgramBindingUploadStrategyArg::as_runtime_value),
+    );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
         "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
@@ -2991,6 +3000,7 @@ mod tests {
             max_num_batched_tokens: None,
             prefill_decode_execution: None,
             invocation_preparation_strategy: None,
+            program_binding_upload_strategy: None,
             scheduler_slo: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
@@ -3020,6 +3030,52 @@ mod tests {
             request_dump_dir: None,
             profile_sample_rate: crate::observability_product::default_profile_sample_rate(),
             output_format: OutputFormat::Text,
+        }
+    }
+
+    #[test]
+    fn program_binding_upload_run_override_reaches_engine_config() {
+        use crate::commands::ProgramBindingUploadStrategyArg;
+        use ferrum_types::ProgramBindingUploadStrategy;
+        let mut command = test_run_cmd();
+        let config_entries = crate::config::RuntimeCliConfig {
+            program_binding_upload_strategy: Some(ProgramBindingUploadStrategy::CompleteRows),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, expected) in [
+            (None, ProgramBindingUploadStrategy::CompleteRows),
+            (
+                Some(ProgramBindingUploadStrategyArg::Sparse),
+                ProgramBindingUploadStrategy::Sparse,
+            ),
+            (
+                Some(ProgramBindingUploadStrategyArg::CompleteRows),
+                ProgramBindingUploadStrategy::CompleteRows,
+            ),
+        ] {
+            command.program_binding_upload_strategy = option;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.program_binding_upload_strategy, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if option.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
+            );
         }
     }
 

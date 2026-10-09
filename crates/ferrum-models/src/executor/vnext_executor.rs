@@ -67,6 +67,7 @@ mod invocation_preparation;
 mod mixed_batch;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
+mod program_binding_upload;
 mod request;
 mod reusable_catalog;
 mod state_memory;
@@ -1402,6 +1403,7 @@ impl VNextReusableExecutionCatalogMissLedger {
 struct VNextExecutorMetrics {
     prefix_cache: Arc<prefix_cache::PrefixCacheMetrics>,
     invocation_preparation: invocation_preparation::PreparationMetrics,
+    program_binding_upload: program_binding_upload::ProgramBindingUploadMetrics,
     prefill_operations: AtomicU64,
     prefill_frontier_narrowings: AtomicU64,
     decode_operations: AtomicU64,
@@ -5061,6 +5063,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             })
             .transpose()?;
 
+        let metrics = VNextExecutorMetrics::default();
+        metrics
+            .program_binding_upload
+            .reset_baseline(runtime.program_binding_upload_snapshot());
         Ok(Self {
             info,
             resolved_plan,
@@ -5100,7 +5106,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             diagnostic_fault: config.diagnostic_fault,
             diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
-            metrics: VNextExecutorMetrics::default(),
+            metrics,
         })
     }
 
@@ -5780,6 +5786,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // the first product wave establishes and accounts for its own upload.
         self.product_token_mask_residency.lock().clear();
         self.metrics.reset_after_startup();
+        self.metrics
+            .program_binding_upload
+            .reset_baseline(self.runtime.program_binding_upload_snapshot());
         Ok(())
     }
 
@@ -9860,6 +9869,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // values, including disabled/zero, so text-LCP fallback cannot stand in
         // for sequence checkpoint reuse on this executor.
         fields.extend(self.prefix_cache_metrics_snapshot());
+        fields.insert(
+            "program_binding_upload".to_owned(),
+            self.metrics
+                .program_binding_upload
+                .snapshot(self.runtime.program_binding_upload_snapshot()),
+        );
         fields.insert(
             "invocation_preparation".to_owned(),
             self.metrics.invocation_preparation.snapshot(),

@@ -20,6 +20,12 @@ mod native_status;
 #[cfg(any(feature = "cuda", test))]
 mod reusable_execution;
 
+#[cfg(any(feature = "cuda", test))]
+mod program_binding_rows;
+
+#[cfg(any(feature = "cuda", test))]
+mod program_binding_upload;
+
 mod kv_layer;
 pub use kv_layer::*;
 

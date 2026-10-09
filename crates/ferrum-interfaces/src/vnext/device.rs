@@ -10,6 +10,9 @@ use std::time::Duration;
 
 use ferrum_types::AttentionExecutionPolicy;
 
+mod program_binding_upload;
+pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
+
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
     EncodedRetainedPlanDependency, ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope,
@@ -3690,6 +3693,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         commands: Vec<Self::Command>,
     ) -> Result<Vec<Self::Command>, Self::Error> {
         Ok(commands)
+    }
+
+    /// Cumulative typed binding-prelude upload observations for this runtime.
+    /// Successful copies mean the host CUDA API returned success, not that a
+    /// GPU fence completed. Unsupported backends retain the default `None`.
+    fn program_binding_upload_snapshot(&self) -> Option<DeviceProgramBindingUploadSnapshot> {
+        None
     }
 
     /// Submits one non-empty ordered command batch and returns its exact

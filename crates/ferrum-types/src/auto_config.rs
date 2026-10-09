@@ -1165,6 +1165,16 @@ impl FerrumConfigBuilder {
                 RuntimeConfigSource::Default,
             );
         }
+        if self
+            .entry("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+            .is_none()
+        {
+            runtime_config.upsert(
+                "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                crate::ProgramBindingUploadStrategy::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
             if self
                 .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
@@ -1241,6 +1251,7 @@ impl FerrumConfigBuilder {
         )?);
         decisions.push(self.prefill_decode_execution_decision()?);
         decisions.push(self.invocation_preparation_strategy_decision()?);
+        decisions.push(self.program_binding_upload_strategy_decision()?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -2547,6 +2558,46 @@ impl FerrumConfigBuilder {
             source,
             source_key,
             ["full", "identity-projection"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn program_binding_upload_strategy_decision(
+        &self,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY";
+        let (strategy, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::ProgramBindingUploadStrategy::parse_runtime_value(&entry.effective_value)
+                    .map_err(|reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    })?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::ProgramBindingUploadStrategy::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if strategy == crate::ProgramBindingUploadStrategy::CompleteRows
+            && (!self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
+        {
+            return Err(AutoConfigError::InvalidOverride {
+                key: key.to_owned(),
+                reason: "complete-rows requires a CUDA plan runtime".to_owned(),
+            });
+        }
+        Ok(self.decision(
+            "program_binding_upload_strategy",
+            strategy.as_runtime_value(),
+            source,
+            source_key,
+            ["sparse", "complete-rows"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5358,6 +5409,91 @@ mod tests {
         assert!(
             matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
         );
+    }
+
+    #[test]
+    fn program_binding_upload_records_sparse_default_and_explicit_sources() {
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY";
+        for (value, runtime_source, source) in [
+            (
+                None,
+                RuntimeConfigSource::Default,
+                AutoConfigSource::Default,
+            ),
+            (
+                Some("complete-rows"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("complete-rows"),
+                RuntimeConfigSource::Env,
+                AutoConfigSource::Env,
+            ),
+            (
+                Some("sparse"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+        ] {
+            let snapshot = value
+                .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
+                .unwrap_or_default();
+            let resolved =
+                scheduler_resolution("cuda", ExecutionResourceAuthority::PlanRuntime, 4, snapshot);
+            let expected = value.unwrap_or("sparse");
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, expected);
+            assert_eq!(entry.source, runtime_source);
+            let decision = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "program_binding_upload_strategy")
+                .unwrap();
+            assert_eq!(decision.selected, expected);
+            assert!(decision.candidates.contains(&decision.selected));
+            assert_eq!(decision.source, source);
+            assert_eq!(decision.source_key.as_deref(), value.map(|_| key));
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .runtime
+                    .program_binding_upload_strategy
+                    .as_runtime_value(),
+                expected
+            );
+        }
+        let error = FerrumConfigBuilder::new(snapshot(&[(key, "automatic")]))
+            .resolve()
+            .unwrap_err();
+        assert!(
+            matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+        );
+        for (backend, authority) in [
+            ("cpu", ExecutionResourceAuthority::PlanRuntime),
+            ("metal", ExecutionResourceAuthority::PlanRuntime),
+            ("cuda", ExecutionResourceAuthority::LegacyEngine),
+        ] {
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            let error = FerrumConfigBuilder::new(snapshot(&[(key, "complete-rows")]))
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+            );
+            scheduler_resolution(backend, authority, 4, snapshot(&[(key, "sparse")]));
+        }
     }
 
     #[test]

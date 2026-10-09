@@ -5,6 +5,8 @@ include!("../vnext_checkpoint_continuation/runtime.rs");
 #[path = "batch.rs"]
 mod batch;
 pub use batch::{BatchObservation, Path};
+#[path = "runtime/complete_binding_rows.rs"]
+mod complete_binding_rows;
 #[path = "runtime/extra.rs"]
 mod extra;
 #[path = "runtime/extra_all_rows.rs"]
@@ -32,6 +34,22 @@ impl Fixture {
         participants: u32,
         definition: Family,
     ) -> Self {
+        Self::for_family_with_binding_upload(
+            kind,
+            reusable,
+            participants,
+            definition,
+            ferrum_types::ProgramBindingUploadStrategy::Sparse,
+        )
+    }
+
+    fn for_family_with_binding_upload(
+        kind: AttentionKind,
+        reusable: bool,
+        participants: u32,
+        definition: Family,
+        upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
+    ) -> Self {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let attention_arithmetic = definition.attention_arithmetic();
@@ -43,7 +61,16 @@ impl Fixture {
         let family = TypedFamilyRegistration::new(definition)
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
-        let (runtime, registry, materializers, materializer, catalog) = composition(kind, &family);
+        let (runtime, registry, materializers, catalog) =
+            CudaVNextComposition::create_with_program_binding_upload_strategy(
+                0,
+                id(format!("device.cuda.upstream-marker.{kind:?}")),
+                ferrum_types::AttentionExecutionPolicy::Portable,
+                upload_strategy,
+            )
+            .unwrap()
+            .into_parts();
+        let materializer = cuda_weight_materializer_selection(&family).unwrap();
         let bucket = reusable.then(|| {
             ReusableExecutionBucketSpec::new(
                 ReusableExecutionClassId::new("fixture.upstream-marker.decode").unwrap(),

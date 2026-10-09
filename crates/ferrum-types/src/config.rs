@@ -100,6 +100,33 @@ impl InvocationPreparationStrategy {
     }
 }
 
+/// Upload policy for CUDA program-binding rows. Complete rows preserve the
+/// compiled row layout while replacing sparse per-field uploads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgramBindingUploadStrategy {
+    #[default]
+    Sparse,
+    CompleteRows,
+}
+
+impl ProgramBindingUploadStrategy {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Sparse => "sparse",
+            Self::CompleteRows => "complete-rows",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sparse" => Ok(Self::Sparse),
+            "complete-rows" => Ok(Self::CompleteRows),
+            _ => Err(format!("expected sparse or complete-rows; got {raw:?}")),
+        }
+    }
+}
+
 /// Explicit one-shot faults used to prove product-path failure attribution.
 /// These are never inferred and remain disabled in normal execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +252,9 @@ pub struct RuntimeKnobs {
     /// Host invocation preparation policy; full preparation is the default.
     #[serde(default)]
     pub invocation_preparation_strategy: InvocationPreparationStrategy,
+    /// Program-binding upload policy; complete rows require a CUDA plan runtime.
+    #[serde(default)]
+    pub program_binding_upload_strategy: ProgramBindingUploadStrategy,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -364,6 +394,14 @@ impl EngineConfig {
             self.runtime.invocation_preparation_strategy =
                 InvocationPreparationStrategy::parse_runtime_value(value).map_err(|reason| {
                     format!("FERRUM_INVOCATION_PREPARATION_STRATEGY: {reason}")
+                })?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+        {
+            self.runtime.program_binding_upload_strategy =
+                ProgramBindingUploadStrategy::parse_runtime_value(value).map_err(|reason| {
+                    format!("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY: {reason}")
                 })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
@@ -1348,6 +1386,53 @@ mod tests {
                 .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
                 .unwrap();
             assert_eq!(config.runtime.invocation_preparation_strategy, strategy);
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "automatic"
+            )]))
+            .unwrap_err()
+            .contains(key));
+    }
+
+    #[test]
+    fn program_binding_upload_defaults_to_sparse_and_rejects_unknown_overrides() {
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY";
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.program_binding_upload_strategy,
+            ProgramBindingUploadStrategy::Sparse
+        );
+        let mut legacy = serde_json::to_value(&config.runtime).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("program_binding_upload_strategy");
+        let restored: RuntimeKnobs = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.program_binding_upload_strategy,
+            ProgramBindingUploadStrategy::Sparse
+        );
+        for strategy in [
+            ProgramBindingUploadStrategy::CompleteRows,
+            ProgramBindingUploadStrategy::Sparse,
+        ] {
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    key,
+                    strategy.as_runtime_value(),
+                )]))
+                .unwrap();
+            assert_eq!(config.runtime.program_binding_upload_strategy, strategy);
+            assert_eq!(
+                serde_json::to_value(strategy).unwrap(),
+                strategy.as_runtime_value()
+            );
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                .unwrap();
+            assert_eq!(config.runtime.program_binding_upload_strategy, strategy);
         }
         assert!(config
             .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(

@@ -31,6 +31,7 @@ pub enum Path {
 pub struct BatchObservation {
     pub values: BTreeMap<(u32, String), Vec<u8>>,
     types: BTreeMap<String, ElementType>,
+    pub binding_rows: Option<Vec<Vec<u8>>>,
 }
 
 impl BatchObservation {
@@ -123,12 +124,40 @@ impl Fixture {
         preparation_strategy: InvocationPreparationStrategy,
         preparation_sink: &P,
     ) -> BatchObservation {
+        let ranges = vec![range; sessions.len()];
+        self.execute_participant_ranges_with_preparation(
+            lane,
+            reaper,
+            sessions,
+            tokens,
+            &ranges,
+            path,
+            preparation_strategy,
+            preparation_sink,
+            None,
+        )
+    }
+
+    pub fn execute_participant_ranges_with_preparation<P: InvocationPreparationSink>(
+        &self,
+        lane: &Arc<ExecutionLane<Runtime>>,
+        reaper: &Arc<CompletionReaper<Runtime>>,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        ranges: &[Range<usize>],
+        path: Path,
+        preparation_strategy: InvocationPreparationStrategy,
+        preparation_sink: &P,
+        binding_row_bytes: Option<usize>,
+    ) -> BatchObservation {
         assert_eq!(sessions.len(), tokens.len());
+        assert_eq!(sessions.len(), ranges.len());
         let participants = sessions.len() as u32;
         let batch = ExecutionBatchParticipants::new(sessions.to_vec()).unwrap();
         let spans = tokens
             .iter()
-            .map(|t| token_span(Arc::clone(t), range.clone()))
+            .zip(ranges)
+            .map(|(t, range)| token_span(Arc::clone(t), range.clone()))
             .collect();
         let mut request = StepResourceAdmissionRequest::new(
             batch.bind_work_shape(spans).unwrap(),
@@ -208,6 +237,7 @@ impl Fixture {
             .iter()
             .enumerate()
             .map(|(participant, t)| {
+                let range = &ranges[participant];
                 SubmissionWaveInputUpload::new(
                     id("node.embedding"),
                     participant as u32,
@@ -249,8 +279,11 @@ impl Fixture {
                         p,
                         component.resource_id().clone(),
                         component.offset_bytes(),
-                        HostTransferLayout::new(ElementType::F32, range.len() as u64 * HIDDEN)
-                            .unwrap(),
+                        HostTransferLayout::new(
+                            ElementType::F32,
+                            ranges[p as usize].len() as u64 * HIDDEN,
+                        )
+                        .unwrap(),
                     )
                     .unwrap()
                 })
@@ -265,7 +298,7 @@ impl Fixture {
                 .find(|v| v.value_id() == &state.value_id)
                 .unwrap();
             let component = &value.storage().components()[0];
-            let bytes = match state.capacity_demand {
+            let bytes_for = |range: &Range<usize>| match state.capacity_demand {
                 StateCapacityDemand::FixedPerScope => state.tensor.byte_len().unwrap(),
                 StateCapacityDemand::TokenScaled { .. } => {
                     assert_eq!(state.id.as_str(), "state.kv");
@@ -291,9 +324,35 @@ impl Fixture {
                                 component.offset_bytes(),
                                 HostTransferLayout::new(
                                     state.tensor.element_type,
-                                    bytes / state.tensor.element_type.size_bytes(),
+                                    bytes_for(&ranges[p as usize])
+                                        / state.tensor.element_type.size_bytes(),
                                 )
                                 .unwrap(),
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+        }
+        if let Some(row_bytes) = binding_row_bytes {
+            let resource = attention
+                .binding_resource()
+                .expect("binding workspace")
+                .clone();
+            names.insert(resource.clone(), "binding_parameters".to_owned());
+            readbacks.push(
+                CompletionReadbackBatchRequest::new(
+                    (0..participants)
+                        .map(|p| {
+                            CompletionReadbackRequest::new_typed(
+                                attention.id().clone(),
+                                p,
+                                resource.clone(),
+                                BufferUsage::Binding,
+                                u64::from(p) * row_bytes as u64,
+                                HostTransferLayout::new(ElementType::U8, row_bytes as u64).unwrap(),
                             )
                             .unwrap()
                         })
@@ -419,7 +478,7 @@ impl Fixture {
             println!(
                 "{}",
                 serde_json::json!({"kind":"marker_replay_catalog","participants":participants,
-                "source_start":range.start,"source_end":range.end,"bindings":program.per_wave_binding_node_indices(),
+                "source_start":ranges[0].start,"source_end":ranges[0].end,"source_ranges":ranges,"bindings":program.per_wave_binding_node_indices(),
                 "eager_boundary_nodes":program.eager_boundary_node_indices(),
                 "retained_plan_dependencies":program.retained_plan_dependencies().len(),
                 "segments":program.segments()})
@@ -495,13 +554,19 @@ impl Fixture {
             );
         }
         let mut values = BTreeMap::new();
+        let mut binding_rows = binding_row_bytes.map(|_| vec![Vec::new(); participants as usize]);
         for disposition in receipt.dispositions() {
             let CompletionReadbackDisposition::Succeeded(result) = disposition else {
                 panic!("attention readback failed: {disposition:?}")
             };
             let name = names[result.request().resource_id()].clone();
+            let participant = result.request().participant_index() as usize;
+            if name == "binding_parameters" {
+                binding_rows.as_mut().unwrap()[participant] = result.bytes().to_vec();
+                continue;
+            }
             let bytes = if name == "state.kv" {
-                valid_kv_positions(result.bytes(), range.end)
+                valid_kv_positions(result.bytes(), ranges[participant].end)
             } else {
                 result.bytes().to_vec()
             };
@@ -509,10 +574,17 @@ impl Fixture {
                 .insert((result.request().participant_index(), name), bytes)
                 .is_none());
         }
-        assert_eq!(values.len(), participants as usize * names.len());
+        assert_eq!(
+            values.len(),
+            participants as usize * (names.len() - usize::from(binding_rows.is_some()))
+        );
         drop((receipt, handle, identity, active));
         step.try_retire_normal().unwrap();
-        BatchObservation { values, types }
+        BatchObservation {
+            values,
+            types,
+            binding_rows,
+        }
     }
 }
 

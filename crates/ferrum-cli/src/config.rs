@@ -249,6 +249,9 @@ pub struct RuntimeCliConfig {
     /// Host invocation preparation policy for native plan runtimes.
     #[serde(default)]
     pub invocation_preparation_strategy: Option<ferrum_types::InvocationPreparationStrategy>,
+    /// Program-binding upload policy; complete rows require a CUDA plan runtime.
+    #[serde(default)]
+    pub program_binding_upload_strategy: Option<ferrum_types::ProgramBindingUploadStrategy>,
 
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
@@ -478,6 +481,12 @@ impl RuntimeCliConfig {
             "FERRUM_INVOCATION_PREPARATION_STRATEGY",
             self.invocation_preparation_strategy
                 .map(ferrum_types::InvocationPreparationStrategy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+            self.program_binding_upload_strategy
+                .map(ferrum_types::ProgramBindingUploadStrategy::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1117,6 +1126,24 @@ mod tests {
         assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\ninvocation_preparation_strategy = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn program_binding_upload_config_file_parses_explicit_strategy() {
+        let config: CliConfig =
+            toml::from_str("[runtime]\nprogram_binding_upload_strategy = \"complete-rows\"\n")
+                .unwrap();
+        let entries = config.runtime.runtime_config_entries();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+            .unwrap();
+        assert_eq!(entry.effective_value, "complete-rows");
+        assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nprogram_binding_upload_strategy = \"automatic\"\n"
         )
         .is_err());
     }

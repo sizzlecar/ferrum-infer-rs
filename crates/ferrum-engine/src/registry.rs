@@ -898,6 +898,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         &self,
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+        validate_program_binding_upload_strategy(config, false)?;
         let vocab_size = config
             .engine_config
             .model
@@ -1137,6 +1138,21 @@ where
     }
 }
 
+fn validate_program_binding_upload_strategy(
+    config: &ComponentConfig,
+    plan_runtime: bool,
+) -> Result<()> {
+    if config.engine_config.runtime.program_binding_upload_strategy
+        == ferrum_types::ProgramBindingUploadStrategy::CompleteRows
+        && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime)
+    {
+        return Err(FerrumError::unsupported(
+            "complete-rows program-binding uploads require a CUDA plan runtime",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_registered_vnext_backend(
     kind: ferrum_models::vnext::ProductionExecutionKind,
     device: &Device,
@@ -1178,6 +1194,7 @@ fn create_registered_vnext_executor(
 ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
     use ferrum_models::vnext::ProductionExecutionKind;
 
+    validate_program_binding_upload_strategy(config, true)?;
     validate_registered_vnext_backend(
         registration.execution_kind(),
         &config.device,
@@ -1230,13 +1247,14 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_program_binding_upload_strategy(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
                             config.engine_config.runtime.attention_execution_policy,
                             config.engine_config.kv_cache.dtype,
                         )?,
+                        config.engine_config.runtime.program_binding_upload_strategy,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -1371,6 +1389,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use candle_core::{DType, Device as CandleDevice};
         use ferrum_models::weight_format::WeightFormat;
 
+        validate_program_binding_upload_strategy(config, true)?;
         // Try to load model from path
         let checkpoint_capture_enabled = config
             .engine_config
@@ -1454,6 +1473,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 }
             }
         }
+        validate_program_binding_upload_strategy(config, false)?;
         if checkpoint_capture_enabled {
             return Err(FerrumError::unsupported(
                 "vNext checkpoint capture requires a registered vNext model package",
@@ -1929,6 +1949,54 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     mod mixed_batch_tests;
+
+    #[test]
+    fn program_binding_upload_requires_cuda_plan_runtime() {
+        use ferrum_types::ProgramBindingUploadStrategy;
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config.engine_config.runtime.program_binding_upload_strategy =
+                    ProgramBindingUploadStrategy::Sparse;
+                validate_program_binding_upload_strategy(&config, plan_runtime).unwrap();
+                config.engine_config.runtime.program_binding_upload_strategy =
+                    ProgramBindingUploadStrategy::CompleteRows;
+                assert_eq!(
+                    validate_program_binding_upload_strategy(&config, plan_runtime).is_ok(),
+                    plan_runtime && matches!(config.device, Device::CUDA(_))
+                );
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_program_binding_upload_strategy(&config, true).is_err());
+        }
+    }
+
+    #[test]
+    fn program_binding_upload_rejects_unsupported_factories_before_model_loading() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.program_binding_upload_strategy =
+            ferrum_types::ProgramBindingUploadStrategy::CompleteRows;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        // No source or device allocation is necessary to reject this policy.
+        let result = tokio_test::block_on(LlmExecutorFactory.create(&config));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("CUDA plan runtime"));
+        config.device = Device::CUDA(0);
+        let result = tokio_test::block_on(StubExecutorFactory.create(&config));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("CUDA plan runtime"));
+    }
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();

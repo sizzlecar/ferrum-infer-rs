@@ -49,6 +49,7 @@ use ferrum_interfaces::vnext::{
 };
 use ferrum_types::{
     AttentionExecutionPolicy, NativeOperatorBackend, NativeOperatorProviderCatalog,
+    ProgramBindingUploadStrategy,
 };
 use sha2::{Digest, Sha256};
 
@@ -113,6 +114,8 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime.rs").as_bytes(),
         q6_head_fingerprint.as_bytes(),
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
+        include_str!("../program_binding_rows.rs").as_bytes(),
+        include_str!("../program_binding_upload.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
         include_str!("../reusable_execution.rs").as_bytes(),
         include_str!("../reusable_execution/warmup.rs").as_bytes(),
@@ -1030,11 +1033,17 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         purpose: CudaCompositionPurpose,
+        upload_strategy: ProgramBindingUploadStrategy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
         let runtime = Arc::new(match purpose {
-            CudaCompositionPurpose::Execution => CudaDeviceRuntime::new(config)?,
+            CudaCompositionPurpose::Execution => {
+                CudaDeviceRuntime::new_with_program_binding_upload_strategy(
+                    config,
+                    upload_strategy,
+                )?
+            }
             CudaCompositionPurpose::NativeCatalogDeclaration => {
                 CudaDeviceRuntime::new_for_native_catalog(config)?
             }
@@ -1067,6 +1076,8 @@ impl CudaVNextComposition {
                 include_str!("vnext_runtime.rs").as_bytes(),
                 q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
+                include_str!("../program_binding_rows.rs").as_bytes(),
+                include_str!("../program_binding_upload.rs").as_bytes(),
                 CUDA_ENGINE_PROVIDER_ID.as_bytes(),
             ]),
             runtime.descriptor().id.clone(),
@@ -1092,11 +1103,26 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_program_binding_upload_strategy(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            ProgramBindingUploadStrategy::Sparse,
+        )
+    }
+
+    pub fn create_with_program_binding_upload_strategy(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let composition = Self::prepare(
             ordinal,
             device_id,
             requested_attention_policy,
             CudaCompositionPurpose::Execution,
+            upload_strategy,
         )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
@@ -1189,6 +1215,7 @@ pub fn cuda_validated_native_operator_catalog_input(
         device_id,
         requested_attention_policy,
         CudaCompositionPurpose::Execution,
+        ProgramBindingUploadStrategy::Sparse,
     )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
@@ -1210,6 +1237,7 @@ pub fn cuda_native_operator_catalog_input(
         device_id,
         requested_attention_policy,
         CudaCompositionPurpose::NativeCatalogDeclaration,
+        ProgramBindingUploadStrategy::Sparse,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }

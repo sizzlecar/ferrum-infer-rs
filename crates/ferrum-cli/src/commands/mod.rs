@@ -33,6 +33,21 @@ impl InvocationPreparationStrategyArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProgramBindingUploadStrategyArg {
+    Sparse,
+    CompleteRows,
+}
+
+impl ProgramBindingUploadStrategyArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Sparse => "sparse",
+            Self::CompleteRows => "complete-rows",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
@@ -93,6 +108,13 @@ mod tests {
     }
 
     impl TestCli {
+        fn binding_upload_strategy(self) -> Option<ProgramBindingUploadStrategyArg> {
+            match self.command {
+                TestCommand::Run(command) => command.program_binding_upload_strategy,
+                TestCommand::Serve(command) => command.program_binding_upload_strategy,
+            }
+        }
+
         fn preparation_strategy(self) -> Option<InvocationPreparationStrategyArg> {
             match self.command {
                 TestCommand::Run(command) => command.invocation_preparation_strategy,
@@ -219,6 +241,42 @@ mod tests {
                 command,
                 "test-model",
                 "--invocation-preparation-strategy",
+                "automatic"
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn program_binding_upload_cli_values_and_default_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .binding_upload_strategy(),
+                None
+            );
+            for (value, expected) in [
+                ("sparse", ProgramBindingUploadStrategyArg::Sparse),
+                (
+                    "complete-rows",
+                    ProgramBindingUploadStrategyArg::CompleteRows,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--program-binding-upload-strategy",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.binding_upload_strategy(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--program-binding-upload-strategy",
                 "automatic"
             ])
             .is_err());

@@ -28,24 +28,26 @@ use ferrum_interfaces::vnext::{
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
-    DeviceNativeWorkAttribution, DeviceReplayedLogicalCommandAttribution,
-    DeviceReplayedSegmentAttribution, DeviceReusableAddressScope, DeviceReusableExecutionCapture,
-    DeviceReusableExecutionInvocation, DeviceReusableExecutionObservation,
-    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
-    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGapReason,
-    DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
-    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ProgramBindingNodeBinding, RetainedHostMemoryRegion, StaticWeightTransformPlan,
-    StaticWeightTransformRequest, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
-    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceNativeWorkAttribution, DeviceProgramBindingUploadSnapshot,
+    DeviceReplayedLogicalCommandAttribution, DeviceReplayedSegmentAttribution,
+    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
+    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionTrim, DeviceRuntime,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
+    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
+    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
+    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, RetainedHostMemoryRegion,
+    StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, VNextError,
+    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
-use ferrum_types::AttentionExecutionPolicy;
+use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 use super::vnext_tool_correlation;
+use crate::backend::program_binding_upload::ProgramBindingUploadCounters;
 
 mod binding_transfers;
 
@@ -488,6 +490,7 @@ impl CudaCompletionReadback {
 pub(crate) struct CudaProgramBindingWrite {
     destination_offset_bytes: u64,
     payload: Box<[u8]>,
+    live_payload_bytes: u64,
 }
 
 impl CudaProgramBindingWrite {
@@ -500,10 +503,31 @@ impl CudaProgramBindingWrite {
                 "CUDA program binding write payload is empty",
             ));
         }
+        let live_payload_bytes = u64::try_from(payload.len()).map_err(|_| {
+            CudaDeviceRuntimeError::contract("CUDA program binding payload exceeds u64")
+        })?;
         Ok(Self {
             destination_offset_bytes,
             payload,
+            live_payload_bytes,
         })
+    }
+
+    /// Only the causal provider calls this after establishing its logical row
+    /// schema. Unused logical pointer entries are ignored by the kernels; this
+    /// does not authorize writing spare slot capacity or neighboring gaps.
+    pub(crate) fn complete_logical_row(
+        destination_offset_bytes: u64,
+        payload: Box<[u8]>,
+        logical_row_bytes: u64,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let mut write = Self::new(destination_offset_bytes, payload)?;
+        write.payload = crate::backend::program_binding_rows::complete_logical_row(
+            write.payload,
+            logical_row_bytes,
+        )
+        .map_err(CudaDeviceRuntimeError::contract)?;
+        Ok(write)
     }
 }
 
@@ -550,7 +574,12 @@ fn coalesce_program_binding_transfers(
             {
                 std::mem::take(&mut writes[layout.source_write_ranges[0].start].payload)
             } else {
-                let mut payload = Vec::with_capacity(packed_bytes);
+                let mut payload = Vec::new();
+                payload.try_reserve_exact(packed_bytes).map_err(|error| {
+                    CudaDeviceRuntimeError::contract(format!(
+                        "program binding packed payload allocation failed: {error}"
+                    ))
+                })?;
                 for range in layout.source_write_ranges {
                     for write in &writes[range] {
                         payload.extend_from_slice(&write.payload);
@@ -1192,6 +1221,7 @@ impl CudaDeviceCommand {
 
     fn coalesced_program_bindings(
         mut commands: Vec<Self>,
+        upload_counters: Arc<ProgramBindingUploadCounters>,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         if commands.is_empty() {
             return Ok(commands);
@@ -1304,6 +1334,10 @@ impl CudaDeviceCommand {
 
         let mut fence_dependencies = Vec::new();
         let mut arena_writes = Vec::new();
+        let mut upload_plan = DeviceProgramBindingUploadSnapshot {
+            physical_arena_bytes: layout_physical_size_bytes,
+            ..Default::default()
+        };
         for patch in patches {
             let slot = patch.binding.slot();
             let expected_device_ptr = arena_device_ptr
@@ -1323,7 +1357,32 @@ impl CudaDeviceCommand {
                     "CUDA program binding patch destination differs from its arena slot",
                 ));
             }
+            upload_plan.logical_arena_bytes = upload_plan
+                .logical_arena_bytes
+                .checked_add(patch.destination.length_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("program binding logical byte count overflows")
+                })?;
             for mut write in patch.writes {
+                upload_plan.live_payload_bytes = upload_plan
+                    .live_payload_bytes
+                    .checked_add(write.live_payload_bytes)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "program binding live byte count overflows",
+                        )
+                    })?;
+                let bytes = u64::try_from(write.payload.len()).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("program binding upload exceeds u64")
+                })?;
+                upload_plan.planned_upload_bytes = upload_plan
+                    .planned_upload_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "program binding upload byte count overflows",
+                        )
+                    })?;
                 write.destination_offset_bytes = slot
                     .physical_offset_bytes()
                     .checked_add(write.destination_offset_bytes)
@@ -1409,6 +1468,7 @@ impl CudaDeviceCommand {
             regions,
             host_storage,
             Box::new(move |stream, _blas, regions, host_storage| {
+                let mut upload_attempt = upload_counters.attempt(upload_plan);
                 if regions.len() != host_storage.len() || regions.len() != transfer_shapes.len() {
                     return Err(CudaDeviceRuntimeError::contract(
                         "CUDA sparse program binding transfer storage differs from its shape",
@@ -1428,6 +1488,7 @@ impl CudaDeviceCommand {
                         .map_err(|error| {
                             CudaDeviceRuntimeError::driver("sparse program binding upload", error)
                         })?;
+                        upload_attempt.copied(payload.len() as u64, false);
                         continue;
                     }
                     let copy = cudarc::driver::sys::CUDA_MEMCPY2D {
@@ -1456,7 +1517,9 @@ impl CudaDeviceCommand {
                                 error,
                             )
                         })?;
+                    upload_attempt.copied(payload.len() as u64, true);
                 }
+                upload_attempt.succeeded();
                 Ok(())
             }),
         ));
@@ -2324,6 +2387,8 @@ impl Mxfp4MarlinPrepareFunctions {
 pub struct CudaDeviceRuntime {
     descriptor: DeviceDescriptor,
     attention_execution_policy: AttentionExecutionPolicy,
+    program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    program_binding_upload_counters: Arc<ProgramBindingUploadCounters>,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -2353,7 +2418,14 @@ impl CudaDeviceRuntime {
     }
 
     pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
-        Self::new_for_purpose(config, CudaRuntimePurpose::Execution)
+        Self::new_with_program_binding_upload_strategy(config, ProgramBindingUploadStrategy::Sparse)
+    }
+
+    pub fn new_with_program_binding_upload_strategy(
+        config: CudaDeviceRuntimeConfig,
+        strategy: ProgramBindingUploadStrategy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_for_purpose(config, CudaRuntimePurpose::Execution, strategy)
     }
 
     /// Only the non-executing catalog exporter may use this constructor. Its
@@ -2362,12 +2434,17 @@ impl CudaDeviceRuntime {
     pub(super) fn new_for_native_catalog(
         config: CudaDeviceRuntimeConfig,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        Self::new_for_purpose(config, CudaRuntimePurpose::NativeCatalogDeclaration)
+        Self::new_for_purpose(
+            config,
+            CudaRuntimePurpose::NativeCatalogDeclaration,
+            ProgramBindingUploadStrategy::Sparse,
+        )
     }
 
     fn new_for_purpose(
         mut config: CudaDeviceRuntimeConfig,
         purpose: CudaRuntimePurpose,
+        program_binding_upload_strategy: ProgramBindingUploadStrategy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         if !config.attention_execution_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(
@@ -2500,6 +2577,8 @@ impl CudaDeviceRuntime {
         Ok(Self {
             descriptor,
             attention_execution_policy: config.attention_execution_policy,
+            program_binding_upload_strategy,
+            program_binding_upload_counters: Arc::new(ProgramBindingUploadCounters::default()),
             runtime_instance,
             context,
             allocation_stream,
@@ -2507,6 +2586,10 @@ impl CudaDeviceRuntime {
             mxfp4_marlin_prepare,
             quarantined: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(super) fn program_binding_upload_strategy(&self) -> ProgramBindingUploadStrategy {
+        self.program_binding_upload_strategy
     }
 
     pub(super) fn context(&self) -> &Arc<CudaContext> {
@@ -3868,7 +3951,14 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         commands: Vec<Self::Command>,
     ) -> Result<Vec<Self::Command>, Self::Error> {
-        CudaDeviceCommand::coalesced_program_bindings(commands)
+        CudaDeviceCommand::coalesced_program_bindings(
+            commands,
+            Arc::clone(&self.program_binding_upload_counters),
+        )
+    }
+
+    fn program_binding_upload_snapshot(&self) -> Option<DeviceProgramBindingUploadSnapshot> {
+        Some(self.program_binding_upload_counters.snapshot())
     }
 
     fn submit(
@@ -4816,6 +4906,54 @@ mod tests {
 
     fn program_binding_write(offset: u64, payload: Vec<u8>) -> CudaProgramBindingWrite {
         CudaProgramBindingWrite::new(offset, payload.into_boxed_slice()).unwrap()
+    }
+
+    #[test]
+    fn complete_logical_rows_coalesce_without_rewriting_capacity_or_slot_gaps() {
+        // Two active causal rows plus a dense GDN slot, with an unused-capacity
+        // gap before that slot. The gap is not part of either upload strategy.
+        let sparse = vec![
+            program_binding_write(16, vec![1; 32]),
+            program_binding_write(80, vec![2; 40]),
+            program_binding_write(192, vec![3; 16]),
+        ];
+        let complete = vec![
+            CudaProgramBindingWrite::complete_logical_row(16, vec![1; 32].into(), 64).unwrap(),
+            CudaProgramBindingWrite::complete_logical_row(80, vec![2; 40].into(), 64).unwrap(),
+            program_binding_write(192, vec![3; 16]),
+        ];
+        assert_eq!(
+            complete
+                .iter()
+                .map(|write| write.live_payload_bytes)
+                .sum::<u64>(),
+            88
+        );
+        let sparse = coalesce_program_binding_transfers(sparse, 256).unwrap();
+        let complete = coalesce_program_binding_transfers(complete, 256).unwrap();
+        assert_eq!(sparse.len(), 3);
+        assert_eq!(complete.len(), 2);
+        assert_eq!(complete[0].destination_offset_bytes, 16);
+        assert_eq!(complete[0].row_count, 1);
+        assert_eq!(complete[0].payload.len(), 128);
+        let mut actual = vec![0xa5; 256];
+        for transfer in complete {
+            for row in 0..transfer.row_count {
+                let offset = usize::try_from(transfer.destination_offset_bytes).unwrap()
+                    + row * usize::try_from(transfer.destination_stride_bytes).unwrap();
+                actual[offset..offset + transfer.row_bytes].copy_from_slice(
+                    &transfer.payload[row * transfer.row_bytes..(row + 1) * transfer.row_bytes],
+                );
+            }
+        }
+        assert!(actual[..16].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(&actual[16..48], &[1; 32]);
+        assert!(actual[48..80].iter().all(|&byte| byte == 0));
+        assert_eq!(&actual[80..120], &[2; 40]);
+        assert!(actual[120..144].iter().all(|&byte| byte == 0));
+        assert!(actual[144..192].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(&actual[192..208], &[3; 16]);
+        assert!(actual[208..].iter().all(|&byte| byte == 0xa5));
     }
 
     #[test]
