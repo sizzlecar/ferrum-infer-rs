@@ -2194,15 +2194,7 @@ impl LogicalBackingSliceAuthority {
 }
 
 pub struct LogicalBackingBufferView<'a, B> {
-    pub(in crate::vnext::resource) bindings:
-        super::dynamic_pool_set::ValidatedBackingBindings<'a, B>,
-    pub(super) authorities: super::dynamic_pool_set::ValidatedBackingAuthorities<'a>,
-    pub(super) logical_size_bytes: u64,
-    pub(super) capacity_size_bytes: u64,
-    pub(super) alignment_bytes: u64,
-    pub(super) usage: BufferUsage,
-    pub(super) element_type: ElementType,
-    pub(super) storage_profile: DynamicStorageProfile,
+    pub(super) payload: super::dynamic_pool_set::ValidatedBackingView<'a, B>,
 }
 
 pub(crate) struct LogicalBackingSegmentBinding<B> {
@@ -2235,39 +2227,40 @@ impl<B> LogicalBackingSegmentBinding<B> {
 
 impl<'a, B> LogicalBackingBufferView<'a, B> {
     pub(crate) fn has_pool_version_proof(&self) -> bool {
-        self.bindings.has_pool_version_proof()
+        self.payload.has_pool_version_proof()
     }
 
     pub(crate) fn segment_bindings(&self) -> &[LogicalBackingSegmentBinding<B>] {
-        &self.bindings
+        &self.payload.bindings
     }
 
     pub const fn size_bytes(&self) -> u64 {
-        self.logical_size_bytes
+        self.payload.values().logical_size_bytes
     }
 
     pub const fn capacity_size_bytes(&self) -> u64 {
-        self.capacity_size_bytes
+        self.payload.values().capacity_size_bytes
     }
 
     pub const fn alignment_bytes(&self) -> u64 {
-        self.alignment_bytes
+        self.payload.values().alignment_bytes
     }
 
     pub const fn usage(&self) -> BufferUsage {
-        self.usage
+        self.payload.values().usage
     }
 
     pub const fn element_type(&self) -> ElementType {
-        self.element_type
+        self.payload.values().element_type
     }
 
     pub const fn storage_profile(&self) -> DynamicStorageProfile {
-        self.storage_profile
+        self.payload.values().storage_profile
     }
 
     pub fn committed_evidence_segments(&self) -> impl Iterator<Item = &BackingSegment> {
-        self.authorities
+        self.payload
+            .authorities
             .as_slice()
             .iter()
             .flat_map(|authority| authority.evidence.segments())
@@ -2277,6 +2270,7 @@ impl<'a, B> LogicalBackingBufferView<'a, B> {
     /// Multi-extent callers must use the aggregate metadata and segment iterator.
     pub fn slice(&self) -> &'a LogicalBackingSliceEvidence {
         &self
+            .payload
             .authorities
             .as_slice()
             .first()

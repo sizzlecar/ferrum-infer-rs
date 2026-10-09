@@ -264,7 +264,7 @@ fn checkpoint_idle_reclaim_keeps_live_or_externally_referenced_donor_chunks() {
             .iter()
             .map(|claim| {
                 let view = harness.root.dynamic_pools.view(claim).unwrap();
-                Arc::clone(&view.bindings[0].chunk)
+                Arc::clone(&view.payload.bindings[0].chunk)
             })
             .collect::<Vec<_>>();
         if retain_view_only {

@@ -23,7 +23,10 @@ fn pool_version_requires_exact_authority_owner_and_unmoved_payload_proof() {
     let mut equal_backing = pools.view_with_pool_version(&equal_authority).unwrap();
     // A sibling can move a payload, but cannot retarget its sealed authority.
     // The physical mappings remain valid, so both must take the full fallback.
-    std::mem::swap(&mut backing.bindings, &mut equal_backing.bindings);
+    std::mem::swap(
+        &mut backing.payload.bindings,
+        &mut equal_backing.payload.bindings,
+    );
     assert!(!pools
         .revalidate_view_with_pool_version(&authority, &backing)
         .unwrap());
@@ -57,13 +60,13 @@ fn pool_version_rechecks_poison_missing_chunk_growth_and_actual_lease_release() 
 
     pool.state.lock().unwrap().poisoned = true;
     // When both predicates fail, preserve the old poison-before-metadata error.
-    backing.logical_size_bytes -= 1;
+    backing.payload.logical_size_bytes -= 1;
     let expected = pools.revalidate_view(&authority, &backing).unwrap_err();
     let actual = pools
         .revalidate_view_with_pool_version(&authority, &backing)
         .unwrap_err();
     assert_eq!(actual.to_string(), expected.to_string());
-    backing.logical_size_bytes += 1;
+    backing.payload.logical_size_bytes += 1;
     pool.state.lock().unwrap().poisoned = false;
     assert!(!pools
         .revalidate_view_with_pool_version(&authority, &backing)
@@ -174,15 +177,15 @@ fn pool_version_mutable_bindings_clear_proof_and_scalar_metadata_still_validates
         .revalidate_view_with_pool_version(&authority, &backing)
         .unwrap());
     // Matches checkpoint's mutable retention traversal, even without a change.
-    assert_eq!(backing.bindings.iter_mut().count(), 3);
+    assert_eq!(backing.payload.bindings.iter_mut().count(), 3);
     assert!(!backing.has_pool_version_proof());
     assert!(!pools
         .revalidate_view_with_pool_version(&authority, &backing)
         .unwrap());
 
     let mut metadata = pools.view_with_pool_version(&authority).unwrap();
-    metadata.logical_size_bytes -= 1;
-    assert!(metadata.has_pool_version_proof());
+    metadata.payload.logical_size_bytes -= 1;
+    assert!(!metadata.has_pool_version_proof());
     let expected = pools.revalidate_view(&authority, &metadata).unwrap_err();
     let actual = pools
         .revalidate_view_with_pool_version(&authority, &metadata)
@@ -190,8 +193,8 @@ fn pool_version_mutable_bindings_clear_proof_and_scalar_metadata_still_validates
     assert_eq!(actual.to_string(), expected.to_string());
 
     let mut bad_segment = pools.view_with_pool_version(&authority).unwrap();
-    let segment = bad_segment.bindings[1].segment.clone();
-    bad_segment.bindings[1].segment = BackingSegment::from_chunk(
+    let segment = bad_segment.payload.bindings[1].segment.clone();
+    bad_segment.payload.bindings[1].segment = BackingSegment::from_chunk(
         segment.pool_id(),
         segment.chunk_ordinal(),
         segment.chunk_generation() + 1,
@@ -204,7 +207,7 @@ fn pool_version_mutable_bindings_clear_proof_and_scalar_metadata_still_validates
         .revalidate_view_with_pool_version(&authority, &bad_segment)
         .is_err());
     let mut truncated = pools.view_with_pool_version(&authority).unwrap();
-    truncated.bindings.pop();
+    truncated.payload.bindings.pop();
     assert!(!truncated.has_pool_version_proof());
     assert!(pools
         .revalidate_view_with_pool_version(&authority, &truncated)
@@ -217,7 +220,7 @@ fn pool_version_hit_does_not_replace_current_runtime_later_page_validation() {
     let pools = &harness.root.dynamic_pools;
     let runtime = harness.runtime.as_ref();
     let backing = pools.view_with_pool_version(&authority).unwrap();
-    let last_buffer = backing.bindings[2].buffer() as *const TestBuffer as usize;
+    let last_buffer = backing.payload.bindings[2].buffer() as *const TestBuffer as usize;
     assert!(pools
         .revalidate_view_with_pool_version(&authority, &backing)
         .unwrap());

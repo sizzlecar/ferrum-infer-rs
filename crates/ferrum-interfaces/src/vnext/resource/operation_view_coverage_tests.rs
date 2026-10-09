@@ -67,8 +67,8 @@ fn full_coverage_proof_rejects_later_page_evidence_and_invalid_windows() {
     let (harness, authority) = paged_window_fixture();
     let pools = &harness.root.dynamic_pools;
     let mut backing = pools.view(&authority).unwrap();
-    let segment = backing.bindings[1].segment.clone();
-    backing.bindings[1].segment = BackingSegment::from_chunk(
+    let segment = backing.payload.bindings[1].segment.clone();
+    backing.payload.bindings[1].segment = BackingSegment::from_chunk(
         segment.pool_id(),
         segment.chunk_ordinal(),
         segment.chunk_generation() + 1,
@@ -85,7 +85,7 @@ fn full_coverage_proof_rejects_later_page_evidence_and_invalid_windows() {
     )
     .is_err());
     let mut truncated = pools.view(&authority).unwrap();
-    truncated.bindings.pop();
+    truncated.payload.bindings.pop();
     assert!(test_only_backing_window_coverage(
         harness.runtime.as_ref(),
         truncated,
@@ -114,7 +114,7 @@ fn full_coverage_checks_unused_later_pages_and_current_descriptors() {
     // The one-byte prefix consumes only page0, but page2 remains part of the
     // committed backing and must receive the same runtime checks in both arms.
     let backing = pools.view(&authority).unwrap();
-    let last_buffer = backing.bindings[2].buffer() as *const TestBuffer as usize;
+    let last_buffer = backing.payload.bindings[2].buffer() as *const TestBuffer as usize;
     let before = runtime.descriptor_queries.load(Ordering::Relaxed);
     test_only_backing_window_coverage(runtime, backing, 1, 0, &[(0, 1)]).unwrap();
     // The helper compares reference and candidate, then constructs the proof.
@@ -126,8 +126,8 @@ fn full_coverage_checks_unused_later_pages_and_current_descriptors() {
 
     for page in 1..3 {
         let mut backing = pools.view(&authority).unwrap();
-        let segment = &backing.bindings[page].segment;
-        backing.bindings[page].segment = BackingSegment::from_chunk(
+        let segment = &backing.payload.bindings[page].segment;
+        backing.payload.bindings[page].segment = BackingSegment::from_chunk(
             segment.pool_id(),
             segment.chunk_ordinal(),
             segment.chunk_generation() + 1,
@@ -195,11 +195,11 @@ fn retained_materialization_rejects_generation_range_and_metadata_drift() {
     let (harness, authority) = paged_window_fixture();
     let pools = &harness.root.dynamic_pools;
     let mut backing = pools.view(&authority).unwrap();
-    backing.logical_size_bytes -= 1;
+    backing.payload.logical_size_bytes -= 1;
     assert!(pools.revalidate_view(&authority, &backing).is_err());
     let mut backing = pools.view(&authority).unwrap();
-    let segment = &backing.bindings[1].segment;
-    backing.bindings[1].segment = BackingSegment::from_chunk(
+    let segment = &backing.payload.bindings[1].segment;
+    backing.payload.bindings[1].segment = BackingSegment::from_chunk(
         segment.pool_id(),
         segment.chunk_ordinal(),
         segment.chunk_generation() + 1,
@@ -209,7 +209,7 @@ fn retained_materialization_rejects_generation_range_and_metadata_drift() {
     .unwrap();
     assert!(pools.revalidate_view(&authority, &backing).is_err());
     let mut backing = pools.view(&authority).unwrap();
-    backing.bindings.pop();
+    backing.payload.bindings.pop();
     assert!(pools.revalidate_view(&authority, &backing).is_err());
     pools
         .revalidate_view(&authority, &pools.view(&authority).unwrap())
@@ -275,7 +275,7 @@ fn retained_materialization_rechecks_current_chunk_generation_bounds_and_identit
     .unwrap();
     // Make the retained chunk pointer agree with current state so rejection
     // specifically requires comparing the live generation to authority.
-    backing.bindings[index].chunk = Arc::clone(&replacement.backing);
+    backing.payload.bindings[index].chunk = Arc::clone(&replacement.backing);
     pool.state
         .lock()
         .unwrap()
@@ -284,11 +284,11 @@ fn retained_materialization_rechecks_current_chunk_generation_bounds_and_identit
     assert!(pools.revalidate_view(&authority, &backing).is_err());
 
     let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
-    backing.bindings[index].chunk = Arc::clone(&original.backing);
+    backing.payload.bindings[index].chunk = Arc::clone(&original.backing);
     let current = Arc::get_mut(&mut replacement.backing).unwrap();
     current.identity = original.backing.identity.clone();
     current.descriptor.size_bytes = original.backing.descriptor.size_bytes - 1;
-    backing.bindings[index].chunk = Arc::clone(&replacement.backing);
+    backing.payload.bindings[index].chunk = Arc::clone(&replacement.backing);
     pool.state
         .lock()
         .unwrap()
@@ -298,7 +298,7 @@ fn retained_materialization_rechecks_current_chunk_generation_bounds_and_identit
     assert!(pools.revalidate_view(&authority, &backing).is_err());
 
     let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
-    backing.bindings[index].chunk = Arc::clone(&original.backing);
+    backing.payload.bindings[index].chunk = Arc::clone(&original.backing);
     Arc::get_mut(&mut replacement.backing).unwrap().descriptor =
         original.backing.descriptor.clone();
     pool.state
@@ -371,3 +371,6 @@ fn first_materialization_still_checks_claim_membership_and_physical_projection()
 
 #[path = "pool_version_tests.rs"]
 mod pool_version_tests;
+
+#[path = "sealed_pool_proof_tests.rs"]
+mod sealed_pool_proof_tests;

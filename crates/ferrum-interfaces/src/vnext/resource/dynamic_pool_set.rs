@@ -35,8 +35,8 @@ use super::{
     DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION, NEXT_DYNAMIC_POOL_INSTANCE_ID,
 };
 use crate::vnext::{
-    DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
-    ReusableExecutionMemoryPlan,
+    BufferUsage, DeviceCapacityPressure, DynamicPoolResidentPressure, DynamicStorageProfile,
+    ElementType, ReusableExecutionBucketId, ReusableExecutionMemoryPlan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -119,19 +119,34 @@ impl<'lease> ValidatedBackingAuthorities<'lease> {
     }
 }
 
-/// An optional stamp is sealed together with the original binding payload and
-/// exact borrowed authority slice. Any mutable payload access invalidates it,
-/// including checkpoint retention replacement and internal negative fixtures.
-/// Moving this payload to another view cannot retarget its authority proof.
-pub(super) struct ValidatedBackingBindings<'lease, B> {
-    values: Vec<LogicalBackingSegmentBinding<B>>,
+/// The complete materialized view and its proof move together. No sibling can
+/// replace metadata, authorities or bindings while preserving the proof: every
+/// mutable value borrow invalidates it before exposing the values.
+pub(super) struct ValidatedBackingView<'lease, B> {
+    values: ValidatedBackingViewValues<'lease, B>,
     version_proof: Option<ValidatedPoolVersion<'lease, B>>,
 }
+
+pub(super) struct ValidatedBackingViewValues<'lease, B> {
+    pub(super) bindings: Vec<LogicalBackingSegmentBinding<B>>,
+    pub(super) authorities: ValidatedBackingAuthorities<'lease>,
+    pub(super) logical_size_bytes: u64,
+    pub(super) capacity_size_bytes: u64,
+    pub(super) alignment_bytes: u64,
+    pub(super) usage: BufferUsage,
+    pub(super) element_type: ElementType,
+    pub(super) storage_profile: DynamicStorageProfile,
+}
+
 struct ValidatedPoolVersion<'lease, B> {
     authorities: &'lease [LogicalBackingSliceAuthority],
     stamp: super::PoolReadStamp<'lease, DynamicBackingPoolState<B>>,
 }
-impl<B> ValidatedBackingBindings<'_, B> {
+impl<'lease, B> ValidatedBackingView<'lease, B> {
+    pub(super) const fn values(&self) -> &ValidatedBackingViewValues<'lease, B> {
+        &self.values
+    }
+
     pub(super) fn has_pool_version_proof(&self) -> bool {
         self.version_proof.is_some()
     }
@@ -146,13 +161,13 @@ impl<B> ValidatedBackingBindings<'_, B> {
         })
     }
 }
-impl<B> std::ops::Deref for ValidatedBackingBindings<'_, B> {
-    type Target = Vec<LogicalBackingSegmentBinding<B>>;
+impl<'lease, B> std::ops::Deref for ValidatedBackingView<'lease, B> {
+    type Target = ValidatedBackingViewValues<'lease, B>;
     fn deref(&self) -> &Self::Target {
         &self.values
     }
 }
-impl<B> std::ops::DerefMut for ValidatedBackingBindings<'_, B> {
+impl<B> std::ops::DerefMut for ValidatedBackingView<'_, B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.version_proof = None;
         &mut self.values
@@ -171,7 +186,7 @@ impl<'view, 'lease, B> ExactRetainedBackingView<'view, 'lease, B> {
         authorities: &[LogicalBackingSliceAuthority],
         view: &'view LogicalBackingBufferView<'lease, B>,
     ) -> Result<Self, VNextError> {
-        if !std::ptr::eq(view.authorities.as_slice(), authorities) {
+        if !std::ptr::eq(view.payload.authorities.as_slice(), authorities) {
             return Err(invalid_resource(
                 "retained backing differs from its exact live authority",
             ));
@@ -183,7 +198,7 @@ impl<'view, 'lease, B> ExactRetainedBackingView<'view, 'lease, B> {
     where
         R: DeviceRuntime<Buffer = B>,
     {
-        for authority in self.view.authorities.as_slice() {
+        for authority in self.view.payload.authorities.as_slice() {
             DynamicPoolSet::<R>::validate_authority_identity_and_bounds(pool, authority)?;
         }
         Ok(())
@@ -2551,7 +2566,26 @@ where
         retained: &LogicalBackingBufferView<'_, R::Buffer>,
     ) -> Result<bool, VNextError> {
         let hit = std::cell::Cell::new(false);
-        self.materialize_or_revalidate_inner(
+        self.materialize_or_revalidate_inner::<true>(
+            std::slice::from_ref(authority),
+            Some(retained),
+            true,
+            Some(&hit),
+        )?;
+        Ok(hit.get())
+    }
+
+    /// Test-only reference for the previous PoolVersion hit position. This
+    /// specializes the same complete implementation; production uses only the
+    /// sealed early-hit specialization.
+    #[cfg(test)]
+    pub(in crate::vnext::resource) fn revalidate_view_with_pool_version_late_reference(
+        &self,
+        authority: &LogicalBackingSliceAuthority,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<bool, VNextError> {
+        let hit = std::cell::Cell::new(false);
+        self.materialize_or_revalidate_inner::<false>(
             std::slice::from_ref(authority),
             Some(retained),
             true,
@@ -2566,10 +2600,10 @@ where
         retained: Option<&LogicalBackingBufferView<'_, R::Buffer>>,
         pool_version: bool,
     ) -> Result<Option<LogicalBackingBufferView<'lease, R::Buffer>>, VNextError> {
-        self.materialize_or_revalidate_inner(authorities, retained, pool_version, None)
+        self.materialize_or_revalidate_inner::<true>(authorities, retained, pool_version, None)
     }
 
-    fn materialize_or_revalidate_inner<'lease>(
+    fn materialize_or_revalidate_inner<'lease, const SEALED_EARLY_HIT: bool>(
         &'lease self,
         authorities: &'lease [LogicalBackingSliceAuthority],
         retained: Option<&LogicalBackingBufferView<'_, R::Buffer>>,
@@ -2586,6 +2620,21 @@ where
         let retained = retained
             .map(|view| ExactRetainedBackingView::new(authorities, view))
             .transpose()?;
+        if SEALED_EARLY_HIT
+            && pool_version
+            && retained
+                .as_ref()
+                .is_some_and(|proof| proof.view.payload.matches(authorities, &pool.state))
+        {
+            // The first complete materialization proved all immutable authority
+            // and view metadata below. Its sealed payload has not changed, and
+            // the same pool's current stable version proves the locked chunk
+            // predicates at this observation. Runtime coverage remains outside.
+            if let Some(hit) = hit {
+                hit.set(true);
+            }
+            return Ok(None);
+        }
         if let Some(proof) = &retained {
             proof.revalidate_authorities(pool)?;
         }
@@ -2627,7 +2676,7 @@ where
         }
         let validate_retained_metadata = || -> Result<(), VNextError> {
             if let Some(proof) = &retained {
-                let view = proof.view;
+                let view = &proof.view.payload;
                 if view.logical_size_bytes != logical_size_bytes
                     || view.capacity_size_bytes != capacity_size_bytes
                     || view.alignment_bytes != first.evidence.alignment_bytes
@@ -2643,10 +2692,11 @@ where
             }
             Ok(())
         };
-        if pool_version
+        if !SEALED_EARLY_HIT
+            && pool_version
             && retained
                 .as_ref()
-                .is_some_and(|proof| proof.view.bindings.matches(authorities, &pool.state))
+                .is_some_and(|proof| proof.view.payload.matches(authorities, &pool.state))
         {
             validate_retained_metadata()?;
             if let Some(hit) = hit {
@@ -2683,7 +2733,7 @@ where
                     ));
                 }
                 if let Some(proof) = &retained {
-                    let view = proof.view;
+                    let view = &proof.view.payload;
                     let binding = &view.bindings[binding_index];
                     if binding.segment != *segment || !Arc::ptr_eq(&binding.chunk, &chunk.backing) {
                         return Err(invalid_resource(
@@ -2719,18 +2769,20 @@ where
         let pool_read_stamp = pool_version.then(|| state.read_stamp()).flatten();
         drop(state);
         Ok(bindings.map(|bindings| LogicalBackingBufferView {
-            bindings: ValidatedBackingBindings {
-                values: bindings,
+            payload: ValidatedBackingView {
+                values: ValidatedBackingViewValues {
+                    bindings,
+                    authorities: ValidatedBackingAuthorities { authorities },
+                    logical_size_bytes,
+                    capacity_size_bytes,
+                    alignment_bytes: first.evidence.alignment_bytes,
+                    usage: first.evidence.usage,
+                    element_type: first.evidence.element_type,
+                    storage_profile: first.evidence.storage_profile,
+                },
                 version_proof: pool_read_stamp
                     .map(|stamp| ValidatedPoolVersion { authorities, stamp }),
             },
-            authorities: ValidatedBackingAuthorities { authorities },
-            logical_size_bytes,
-            capacity_size_bytes,
-            alignment_bytes: first.evidence.alignment_bytes,
-            usage: first.evidence.usage,
-            element_type: first.evidence.element_type,
-            storage_profile: first.evidence.storage_profile,
         }))
     }
 
