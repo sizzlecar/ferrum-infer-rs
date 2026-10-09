@@ -962,6 +962,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -997,6 +998,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1037,6 +1039,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1062,9 +1065,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let pool_version = super::preparation::PoolVersionCounts::default();
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            pool_version: &pool_version,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1085,6 +1090,8 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            (strategy == ferrum_types::InvocationPreparationStrategy::PoolVersion)
+                .then_some(&pool_version),
         )
     }
 
@@ -1135,6 +1142,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         Ok(SubmissionWaveDeterminismHandle::from_profiled_eager(
             profiled,
@@ -1220,6 +1228,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         SubmissionWaveDeterminismHandle::from_profiled_replayed(
             profiled,
@@ -1263,6 +1272,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1299,6 +1309,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1337,6 +1348,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1363,9 +1375,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let pool_version = super::preparation::PoolVersionCounts::default();
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            pool_version: &pool_version,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1386,6 +1400,8 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            (strategy == ferrum_types::InvocationPreparationStrategy::PoolVersion)
+                .then_some(&pool_version),
         )
     }
 
@@ -1404,6 +1420,7 @@ impl OperationDispatch {
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
+        pool_version: Option<&super::preparation::PoolVersionCounts>,
     ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
@@ -1700,17 +1717,20 @@ impl OperationDispatch {
                             timing_sink,
                             SubmissionWaveDispatchStage::NodeInvocationConstruct,
                         );
-                        let invocation = BatchedOperationInvocation::from_reusable_wave_node(
-                            runtime,
-                            resolved,
-                            provider.dispatch(),
-                            batch_identity,
-                            node_identity,
-                            completion.wave(),
-                            binding_node_index,
-                            active_bindings.clone(),
-                        )
-                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        let invocation =
+                            BatchedOperationInvocation::from_wave_node_with_pool_version(
+                                runtime,
+                                resolved,
+                                provider.dispatch(),
+                                batch_identity,
+                                node_identity,
+                                completion.wave(),
+                                binding_node_index,
+                                active_bindings.clone(),
+                                true,
+                                pool_version,
+                            )
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
                         drop(invocation_stage);
                         let expected_phase = invocation.operation().profile_phase;
                         let program_binding = invocation.program_binding().cloned();
@@ -1842,7 +1862,7 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::NodeInvocationConstruct,
                 );
-                let invocation = BatchedOperationInvocation::from_wave_node(
+                let invocation = BatchedOperationInvocation::from_wave_node_with_pool_version(
                     runtime,
                     resolved,
                     provider.dispatch(),
@@ -1851,6 +1871,8 @@ impl OperationDispatch {
                     completion.wave(),
                     node_index,
                     active_bindings.clone(),
+                    false,
+                    pool_version,
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
                 drop(invocation_stage);
@@ -1944,7 +1966,7 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::NodeInvocationConstruct,
                 );
-                let invocation = BatchedOperationInvocation::from_wave_node(
+                let invocation = BatchedOperationInvocation::from_wave_node_with_pool_version(
                     runtime,
                     resolved,
                     provider.dispatch(),
@@ -1953,6 +1975,8 @@ impl OperationDispatch {
                     completion.wave(),
                     node_index,
                     active_bindings.clone(),
+                    false,
+                    pool_version,
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
                 drop(invocation_stage);

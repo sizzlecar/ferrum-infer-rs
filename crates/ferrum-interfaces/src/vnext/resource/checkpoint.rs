@@ -162,7 +162,7 @@ impl<R: DeviceRuntime> CheckpointBackingOwner<R> {
             .binary_search_by(|slice| slice.resource_id().cmp(resource_id))
             .map_err(|_| invalid_resource("checkpoint does not own this resource"))?;
         let mut view = self.plan.dynamic_pools.view(&self.backing_slices[index])?;
-        for binding in &mut view.bindings {
+        for binding in view.bindings.iter_mut() {
             // A command may retain a segment after dropping the borrowed
             // view. Pin the logical lease and plan as well as physical bytes.
             binding.retention =

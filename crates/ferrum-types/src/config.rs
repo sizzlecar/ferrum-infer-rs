@@ -81,6 +81,8 @@ pub enum InvocationPreparationStrategy {
     #[default]
     Full,
     IdentityProjection,
+    /// Revalidate retained pool bindings when their pool state version changes.
+    PoolVersion,
 }
 
 impl InvocationPreparationStrategy {
@@ -88,6 +90,7 @@ impl InvocationPreparationStrategy {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::PoolVersion => "pool-version",
         }
     }
 
@@ -95,7 +98,10 @@ impl InvocationPreparationStrategy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
-            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+            "pool-version" => Ok(Self::PoolVersion),
+            _ => Err(format!(
+                "expected full, identity-projection or pool-version; got {raw:?}"
+            )),
         }
     }
 }
@@ -1331,6 +1337,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::PoolVersion,
             InvocationPreparationStrategy::Full,
         ] {
             config

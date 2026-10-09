@@ -15,6 +15,8 @@ mod extra_prefill;
 mod hybrid;
 #[path = "runtime/identity_projection.rs"]
 mod identity_projection;
+#[path = "runtime/pool_version.rs"]
+mod pool_version;
 #[path = "runtime/prefill.rs"]
 mod prefill;
 #[path = "runtime/replay_bindings.rs"]

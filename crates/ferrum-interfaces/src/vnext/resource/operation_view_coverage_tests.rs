@@ -368,3 +368,6 @@ fn first_materialization_still_checks_claim_membership_and_physical_projection()
     let backing = pools.view(&authority).unwrap();
     pools.revalidate_view(&authority, &backing).unwrap();
 }
+
+#[path = "pool_version_tests.rs"]
+mod pool_version_tests;

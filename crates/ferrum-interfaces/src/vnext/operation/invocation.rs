@@ -271,6 +271,34 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
             )),
         }
     }
+    fn versioned_backing_view(
+        self,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'a, R::Buffer>, VNextError> {
+        match self {
+            Self::Wave { wave, node_index } => {
+                wave.backing_view_with_pool_version(node_index, resource_id)
+            }
+            Self::Invocation(_) => Err(invalid_operation(
+                "shared materialization requires one prepared wave",
+            )),
+        }
+    }
+
+    fn revalidate_versioned_backing_view(
+        self,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<bool, VNextError> {
+        match self {
+            Self::Wave { wave, node_index } => {
+                wave.revalidate_backing_view_with_pool_version(node_index, resource_id, retained)
+            }
+            Self::Invocation(_) => Err(invalid_operation(
+                "shared materialization requires one prepared wave",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,6 +654,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         reusable_bindings_only: bool,
         shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
         device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
+        pool_version: Option<&super::preparation::PoolVersionCounts>,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -782,10 +811,24 @@ impl<'a, B> OperationInvocation<'a, B> {
                         AllocationLifetime::Step | AllocationLifetime::Invocation => {
                             if let Some(entry) = shared_backings.get_mut(resource_index) {
                                 let retained = if let Some(retained) = entry {
-                                    resources.revalidate_backing_view(resource_id, retained)?;
+                                    if let Some(counts) = pool_version {
+                                        let hit = resources.revalidate_versioned_backing_view(
+                                            resource_id,
+                                            retained,
+                                        )?;
+                                        counts.record_check(hit);
+                                    } else {
+                                        resources.revalidate_backing_view(resource_id, retained)?;
+                                    }
                                     Arc::clone(retained)
                                 } else {
-                                    let retained = Arc::new(resources.backing_view(resource_id)?);
+                                    let retained = if let Some(counts) = pool_version {
+                                        let view = resources.versioned_backing_view(resource_id)?;
+                                        counts.record_proof(view.has_pool_version_proof());
+                                        Arc::new(view)
+                                    } else {
+                                        Arc::new(resources.backing_view(resource_id)?)
+                                    };
                                     *entry = Some(Arc::clone(&retained));
                                     retained
                                 };
@@ -1197,6 +1240,37 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_wave_node_with_pool_version<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: I,
+        reusable_bindings_only: bool,
+        pool_version: Option<&super::preparation::PoolVersionCounts>,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::from_resources_with_pool_version(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Wave { wave, node_index },
+            active_bindings,
+            reusable_bindings_only,
+            true,
+            pool_version,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn from_resources<'binding, R, I>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
@@ -1207,6 +1281,37 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         active_bindings: I,
         reusable_bindings_only: bool,
         share_materialization: bool,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::from_resources_with_pool_version(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            resources,
+            active_bindings,
+            reusable_bindings_only,
+            share_materialization,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_resources_with_pool_version<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        resources: OperationInvocationResources<'a, R>,
+        active_bindings: I,
+        reusable_bindings_only: bool,
+        share_materialization: bool,
+        pool_version: Option<&super::preparation::PoolVersionCounts>,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -1281,6 +1386,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     reusable_bindings_only,
                     &mut shared_backings,
                     &mut device_agreements,
+                    pool_version,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;

@@ -119,6 +119,46 @@ impl<'lease> ValidatedBackingAuthorities<'lease> {
     }
 }
 
+/// An optional stamp is sealed together with the original binding payload and
+/// exact borrowed authority slice. Any mutable payload access invalidates it,
+/// including checkpoint retention replacement and internal negative fixtures.
+/// Moving this payload to another view cannot retarget its authority proof.
+pub(super) struct ValidatedBackingBindings<'lease, B> {
+    values: Vec<LogicalBackingSegmentBinding<B>>,
+    version_proof: Option<ValidatedPoolVersion<'lease, B>>,
+}
+struct ValidatedPoolVersion<'lease, B> {
+    authorities: &'lease [LogicalBackingSliceAuthority],
+    stamp: super::PoolReadStamp<'lease, DynamicBackingPoolState<B>>,
+}
+impl<B> ValidatedBackingBindings<'_, B> {
+    pub(super) fn has_pool_version_proof(&self) -> bool {
+        self.version_proof.is_some()
+    }
+
+    fn matches(
+        &self,
+        authorities: &[LogicalBackingSliceAuthority],
+        pool: &super::PoolStateMutex<DynamicBackingPoolState<B>>,
+    ) -> bool {
+        self.version_proof.as_ref().is_some_and(|proof| {
+            std::ptr::eq(proof.authorities, authorities) && proof.stamp.matches(pool)
+        })
+    }
+}
+impl<B> std::ops::Deref for ValidatedBackingBindings<'_, B> {
+    type Target = Vec<LogicalBackingSegmentBinding<B>>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+impl<B> std::ops::DerefMut for ValidatedBackingBindings<'_, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.version_proof = None;
+        &mut self.values
+    }
+}
+
 /// A previously materialized view may prove immutable claim relationships only
 /// for its exact borrowed authority slice. It does not prove current pool or
 /// chunk validity, which every reuse must check again.
@@ -196,7 +236,7 @@ where
                 logical_admission: logical_admission.clone(),
                 maintenance: Mutex::new(()),
                 next_extent_generation: AtomicU64::new(1),
-                state: Mutex::new(DynamicBackingPoolState {
+                state: super::PoolStateMutex::new(DynamicBackingPoolState {
                     resident_bytes: 0,
                     pending_growth_bytes: 0,
                     next_chunk_ordinal: 1,
@@ -2479,7 +2519,7 @@ where
         &'lease self,
         authorities: &'lease [LogicalBackingSliceAuthority],
     ) -> Result<LogicalBackingBufferView<'lease, R::Buffer>, VNextError> {
-        self.materialize_or_revalidate(authorities, None)?
+        self.materialize_or_revalidate(authorities, None, false)?
             .ok_or_else(|| invalid_resource("backing materialization did not return a view"))
     }
 
@@ -2491,14 +2531,50 @@ where
         authority: &LogicalBackingSliceAuthority,
         retained: &LogicalBackingBufferView<'_, R::Buffer>,
     ) -> Result<(), VNextError> {
-        self.materialize_or_revalidate(std::slice::from_ref(authority), Some(retained))?;
+        self.materialize_or_revalidate(std::slice::from_ref(authority), Some(retained), false)?;
         Ok(())
+    }
+
+    pub(in crate::vnext::resource) fn view_with_pool_version<'lease>(
+        &'lease self,
+        authority: &'lease LogicalBackingSliceAuthority,
+    ) -> Result<LogicalBackingBufferView<'lease, R::Buffer>, VNextError> {
+        self.materialize_or_revalidate(std::slice::from_ref(authority), None, true)?
+            .ok_or_else(|| invalid_resource("backing materialization did not return a view"))
+    }
+
+    /// Only the exact, immutable retained view can consume its private stamp.
+    /// Runtime descriptors and per-node projections remain outside this check.
+    pub(in crate::vnext::resource) fn revalidate_view_with_pool_version(
+        &self,
+        authority: &LogicalBackingSliceAuthority,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<bool, VNextError> {
+        let hit = std::cell::Cell::new(false);
+        self.materialize_or_revalidate_inner(
+            std::slice::from_ref(authority),
+            Some(retained),
+            true,
+            Some(&hit),
+        )?;
+        Ok(hit.get())
     }
 
     fn materialize_or_revalidate<'lease>(
         &'lease self,
         authorities: &'lease [LogicalBackingSliceAuthority],
         retained: Option<&LogicalBackingBufferView<'_, R::Buffer>>,
+        pool_version: bool,
+    ) -> Result<Option<LogicalBackingBufferView<'lease, R::Buffer>>, VNextError> {
+        self.materialize_or_revalidate_inner(authorities, retained, pool_version, None)
+    }
+
+    fn materialize_or_revalidate_inner<'lease>(
+        &'lease self,
+        authorities: &'lease [LogicalBackingSliceAuthority],
+        retained: Option<&LogicalBackingBufferView<'_, R::Buffer>>,
+        pool_version: bool,
+        hit: Option<&std::cell::Cell<bool>>,
     ) -> Result<Option<LogicalBackingBufferView<'lease, R::Buffer>>, VNextError> {
         let first = authorities
             .first()
@@ -2549,6 +2625,35 @@ where
                 .checked_add(authority.evidence.segments.len())
                 .ok_or_else(|| invalid_resource("logical backing segment count overflows usize"))?;
         }
+        let validate_retained_metadata = || -> Result<(), VNextError> {
+            if let Some(proof) = &retained {
+                let view = proof.view;
+                if view.logical_size_bytes != logical_size_bytes
+                    || view.capacity_size_bytes != capacity_size_bytes
+                    || view.alignment_bytes != first.evidence.alignment_bytes
+                    || view.usage != first.evidence.usage
+                    || view.element_type != first.evidence.element_type
+                    || view.storage_profile != first.evidence.storage_profile
+                    || view.bindings.len() != segment_count
+                {
+                    return Err(invalid_resource(
+                        "retained backing differs from its exact live authority",
+                    ));
+                }
+            }
+            Ok(())
+        };
+        if pool_version
+            && retained
+                .as_ref()
+                .is_some_and(|proof| proof.view.bindings.matches(authorities, &pool.state))
+        {
+            validate_retained_metadata()?;
+            if let Some(hit) = hit {
+                hit.set(true);
+            }
+            return Ok(None);
+        }
         let state = pool
             .state
             .lock()
@@ -2556,21 +2661,7 @@ where
         if state.poisoned {
             return Err(invalid_resource("dynamic backing pool is fail-closed"));
         }
-        if let Some(proof) = &retained {
-            let view = proof.view;
-            if view.logical_size_bytes != logical_size_bytes
-                || view.capacity_size_bytes != capacity_size_bytes
-                || view.alignment_bytes != first.evidence.alignment_bytes
-                || view.usage != first.evidence.usage
-                || view.element_type != first.evidence.element_type
-                || view.storage_profile != first.evidence.storage_profile
-                || view.bindings.len() != segment_count
-            {
-                return Err(invalid_resource(
-                    "retained backing differs from its exact live authority",
-                ));
-            }
-        }
+        validate_retained_metadata()?;
         let mut bindings = retained
             .is_none()
             .then(|| Vec::with_capacity(segment_count));
@@ -2623,9 +2714,16 @@ where
                 binding_index += 1;
             }
         }
+        // Same locked observation as the complete current chunk validation.
+        // Retained fallbacks do not refresh the old proof or silently rebind it.
+        let pool_read_stamp = pool_version.then(|| state.read_stamp()).flatten();
         drop(state);
         Ok(bindings.map(|bindings| LogicalBackingBufferView {
-            bindings,
+            bindings: ValidatedBackingBindings {
+                values: bindings,
+                version_proof: pool_read_stamp
+                    .map(|stamp| ValidatedPoolVersion { authorities, stamp }),
+            },
             authorities: ValidatedBackingAuthorities { authorities },
             logical_size_bytes,
             capacity_size_bytes,

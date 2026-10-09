@@ -55,6 +55,8 @@ mod lane_stable_identity;
 pub use lane_stable_identity::*;
 mod program_binding;
 pub use program_binding::*;
+mod pool_state_mutex;
+use pool_state_mutex::{PoolReadStamp, PoolStateGuard, PoolStateMutex};
 mod dynamic_pool;
 pub use dynamic_pool::*;
 mod maintenance_boundary;

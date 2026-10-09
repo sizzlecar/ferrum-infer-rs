@@ -547,6 +547,49 @@ where
             .revalidate_view(authority, retained)
     }
 
+    pub(crate) fn backing_view_with_pool_version(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        if let Some(authority) = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+        {
+            return self.participants[0]
+                .session
+                .resources()
+                .request
+                .plan
+                .dynamic_pools()
+                .view_with_pool_version(authority);
+        }
+        Err(invalid_resource(format!(
+            "resource `{resource_id}` is not step-shared backing"
+        )))
+    }
+
+    pub(crate) fn revalidate_backing_view_with_pool_version(
+        &self,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<bool, VNextError> {
+        let authority = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+            .ok_or_else(|| invalid_resource("retained resource is not step-shared backing"))?;
+        self.participants[0]
+            .session
+            .resources()
+            .request
+            .plan
+            .dynamic_pools()
+            .revalidate_view_with_pool_version(authority, retained)
+    }
+
     pub(crate) fn dynamic_descriptor(
         &self,
         resource_id: &ResourceId,
@@ -1857,6 +1900,56 @@ where
                 .revalidate_view(authority, retained);
         }
         self.step.revalidate_backing_view(resource_id, retained)
+    }
+
+    pub(crate) fn backing_view_with_pool_version(
+        &self,
+        node_index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?;
+        if let Some(authority) = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+        {
+            return node.participant_authority.participants[0]
+                .request
+                .plan
+                .dynamic_pools()
+                .view_with_pool_version(authority);
+        }
+        self.step.backing_view_with_pool_version(resource_id)
+    }
+
+    pub(crate) fn revalidate_backing_view_with_pool_version(
+        &self,
+        node_index: usize,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<bool, VNextError> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?;
+        if let Some(authority) = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+        {
+            return node.participant_authority.participants[0]
+                .request
+                .plan
+                .dynamic_pools()
+                .revalidate_view_with_pool_version(authority, retained);
+        }
+        self.step
+            .revalidate_backing_view_with_pool_version(resource_id, retained)
     }
 
     pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {

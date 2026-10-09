@@ -392,7 +392,7 @@ pub(super) struct DynamicBackingClaimOccupancy {
 }
 
 pub(super) fn rollback_free_extent_journal<B>(
-    states: &mut [std::sync::MutexGuard<'_, DynamicBackingPoolState<B>>],
+    states: &mut [super::PoolStateGuard<'_, DynamicBackingPoolState<B>>],
     journals: &[Vec<Vec<BackingSegment>>],
 ) -> Result<(), VNextError> {
     for group_index in (0..journals.len()).rev() {
@@ -443,7 +443,7 @@ where
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) maintenance: Mutex<()>,
     pub(super) next_extent_generation: AtomicU64,
-    pub(super) state: Mutex<DynamicBackingPoolState<R::Buffer>>,
+    pub(super) state: super::PoolStateMutex<DynamicBackingPoolState<R::Buffer>>,
 }
 
 pub(super) struct PendingGrowthGuard<R>
@@ -2194,7 +2194,8 @@ impl LogicalBackingSliceAuthority {
 }
 
 pub struct LogicalBackingBufferView<'a, B> {
-    pub(in crate::vnext::resource) bindings: Vec<LogicalBackingSegmentBinding<B>>,
+    pub(in crate::vnext::resource) bindings:
+        super::dynamic_pool_set::ValidatedBackingBindings<'a, B>,
     pub(super) authorities: super::dynamic_pool_set::ValidatedBackingAuthorities<'a>,
     pub(super) logical_size_bytes: u64,
     pub(super) capacity_size_bytes: u64,
@@ -2233,6 +2234,10 @@ impl<B> LogicalBackingSegmentBinding<B> {
 }
 
 impl<'a, B> LogicalBackingBufferView<'a, B> {
+    pub(crate) fn has_pool_version_proof(&self) -> bool {
+        self.bindings.has_pool_version_proof()
+    }
+
     pub(crate) fn segment_bindings(&self) -> &[LogicalBackingSegmentBinding<B>] {
         &self.bindings
     }
