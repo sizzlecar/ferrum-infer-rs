@@ -3703,7 +3703,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn immutable_runtime_metadata(
         &self,
-    ) -> Option<ferrum_interfaces::vnext::ImmutableRuntimeMetadata<'_>> {
+    ) -> Option<ferrum_interfaces::vnext::ImmutableRuntimeMetadata<'_, Self>> {
         // The descriptor is installed once by the runtime constructor. Stream,
         // allocator, quarantine and graph-cache state are not this capability.
         Some(ferrum_interfaces::vnext::ImmutableRuntimeMetadata::declare(
@@ -3715,7 +3715,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn immutable_buffer_metadata<'a>(
         &'a self,
         buffer: &'a Self::Buffer,
-    ) -> Option<ferrum_interfaces::vnext::ImmutableBufferMetadata<'a, Self::Buffer>> {
+    ) -> Option<ferrum_interfaces::vnext::ImmutableBufferMetadata<'a, Self>> {
         if buffer.runtime_instance != self.runtime_instance {
             return None;
         }

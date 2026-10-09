@@ -109,7 +109,8 @@ pub(crate) fn encode(
     // Unsupported declarations fall back before any dependency is consumed.
     if patch.nodes().iter().any(|node| {
         node.declaration()
-            .state::<CudaSegmentBindingRecipe>()
+            .provider_state()
+            .downcast_ref::<CudaSegmentBindingRecipe>()
             .is_none()
     }) {
         return Ok(None);
@@ -118,7 +119,8 @@ pub(crate) fn encode(
     for mut node in patch.into_nodes() {
         let recipe = node
             .declaration()
-            .state::<CudaSegmentBindingRecipe>()
+            .provider_state()
+            .downcast_ref::<CudaSegmentBindingRecipe>()
             .expect("all CUDA segment declaration types were checked");
         let mut bindings = match &recipe.dynamic {
             DynamicRecipe::PlanDependencies => Ok(EncodedReusableExecutionBindings::empty()),

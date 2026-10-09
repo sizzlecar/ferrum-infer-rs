@@ -128,8 +128,10 @@ impl SegmentBindingDeclaration {
     pub fn dependencies(&self) -> &[SegmentBindingDependency] {
         &self.dependencies
     }
-    pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.state.downcast_ref()
+    /// Only the backend interprets its opaque Plan state. Core retains and
+    /// transports this borrow without selecting a concrete provider type.
+    pub fn provider_state(&self) -> &(dyn Any + Send + Sync) {
+        self.state.as_ref()
     }
 }
 

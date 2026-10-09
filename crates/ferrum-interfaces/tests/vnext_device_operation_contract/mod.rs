@@ -1685,7 +1685,7 @@ impl DeviceRuntime for TestRuntime {
         }
     }
 
-    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_>> {
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_, Self>> {
         let (enabled, foreign) = {
             let trace = self.trace.lock().unwrap();
             (
@@ -1715,7 +1715,7 @@ impl DeviceRuntime for TestRuntime {
     fn immutable_buffer_metadata<'a>(
         &'a self,
         buffer: &'a Self::Buffer,
-    ) -> Option<ImmutableBufferMetadata<'a, Self::Buffer>> {
+    ) -> Option<ImmutableBufferMetadata<'a, Self>> {
         self.trace
             .lock()
             .unwrap()
