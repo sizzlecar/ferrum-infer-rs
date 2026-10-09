@@ -198,11 +198,11 @@ fn compare(kind: AttentionKind) {
     let mut hot_after_growth = 0;
     let mut publications = 0;
     let mut previous_frames: [Vec<ExecutionFrameId>; 2] = [Vec::new(), Vec::new()];
+    let mut previous_programs: [Option<DeviceReusableExecutionProgramId>; 2] = [None, None];
     for position in 0..joint_waves {
         let ranges = [lead + position..lead + position + 1, position..position + 1];
         let changed_extent = kind == AttentionKind::Causal && position == 4;
-        let path = if position < 2 || (kind == AttentionKind::Causal && (4..6).contains(&position))
-        {
+        let path = if position < 2 {
             Path::Warm
         } else {
             Path::Replay
@@ -242,6 +242,20 @@ fn compare(kind: AttentionKind) {
                 Some(row_bytes),
             );
             let stats = sinks[arm].last();
+            let program_id = observation
+                .reusable_program_id
+                .as_ref()
+                .expect("joint single-token work has an actual reusable program identity");
+            // Token-span work supplies no CommittedPageWork. Its program pages
+            // are distinct from the current physical KV allocation measured above.
+            assert_eq!(program_id.immediate_pages(), 0);
+            if changed_extent {
+                assert_eq!(
+                    Some(program_id),
+                    previous_programs[arm].as_ref(),
+                    "physical KV growth keeps this fixture's exact program identity"
+                );
+            }
             assert_eq!(
                 fixture
                     ._composition
@@ -282,10 +296,11 @@ fn compare(kind: AttentionKind) {
                 publications += u64::from(observation.segment_published);
                 if changed_extent {
                     assert_eq!(
-                        stats.segment_hits, 0,
-                        "new physical KV extent cannot consume the previous exact program recipe"
+                        stats.segment_hits, 1,
+                        "the unchanged program must hot-encode the freshly authorized larger KV extent"
                     );
-                    assert!(stats.segment_misses > 0);
+                    assert_eq!(stats.segment_misses, 0);
+                    assert!(!observation.segment_published);
                 }
             }
             if !previous_frames[arm].is_empty() {
@@ -296,10 +311,12 @@ fn compare(kind: AttentionKind) {
                     .all(|(current, previous)| current > previous));
             }
             previous_frames[arm] = observation.participant_frames.clone();
+            previous_programs[arm] = Some(program_id.clone());
             println!(
                 "{}",
                 serde_json::json!({"kind":"decode_segment_wave", "attention":format!("{kind:?}"), "strategy":modes[arm],
-                "ranges":ranges, "physical_kv_pages":pages, "published":observation.segment_published,
+                "ranges":ranges, "physical_kv_pages":pages, "reusable_program_id":program_id,
+                "program_immediate_pages":program_id.immediate_pages(), "published":observation.segment_published,
                 "hits":stats.segment_hits, "misses":stats.segment_misses, "encoded_nodes":stats.segment_encoded_nodes,
                 "parts_materialized":stats.parts_materialized})
             );
@@ -313,7 +330,7 @@ fn compare(kind: AttentionKind) {
         "must observe a true hot wave before the page-growth boundary"
     );
     assert!(hot_after_growth > 0);
-    assert!(publications >= if kind == AttentionKind::Causal { 2 } else { 1 });
+    assert!(publications >= 1);
 
     // Drop the original sessions and admit different requests on the same
     // immutable Plan/lane. No cold recipe may retain their request/state owners.

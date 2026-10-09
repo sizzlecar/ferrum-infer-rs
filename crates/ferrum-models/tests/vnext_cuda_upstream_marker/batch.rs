@@ -35,6 +35,7 @@ pub struct BatchObservation {
     /// Observations use caller order; raw rows retain the device's row index.
     pub caller_to_canonical_participant: Vec<u32>,
     pub segment_published: bool,
+    pub reusable_program_id: Option<DeviceReusableExecutionProgramId>,
     pub participant_frames: Vec<ExecutionFrameId>,
 }
 
@@ -640,6 +641,7 @@ impl Fixture {
             binding_rows,
             caller_to_canonical_participant,
             segment_published,
+            reusable_program_id: program_id,
             participant_frames,
         }
     }
