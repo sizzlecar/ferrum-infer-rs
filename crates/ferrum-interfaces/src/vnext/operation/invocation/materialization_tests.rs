@@ -333,3 +333,6 @@ fn shared_materialization_preserves_unequal_participant_token_windows() {
 
 #[path = "identity_projection_tests.rs"]
 mod identity_projection_tests;
+
+#[path = "constructor_timing_tests.rs"]
+mod constructor_timing_tests;

@@ -249,6 +249,33 @@ pub enum SubmissionWaveDispatchStage {
     LaneReserveSubmitAndArm,
 }
 
+/// Exclusive host time accumulated across visits within one node constructor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InvocationConstructorPhaseTiming {
+    pub elapsed: Duration,
+    pub visits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InvocationConstructorOutcome {
+    Success,
+    #[default]
+    Error,
+}
+
+/// One callback per completed or ordinarily failed constructor. Panic unwinding
+/// skips the callback, matching the existing outer dispatch timers. These are
+/// host elapsed intervals, not pure CPU or device timing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InvocationConstructorTimingBreakdown {
+    pub outcome: InvocationConstructorOutcome,
+    pub node_setup_assemble: InvocationConstructorPhaseTiming,
+    pub participant_common_validate: InvocationConstructorPhaseTiming,
+    pub resource_view_build: InvocationConstructorPhaseTiming,
+    pub runtime_full_coverage: InvocationConstructorPhaseTiming,
+    pub component_workspace_validate: InvocationConstructorPhaseTiming,
+}
+
 /// Diagnostic-only timing sink for the prepared-wave dispatch hot path.
 ///
 /// The sink receives only a stage and completed host duration; it receives no
@@ -258,6 +285,115 @@ pub enum SubmissionWaveDispatchStage {
 /// allocate, or panic.
 pub trait SubmissionWaveDispatchTimingSink: DeviceSubmissionTimingSink {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration);
+
+    fn record_invocation_construct_breakdown(
+        &self,
+        _breakdown: InvocationConstructorTimingBreakdown,
+    ) {
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InvocationConstructorPhase {
+    NodeSetupAssemble,
+    ParticipantCommonValidate,
+    ResourceViewBuild,
+    RuntimeFullCoverage,
+    ComponentWorkspaceValidate,
+}
+
+struct InvocationConstructorTimingState {
+    breakdown: InvocationConstructorTimingBreakdown,
+    phase: InvocationConstructorPhase,
+    started: Instant,
+}
+
+impl InvocationConstructorTimingState {
+    fn current(&mut self) -> &mut InvocationConstructorPhaseTiming {
+        match self.phase {
+            InvocationConstructorPhase::NodeSetupAssemble => {
+                &mut self.breakdown.node_setup_assemble
+            }
+            InvocationConstructorPhase::ParticipantCommonValidate => {
+                &mut self.breakdown.participant_common_validate
+            }
+            InvocationConstructorPhase::ResourceViewBuild => {
+                &mut self.breakdown.resource_view_build
+            }
+            InvocationConstructorPhase::RuntimeFullCoverage => {
+                &mut self.breakdown.runtime_full_coverage
+            }
+            InvocationConstructorPhase::ComponentWorkspaceValidate => {
+                &mut self.breakdown.component_workspace_validate
+            }
+        }
+    }
+
+    fn close_interval(&mut self, now: Instant) {
+        let elapsed = now.duration_since(self.started);
+        let current = self.current();
+        current.elapsed = current.elapsed.saturating_add(elapsed);
+        self.started = now;
+    }
+}
+
+/// One active phase at a time, with no clocks, visit updates or callbacks in
+/// the statically disabled specialization. Never carries correctness authority.
+pub(super) struct InvocationConstructorTimer<'sink, S: SubmissionWaveDispatchTimingSink> {
+    sink: &'sink S,
+    state: Option<InvocationConstructorTimingState>,
+}
+
+impl<'sink, S: SubmissionWaveDispatchTimingSink> InvocationConstructorTimer<'sink, S> {
+    #[inline(always)]
+    pub(super) fn start(sink: &'sink S) -> Self {
+        Self {
+            sink,
+            state: S::ENABLED.then(|| {
+                let mut breakdown = InvocationConstructorTimingBreakdown::default();
+                breakdown.node_setup_assemble.visits = 1;
+                InvocationConstructorTimingState {
+                    breakdown,
+                    phase: InvocationConstructorPhase::NodeSetupAssemble,
+                    started: Instant::now(),
+                }
+            }),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn enter(&mut self, phase: InvocationConstructorPhase) {
+        if S::ENABLED {
+            if let Some(state) = &mut self.state {
+                if state.phase != phase {
+                    state.close_interval(Instant::now());
+                    state.phase = phase;
+                    state.current().visits += 1;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn complete(&mut self) {
+        if S::ENABLED {
+            if let Some(state) = &mut self.state {
+                state.breakdown.outcome = InvocationConstructorOutcome::Success;
+            }
+        }
+    }
+}
+
+impl<S: SubmissionWaveDispatchTimingSink> Drop for InvocationConstructorTimer<'_, S> {
+    fn drop(&mut self) {
+        if S::ENABLED && !std::thread::panicking() {
+            if let Some(mut state) = self.state.take() {
+                state.close_interval(Instant::now());
+                self.sink
+                    .record_invocation_construct_breakdown(state.breakdown);
+            }
+        }
+    }
 }
 
 pub(super) struct DisabledSubmissionWaveDispatchTimingSink;

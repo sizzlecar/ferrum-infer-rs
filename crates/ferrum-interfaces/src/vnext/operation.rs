@@ -72,7 +72,8 @@ pub use determinism_artifact::{
 };
 pub use dispatch::OperationDispatch;
 pub use dispatch_contract::{
-    BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatchError,
+    BoundDeviceSubmissionAttribution, DispatchRetryAuthority, InvocationConstructorOutcome,
+    InvocationConstructorPhaseTiming, InvocationConstructorTimingBreakdown, OperationDispatchError,
     ProfiledSubmissionHandle, SubmissionExecutionPolicy, SubmissionScratchInitialization,
     SubmissionWaveDispatchError, SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink,
     SubmissionWaveInputUpload,

@@ -63,6 +63,7 @@ use super::{
 mod backing_maintenance;
 mod composition;
 mod determinism;
+mod invocation_constructor_timing;
 mod invocation_preparation;
 mod mixed_batch;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
@@ -2120,6 +2121,8 @@ struct VNextWaveTimingMetrics {
     provider_node_encode: AtomicDurationMetrics,
     node_identity_materialize: AtomicDurationMetrics,
     node_invocation_construct: AtomicDurationMetrics,
+    invocation_construct_breakdown:
+        invocation_constructor_timing::InvocationConstructorTimingMetrics,
     provider_dynamic_binding_encode: AtomicDurationMetrics,
     binding_validate_coalesce: AtomicDurationMetrics,
     lane_reserve_submit_arm: AtomicDurationMetrics,
@@ -2206,6 +2209,12 @@ impl VNextPreparedWaveTopologyMetrics {
 
 impl VNextWaveTimingMetrics {
     fn snapshot(&self) -> serde_json::Value {
+        let invocation_construct = self.node_invocation_construct.snapshot();
+        let invocation_construct_breakdown = self.invocation_construct_breakdown.snapshot(
+            invocation_construct["total_ns"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
         serde_json::json!({
             "clock": "host_monotonic",
             "scope": "executor_host_wall_boundaries",
@@ -2230,7 +2239,8 @@ impl VNextWaveTimingMetrics {
                     "provider_node_encode_breakdown": {
                         "collection": "profile_attached_only",
                         "identity_materialize": self.node_identity_materialize.snapshot(),
-                        "invocation_construct": self.node_invocation_construct.snapshot(),
+                        "invocation_construct": invocation_construct,
+                        "invocation_construct_breakdown": invocation_construct_breakdown,
                         "dynamic_binding_encode": self.provider_dynamic_binding_encode.snapshot(),
                         "binding_validate_coalesce": self.binding_validate_coalesce.snapshot(),
                     },
@@ -2303,6 +2313,7 @@ impl VNextWaveTimingMetrics {
             metrics.reset();
         }
         self.resource_step_admission_breakdown.reset();
+        self.invocation_construct_breakdown.reset();
         self.reusable_execution.reset();
     }
 }
@@ -2426,6 +2437,13 @@ impl DeviceSubmissionTimingSink for VNextWaveTimingMetrics {
 }
 
 impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
+    fn record_invocation_construct_breakdown(
+        &self,
+        breakdown: InvocationConstructorTimingBreakdown,
+    ) {
+        self.invocation_construct_breakdown.record(&breakdown);
+    }
+
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         match stage {
             SubmissionWaveDispatchStage::ContractValidateAndReserve => {
@@ -2481,6 +2499,16 @@ impl DeviceSubmissionTimingSink for VNextWaveTimingSink<'_> {
 }
 
 impl SubmissionWaveDispatchTimingSink for VNextWaveTimingSink<'_> {
+    fn record_invocation_construct_breakdown(
+        &self,
+        breakdown: InvocationConstructorTimingBreakdown,
+    ) {
+        self.aggregate
+            .invocation_construct_breakdown
+            .record(&breakdown);
+        self.phase.invocation_construct_breakdown.record(&breakdown);
+    }
+
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         SubmissionWaveDispatchTimingSink::record(self.aggregate, stage, elapsed);
         SubmissionWaveDispatchTimingSink::record(self.phase, stage, elapsed);

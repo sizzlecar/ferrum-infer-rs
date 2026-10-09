@@ -1700,17 +1700,19 @@ impl OperationDispatch {
                             timing_sink,
                             SubmissionWaveDispatchStage::NodeInvocationConstruct,
                         );
-                        let invocation = BatchedOperationInvocation::from_reusable_wave_node(
-                            runtime,
-                            resolved,
-                            provider.dispatch(),
-                            batch_identity,
-                            node_identity,
-                            completion.wave(),
-                            binding_node_index,
-                            active_bindings.clone(),
-                        )
-                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        let invocation =
+                            BatchedOperationInvocation::from_reusable_wave_node_with_timing(
+                                runtime,
+                                resolved,
+                                provider.dispatch(),
+                                batch_identity,
+                                node_identity,
+                                completion.wave(),
+                                binding_node_index,
+                                active_bindings.clone(),
+                                timing_sink,
+                            )
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
                         drop(invocation_stage);
                         let expected_phase = invocation.operation().profile_phase;
                         let program_binding = invocation.program_binding().cloned();
@@ -1842,7 +1844,7 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::NodeInvocationConstruct,
                 );
-                let invocation = BatchedOperationInvocation::from_wave_node(
+                let invocation = BatchedOperationInvocation::from_wave_node_with_timing(
                     runtime,
                     resolved,
                     provider.dispatch(),
@@ -1851,6 +1853,7 @@ impl OperationDispatch {
                     completion.wave(),
                     node_index,
                     active_bindings.clone(),
+                    timing_sink,
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
                 drop(invocation_stage);
@@ -1944,7 +1947,7 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::NodeInvocationConstruct,
                 );
-                let invocation = BatchedOperationInvocation::from_wave_node(
+                let invocation = BatchedOperationInvocation::from_wave_node_with_timing(
                     runtime,
                     resolved,
                     provider.dispatch(),
@@ -1953,6 +1956,7 @@ impl OperationDispatch {
                     completion.wave(),
                     node_index,
                     active_bindings.clone(),
+                    timing_sink,
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
                 drop(invocation_stage);

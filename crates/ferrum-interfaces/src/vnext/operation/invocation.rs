@@ -17,6 +17,10 @@ use super::buffer_view::{
     sequence_execution_shape, validate_value_binding_physical_coverage, OperationBacking,
     ValueBindingPhysicalCoverage,
 };
+use super::dispatch_contract::{
+    DisabledSubmissionWaveDispatchTimingSink, InvocationConstructorPhase,
+    InvocationConstructorTimer, SubmissionWaveDispatchTimingSink,
+};
 use super::foundation::invalid_operation;
 use super::{
     AttributeId, BatchOperationIdentity, BatchOperationNodeIdentity, ElementType,
@@ -612,7 +616,7 @@ pub struct OperationInvocation<'a, B> {
 
 impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
-    fn from_prepared<'runtime, R>(
+    fn from_prepared<'runtime, R, S>(
         runtime: &'runtime R,
         resolved: &'a dyn ExecutablePlanView,
         prepared: &PreparedOperationDispatchBinding,
@@ -626,10 +630,13 @@ impl<'a, B> OperationInvocation<'a, B> {
         reusable_bindings_only: bool,
         shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
         device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
+        timing: &mut InvocationConstructorTimer<'_, S>,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
+        S: SubmissionWaveDispatchTimingSink,
     {
+        timing.enter(InvocationConstructorPhase::ParticipantCommonValidate);
         let plan = resolved.execution_plan();
         let parts = identity.projection();
         let participant = resources.participant(participant_index)?;
@@ -705,6 +712,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                 "operation invocation does not close over the runtime device, selected plan, node, provider, request, and lease transaction",
             ));
         }
+        timing.enter(InvocationConstructorPhase::ResourceViewBuild);
         let provider_resources = node.provider_resources();
         let projection = reusable_bindings_only
             .then_some(prepared.reusable_binding_projection.as_ref())
@@ -921,7 +929,9 @@ impl<'a, B> OperationInvocation<'a, B> {
             }
         }
 
+        timing.enter(InvocationConstructorPhase::RuntimeFullCoverage);
         let covered_views = FullyCoveredOperationViews::validate(&views, runtime, lease_identity)?;
+        timing.enter(InvocationConstructorPhase::ComponentWorkspaceValidate);
         if node.values().len() != prepared.binding_component_views.len() {
             return Err(invalid_operation(
                 "prepared value-binding recipe differs from its plan node",
@@ -1166,6 +1176,37 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_wave_node_with_timing<'binding, R, I, S>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: I,
+        timing_sink: &S,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::from_resources_with_timing(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Wave { wave, node_index },
+            active_bindings,
+            false,
+            true,
+            timing_sink,
+        )
+    }
+
     /// Used only after dispatch validates the live resident program and only
     /// for nodes inside that program's resident compute segment.
     #[allow(clippy::too_many_arguments)]
@@ -1197,6 +1238,37 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_reusable_wave_node_with_timing<'binding, R, I, S>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: I,
+        timing_sink: &S,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::from_resources_with_timing(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Wave { wave, node_index },
+            active_bindings,
+            true,
+            true,
+            timing_sink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn from_resources<'binding, R, I>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
@@ -1212,6 +1284,39 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         R: DeviceRuntime<Buffer = B>,
         I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
+        Self::from_resources_with_timing(
+            runtime,
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            resources,
+            active_bindings,
+            reusable_bindings_only,
+            share_materialization,
+            &DisabledSubmissionWaveDispatchTimingSink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_resources_with_timing<'binding, R, I, S>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        resources: OperationInvocationResources<'a, R>,
+        active_bindings: I,
+        reusable_bindings_only: bool,
+        share_materialization: bool,
+        timing_sink: &S,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        let mut timing = InvocationConstructorTimer::start(timing_sink);
         let participant_count = resources.participant_count()?;
         let participant_frames = resources.participant_frames()?;
         if participant_count == 0
@@ -1267,7 +1372,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             .zip(active_bindings)
             .enumerate()
             .map(|(index, (participant, active_binding))| {
-                OperationInvocation::from_prepared(
+                let participant = OperationInvocation::from_prepared(
                     runtime,
                     resolved,
                     prepared,
@@ -1281,11 +1386,16 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     reusable_bindings_only,
                     &mut shared_backings,
                     &mut device_agreements,
-                )
+                    &mut timing,
+                );
+                if participant.is_ok() {
+                    timing.enter(InvocationConstructorPhase::NodeSetupAssemble);
+                }
+                participant
             })
             .collect::<Result<Vec<_>, _>>()?;
         let program_binding = resources.program_binding_node();
-        Ok(Self {
+        let invocation = Self {
             batch_identity,
             node_identity,
             participants,
@@ -1295,7 +1405,9 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                 p.scope() == crate::vnext::ProviderWorkspaceScope::Plan
                     && p.reuse_policy() == crate::vnext::ProviderWorkspaceReusePolicy::Preserve
             }),
-        })
+        };
+        timing.complete();
+        Ok(invocation)
     }
 
     pub fn batch_identity(&self) -> &BatchOperationIdentity {
