@@ -1,4 +1,4 @@
-# 热门模型：结果与决定（2026-10-09 14:58）
+# 热门模型：结果与决定（2026-10-09 15:39）
 
 [目标](goal-popular-models-concurrency.zh.md)：先让 CUDA 27B 四档追平 llama.cpp。**当前 IP（身份投影）版 C4/C8/C16/C32 为 109.86/151.82/224.45/268.24 tok/s，达到 llama 的 67.85%/60.28%/66.48%/62.39%。保留 IP 继续验证，默认仍 Full；目标与正式验收未完成。** 同 CLI 的 C8/C32 吞吐提高 1.09%/6.88%，但 C32 TTFT 中位数增加 7.75%。
 
@@ -28,7 +28,7 @@ CUDA内存为250ms全卡NVML采样峰及冷启动至关闭的GNU RSS峰，包含
 
 **收益与决定。** IP共享不可变身份种子/拓扑，按需构造旧完整对象，保留实时授权、代次、frame、活跃状态和资源边界检查。C8/C32实际投影166万/609万次，dispatch返回前完整parts发布均0；不代表整条路径零分配。相对同CLI Full，Decode host提交均值下降1.83%/6.45%；C32 TPOT P50/P99下降7.46%/10.33%，可见ITL下降6.26%/6.03%，TTFT P99下降11.76%、P50上升7.75%；C8 TPOT P99增加0.15%。host窗口含预热、等待和调度，非纯CPU；两臂wave数可不同。
 
-同CLI两臂12秒CPU采样中，身份构造栈226→25、身份命名空间分配器叶样本143→31；资源构造与provider准备仍占样本。栈几乎全截断，不能换算墙钟或收益上限。下一版WA只在单次dispatch复用已验证身份事实，46项CPU、独立源审与两项真实GPU对照通过，CLI构建中，尚无性能结果。
+同CLI两臂12秒CPU采样中，身份构造栈226→25、身份命名空间分配器叶样本143→31；资源构造与provider准备仍占样本。栈几乎全截断，不能换算墙钟或收益上限。WA（单次dispatch复用已验证身份事实）通过46项CPU、2项实际GPU及run4/serve6对照。普通四格320正式＋32预热零错拒；相对同CLI IP，C8/C32吞吐仅增0.34%/2.02%，相对上表保留IP为＋0.23%/−0.48%，C32可见ITL P99较同CLI IP增加2.30%。**保留IP，不将WA升级为保留版或扩做全量验收。** 单次顺序测试不能证明稳定收益；四格完整延迟、内存、计数及独核见库外 wave-agreement-r1/performance-analysis/。
 
 IP通过28项实际GPU（原provider回归为Full）、run4/serve6对照及全仓fmt/check/test/Clippy、Metal编译。IP/Full各17步×2参与者完整输出/有效状态相等，整模IDs、文本、sampling、stop、usage、数值身份均等原资源视图版；覆盖逻辑KV块边界，未覆盖物理扩容。
 
@@ -36,6 +36,6 @@ IP通过28项实际GPU（原provider回归为Full）、run4/serve6对照及全�
 
 **质量与范围。** 原资源视图版同C16、600 GSM8K＋900 MMLU，共1500有效配对：严格87.33%、快速87.27%，差−0.067个百分点；单侧95%下界−0.533个百分点，高于预设−2个百分点，非劣门通过，截断计错。限定异常复核未见新的格式崩溃或独有循环；不自动覆盖新调度、其他模型或批大小一致性。拆批快路径分歧与有限样本的接纳顺序相关，严格profile三模式相等，快路径具体数值机制未定，未资格默认开启。
 
-余项：WA run/serve及同CLI IP对照、llama质量参照、64题描述性异常检查、9B回归、SLO校准与CUDA每格200×2验收；通过后才改Auto默认。35B归P1；Metal只对照llama，vLLM只在CUDA，不恢复44格。
+下一步：用当前CLI的IP C32短CUDA整图追踪核查执行间隔与记录完整性。余项：llama质量参照、64题描述性异常检查、9B回归、SLO校准与CUDA每格200×2验收；通过后才改Auto默认。35B归P1；Metal只对照llama，vLLM只在CUDA，不恢复44格。
 
 上链下当前证据`identity-projection-r1/`，候选`wave-agreement-r1/`；协作入口：[HANDOFF](</Users/chejinxuan/ferrum-handoffs/20261007-p1-collaboration/HANDOFF.txt>)。
