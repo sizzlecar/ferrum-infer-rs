@@ -70,6 +70,7 @@ mod prefix_cache;
 mod program_binding_upload;
 mod request;
 mod reusable_catalog;
+mod segment_outcomes;
 mod state_memory;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -2114,6 +2115,7 @@ struct VNextWaveTimingMetrics {
     resource_step_admission_breakdown: VNextStepAdmissionTimingMetrics,
     resource_submission_wave_prepare: AtomicDurationMetrics,
     host_encode_submit: AtomicDurationMetrics,
+    segment_outcomes: segment_outcomes::OutcomeMetrics,
     token_upload_prepare: AtomicDurationMetrics,
     wave_identity_bind: AtomicDurationMetrics,
     provider_encode_submit: AtomicDurationMetrics,
@@ -2222,6 +2224,7 @@ impl VNextWaveTimingMetrics {
                 "submission_wave_prepare": self.resource_submission_wave_prepare.snapshot(),
             },
             "host_encode_submit": self.host_encode_submit.snapshot(),
+            "segment_outcomes": self.segment_outcomes.snapshot(),
             "host_encode_submit_breakdown": {
                 "collection": "profile_attached_only",
                 "token_upload_prepare": self.token_upload_prepare.snapshot(),
@@ -2312,6 +2315,7 @@ impl VNextWaveTimingMetrics {
             metrics.reset();
         }
         self.resource_step_admission_breakdown.reset();
+        self.segment_outcomes.reset();
         self.reusable_execution.reset();
     }
 }
@@ -7252,6 +7256,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        mut outcome_observation: Option<&mut segment_outcomes::WaveObservation>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7497,6 +7502,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 aggregate: &self.metrics.wave_timing,
                 phase: phase_timing,
             };
+            let attempt_observation = timing_enabled
+                .then(|| {
+                    segment_outcomes::AttemptObservation::new(
+                        &timing_sink,
+                        &self.metrics.invocation_preparation,
+                    )
+                })
+                .flatten();
             let device_timing_mode = self.device_timing_mode();
             let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
             let mut reusable_catalog_miss = None;
@@ -7607,7 +7620,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .start_if(timing_enabled);
                 let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
                 if let Some(reusable_program) = reusable_program {
-                    if timing_enabled {
+                    if let Some(observation) = attempt_observation.as_ref() {
                         OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                             self.providers.providers(),
                             &self.resolved_plan,
@@ -7618,8 +7631,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             reusable_program,
                             execution_policy,
                             self.invocation_preparation_strategy,
-                            &timing_sink,
-                            &self.metrics.invocation_preparation,
+                            observation,
+                            observation,
                             wave,
                             &self.lane,
                             &self.reaper,
@@ -7644,7 +7657,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )
                         .map(|profiled| (profiled.into_parts().0, None))
                     }
-                } else if timing_enabled {
+                } else if let Some(observation) = attempt_observation.as_ref() {
                     OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
@@ -7654,8 +7667,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &uploads,
                         execution_policy,
                         self.invocation_preparation_strategy,
-                        &timing_sink,
-                        &self.metrics.invocation_preparation,
+                        observation,
+                        observation,
                         wave,
                         &self.lane,
                         &self.reaper,
@@ -7680,6 +7693,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map(|profiled| (profiled.into_parts().0, None))
                 }
             };
+            if let (Some(wave_observation), Some(attempt_observation)) =
+                (outcome_observation.as_deref_mut(), attempt_observation)
+            {
+                let outcome = if submission.is_ok() {
+                    segment_outcomes::Outcome::Success
+                } else {
+                    segment_outcomes::Outcome::Error
+                };
+                wave_observation.record_attempt(
+                    attempt_observation.finish(outcome),
+                    &self.metrics.wave_timing.segment_outcomes,
+                    &phase_timing.segment_outcomes,
+                );
+            }
             match submission {
                 Ok((completion, attribution)) => {
                     let identity_materialization = identity.materialization_snapshot();
@@ -7725,6 +7752,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry })
                     if retries < MAX_DEFINITELY_NOT_SUBMITTED_RETRIES =>
                 {
+                    if let Some(observation) = outcome_observation.as_deref_mut() {
+                        observation.mark_retry();
+                    }
                     retries += 1;
                     if reusable_program_stats.is_some() {
                         self.metrics
@@ -8069,8 +8099,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
         let (mut token_mask_residency, dispatch) = {
-            let _timing = self.metrics.wave_timing.host_encode_submit.start();
-            let _phase_timing = phase_timing.host_encode_submit.start();
+            let timing = self.metrics.wave_timing.host_encode_submit.start();
+            let phase_timer = phase_timing.host_encode_submit.start();
+            let mut outcome_observation = self
+                .host_dispatch_timing_enabled()
+                .then(segment_outcomes::WaveObservation::default);
             // Product-fixed inputs live in the lane-stable Step arena. One Step
             // slot lease is exclusive through terminal completion, while a
             // released slot retains its physical backing for later waves. Bind
@@ -8102,7 +8135,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 kind,
                 output_mode,
                 token_mask_residency.plans(),
+                outcome_observation.as_mut(),
             );
+            if let Some(observation) = outcome_observation {
+                let elapsed = timing.finish();
+                drop(phase_timer);
+                let outcome = if matches!(&dispatch, DispatchOutcome::Submitted { .. }) {
+                    segment_outcomes::Outcome::Success
+                } else {
+                    segment_outcomes::Outcome::Error
+                };
+                observation.finish(
+                    outcome,
+                    elapsed,
+                    &self.metrics.wave_timing.segment_outcomes,
+                    &phase_timing.segment_outcomes,
+                );
+            }
             (token_mask_residency, dispatch)
         };
         let mut execution_event_error = None;

@@ -69,7 +69,7 @@ impl AtomicDurationMetrics {
     pub(super) fn start(&self) -> AtomicDurationTimer<'_> {
         AtomicDurationTimer {
             metrics: self,
-            started: Instant::now(),
+            started: Some(Instant::now()),
         }
     }
 
@@ -109,12 +109,27 @@ impl AtomicDurationMetrics {
 
 pub(super) struct AtomicDurationTimer<'a> {
     metrics: &'a AtomicDurationMetrics,
-    started: Instant,
+    started: Option<Instant>,
+}
+
+impl AtomicDurationTimer<'_> {
+    /// Return the same interval recorded into the existing parent metric.
+    pub(super) fn finish(mut self) -> Duration {
+        let elapsed = self
+            .started
+            .take()
+            .expect("active duration timer")
+            .elapsed();
+        self.metrics.record(elapsed);
+        elapsed
+    }
 }
 
 impl Drop for AtomicDurationTimer<'_> {
     fn drop(&mut self) {
-        self.metrics.record(self.started.elapsed());
+        if let Some(started) = self.started.take() {
+            self.metrics.record(started.elapsed());
+        }
     }
 }
 
