@@ -2541,6 +2541,10 @@ mod tests {
                 Some(InvocationPreparationStrategyArg::IdentityProjection),
                 InvocationPreparationStrategy::IdentityProjection,
             ),
+            (
+                Some(InvocationPreparationStrategyArg::PreparedViewWorkspace),
+                InvocationPreparationStrategy::PreparedViewWorkspace,
+            ),
         ] {
             let mut cli = Vec::new();
             push_invocation_preparation_strategy_cli_entry(&mut cli, option);

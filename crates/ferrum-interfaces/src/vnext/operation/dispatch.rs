@@ -27,7 +27,7 @@ use super::dispatch_contract::{
     SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
 };
 use super::foundation::invalid_operation;
-use super::invocation::OperationInvocationResources;
+use super::invocation::{OperationInvocationResources, WaveInvocationWorkspace};
 use super::workspace_encoding::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
 };
@@ -962,6 +962,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -997,6 +998,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1037,6 +1039,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1062,9 +1065,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let borrowed_view_nodes = std::cell::Cell::new(0);
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            borrowed_view_nodes: &borrowed_view_nodes,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1085,6 +1090,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            Some(&borrowed_view_nodes),
         )
     }
 
@@ -1135,6 +1141,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         Ok(SubmissionWaveDeterminismHandle::from_profiled_eager(
             profiled,
@@ -1220,6 +1227,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         SubmissionWaveDeterminismHandle::from_profiled_replayed(
             profiled,
@@ -1263,6 +1271,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1299,6 +1308,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1337,6 +1347,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1363,9 +1374,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let borrowed_view_nodes = std::cell::Cell::new(0);
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            borrowed_view_nodes: &borrowed_view_nodes,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1386,6 +1399,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            Some(&borrowed_view_nodes),
         )
     }
 
@@ -1404,6 +1418,7 @@ impl OperationDispatch {
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
+        borrowed_view_nodes: Option<&std::cell::Cell<u64>>,
     ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
@@ -1664,6 +1679,9 @@ impl OperationDispatch {
         let mut program_binding_resources = BTreeSet::new();
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
+        let mut view_workspace = (batch_identity.preparation_strategy()
+            == ferrum_types::InvocationPreparationStrategy::PreparedViewWorkspace)
+            .then(WaveInvocationWorkspace::new);
         if let Some(reusable_program) = reusable_program {
             let mut node_index = 0_usize;
             let mut segment_index = 0_usize;
@@ -1700,45 +1718,72 @@ impl OperationDispatch {
                             timing_sink,
                             SubmissionWaveDispatchStage::NodeInvocationConstruct,
                         );
-                        let invocation = BatchedOperationInvocation::from_reusable_wave_node(
-                            runtime,
-                            resolved,
-                            provider.dispatch(),
-                            batch_identity,
-                            node_identity,
-                            completion.wave(),
-                            binding_node_index,
-                            active_bindings.clone(),
-                        )
-                        .map_err(SubmissionWaveDispatchError::Contract)?;
-                        drop(invocation_stage);
-                        let expected_phase = invocation.operation().profile_phase;
-                        let program_binding = invocation.program_binding().cloned();
-                        let dependency_scope = invocation.retained_dependency_scope.clone();
-                        let binding_stage = SubmissionWaveDispatchStageTimer::start(
-                            timing_sink,
-                            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
-                        );
-                        let mut bindings = match provider
-                            .provider()
-                            .encode_reusable_execution_bindings(invocation)
-                        {
-                            Ok(bindings) => bindings,
-                            Err(failure)
-                                if node_identity.contains_identity(failure.identity())
-                                    && failure.phase() == expected_phase =>
+                        let encode = |invocation: BatchedOperationInvocation<'_, R::Buffer>| {
+                            drop(invocation_stage);
+                            let expected_phase = invocation.operation().profile_phase;
+                            let program_binding = invocation.program_binding().cloned();
+                            let dependency_scope = invocation.retained_dependency_scope.clone();
+                            let binding_stage = SubmissionWaveDispatchStageTimer::start(
+                                timing_sink,
+                                SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+                            );
+                            let bindings = match provider
+                                .provider()
+                                .encode_reusable_execution_bindings(invocation)
                             {
-                                return Err(SubmissionWaveDispatchError::Provider(failure));
-                            }
-                            Err(_) => {
-                                return Err(SubmissionWaveDispatchError::Contract(
+                                Ok(bindings) => bindings,
+                                Err(failure)
+                                    if node_identity.contains_identity(failure.identity())
+                                        && failure.phase() == expected_phase =>
+                                {
+                                    return Err(SubmissionWaveDispatchError::Provider(failure));
+                                }
+                                Err(_) => {
+                                    return Err(SubmissionWaveDispatchError::Contract(
                                     invalid_operation(
                                         "reusable provider returned a failure for another node identity or profile phase",
                                     ),
                                 ));
-                            }
+                                }
+                            };
+                            drop(binding_stage);
+                            Ok((bindings, program_binding, dependency_scope))
                         };
-                        drop(binding_stage);
+                        let (mut bindings, program_binding, dependency_scope) =
+                            if let Some(workspace) = view_workspace.as_mut() {
+                                workspace
+                                    .with_reusable_wave_node(
+                                        runtime,
+                                        resolved,
+                                        provider.dispatch(),
+                                        batch_identity,
+                                        node_identity,
+                                        completion.wave(),
+                                        binding_node_index,
+                                        active_bindings.clone(),
+                                        |invocation| {
+                                            if let Some(count) = borrowed_view_nodes {
+                                                count.set(count.get().saturating_add(1));
+                                            }
+                                            encode(invocation)
+                                        },
+                                    )
+                                    .map_err(SubmissionWaveDispatchError::Contract)??
+                            } else {
+                                let invocation =
+                                    BatchedOperationInvocation::from_reusable_wave_node(
+                                        runtime,
+                                        resolved,
+                                        provider.dispatch(),
+                                        batch_identity,
+                                        node_identity,
+                                        completion.wave(),
+                                        binding_node_index,
+                                        active_bindings.clone(),
+                                    )
+                                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                                encode(invocation)?
+                            };
                         let validation_stage = SubmissionWaveDispatchStageTimer::start(
                             timing_sink,
                             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
@@ -2030,6 +2075,7 @@ impl OperationDispatch {
                 encoded_operations.push((node_index, dynamic_bindings, compute, result_bindings));
             }
         }
+        drop(view_workspace);
         let validation_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,

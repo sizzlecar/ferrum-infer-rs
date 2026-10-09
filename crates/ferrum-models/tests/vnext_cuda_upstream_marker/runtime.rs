@@ -17,6 +17,8 @@ mod hybrid;
 mod identity_projection;
 #[path = "runtime/prefill.rs"]
 mod prefill;
+#[path = "runtime/prepared_view_workspace.rs"]
+mod prepared_view_workspace;
 #[path = "runtime/replay_bindings.rs"]
 mod replay_bindings;
 #[path = "runtime/two_streams.rs"]

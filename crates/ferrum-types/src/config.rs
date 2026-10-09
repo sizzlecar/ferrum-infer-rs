@@ -74,13 +74,15 @@ impl PrefillDecodeExecution {
 
 /// Host invocation preparation for native plan runtimes. Identity projection
 /// borrows compiled identity metadata while preserving per-invocation validation.
-/// It does not change resource preparation or device execution policy.
+/// Prepared view workspace also reuses empty view-buffer capacity between
+/// resident binding nodes. Live validation and device execution stay unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InvocationPreparationStrategy {
     #[default]
     Full,
     IdentityProjection,
+    PreparedViewWorkspace,
 }
 
 impl InvocationPreparationStrategy {
@@ -88,6 +90,7 @@ impl InvocationPreparationStrategy {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::PreparedViewWorkspace => "prepared-view-workspace",
         }
     }
 
@@ -95,7 +98,10 @@ impl InvocationPreparationStrategy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
-            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+            "prepared-view-workspace" => Ok(Self::PreparedViewWorkspace),
+            _ => Err(format!(
+                "expected full, identity-projection or prepared-view-workspace; got {raw:?}"
+            )),
         }
     }
 }
@@ -1331,6 +1337,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::PreparedViewWorkspace,
             InvocationPreparationStrategy::Full,
         ] {
             config

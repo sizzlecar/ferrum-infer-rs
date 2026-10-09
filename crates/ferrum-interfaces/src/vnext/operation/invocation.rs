@@ -29,9 +29,12 @@ mod descriptor_agreement;
 mod materialization_tests;
 use descriptor_agreement::DeviceDescriptorAgreement;
 mod view_coverage;
+mod view_workspace;
 #[cfg(test)]
 pub(crate) use view_coverage::test_only_backing_window_coverage;
 use view_coverage::FullyCoveredOperationViews;
+pub(super) use view_workspace::WaveInvocationWorkspace;
+use view_workspace::{BuiltInvocationViews, InvocationViewBuilder, InvocationViews};
 
 pub(super) enum OperationInvocationResources<'a, R: DeviceRuntime> {
     Invocation(&'a InvocationResourceLease<R>),
@@ -594,11 +597,16 @@ impl PreparedOperationDispatchBinding {
 /// One participant projection inside a plan-selected physical batch. It has
 /// no public constructor and does not own submission authority.
 pub struct OperationInvocation<'a, B> {
+    header: InvocationHeader<'a>,
+    views: InvocationViews<'a, B>,
+}
+
+#[derive(Clone, Copy)]
+struct InvocationHeader<'a> {
     identity: &'a ExecutionIdentityEnvelope,
     operation: &'a OperationDescriptor,
     node_id: &'a NodeId,
     provider_id: &'a ProviderId,
-    views: Vec<OperationBufferView<'a, B>>,
     bindings: &'a [ResolvedValueBinding],
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
     work: &'a NodeWorkContract,
@@ -627,6 +635,51 @@ impl<'a, B> OperationInvocation<'a, B> {
         shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
         device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
     ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+    {
+        let (header, views) = Self::prepare_with_storage(
+            runtime,
+            resolved,
+            prepared,
+            node,
+            operation,
+            identity,
+            node_id,
+            resources,
+            active_binding,
+            participant_index,
+            reusable_bindings_only,
+            shared_backings,
+            device_agreements,
+            None,
+        )?;
+        let BuiltInvocationViews::Owned(views) = views else {
+            unreachable!("owned preparation cannot return an arena range")
+        };
+        Ok(Self {
+            header,
+            views: InvocationViews::Owned(views),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_with_storage<'runtime, R>(
+        runtime: &'runtime R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        node: &'a PlanNode,
+        operation: &'a OperationDescriptor,
+        identity: &'a ExecutionIdentityEnvelope,
+        node_id: &'a NodeId,
+        resources: OperationInvocationResources<'a, R>,
+        active_binding: &TrustedActiveSequenceBinding,
+        participant_index: usize,
+        reusable_bindings_only: bool,
+        shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
+        device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
+        arena: Option<&mut Vec<OperationBufferView<'a, B>>>,
+    ) -> Result<(InvocationHeader<'a>, BuiltInvocationViews<'a, B>), VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
     {
@@ -716,7 +769,8 @@ impl<'a, B> OperationInvocation<'a, B> {
         let scratch_view = prepared.scratch_view.and_then(map_view);
         let binding_view = prepared.binding_view.and_then(map_view);
         let persistent_view = prepared.persistent_view.and_then(map_view);
-        let mut views = Vec::with_capacity(
+        let mut views = InvocationViewBuilder::new(
+            arena,
             projection.map_or(prepared.resources.len(), |projection| projection.view_count),
         );
         for (resource_index, resource) in prepared.resources.iter().enumerate() {
@@ -1023,42 +1077,44 @@ impl<'a, B> OperationInvocation<'a, B> {
                 .filter(|_| projection.is_none() || persistent_view.is_some()),
             "persistent",
         )?;
-        Ok(Self {
-            identity,
-            operation,
-            node_id,
-            provider_id: node.selection().selected_provider(),
-            views,
-            bindings: node.values(),
-            attributes: node.attributes(),
-            work: node.work(),
-            scratch_view,
-            binding_view,
-            persistent_view,
-            work_shape: resources.work_shape()?,
-            claimed_backing_fingerprint: resources.backing_fingerprint(),
-            projection_numerics: provider_resources.projection_numerics(),
-        })
+        Ok((
+            InvocationHeader {
+                identity,
+                operation,
+                node_id,
+                provider_id: node.selection().selected_provider(),
+                bindings: node.values(),
+                attributes: node.attributes(),
+                work: node.work(),
+                scratch_view,
+                binding_view,
+                persistent_view,
+                work_shape: resources.work_shape()?,
+                claimed_backing_fingerprint: resources.backing_fingerprint(),
+                projection_numerics: provider_resources.projection_numerics(),
+            },
+            views.finish(),
+        ))
     }
 
     pub fn identity(&self) -> &ExecutionIdentityEnvelope {
-        self.identity
+        self.header.identity
     }
 
     pub fn operation(&self) -> &OperationDescriptor {
-        self.operation
+        self.header.operation
     }
 
     pub fn node_id(&self) -> &NodeId {
-        self.node_id
+        self.header.node_id
     }
 
     pub fn provider_id(&self) -> &ProviderId {
-        self.provider_id
+        self.header.provider_id
     }
 
     pub fn projection_numerics(&self) -> Option<&crate::vnext::PreparedProjectionNumerics> {
-        self.projection_numerics
+        self.header.projection_numerics
     }
 
     pub fn views(&self) -> &[OperationBufferView<'a, B>] {
@@ -1066,35 +1122,35 @@ impl<'a, B> OperationInvocation<'a, B> {
     }
 
     pub fn bindings(&self) -> &[ResolvedValueBinding] {
-        self.bindings
+        self.header.bindings
     }
 
     pub fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
-        self.attributes
+        self.header.attributes
     }
 
     pub fn work(&self) -> &NodeWorkContract {
-        self.work
+        self.header.work
     }
 
     pub fn scratch_view(&self) -> Option<&OperationBufferView<'a, B>> {
-        self.scratch_view.map(|index| &self.views[index])
+        self.header.scratch_view.map(|index| &self.views[index])
     }
 
     pub fn binding_view(&self) -> Option<&OperationBufferView<'a, B>> {
-        self.binding_view.map(|index| &self.views[index])
+        self.header.binding_view.map(|index| &self.views[index])
     }
 
     pub fn persistent_view(&self) -> Option<&OperationBufferView<'a, B>> {
-        self.persistent_view.map(|index| &self.views[index])
+        self.header.persistent_view.map(|index| &self.views[index])
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
-        self.work_shape
+        self.header.work_shape
     }
 
     pub fn claimed_backing_fingerprint(&self) -> &str {
-        self.claimed_backing_fingerprint
+        self.header.claimed_backing_fingerprint
     }
 }
 
@@ -1197,17 +1253,14 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_resources<'binding, R, I>(
-        runtime: &R,
+    fn validate_resources<'binding, R, I>(
         resolved: &'a dyn ExecutablePlanView,
         prepared: &PreparedOperationDispatchBinding,
         batch_identity: &'a BatchOperationIdentity,
         node_identity: &'a BatchOperationNodeIdentity,
         resources: OperationInvocationResources<'a, R>,
-        active_bindings: I,
-        reusable_bindings_only: bool,
-        share_materialization: bool,
-    ) -> Result<Self, VNextError>
+        active_bindings: &I,
+    ) -> Result<(usize, &'a PlanNode, &'a OperationDescriptor), VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
         I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
@@ -1241,6 +1294,33 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         }
         let node = prepared.node(resolved, node_identity.node_id())?;
         let operation = resolved.capabilities().operation(node.operation_id())?;
+        Ok((participant_count, node, operation))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_resources<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        resources: OperationInvocationResources<'a, R>,
+        active_bindings: I,
+        reusable_bindings_only: bool,
+        share_materialization: bool,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        let (participant_count, node, operation) = Self::validate_resources(
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            resources,
+            &active_bindings,
+        )?;
         // A new table for each node/wave construction, never stored in a Plan,
         // lane or returned invocation. Only the immutable payload is shared;
         // each later participant rechecks live pool authority before using it.

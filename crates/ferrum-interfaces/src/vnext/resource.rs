@@ -105,3 +105,6 @@ mod dynamic_pool_tests;
 #[cfg(test)]
 #[path = "resource/sequence_session_frame_tests.rs"]
 mod sequence_session_frame_tests;
+
+#[cfg(test)]
+pub(crate) mod prepared_view_workspace_test_support;

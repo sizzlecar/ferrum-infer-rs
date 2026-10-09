@@ -1,4 +1,4 @@
-//! Accounting is scoped to identity preparation through dispatch return, including
+//! Accounting is scoped to invocation preparation through dispatch return, including
 //! failed dispatch attempts. Later observation can materialize more owned parts.
 use super::*;
 
@@ -7,6 +7,7 @@ pub(super) struct PreparationMetrics {
     dispatch_attempts: AtomicU64,
     projected_identities: AtomicU64,
     parts_materialized: AtomicU64,
+    borrowed_view_nodes: AtomicU64,
 }
 
 impl InvocationPreparationSink for PreparationMetrics {
@@ -16,6 +17,8 @@ impl InvocationPreparationSink for PreparationMetrics {
             .fetch_add(stats.projected_identities, Ordering::Relaxed);
         self.parts_materialized
             .fetch_add(stats.parts_materialized, Ordering::Relaxed);
+        self.borrowed_view_nodes
+            .fetch_add(stats.borrowed_view_nodes, Ordering::Relaxed);
     }
 }
 
@@ -25,6 +28,7 @@ impl PreparationMetrics {
             &self.dispatch_attempts,
             &self.projected_identities,
             &self.parts_materialized,
+            &self.borrowed_view_nodes,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -32,12 +36,14 @@ impl PreparationMetrics {
 
     pub(super) fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
-            "scope": "identity_projection_through_dispatch_return_including_failures",
+            "scope": "invocation_preparation_through_dispatch_return_including_failures",
             "full_mode": "projection_counters_zero_do_not_measure_full_preparation_work",
             "later_observation": "owned_parts_materialized_after_dispatch_return_are_excluded",
+            "borrowed_view_scope": "successfully_constructed_borrowed_views_before_dispatch_return;does_not_prove_allocation_savings_or_gpu_completion",
             "dispatch_attempts": self.dispatch_attempts.load(Ordering::Relaxed),
             "projected_identities": self.projected_identities.load(Ordering::Relaxed),
             "parts_materialized": self.parts_materialized.load(Ordering::Relaxed),
+            "borrowed_view_nodes": self.borrowed_view_nodes.load(Ordering::Relaxed),
         })
     }
 }
@@ -63,32 +69,38 @@ mod tests {
         metrics.record_preparation(InvocationPreparationStats {
             projected_identities: 5,
             parts_materialized: 2,
+            borrowed_view_nodes: 4,
         });
         metrics.record_preparation(InvocationPreparationStats {
             projected_identities: 3,
             parts_materialized: 0,
+            borrowed_view_nodes: 2,
         });
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot["dispatch_attempts"], 2);
         assert_eq!(snapshot["projected_identities"], 8);
         assert_eq!(snapshot["parts_materialized"], 2);
+        assert_eq!(snapshot["borrowed_view_nodes"], 6);
         executor_metrics.reset_after_startup();
         let reset = metrics.snapshot();
         for field in [
             "dispatch_attempts",
             "projected_identities",
             "parts_materialized",
+            "borrowed_view_nodes",
         ] {
             assert_eq!(reset[field], 0);
         }
         metrics.record_preparation(InvocationPreparationStats {
             projected_identities: 1,
             parts_materialized: 1,
+            borrowed_view_nodes: 0,
         });
         let next = metrics.snapshot();
         assert_eq!(next["dispatch_attempts"], 1);
         assert_eq!(next["projected_identities"], 1);
         assert_eq!(next["parts_materialized"], 1);
+        assert_eq!(next["borrowed_view_nodes"], 0);
     }
 
     #[test]
@@ -125,6 +137,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::PreparedViewWorkspace,
             InvocationPreparationStrategy::Full,
         ] {
             engine
