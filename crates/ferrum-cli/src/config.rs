@@ -1104,17 +1104,19 @@ mod tests {
 
     #[test]
     fn invocation_preparation_config_file_parses_explicit_strategy() {
-        let config: CliConfig = toml::from_str(
-            "[runtime]\ninvocation_preparation_strategy = \"identity-projection\"\n",
-        )
-        .unwrap();
-        let entries = config.runtime.runtime_config_entries();
-        let entry = entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+        for strategy in ["full", "identity-projection", "compact-bindings"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\ninvocation_preparation_strategy = \"{strategy}\"\n"
+            ))
             .unwrap();
-        assert_eq!(entry.effective_value, "identity-projection");
-        assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+                .unwrap();
+            assert_eq!(entry.effective_value, strategy);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\ninvocation_preparation_strategy = \"automatic\"\n"
         )

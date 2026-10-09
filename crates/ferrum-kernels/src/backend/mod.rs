@@ -18,6 +18,8 @@ pub use memory::probe_device_memory;
 mod native_status;
 
 #[cfg(any(feature = "cuda", test))]
+mod gdn_sequence_control;
+#[cfg(any(feature = "cuda", test))]
 mod reusable_execution;
 
 mod kv_layer;

@@ -962,6 +962,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -997,6 +998,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1037,6 +1039,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1062,9 +1065,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let compact_binding_nodes = std::cell::Cell::new(0);
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            compact_binding_nodes: &compact_binding_nodes,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1085,6 +1090,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            Some(&compact_binding_nodes),
         )
     }
 
@@ -1135,6 +1141,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         Ok(SubmissionWaveDeterminismHandle::from_profiled_eager(
             profiled,
@@ -1220,6 +1227,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )?;
         SubmissionWaveDeterminismHandle::from_profiled_replayed(
             profiled,
@@ -1263,6 +1271,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1299,6 +1308,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
         .map(|profiled| profiled.into_parts().0)
     }
@@ -1337,6 +1347,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            None,
         )
     }
 
@@ -1363,9 +1374,11 @@ impl OperationDispatch {
         S: SubmissionWaveDispatchTimingSink,
         P: super::InvocationPreparationSink,
     {
+        let compact_binding_nodes = std::cell::Cell::new(0);
         let _observation = super::preparation::PreparationObservation {
             identity: batch_identity,
             sink: preparation_sink,
+            compact_binding_nodes: &compact_binding_nodes,
         };
         if batch_identity.preparation_strategy() != strategy {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -1386,6 +1399,7 @@ impl OperationDispatch {
             wave,
             lane,
             reaper,
+            Some(&compact_binding_nodes),
         )
     }
 
@@ -1404,6 +1418,7 @@ impl OperationDispatch {
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
+        compact_binding_nodes: Option<&std::cell::Cell<u64>>,
     ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
@@ -1738,6 +1753,11 @@ impl OperationDispatch {
                                 ));
                             }
                         };
+                        if bindings.used_compact_preparation() {
+                            if let Some(count) = compact_binding_nodes {
+                                count.set(count.get().saturating_add(1));
+                            }
+                        }
                         drop(binding_stage);
                         let validation_stage = SubmissionWaveDispatchStageTimer::start(
                             timing_sink,

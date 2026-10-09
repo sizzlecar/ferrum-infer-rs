@@ -21,6 +21,7 @@ impl PrefillDecodeExecutionArg {
 pub enum InvocationPreparationStrategyArg {
     Full,
     IdentityProjection,
+    CompactBindings,
 }
 
 impl InvocationPreparationStrategyArg {
@@ -28,6 +29,7 @@ impl InvocationPreparationStrategyArg {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::CompactBindings => "compact-bindings",
         }
     }
 }
@@ -202,6 +204,10 @@ mod tests {
                 (
                     "identity-projection",
                     InvocationPreparationStrategyArg::IdentityProjection,
+                ),
+                (
+                    "compact-bindings",
+                    InvocationPreparationStrategyArg::CompactBindings,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

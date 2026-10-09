@@ -3085,6 +3085,7 @@ pub struct EncodedReusableExecutionBindings<C> {
     program_bindings: Vec<C>,
     dynamic_bindings: Vec<C>,
     result_bindings: Vec<C>,
+    compact_preparation: bool,
 }
 
 impl<C> EncodedReusableExecutionBindings<C> {
@@ -3110,7 +3111,19 @@ impl<C> EncodedReusableExecutionBindings<C> {
             program_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
             result_bindings: Vec::new(),
+            compact_preparation: false,
         }
+    }
+
+    /// Records that this result was built by the provider's compact binding path.
+    /// This is diagnostic metadata, never execution or resource authority.
+    pub fn with_compact_preparation(mut self) -> Self {
+        self.compact_preparation = true;
+        self
+    }
+
+    pub fn used_compact_preparation(&self) -> bool {
+        self.compact_preparation
     }
 
     pub fn with_program_binding(mut self, command: C) -> Self {
@@ -3137,6 +3150,7 @@ impl<C> EncodedReusableExecutionBindings<C> {
             program_bindings,
             dynamic_bindings,
             result_bindings,
+            compact_preparation: false,
         }
     }
 

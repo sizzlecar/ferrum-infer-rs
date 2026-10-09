@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::backend::gdn_sequence_control::{SequenceControl, TokenSequenceIndices};
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
@@ -26,6 +27,7 @@ use ferrum_interfaces::vnext::{
     ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
     GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
 };
+use ferrum_types::InvocationPreparationStrategy;
 use sha2::{Digest, Sha256};
 
 use super::replay_encoding::{Encoding, EncodingTarget};
@@ -206,6 +208,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("attention/precision.rs"),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("replay_encoding.rs"),
+            include_bytes!("../../../gdn_sequence_control.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("attention/native_projection.rs"),
@@ -1585,6 +1588,11 @@ fn encode_attention(
     {
         return Err("CUDA recurrent attention received another or empty operation".to_owned());
     }
+    let compact_bindings = target == EncodingTarget::BindingsOnly
+        && functions.upstream.is_some()
+        && invocation.program_binding().is_some()
+        && invocation.batch_identity().preparation_strategy()
+            == InvocationPreparationStrategy::CompactBindings;
     let first = &invocation.participants()[0];
     let q8act = precision
         .q8act()
@@ -1607,6 +1615,11 @@ fn encode_attention(
         q8act
     };
     let mut q8act = q8act;
+    if compact_bindings {
+        if let Some(plan) = q8act.as_mut() {
+            plan.enable_compact_bindings();
+        }
+    }
     let shape = AttentionShape::from_attributes(first.attributes())?;
     let projection = AttentionProjection::from_values(
         first.bindings(),
@@ -1710,18 +1723,27 @@ fn encode_attention(
     let mut binding_regions = vec![compute_regions[shared.binding].clone()];
     let mut binding_host_storage = Vec::with_capacity(invocation.participants().len());
     let mut state_bindings = Vec::with_capacity(invocation.participants().len());
-    let mut compute_fence_dependencies =
-        Vec::with_capacity(invocation.participants().len().saturating_mul(2));
-    let mut host_storage = Vec::with_capacity(if use_packed {
+    let mut compute_fence_dependencies = Vec::with_capacity(if compact_bindings {
+        0
+    } else {
+        invocation.participants().len().saturating_mul(2)
+    });
+    let launch_count = if use_packed {
+        1
+    } else {
+        participant_count_usize
+    };
+    let mut host_storage = Vec::with_capacity(if compact_bindings {
+        0
+    } else if use_packed {
         2
     } else {
         participant_count_usize
     });
-    let mut launches = Vec::with_capacity(if use_packed {
-        1
-    } else {
-        participant_count_usize
-    });
+    let mut launches = Vec::with_capacity(if compact_bindings { 0 } else { launch_count });
+    // The binding path needs local row counts for native-wave validation, but
+    // does not consume launch owners or captured control payloads.
+    let mut binding_rows = Vec::with_capacity(if compact_bindings { launch_count } else { 0 });
     let mut participant_token_counts = Vec::with_capacity(participant_count_usize);
     let mut packed_token_cursor = 0_u64;
     let mut packed_execution_form = None;
@@ -1759,8 +1781,10 @@ fn encode_attention(
         let first_state_region = binding_regions.len();
         binding_regions.push(conv_state.clone());
         binding_regions.push(delta_state.clone());
-        compute_fence_dependencies.push(conv_state.clone());
-        compute_fence_dependencies.push(delta_state.clone());
+        if !compact_bindings {
+            compute_fence_dependencies.push(conv_state.clone());
+            compute_fence_dependencies.push(delta_state.clone());
+        }
         let binding_offset = binding_layout.offset(participant_index)?;
         let host_binding = binding_host_storage.len();
         binding_host_storage.push(state_binding_payload(&conv_state, &delta_state));
@@ -1819,19 +1843,24 @@ fn encode_attention(
                 },
                 tokens,
             )?);
-            let host_control = host_storage.len();
-            host_storage.push(sequence_control(&[tokens])?);
-            launches.push(AttentionLaunch {
-                input_region,
-                output_region,
-                state_binding_offset: binding_offset,
-                host_control,
-                host_token_seq_indices: None,
-                execution_form,
-                batch_i32: 1,
-                tokens,
-                tokens_i32,
-            });
+            if compact_bindings {
+                SequenceControl::validate(&[tokens])?;
+                binding_rows.push(tokens);
+            } else {
+                let host_control = host_storage.len();
+                host_storage.push(sequence_control(&[tokens])?);
+                launches.push(AttentionLaunch {
+                    input_region,
+                    output_region,
+                    state_binding_offset: binding_offset,
+                    host_control,
+                    host_token_seq_indices: None,
+                    execution_form,
+                    batch_i32: 1,
+                    tokens,
+                    tokens_i32,
+                });
+            }
         }
     }
     if let Some((input_region, output_region)) = packed_regions {
@@ -1841,26 +1870,44 @@ fn encode_attention(
             );
         }
         let host_control = host_storage.len();
-        host_storage.push(sequence_control(&participant_token_counts)?);
+        if compact_bindings {
+            SequenceControl::validate(&participant_token_counts)?;
+        } else {
+            host_storage.push(sequence_control(&participant_token_counts)?);
+        }
         let host_token_seq_indices = host_storage.len();
-        host_storage.push(token_sequence_indices(&participant_token_counts)?);
-        launches.push(AttentionLaunch {
-            input_region,
-            output_region,
-            state_binding_offset: 0,
-            host_control,
-            host_token_seq_indices: Some(host_token_seq_indices),
-            execution_form: packed_execution_form.ok_or_else(|| {
-                "CUDA packed recurrent attention has no execution form".to_owned()
-            })?,
-            batch_i32: checked_i32(participant_count_u64, "attention packed participant count")?,
-            tokens: total_tokens,
-            tokens_i32: checked_i32(total_tokens, "attention packed token count")?,
-        });
+        if compact_bindings {
+            TokenSequenceIndices::validate(&participant_token_counts)?;
+        } else {
+            host_storage.push(token_sequence_indices(&participant_token_counts)?);
+        }
+        let execution_form = packed_execution_form
+            .ok_or_else(|| "CUDA packed recurrent attention has no execution form".to_owned())?;
+        let batch_i32 = checked_i32(participant_count_u64, "attention packed participant count")?;
+        let tokens_i32 = checked_i32(total_tokens, "attention packed token count")?;
+        if compact_bindings {
+            binding_rows.push(total_tokens);
+        } else {
+            launches.push(AttentionLaunch {
+                input_region,
+                output_region,
+                state_binding_offset: 0,
+                host_control,
+                host_token_seq_indices: Some(host_token_seq_indices),
+                execution_form,
+                batch_i32,
+                tokens: total_tokens,
+                tokens_i32,
+            });
+        }
     }
 
     if let Some(plan) = q8act.as_mut().filter(|p| p.is_upstream()) {
-        for launch in &launches {
+        for tokens in launches
+            .iter()
+            .map(|launch| launch.tokens)
+            .chain(binding_rows.iter().copied())
+        {
             for (role, weight, input, output) in [
                 (
                     ProjectionRole::GatedDeltaInput,
@@ -1889,7 +1936,7 @@ fn encode_attention(
                         &compute_regions[shared.scratch],
                         input,
                         output,
-                        u32::try_from(launch.tokens).map_err(|_| "attention rows exceed u32")?,
+                        u32::try_from(tokens).map_err(|_| "attention rows exceed u32")?,
                     )?;
                 } else if plan.projection(role)?.has_staged_leaf() {
                     return Err("upstream attention requires native physical projections".into());
@@ -1910,7 +1957,12 @@ fn encode_attention(
     } else {
         u64::from(participant_count)
     };
-    if u64::try_from(launches.len()).ok() != Some(attributed_launches) {
+    let prepared_launches = if compact_bindings {
+        binding_rows.len()
+    } else {
+        launches.len()
+    };
+    if u64::try_from(prepared_launches).ok() != Some(attributed_launches) {
         return Err("CUDA recurrent attention launch attribution is inconsistent".to_owned());
     }
     let (binding_command, has_compiled_program_slot) =
@@ -1983,7 +2035,11 @@ fn encode_attention(
             EncodedReusableExecutionBindings::empty().with_program_binding(binding_command),
             |encoded, dependency| encoded.with_retained_plan_dependency(dependency),
         );
-        return Ok(Encoding::Bindings(bindings));
+        return Ok(Encoding::Bindings(if compact_bindings {
+            bindings.with_compact_preparation()
+        } else {
+            bindings
+        }));
     }
 
     let q8act = q8act.map(PreparedAttentionProjections::into_owned);

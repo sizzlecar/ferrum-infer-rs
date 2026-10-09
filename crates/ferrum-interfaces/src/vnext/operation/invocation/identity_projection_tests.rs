@@ -9,6 +9,20 @@ fn projected_identity(
     wave: &PreparedStepSubmissionWave<TestRuntime>,
     active: &[TrustedActiveSequenceBinding],
 ) -> BatchOperationIdentity {
+    identity_with_preparation(
+        fixture,
+        wave,
+        active,
+        InvocationPreparationStrategy::IdentityProjection,
+    )
+}
+
+fn identity_with_preparation(
+    fixture: &Fixture,
+    wave: &PreparedStepSubmissionWave<TestRuntime>,
+    active: &[TrustedActiveSequenceBinding],
+    strategy: InvocationPreparationStrategy,
+) -> BatchOperationIdentity {
     let lane = wave.step_resources().execution_lane();
     let topology =
         OperationDispatch::compile_submission_wave_identity(&fixture.resolved, lane).unwrap();
@@ -17,7 +31,7 @@ fn projected_identity(
         active.iter(),
         wave,
         lane,
-        InvocationPreparationStrategy::IdentityProjection,
+        strategy,
     )
     .unwrap()
 }
@@ -367,13 +381,23 @@ impl InvocationPreparationSink for PreparationCapture {
 
 #[test]
 fn identity_projection_off_submission_stays_lazy_until_explicit_observation() {
+    off_submission(InvocationPreparationStrategy::IdentityProjection);
+}
+
+#[test]
+fn compact_bindings_off_submission_keeps_ip_and_does_not_claim_noncompact_provider_work() {
+    off_submission(InvocationPreparationStrategy::CompactBindings);
+}
+
+fn off_submission(strategy: InvocationPreparationStrategy) {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active = wave_active_bindings(&wave, &session);
     let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture.registry.bind_plan(&fixture.resolved).unwrap();
-    let identity = projected_identity(&fixture, &wave, &active);
+    let identity = identity_with_preparation(&fixture, &wave, &active, strategy);
+    assert_eq!(identity.preparation_strategy(), strategy);
     let expected = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
         active.iter(),
@@ -390,7 +414,7 @@ fn identity_projection_off_submission_stays_lazy_until_explicit_observation() {
         DeviceTimingMode::Off,
         &[],
         SubmissionExecutionPolicy::adaptive(),
-        InvocationPreparationStrategy::IdentityProjection,
+        strategy,
         &ProjectionOffTiming,
         &capture,
         wave,
@@ -402,6 +426,7 @@ fn identity_projection_off_submission_stays_lazy_until_explicit_observation() {
     let at_return = identity.preparation_snapshot();
     assert!(at_return.projected_identities > 0);
     assert_eq!(at_return.parts_materialized, 0);
+    assert_eq!(at_return.compact_binding_nodes, 0);
     assert_eq!(*capture.0.lock().unwrap(), vec![at_return]);
     assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 1);
     assert!(matches!(

@@ -74,13 +74,15 @@ impl PrefillDecodeExecution {
 
 /// Host invocation preparation for native plan runtimes. Identity projection
 /// borrows compiled identity metadata while preserving per-invocation validation.
-/// It does not change resource preparation or device execution policy.
+/// Compact bindings also skips compute-only provider preparation for supported
+/// resident binding commands. Live validation and device execution stay unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InvocationPreparationStrategy {
     #[default]
     Full,
     IdentityProjection,
+    CompactBindings,
 }
 
 impl InvocationPreparationStrategy {
@@ -88,6 +90,7 @@ impl InvocationPreparationStrategy {
         match self {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
+            Self::CompactBindings => "compact-bindings",
         }
     }
 
@@ -95,7 +98,10 @@ impl InvocationPreparationStrategy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
-            _ => Err(format!("expected full or identity-projection; got {raw:?}")),
+            "compact-bindings" => Ok(Self::CompactBindings),
+            _ => Err(format!(
+                "expected full, identity-projection or compact-bindings; got {raw:?}"
+            )),
         }
     }
 }
@@ -1331,6 +1337,7 @@ mod tests {
         );
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::CompactBindings,
             InvocationPreparationStrategy::Full,
         ] {
             config

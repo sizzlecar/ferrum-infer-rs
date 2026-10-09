@@ -5309,6 +5309,16 @@ mod tests {
                 AutoConfigSource::Env,
             ),
             (
+                Some("compact-bindings"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("compact-bindings"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+            (
                 Some("full"),
                 RuntimeConfigSource::Cli,
                 AutoConfigSource::Cli,

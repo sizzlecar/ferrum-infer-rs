@@ -14,7 +14,7 @@ use ferrum_interfaces::vnext::{
     CompositeNumericalArithmetic, DynamicStorageRequirement, ElementType,
     EncodedRetainedPlanDependency, OperationInvocation, ProviderWorkspaceRequirement,
     ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, UpstreamMarkerV2Profile,
-    UpstreamProjectionLayout, UpstreamProjectionWaveFacts, UpstreamScratchEstimate,
+    UpstreamProjectionLayout, UpstreamProjectionWaveFacts, UpstreamScratchEstimate, WeightId,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,7 @@ pub(super) struct State {
     runtime: Arc<Runtime>,
     pub fixed_bytes: u64,
     launches: Vec<Projection>,
+    compact_bindings: Option<Vec<BindingProjection>>,
     preparation: ProjectionPreparation,
 }
 impl State {
@@ -136,6 +137,21 @@ struct Projection {
     leaves: Vec<Leaf>,
     extra_dispatches: u64,
     transfers: u64,
+}
+// Invocation-local checked facts. These do not contain issued dependency authority;
+// upstream_bindings issues that authority afresh after every projection is checked.
+#[derive(Clone)]
+struct BindingProjection {
+    role: ProjectionRole,
+    rows: u32,
+    leaves: Vec<BindingLeaf>,
+}
+#[derive(Clone)]
+struct BindingLeaf {
+    index: u64,
+    component_id: WeightId,
+    algorithm: u32,
+    validation: Arc<WeightValidation>,
 }
 #[derive(Clone)]
 struct Leaf {
@@ -197,6 +213,7 @@ impl<'a> PreparedAttentionProjections<'a> {
                 runtime,
                 fixed_bytes: estimate.fixed_bytes,
                 launches: Vec::new(),
+                compact_bindings: None,
                 preparation,
             }),
         })
@@ -222,6 +239,15 @@ impl<'a> PreparedAttentionProjections<'a> {
             return Err("upstream attention participants differ from the explicit contract".into());
         }
         Self::from_upstream_numerics(kind, preparation.numerics(numerics), runtime, preparation)
+    }
+    /// Only the binding encoder opts in. Full compute and its retained owners
+    /// keep the existing preparation representation.
+    pub fn enable_compact_bindings(&mut self) {
+        if let Some(state) = self.upstream.as_mut() {
+            if state.preparation == ProjectionPreparation::BindingsOnly {
+                state.compact_bindings = Some(Vec::new());
+            }
+        }
     }
     pub fn upstream_persistent_requirement(
         &self,
@@ -279,17 +305,21 @@ impl<'a> PreparedAttentionProjections<'a> {
             .launches
             .iter()
             .any(|p| p.role == role && p.rows == rows)
+            || state.compact_bindings.as_ref().is_some_and(|projections| {
+                projections.iter().any(|p| p.role == role && p.rows == rows)
+            })
         {
             return Ok(());
         }
+        let compact = state.compact_bindings.is_some();
         let mut leaves = Vec::new();
+        let mut binding_leaves = Vec::new();
         let mut extra_dispatches = 0;
         let mut transfers = 0;
         for (i, part) in parts.iter().enumerate() {
             let weight = weight_regions
                 .get(i)
-                .ok_or("missing physical upstream attention leaf")?
-                .clone();
+                .ok_or("missing physical upstream attention leaf")?;
             let facts = UpstreamProjectionWaveFacts {
                 role,
                 component_id: part.component_id.clone(),
@@ -336,7 +366,7 @@ impl<'a> PreparedAttentionProjections<'a> {
                     transfers,
                     1 + u64::from(native.geometry().guard_blocks != 0),
                 )?;
-                Some(validation)
+                Some((validation, native.geometry().algorithm))
             } else {
                 None
             };
@@ -345,27 +375,45 @@ impl<'a> PreparedAttentionProjections<'a> {
                 .map(|i| {
                     weight_regions
                         .get(i)
-                        .cloned()
                         .ok_or("missing attention transform signs")
                 })
                 .transpose()?;
-            leaves.push(Leaf {
-                part: part.clone(),
-                weight,
-                signs,
-                stage,
-                validation,
+            if compact {
+                if let Some((validation, algorithm)) = validation {
+                    binding_leaves.push(BindingLeaf {
+                        index: i as u64,
+                        component_id: part.component_id.clone(),
+                        algorithm,
+                        validation,
+                    });
+                }
+            } else {
+                leaves.push(Leaf {
+                    part: part.clone(),
+                    weight: weight.clone(),
+                    signs: signs.cloned(),
+                    stage,
+                    validation: validation.map(|(validation, _)| validation),
+                });
+            }
+        }
+        if let Some(projections) = state.compact_bindings.as_mut() {
+            projections.push(BindingProjection {
+                role,
+                rows,
+                leaves: binding_leaves,
+            });
+        } else {
+            state.launches.push(Projection {
+                role,
+                rows,
+                input,
+                output,
+                leaves,
+                extra_dispatches,
+                transfers,
             });
         }
-        state.launches.push(Projection {
-            role,
-            rows,
-            input,
-            output,
-            leaves,
-            extra_dispatches,
-            transfers,
-        });
         Ok(())
     }
     pub fn upstream_bindings(
@@ -373,6 +421,35 @@ impl<'a> PreparedAttentionProjections<'a> {
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<Vec<EncodedRetainedPlanDependency<CudaDeviceCommand>>, String> {
         let mut bindings = Vec::new();
+        if let Some(projections) = self
+            .upstream
+            .as_ref()
+            .and_then(|s| s.compact_bindings.as_ref())
+        {
+            for projection in projections {
+                let retained = self.projection(projection.role)?;
+                let first_leaf = self
+                    .numerics
+                    .projections()
+                    .iter()
+                    .take_while(|p| p.role() != projection.role)
+                    .map(|p| p.leaves().len() as u64)
+                    .sum();
+                for leaf in &projection.leaves {
+                    bindings.push(
+                        leaf.validation
+                            .retained_dependency(
+                                invocation,
+                                retained.weight_input_ordinal(),
+                                &leaf.component_id,
+                                flag_offset(first_leaf, leaf.index, leaf.algorithm)?,
+                            )
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+            return Ok(bindings);
+        }
         for projection in self.upstream.iter().flat_map(|s| s.launches.iter()) {
             let retained = self.projection(projection.role)?;
             let first_leaf = self
@@ -407,6 +484,13 @@ impl<'a> PreparedAttentionProjections<'a> {
         Ok(bindings)
     }
     pub fn upstream_work(&self, rows: u32) -> Result<(u64, u64), String> {
+        if self
+            .upstream
+            .as_ref()
+            .is_some_and(|s| s.compact_bindings.is_some())
+        {
+            return Err("compact attention bindings have no compute work".into());
+        }
         self.upstream
             .iter()
             .flat_map(|s| s.launches.iter())
@@ -550,6 +634,9 @@ fn add(a: u64, b: u64) -> Result<u64, String> {
 
 impl State {
     pub(super) fn append_replay_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
+        if self.compact_bindings.is_some() {
+            return Err("compact attention bindings have no compute replay fingerprint".into());
+        }
         for projection in &self.launches {
             for leaf in &projection.leaves {
                 let fingerprint = leaf.stage.replay_fingerprint()?;
