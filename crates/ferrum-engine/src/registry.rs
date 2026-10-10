@@ -898,6 +898,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         &self,
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+        validate_causal_decode_preparation_mode(config, false)?;
         validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
         validate_invocation_preparation_strategy(config, false)?;
@@ -1189,6 +1190,47 @@ fn validate_segment_binding_owner_view_mode(
     Ok(())
 }
 
+fn validate_causal_decode_preparation_mode(
+    config: &ComponentConfig,
+    plan_runtime: bool,
+) -> Result<()> {
+    use ferrum_types::{AttentionExecutionPolicy, CausalDecodePreparationMode};
+    if config.engine_config.runtime.causal_decode_preparation_mode
+        == CausalDecodePreparationMode::PerParticipant
+    {
+        return Ok(());
+    }
+    if !matches!(config.device, Device::CUDA(_)) || !plan_runtime {
+        return Err(FerrumError::unsupported(
+            "packed causal decode preparation requires a CUDA plan runtime",
+        ));
+    }
+    #[cfg(feature = "cuda")]
+    let native_adaptive_supported =
+        ferrum_kernels::backend::cuda::vnext_ops::cuda_vnext_capabilities()
+            .map_err(|error| FerrumError::device(error.to_string()))?
+            .iter()
+            .any(|capability| {
+                capability.as_str()
+                    == ferrum_interfaces::vnext::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+            });
+    #[cfg(not(feature = "cuda"))]
+    let native_adaptive_supported = false;
+    let requested = crate::product_composition::cuda_attention_policy_for_kv(
+        config.engine_config.runtime.attention_execution_policy,
+        config.engine_config.kv_cache.dtype,
+    )?;
+    let resolved = requested
+        .resolve(native_adaptive_supported)
+        .map_err(FerrumError::unsupported)?;
+    if !native_adaptive_supported || resolved != AttentionExecutionPolicy::NativeAdaptive {
+        return Err(FerrumError::unsupported(
+            "packed causal decode preparation requires compiled native-adaptive paged attention and F16 KV storage",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_registered_vnext_backend(
     kind: ferrum_models::vnext::ProductionExecutionKind,
     device: &Device,
@@ -1229,6 +1271,8 @@ fn create_registered_vnext_executor(
     registration: ferrum_models::vnext::RegisteredProductionModel,
 ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
     use ferrum_models::vnext::ProductionExecutionKind;
+
+    validate_causal_decode_preparation_mode(config, true)?;
 
     validate_segment_binding_owner_view_mode(config, true)?;
     validate_program_binding_upload_strategy(config, true)?;
@@ -1285,7 +1329,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_segment_binding_owner_view_mode(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_causal_decode_preparation_mode(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1295,6 +1339,7 @@ fn create_registered_vnext_executor(
                         config.engine_config.runtime.program_binding_upload_strategy,
                         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
                         config.engine_config.runtime.segment_binding_owner_view_mode,
+                        config.engine_config.runtime.causal_decode_preparation_mode,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -1429,6 +1474,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use candle_core::{DType, Device as CandleDevice};
         use ferrum_models::weight_format::WeightFormat;
 
+        validate_causal_decode_preparation_mode(config, true)?;
+
         validate_segment_binding_owner_view_mode(config, true)?;
         validate_program_binding_upload_strategy(config, true)?;
         validate_invocation_preparation_strategy(config, true)?;
@@ -1515,6 +1562,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 }
             }
         }
+        validate_causal_decode_preparation_mode(config, false)?;
         validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
         validate_invocation_preparation_strategy(config, false)?;
@@ -2086,6 +2134,66 @@ mod tests {
             config.device = Device::Metal;
             assert!(validate_segment_binding_owner_view_mode(&config, true).is_err());
         }
+    }
+
+    #[test]
+    fn causal_decode_preparation_rejects_unsupported_backends_and_attention() {
+        use ferrum_types::{AttentionExecutionPolicy, CausalDecodePreparationMode, KvCacheDtype};
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config.engine_config.runtime.causal_decode_preparation_mode =
+                    CausalDecodePreparationMode::PerParticipant;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                config.engine_config.runtime.causal_decode_preparation_mode =
+                    CausalDecodePreparationMode::Packed;
+                config.engine_config.runtime.attention_execution_policy =
+                    AttentionExecutionPolicy::Portable;
+                assert!(validate_causal_decode_preparation_mode(&config, plan_runtime).is_err());
+            }
+        }
+        config.device = Device::CUDA(0);
+        config.engine_config.runtime.attention_execution_policy = AttentionExecutionPolicy::Auto;
+        config.engine_config.kv_cache.dtype = KvCacheDtype::Int8;
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        config.engine_config.kv_cache.dtype = KvCacheDtype::Fp16;
+        #[cfg(not(feature = "cuda"))]
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        #[cfg(feature = "cuda")]
+        {
+            let supported = ferrum_kernels::backend::cuda::vnext_ops::cuda_vnext_capabilities()
+                .unwrap()
+                .iter()
+                .any(|cap| {
+                    cap.as_str()
+                        == ferrum_interfaces::vnext::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+                });
+            assert_eq!(
+                validate_causal_decode_preparation_mode(&config, true).is_ok(),
+                supported
+            );
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_rejects_unsupported_factories_before_loading() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.causal_decode_preparation_mode =
+            ferrum_types::CausalDecodePreparationMode::Packed;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("packed causal decode preparation"));
+        config.device = Device::CUDA(0);
+        assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("packed causal decode preparation"));
     }
 
     #[test]

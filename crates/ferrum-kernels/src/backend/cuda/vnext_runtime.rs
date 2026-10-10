@@ -2529,6 +2529,7 @@ pub struct CudaDeviceRuntime {
     segment_binding_oracle_audited_nodes: AtomicU64,
     segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
     segment_binding_indexed_encodes: AtomicU64,
+    packed_decode_prepare_gate: bool,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -2731,6 +2732,7 @@ impl CudaDeviceRuntime {
             segment_binding_owner_view_mode:
                 ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
             segment_binding_indexed_encodes: AtomicU64::new(0),
+            packed_decode_prepare_gate: false,
             runtime_instance,
             context,
             allocation_stream,
@@ -2767,6 +2769,16 @@ impl CudaDeviceRuntime {
     /// Successful indexed host encodes, not submissions or GPU completions.
     pub fn segment_binding_indexed_encodes(&self) -> u64 {
         self.segment_binding_indexed_encodes.load(Ordering::Relaxed)
+    }
+
+    /// Constructor-only selection for canonical packed decode preparation.
+    pub fn with_packed_decode_prepare_gate(mut self, enabled: bool) -> Self {
+        self.packed_decode_prepare_gate = enabled;
+        self
+    }
+
+    pub(super) fn packed_decode_prepare_gate_enabled(&self) -> bool {
+        self.packed_decode_prepare_gate
     }
 
     pub(super) fn program_binding_upload_strategy(&self) -> ProgramBindingUploadStrategy {

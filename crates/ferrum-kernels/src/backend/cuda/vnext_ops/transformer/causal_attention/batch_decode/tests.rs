@@ -143,6 +143,90 @@ fn scratch_accounts_for_every_owner_without_aliasing_partition_arrays() {
     .is_err());
 }
 
+#[test]
+fn packed_prepare_gate_geometry_respects_native_index_bounds() {
+    let shape = shape(256);
+    let binding = BindingLayout::new(shape, 4).unwrap();
+    let work = PackedDecodeWork::new(4, binding, shape, true).unwrap();
+    let prepare = work.prepare().unwrap();
+    assert_eq!(prepare.token_grid, 1);
+    assert_eq!(prepare.participant_grid, 4);
+    assert_eq!(prepare.binding_slot_bytes, binding.slot_bytes);
+    assert_eq!(work.gate_tokens(), Some(4));
+    assert!(PackedDecodeWork::new(
+        65_535,
+        BindingLayout::new(shape, 65_535).unwrap(),
+        shape,
+        true
+    )
+    .unwrap()
+    .prepare()
+    .is_some());
+    let over_grid_z = PackedDecodeWork::new(
+        65_536,
+        BindingLayout::new(shape, 65_536).unwrap(),
+        shape,
+        true,
+    )
+    .unwrap();
+    assert!(over_grid_z.prepare().is_none());
+    assert_eq!(over_grid_z.gate_tokens(), Some(65_536));
+    assert!(PackedDecodeWork::new(3, binding, shape, true).is_none());
+
+    let last_complete_block = (i32::MAX as u64 / 256) * 256;
+    assert_eq!(packed_gate_tokens(1, last_complete_block, 1), Some(1));
+    // A partial last block would make native signed idx wrap before its guard.
+    assert_eq!(packed_gate_tokens(1, last_complete_block + 1, 1), None);
+    assert_eq!(packed_gate_tokens(2, 128, (i32::MAX as u64) / 2), Some(2));
+    assert_eq!(packed_gate_tokens(2, 128, (i32::MAX as u64) / 2 + 1), None);
+    assert_eq!(packed_gate_tokens(u64::MAX, 2, 1), None);
+    assert_eq!(packed_gate_tokens(2, 1, u64::MAX), None);
+    assert_eq!(packed_gate_tokens(0, 128, 256), None);
+}
+
+#[test]
+fn packed_decode_dispatch_count_tracks_gate_fallback_and_unchanged_attention_groups() {
+    use CausalAttentionKernelPath::{VllmAddressedDecodeV1 as V1, VllmAddressedDecodeV2 as V2};
+    let paths = [V1, V1, V2, V1];
+    let mut shape = shape(256);
+    shape.output_gate = true;
+    shape.query_projection_features = 2 * shape.query_features;
+    let binding = BindingLayout::new(shape, paths.len()).unwrap();
+    let work = PackedDecodeWork::new(paths.len(), binding, shape, true);
+    assert_eq!(physical_dispatch_count(paths, true, false, true, None), 19);
+    assert_eq!(physical_dispatch_count(paths, true, false, true, work), 13);
+    assert_eq!(physical_dispatch_count(paths, false, false, true, work), 12);
+    assert_eq!(physical_dispatch_count(paths, true, true, true, work), 14);
+
+    // Request/Step KV can alias across participants: no parallel prepare proof.
+    // Dense scratch rows still permit one gate, independently of KV ownership.
+    let work = PackedDecodeWork::new(paths.len(), binding, shape, false).unwrap();
+    assert!(work.prepare().is_none());
+    assert_eq!(work.gate_tokens(), Some(4));
+    assert_eq!(
+        physical_dispatch_count(paths, true, false, true, Some(work)),
+        16
+    );
+    assert_eq!(
+        physical_dispatch_count(paths, false, false, true, Some(work)),
+        15
+    );
+
+    // Each row's projection indexing fits, but four rows together do not.
+    shape.query_projection_features = (i32::MAX as u64) / 2;
+    let work = PackedDecodeWork::new(paths.len(), binding, shape, true).unwrap();
+    assert!(work.gate_tokens().is_none());
+    assert_eq!(
+        physical_dispatch_count(paths, true, false, true, Some(work)),
+        16
+    );
+    // The mode cannot enable a formerly ineligible attention batch.
+    assert_eq!(
+        physical_dispatch_count([V1, V2, V1], true, false, true, Some(work)),
+        physical_dispatch_count([V1, V2, V1], true, false, true, None),
+    );
+}
+
 #[cfg(feature = "vllm-paged-attn-v2")]
 #[test]
 fn batched_launch_rejects_reordered_query_rows_and_single_owner_scratch() {
@@ -186,12 +270,26 @@ fn batched_launch_rejects_reordered_query_rows_and_single_owner_scratch() {
             }
         })
         .collect::<Vec<_>>();
-    let batch = BatchDecode::for_launches(&launches, true, binding, shape, layout)
+    let batch = BatchDecode::for_launches(&launches, true, binding, shape, layout, false, true)
         .unwrap()
         .unwrap();
     assert_eq!(batch.maximum_sequence(), 1536);
+    assert!(batch.packed_work().is_none());
+    let packed = BatchDecode::for_launches(&launches, true, binding, shape, layout, true, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(packed.maximum_sequence(), batch.maximum_sequence());
+    assert!(packed.packed_work().is_some());
+    let shared_kv = BatchDecode::for_launches(&launches, true, binding, shape, layout, true, false)
+        .unwrap()
+        .unwrap();
+    assert!(shared_kv.packed_work().unwrap().prepare().is_none());
+    assert_eq!(shared_kv.packed_work().unwrap().gate_tokens(), Some(2));
+    let mut bad_raw = launches.clone();
+    bad_raw[1].packed_key_raw = bad_raw[0].packed_key_raw;
+    assert!(BatchDecode::for_launches(&bad_raw, true, binding, shape, layout, true, true).is_err());
     assert!(
-        BatchDecode::for_launches(&launches, false, binding, shape, layout)
+        BatchDecode::for_launches(&launches, false, binding, shape, layout, true, true)
             .unwrap()
             .is_none()
     );
@@ -202,10 +300,46 @@ fn batched_launch_rejects_reordered_query_rows_and_single_owner_scratch() {
         AttentionExecutionPolicy::NativeAdaptive,
     )
     .unwrap();
-    assert!(BatchDecode::for_launches(&launches, true, binding, shape, single).is_err());
+    assert!(
+        BatchDecode::for_launches(&launches, true, binding, shape, single, true, true).is_err()
+    );
     launches[1].packed_query = launches[0].packed_query;
-    assert!(BatchDecode::for_launches(&launches, true, binding, shape, layout).is_err());
+    assert!(
+        BatchDecode::for_launches(&launches, true, binding, shape, layout, true, true).is_err()
+    );
+}
+
+#[test]
+fn packed_prepare_gate_replay_identity_distinguishes_effective_fallbacks() {
+    let mut shape = shape(256);
+    let binding = BindingLayout::new(shape, 4).unwrap();
+    let sequence_owned = PackedDecodeWork::new(4, binding, shape, true);
+    let possibly_shared = PackedDecodeWork::new(4, binding, shape, false);
+    let key = |work, output_gate| {
+        bind_prepare_gate_replay(
+            CudaCommandReplayKeyBuilder::new("same-provider", "causal"),
+            work,
+            output_gate,
+        )
+        .finish()
+        .bind_runtime_payload("causal", std::iter::empty(), &[])
+    };
+    // Identical provider/address payloads must not reuse a parallel-prepare
+    // graph for legal shared KV that requires the serial prepare path.
+    assert_ne!(key(sequence_owned, true), key(possibly_shared, true));
+    assert_ne!(key(possibly_shared, true), key(None, true));
+
+    shape.query_projection_features = i32::MAX as u64;
+    let prepare_only = PackedDecodeWork::new(4, binding, shape, true);
+    let both_fallback = PackedDecodeWork::new(4, binding, shape, false);
+    assert_ne!(key(sequence_owned, true), key(prepare_only, true));
+    // When gate is absent its unused eligibility must not invent topology.
+    assert_eq!(key(sequence_owned, false), key(prepare_only, false));
+    assert_eq!(key(both_fallback, true), key(None, true));
 }
 
 #[cfg(feature = "vllm-paged-attn-v2")]
 mod gpu;
+
+#[cfg(feature = "vllm-paged-attn-v2")]
+mod packed_prepare_gate_gpu;

@@ -358,7 +358,7 @@ fn exercise(
                 &functions.attention_gate,
                 output.pointer(stream),
                 q_gpu.pointer(stream),
-                launch,
+                launch.tokens,
                 cuda,
             )
             .unwrap();

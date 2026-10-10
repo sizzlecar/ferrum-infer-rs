@@ -67,6 +67,23 @@ impl SegmentBindingOwnerViewModeArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CausalDecodePreparationModeArg {
+    PerParticipant,
+    Packed,
+}
+
+impl CausalDecodePreparationModeArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PerParticipant => {
+                ferrum_types::CausalDecodePreparationMode::PerParticipant.as_runtime_value()
+            }
+            Self::Packed => ferrum_types::CausalDecodePreparationMode::Packed.as_runtime_value(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
@@ -134,6 +151,13 @@ mod tests {
             }
         }
 
+        fn causal_decode_preparation_mode(self) -> Option<CausalDecodePreparationModeArg> {
+            match self.command {
+                TestCommand::Run(command) => command.causal_decode_preparation_mode,
+                TestCommand::Serve(command) => command.causal_decode_preparation_mode,
+            }
+        }
+
         fn binding_upload_strategy(self) -> Option<ProgramBindingUploadStrategyArg> {
             match self.command {
                 TestCommand::Run(command) => command.program_binding_upload_strategy,
@@ -184,6 +208,43 @@ mod tests {
                 command,
                 "test-model",
                 "--segment-binding-owner-view-mode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .causal_decode_preparation_mode(),
+                None
+            );
+            for (value, expected) in [
+                (
+                    "per-participant",
+                    CausalDecodePreparationModeArg::PerParticipant,
+                ),
+                ("packed", CausalDecodePreparationModeArg::Packed),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--causal-decode-preparation-mode",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.causal_decode_preparation_mode(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--causal-decode-preparation-mode",
                 "automatic",
             ])
             .is_err());

@@ -50,6 +50,86 @@ pub(super) fn group_ranges(
 pub(super) struct BatchDecode {
     groups: Vec<(std::ops::Range<usize>, BatchGeometry)>,
     participants: i32,
+    packed_work: Option<PackedDecodeWork>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PackedDecodeWork {
+    prepare: Option<PackedPrepareLaunch>,
+    gate_tokens: Option<u64>,
+}
+
+impl PackedDecodeWork {
+    fn new(
+        participants: usize,
+        binding: BindingLayout,
+        shape: CausalAttentionShape,
+        independent_sequence_kv: bool,
+    ) -> Option<Self> {
+        if participants == 0
+            || binding.slot_bytes == 0
+            || binding.slot_bytes.checked_mul(participants as u64) != Some(binding.required_bytes)
+        {
+            return None;
+        }
+        Some(Self {
+            // Only actual participant-owned Sequence views prove independent
+            // mutable KV claims. Request/Step views can alias across rows.
+            // Preparation's grid-z bound does not constrain the flat gate.
+            prepare: (independent_sequence_kv && participants <= 65_535).then_some(
+                PackedPrepareLaunch {
+                    token_grid: 1,
+                    participant_grid: participants as u32,
+                    binding_slot_bytes: binding.slot_bytes,
+                },
+            ),
+            gate_tokens: packed_gate_tokens(
+                participants as u64,
+                shape.query_features,
+                shape.query_projection_features,
+            ),
+        })
+    }
+
+    pub(super) fn prepare(self) -> Option<PackedPrepareLaunch> {
+        self.prepare
+    }
+
+    pub(super) fn gate_tokens(self) -> Option<u64> {
+        self.gate_tokens
+    }
+}
+
+pub(super) fn bind_prepare_gate_replay(
+    key: CudaCommandReplayKeyBuilder,
+    work: Option<PackedDecodeWork>,
+    output_gate: bool,
+) -> CudaCommandReplayKeyBuilder {
+    // Provider mode alone is insufficient: legal KV ownership and native
+    // index limits can select different captured kernels under the same mode.
+    key.boolean(work.and_then(PackedDecodeWork::prepare).is_some())
+        .u64(if output_gate {
+            work.and_then(PackedDecodeWork::gate_tokens).unwrap_or(0)
+        } else {
+            0
+        })
+}
+
+fn packed_gate_tokens(tokens: u64, query_features: u64, projection_features: u64) -> Option<u64> {
+    if tokens == 0 || query_features == 0 || projection_features == 0 {
+        return None;
+    }
+    let elements = tokens.checked_mul(query_features)?;
+    let launched_threads = elements
+        .div_ceil(u64::from(THREADS_PER_BLOCK))
+        .checked_mul(u64::from(THREADS_PER_BLOCK))?;
+    let projection_elements = tokens.checked_mul(projection_features)?;
+    // The native gate uses signed i32 for idx, total and gate_idx. Include
+    // padded threads in the bound, even though valid threads alone may fit.
+    (tokens <= i32::MAX as u64
+        && launched_threads <= i32::MAX as u64
+        && projection_elements <= i32::MAX as u64)
+        .then_some(tokens)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +140,10 @@ pub(super) struct BatchGeometry {
 }
 
 impl BatchDecode {
+    pub(super) fn packed_work(&self) -> Option<PackedDecodeWork> {
+        self.packed_work
+    }
+
     #[cfg(test)]
     fn maximum_sequence(&self) -> u64 {
         self.groups
@@ -120,6 +204,8 @@ impl BatchDecode {
         binding: BindingLayout,
         shape: CausalAttentionShape,
         layout: ScratchLayout,
+        packed_prepare_gate: bool,
+        independent_sequence_kv: bool,
     ) -> Result<Option<Self>, String> {
         if !eligible(launches.iter().map(|launch| launch.path), packed) {
             return Ok(None);
@@ -144,6 +230,25 @@ impl BatchDecode {
                 return Err(
                     "causal attention batch rows are not canonical packed decode rows".into(),
                 );
+            }
+            if packed_prepare_gate
+                && (launch.tokens_i32 != 1
+                    || launch.packed_query_raw
+                        != layout.token_offset(
+                            layout.query_raw,
+                            index as u64,
+                            shape.query_projection_features,
+                        )?
+                    || launch.packed_key_raw
+                        != layout.token_offset(layout.key_raw, index as u64, shape.kv_features)?
+                    || launch.packed_value_raw
+                        != layout.token_offset(
+                            layout.value_raw,
+                            index as u64,
+                            shape.kv_features,
+                        )?)
+            {
+                return Err("packed causal preparation rows differ from scratch geometry".into());
             }
         }
         if binding.slot_bytes.checked_mul(launches.len() as u64) != Some(binding.required_bytes) {
@@ -181,6 +286,11 @@ impl BatchDecode {
             groups,
             participants: i32::try_from(launches.len())
                 .map_err(|_| "causal batch owner count exceeds i32")?,
+            packed_work: packed_prepare_gate
+                .then(|| {
+                    PackedDecodeWork::new(launches.len(), binding, shape, independent_sequence_kv)
+                })
+                .flatten(),
         }))
     }
 
@@ -201,24 +311,43 @@ impl BatchDecode {
     ) -> Result<(), CudaDeviceRuntimeError> {
         #[cfg(feature = "vllm-paged-attn-v2")]
         {
-            for launch in launches {
-                let control = scratch_pointer(binding, launch.binding_offset)?;
+            if let Some(prepare) = self.packed_work.and_then(PackedDecodeWork::prepare) {
                 launch_prepare(
                     stream,
                     &functions.prepare,
-                    scratch_pointer(scratch, launch.packed_query_raw)?,
-                    scratch_pointer(scratch, launch.packed_key_raw)?,
-                    scratch_pointer(scratch, launch.packed_value_raw)?,
+                    scratch_pointer(scratch, layout.query_raw)?,
+                    scratch_pointer(scratch, layout.key_raw)?,
+                    scratch_pointer(scratch, layout.value_raw)?,
                     query_norm,
                     key_norm,
-                    scratch_pointer(scratch, launch.packed_query)?,
-                    control,
-                    scratch_pointer(control, BINDING_CONTROL_BYTES)?,
-                    *launch,
+                    scratch_pointer(scratch, layout.query)?,
+                    binding,
+                    scratch_pointer(binding, BINDING_CONTROL_BYTES)?,
+                    launches[0],
                     shape,
                     1,
-                    None,
+                    Some(prepare),
                 )?;
+            } else {
+                for launch in launches {
+                    let control = scratch_pointer(binding, launch.binding_offset)?;
+                    launch_prepare(
+                        stream,
+                        &functions.prepare,
+                        scratch_pointer(scratch, launch.packed_query_raw)?,
+                        scratch_pointer(scratch, launch.packed_key_raw)?,
+                        scratch_pointer(scratch, launch.packed_value_raw)?,
+                        query_norm,
+                        key_norm,
+                        scratch_pointer(scratch, launch.packed_query)?,
+                        control,
+                        scratch_pointer(control, BINDING_CONTROL_BYTES)?,
+                        *launch,
+                        shape,
+                        1,
+                        None,
+                    )?;
+                }
             }
             let partition = layout
                 .vllm
@@ -265,15 +394,26 @@ impl BatchDecode {
                 }
             }
             if output_gate {
-                for launch in launches {
+                if let Some(tokens) = self.packed_work.and_then(PackedDecodeWork::gate_tokens) {
                     launch_attention_gate(
                         stream,
                         &functions.attention_gate,
-                        scratch_pointer(scratch, launch.packed_context)?,
-                        scratch_pointer(scratch, launch.packed_query_raw)?,
-                        *launch,
+                        scratch_pointer(scratch, layout.context)?,
+                        scratch_pointer(scratch, layout.query_raw)?,
+                        tokens,
                         shape,
                     )?;
+                } else {
+                    for launch in launches {
+                        launch_attention_gate(
+                            stream,
+                            &functions.attention_gate,
+                            scratch_pointer(scratch, launch.packed_context)?,
+                            scratch_pointer(scratch, launch.packed_query_raw)?,
+                            launch.tokens,
+                            shape,
+                        )?;
+                    }
                 }
             }
             Ok(())

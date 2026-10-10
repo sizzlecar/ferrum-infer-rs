@@ -1185,6 +1185,16 @@ impl FerrumConfigBuilder {
                 RuntimeConfigSource::Default,
             );
         }
+        if self
+            .entry(crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                crate::CausalDecodePreparationMode::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
             if self
                 .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
@@ -1263,6 +1273,9 @@ impl FerrumConfigBuilder {
         decisions.push(self.invocation_preparation_strategy_decision()?);
         decisions.push(self.program_binding_upload_strategy_decision()?);
         decisions.push(self.segment_binding_owner_view_mode_decision()?);
+        decisions.push(self.causal_decode_preparation_mode_decision(
+            plan_attention.as_ref().map(|(_, compiled)| compiled.value),
+        )?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -2668,6 +2681,50 @@ impl FerrumConfigBuilder {
             source,
             source_key,
             ["legacy", "indexed"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn causal_decode_preparation_mode_decision(
+        &self,
+        compiled_attention: Option<AttentionExecutionPolicy>,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::CausalDecodePreparationMode::parse_config_entry(entry).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::CausalDecodePreparationMode::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::CausalDecodePreparationMode::Packed
+            && (!self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || !self.hardware.compiled_features.vllm_paged_attn
+                || compiled_attention != Some(AttentionExecutionPolicy::NativeAdaptive))
+        {
+            return Err(AutoConfigError::InvalidOverride {
+                key: key.to_owned(),
+                reason: "packed causal decode preparation requires a CUDA plan runtime with compiled native-adaptive paged attention and F16 KV storage".to_owned(),
+            });
+        }
+        Ok(self.decision(
+            "causal_decode_preparation_mode",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["per-participant", "packed"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5575,6 +5632,180 @@ mod tests {
                     upload
                 );
             }
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_reports_sources_and_preserves_independent_policies() {
+        let key = crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        for (mode, source) in [
+            (None, RuntimeConfigSource::Default),
+            (Some("packed"), RuntimeConfigSource::ConfigFile),
+            (Some("per-participant"), RuntimeConfigSource::Cli),
+            (Some("packed"), RuntimeConfigSource::Cli),
+        ] {
+            for preparation in ["full", "decode-segment"] {
+                for upload in ["sparse", "compact-scatter"] {
+                    let mut entries = vec![
+                        RuntimeConfigEntry::new(
+                            "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                            preparation,
+                            RuntimeConfigSource::Cli,
+                        ),
+                        RuntimeConfigEntry::new(
+                            "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                            upload,
+                            RuntimeConfigSource::Cli,
+                        ),
+                    ];
+                    if let Some(mode) = mode {
+                        entries.push(RuntimeConfigEntry::new(key, mode, source));
+                    }
+                    let mut hardware = HardwareCapabilities::unknown();
+                    hardware.backend = "cuda".to_owned();
+                    hardware.compiled_features.cuda = true;
+                    hardware.compiled_features.vllm_paged_attn = true;
+                    let resolved =
+                        FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
+                            .with_hardware_capabilities(hardware)
+                            .with_execution_resource_authority(
+                                ExecutionResourceAuthority::PlanRuntime,
+                            )
+                            .resolve()
+                            .unwrap();
+                    let expected = mode.unwrap_or("per-participant");
+                    let entry = resolved
+                        .runtime_config
+                        .entries
+                        .iter()
+                        .find(|entry| entry.key == key)
+                        .unwrap();
+                    assert_eq!(entry.effective_value, expected);
+                    assert_eq!(entry.source, source);
+                    let decision = resolved
+                        .decisions
+                        .iter()
+                        .find(|decision| decision.selection == "causal_decode_preparation_mode")
+                        .unwrap();
+                    assert_eq!(decision.selected, expected);
+                    assert_eq!(decision.source, auto_config_source_from_runtime(source));
+                    assert_eq!(decision.source_key.as_deref(), mode.map(|_| key));
+                    let mut engine = crate::EngineConfig::default();
+                    engine
+                        .apply_runtime_config_snapshot(&resolved.runtime_config)
+                        .unwrap();
+                    assert_eq!(
+                        engine
+                            .runtime
+                            .causal_decode_preparation_mode
+                            .as_runtime_value(),
+                        expected
+                    );
+                    assert_eq!(
+                        engine
+                            .runtime
+                            .program_binding_upload_strategy
+                            .as_runtime_value(),
+                        upload
+                    );
+                    assert_eq!(
+                        engine
+                            .runtime
+                            .invocation_preparation_strategy
+                            .as_runtime_value(),
+                        preparation
+                    );
+                    assert_eq!(
+                        resolved.compiled_attention_policy,
+                        Some(AttentionExecutionPolicy::NativeAdaptive)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_rejects_env_and_unavailable_native_execution() {
+        let key = crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        for (backend, authority, compiled, policy, kv, source) in [
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Env,
+            ),
+            (
+                "cpu",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::LegacyEngine,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                false,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "portable",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "int8",
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            let entries = snapshot_with_sources(&[
+                (key, "packed", source),
+                ("FERRUM_ATTENTION_POLICY", policy, RuntimeConfigSource::Cli),
+                ("FERRUM_KV_DTYPE", kv, RuntimeConfigSource::Cli),
+            ]);
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            hardware.compiled_features.cuda = backend == "cuda";
+            hardware.compiled_features.vllm_paged_attn = compiled;
+            // INT8 is a valid storage choice for this fixture; the packed
+            // preparation mode must reject its resolved portable attention.
+            hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
+            let error = FerrumConfigBuilder::new(entries)
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(&error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key),
+                "backend={backend}, authority={authority:?}, compiled={compiled}, policy={policy}, kv={kv}, source={source:?}: {error:?}"
+            );
         }
     }
 

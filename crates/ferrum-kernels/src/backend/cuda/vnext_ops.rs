@@ -1052,9 +1052,18 @@ impl CudaVNextComposition {
         upload_strategy: ProgramBindingUploadStrategy,
         oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
         owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
+        if causal_decode_preparation == ferrum_types::CausalDecodePreparationMode::Packed
+            && (!cfg!(feature = "vllm-paged-attn-v2")
+                || config.attention_execution_policy != AttentionExecutionPolicy::NativeAdaptive)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "packed causal decode preparation requires compiled native-adaptive paged attention",
+            ));
+        }
         let runtime = Arc::new(
             match purpose {
                 CudaCompositionPurpose::Execution => {
@@ -1068,7 +1077,10 @@ impl CudaVNextComposition {
                 }
             }
             .with_segment_binding_oracle(oracle)
-            .with_segment_binding_owner_view_mode(owner_view_mode),
+            .with_segment_binding_owner_view_mode(owner_view_mode)
+            .with_packed_decode_prepare_gate(
+                causal_decode_preparation == ferrum_types::CausalDecodePreparationMode::Packed,
+            ),
         );
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[allow(unused_mut)]
@@ -1177,6 +1189,27 @@ impl CudaVNextComposition {
         oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
         owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_causal_decode_preparation_mode(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            ferrum_types::CausalDecodePreparationMode::PerParticipant,
+        )
+    }
+
+    /// Select preparation before constructing the actual provider registry and catalog.
+    pub fn create_with_causal_decode_preparation_mode(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let composition = Self::prepare(
             ordinal,
             device_id,
@@ -1185,6 +1218,7 @@ impl CudaVNextComposition {
             upload_strategy,
             oracle,
             owner_view_mode,
+            causal_decode_preparation,
         )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
@@ -1272,6 +1306,21 @@ pub fn cuda_validated_native_operator_catalog_input(
     device_id: DeviceId,
     requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_causal_decode_preparation_mode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        ferrum_types::CausalDecodePreparationMode::PerParticipant,
+    )
+}
+
+/// Export the live catalog for the explicitly selected preparation mode.
+pub fn cuda_validated_native_operator_catalog_input_with_causal_decode_preparation_mode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1280,6 +1329,7 @@ pub fn cuda_validated_native_operator_catalog_input(
         ProgramBindingUploadStrategy::Sparse,
         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
         ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+        causal_decode_preparation,
     )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
@@ -1296,6 +1346,21 @@ pub fn cuda_native_operator_catalog_input(
     device_id: DeviceId,
     requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_causal_decode_preparation_mode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        ferrum_types::CausalDecodePreparationMode::PerParticipant,
+    )
+}
+
+/// Declare source-constructed identities for an explicit mode without native execution.
+pub fn cuda_native_operator_catalog_input_with_causal_decode_preparation_mode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1304,6 +1369,7 @@ pub fn cuda_native_operator_catalog_input(
         ProgramBindingUploadStrategy::Sparse,
         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
         ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+        causal_decode_preparation,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }

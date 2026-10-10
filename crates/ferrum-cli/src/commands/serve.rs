@@ -139,6 +139,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub segment_binding_owner_view_mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
 
+    /// Causal decode preparation (default: per-participant). Packed requires native CUDA attention.
+    #[arg(long, value_enum)]
+    pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -425,6 +429,7 @@ async fn execute_with_compatibility(
         invocation_preparation_strategy,
         program_binding_upload_strategy,
         segment_binding_owner_view_mode,
+        causal_decode_preparation_mode,
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
@@ -886,6 +891,10 @@ async fn execute_with_compatibility(
     push_segment_binding_owner_view_mode_cli_entry(
         &mut startup_cli_runtime_entries,
         segment_binding_owner_view_mode,
+    );
+    push_causal_decode_preparation_mode_cli_entry(
+        &mut startup_cli_runtime_entries,
+        causal_decode_preparation_mode,
     );
     startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
@@ -1623,6 +1632,17 @@ fn push_segment_binding_owner_view_mode_cli_entry(
         entries,
         ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
         mode.map(crate::commands::SegmentBindingOwnerViewModeArg::as_runtime_value),
+    );
+}
+
+fn push_causal_decode_preparation_mode_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    mode: Option<crate::commands::CausalDecodePreparationModeArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+        mode.map(crate::commands::CausalDecodePreparationModeArg::as_runtime_value),
     );
 }
 
@@ -2606,6 +2626,61 @@ mod tests {
             let mut engine = ferrum_types::EngineConfig::default();
             engine.apply_runtime_config_snapshot(&snapshot).unwrap();
             assert_eq!(engine.runtime.segment_binding_owner_view_mode, expected);
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_serve_precedence_preserves_upload_policy() {
+        use crate::commands::CausalDecodePreparationModeArg as Arg;
+        use ferrum_types::{
+            CausalDecodePreparationMode as Mode, CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::PerParticipant, None),
+            (
+                Some(Mode::Packed),
+                None,
+                Mode::Packed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Packed),
+                Some(Arg::PerParticipant),
+                Mode::PerParticipant,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::PerParticipant),
+                Some(Arg::Packed),
+                Mode::Packed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                causal_decode_preparation_mode: config_mode,
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_causal_decode_preparation_mode_cli_entry(&mut cli_entries, cli_mode);
+            let snapshot = merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.causal_decode_preparation_mode, expected);
             assert_eq!(
                 engine.runtime.program_binding_upload_strategy,
                 ferrum_types::ProgramBindingUploadStrategy::CompactScatter

@@ -257,6 +257,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub segment_binding_owner_view_mode: Option<ferrum_types::SegmentBindingOwnerViewMode>,
 
+    /// Preparation of eligible native CUDA batched causal decode rows.
+    #[serde(default)]
+    pub causal_decode_preparation_mode: Option<ferrum_types::CausalDecodePreparationMode>,
+
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -497,6 +501,12 @@ impl RuntimeCliConfig {
             ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
             self.segment_binding_owner_view_mode
                 .map(ferrum_types::SegmentBindingOwnerViewMode::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+            self.causal_decode_preparation_mode
+                .map(ferrum_types::CausalDecodePreparationMode::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1138,6 +1148,27 @@ mod tests {
         }
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\nsegment_binding_owner_view_mode = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn causal_decode_preparation_config_file_parses_explicit_mode() {
+        for value in ["per-participant", "packed"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\ncausal_decode_preparation_mode = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\ncausal_decode_preparation_mode = \"automatic\"\n"
         )
         .is_err());
     }

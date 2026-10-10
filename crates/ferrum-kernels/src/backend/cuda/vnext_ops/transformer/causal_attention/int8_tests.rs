@@ -658,7 +658,7 @@ fn packed_case(
             selected,
             shape.cuda_shape().unwrap(),
             0,
-            grid,
+            grid.map(PackedFallbackLaunch::prepare_geometry),
         )
         .unwrap();
         launch_fallback_attention(

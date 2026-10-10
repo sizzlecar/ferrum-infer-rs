@@ -149,6 +149,46 @@ impl ProgramBindingUploadStrategy {
 pub const SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY: &str =
     "FERRUM_SEGMENT_BINDING_OWNER_VIEW_MODE";
 
+/// Snapshot identity for an explicit CLI/config option, never an environment switch.
+pub const CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECODE_PREPARATION_MODE";
+
+/// Preparation of rows in an eligible native batched causal decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalDecodePreparationMode {
+    #[default]
+    PerParticipant,
+    Packed,
+}
+
+impl CausalDecodePreparationMode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PerParticipant => "per-participant",
+            Self::Packed => "packed",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "per-participant" => Ok(Self::PerParticipant),
+            "packed" => Ok(Self::Packed),
+            _ => Err(format!("expected per-participant or packed; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select causal decode preparation through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Representation of freshly checked decode-segment binding owners. Both
 /// modes retain the same current-wave authorization and exact physical ranges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +358,9 @@ pub struct RuntimeKnobs {
     /// Fresh owner representation for CUDA decode segments; Legacy is default.
     #[serde(default)]
     pub segment_binding_owner_view_mode: SegmentBindingOwnerViewMode,
+    /// Packed preparation applies only to eligible native batched causal decode.
+    #[serde(default)]
+    pub causal_decode_preparation_mode: CausalDecodePreparationMode,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -475,6 +518,16 @@ impl EngineConfig {
             self.runtime.segment_binding_owner_view_mode =
                 SegmentBindingOwnerViewMode::parse_config_entry(entry).map_err(|reason| {
                     format!("{SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY}: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+        {
+            self.runtime.causal_decode_preparation_mode =
+                CausalDecodePreparationMode::parse_config_entry(entry).map_err(|reason| {
+                    format!("{CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY}: {reason}")
                 })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
@@ -1563,6 +1616,50 @@ mod tests {
     }
 
     #[test]
+    fn causal_decode_preparation_mode_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::PerParticipant
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("causal_decode_preparation_mode");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::PerParticipant
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                CausalDecodePreparationMode::Packed,
+                CausalDecodePreparationMode::PerParticipant,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.causal_decode_preparation_mode, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.causal_decode_preparation_mode, mode);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+
+    #[test]
     fn segment_owner_mode_environment_cannot_activate_or_override_typed_config() {
         let key = SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
         let mut config = EngineConfig::default();
@@ -1583,6 +1680,31 @@ mod tests {
         assert_eq!(
             config.runtime.segment_binding_owner_view_mode,
             SegmentBindingOwnerViewMode::Indexed
+        );
+    }
+
+    #[test]
+    fn causal_decode_preparation_mode_environment_cannot_activate_or_override_typed_config() {
+        let key = CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(key, "packed")]))
+            .unwrap_err()
+            .contains("not environment"));
+        assert_eq!(
+            config.runtime.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::PerParticipant
+        );
+        config.runtime.causal_decode_preparation_mode = CausalDecodePreparationMode::Packed;
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "per-participant"
+            )]))
+            .is_err());
+        assert_eq!(
+            config.runtime.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::Packed
         );
     }
 

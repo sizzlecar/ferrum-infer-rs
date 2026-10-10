@@ -7,10 +7,10 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
-    ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EncodedDeviceOperation, EncodedReusableExecutionBindings,
+    causal_paged_attention_contract, AllocationLifetime, AttributeId, BatchedOperationInvocation,
+    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
+    DynamicStorageView, ElementType, EncodedDeviceOperation, EncodedReusableExecutionBindings,
     OperationBufferStorageKind, OperationContract, OperationFailure, OperationInvocation,
     OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
@@ -143,6 +143,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     functions: CausalAttentionFunctions,
     attention_policy: AttentionExecutionPolicy,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    packed_decode_prepare_gate: bool,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     q8act: bool,
@@ -440,8 +441,11 @@ impl CudaCausalPagedAttentionProvider {
             precision.estimator_id(semantics)
         };
         let source = include_str!("causal_attention.rs");
+        let packed_decode_prepare_gate = runtime.packed_decode_prepare_gate_enabled();
+        let packed_decode_mode = [u8::from(packed_decode_prepare_gate)];
         let mut provider_sources = vec![
             source.as_bytes(),
+            packed_decode_mode.as_slice(),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
@@ -491,6 +495,7 @@ impl CudaCausalPagedAttentionProvider {
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
+            packed_decode_mode.as_slice(),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             estimator_id.as_bytes(),
@@ -772,6 +777,7 @@ impl CudaCausalPagedAttentionProvider {
             functions,
             attention_policy,
             program_binding_upload_strategy: runtime.program_binding_upload_strategy(),
+            packed_decode_prepare_gate,
             semantics,
             precision,
             q8act,
@@ -998,6 +1004,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.descriptor.provider_implementation_fingerprint(),
             self.attention_policy,
             self.program_binding_upload_strategy,
+            self.packed_decode_prepare_gate,
             self.semantics,
             self.precision,
             self.descriptor.operation_id().as_str(),
@@ -1037,6 +1044,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.descriptor.provider_implementation_fingerprint(),
             self.attention_policy,
             self.program_binding_upload_strategy,
+            self.packed_decode_prepare_gate,
             self.semantics,
             self.precision,
             self.descriptor.operation_id().as_str(),
@@ -1090,6 +1098,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 self.descriptor.provider_implementation_fingerprint(),
                 self.attention_policy,
                 self.program_binding_upload_strategy,
+                self.packed_decode_prepare_gate,
                 self.semantics,
                 self.precision,
                 self.descriptor.operation_id().as_str(),
@@ -2275,6 +2284,23 @@ struct PackedFallbackLaunch {
     path: CausalAttentionKernelPath,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PackedPrepareLaunch {
+    token_grid: u64,
+    participant_grid: u32,
+    binding_slot_bytes: u64,
+}
+
+impl PackedFallbackLaunch {
+    fn prepare_geometry(self) -> PackedPrepareLaunch {
+        PackedPrepareLaunch {
+            token_grid: self.token_grid,
+            participant_grid: self.participant_grid,
+            binding_slot_bytes: self.binding_slot_bytes,
+        }
+    }
+}
+
 fn packed_fallback_launch(
     launches: &[CausalAttentionLaunch],
     binding_layout: BindingLayout,
@@ -2326,6 +2352,7 @@ fn encode_attention(
     provider_fingerprint: &str,
     attention_policy: AttentionExecutionPolicy,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    packed_decode_prepare_gate: bool,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     operation_id: &str,
@@ -2501,6 +2528,7 @@ fn encode_attention(
     let mut host_storage = Vec::with_capacity(invocation.participants().len());
     let mut launches = Vec::with_capacity(invocation.participants().len());
     let mut bindings = Vec::with_capacity(invocation.participants().len());
+    let mut independent_sequence_kv = true;
     for (participant_index, (participant, token_range)) in invocation
         .participants()
         .iter()
@@ -2561,7 +2589,16 @@ fn encode_attention(
             )?,
             shape.kv_element_type(),
         )?;
+        if packed_decode_prepare_gate {
+            independent_sequence_kv &= state_is_sequence_owned(participant, state);
+        }
         let scale_pages = scale_state_regions(participant, shape, source.end)?;
+        if packed_decode_prepare_gate && shape.int8_kv {
+            independent_sequence_kv &= state_is_sequence_owned(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
+            );
+        }
         let page_count = u64::try_from(pages.len())
             .map_err(|_| "causal attention page count exceeds u64".to_owned())?;
         if page_count > shape.maximum_pages()? {
@@ -2844,12 +2881,15 @@ fn encode_attention(
         binding_layout,
         shape,
         layout,
+        packed_decode_prepare_gate,
+        independent_sequence_kv,
     )?;
     let compute_dispatch_count = physical_dispatch_count(
         launches.iter().map(|launch| launch.path),
         shape.output_gate,
         shape.post_attention_norm,
         packed_enabled,
+        batch_decode.as_ref().and_then(|batch| batch.packed_work()),
     );
     let projection_extra = if packed_enabled {
         native_projection_extra_dispatches(&shared, total_tokens)?
@@ -2955,6 +2995,11 @@ fn encode_attention(
                 .u64(binding_layout.required_bytes)
                 .u64(binding_layout.slot_bytes)
                 .u64(launches.len() as u64);
+            replay_key = batch_decode::bind_prepare_gate_replay(
+                replay_key,
+                batch_decode.as_ref().and_then(|batch| batch.packed_work()),
+                shape.output_gate,
+            );
             for launch in &launches {
                 let replay_envelope = launch.replay_topology.envelope();
                 replay_key = replay_key
@@ -3107,17 +3152,28 @@ fn physical_dispatch_count(
     output_gate: bool,
     post_attention_norm: bool,
     packed: bool,
+    packed_work: Option<batch_decode::PackedDecodeWork>,
 ) -> u64 {
     let paths = paths.into_iter().collect::<Vec<_>>();
     if batch_decode::eligible(paths.iter().copied(), packed) {
         return 6
             + u64::from(post_attention_norm)
-            + paths.len() as u64
+            + if packed_work.is_some_and(|work| work.prepare().is_some()) {
+                1
+            } else {
+                paths.len() as u64
+            }
             + 1
             + batch_decode::group_ranges(&paths)
                 .map(|range| paths[range.start].attention_dispatch_count())
                 .sum::<u64>()
-            + if output_gate { paths.len() as u64 } else { 0 };
+            + if !output_gate {
+                0
+            } else if packed_work.is_some_and(|work| work.gate_tokens().is_some()) {
+                1
+            } else {
+                paths.len() as u64
+            };
     }
     let packed_fallback = packed
         && paths.len() > 1
@@ -3480,7 +3536,7 @@ fn enqueue_packed_attention(
             launch,
             cuda,
             i32::from(packed_fallback.path.uses_vllm_layout()),
-            Some(packed_fallback),
+            Some(packed_fallback.prepare_geometry()),
         )?;
         launch_fallback_attention(
             stream,
@@ -3502,7 +3558,7 @@ fn enqueue_packed_attention(
                     &functions.attention_gate,
                     scratch_pointer(scratch_base, launch.packed_context)?,
                     scratch_pointer(scratch_base, launch.packed_query_raw)?,
-                    *launch,
+                    launch.tokens,
                     cuda,
                 )?;
             }
@@ -3556,7 +3612,7 @@ fn enqueue_packed_attention(
                     &functions.attention_gate,
                     participant_context,
                     participant_query_raw,
-                    *launch,
+                    launch.tokens,
                     cuda,
                 )?;
             }
@@ -3713,7 +3769,7 @@ fn enqueue_attention(
             &functions.attention_gate,
             context,
             query_raw,
-            launch,
+            launch.tokens,
             cuda,
         )?;
     }
@@ -4063,7 +4119,7 @@ fn launch_prepare(
     launch: CausalAttentionLaunch,
     shape: CudaCausalAttentionShape,
     kv_layout: i32,
-    packed: Option<PackedFallbackLaunch>,
+    packed: Option<PackedPrepareLaunch>,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let page_elements = checked_i32_runtime(
         VNEXT_KV_PAGE_BYTES
@@ -4311,11 +4367,10 @@ fn launch_attention_gate(
     function: &CudaFunction,
     context: u64,
     query_raw: u64,
-    launch: CausalAttentionLaunch,
+    tokens: u64,
     shape: CudaCausalAttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let elements = launch
-        .tokens
+    let elements = tokens
         .checked_mul(shape.query_features as u64)
         .ok_or_else(|| CudaDeviceRuntimeError::contract("attention gate size overflows"))?;
     let grid = checked_u32_runtime(
@@ -4328,7 +4383,7 @@ fn launch_attention_gate(
         builder.arg(pointer);
     }
     let dimensions = [
-        launch.tokens_i32,
+        checked_i32_runtime(tokens, "attention gate token count")?,
         shape.query_features,
         shape.query_projection_features,
         shape.head_dim,
@@ -4595,6 +4650,23 @@ fn launch_residual(
     result
         .map(|_| ())
         .map_err(|error| CudaDeviceRuntimeError::driver("causal attention residual launch", error))
+}
+
+// Core constructs Sequence views from this participant's exact current backing
+// snapshot after checking sequence/frame/session authority. Distinct admitted
+// session slots own disjoint live claims, including when ranges share a buffer.
+// Request/Step lifetimes do not establish this cross-participant independence.
+fn state_is_sequence_owned(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    state: &ResolvedValueBinding,
+) -> bool {
+    let [component] = state.storage().components() else {
+        return false;
+    };
+    participant.views().iter().any(|view| {
+        view.resource_id() == component.resource_id()
+            && view.allocation_lifetime() == AllocationLifetime::Sequence
+    })
 }
 
 fn paged_state_regions(
@@ -5716,33 +5788,60 @@ mod tests {
         let token_fallback = CausalAttentionKernelPath::TokenMajorFallback;
         let addressed_fallback = CausalAttentionKernelPath::VllmAddressedFallback;
 
-        assert_eq!(physical_dispatch_count([v1], false, false, false), 8);
-        assert_eq!(physical_dispatch_count([v1; 4], false, false, false), 32);
-        assert_eq!(physical_dispatch_count([v1; 4], false, false, true), 12);
-        assert_eq!(physical_dispatch_count([v2; 4], true, false, false), 40);
-        assert_eq!(physical_dispatch_count([v2; 4], true, false, true), 17);
-        assert_eq!(physical_dispatch_count([v1; 32], true, false, true), 72);
-        assert_eq!(physical_dispatch_count([v2; 32], true, false, true), 73);
-        assert_eq!(physical_dispatch_count([v1], false, true, false), 9);
-        assert_eq!(physical_dispatch_count([v1; 4], false, true, true), 13);
+        assert_eq!(physical_dispatch_count([v1], false, false, false, None), 8);
         assert_eq!(
-            physical_dispatch_count([token_fallback; 4], false, false, false),
+            physical_dispatch_count([v1; 4], false, false, false, None),
             32
         );
         assert_eq!(
-            physical_dispatch_count([token_fallback; 4], false, false, true),
-            8
+            physical_dispatch_count([v1; 4], false, false, true, None),
+            12
         );
         assert_eq!(
-            physical_dispatch_count([token_fallback; 32], false, true, true),
-            9
-        );
-        assert_eq!(
-            physical_dispatch_count([addressed_fallback; 32], true, false, true),
+            physical_dispatch_count([v2; 4], true, false, false, None),
             40
         );
         assert_eq!(
-            physical_dispatch_count([token_fallback, addressed_fallback], false, false, true,),
+            physical_dispatch_count([v2; 4], true, false, true, None),
+            17
+        );
+        assert_eq!(
+            physical_dispatch_count([v1; 32], true, false, true, None),
+            72
+        );
+        assert_eq!(
+            physical_dispatch_count([v2; 32], true, false, true, None),
+            73
+        );
+        assert_eq!(physical_dispatch_count([v1], false, true, false, None), 9);
+        assert_eq!(
+            physical_dispatch_count([v1; 4], false, true, true, None),
+            13
+        );
+        assert_eq!(
+            physical_dispatch_count([token_fallback; 4], false, false, false, None),
+            32
+        );
+        assert_eq!(
+            physical_dispatch_count([token_fallback; 4], false, false, true, None),
+            8
+        );
+        assert_eq!(
+            physical_dispatch_count([token_fallback; 32], false, true, true, None),
+            9
+        );
+        assert_eq!(
+            physical_dispatch_count([addressed_fallback; 32], true, false, true, None),
+            40
+        );
+        assert_eq!(
+            physical_dispatch_count(
+                [token_fallback, addressed_fallback],
+                false,
+                false,
+                true,
+                None
+            ),
             10
         );
     }

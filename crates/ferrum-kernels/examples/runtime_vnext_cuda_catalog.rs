@@ -4,15 +4,15 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::cuda_validated_native_operator_catalog_input;
-use ferrum_types::{AttentionExecutionPolicy, NativeOperatorBackend};
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_validated_native_operator_catalog_input_with_causal_decode_preparation_mode;
+use ferrum_types::{AttentionExecutionPolicy, CausalDecodePreparationMode, NativeOperatorBackend};
 use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments.len() != 6 {
+    if !matches!(arguments.len(), 6 | 7) {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> <compiled-native-operators-out>",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> <compiled-native-operators-out> [causal-decode-preparation-mode]",
             arguments.first().map(String::as_str).unwrap_or("runtime_vnext_cuda_catalog")
         )
         .into());
@@ -22,11 +22,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let provider_catalog_path = Path::new(&arguments[3]);
     let capability_catalog_path = Path::new(&arguments[4]);
     let compiled_native_operators_path = Path::new(&arguments[5]);
-    let catalog_input = cuda_validated_native_operator_catalog_input(
-        ordinal,
-        DeviceId::new(format!("cuda:{ordinal}"))?,
-        policy,
-    )?;
+    let causal_decode_preparation = arguments
+        .get(6)
+        .map(|value| CausalDecodePreparationMode::parse_runtime_value(value))
+        .transpose()?
+        .unwrap_or_default();
+    let catalog_input =
+        cuda_validated_native_operator_catalog_input_with_causal_decode_preparation_mode(
+            ordinal,
+            DeviceId::new(format!("cuda:{ordinal}"))?,
+            policy,
+            causal_decode_preparation,
+        )?;
     let capability_catalog = catalog_input.capability_catalog();
     let provider_catalog =
         capability_catalog.native_operator_provider_catalog(NativeOperatorBackend::Cuda)?;
