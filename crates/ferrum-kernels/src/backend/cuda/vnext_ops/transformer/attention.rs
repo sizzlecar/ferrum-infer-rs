@@ -159,6 +159,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         Self::with_precision(runtime, AttentionPrecision::F32MasterUpstreamExtraAllRows)
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_upstream_m8_geometry(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterUpstreamM8Geometry)
+    }
+
     pub(in crate::backend::cuda::vnext_ops) fn new_g32_mmq_prefill(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {

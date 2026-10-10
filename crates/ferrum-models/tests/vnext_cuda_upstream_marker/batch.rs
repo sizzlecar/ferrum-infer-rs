@@ -311,7 +311,8 @@ impl Fixture {
                         component.offset_bytes(),
                         HostTransferLayout::new(
                             ElementType::F32,
-                            ranges[p as usize].len() as u64 * HIDDEN,
+                            ranges[p as usize].len() as u64
+                                * output.tensor().dimensions().last().copied().unwrap(),
                         )
                         .unwrap(),
                     )

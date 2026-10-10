@@ -5,6 +5,8 @@ pub mod extra;
 pub mod extra_all_rows;
 #[path = "family/extra_prefill.rs"]
 pub mod extra_prefill;
+#[path = "family/geometry.rs"]
+pub mod geometry;
 pub use extra::Weights;
 
 const INTERMEDIATE: u64 = 768;
@@ -17,6 +19,7 @@ pub struct Family {
     selected: UpstreamMarkerV2Profile,
     maximum_tokens: u64,
     g32_baseline: bool,
+    geometry: bool,
 }
 
 impl Family {
@@ -25,6 +28,7 @@ impl Family {
             base: attention_family::Family::new(kind),
             maximum_tokens: MAX_TOKENS,
             g32_baseline: false,
+            geometry: false,
             selected: match kind {
                 AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDelta,
                 AttentionKind::Causal => UpstreamMarkerV2Profile::Causal,
@@ -126,6 +130,9 @@ impl Family {
     }
     pub fn states(&self) -> Vec<StateSpec> {
         let mut states = self.base.states();
+        if self.geometry {
+            geometry::resize_states(&mut states);
+        }
         for state in &mut states {
             if let StateCapacityDemand::TokenScaled { maximum_tokens, .. } =
                 &mut state.capacity_demand
@@ -136,7 +143,9 @@ impl Family {
         states
     }
     pub fn profile_id(&self) -> &'static str {
-        if self.g32_baseline {
+        if self.geometry {
+            geometry::PROFILE
+        } else if self.g32_baseline {
             "fixture.attention-ffn.require-atn-g32"
         } else if self.selected.extra_all_rows() {
             extra_all_rows::PROFILE
@@ -188,12 +197,16 @@ impl ModelFamilyProvider for Family {
 
     fn weight_schema(&self, config: &AttentionKind) -> Result<WeightSchema, VNextError> {
         let mut schema = self.base.weight_schema(config)?;
+        if self.geometry {
+            geometry::resize_schema(&mut schema, *config);
+        }
+        let hidden = self.hidden_size();
         let norm: WeightId = id("component.ffn_norm");
         schema.components.push(WeightComponentSpec {
             id: norm.clone(),
             role: WeightComponentRole::Values,
             external_names: vec!["ffn_norm".into()],
-            dimensions: vec![HIDDEN],
+            dimensions: vec![hidden],
             encoding: WeightEncoding::Dense {
                 element_type: ElementType::F16,
             },
@@ -201,17 +214,17 @@ impl ModelFamilyProvider for Family {
         });
         schema.tensors.push(WeightTensorSpec {
             id: id("weight.ffn_norm"),
-            dimensions: vec![HIDDEN],
+            dimensions: vec![hidden],
             logical_element_type: ElementType::F16,
             physical_layout: PhysicalWeightLayout::Dense { component_id: norm },
             required: true,
         });
-        mixed_weight(&mut schema, "ffn_gate_up", 2, INTERMEDIATE, HIDDEN);
-        mixed_weight(&mut schema, "ffn_down", 1, HIDDEN, INTERMEDIATE);
+        mixed_weight(&mut schema, "ffn_gate_up", 2, INTERMEDIATE, hidden);
+        mixed_weight(&mut schema, "ffn_down", 1, hidden, INTERMEDIATE);
         // One extra physical dense leaf in each operation makes the validation
         // payload an odd number of eight-byte banks. Its admitted Plan buffer
         // must include alignment padding; no dimensions or budget change.
-        if self.selected.extra() {
+        if self.selected.extra() && !self.geometry {
             extra::extend_schema(&mut schema);
             // 7 leaves per bank gives 21 FFN leaves; only attention needs a
             // split to keep both admitted flag extents genuinely padded.
@@ -291,6 +304,9 @@ impl ModelFamilyProvider for Family {
         }
         let old = self.base.semantic_program(config, profile)?;
         let mut blocks = old.blocks().to_vec();
+        if self.geometry {
+            geometry::resize_nodes(&mut blocks, *config);
+        }
         let attention = &mut blocks[0].nodes[1];
         attention.operation_id = id(self.attention_operation());
         if attention
@@ -318,7 +334,8 @@ impl ModelFamilyProvider for Family {
                 attributes: attrs,
             });
         };
-        let hidden = || BTreeMap::from([(id("hidden_size"), SemanticValue::Unsigned(HIDDEN))]);
+        let hidden_size = self.hidden_size();
+        let hidden = || BTreeMap::from([(id("hidden_size"), SemanticValue::Unsigned(hidden_size))]);
         let mut norm = hidden();
         norm.insert(
             id("epsilon"),
@@ -355,10 +372,13 @@ impl ModelFamilyProvider for Family {
             hidden(),
         );
         let mut weights = old.weights().to_vec();
+        if self.geometry {
+            geometry::resize_weights(&mut weights, *config);
+        }
         for (name, dimensions) in [
-            ("ffn_norm", vec![HIDDEN]),
-            ("ffn_gate_up", vec![2, INTERMEDIATE, HIDDEN]),
-            ("ffn_down", vec![HIDDEN, INTERMEDIATE]),
+            ("ffn_norm", vec![hidden_size]),
+            ("ffn_gate_up", vec![2, INTERMEDIATE, hidden_size]),
+            ("ffn_down", vec![hidden_size, INTERMEDIATE]),
         ] {
             weights.push(WeightReference {
                 weight_id: id(format!("weight.{name}")),

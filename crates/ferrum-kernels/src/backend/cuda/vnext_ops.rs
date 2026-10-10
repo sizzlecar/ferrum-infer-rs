@@ -572,8 +572,10 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalM8Geometry,
         ] {
             if upstream_profile_compiled(profile.prefill() || profile.hybrid())
                 && (!profile.extra() || upstream_extra_profile_compiled(profile.extra_prefill()))
@@ -897,8 +899,10 @@ pub fn cuda_vnext_operation_registry(
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalM8Geometry,
     ] {
         if runtime
             .descriptor()
@@ -908,6 +912,11 @@ pub fn cuda_vnext_operation_registry(
         {
             contracts.push(Box::new(profile.contract().map_err(contract_error)?));
             match profile {
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry => {
+                    providers.push(Box::new(
+                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_m8_geometry(runtime)?,
+                    ))
+                }
                 ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows => {
                     providers.push(Box::new(
                         transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra_all_rows(runtime)?,
@@ -955,7 +964,8 @@ pub fn cuda_vnext_operation_registry(
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows => {
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalM8Geometry => {
                     providers.push(Box::new(
                         transformer::CudaCausalPagedAttentionProvider::new_upstream(
                             runtime,

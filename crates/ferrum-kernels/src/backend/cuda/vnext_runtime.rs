@@ -2501,8 +2501,10 @@ impl CudaDeviceRuntime {
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalM8Geometry,
         ] {
             if major >= 8 && matches!(purpose, CudaRuntimePurpose::NativeCatalogDeclaration) {
                 config.capabilities.insert(

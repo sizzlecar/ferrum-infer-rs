@@ -13,6 +13,8 @@ mod extra;
 mod extra_all_rows;
 #[path = "runtime/extra_prefill.rs"]
 mod extra_prefill;
+#[path = "runtime/geometry.rs"]
+mod geometry;
 #[path = "runtime/hybrid.rs"]
 mod hybrid;
 #[path = "runtime/identity_projection.rs"]
@@ -72,6 +74,7 @@ impl Fixture {
     ) -> Self {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
+        let geometry = definition.is_geometry();
         let attention_arithmetic = definition.attention_arithmetic();
         let swiglu_arithmetic = definition.swiglu_arithmetic();
         let selected = definition.attention_profile();
@@ -212,9 +215,13 @@ impl Fixture {
                 .find(|a| a.resource_id() == resource)
                 .unwrap();
             assert_eq!(requirement.fixed_bytes(), Some(flag_bytes));
-            assert_ne!(flag_bytes % requirement.alignment_bytes(), 0);
             assert_eq!(allocation.per_instance_bytes(), flag_bytes);
-            assert!(allocation.size_bytes() > flag_bytes);
+            if !geometry {
+                assert_ne!(flag_bytes % requirement.alignment_bytes(), 0);
+                assert!(allocation.size_bytes() > flag_bytes);
+            } else {
+                assert!(allocation.size_bytes() >= flag_bytes);
+            }
             assert_eq!(allocation.element_type(), ElementType::U8);
             assert_eq!(allocation.usage(), BufferUsage::Persistent);
             assert_eq!(allocation.lifetime(), AllocationLifetime::Plan);
@@ -229,7 +236,7 @@ impl Fixture {
                         _ => None,
                     })
                     .collect();
-                let expected = if selected.extra() {
+                let expected = if selected.extra() && !geometry {
                     BTreeSet::from(family::extra::FORMATS)
                 } else {
                     BTreeSet::from([
