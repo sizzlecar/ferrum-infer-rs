@@ -1,0 +1,146 @@
+{
+  "schema_version": 3,
+  "operator": "ferrum.cuda.upstream_linear",
+  "source_package_kind": "ferrum-native-upstream-linear",
+  "source_package_revision": "marker-v2-test-mmvq-row1-r1+d81235049384534c167caea52b85a694f6103d14",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/ggml-org/llama.cpp.git",
+      "revision": "d81235049384534c167caea52b85a694f6103d14",
+      "license": "MIT"
+    }
+  ],
+  "translation_units": [
+    "kernels/boundary.cu",
+    "kernels/mmq.cu",
+    "kernels/mmvq.cu"
+  ],
+  "headers": [
+    "kernels/abi.h",
+    "kernels/boundary.h",
+    "kernels/marker.cuh",
+    "llama/ggml/include/ggml-alloc.h",
+    "llama/ggml/include/ggml-backend.h",
+    "llama/ggml/include/ggml-cuda.h",
+    "llama/ggml/include/ggml.h",
+    "llama/ggml/include/gguf.h",
+    "llama/ggml/src/ggml-common.h",
+    "llama/ggml/src/ggml-cuda/common.cuh",
+    "llama/ggml/src/ggml-cuda/mma.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-ampere.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-blackwell.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-cdna.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-gcn.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-rdna2.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-rdna3.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-config-rdna4.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-load-tiles.cuh",
+    "llama/ggml/src/ggml-cuda/mmq-vec-dot.cuh",
+    "llama/ggml/src/ggml-cuda/mmq.cuh",
+    "llama/ggml/src/ggml-cuda/mmvq.cuh",
+    "llama/ggml/src/ggml-cuda/quantize.cuh",
+    "llama/ggml/src/ggml-cuda/unary.cuh",
+    "llama/ggml/src/ggml-cuda/vecdotq.cuh",
+    "llama/ggml/src/ggml-cuda/vendors/cuda.h",
+    "llama/ggml/src/ggml-impl.h"
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/boundary.cu",
+      "headers": [
+        "kernels/abi.h",
+        "kernels/boundary.h"
+      ]
+    },
+    {
+      "translation_unit": "kernels/mmq.cu",
+      "headers": [
+        "kernels/abi.h",
+        "kernels/boundary.h",
+        "kernels/marker.cuh",
+        "llama/ggml/include/ggml-alloc.h",
+        "llama/ggml/include/ggml-backend.h",
+        "llama/ggml/include/ggml-cuda.h",
+        "llama/ggml/include/ggml.h",
+        "llama/ggml/include/gguf.h",
+        "llama/ggml/src/ggml-common.h",
+        "llama/ggml/src/ggml-cuda/common.cuh",
+        "llama/ggml/src/ggml-cuda/mma.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-ampere.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-blackwell.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-cdna.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-gcn.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna2.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna3.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna4.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-load-tiles.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-vec-dot.cuh",
+        "llama/ggml/src/ggml-cuda/mmq.cuh",
+        "llama/ggml/src/ggml-cuda/quantize.cuh",
+        "llama/ggml/src/ggml-cuda/vecdotq.cuh",
+        "llama/ggml/src/ggml-cuda/vendors/cuda.h",
+        "llama/ggml/src/ggml-impl.h"
+      ]
+    },
+    {
+      "translation_unit": "kernels/mmvq.cu",
+      "headers": [
+        "kernels/abi.h",
+        "kernels/boundary.h",
+        "kernels/marker.cuh",
+        "llama/ggml/include/ggml-alloc.h",
+        "llama/ggml/include/ggml-backend.h",
+        "llama/ggml/include/ggml-cuda.h",
+        "llama/ggml/include/ggml.h",
+        "llama/ggml/include/gguf.h",
+        "llama/ggml/src/ggml-common.h",
+        "llama/ggml/src/ggml-cuda/common.cuh",
+        "llama/ggml/src/ggml-cuda/mma.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-ampere.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-blackwell.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-cdna.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-gcn.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-pascal-older.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna2.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna3.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-config-rdna4.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-load-tiles.cuh",
+        "llama/ggml/src/ggml-cuda/mmq-vec-dot.cuh",
+        "llama/ggml/src/ggml-cuda/mmq.cuh",
+        "llama/ggml/src/ggml-cuda/mmvq.cuh",
+        "llama/ggml/src/ggml-cuda/quantize.cuh",
+        "llama/ggml/src/ggml-cuda/unary.cuh",
+        "llama/ggml/src/ggml-cuda/vecdotq.cuh",
+        "llama/ggml/src/ggml-cuda/vendors/cuda.h",
+        "llama/ggml/src/ggml-impl.h"
+      ]
+    }
+  ],
+  "include_dirs": [
+    "kernels",
+    "llama/ggml/include",
+    "llama/ggml/src",
+    "llama/ggml/src/ggml-cuda",
+    "llama/include"
+  ],
+  "defines": [],
+  "nvcc_policy": {
+    "cpp_standard": "cpp17",
+    "optimization": "o3",
+    "use_fast_math": true,
+    "relaxed_constexpr": true,
+    "extended_lambda": true,
+    "host_position_independent_code": true,
+    "host_default_visibility": false
+  },
+  "architecture": "device_compute_capability",
+  "archive_file": "libferrum_upstream_linear.a"
+}

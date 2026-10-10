@@ -4,6 +4,9 @@
 use super::*;
 use std::time::Instant;
 
+#[path = "timing/rowtile.rs"]
+mod rowtile;
+
 unsafe extern "C" {
     fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
     fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;

@@ -320,7 +320,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int test_output_rows = 0>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -339,7 +339,9 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int original_rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    static_assert(test_output_rows == 0 || (test_output_rows == 1 && ncols_dst == 8 && !has_fusion && !small_k && !halve_iters));
+    constexpr int rows_per_cuda_block = test_output_rows ? test_output_rows : original_rows_per_cuda_block;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -529,7 +531,10 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+            // A shuffle reduction may have a lane-specific floating-point tree.
+            // Keep the original row2 writer lane, including odd output rows.
+            const int writer_lane = test_output_rows ? row0 % original_rows_per_cuda_block : i;
+            if (threadIdx.x == writer_lane && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
@@ -721,13 +726,13 @@ static int ferrum_test_mmvq_pack(const TestMmvqPlan * p, const half * input,
     return cudaGetLastError();
 }
 
-template<ggml_type T,int C,bool Small>
+template<ggml_type T,int C,bool Small,int TestOutputRows = 0>
 static int test_mmvq_launch(const TestMmvqPlan & p,const void * w,const void * q,float * o,cudaStream_t stream) {
-    const dim3 grid(p.padded_outputs/p.rows_per_block,p.channels,1), block(32,p.nwarps,1);
+    const dim3 grid(TestOutputRows ? p.outputs : p.padded_outputs/p.rows_per_block,p.channels,1), block(32,p.nwarps,1);
     const auto one=init_fastdiv_values(1);
     const uint32_t qstride=p.padded_inputs/32;
     ggml_cuda_mm_fusion_args_device fusion{};
-    mul_mat_vec_q<T,C,false,Small,false><<<grid,block,0,stream>>>(w,q,
+    mul_mat_vec_q<T,C,false,Small,false,TestOutputRows><<<grid,block,0,stream>>>(w,q,
         static_cast<const int32_t *>(nullptr),fusion,o,p.inputs,make_uint3(0,0,0),
         p.inputs/256,qstride,p.outputs,init_fastdiv_values(p.channels),
         p.padded_outputs*(p.inputs/256),p.layout?qstride:p.rows*qstride,
@@ -803,6 +808,26 @@ extern "C" int ferrum_upstream_mmvq_dot_v1(const FerrumUpstreamLinearPlanV1 * p,
             static_cast<cudaStream_t>(stream));
     });
 }
+// Experimental test ABI only: no provider registration or production caller.
+// Borrow an unchanged, exact-validated baseline plan for logical extents and
+// scratch. The original ABI's immutable launch geometry is never rewritten.
+extern "C" int ferrum_test_mmvq_m8_row1_dot_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * weights,const void * packed,void * output,void * fixup,void * stream) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmvqPlan n{};
+        if (!upstream_mmvq_valid(p,n) || fixup) return -1;
+        if (n.layout != 0 || n.rows != 8 || n.ncols != 8 || n.channels != 1 ||
+                n.nwarps != 2 || n.rows_per_block != 2 || n.small_k ||
+                (n.format != GGML_TYPE_Q4_K && n.format != GGML_TYPE_Q5_K)) return -2;
+        if (!weights || !packed || !output || uintptr_t(weights)%4 ||
+                uintptr_t(packed)%4 || uintptr_t(output)%4) return -5;
+        const auto s = static_cast<cudaStream_t>(stream);
+        if (n.format == GGML_TYPE_Q4_K)
+            return test_mmvq_launch<GGML_TYPE_Q4_K,8,false,1>(n,weights,packed,static_cast<float *>(output),s);
+        return test_mmvq_launch<GGML_TYPE_Q5_K,8,false,1>(n,weights,packed,static_cast<float *>(output),s);
+    });
+}
+
 extern "C" int ferrum_upstream_mmvq_cast_v1(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,void * output,uint32_t stride,void * stream) noexcept {
     return ferrum_upstream_boundary([&]() -> int {
