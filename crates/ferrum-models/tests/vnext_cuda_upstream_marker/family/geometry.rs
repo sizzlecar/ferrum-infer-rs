@@ -12,6 +12,73 @@ pub enum WideArithmetic {
     InheritedExtraAllRows,
 }
 
+/// Synthetic FFN input range, independent of attention arithmetic/weights.
+/// The legacy wide first-wave failure remains reproducible with an explicit
+/// LegacyUnscaled selection; it is not a positive finite regression gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnInputGain {
+    LegacyUnscaled,
+    OneSixteenth,
+}
+
+impl FfnInputGain {
+    pub fn multiplier(self) -> f32 {
+        match self {
+            Self::LegacyUnscaled => 1.0,
+            Self::OneSixteenth => 1.0 / 16.0,
+        }
+    }
+}
+
+/// Delegate every component byte unchanged except the explicitly selected
+/// wide FFN normalization gain. In particular, no packed scale is modified.
+pub struct FixtureWeights {
+    base: Weights,
+    ffn_input_gain: FfnInputGain,
+}
+
+impl FixtureWeights {
+    pub fn new(schema: &WeightSchema, ffn_input_gain: FfnInputGain) -> Self {
+        Self {
+            base: Weights::new(schema),
+            ffn_input_gain,
+        }
+    }
+}
+
+impl WeightComponentSource for FixtureWeights {
+    fn component<'s>(
+        &'s self,
+        component: &WeightComponentSpec,
+    ) -> Result<WeightComponentPayload<'s>, VNextError> {
+        let original = self.base.component(component)?;
+        if self.ffn_input_gain == FfnInputGain::LegacyUnscaled
+            || component.id.as_str() != "component.ffn_norm"
+        {
+            return Ok(original);
+        }
+        assert_eq!(original.element_type(), ElementType::F16);
+        let bytes: Vec<u8> = original
+            .bytes()
+            .chunks_exact(2)
+            .flat_map(|b| {
+                let gain = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let scaled = f16::from_f32(gain * self.ffn_input_gain.multiplier());
+                assert!(scaled.is_normal() && scaled.to_f32() > 0.0);
+                scaled.to_le_bytes()
+            })
+            .collect();
+        WeightComponentPayload::new(
+            component,
+            original.external_name(),
+            original.source_file(),
+            original.dimensions().to_vec(),
+            original.element_type(),
+            bytes,
+        )
+    }
+}
+
 impl Family {
     pub fn m8_geometry(kind: AttentionKind) -> Self {
         Self::wide_arithmetic(kind, WideArithmetic::Geometry)
@@ -20,6 +87,7 @@ impl Family {
     pub fn wide_arithmetic(kind: AttentionKind, arithmetic: WideArithmetic) -> Self {
         let mut value = Self::new(kind);
         value.geometry = true;
+        value.ffn_input_gain = FfnInputGain::OneSixteenth;
         value.maximum_tokens = 128;
         value.selected = match (kind, arithmetic) {
             (AttentionKind::GatedDelta, WideArithmetic::Geometry) => {
@@ -37,6 +105,19 @@ impl Family {
             _ => unreachable!(),
         };
         value
+    }
+
+    pub fn with_ffn_input_gain(mut self, gain: FfnInputGain) -> Self {
+        assert!(
+            self.geometry,
+            "range adjustment is only for the wide fixture"
+        );
+        self.ffn_input_gain = gain;
+        self
+    }
+
+    pub fn ffn_input_gain(&self) -> FfnInputGain {
+        self.ffn_input_gain
     }
 
     pub fn with_intermediate_observation(mut self) -> Self {

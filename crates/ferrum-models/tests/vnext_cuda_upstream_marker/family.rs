@@ -21,6 +21,7 @@ pub struct Family {
     g32_baseline: bool,
     geometry: bool,
     observe_intermediates: bool,
+    ffn_input_gain: geometry::FfnInputGain,
 }
 
 impl Family {
@@ -31,6 +32,7 @@ impl Family {
             g32_baseline: false,
             geometry: false,
             observe_intermediates: false,
+            ffn_input_gain: geometry::FfnInputGain::LegacyUnscaled,
             selected: match kind {
                 AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDelta,
                 AttentionKind::Causal => UpstreamMarkerV2Profile::Causal,

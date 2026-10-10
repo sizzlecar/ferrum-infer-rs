@@ -76,6 +76,7 @@ impl Fixture {
         let baseline = definition.is_g32_baseline();
         let geometry = definition.is_geometry();
         let observe_intermediates = definition.observes_intermediates();
+        let ffn_input_gain = definition.ffn_input_gain();
         let attention_arithmetic = definition.attention_arithmetic();
         let swiglu_arithmetic = definition.swiglu_arithmetic();
         let selected = definition.attention_profile();
@@ -300,7 +301,7 @@ impl Fixture {
         // admission provisions the actual first work shape. Preallocating each
         // minimum can strand a smaller contiguous extent below a full-width
         // claim even when no execution owns that extent.
-        let source = family::Weights::new(family.weight_schema());
+        let source = family::geometry::FixtureWeights::new(family.weight_schema(), ffn_input_gain);
         let initialized = committed
             .initialize_static(
                 &family,

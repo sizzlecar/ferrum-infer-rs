@@ -442,7 +442,7 @@ fn compare(kind: AttentionKind) {
     );
     println!(
         "{}",
-        serde_json::json!({"kind":"geometry_segment_complete", "attention":format!("{kind:?}"),"fixture_profile":family::geometry::PROFILE,"hidden":family::geometry::WIDE_HIDDEN,"widths":widths,"hits_by_width":hits_by_width,"publications":publications,"fresh_hits":fresh_hits,"same_wave_oracle_audited_nodes":audited,"full_output_and_state_equal":true,"qualification_scope":"new attention operation contracts on synthetic provider family; Qwen profile/head eligibility and full-model quality are separate"})
+        serde_json::json!({"kind":"geometry_segment_complete", "attention":format!("{kind:?}"),"fixture_profile":family::geometry::PROFILE,"hidden":family::geometry::WIDE_HIDDEN,"ffn_input_gain":family::geometry::FfnInputGain::OneSixteenth.multiplier(),"widths":widths,"hits_by_width":hits_by_width,"publications":publications,"fresh_hits":fresh_hits,"same_wave_oracle_audited_nodes":audited,"full_output_and_state_equal":true,"qualification_scope":"new attention operation contracts on synthetic provider family; Qwen profile/head eligibility and full-model quality are separate"})
     );
 }
 
@@ -459,9 +459,10 @@ fn geometry_causal_m8_mixed_leaves_full_matches_segment_across_widths_and_kv_gro
 }
 
 #[test]
-#[ignore = "requires exclusive CUDA; isolates first-wave nonfinite values without changing generated scales"]
+#[ignore = "requires exclusive CUDA; compares first-wave finite values with bounded synthetic FFN input"]
 fn geometry_gdn_wide_first_wave_finite_isolation() {
-    use family::geometry::WideArithmetic;
+    use family::geometry::{FfnInputGain, WideArithmetic};
+    let ffn_input_gain = FfnInputGain::OneSixteenth;
     let kind = AttentionKind::GatedDelta;
     let policies = [
         WideArithmetic::InheritedExtraAllRows,
@@ -495,7 +496,7 @@ fn geometry_gdn_wide_first_wave_finite_isolation() {
         (WideArithmetic::InheritedExtraAllRows, true),
         (WideArithmetic::Geometry, true),
     ] {
-        let definition = Family::wide_arithmetic(kind, policy);
+        let definition = Family::wide_arithmetic(kind, policy).with_ffn_input_gain(ffn_input_gain);
         let fixture = Fixture::for_family_with_segment_oracle(
             kind,
             true,
@@ -539,7 +540,7 @@ fn geometry_gdn_wide_first_wave_finite_isolation() {
         println!(
             "{}",
             serde_json::json!({"kind":"geometry_first_wave_finite_isolation","arithmetic":format!("{policy:?}"),
-            "participants":8,"range":[0,1],"strategy":"full","weight_scale_changed":false,"retained_intermediate_values":retained,"profile":Family::wide_arithmetic(kind,policy).profile_id(),
+            "participants":8,"range":[0,1],"strategy":"full","ffn_input_gain":ffn_input_gain.multiplier(),"packed_weight_bytes_changed":false,"attention_weight_bytes_changed":false,"retained_intermediate_values":retained,"profile":Family::wide_arithmetic(kind,policy).profile_id(),
             "values":observation.finite_summary()})
         );
         for session in sessions {
