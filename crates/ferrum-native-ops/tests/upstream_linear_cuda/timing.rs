@@ -8,6 +8,8 @@ use std::time::Instant;
 mod attention_boundaries;
 #[path = "timing/attention_shapes.rs"]
 mod attention_shapes;
+#[path = "timing/attention_wide_boundaries.rs"]
+mod attention_wide_boundaries;
 #[path = "timing/rowtile.rs"]
 mod rowtile;
 
