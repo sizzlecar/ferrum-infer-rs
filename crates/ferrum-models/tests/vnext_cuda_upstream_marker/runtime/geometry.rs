@@ -129,16 +129,30 @@ fn assert_selected_routes(fixture: &Fixture, kind: AttentionKind, participants: 
 }
 
 fn compare(kind: AttentionKind) {
-    let modes = [
+    compare_family(
+        kind,
+        Family::m8_geometry,
         InvocationPreparationStrategy::Full,
-        InvocationPreparationStrategy::DecodeSegment,
-    ];
+        assert_selected_routes,
+        "geometry",
+    );
+}
+
+pub(super) fn compare_family(
+    kind: AttentionKind,
+    family: fn(AttentionKind) -> Family,
+    reference: InvocationPreparationStrategy,
+    check_routes: fn(&Fixture, AttentionKind, u32),
+    label: &str,
+) {
+    let profile = family(kind).profile_id();
+    let modes = [reference, InvocationPreparationStrategy::DecodeSegment];
     let fixtures = modes.map(|mode| {
         Fixture::for_family_with_segment_oracle(
             kind,
             true,
             8,
-            Family::m8_geometry(kind),
+            family(kind),
             ProgramBindingUploadStrategy::Sparse,
             if mode == InvocationPreparationStrategy::DecodeSegment {
                 SegmentBindingOracleMode::CompareReference
@@ -165,7 +179,7 @@ fn compare(kind: AttentionKind) {
             .enumerate()
             .map(|(p, t)| {
                 fixture.admit_with_ceiling(
-                    &format!("geometry-original-{p}"),
+                    &format!("{label}-original-{p}"),
                     Arc::from(&t[..1]),
                     t.len(),
                 )
@@ -222,7 +236,7 @@ fn compare(kind: AttentionKind) {
         };
         let mut observations = Vec::new();
         for (arm, (fixture, group)) in fixtures.iter().zip(&sessions).enumerate() {
-            assert_selected_routes(fixture, kind, width as u32);
+            check_routes(fixture, kind, width as u32);
             for ((session, t), range) in group[..width].iter().zip(&tokens).zip(&ranges) {
                 fixture.extend(session, Arc::from(&t[..range.end]));
             }
@@ -328,7 +342,7 @@ fn compare(kind: AttentionKind) {
             prior_programs[arm] = Some(program.clone());
             println!(
                 "{}",
-                serde_json::json!({"kind":"geometry_segment_wave", "attention":format!("{kind:?}"),"strategy":modes[arm],"wave":position,"participants":width,"ranges":ranges,"physical_kv_pages":pages,"program":program,"hits":stats.segment_hits,"misses":stats.segment_misses,"encoded_nodes":stats.segment_encoded_nodes,"published":observation.segment_published})
+                serde_json::json!({"kind":format!("{label}_segment_wave"), "attention":format!("{kind:?}"),"strategy":modes[arm],"wave":position,"participants":width,"ranges":ranges,"physical_kv_pages":pages,"program":program,"hits":stats.segment_hits,"misses":stats.segment_misses,"encoded_nodes":stats.segment_encoded_nodes,"published":observation.segment_published})
             );
             observations.push(observation);
         }
@@ -365,7 +379,7 @@ fn compare(kind: AttentionKind) {
             .enumerate()
             .map(|(p, t)| {
                 fixture.admit_with_ceiling(
-                    &format!("geometry-fresh-{p}"),
+                    &format!("{label}-fresh-{p}"),
                     Arc::from(&t[..1]),
                     t.len(),
                 )
@@ -376,7 +390,7 @@ fn compare(kind: AttentionKind) {
     for position in 0..6 {
         let mut observations = Vec::new();
         for (arm, (fixture, group)) in fixtures.iter().zip(&fresh).enumerate() {
-            assert_selected_routes(fixture, kind, 8);
+            check_routes(fixture, kind, 8);
             for (p, (session, t)) in group.iter().zip(&fresh_tokens).enumerate() {
                 assert_ne!(session.sequence_authority(), old_authorities[arm][p]);
                 fixture.extend(session, Arc::from(&t[..=position]));
@@ -442,7 +456,7 @@ fn compare(kind: AttentionKind) {
     );
     println!(
         "{}",
-        serde_json::json!({"kind":"geometry_segment_complete", "attention":format!("{kind:?}"),"fixture_profile":family::geometry::PROFILE,"hidden":family::geometry::WIDE_HIDDEN,"ffn_input_gain":family::geometry::FfnInputGain::OneSixteenth.multiplier(),"widths":widths,"hits_by_width":hits_by_width,"publications":publications,"fresh_hits":fresh_hits,"same_wave_oracle_audited_nodes":audited,"full_output_and_state_equal":true,"qualification_scope":"new attention operation contracts on synthetic provider family; Qwen profile/head eligibility and full-model quality are separate"})
+        serde_json::json!({"kind":format!("{label}_segment_complete"), "attention":format!("{kind:?}"),"fixture_profile":profile,"hidden":family::geometry::WIDE_HIDDEN,"ffn_input_gain":family::geometry::FfnInputGain::OneSixteenth.multiplier(),"widths":widths,"hits_by_width":hits_by_width,"publications":publications,"fresh_hits":fresh_hits,"same_wave_oracle_audited_nodes":audited,"full_output_and_state_equal":true,"qualification_scope":"declared operation contracts on synthetic provider family; Qwen profile/head eligibility and full-model quality are separate"})
     );
 }
 

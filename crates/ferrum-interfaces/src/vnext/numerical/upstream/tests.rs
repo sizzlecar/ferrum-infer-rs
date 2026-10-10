@@ -10,6 +10,9 @@ mod extra;
 #[path = "geometry_tests.rs"]
 mod geometry;
 
+#[path = "q6_f16_tests.rs"]
+mod q6_f16;
+
 #[test]
 fn upstream_prefill_interval_preserves_legacy_wire_and_rejects_ambiguous_domains() {
     for (old, new) in [

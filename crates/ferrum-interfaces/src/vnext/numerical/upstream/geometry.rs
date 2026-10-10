@@ -15,14 +15,47 @@ pub enum UpstreamProjectionGeometrySelection {
         minimum_input_features: u64,
         minimum_output_features: u64,
     },
+    /// An explicit selection bound for the independent Q6 F16 MMQ ABI.
+    /// Outside these bounds retain strict arithmetic, rather than another
+    /// quantized route. The ABI itself supports Columns rows 1..=32.
+    Q6F16Mmq {
+        minimum_input_features: u64,
+        minimum_output_features: u64,
+        minimum_rows_for_small_outputs: u32,
+        minimum_output_features_for_small_rows: u64,
+    },
 }
 
 impl UpstreamProjectionGeometrySelection {
     pub(super) fn validate(&self, policy: &UpstreamProjectionPolicy) -> Result<(), String> {
+        if let Self::Q6F16Mmq {
+            minimum_input_features,
+            minimum_output_features,
+            minimum_rows_for_small_outputs,
+            minimum_output_features_for_small_rows,
+        } = self
+        {
+            if *minimum_input_features == 0
+                || *minimum_output_features == 0
+                || !(1..=32).contains(minimum_rows_for_small_outputs)
+                || *minimum_output_features_for_small_rows < *minimum_output_features
+                || policy.format != ProjectionBlockFormat::Q6K
+                || policy.routes.iter().any(|r| {
+                    r.layout != UpstreamProjectionLayout::Columns
+                        || r.arithmetic != UpstreamProjectionArithmetic::MmqD4Q6F16MarkerV1
+                })
+            {
+                return Err("Q6 F16 geometry selection requires explicit positive bounds and its Columns ABI".into());
+            }
+            return Ok(());
+        }
         let Self::M8Q4Q5Mmq {
             minimum_input_features,
             minimum_output_features,
-        } = self;
+        } = self
+        else {
+            unreachable!("Q6 branch returned")
+        };
         if *minimum_input_features == 0 || *minimum_output_features == 0 {
             return Err("geometry selection requires positive explicit K/N bounds".into());
         }
@@ -53,7 +86,10 @@ impl UpstreamProjectionGeometrySelection {
         let Self::M8Q4Q5Mmq {
             minimum_input_features,
             minimum_output_features,
-        } = self;
+        } = self
+        else {
+            return false;
+        };
         matches!(
             format,
             ProjectionBlockFormat::Q4K | ProjectionBlockFormat::Q5K
@@ -80,6 +116,22 @@ impl UpstreamProjectionPolicy {
             .routes
             .iter()
             .find(|route| route.layout == layout && route.contains_rows(local_rows))?;
+        if let Some(UpstreamProjectionGeometrySelection::Q6F16Mmq {
+            minimum_input_features,
+            minimum_output_features,
+            minimum_rows_for_small_outputs,
+            minimum_output_features_for_small_rows,
+        }) = self.geometry_selection
+        {
+            return (self.format == ProjectionBlockFormat::Q6K
+                && layout == UpstreamProjectionLayout::Columns
+                && input_features >= minimum_input_features
+                && input_features % 256 == 0
+                && leaf_output_features >= minimum_output_features
+                && (local_rows >= minimum_rows_for_small_outputs
+                    || leaf_output_features >= minimum_output_features_for_small_rows))
+                .then_some(route.arithmetic);
+        }
         if self.geometry_selection.is_some_and(|selection| {
             selection.selects_mmq(
                 self.format,

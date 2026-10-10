@@ -20,6 +20,7 @@ pub(super) enum AttentionPrecision {
     F32MasterUpstreamExtraLargePrefill,
     F32MasterUpstreamExtraAllRows,
     F32MasterUpstreamM8Geometry,
+    F32MasterUpstreamQ6F16,
     F32MasterG32MmqPrefill,
 }
 
@@ -36,6 +37,7 @@ impl AttentionPrecision {
             Self::F32MasterUpstreamExtraLargePrefill => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill.operation_id(),
             Self::F32MasterUpstreamExtraAllRows => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows.operation_id(),
             Self::F32MasterUpstreamM8Geometry => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry.operation_id(),
+            Self::F32MasterUpstreamQ6F16 => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16.operation_id(),
             Self::F32MasterG32MmqPrefill => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill.operation_id(),
         }
     }
@@ -52,6 +54,7 @@ impl AttentionPrecision {
             Self::F32MasterUpstreamExtraLargePrefill => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill.contract(),
             Self::F32MasterUpstreamExtraAllRows => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows.contract(),
             Self::F32MasterUpstreamM8Geometry => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry.contract(),
+            Self::F32MasterUpstreamQ6F16 => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16.contract(),
             Self::F32MasterG32MmqPrefill => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill.contract(),
         }
     }
@@ -68,6 +71,7 @@ impl AttentionPrecision {
             Self::F32MasterUpstreamExtraLargePrefill => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill.capability_id(),
             Self::F32MasterUpstreamExtraAllRows => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows.capability_id(),
             Self::F32MasterUpstreamM8Geometry => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry.capability_id(),
+            Self::F32MasterUpstreamQ6F16 => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16.capability_id(),
             Self::F32MasterG32MmqPrefill => ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill.capability_id(),
         }
     }
@@ -85,6 +89,7 @@ impl AttentionPrecision {
             Self::F32MasterUpstreamExtraLargePrefill => "provider.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
             Self::F32MasterUpstreamExtraAllRows => "provider.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
             Self::F32MasterUpstreamM8Geometry => "provider.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-m8-geometry-v1",
+            Self::F32MasterUpstreamQ6F16 => "provider.cuda.gated_delta_recurrent_attention.f32-master.upstream-q6-f16-marker-v1",
             Self::F32MasterG32MmqPrefill => "provider.cuda.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
             Self::F32MasterQ8Act => {
                 "provider.cuda.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-q8act-g32"
@@ -103,6 +108,7 @@ impl AttentionPrecision {
             Self::F32MasterUpstreamExtraLargePrefill => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-prefill",
             Self::F32MasterUpstreamExtraAllRows => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
             Self::F32MasterUpstreamM8Geometry => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-m8-geometry-v1",
+            Self::F32MasterUpstreamQ6F16 => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.upstream-q6-f16-marker-v1",
             Self::F32MasterG32MmqPrefill => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-g32-mmq-prefill-marker-v1",
             Self::F32MasterQ8Act => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.q4k-q5k-iq4xs-q8act-g32",
         }
@@ -120,6 +126,7 @@ impl AttentionPrecision {
             | Self::F32MasterUpstreamExtraLargePrefill
             | Self::F32MasterUpstreamExtraAllRows
             | Self::F32MasterUpstreamM8Geometry
+            | Self::F32MasterUpstreamQ6F16
             | Self::F32MasterG32MmqPrefill => ElementType::F32,
         }
     }
@@ -136,6 +143,7 @@ impl AttentionPrecision {
             | Self::F32MasterUpstreamExtraLargePrefill
             | Self::F32MasterUpstreamExtraAllRows
             | Self::F32MasterUpstreamM8Geometry
+            | Self::F32MasterUpstreamQ6F16
             | Self::F32MasterG32MmqPrefill => "vnext_rms_norm_f32_to_f16",
         }
     }
@@ -152,11 +160,15 @@ impl AttentionPrecision {
             | Self::F32MasterUpstreamExtraLargePrefill
             | Self::F32MasterUpstreamExtraAllRows
             | Self::F32MasterUpstreamM8Geometry
+            | Self::F32MasterUpstreamQ6F16
             | Self::F32MasterG32MmqPrefill => "vnext_residual_add_f32_f16",
         }
     }
 
     pub(super) fn upstream_profile(self) -> ferrum_interfaces::vnext::UpstreamMarkerV2Profile {
+        if matches!(self, Self::F32MasterUpstreamQ6F16) {
+            return ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16;
+        }
         if matches!(self, Self::F32MasterUpstreamM8Geometry) {
             return ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry;
         }
@@ -188,6 +200,7 @@ impl AttentionPrecision {
                 | Self::F32MasterUpstreamExtraLargePrefill
                 | Self::F32MasterUpstreamExtraAllRows
                 | Self::F32MasterUpstreamM8Geometry
+                | Self::F32MasterUpstreamQ6F16
                 | Self::F32MasterG32MmqPrefill
         )
     }

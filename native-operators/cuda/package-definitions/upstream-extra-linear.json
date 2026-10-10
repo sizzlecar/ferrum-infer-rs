@@ -91,6 +91,27 @@
       ]
     },
     {
+      "operation_id": "operation.causal_paged_attention.f32-master.upstream-q6-f16-marker-v1",
+      "provider_id": "provider.cuda.causal_paged_attention.f32-master.upstream-q6-f16-marker-v1",
+      "entrypoints": [
+        "ferrum_upstream_extra_mmq_cast_v1",
+        "ferrum_upstream_extra_mmq_cast_v2",
+        "ferrum_upstream_extra_mmq_check_weights_v2",
+        "ferrum_upstream_extra_mmq_dot_v1",
+        "ferrum_upstream_extra_mmq_pack_v1",
+        "ferrum_upstream_extra_mmq_pack_v2",
+        "ferrum_upstream_extra_mmq_plan_v1",
+        "ferrum_upstream_extra_mmq_prefill_plan_v2",
+        "ferrum_upstream_extra_mmvq_cast_v1",
+        "ferrum_upstream_extra_mmvq_cast_v2",
+        "ferrum_upstream_extra_mmvq_check_weights_v2",
+        "ferrum_upstream_extra_mmvq_dot_v1",
+        "ferrum_upstream_extra_mmvq_pack_v1",
+        "ferrum_upstream_extra_mmvq_pack_v2",
+        "ferrum_upstream_extra_mmvq_plan_v1"
+      ]
+    },
+    {
       "operation_id": "operation.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
       "provider_id": "provider.cuda.dense_swiglu.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-extra-all-rows",
       "entrypoints": [
@@ -143,6 +164,27 @@
         "ferrum_upstream_extra_mmq_pack_v1",
         "ferrum_upstream_extra_mmq_pack_v2",
         "ferrum_upstream_extra_mmq_plan_v1",
+        "ferrum_upstream_extra_mmvq_cast_v1",
+        "ferrum_upstream_extra_mmvq_cast_v2",
+        "ferrum_upstream_extra_mmvq_check_weights_v2",
+        "ferrum_upstream_extra_mmvq_dot_v1",
+        "ferrum_upstream_extra_mmvq_pack_v1",
+        "ferrum_upstream_extra_mmvq_pack_v2",
+        "ferrum_upstream_extra_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu.upstream-q6-f16-marker-v1",
+      "provider_id": "provider.cuda.dense_swiglu.upstream-q6-f16-marker-v1",
+      "entrypoints": [
+        "ferrum_upstream_extra_mmq_cast_v1",
+        "ferrum_upstream_extra_mmq_cast_v2",
+        "ferrum_upstream_extra_mmq_check_weights_v2",
+        "ferrum_upstream_extra_mmq_dot_v1",
+        "ferrum_upstream_extra_mmq_pack_v1",
+        "ferrum_upstream_extra_mmq_pack_v2",
+        "ferrum_upstream_extra_mmq_plan_v1",
+        "ferrum_upstream_extra_mmq_prefill_plan_v2",
         "ferrum_upstream_extra_mmvq_cast_v1",
         "ferrum_upstream_extra_mmvq_cast_v2",
         "ferrum_upstream_extra_mmvq_check_weights_v2",
@@ -226,6 +268,27 @@
         "ferrum_upstream_extra_mmq_pack_v1",
         "ferrum_upstream_extra_mmq_pack_v2",
         "ferrum_upstream_extra_mmq_plan_v1",
+        "ferrum_upstream_extra_mmvq_cast_v1",
+        "ferrum_upstream_extra_mmvq_cast_v2",
+        "ferrum_upstream_extra_mmvq_check_weights_v2",
+        "ferrum_upstream_extra_mmvq_dot_v1",
+        "ferrum_upstream_extra_mmvq_pack_v1",
+        "ferrum_upstream_extra_mmvq_pack_v2",
+        "ferrum_upstream_extra_mmvq_plan_v1"
+      ]
+    },
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master.upstream-q6-f16-marker-v1",
+      "provider_id": "provider.cuda.gated_delta_recurrent_attention.f32-master.upstream-q6-f16-marker-v1",
+      "entrypoints": [
+        "ferrum_upstream_extra_mmq_cast_v1",
+        "ferrum_upstream_extra_mmq_cast_v2",
+        "ferrum_upstream_extra_mmq_check_weights_v2",
+        "ferrum_upstream_extra_mmq_dot_v1",
+        "ferrum_upstream_extra_mmq_pack_v1",
+        "ferrum_upstream_extra_mmq_pack_v2",
+        "ferrum_upstream_extra_mmq_plan_v1",
+        "ferrum_upstream_extra_mmq_prefill_plan_v2",
         "ferrum_upstream_extra_mmvq_cast_v1",
         "ferrum_upstream_extra_mmvq_cast_v2",
         "ferrum_upstream_extra_mmvq_check_weights_v2",

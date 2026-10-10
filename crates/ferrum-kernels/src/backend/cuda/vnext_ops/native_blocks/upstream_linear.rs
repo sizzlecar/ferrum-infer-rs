@@ -17,6 +17,10 @@ use crate::native_ops::upstream_linear::{
     Algorithm, Arithmetic, Device, DeviceSpan, ExtraFormat, Format, Layout, PreparedUpstreamLinear,
 };
 
+mod native_plan;
+use crate::native_ops::upstream_q6_f16_linear::PreparedQ6F16Linear;
+use native_plan::PreparedProjectionNative;
+
 mod preparation;
 pub(in crate::backend::cuda::vnext_ops) use preparation::ProjectionPreparation;
 use preparation::ReplayFingerprint;
@@ -30,9 +34,31 @@ pub(in crate::backend::cuda::vnext_ops) use weight_validation::{
 enum NativeFamily {
     Base,
     Extra,
+    Q6F16,
 }
 
 type NativeKey = (NativeFamily, u32, u32, u32, u32, u32);
+
+/// The package ABI remains 1; its independently typed F16 boundary has tag 2.
+/// An old F32-only package cannot advertise this capability. Live catalog
+/// verification still binds the selected provider to the compiled artifact.
+pub(crate) fn q6_f16_compiled() -> bool {
+    use ferrum_native_ops::upstream_q6_f16_linear::{
+        UPSTREAM_Q6_F16_LINEAR_EXPORTS, UPSTREAM_Q6_F16_LINEAR_OPERATOR,
+    };
+    cfg!(feature = "cuda-upstream-q6-f32-linear")
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == UPSTREAM_Q6_F16_LINEAR_OPERATOR
+                    && artifact.backend == ferrum_types::NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && UPSTREAM_Q6_F16_LINEAR_EXPORTS
+                        .iter()
+                        .all(|required| artifact.exports.iter().any(|name| name == required))
+            })
+}
 
 /// Retained matrix validation follows this explicit profile's format family;
 /// the original G32 validator remains restricted to its own three formats.
@@ -42,7 +68,17 @@ pub(in crate::backend::cuda::vnext_ops) fn validate_parts(
     parts: &[super::weights::MatrixPart],
 ) -> Result<(), String> {
     use crate::gguf_blocks::GgufBlockFormat as Block;
-    let formats: &[Block] = if profile.extra() {
+    let formats: &[Block] = if profile.q6_f16() {
+        &[
+            Block::Q3K,
+            Block::Q4K,
+            Block::Q5K,
+            Block::Q6K,
+            Block::Iq3S,
+            Block::Iq4Nl,
+            Block::Iq4Xs,
+        ]
+    } else if profile.extra() {
         &[
             Block::Q3K,
             Block::Q4K,
@@ -62,6 +98,7 @@ fn block_format(format: ProjectionBlockFormat) -> crate::gguf_blocks::GgufBlockF
     match format {
         ProjectionBlockFormat::Q4K => Block::Q4K,
         ProjectionBlockFormat::Q5K => Block::Q5K,
+        ProjectionBlockFormat::Q6K => Block::Q6K,
         ProjectionBlockFormat::Iq4Xs => Block::Iq4Xs,
         ProjectionBlockFormat::Q3K => Block::Q3K,
         ProjectionBlockFormat::Iq3S => Block::Iq3S,
@@ -74,7 +111,7 @@ pub(in crate::backend::cuda::vnext_ops) struct UpstreamPlanFactory {
     device: Device,
     fingerprint: String,
     // Geometry contains no allocation addresses or resource authorization.
-    plans: Mutex<BTreeMap<NativeKey, Arc<PreparedUpstreamLinear>>>,
+    plans: Mutex<BTreeMap<NativeKey, Arc<PreparedProjectionNative>>>,
     waves: Mutex<BTreeMap<(String, UpstreamProjectionWaveFacts), Arc<PreparedUpstreamLeaf>>>,
 }
 
@@ -113,7 +150,7 @@ impl UpstreamPlanFactory {
         rows: u32,
         inputs: u32,
         outputs: u32,
-    ) -> Result<Arc<PreparedUpstreamLinear>, String> {
+    ) -> Result<Arc<PreparedProjectionNative>, String> {
         let (family, algorithm) = match arithmetic {
             UpstreamProjectionArithmetic::MmqD4MarkerV2
             | UpstreamProjectionArithmetic::MmqDs4MarkerV2 => (NativeFamily::Base, Algorithm::Mmq),
@@ -124,6 +161,9 @@ impl UpstreamPlanFactory {
             UpstreamProjectionArithmetic::MmvqQ8_1ExtraMarkerV2 => {
                 (NativeFamily::Extra, Algorithm::Mmvq)
             }
+            UpstreamProjectionArithmetic::MmqD4Q6F16MarkerV1 => {
+                (NativeFamily::Q6F16, Algorithm::Mmq)
+            }
             _ => return Err("this provider requires actual MarkerV2 device arithmetic".into()),
         };
         let (base, extra) = match (family, format) {
@@ -133,11 +173,13 @@ impl UpstreamPlanFactory {
             (NativeFamily::Extra, ProjectionBlockFormat::Q3K) => (None, Some(ExtraFormat::Q3K)),
             (NativeFamily::Extra, ProjectionBlockFormat::Iq3S) => (None, Some(ExtraFormat::Iq3S)),
             (NativeFamily::Extra, ProjectionBlockFormat::Iq4Nl) => (None, Some(ExtraFormat::Iq4Nl)),
+            (NativeFamily::Q6F16, ProjectionBlockFormat::Q6K) => (None, None),
             _ => return Err("projection arithmetic and native format family differ".into()),
         };
         let format_code = base
             .map(|format| format as u32)
             .or_else(|| extra.map(|format| format as u32))
+            .or_else(|| (family == NativeFamily::Q6F16).then_some(14))
             .ok_or("native format is absent")?;
         let key = (family, algorithm as u32, format_code, rows, inputs, outputs);
         let mut plans = self
@@ -151,6 +193,7 @@ impl UpstreamPlanFactory {
             .bind_to_thread()
             .map_err(|error| error.to_string())?;
         let plan = match (base, extra) {
+            (None, None) if family == NativeFamily::Q6F16 => PreparedQ6F16Linear::new(rows, inputs, outputs, self.device).map(PreparedProjectionNative::Q6F16),
             (Some(format), None) => PreparedUpstreamLinear::new(
                 algorithm,
                 Arithmetic::MarkerV2,
@@ -160,7 +203,7 @@ impl UpstreamPlanFactory {
                 inputs,
                 outputs,
                 self.device,
-            ),
+            ).map(PreparedProjectionNative::Upstream),
             // Only an explicitly declared extra prefill interval can select
             // these rows. Small requests keep their original constructor and
             // numerical route; an old archive cannot satisfy the v2 planner.
@@ -171,7 +214,7 @@ impl UpstreamPlanFactory {
                     inputs,
                     outputs,
                     self.device,
-                )
+                ).map(PreparedProjectionNative::Upstream)
             }
             (None, Some(format)) => PreparedUpstreamLinear::new_extra(
                 algorithm,
@@ -182,7 +225,7 @@ impl UpstreamPlanFactory {
                 inputs,
                 outputs,
                 self.device,
-            ),
+            ).map(PreparedProjectionNative::Upstream),
             _ => return Err("native format family is ambiguous".into()),
         }
         .map_err(|error| format!("{error}; family={family:?} algorithm={algorithm:?} format={format_code} rows={rows} inputs={inputs} outputs={outputs}"))?;
@@ -416,7 +459,7 @@ impl UpstreamPlanFactory {
         })
     }
 
-    fn facts(&self, plan: &PreparedUpstreamLinear) -> UpstreamNativePlanFacts {
+    fn facts(&self, plan: &PreparedProjectionNative) -> UpstreamNativePlanFacts {
         let p = plan.geometry();
         let geometry = if p.algorithm == Algorithm::Mmq as u32 {
             UpstreamNativeGeometry::Mmq {
@@ -451,7 +494,7 @@ impl UpstreamPlanFactory {
 
 pub(in crate::backend::cuda::vnext_ops) struct PreparedUpstreamLeaf {
     pub decision: PreparedUpstreamProjectionWave,
-    pub native: Option<Arc<PreparedUpstreamLinear>>,
+    pub native: Option<Arc<PreparedProjectionNative>>,
     output_offset: u64,
     fingerprint: ReplayFingerprint,
 }

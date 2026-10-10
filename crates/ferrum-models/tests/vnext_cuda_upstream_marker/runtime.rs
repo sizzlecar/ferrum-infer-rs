@@ -21,6 +21,8 @@ mod hybrid;
 mod identity_projection;
 #[path = "runtime/prefill.rs"]
 mod prefill;
+#[path = "runtime/q6_f16.rs"]
+mod q6_f16;
 #[path = "runtime/replay_bindings.rs"]
 mod replay_bindings;
 #[path = "runtime/two_streams.rs"]
@@ -243,7 +245,13 @@ impl Fixture {
                         _ => None,
                     })
                     .collect();
-                let expected = if selected.extra() && !geometry {
+                let expected = if selected.q6_f16() {
+                    if projection.has_staged_leaf() {
+                        BTreeSet::from(["quantization.gguf.q6-k"])
+                    } else {
+                        BTreeSet::new()
+                    }
+                } else if selected.extra() && !geometry {
                     BTreeSet::from(family::extra::FORMATS)
                 } else {
                     BTreeSet::from([

@@ -179,6 +179,7 @@ impl PreparedUpstreamProjectionWave {
                 | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                 | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
                 | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
+                | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
         ) {
             return Err(
                 "per-wave upstream planning requires the explicit upstream composite".into(),

@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex, Weak};
 use cudarc::driver::{CudaEvent, CudaStream};
 use ferrum_interfaces::vnext::DeviceNativeOperationId;
 
+use super::native_plan::PreparedProjectionNative;
 use crate::backend::cuda::vnext_runtime::{
     CudaBufferRegion, CudaDependencyWork, CudaDeviceCommand, CudaDeviceRuntimeError,
     CudaPlanBackingIdentity,
 };
-use crate::native_ops::upstream_linear::{Arithmetic, DeviceSpan, PreparedUpstreamLinear};
+use crate::native_ops::upstream_linear::{Arithmetic, DeviceSpan};
 use crate::native_ops::upstream_q6_f32_linear::PreparedQ6F32Linear;
 
 const RETAINED_WEIGHT_VALIDATION_OPERATION: DeviceNativeOperationId =
@@ -24,7 +25,7 @@ const RETAINED_WEIGHT_VALIDATION_OPERATION: DeviceNativeOperationId =
     };
 
 enum ValidationPlan {
-    Upstream(Arc<PreparedUpstreamLinear>),
+    Upstream(Arc<PreparedProjectionNative>),
     Q6F32(Arc<PreparedQ6F32Linear>),
 }
 impl ValidationPlan {
@@ -46,6 +47,7 @@ struct ValidationIdentity {
     weight: CudaPlanBackingIdentity,
     implementation: String,
     native_operator: &'static str,
+    native_boundary_abi: u32,
     algorithm: u32,
     format: u32,
     inputs: u32,
@@ -65,7 +67,7 @@ pub(in crate::backend::cuda::vnext_ops) struct WeightValidationRegistry {
 impl WeightValidationRegistry {
     pub fn prepare(
         &self,
-        native: Arc<PreparedUpstreamLinear>,
+        native: Arc<PreparedProjectionNative>,
         implementation: &str,
         weights: CudaBufferRegion,
         flag: CudaBufferRegion,
@@ -80,6 +82,7 @@ impl WeightValidationRegistry {
             weight: weights.plan_backing_identity()?,
             implementation: implementation.to_owned(),
             native_operator: native.operator(),
+            native_boundary_abi: native.boundary_abi(),
             algorithm: geometry.algorithm,
             format: geometry.request.format,
             inputs: geometry.request.inputs,
@@ -102,6 +105,8 @@ impl WeightValidationRegistry {
             weight: weights.plan_backing_identity()?,
             implementation: implementation.to_owned(),
             native_operator: native.operator(),
+            native_boundary_abi:
+                ferrum_native_ops::upstream_q6_f32_linear::UPSTREAM_Q6_F32_LINEAR_ABI,
             algorithm: geometry.algorithm,
             format: geometry.request.format,
             inputs: geometry.request.inputs,
@@ -200,9 +205,10 @@ impl WeightValidation {
         CudaDeviceRuntimeError,
     > {
         let identity = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.identity.implementation,
             self.identity.native_operator,
+            self.identity.native_boundary_abi,
             self.identity.algorithm,
             self.identity.format,
             self.identity.inputs,
@@ -243,9 +249,10 @@ impl WeightValidation {
                 persistent_length_bytes: 4,
                 alignment_bytes: 4,
                 validation_identity: format!(
-                    "{}:{}:{}:{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}:{}:{}:{}",
                     self.identity.implementation,
                     self.identity.native_operator,
+                    self.identity.native_boundary_abi,
                     self.identity.algorithm,
                     self.identity.format,
                     self.identity.inputs,

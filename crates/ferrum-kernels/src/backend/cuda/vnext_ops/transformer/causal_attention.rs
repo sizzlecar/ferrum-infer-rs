@@ -237,6 +237,7 @@ impl CudaCausalPagedAttentionProvider {
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalM8Geometry
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16
         ) {
             return Err(CudaDeviceRuntimeError::contract("not a causal profile"));
         }
@@ -409,6 +410,7 @@ impl CudaCausalPagedAttentionProvider {
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalM8Geometry,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16,
         ]
         .into_iter()
         .find(|profile| profile.operation_id() == contract.descriptor().id.as_str());

@@ -39,6 +39,7 @@ impl CudaUpstreamSwiGluProvider {
                 | UpstreamMarkerV2Profile::SwiGluExtraPrefill
                 | UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
                 | UpstreamMarkerV2Profile::SwiGluExtraAllRows
+                | UpstreamMarkerV2Profile::SwiGluQ6F16
         ) {
             return Err(CudaDeviceRuntimeError::contract("not a SwiGLU profile"));
         }
@@ -49,6 +50,25 @@ impl CudaUpstreamSwiGluProvider {
             include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/upstream_linear.rs"),
             include_bytes!("../native_blocks/upstream_linear/preparation.rs"),
+            include_bytes!("../native_blocks/upstream_linear/native_plan.rs"),
+            include_bytes!("../../../../native_ops/upstream_q6_f16_linear.rs"),
+            include_bytes!("../../../../native_ops/upstream_q6_f16_linear/ffi.rs"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ferrum-native-ops/src/upstream_q6_f16_linear.rs"
+            )),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../native-operators/cuda/upstream-q6-f32-linear/abi.h"
+            )),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../native-operators/cuda/upstream-q6-f32-linear/mmq.cu"
+            )),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../native-operators/cuda/upstream-q6-f32-linear/f16_adapter.cuh"
+            )),
             include_bytes!("../native_blocks/upstream_linear/weight_validation.rs"),
             include_bytes!("segment_bindings.rs"),
             include_bytes!("../native_blocks/weights.rs"),

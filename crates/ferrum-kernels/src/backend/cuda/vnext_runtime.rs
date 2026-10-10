@@ -2499,12 +2499,15 @@ impl CudaDeviceRuntime {
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluQ6F16,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaM8Geometry,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalM8Geometry,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16,
         ] {
             if major >= 8 && matches!(purpose, CudaRuntimePurpose::NativeCatalogDeclaration) {
                 config.capabilities.insert(
@@ -2517,6 +2520,7 @@ impl CudaDeviceRuntime {
                 )
                 || (profile.extra()
                     && !super::vnext_ops::upstream_extra_profile_compiled(profile.extra_prefill()))
+                || (profile.q6_f16() && !super::vnext_ops::upstream_q6_f16_profile_compiled())
                 || (profile.hybrid()
                     && !super::vnext_ops::q8act_g32_profile_compiled(
                         ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,

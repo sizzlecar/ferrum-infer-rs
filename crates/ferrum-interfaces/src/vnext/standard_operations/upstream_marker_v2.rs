@@ -76,6 +76,22 @@ pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4X
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_M8_GEOMETRY_V1_OPERATION_ID: &str = "operation.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-m8-geometry-v1";
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_M8_GEOMETRY_V1_CAPABILITY_ID: &str = "capability.operation.causal_paged_attention.f32-master.q3k-q4k-q5k-iq3s-iq4nl-iq4xs-upstream-marker-v2-m8-geometry-v1";
 
+pub const DENSE_SWIGLU_Q6_F16_MARKER_V1_OPERATION_ID: &str =
+    "operation.dense_swiglu.upstream-q6-f16-marker-v1";
+pub const DENSE_SWIGLU_Q6_F16_MARKER_V1_CAPABILITY_ID: &str =
+    "capability.operation.dense_swiglu.upstream-q6-f16-marker-v1";
+pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID: &str =
+    "operation.gated_delta_recurrent_attention.f32-master.upstream-q6-f16-marker-v1";
+pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_CAPABILITY_ID: &str =
+    "capability.operation.gated_delta_recurrent_attention.f32-master.upstream-q6-f16-marker-v1";
+pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID: &str =
+    "operation.causal_paged_attention.f32-master.upstream-q6-f16-marker-v1";
+pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_CAPABILITY_ID: &str =
+    "capability.operation.causal_paged_attention.f32-master.upstream-q6-f16-marker-v1";
+
+#[path = "upstream_marker_v2/q6_f16.rs"]
+mod q6_f16;
+
 #[path = "upstream_marker_v2/extra.rs"]
 mod extra;
 #[path = "upstream_marker_v2/geometry.rs"]
@@ -106,17 +122,29 @@ pub enum UpstreamMarkerV2Profile {
     CausalExtraAllRows,
     GatedDeltaM8Geometry,
     CausalM8Geometry,
+    SwiGluQ6F16,
+    GatedDeltaQ6F16,
+    CausalQ6F16,
 }
 
 impl UpstreamMarkerV2Profile {
+    pub const fn q6_f16(self) -> bool {
+        matches!(
+            self,
+            Self::SwiGluQ6F16 | Self::GatedDeltaQ6F16 | Self::CausalQ6F16
+        )
+    }
     /// Separate exact profile: fill undeclared extra local widths with MMQ.
     pub const fn extra_all_rows(self) -> bool {
         matches!(
             self,
-            Self::SwiGluExtraAllRows
+            Self::SwiGluQ6F16
+                | Self::SwiGluExtraAllRows
                 | Self::GatedDeltaExtraAllRows
+                | Self::GatedDeltaQ6F16
                 | Self::GatedDeltaM8Geometry
                 | Self::CausalExtraAllRows
+                | Self::CausalQ6F16
                 | Self::CausalM8Geometry
         )
     }
@@ -126,12 +154,15 @@ impl UpstreamMarkerV2Profile {
         matches!(
             self,
             Self::SwiGluExtraLargePrefill
+                | Self::SwiGluQ6F16
                 | Self::SwiGluExtraAllRows
                 | Self::GatedDeltaExtraLargePrefill
                 | Self::GatedDeltaExtraAllRows
+                | Self::GatedDeltaQ6F16
                 | Self::GatedDeltaM8Geometry
                 | Self::CausalExtraLargePrefill
                 | Self::CausalExtraAllRows
+                | Self::CausalQ6F16
                 | Self::CausalM8Geometry
         )
     }
@@ -158,14 +189,17 @@ impl UpstreamMarkerV2Profile {
                 | Self::GatedDeltaPrefill
                 | Self::CausalPrefill
                 | Self::SwiGluExtraLargePrefill
+                | Self::SwiGluQ6F16
                 | Self::SwiGluExtraAllRows
                 | Self::SwiGluExtraPrefill
                 | Self::GatedDeltaExtraLargePrefill
                 | Self::GatedDeltaExtraAllRows
+                | Self::GatedDeltaQ6F16
                 | Self::GatedDeltaM8Geometry
                 | Self::GatedDeltaExtraPrefill
                 | Self::CausalExtraLargePrefill
                 | Self::CausalExtraAllRows
+                | Self::CausalQ6F16
                 | Self::CausalM8Geometry
                 | Self::CausalExtraPrefill
         )
@@ -181,12 +215,14 @@ impl UpstreamMarkerV2Profile {
 
     pub const fn operation_id(self) -> &'static str {
         match self {
+            Self::SwiGluQ6F16 => DENSE_SWIGLU_Q6_F16_MARKER_V1_OPERATION_ID,
             Self::SwiGlu => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,
             Self::SwiGluPrefill => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
             Self::SwiGluExtraPrefill => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
             Self::SwiGluExtraLargePrefill => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,
             Self::SwiGluExtraAllRows => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,
             Self::SwiGluG32MmqPrefill => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,
+            Self::GatedDeltaQ6F16 => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID,
             Self::GatedDelta => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,
             Self::GatedDeltaPrefill => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
             Self::GatedDeltaExtraPrefill => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
@@ -194,6 +230,7 @@ impl UpstreamMarkerV2Profile {
             Self::GatedDeltaExtraAllRows => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,
             Self::GatedDeltaM8Geometry => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_M8_GEOMETRY_V1_OPERATION_ID,
             Self::GatedDeltaG32MmqPrefill => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,
+            Self::CausalQ6F16 => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID,
             Self::Causal => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,
             Self::CausalPrefill => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
             Self::CausalExtraPrefill => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,
@@ -205,12 +242,14 @@ impl UpstreamMarkerV2Profile {
     }
     pub const fn capability_id(self) -> &'static str {
         match self {
+            Self::SwiGluQ6F16 => DENSE_SWIGLU_Q6_F16_MARKER_V1_CAPABILITY_ID,
             Self::SwiGlu => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_CAPABILITY_ID,
             Self::SwiGluPrefill => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
             Self::SwiGluExtraPrefill => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
             Self::SwiGluExtraLargePrefill => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_CAPABILITY_ID,
             Self::SwiGluExtraAllRows => DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_CAPABILITY_ID,
             Self::SwiGluG32MmqPrefill => DENSE_SWIGLU_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_CAPABILITY_ID,
+            Self::GatedDeltaQ6F16 => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_CAPABILITY_ID,
             Self::GatedDelta => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_CAPABILITY_ID,
             Self::GatedDeltaPrefill => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
             Self::GatedDeltaExtraPrefill => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
@@ -218,6 +257,7 @@ impl UpstreamMarkerV2Profile {
             Self::GatedDeltaExtraAllRows => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_CAPABILITY_ID,
             Self::GatedDeltaM8Geometry => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_M8_GEOMETRY_V1_CAPABILITY_ID,
             Self::GatedDeltaG32MmqPrefill => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_CAPABILITY_ID,
+            Self::CausalQ6F16 => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_CAPABILITY_ID,
             Self::Causal => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_CAPABILITY_ID,
             Self::CausalPrefill => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
             Self::CausalExtraPrefill => CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_CAPABILITY_ID,
@@ -233,6 +273,7 @@ impl UpstreamMarkerV2Profile {
             | Self::SwiGluPrefill
             | Self::SwiGluG32MmqPrefill
             | Self::SwiGluExtraLargePrefill
+            | Self::SwiGluQ6F16
             | Self::SwiGluExtraAllRows
             | Self::SwiGluExtraPrefill => DENSE_SWIGLU_OPERATION_ID,
             Self::GatedDelta
@@ -240,6 +281,7 @@ impl UpstreamMarkerV2Profile {
             | Self::GatedDeltaG32MmqPrefill
             | Self::GatedDeltaExtraLargePrefill
             | Self::GatedDeltaExtraAllRows
+            | Self::GatedDeltaQ6F16
             | Self::GatedDeltaM8Geometry
             | Self::GatedDeltaExtraPrefill => {
                 GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
@@ -249,6 +291,7 @@ impl UpstreamMarkerV2Profile {
             | Self::CausalG32MmqPrefill
             | Self::CausalExtraLargePrefill
             | Self::CausalExtraAllRows
+            | Self::CausalQ6F16
             | Self::CausalM8Geometry
             | Self::CausalExtraPrefill => CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
         }
@@ -259,6 +302,7 @@ impl UpstreamMarkerV2Profile {
             | Self::SwiGluPrefill
             | Self::SwiGluG32MmqPrefill
             | Self::SwiGluExtraLargePrefill
+            | Self::SwiGluQ6F16
             | Self::SwiGluExtraAllRows
             | Self::SwiGluExtraPrefill => dense_swiglu_contract(),
             Self::GatedDelta
@@ -266,6 +310,7 @@ impl UpstreamMarkerV2Profile {
             | Self::GatedDeltaG32MmqPrefill
             | Self::GatedDeltaExtraLargePrefill
             | Self::GatedDeltaExtraAllRows
+            | Self::GatedDeltaQ6F16
             | Self::GatedDeltaM8Geometry
             | Self::GatedDeltaExtraPrefill => gated_delta_recurrent_attention_f32_master_contract(),
             Self::Causal
@@ -273,6 +318,7 @@ impl UpstreamMarkerV2Profile {
             | Self::CausalG32MmqPrefill
             | Self::CausalExtraLargePrefill
             | Self::CausalExtraAllRows
+            | Self::CausalQ6F16
             | Self::CausalM8Geometry
             | Self::CausalExtraPrefill => causal_paged_attention_f32_master_contract(),
         }
@@ -282,6 +328,9 @@ impl UpstreamMarkerV2Profile {
     /// Encoding must consume prepared leaf indices/plans, not reconstruct and
     /// serialize this owned declaration on every projection or decode wave.
     pub fn arithmetic(self) -> CompositeNumericalArithmetic {
+        if self.q6_f16() {
+            return q6_f16::arithmetic(self);
+        }
         if matches!(self, Self::GatedDeltaM8Geometry | Self::CausalM8Geometry) {
             return geometry::arithmetic(self);
         }
@@ -296,6 +345,7 @@ impl UpstreamMarkerV2Profile {
             | Self::SwiGluPrefill
             | Self::SwiGluG32MmqPrefill
             | Self::SwiGluExtraLargePrefill
+            | Self::SwiGluQ6F16
             | Self::SwiGluExtraAllRows
             | Self::SwiGluExtraPrefill => &[
                 (ProjectionRole::SwiGluGateUp, 1),
@@ -306,6 +356,7 @@ impl UpstreamMarkerV2Profile {
             | Self::GatedDeltaG32MmqPrefill
             | Self::GatedDeltaExtraLargePrefill
             | Self::GatedDeltaExtraAllRows
+            | Self::GatedDeltaQ6F16
             | Self::GatedDeltaM8Geometry
             | Self::GatedDeltaExtraPrefill => &[
                 (ProjectionRole::GatedDeltaInput, 2),
@@ -316,6 +367,7 @@ impl UpstreamMarkerV2Profile {
             | Self::CausalG32MmqPrefill
             | Self::CausalExtraLargePrefill
             | Self::CausalExtraAllRows
+            | Self::CausalQ6F16
             | Self::CausalM8Geometry
             | Self::CausalExtraPrefill => &[
                 (ProjectionRole::CausalQuery, 2),

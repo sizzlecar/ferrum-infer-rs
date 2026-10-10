@@ -18,6 +18,8 @@ pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA: u32 = 4;
 pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL: u32 = 6;
 /// Explicit physical-leaf geometry selection; legacy route schemas stay closed.
 pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY: u32 = 8;
+/// Independent Q6_K F16 input/output ABI, distinct from the F32 head schema.
+pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,10 +173,23 @@ impl StagedNumericalArithmetic {
     /// Family registration still has to reproduce this declaration; operation
     /// and provider versions must implement it before any plan can execute it.
     pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version == NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16 {
+            return match self.stages.as_slice() {
+                [NumericalArithmeticStage::UpstreamProjection { policy }]
+                    if policy.format == super::ProjectionBlockFormat::Q6K =>
+                {
+                    policy.validate()
+                }
+                _ => Err("Q6 F16 schema requires its independent upstream policy".into()),
+            };
+        }
         if self.schema_version == NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY {
             return match self.stages.as_slice() {
                 [NumericalArithmeticStage::UpstreamProjection { policy }]
-                    if policy.geometry_selection.is_some() =>
+                    if matches!(
+                        policy.geometry_selection,
+                        Some(super::UpstreamProjectionGeometrySelection::M8Q4Q5Mmq { .. })
+                    ) =>
                 {
                     policy.validate()
                 }
@@ -204,6 +219,9 @@ impl StagedNumericalArithmetic {
         ) {
             return match self.stages.as_slice() {
                 [NumericalArithmeticStage::UpstreamProjection { policy }] => {
+                    if policy.format == super::ProjectionBlockFormat::Q6K {
+                        return Err("Q6 F16 requires its independent staged schema".into());
+                    }
                     if policy.geometry_selection.is_some() {
                         return Err("legacy upstream schema cannot carry geometry selection".into());
                     }

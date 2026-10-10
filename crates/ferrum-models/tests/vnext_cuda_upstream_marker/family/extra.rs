@@ -126,7 +126,7 @@ pub struct Weights {
 }
 impl Weights {
     pub fn new(schema: &WeightSchema) -> Self {
-        let is_extra = |c: &WeightComponentSpec| matches!(&c.encoding,WeightEncoding::BlockQuantized(s) if matches!(s.format_id.as_str(),"quantization.gguf.q3-k"|"quantization.gguf.iq3-s"|"quantization.gguf.iq4-nl"));
+        let is_extra = |c: &WeightComponentSpec| matches!(&c.encoding,WeightEncoding::BlockQuantized(s) if matches!(s.format_id.as_str(),"quantization.gguf.q3-k"|"quantization.gguf.iq3-s"|"quantization.gguf.iq4-nl"|"quantization.gguf.q6-k"));
         let mut base_schema = schema.clone();
         base_schema.components.retain(|c| !is_extra(c));
         let base = attention_family::Weights::new(&base_schema);
@@ -144,7 +144,18 @@ impl Weights {
                         let mut data = (0..spec.bytes_per_block as usize)
                             .map(|i| ((i * 17 + block * 7 + ordinal * 19) % 251) as u8)
                             .collect::<Vec<_>>();
-                        let scale_offset = if spec.format_id.as_str() == "quantization.gguf.q3-k" {
+                        let scale_offset = if spec.format_id.as_str() == "quantization.gguf.q6-k" {
+                            assert_eq!(data.len(), 210);
+                            // Signed, nonzero local scales and a normal F16
+                            // global scale keep the wide synthetic FFN bounded.
+                            for (i, scale) in data[192..208].iter_mut().enumerate() {
+                                let magnitude = ((block + i + ordinal) % 4 + 1) as i8;
+                                *scale = if i % 2 == 0 { magnitude } else { -magnitude } as u8;
+                            }
+                            data[208..210]
+                                .copy_from_slice(&f16::from_f32(1.0 / 8192.0).to_le_bytes());
+                            return data;
+                        } else if spec.format_id.as_str() == "quantization.gguf.q3-k" {
                             108
                         } else {
                             0

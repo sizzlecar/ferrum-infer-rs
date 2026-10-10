@@ -7,6 +7,8 @@ pub mod extra_all_rows;
 pub mod extra_prefill;
 #[path = "family/geometry.rs"]
 pub mod geometry;
+#[path = "family/q6_f16.rs"]
+pub mod q6_f16;
 pub use extra::Weights;
 
 const INTERMEDIATE: u64 = 768;
@@ -118,7 +120,9 @@ impl Family {
         self.selected
     }
     pub fn swiglu_profile(&self) -> UpstreamMarkerV2Profile {
-        if self.selected.extra_all_rows() {
+        if self.selected.q6_f16() {
+            UpstreamMarkerV2Profile::SwiGluQ6F16
+        } else if self.selected.extra_all_rows() {
             UpstreamMarkerV2Profile::SwiGluExtraAllRows
         } else if self.selected.extra_prefill() {
             UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
@@ -147,7 +151,9 @@ impl Family {
         states
     }
     pub fn profile_id(&self) -> &'static str {
-        if self.geometry {
+        if self.selected.q6_f16() {
+            q6_f16::PROFILE
+        } else if self.geometry {
             if matches!(
                 self.selected,
                 UpstreamMarkerV2Profile::GatedDeltaM8Geometry
@@ -231,12 +237,15 @@ impl ModelFamilyProvider for Family {
             physical_layout: PhysicalWeightLayout::Dense { component_id: norm },
             required: true,
         });
-        mixed_weight(&mut schema, "ffn_gate_up", 2, INTERMEDIATE, hidden);
-        mixed_weight(&mut schema, "ffn_down", 1, hidden, INTERMEDIATE);
+        let intermediate = self.intermediate_size();
+        mixed_weight(&mut schema, "ffn_gate_up", 2, intermediate, hidden);
+        mixed_weight(&mut schema, "ffn_down", 1, hidden, intermediate);
         // One extra physical dense leaf in each operation makes the validation
         // payload an odd number of eight-byte banks. Its admitted Plan buffer
         // must include alignment padding; no dimensions or budget change.
-        if self.selected.extra() && !self.geometry {
+        if self.selected.q6_f16() {
+            q6_f16::replace_projection_leaves(&mut schema);
+        } else if self.selected.extra() && !self.geometry {
             extra::extend_schema(&mut schema);
             // 7 leaves per bank gives 21 FFN leaves; only attention needs a
             // split to keep both admitted flag extents genuinely padded.
@@ -363,7 +372,7 @@ impl ModelFamilyProvider for Family {
         let mut ffn = hidden();
         ffn.insert(
             id("intermediate_size"),
-            SemanticValue::Unsigned(INTERMEDIATE),
+            SemanticValue::Unsigned(self.intermediate_size()),
         );
         node(
             "node.swiglu",
@@ -389,8 +398,11 @@ impl ModelFamilyProvider for Family {
         }
         for (name, dimensions) in [
             ("ffn_norm", vec![hidden_size]),
-            ("ffn_gate_up", vec![2, INTERMEDIATE, hidden_size]),
-            ("ffn_down", vec![hidden_size, INTERMEDIATE]),
+            (
+                "ffn_gate_up",
+                vec![2, self.intermediate_size(), hidden_size],
+            ),
+            ("ffn_down", vec![hidden_size, self.intermediate_size()]),
         ] {
             weights.push(WeightReference {
                 weight_id: id(format!("weight.{name}")),
