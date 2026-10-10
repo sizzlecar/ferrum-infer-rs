@@ -4,6 +4,8 @@
 use super::*;
 use std::time::Instant;
 
+#[path = "timing/attention_boundaries.rs"]
+mod attention_boundaries;
 #[path = "timing/attention_shapes.rs"]
 mod attention_shapes;
 #[path = "timing/rowtile.rs"]
