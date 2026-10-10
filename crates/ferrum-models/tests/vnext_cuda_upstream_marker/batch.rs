@@ -28,6 +28,12 @@ pub enum Path {
     EagerBoundary,
 }
 
+#[derive(Clone, Copy)]
+pub enum ObservationScope {
+    OutputAndState,
+    RetainedIntermediates,
+}
+
 pub struct BatchObservation {
     pub values: BTreeMap<(u32, String), Vec<u8>>,
     types: BTreeMap<String, ElementType>,
@@ -40,6 +46,20 @@ pub struct BatchObservation {
 }
 
 impl BatchObservation {
+    pub fn finite_summary(&self) -> Vec<Value> {
+        self.values.iter().map(|((participant, name), bytes)| {
+            let values: Vec<f32> = match self.types[name] {
+                ElementType::F16 => bytes.chunks_exact(2).map(|v| f16::from_le_bytes(v.try_into().unwrap()).to_f32()).collect(),
+                ElementType::F32 => bytes.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect(),
+                dtype => panic!("unexpected diagnostic dtype {dtype:?}"),
+            };
+            serde_json::json!({"participant":participant,"value":name,"dtype":self.types[name],"elements":values.len(),"bytes":bytes.len(),
+                "sha256":format!("{:x}",Sha256::digest(bytes)),"nan":values.iter().filter(|v|v.is_nan()).count(),
+                "infinite":values.iter().filter(|v|v.is_infinite()).count(),"finite_max_abs":values.iter().filter(|v|v.is_finite()).fold(0.0f32,|m,v|m.max(v.abs())),
+                "first_nonfinite":values.iter().enumerate().filter(|(_,v)|!v.is_finite()).take(4).map(|(index,v)|serde_json::json!({"index":index,"f32_bits":v.to_bits()})).collect::<Vec<_>>()})
+        }).collect()
+    }
+
     pub fn assert_same(&self, other: &Self) {
         assert_eq!(
             self.values, other.values,
@@ -154,6 +174,33 @@ impl Fixture {
         preparation_strategy: InvocationPreparationStrategy,
         preparation_sink: &P,
         binding_row_bytes: Option<usize>,
+    ) -> BatchObservation {
+        self.execute_participant_ranges_observed(
+            lane,
+            reaper,
+            sessions,
+            tokens,
+            ranges,
+            path,
+            preparation_strategy,
+            preparation_sink,
+            binding_row_bytes,
+            ObservationScope::OutputAndState,
+        )
+    }
+
+    pub fn execute_participant_ranges_observed<P: InvocationPreparationSink>(
+        &self,
+        lane: &Arc<ExecutionLane<Runtime>>,
+        reaper: &Arc<CompletionReaper<Runtime>>,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        ranges: &[Range<usize>],
+        path: Path,
+        preparation_strategy: InvocationPreparationStrategy,
+        preparation_sink: &P,
+        binding_row_bytes: Option<usize>,
+        observation_scope: ObservationScope,
     ) -> BatchObservation {
         assert_eq!(sessions.len(), tokens.len());
         assert_eq!(sessions.len(), ranges.len());
@@ -322,6 +369,53 @@ impl Fixture {
         )
         .unwrap()];
         let mut types = BTreeMap::from([("output".to_owned(), ElementType::F32)]);
+        if matches!(observation_scope, ObservationScope::RetainedIntermediates) {
+            // The isolated diagnostic explicitly retained these completion
+            // values at compile time. Ordinary fixtures keep their old plan.
+            for (node_name, name) in [
+                ("node.attention", "attention"),
+                ("node.ffn_norm", "normalized"),
+                ("node.swiglu", "ffn"),
+            ] {
+                let node = plan
+                    .payload()
+                    .nodes()
+                    .iter()
+                    .find(|n| n.id().as_str() == node_name)
+                    .unwrap();
+                let value = node
+                    .values()
+                    .iter()
+                    .find(|v| v.role() == ResolvedValueRole::Output && v.ordinal() == 0)
+                    .unwrap();
+                let component = &value.storage().components()[0];
+                let dtype = value.tensor().element_type();
+                names.insert(component.resource_id().clone(), name.to_owned());
+                types.insert(name.to_owned(), dtype);
+                readbacks.push(
+                    CompletionReadbackBatchRequest::new(
+                        (0..participants)
+                            .map(|p| {
+                                CompletionReadbackRequest::new(
+                                    node.id().clone(),
+                                    p,
+                                    component.resource_id().clone(),
+                                    component.offset_bytes(),
+                                    HostTransferLayout::new(
+                                        dtype,
+                                        ranges[p as usize].len() as u64
+                                            * value.tensor().dimensions().last().copied().unwrap(),
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap()
+                            })
+                            .collect(),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
         for state in &self.states {
             let value = attention
                 .values()
@@ -469,6 +563,7 @@ impl Fixture {
                     COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
                         | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                         | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
                 );
                 if arithmetic.schema_version
                     == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ

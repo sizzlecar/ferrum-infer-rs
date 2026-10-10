@@ -75,6 +75,7 @@ impl Fixture {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let geometry = definition.is_geometry();
+        let observe_intermediates = definition.observes_intermediates();
         let attention_arithmetic = definition.attention_arithmetic();
         let swiglu_arithmetic = definition.swiglu_arithmetic();
         let selected = definition.attention_profile();
@@ -159,6 +160,11 @@ impl Fixture {
         .unwrap();
         options.require_weight_materializer_selection(materializer);
         options.retain_completion_value(id("value.output"));
+        if observe_intermediates {
+            for value in ["value.attention", "value.normalized", "value.ffn"] {
+                options.retain_completion_value(id(value));
+            }
+        }
         let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             &family,
             &catalog,

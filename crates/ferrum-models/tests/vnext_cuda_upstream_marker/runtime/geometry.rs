@@ -457,3 +457,99 @@ fn geometry_gdn_m8_mixed_leaves_full_matches_segment_across_widths_and_requests(
 fn geometry_causal_m8_mixed_leaves_full_matches_segment_across_widths_and_kv_growth() {
     compare(AttentionKind::Causal);
 }
+
+#[test]
+#[ignore = "requires exclusive CUDA; isolates first-wave nonfinite values without changing generated scales"]
+fn geometry_gdn_wide_first_wave_finite_isolation() {
+    use family::geometry::WideArithmetic;
+    let kind = AttentionKind::GatedDelta;
+    let policies = [
+        WideArithmetic::InheritedExtraAllRows,
+        WideArithmetic::Geometry,
+    ];
+    let schemas = policies.map(|policy| {
+        Family::wide_arithmetic(kind, policy)
+            .weight_schema(&kind)
+            .unwrap()
+    });
+    assert_eq!(
+        schemas[0], schemas[1],
+        "both arms use the same schema and deterministic weight generator"
+    );
+    let tokens: Vec<Arc<[u32]>> = (0..8)
+        .map(|p| {
+            (0..14)
+                .map(|position| ((position * 7 + p * 3 + 1) % 32) as u32)
+                .collect()
+        })
+        .collect();
+    let mut outputs = Vec::new();
+    // First compare both declarations under the original liveness plan, then
+    // compare the two
+    // arithmetic declarations under the same explicitly retained-value plan.
+    // If only retained runs are finite, that is an alias/liveness lead, not
+    // evidence that scaling or the new arithmetic caused the original failure.
+    for (policy, retained) in [
+        (WideArithmetic::InheritedExtraAllRows, false),
+        (WideArithmetic::Geometry, false),
+        (WideArithmetic::InheritedExtraAllRows, true),
+        (WideArithmetic::Geometry, true),
+    ] {
+        let definition = Family::wide_arithmetic(kind, policy);
+        let fixture = Fixture::for_family_with_segment_oracle(
+            kind,
+            true,
+            8,
+            if retained {
+                definition.with_intermediate_observation()
+            } else {
+                definition
+            },
+            ProgramBindingUploadStrategy::Sparse,
+            SegmentBindingOracleMode::Disabled,
+        );
+        let sessions = tokens
+            .iter()
+            .enumerate()
+            .map(|(p, t)| {
+                fixture.admit_with_ceiling(
+                    &format!("wide-isolation-{p}"),
+                    Arc::from(&t[..1]),
+                    t.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let sink = Preparation::default();
+        let observation = fixture.execute_participant_ranges_observed(
+            &fixture.lane,
+            &fixture.reaper,
+            &sessions,
+            &tokens,
+            &vec![0..1; 8],
+            Path::Warm,
+            InvocationPreparationStrategy::Full,
+            &sink,
+            None,
+            if retained {
+                batch::ObservationScope::RetainedIntermediates
+            } else {
+                batch::ObservationScope::OutputAndState
+            },
+        );
+        println!(
+            "{}",
+            serde_json::json!({"kind":"geometry_first_wave_finite_isolation","arithmetic":format!("{policy:?}"),
+            "participants":8,"range":[0,1],"strategy":"full","weight_scale_changed":false,"retained_intermediate_values":retained,"profile":Family::wide_arithmetic(kind,policy).profile_id(),
+            "values":observation.finite_summary()})
+        );
+        for session in sessions {
+            session.try_complete().unwrap();
+        }
+        outputs.push(observation);
+    }
+    // All complete readbacks are recorded before a finite assertion can abort.
+    // Different declared algorithms are not required to be bitwise equivalent.
+    for output in outputs {
+        output.assert_same(&output);
+    }
+}

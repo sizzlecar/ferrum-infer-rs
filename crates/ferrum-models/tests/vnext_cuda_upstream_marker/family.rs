@@ -20,6 +20,7 @@ pub struct Family {
     maximum_tokens: u64,
     g32_baseline: bool,
     geometry: bool,
+    observe_intermediates: bool,
 }
 
 impl Family {
@@ -29,6 +30,7 @@ impl Family {
             maximum_tokens: MAX_TOKENS,
             g32_baseline: false,
             geometry: false,
+            observe_intermediates: false,
             selected: match kind {
                 AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDelta,
                 AttentionKind::Causal => UpstreamMarkerV2Profile::Causal,
@@ -144,7 +146,15 @@ impl Family {
     }
     pub fn profile_id(&self) -> &'static str {
         if self.geometry {
-            geometry::PROFILE
+            if matches!(
+                self.selected,
+                UpstreamMarkerV2Profile::GatedDeltaM8Geometry
+                    | UpstreamMarkerV2Profile::CausalM8Geometry
+            ) {
+                geometry::PROFILE
+            } else {
+                geometry::INHERITED_PROFILE
+            }
         } else if self.g32_baseline {
             "fixture.attention-ffn.require-atn-g32"
         } else if self.selected.extra_all_rows() {

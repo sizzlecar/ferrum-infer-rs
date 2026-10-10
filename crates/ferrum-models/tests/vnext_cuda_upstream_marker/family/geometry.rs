@@ -3,19 +3,49 @@
 use super::*;
 
 pub const PROFILE: &str = "fixture.attention-ffn.require-m8-mmq-geometry-v1";
+pub const INHERITED_PROFILE: &str = "fixture.attention-ffn.wide-extra-all-rows-control";
 pub const WIDE_HIDDEN: u64 = 5120;
+
+#[derive(Clone, Copy, Debug)]
+pub enum WideArithmetic {
+    Geometry,
+    InheritedExtraAllRows,
+}
 
 impl Family {
     pub fn m8_geometry(kind: AttentionKind) -> Self {
+        Self::wide_arithmetic(kind, WideArithmetic::Geometry)
+    }
+
+    pub fn wide_arithmetic(kind: AttentionKind, arithmetic: WideArithmetic) -> Self {
         let mut value = Self::new(kind);
         value.geometry = true;
         value.maximum_tokens = 128;
-        value.selected = match kind {
-            AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDeltaM8Geometry,
-            AttentionKind::Causal => UpstreamMarkerV2Profile::CausalM8Geometry,
+        value.selected = match (kind, arithmetic) {
+            (AttentionKind::GatedDelta, WideArithmetic::Geometry) => {
+                UpstreamMarkerV2Profile::GatedDeltaM8Geometry
+            }
+            (AttentionKind::Causal, WideArithmetic::Geometry) => {
+                UpstreamMarkerV2Profile::CausalM8Geometry
+            }
+            (AttentionKind::GatedDelta, WideArithmetic::InheritedExtraAllRows) => {
+                UpstreamMarkerV2Profile::GatedDeltaExtraAllRows
+            }
+            (AttentionKind::Causal, WideArithmetic::InheritedExtraAllRows) => {
+                UpstreamMarkerV2Profile::CausalExtraAllRows
+            }
             _ => unreachable!(),
         };
         value
+    }
+
+    pub fn with_intermediate_observation(mut self) -> Self {
+        self.observe_intermediates = true;
+        self
+    }
+
+    pub fn observes_intermediates(&self) -> bool {
+        self.observe_intermediates
     }
 
     pub fn is_geometry(&self) -> bool {
