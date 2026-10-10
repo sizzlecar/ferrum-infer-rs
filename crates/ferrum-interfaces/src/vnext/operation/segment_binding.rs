@@ -10,7 +10,8 @@ use super::foundation::invalid_operation;
 use super::{OperationBufferStorageKind, ResolvedValueRole, RetainedPlanDependencyAuthority};
 use crate::vnext::{
     BatchWorkShape, BufferDescriptor, DeviceBufferRetention, ElementType,
-    EncodedReusableExecutionBindings, ProgramBindingNodeBinding, VNextError, WeightId,
+    EncodedReusableExecutionBindings, ProgramBindingNodeBinding, SegmentBackingWindowView,
+    VNextError, WeightId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +144,37 @@ pub enum SegmentBindingOracleMode {
     CompareReference,
 }
 
+/// Representation only. Indexed facts still come from the current full permit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SegmentBindingOwnerViewMode {
+    #[default]
+    Legacy,
+    Indexed,
+}
+
+/// An index into one current patch, never a cross-wave ownership identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentBindingOwnerIndex(pub(crate) usize);
+
+impl SegmentBindingOwnerIndex {
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Borrowed exact ownership. A command must retain this capability and its
+/// backend allocation before returning from the synchronous segment encoder.
+pub struct SegmentBindingOwnerView<'a, B> {
+    pub(crate) buffer: &'a B,
+    pub(crate) retention: &'a DeviceBufferRetention,
+}
+
+impl<'a, B> SegmentBindingOwnerView<'a, B> {
+    pub fn buffer_and_retention(&self) -> (&'a B, &'a DeviceBufferRetention) {
+        (self.buffer, self.retention)
+    }
+}
+
 /// Borrowed command channels for the same-wave diagnostic. No authority can be
 /// moved, minted, or submitted through this view.
 pub struct SegmentBindingOracleCommands<'a, C> {
@@ -181,8 +213,126 @@ impl<'a, B> SegmentBindingPhysicalRegion<'a, B> {
 pub struct PreparedSegmentBindingRegion<'a, B> {
     pub(crate) descriptor: BufferDescriptor,
     pub(crate) storage_kind: OperationBufferStorageKind,
-    pub(crate) regions: Vec<SegmentBindingPhysicalRegion<'a, B>>,
+    pub(crate) source: SegmentBindingPhysicalSource<'a, B>,
 }
+
+pub(crate) enum SegmentBindingPhysicalSource<'a, B> {
+    Legacy(Vec<SegmentBindingPhysicalRegion<'a, B>>),
+    Plan {
+        owner_index: SegmentBindingOwnerIndex,
+        buffer: &'a B,
+        physical_range: Range<u64>,
+        retention: &'a DeviceBufferRetention,
+    },
+    Dynamic {
+        window: SegmentBackingWindowView<'a, B>,
+        owner_base: usize,
+    },
+}
+
+/// One exact checked occurrence. The owner may retain a larger allocation;
+/// only this range, not that allocation's size, is authorized by this fact.
+pub struct SegmentBindingPhysicalRegionView<'a, B> {
+    buffer: &'a B,
+    physical_range: Range<u64>,
+    logical_offset_bytes: u64,
+    retention: &'a DeviceBufferRetention,
+    owner_index: Option<SegmentBindingOwnerIndex>,
+}
+
+impl<'a, B> SegmentBindingPhysicalRegionView<'a, B> {
+    pub fn borrowed_buffer_and_physical_range(
+        &self,
+    ) -> (&'a B, Range<u64>, &'a DeviceBufferRetention) {
+        (self.buffer, self.physical_range.clone(), self.retention)
+    }
+
+    pub fn buffer_and_physical_range(&self) -> (&'a B, Range<u64>, DeviceBufferRetention) {
+        (
+            self.buffer,
+            self.physical_range.clone(),
+            self.retention.clone(),
+        )
+    }
+
+    pub const fn owner_index(&self) -> Option<SegmentBindingOwnerIndex> {
+        self.owner_index
+    }
+
+    pub const fn logical_offset_bytes(&self) -> u64 {
+        self.logical_offset_bytes
+    }
+
+    pub fn length_bytes(&self) -> u64 {
+        self.physical_range.end - self.physical_range.start
+    }
+}
+
+pub struct SegmentBindingPhysicalRegions<'a, B> {
+    source: &'a SegmentBindingPhysicalSource<'a, B>,
+    next: usize,
+    len: usize,
+}
+
+impl<'a, B> Iterator for SegmentBindingPhysicalRegions<'a, B> {
+    type Item = SegmentBindingPhysicalRegionView<'a, B>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.len {
+            return None;
+        }
+        let result = match self.source {
+            SegmentBindingPhysicalSource::Legacy(regions) => {
+                let region = regions.get(self.next)?;
+                SegmentBindingPhysicalRegionView {
+                    buffer: region.buffer,
+                    physical_range: region.physical_range.clone(),
+                    logical_offset_bytes: region.logical_offset_bytes,
+                    retention: &region.retention,
+                    owner_index: None,
+                }
+            }
+            SegmentBindingPhysicalSource::Plan {
+                owner_index,
+                buffer,
+                physical_range,
+                retention,
+            } => SegmentBindingPhysicalRegionView {
+                buffer: *buffer,
+                physical_range: physical_range.clone(),
+                logical_offset_bytes: 0,
+                retention: *retention,
+                owner_index: Some(*owner_index),
+            },
+            SegmentBindingPhysicalSource::Dynamic { window, owner_base } => {
+                let region = window.physical_region(self.next)?;
+                let (buffer, physical_range, retention) =
+                    region.borrowed_buffer_and_physical_range();
+                SegmentBindingPhysicalRegionView {
+                    buffer,
+                    physical_range,
+                    logical_offset_bytes: region.logical_offset_bytes(),
+                    retention,
+                    // The complete owner table length was checked before any
+                    // projection was built; binding indices belong to it.
+                    owner_index: Some(SegmentBindingOwnerIndex(
+                        owner_base + region.binding_index(),
+                    )),
+                }
+            }
+        };
+        self.next += 1;
+        Some(result)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<B> ExactSizeIterator for SegmentBindingPhysicalRegions<'_, B> {}
+impl<B> std::iter::FusedIterator for SegmentBindingPhysicalRegions<'_, B> {}
 
 impl<B> PreparedSegmentBindingRegion<'_, B> {
     pub fn descriptor(&self) -> &BufferDescriptor {
@@ -191,8 +341,17 @@ impl<B> PreparedSegmentBindingRegion<'_, B> {
     pub fn storage_kind(&self) -> OperationBufferStorageKind {
         self.storage_kind
     }
-    pub fn physical_regions(&self) -> &[SegmentBindingPhysicalRegion<'_, B>] {
-        &self.regions
+    pub fn physical_regions(&self) -> SegmentBindingPhysicalRegions<'_, B> {
+        let len = match &self.source {
+            SegmentBindingPhysicalSource::Legacy(regions) => regions.len(),
+            SegmentBindingPhysicalSource::Plan { .. } => 1,
+            SegmentBindingPhysicalSource::Dynamic { window, .. } => window.region_count(),
+        };
+        SegmentBindingPhysicalRegions {
+            source: &self.source,
+            next: 0,
+            len,
+        }
     }
 }
 
@@ -256,10 +415,29 @@ impl<B> PreparedSegmentBindingNode<'_, B> {
 }
 
 pub struct PreparedSegmentBindingPatch<'a, B> {
+    pub(crate) owner_view_mode: SegmentBindingOwnerViewMode,
+    pub(crate) owners: Vec<SegmentBindingOwnerView<'a, B>>,
     pub(crate) nodes: Vec<PreparedSegmentBindingNode<'a, B>>,
 }
 
 impl<'a, B> PreparedSegmentBindingPatch<'a, B> {
+    pub const fn owner_view_mode(&self) -> SegmentBindingOwnerViewMode {
+        self.owner_view_mode
+    }
+
+    pub fn owners(&self) -> &[SegmentBindingOwnerView<'a, B>] {
+        &self.owners
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<SegmentBindingOwnerView<'a, B>>,
+        Vec<PreparedSegmentBindingNode<'a, B>>,
+    ) {
+        (self.owners, self.nodes)
+    }
+
     pub fn nodes(&self) -> &[PreparedSegmentBindingNode<'a, B>] {
         &self.nodes
     }

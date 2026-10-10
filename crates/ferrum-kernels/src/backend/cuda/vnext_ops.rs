@@ -125,6 +125,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
         include_str!("vnext_runtime/binding_scatter.rs").as_bytes(),
         include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
+        include_str!("vnext_runtime/segment_owners.rs").as_bytes(),
         include_str!("../program_binding_rows.rs").as_bytes(),
         include_str!("../program_binding_upload.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
@@ -1050,6 +1051,7 @@ impl CudaVNextComposition {
         purpose: CudaCompositionPurpose,
         upload_strategy: ProgramBindingUploadStrategy,
         oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
@@ -1065,7 +1067,8 @@ impl CudaVNextComposition {
                     CudaDeviceRuntime::new_for_native_catalog(config)?
                 }
             }
-            .with_segment_binding_oracle(oracle),
+            .with_segment_binding_oracle(oracle)
+            .with_segment_binding_owner_view_mode(owner_view_mode),
         );
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[allow(unused_mut)]
@@ -1096,6 +1099,7 @@ impl CudaVNextComposition {
                 q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
                 include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
+                include_str!("vnext_runtime/segment_owners.rs").as_bytes(),
                 include_str!("../program_binding_rows.rs").as_bytes(),
                 include_str!("../program_binding_upload.rs").as_bytes(),
                 CUDA_ENGINE_PROVIDER_ID.as_bytes(),
@@ -1154,6 +1158,25 @@ impl CudaVNextComposition {
         upload_strategy: ProgramBindingUploadStrategy,
         oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_segment_binding_owner_view_mode(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+        )
+    }
+
+    /// Explicit representation diagnostic; existing factories remain Legacy.
+    pub fn create_with_segment_binding_owner_view_mode(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let composition = Self::prepare(
             ordinal,
             device_id,
@@ -1161,6 +1184,7 @@ impl CudaVNextComposition {
             CudaCompositionPurpose::Execution,
             upload_strategy,
             oracle,
+            owner_view_mode,
         )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
@@ -1255,6 +1279,7 @@ pub fn cuda_validated_native_operator_catalog_input(
         CudaCompositionPurpose::Execution,
         ProgramBindingUploadStrategy::Sparse,
         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+        ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
     )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
@@ -1278,6 +1303,7 @@ pub fn cuda_native_operator_catalog_input(
         CudaCompositionPurpose::NativeCatalogDeclaration,
         ProgramBindingUploadStrategy::Sparse,
         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+        ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }

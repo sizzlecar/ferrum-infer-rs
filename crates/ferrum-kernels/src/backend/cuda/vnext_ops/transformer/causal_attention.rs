@@ -4723,15 +4723,40 @@ fn binding_addresses(
     let table_entries_usize = usize::try_from(table_entries)
         .map_err(|_| "causal attention address-table count is negative".to_owned())?;
     let mut addresses = Vec::with_capacity(table_entries_usize);
+    visit_binding_addresses(
+        layout,
+        table_entries,
+        page_addresses.len(),
+        |index| {
+            page_addresses.get(index).copied().ok_or_else(|| {
+                "causal attention vLLM address table exceeds retained pages".to_owned()
+            })
+        },
+        |address| addresses.push(address),
+    )?;
+    Ok(addresses)
+}
+
+fn visit_binding_addresses(
+    layout: CausalKvLayout,
+    table_entries: i32,
+    page_count: usize,
+    mut page_address: impl FnMut(usize) -> Result<u64, String>,
+    mut emit: impl FnMut(u64),
+) -> Result<(), String> {
+    let table_entries_usize = usize::try_from(table_entries)
+        .map_err(|_| "causal attention address-table count is negative".to_owned())?;
     match layout {
         CausalKvLayout::TokenMajorPages => {
-            if table_entries_usize != page_addresses.len() {
+            if table_entries_usize != page_count {
                 return Err(
                     "token-major causal attention table does not match its retained pages"
                         .to_owned(),
                 );
             }
-            addresses.extend_from_slice(page_addresses);
+            for index in 0..page_count {
+                emit(page_address(index)?);
+            }
         }
         CausalKvLayout::VllmBlocks16 {
             combined_block_bytes,
@@ -4746,11 +4771,13 @@ fn binding_addresses(
                 return Err("causal attention vLLM block geometry is invalid".to_owned());
             }
             for logical_block in 0..table_entries_usize {
-                let page = *page_addresses
-                    .get(logical_block / blocks_per_page)
-                    .ok_or_else(|| {
+                let page_index = logical_block / blocks_per_page;
+                if page_index >= page_count {
+                    return Err(
                         "causal attention vLLM address table exceeds retained pages".to_owned()
-                    })?;
+                    );
+                }
+                let page = page_address(page_index)?;
                 let offset = u64::try_from(logical_block % blocks_per_page)
                     .ok()
                     .and_then(|block| block.checked_mul(combined_block_bytes))
@@ -4760,7 +4787,7 @@ fn binding_addresses(
                             .is_some_and(|end| end <= VNEXT_KV_PAGE_BYTES)
                     })
                     .ok_or_else(|| "causal attention vLLM block offset overflows".to_owned())?;
-                addresses.push(
+                emit(
                     page.checked_add(offset).ok_or_else(|| {
                         "causal attention vLLM block address overflows".to_owned()
                     })?,
@@ -4768,7 +4795,7 @@ fn binding_addresses(
             }
         }
     }
-    Ok(addresses)
+    Ok(())
 }
 
 fn validate_signature(

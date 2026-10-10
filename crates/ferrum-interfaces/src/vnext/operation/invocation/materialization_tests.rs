@@ -21,6 +21,8 @@ mod segment_compile_tests;
 mod segment_dependency_tests;
 #[path = "segment_hot_tests.rs"]
 mod segment_hot_tests;
+#[path = "segment_owner_tests.rs"]
+mod segment_owner_tests;
 #[path = "segment_publication_tests.rs"]
 mod segment_publication_tests;
 

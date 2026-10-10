@@ -134,3 +134,56 @@ pub(in crate::backend::cuda::vnext_ops) fn encode(
     .map_err(|e| e.to_string())?;
     Ok(EncodedReusableExecutionBindings::empty().with_program_binding(command))
 }
+
+pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
+    node: &PreparedSegmentBindingNode<'_, CudaDeviceBuffer>,
+    recipe: &GatedDeltaRecipe,
+    owners: &mut crate::backend::cuda::vnext_runtime::CudaSegmentOwnerBuilder<'_>,
+) -> Result<segment::PendingBinding, String> {
+    if node.participant_count() != recipe.participants || recipe.participants == 0 {
+        return Err("segment recurrent participant shape differs from cold geometry".into());
+    }
+    let destination = segment::shared_borrowed_region(node, 2)?;
+    let layout = StateBindingLayout::new(recipe.participants)?;
+    let mut writes = Vec::with_capacity(recipe.participants);
+    let mut ranges = Vec::with_capacity(recipe.participants.saturating_mul(2));
+    for participant in 0..recipe.participants {
+        let conv = segment::indexed_contiguous_region(node, participant, 0, owners)?;
+        let delta = segment::indexed_contiguous_region(node, participant, 1, owners)?;
+        let conv_view = owners.region(&conv).map_err(|e| e.to_string())?;
+        let delta_view = owners.region(&delta).map_err(|e| e.to_string())?;
+        if conv_view.element_type() != ElementType::F16
+            || conv_view.length_bytes() != recipe.conv_bytes
+            || delta_view.element_type() != ElementType::F32
+            || delta_view.length_bytes() != recipe.delta_bytes
+        {
+            return Err("segment recurrent state differs from admitted geometry".into());
+        }
+        let mut payload = Vec::with_capacity(STATE_BINDING_SLOT_BYTES as usize);
+        payload.extend_from_slice(&conv_view.device_ptr().to_le_bytes());
+        payload.extend_from_slice(&delta_view.device_ptr().to_le_bytes());
+        writes.push(
+            super::super::CudaProgramBindingWrite::new(
+                layout.offset(participant)?,
+                payload.into_boxed_slice(),
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        ranges.push(conv);
+        ranges.push(delta);
+    }
+    Ok(segment::PendingBinding {
+        operation: "vnext_gated_delta_recurrent_attention_bindings",
+        binding: node
+            .program_binding()
+            .ok_or("segment recurrent binding slot is absent")?
+            .clone(),
+        destination,
+        writes,
+        ranges,
+        numerical_status: None,
+        participants: u32::try_from(recipe.participants)
+            .map_err(|_| "segment participant count exceeds u32")?,
+        tokens: node.work_shape().immediate_tokens(),
+    })
+}

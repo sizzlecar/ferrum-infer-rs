@@ -54,6 +54,9 @@ mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
 mod segment_oracle;
+mod segment_owners;
+use segment_owners::CudaProgramBindingRetention;
+pub(crate) use segment_owners::{CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, CudaSegmentRange};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -546,7 +549,7 @@ struct CudaProgramBindingPatch {
     binding: ProgramBindingNodeBinding,
     destination: CudaBufferRegion,
     writes: Vec<CudaProgramBindingWrite>,
-    fence_dependencies: Vec<CudaBufferRegion>,
+    retention: CudaProgramBindingRetention,
 }
 
 struct CudaProgramBindingTransfer {
@@ -624,6 +627,8 @@ pub struct CudaDeviceCommand {
     transfer_command_count: u64,
     executable: Option<Arc<CudaCommandExecutable>>,
     fence_dependencies: Vec<CudaBufferRegion>,
+    // Submission-specific ownership must never enter a cached executable.
+    binding_owner_tables: Vec<Arc<CudaSegmentOwnerTable>>,
     replay_key: Option<CudaCommandReplayKey>,
     reusable_address_scope: Option<DeviceReusableAddressScope>,
     replay_gap_reason: Option<DeviceReusableExecutionProgramGapReason>,
@@ -782,6 +787,7 @@ impl CudaDeviceCommand {
                 ))),
             })),
             fence_dependencies: Vec::new(),
+            binding_owner_tables: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
@@ -993,6 +999,7 @@ impl CudaDeviceCommand {
                 Box::new(enqueue),
             ))),
             fence_dependencies,
+            binding_owner_tables: Vec::new(),
             replay_key,
             reusable_address_scope,
             replay_gap_reason,
@@ -1036,6 +1043,7 @@ impl CudaDeviceCommand {
                 Box::new(enqueue),
             ))),
             fence_dependencies,
+            binding_owner_tables: Vec::new(),
             replay_key,
             reusable_address_scope,
             replay_gap_reason,
@@ -1068,6 +1076,7 @@ impl CudaDeviceCommand {
             transfer_command_count: 1,
             executable: Some(executable),
             fence_dependencies: Vec::new(),
+            binding_owner_tables: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
@@ -1081,11 +1090,52 @@ impl CudaDeviceCommand {
         operation: &'static str,
         binding: ProgramBindingNodeBinding,
         destination: CudaBufferRegion,
-        mut writes: Vec<CudaProgramBindingWrite>,
+        writes: Vec<CudaProgramBindingWrite>,
         fence_dependencies: Vec<CudaBufferRegion>,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let runtime_instance = destination.runtime_instance;
         validate_fence_dependencies(runtime_instance, &fence_dependencies)?;
+        Self::program_binding_patch_with_retention(
+            operation,
+            binding,
+            destination,
+            writes,
+            CudaProgramBindingRetention::Legacy(fence_dependencies),
+        )
+    }
+
+    pub(crate) fn indexed_program_binding_patch(
+        operation: &'static str,
+        binding: ProgramBindingNodeBinding,
+        destination: CudaBufferRegion,
+        writes: Vec<CudaProgramBindingWrite>,
+        owners: Arc<CudaSegmentOwnerTable>,
+        ranges: Vec<CudaSegmentRange>,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        for range in &ranges {
+            if owners.region(range)?.runtime_instance != destination.runtime_instance {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "segment owner belongs to another CUDA runtime",
+                ));
+            }
+        }
+        Self::program_binding_patch_with_retention(
+            operation,
+            binding,
+            destination,
+            writes,
+            CudaProgramBindingRetention::Indexed { owners, ranges },
+        )
+    }
+
+    fn program_binding_patch_with_retention(
+        operation: &'static str,
+        binding: ProgramBindingNodeBinding,
+        destination: CudaBufferRegion,
+        mut writes: Vec<CudaProgramBindingWrite>,
+        retention: CudaProgramBindingRetention,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let runtime_instance = destination.runtime_instance;
         let slot = binding.slot();
         if destination.element_type != ElementType::U8
             || destination.length_bytes == 0
@@ -1128,6 +1178,7 @@ impl CudaDeviceCommand {
             transfer_command_count: 0,
             executable: None,
             fence_dependencies: Vec::new(),
+            binding_owner_tables: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
@@ -1135,7 +1186,7 @@ impl CudaDeviceCommand {
                 binding,
                 destination,
                 writes,
-                fence_dependencies,
+                retention,
             }),
             reusable_execution: None,
             completion_checks: Vec::new(),
@@ -1221,6 +1272,7 @@ impl CudaDeviceCommand {
             transfer_command_count: 0,
             executable: Some(executable),
             fence_dependencies: Vec::new(),
+            binding_owner_tables: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
@@ -1345,6 +1397,10 @@ impl CudaDeviceCommand {
         }
 
         let mut fence_dependencies = Vec::new();
+        let mut binding_owner_tables = commands
+            .iter_mut()
+            .flat_map(|command| std::mem::take(&mut command.binding_owner_tables))
+            .collect::<Vec<_>>();
         let mut arena_writes = Vec::new();
         let mut upload_plan = DeviceProgramBindingUploadSnapshot {
             physical_arena_bytes: layout_physical_size_bytes,
@@ -1405,7 +1461,12 @@ impl CudaDeviceCommand {
                     })?;
                 arena_writes.push(write);
             }
-            fence_dependencies.extend(patch.fence_dependencies);
+            match patch.retention {
+                CudaProgramBindingRetention::Legacy(regions) => fence_dependencies.extend(regions),
+                CudaProgramBindingRetention::Indexed { owners, .. } => {
+                    binding_owner_tables.push(owners)
+                }
+            }
         }
 
         let transfers =
@@ -1516,6 +1577,7 @@ impl CudaDeviceCommand {
                 transfer_command_count: 1,
                 executable: Some(executable),
                 fence_dependencies,
+                binding_owner_tables,
                 replay_key: None,
                 reusable_address_scope: None,
                 replay_gap_reason: None,
@@ -1601,6 +1663,7 @@ impl CudaDeviceCommand {
             transfer_command_count,
             executable: Some(executable),
             fence_dependencies,
+            binding_owner_tables,
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
@@ -1611,7 +1674,7 @@ impl CudaDeviceCommand {
     }
 
     fn coalesced_opaque_program_bindings(
-        commands: Vec<Self>,
+        mut commands: Vec<Self>,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         let runtime_instance = commands[0].runtime_instance;
         let participant_start = commands[0].participant_start;
@@ -1643,6 +1706,10 @@ impl CudaDeviceCommand {
                     )
                 })
         })?;
+        let binding_owner_tables = commands
+            .iter_mut()
+            .flat_map(|command| std::mem::take(&mut command.binding_owner_tables))
+            .collect();
         let executable = Arc::new(CudaCommandExecutable::static_work(
             Vec::new(),
             Vec::new(),
@@ -1663,6 +1730,7 @@ impl CudaDeviceCommand {
             transfer_command_count,
             executable: Some(executable),
             fence_dependencies: Vec::new(),
+            binding_owner_tables,
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
@@ -2459,6 +2527,8 @@ pub struct CudaDeviceRuntime {
     binding_scatter: Option<binding_scatter::BindingScatter>,
     segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
     segment_binding_oracle_audited_nodes: AtomicU64,
+    segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+    segment_binding_indexed_encodes: AtomicU64,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -2658,6 +2728,9 @@ impl CudaDeviceRuntime {
             binding_scatter,
             segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
             segment_binding_oracle_audited_nodes: AtomicU64::new(0),
+            segment_binding_owner_view_mode:
+                ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+            segment_binding_indexed_encodes: AtomicU64::new(0),
             runtime_instance,
             context,
             allocation_stream,
@@ -2680,6 +2753,20 @@ impl CudaDeviceRuntime {
     pub fn segment_binding_oracle_audited_nodes(&self) -> u64 {
         self.segment_binding_oracle_audited_nodes
             .load(Ordering::Relaxed)
+    }
+
+    /// Explicit diagnostic selection; ordinary construction remains Legacy.
+    pub fn with_segment_binding_owner_view_mode(
+        mut self,
+        mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+    ) -> Self {
+        self.segment_binding_owner_view_mode = mode;
+        self
+    }
+
+    /// Successful indexed host encodes, not submissions or GPU completions.
+    pub fn segment_binding_indexed_encodes(&self) -> u64 {
+        self.segment_binding_indexed_encodes.load(Ordering::Relaxed)
     }
 
     pub(super) fn program_binding_upload_strategy(&self) -> ProgramBindingUploadStrategy {
@@ -3935,7 +4022,23 @@ impl DeviceRuntime for CudaDeviceRuntime {
         Option<Vec<ferrum_interfaces::vnext::EncodedSegmentBindingNode<Self::Command>>>,
         Self::Error,
     > {
-        super::vnext_ops::encode_segment_bindings(patch)
+        let indexed = patch.owner_view_mode()
+            == ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed;
+        let encoded = super::vnext_ops::encode_segment_bindings(patch)?;
+        if indexed && encoded.is_some() {
+            self.segment_binding_indexed_encodes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| CudaDeviceRuntimeError::contract("indexed segment count exhausted"))?;
+        }
+        Ok(encoded)
+    }
+
+    fn segment_binding_owner_view_mode(
+        &self,
+    ) -> ferrum_interfaces::vnext::SegmentBindingOwnerViewMode {
+        self.segment_binding_owner_view_mode
     }
 
     fn segment_binding_oracle_mode(&self) -> ferrum_interfaces::vnext::SegmentBindingOracleMode {
@@ -5625,6 +5728,7 @@ mod tests {
                 Box::new(|_, _, _, _| Ok(())),
             ))),
             fence_dependencies: Vec::new(),
+            binding_owner_tables: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,

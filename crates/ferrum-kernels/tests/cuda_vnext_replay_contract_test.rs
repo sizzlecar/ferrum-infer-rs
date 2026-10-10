@@ -319,7 +319,8 @@ fn typed_program_binding_patches_form_one_layout_owned_sparse_prelude() {
     assert!(RUNTIME_SOURCE.contains("executable: None"));
     assert!(!RUNTIME_SOURCE.contains("let mut host_patch = vec![0_u8; patch_bytes]"));
     assert!(!RUNTIME_SOURCE.contains("\"aggregate program binding upload\""));
-    assert!(RUNTIME_SOURCE.contains("fence_dependencies.extend(patch.fence_dependencies)"));
+    // Retained ownership may use legacy regions or an indexed command sidecar.
+    // Its lifetime must be checked by execution tests, not a field-name match.
 }
 
 #[test]

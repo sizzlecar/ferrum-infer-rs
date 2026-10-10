@@ -121,14 +121,14 @@ fn check_binding_controls(
     // These are real post-upload row readbacks, not a same-wave host-byte oracle.
 }
 
-fn compare(kind: AttentionKind) {
+fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
     let modes = [
         InvocationPreparationStrategy::IdentityProjection,
         InvocationPreparationStrategy::DecodeSegment,
     ];
     let maximum_tokens = 8192;
     let fixtures = modes.map(|mode| {
-        Fixture::for_family_with_segment_oracle(
+        Fixture::for_family_with_segment_owner_views(
             kind,
             true,
             2,
@@ -139,8 +139,26 @@ fn compare(kind: AttentionKind) {
             } else {
                 SegmentBindingOracleMode::Disabled
             },
+            if mode == InvocationPreparationStrategy::DecodeSegment {
+                owner_mode
+            } else {
+                SegmentBindingOwnerViewMode::Legacy
+            },
         )
     });
+    for (arm, fixture) in fixtures.iter().enumerate() {
+        assert_eq!(
+            fixture
+                ._composition
+                ._runtime
+                .segment_binding_owner_view_mode(),
+            if arm == 1 {
+                owner_mode
+            } else {
+                SegmentBindingOwnerViewMode::Legacy
+            },
+        );
+    }
     let lead = if kind == AttentionKind::Causal { 60 } else { 0 };
     let joint_waves = 17;
     let tokens: Vec<Arc<[u32]>> = (0..2)
@@ -230,6 +248,10 @@ fn compare(kind: AttentionKind) {
                 ._composition
                 ._runtime
                 .segment_binding_oracle_audited_nodes();
+            let indexed_before = fixture
+                ._composition
+                ._runtime
+                .segment_binding_indexed_encodes();
             let observation = fixture.execute_participant_ranges_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
@@ -242,6 +264,20 @@ fn compare(kind: AttentionKind) {
                 Some(row_bytes),
             );
             let stats = sinks[arm].last();
+            let indexed_encodes = fixture
+                ._composition
+                ._runtime
+                .segment_binding_indexed_encodes()
+                - indexed_before;
+            assert_eq!(
+                indexed_encodes,
+                if arm == 1 && owner_mode == SegmentBindingOwnerViewMode::Indexed {
+                    stats.segment_hits
+                } else {
+                    0
+                },
+                "each actual Indexed hot hit must use the indexed encoder; this counts host encoding, not GPU completion"
+            );
             let program_id = observation
                 .reusable_program_id
                 .as_ref()
@@ -316,6 +352,8 @@ fn compare(kind: AttentionKind) {
                 "{}",
                 serde_json::json!({"kind":"decode_segment_wave", "attention":format!("{kind:?}"), "strategy":modes[arm],
                 "ranges":ranges, "physical_kv_pages":pages, "reusable_program_id":program_id,
+                "owner_view_mode":format!("{:?}",fixture._composition._runtime.segment_binding_owner_view_mode()),
+                "indexed_host_encodes":indexed_encodes,
                 "program_immediate_pages":program_id.immediate_pages(), "published":observation.segment_published,
                 "hits":stats.segment_hits, "misses":stats.segment_misses, "encoded_nodes":stats.segment_encoded_nodes,
                 "parts_materialized":stats.parts_materialized})
@@ -373,6 +411,14 @@ fn compare(kind: AttentionKind) {
                 assert_ne!(session.sequence_authority(), old_authorities[arm][index]);
                 fixture.extend(session, Arc::from(&t[..=position]));
             }
+            let indexed_before = fixture
+                ._composition
+                ._runtime
+                .segment_binding_indexed_encodes();
+            let audited_before = fixture
+                ._composition
+                ._runtime
+                .segment_binding_oracle_audited_nodes();
             let output = fixture.execute_participants_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
@@ -389,6 +435,28 @@ fn compare(kind: AttentionKind) {
             );
             let stats = sinks[arm].last();
             assert_eq!(stats.parts_materialized, 0);
+            assert_eq!(
+                fixture
+                    ._composition
+                    ._runtime
+                    .segment_binding_indexed_encodes()
+                    - indexed_before,
+                if arm == 1 && owner_mode == SegmentBindingOwnerViewMode::Indexed {
+                    stats.segment_hits
+                } else {
+                    0
+                },
+                "fresh requests must exercise the selected representation with fresh authority"
+            );
+            assert_eq!(
+                fixture
+                    ._composition
+                    ._runtime
+                    .segment_binding_oracle_audited_nodes()
+                    - audited_before,
+                stats.segment_encoded_nodes,
+                "fresh-request hot nodes must also pass the entire same-wave oracle"
+            );
             if arm == 1 {
                 fresh_hits += stats.segment_hits;
             }
@@ -417,10 +485,27 @@ fn compare(kind: AttentionKind) {
         ._runtime
         .segment_binding_oracle_audited_nodes();
     assert!(audited_nodes > 0);
+    let indexed_encodes = fixtures[1]
+        ._composition
+        ._runtime
+        .segment_binding_indexed_encodes();
+    assert_eq!(
+        fixtures[0]
+            ._composition
+            ._runtime
+            .segment_binding_indexed_encodes(),
+        0
+    );
+    if owner_mode == SegmentBindingOwnerViewMode::Indexed {
+        assert!(indexed_encodes > 0);
+    } else {
+        assert_eq!(indexed_encodes, 0);
+    }
     println!(
         "{}",
         serde_json::json!({"kind":"decode_segment_actual_cuda", "attention":format!("{kind:?}"),
         "participants":2, "lead_waves":lead, "joint_waves":joint_waves, "fresh_request_waves":8,
+        "owner_view_mode":format!("{owner_mode:?}"), "indexed_host_encodes":indexed_encodes,
         "hot_before_extent_change":hot_before_growth, "hot_after_extent_change":hot_after_growth,
         "publications":publications, "fresh_request_hits":fresh_hits, "full_output_and_valid_state_equal":true,
         "same_wave_oracle_audited_nodes":audited_nodes, "binding_readback_scope":"exact current control/status bytes and nonzero pointers", "same_wave_oracle_scope":"all encoded patch bytes/owners/ranges/status/attribution and fresh Plan dependency identities; reference never submitted"})
@@ -430,11 +515,29 @@ fn compare(kind: AttentionKind) {
 #[test]
 #[ignore = "requires exclusive CUDA and actual whole-segment publication/replay"]
 fn decode_segment_gdn_matches_ip_across_fresh_frames_and_requests() {
-    compare(AttentionKind::GatedDelta);
+    compare(
+        AttentionKind::GatedDelta,
+        SegmentBindingOwnerViewMode::Legacy,
+    );
 }
 
 #[test]
 #[ignore = "requires exclusive CUDA and actual whole-segment publication/replay"]
 fn decode_segment_causal_matches_ip_across_hot_physical_kv_extension() {
-    compare(AttentionKind::Causal);
+    compare(AttentionKind::Causal, SegmentBindingOwnerViewMode::Legacy);
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA, indexed owner views and the complete same-wave reference oracle"]
+fn decode_segment_indexed_gdn_matches_ip_across_fresh_frames_and_requests() {
+    compare(
+        AttentionKind::GatedDelta,
+        SegmentBindingOwnerViewMode::Indexed,
+    );
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA, indexed owner views and actual hot physical KV extension"]
+fn decode_segment_indexed_causal_matches_ip_across_hot_physical_kv_extension() {
+    compare(AttentionKind::Causal, SegmentBindingOwnerViewMode::Indexed);
 }

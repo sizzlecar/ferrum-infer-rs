@@ -249,6 +249,17 @@ pub struct SegmentBackingWindowView<'a, B> {
 }
 
 impl<'a, B> SegmentBackingWindowView<'a, B> {
+    pub(crate) fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    pub(crate) fn physical_region(&self, index: usize) -> Option<SegmentPhysicalRegion<'a, B>> {
+        self.regions.get(index).map(|region| SegmentPhysicalRegion {
+            binding: &self.batch.bindings[region.binding_index],
+            region,
+        })
+    }
+
     pub fn physical_regions(
         &self,
     ) -> impl ExactSizeIterator<Item = SegmentPhysicalRegion<'a, B>> + 'a {
@@ -268,6 +279,21 @@ pub struct SegmentPhysicalRegion<'a, B> {
 }
 
 impl<'a, B> SegmentPhysicalRegion<'a, B> {
+    pub(crate) const fn binding_index(&self) -> usize {
+        self.region.binding_index
+    }
+
+    pub(crate) fn borrowed_buffer_and_physical_range(
+        &self,
+    ) -> (&'a B, Range<u64>, &'a DeviceBufferRetention) {
+        (
+            self.binding.buffer(),
+            self.region.physical_offset_bytes
+                ..self.region.physical_offset_bytes + self.region.length_bytes,
+            self.binding.retention_ref(),
+        )
+    }
+
     pub const fn logical_offset_bytes(&self) -> u64 {
         self.region.logical_offset_bytes
     }

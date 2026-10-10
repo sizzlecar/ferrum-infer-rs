@@ -70,6 +70,26 @@ impl Fixture {
         upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
         oracle: SegmentBindingOracleMode,
     ) -> Self {
+        Self::for_family_with_segment_owner_views(
+            kind,
+            reusable,
+            participants,
+            definition,
+            upload_strategy,
+            oracle,
+            SegmentBindingOwnerViewMode::Legacy,
+        )
+    }
+
+    fn for_family_with_segment_owner_views(
+        kind: AttentionKind,
+        reusable: bool,
+        participants: u32,
+        definition: Family,
+        upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
+        oracle: SegmentBindingOracleMode,
+        owner_mode: SegmentBindingOwnerViewMode,
+    ) -> Self {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let attention_arithmetic = definition.attention_arithmetic();
@@ -82,12 +102,13 @@ impl Fixture {
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
         let (runtime, registry, materializers, catalog) =
-            CudaVNextComposition::create_with_segment_binding_oracle(
+            CudaVNextComposition::create_with_segment_binding_owner_view_mode(
                 0,
                 id(format!("device.cuda.upstream-marker.{kind:?}")),
                 ferrum_types::AttentionExecutionPolicy::Portable,
                 upload_strategy,
                 oracle,
+                owner_mode,
             )
             .unwrap()
             .into_parts();

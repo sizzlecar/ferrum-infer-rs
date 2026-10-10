@@ -9,6 +9,7 @@ use super::foundation::invalid_operation;
 use super::invocation::{validate_segment_wave_authority, OperationInvocationResources};
 use super::preparation::SegmentPreparationMissReason;
 use super::retained_dependency::{issue_segment_plan_dependency, SegmentPlanDependencyInput};
+use super::segment_binding::SegmentBindingPhysicalSource;
 use super::segment_compile::{CompiledSegmentBindingRecipe, CompiledSegmentResourceSource};
 use crate::vnext::resource::{SegmentPlanResourceRequest, SegmentPlanResourceView};
 use crate::vnext::*;
@@ -491,6 +492,32 @@ where
         timing_sink,
         SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
     );
+    let owner_view_mode = runtime.segment_binding_owner_view_mode();
+    let mut owners = Vec::new();
+    if owner_view_mode == SegmentBindingOwnerViewMode::Indexed {
+        let owner_count = plan_views
+            .len()
+            .checked_add(backing.as_ref().map_or(0, |batch| batch.bindings().len()))
+            .ok_or_else(|| invalid_operation("segment owner table length overflows"))?;
+        owners
+            .try_reserve_exact(owner_count)
+            .map_err(|_| invalid_operation("segment owner view allocation failed"))?;
+        owners.extend(plan_views.iter().map(|plan| SegmentBindingOwnerView {
+            buffer: plan.leased.buffer(),
+            retention: &plan.retention,
+        }));
+        if let Some(backing) = &backing {
+            owners.extend(
+                backing
+                    .bindings()
+                    .iter()
+                    .map(|binding| SegmentBindingOwnerView {
+                        buffer: binding.buffer(),
+                        retention: binding.retention_ref(),
+                    }),
+            );
+        }
+    }
     let mut scopes = Vec::with_capacity(recipe.nodes.len());
     let mut patches = Vec::with_capacity(recipe.nodes.len());
     for (compiled, windows) in recipe.nodes.iter().zip(node_windows) {
@@ -524,43 +551,71 @@ where
         }
         let regions = windows
             .into_iter()
-            .map(|window| {
-                let regions = match window.source {
+            .map(|window| -> Result<_, VNextError> {
+                let source = match window.source {
                     RegionSource::Plan {
                         index,
                         offset,
                         length,
-                    } => vec![SegmentBindingPhysicalRegion {
-                        buffer: plan_views[index].leased.buffer(),
-                        physical_range: offset..offset + length,
-                        logical_offset_bytes: 0,
-                        retention: plan_views[index].retention.clone(),
-                    }],
-                    RegionSource::Dynamic(index) => backing
-                        .as_ref()
-                        .expect("dynamic window owns backing")
-                        .window(index)
-                        .expect("compiled window exists")
-                        .physical_regions()
-                        .map(|region| {
-                            let (buffer, physical_range, retention) =
-                                region.buffer_and_physical_range();
-                            SegmentBindingPhysicalRegion {
-                                buffer,
-                                physical_range,
-                                logical_offset_bytes: region.logical_offset_bytes(),
-                                retention,
+                    } => match owner_view_mode {
+                        SegmentBindingOwnerViewMode::Legacy => {
+                            SegmentBindingPhysicalSource::Legacy(vec![
+                                SegmentBindingPhysicalRegion {
+                                    buffer: plan_views[index].leased.buffer(),
+                                    physical_range: offset..offset + length,
+                                    logical_offset_bytes: 0,
+                                    retention: plan_views[index].retention.clone(),
+                                },
+                            ])
+                        }
+                        SegmentBindingOwnerViewMode::Indexed => {
+                            SegmentBindingPhysicalSource::Plan {
+                                owner_index: SegmentBindingOwnerIndex(index),
+                                buffer: plan_views[index].leased.buffer(),
+                                physical_range: offset..offset + length,
+                                retention: &plan_views[index].retention,
                             }
-                        })
-                        .collect(),
+                        }
+                    },
+                    RegionSource::Dynamic(index) => {
+                        let current = backing
+                            .as_ref()
+                            .and_then(|batch| batch.window(index))
+                            .ok_or_else(|| invalid_operation("segment dynamic window is absent"))?;
+                        match owner_view_mode {
+                            SegmentBindingOwnerViewMode::Legacy => {
+                                SegmentBindingPhysicalSource::Legacy(
+                                    current
+                                        .physical_regions()
+                                        .map(|region| {
+                                            let (buffer, physical_range, retention) =
+                                                region.buffer_and_physical_range();
+                                            SegmentBindingPhysicalRegion {
+                                                buffer,
+                                                physical_range,
+                                                logical_offset_bytes: region.logical_offset_bytes(),
+                                                retention,
+                                            }
+                                        })
+                                        .collect(),
+                                )
+                            }
+                            SegmentBindingOwnerViewMode::Indexed => {
+                                SegmentBindingPhysicalSource::Dynamic {
+                                    window: current,
+                                    owner_base: plan_views.len(),
+                                }
+                            }
+                        }
+                    }
                 };
-                PreparedSegmentBindingRegion {
+                Ok(PreparedSegmentBindingRegion {
                     descriptor: window.descriptor,
                     storage_kind: window.storage_kind,
-                    regions,
-                }
+                    source,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         patches.push(PreparedSegmentBindingNode {
             node_index: u32::try_from(compiled.node_index)
                 .map_err(|_| invalid_operation("segment node index exceeds u32"))?,
@@ -580,7 +635,11 @@ where
         SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
     );
     let Some(encoded) = runtime
-        .encode_segment_bindings(PreparedSegmentBindingPatch { nodes: patches })
+        .encode_segment_bindings(PreparedSegmentBindingPatch {
+            owner_view_mode,
+            owners,
+            nodes: patches,
+        })
         .map_err(|error| {
             invalid_operation(format!("whole segment binding encode failed: {error}"))
         })?

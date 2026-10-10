@@ -43,7 +43,7 @@ const SEGMENT_PHASES: [SubmissionWaveDispatchStage; 10] = [
     SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
 ];
 
-fn compile(
+pub(super) fn compile(
     fixture: &Fixture,
     wave: &PreparedStepSubmissionWave<TestRuntime>,
 ) -> CompiledSegmentBindingRecipe {
@@ -116,7 +116,18 @@ fn oracle(
     active: &[TrustedActiveSequenceBinding],
     recipe: &CompiledSegmentBindingRecipe,
 ) -> Vec<SegmentTestRegion> {
+    oracle_with_owners(fixture, wave, identity, active, recipe).0
+}
+
+pub(super) fn oracle_with_owners(
+    fixture: &Fixture,
+    wave: &PreparedStepSubmissionWave<TestRuntime>,
+    identity: &BatchOperationIdentity,
+    active: &[TrustedActiveSequenceBinding],
+    recipe: &CompiledSegmentBindingRecipe,
+) -> (Vec<SegmentTestRegion>, Vec<DeviceBufferRetention>) {
     let mut result = Vec::new();
+    let mut owners = Vec::new();
     for compiled in &recipe.nodes {
         let provider = fixture
             .registry
@@ -159,7 +170,8 @@ fn oracle(
                     .unwrap()
                     .iter()
                     .map(|part| {
-                        let (buffer, range, _retention) = part.buffer_and_physical_range();
+                        let (buffer, range, retention) = part.buffer_and_physical_range();
+                        owners.push(retention);
                         (
                             buffer as *const TestBuffer as usize,
                             range,
@@ -177,7 +189,7 @@ fn oracle(
             }
         }
     }
-    result
+    (result, owners)
 }
 
 #[test]

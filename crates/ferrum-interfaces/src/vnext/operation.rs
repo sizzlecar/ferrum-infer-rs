@@ -30,8 +30,10 @@ mod segment_oracle;
 pub use segment_binding::{
     EncodedSegmentBindingNode, PreparedSegmentBindingNode, PreparedSegmentBindingPatch,
     PreparedSegmentBindingRegion, SegmentBindingDeclaration, SegmentBindingDependency,
-    SegmentBindingOracleCommands, SegmentBindingOracleMode, SegmentBindingPhysicalRegion,
-    SegmentBindingRegionExtent, SegmentBindingRegionRequest, SegmentBindingRegionSelector,
+    SegmentBindingOracleCommands, SegmentBindingOracleMode, SegmentBindingOwnerIndex,
+    SegmentBindingOwnerView, SegmentBindingOwnerViewMode, SegmentBindingPhysicalRegion,
+    SegmentBindingPhysicalRegionView, SegmentBindingPhysicalRegions, SegmentBindingRegionExtent,
+    SegmentBindingRegionRequest, SegmentBindingRegionSelector,
 };
 mod semantic;
 mod storage_profile;

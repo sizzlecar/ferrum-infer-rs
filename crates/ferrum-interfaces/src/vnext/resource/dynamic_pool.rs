@@ -2230,6 +2230,10 @@ impl<B> LogicalBackingSegmentBinding<B> {
     pub(crate) fn retention(&self) -> DeviceBufferRetention {
         self.retention.clone()
     }
+
+    pub(crate) fn retention_ref(&self) -> &DeviceBufferRetention {
+        &self.retention
+    }
 }
 
 impl<'a, B> LogicalBackingBufferView<'a, B> {

@@ -537,6 +537,18 @@ pub enum DeviceReusableAddressScope {
 }
 
 impl DeviceBufferRetention {
+    /// Compares the exact retained owners without exposing or issuing ownership.
+    /// Equal allocation addresses or descriptors do not establish this identity.
+    pub fn same_owners(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self._primary_owner, &other._primary_owner)
+            && match (&self._secondary_owner, &other._secondary_owner) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+            && self.reusable_address_scope == other.reusable_address_scope
+    }
+
     pub(crate) fn plan<T>(owner: Arc<T>) -> Self
     where
         T: Send + Sync + 'static,
@@ -3642,6 +3654,12 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         _patch: super::PreparedSegmentBindingPatch<'_, Self::Buffer>,
     ) -> Result<Option<Vec<super::EncodedSegmentBindingNode<Self::Command>>>, Self::Error> {
         Ok(None)
+    }
+
+    /// Selects only the representation of this wave's freshly checked facts.
+    /// Neither representation permits reusing authority from another wave.
+    fn segment_binding_owner_view_mode(&self) -> super::SegmentBindingOwnerViewMode {
+        super::SegmentBindingOwnerViewMode::Legacy
     }
 
     /// Explicit diagnostic selection, immutable after runtime construction.

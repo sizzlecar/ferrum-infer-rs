@@ -3,16 +3,17 @@ use super::*;
 use ferrum_interfaces::vnext::SegmentBindingOracleCommands;
 
 fn same_region(a: &CudaBufferRegion, b: &CudaBufferRegion) -> bool {
-    Arc::ptr_eq(&a._allocation, &b._allocation)
-        && a.runtime_instance == b.runtime_instance
-        && a.device_ptr == b.device_ptr
-        && a.length_bytes == b.length_bytes
-        && a.element_type == b.element_type
-        && a.reusable_address_scope == b.reusable_address_scope
-        && a._core_retention.is_some() == b._core_retention.is_some()
+    a.borrowed().same_region(b.borrowed())
 }
 fn same_regions(a: &[CudaBufferRegion], b: &[CudaBufferRegion]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_region(a, b))
+}
+fn same_retention(a: &CudaProgramBindingRetention, b: &CudaProgramBindingRetention) -> bool {
+    a.len() == b.len()
+        && (0..a.len()).all(|index| match (a.region(index), b.region(index)) {
+            (Some(a), Some(b)) => a.same_region(b),
+            _ => false,
+        })
 }
 fn same_command(a: &CudaDeviceCommand, b: &CudaDeviceCommand) -> bool {
     if a.runtime_instance != b.runtime_instance
@@ -66,7 +67,7 @@ fn same_command(a: &CudaDeviceCommand, b: &CudaDeviceCommand) -> bool {
                 && a.binding.lane_slot_identity() == b.binding.lane_slot_identity()
                 && a.binding.slot() == b.binding.slot()
                 && same_region(&a.destination, &b.destination)
-                && same_regions(&a.fence_dependencies, &b.fence_dependencies)
+                && same_retention(&a.retention, &b.retention)
                 && a.writes.len() == b.writes.len()
                 && a.writes.iter().zip(&b.writes).all(|(a, b)| {
                     a.destination_offset_bytes == b.destination_offset_bytes

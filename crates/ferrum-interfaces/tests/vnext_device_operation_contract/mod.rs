@@ -1406,6 +1406,10 @@ pub(crate) struct RuntimeTrace {
     pub(crate) segment_foreign_runtime_metadata: bool,
     pub(crate) segment_encoder_enabled: bool,
     pub(crate) segment_oracle_enabled: bool,
+    pub(crate) segment_owner_view_mode: SegmentBindingOwnerViewMode,
+    pub(crate) segment_capture_owners: bool,
+    pub(crate) segment_owner_count: usize,
+    pub(crate) segment_retained_owners: Vec<DeviceBufferRetention>,
     pub(crate) segment_regions: Vec<SegmentTestRegion>,
     pub(crate) segment_entry: Option<DeviceReusableExecutionEntryIdentity>,
     pub(crate) segment_entry_error: bool,
@@ -1731,16 +1735,30 @@ impl DeviceRuntime for TestRuntime {
         }
     }
 
+    fn segment_binding_owner_view_mode(&self) -> SegmentBindingOwnerViewMode {
+        self.trace.lock().unwrap().segment_owner_view_mode
+    }
+
     fn encode_segment_bindings(
         &self,
         patch: PreparedSegmentBindingPatch<'_, Self::Buffer>,
     ) -> Result<Option<Vec<EncodedSegmentBindingNode<Self::Command>>>, Self::Error> {
-        if !self.trace.lock().unwrap().segment_encoder_enabled {
+        let (enabled, capture_owners) = {
+            let trace = self.trace.lock().unwrap();
+            (trace.segment_encoder_enabled, trace.segment_capture_owners)
+        };
+        if !enabled {
             return Ok(None);
         }
+        let mode = patch.owner_view_mode();
+        let (owners, nodes) = patch.into_parts();
+        if mode == SegmentBindingOwnerViewMode::Legacy {
+            assert!(owners.is_empty());
+        }
         let mut snapshots = Vec::new();
+        let mut retained_owners = Vec::new();
         let mut encoded = Vec::new();
-        for node in patch.into_nodes() {
+        for node in nodes {
             for participant in 0..node.participant_count() {
                 for region in 0..node.declaration().regions().len() {
                     let value = node
@@ -1749,9 +1767,22 @@ impl DeviceRuntime for TestRuntime {
                     let mut covered = 0_u64;
                     let physical = value
                         .physical_regions()
-                        .iter()
                         .map(|part| {
-                            let (buffer, range, _retention) = part.buffer_and_physical_range();
+                            let (buffer, range, retention) =
+                                part.borrowed_buffer_and_physical_range();
+                            match part.owner_index() {
+                                Some(index) => {
+                                    assert_eq!(mode, SegmentBindingOwnerViewMode::Indexed);
+                                    let (owner_buffer, owner_retention) =
+                                        owners[index.get()].buffer_and_retention();
+                                    assert!(std::ptr::eq(buffer, owner_buffer));
+                                    assert!(retention.same_owners(owner_retention));
+                                }
+                                None => assert_eq!(mode, SegmentBindingOwnerViewMode::Legacy),
+                            }
+                            if capture_owners {
+                                retained_owners.push(retention.clone());
+                            }
                             assert!(
                                 range.start < range.end
                                     && range.end <= buffer.descriptor.size_bytes
@@ -1779,7 +1810,10 @@ impl DeviceRuntime for TestRuntime {
                 bindings: EncodedReusableExecutionBindings::empty(),
             });
         }
-        self.trace.lock().unwrap().segment_regions = snapshots;
+        let mut trace = self.trace.lock().unwrap();
+        trace.segment_regions = snapshots;
+        trace.segment_owner_count = owners.len();
+        trace.segment_retained_owners = retained_owners;
         Ok(Some(encoded))
     }
 

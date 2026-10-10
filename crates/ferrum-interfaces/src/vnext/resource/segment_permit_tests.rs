@@ -86,6 +86,97 @@ fn windows(expected: &[SegmentBackingExpectation]) -> Vec<SegmentBackingWindow> 
 }
 
 #[test]
+fn segment_owner_identity_distinguishes_real_leases_and_retains_only_when_cloned() {
+    // Two declared resources make the real initial chunk 128 bytes. Merely
+    // setting a 256-byte maximum does not make that capacity resident.
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        2,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pools = &harness.root.dynamic_pools;
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let authorities = vec![claim_size(pools, pool, 64)];
+    let second = claim_size(pools, pool, 64);
+    let first_view = pools.view(&authorities[0]).unwrap();
+    let second_view = pools.view(&second).unwrap();
+    let first = &first_view.segment_bindings()[0];
+    let other = &second_view.segment_bindings()[0];
+    assert!(std::ptr::eq(first.buffer(), other.buffer()));
+    assert!(first.retention_ref().same_owners(&first.retention()));
+    assert!(!first.retention_ref().same_owners(other.retention_ref()));
+    // Reusing the same allocation and scalar range must never make distinct
+    // lease owners equal. The range is not part of opaque owner identity.
+    let same_range = first.segment().offset_bytes()
+        ..first.segment().offset_bytes() + first.segment().length_bytes();
+    let first_fact = (first.buffer(), same_range.clone(), first.retention());
+    let foreign_fact = (other.buffer(), same_range, other.retention());
+    assert!(std::ptr::eq(first_fact.0, foreign_fact.0));
+    assert_eq!(first_fact.1, foreign_fact.1);
+    assert!(!first_fact.2.same_owners(&foreign_fact.2));
+    drop(first_fact);
+    drop(foreign_fact);
+    drop(first_view);
+    drop(second_view);
+
+    let groups = [std::slice::from_ref(&authorities[0])];
+    let mut expected = expectations(&groups);
+    expected[0].logical_bytes = 32;
+    expected[0].logical_size_rule = SegmentLogicalSizeRule::AtLeast;
+    let mut requested = windows(&expected);
+    requested[0].offset_bytes = 16;
+    requested[0].length_bytes = 16;
+    let batch = pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .unwrap();
+    let lease_count = Arc::strong_count(&authorities[0].segment_lease);
+    let chunk_count = Arc::strong_count(&batch.bindings()[0].chunk);
+    let window = batch.window(0).unwrap();
+    let borrowed = window.physical_region(0).unwrap();
+    let (buffer, range, retention) = borrowed.borrowed_buffer_and_physical_range();
+    assert!(std::ptr::eq(buffer, batch.bindings()[0].buffer()));
+    let base = authorities[0].evidence.segments[0].offset_bytes();
+    assert_eq!(range, base + 16..base + 32);
+    assert_eq!(borrowed.logical_offset_bytes(), 0);
+    assert_eq!(window.region_count(), 1);
+    assert!(window.physical_region(1).is_none());
+    assert_eq!(
+        Arc::strong_count(&authorities[0].segment_lease),
+        lease_count
+    );
+    assert_eq!(Arc::strong_count(&batch.bindings()[0].chunk), chunk_count);
+    let retained = retention.clone();
+    let lease = Arc::downgrade(&authorities[0].segment_lease);
+    drop(batch);
+    requested[0].length_bytes = 17;
+    assert!(pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .is_err());
+    drop(second);
+    drop(authorities);
+    assert!(
+        lease.upgrade().is_some(),
+        "command-owned capability retains the live lease"
+    );
+    drop(retained);
+    assert!(
+        lease.upgrade().is_none(),
+        "borrowed metadata does not prolong ownership"
+    );
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn segment_permit_timing_flushes_after_two_pool_unlock_and_preserves_views() {
     let (harness, authorities) = two_pools();
     let pools = &harness.root.dynamic_pools;
