@@ -31,6 +31,10 @@ pub(super) fn declare(
         ElementType::F32,
     )?;
     let layout = StateBindingLayout::new(invocation.participants().len())?;
+    // Keep the same full admitted destination as the reference encoder, even
+    // when its physical view includes alignment beyond the live row span.
+    let binding_bytes =
+        super::super::shared_binding_region(invocation, layout.required_bytes)?.length_bytes();
     let request = |selector, bytes, element_type, alignment_bytes| SegmentBindingRegionRequest {
         selector,
         offset_bytes: 0,
@@ -61,7 +65,7 @@ pub(super) fn declare(
         ),
         request(
             SegmentBindingRegionSelector::ProgramBinding,
-            layout.required_bytes,
+            binding_bytes,
             ElementType::U8,
             1,
         ),

@@ -23,6 +23,10 @@ pub(super) fn declare(
         return Ok(None);
     }
     let layout = BindingLayout::new(shape, invocation.participants().len())?;
+    // The admitted view includes planner alignment beyond the live row span.
+    // Match the reference encoder's complete destination, without retaining it.
+    let binding_bytes =
+        super::super::shared_binding_region(invocation, layout.required_bytes)?.length_bytes();
     let mut regions = vec![
         SegmentBindingRegionRequest {
             selector: SegmentBindingRegionSelector::Value {
@@ -38,7 +42,7 @@ pub(super) fn declare(
         SegmentBindingRegionRequest {
             selector: SegmentBindingRegionSelector::ProgramBinding,
             offset_bytes: 0,
-            extent: SegmentBindingRegionExtent::Exact(layout.required_bytes),
+            extent: SegmentBindingRegionExtent::Exact(binding_bytes),
             element_type: ElementType::U8,
             alignment_bytes: 1,
         },
