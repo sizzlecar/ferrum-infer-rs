@@ -4,6 +4,8 @@
 use super::*;
 use std::time::Instant;
 
+#[path = "timing/attention_shapes.rs"]
+mod attention_shapes;
 #[path = "timing/rowtile.rs"]
 mod rowtile;
 
@@ -265,149 +267,172 @@ impl Route {
     }
 }
 
-#[test]
-#[ignore = "exclusive CUDA MarkerV2 paired diagnostic; run correctness first"]
-fn marker_v2_m8_mmq_mmvq_paired_working_sets() {
+fn paired_device_l2_bytes() -> i32 {
     let _ = caps();
     let mut l2 = 0;
     unsafe {
         ok(cudaDeviceGetAttribute(&mut l2, 38, 0));
     }
     assert!(l2 > 0);
+    l2
+}
+
+fn paired_m8_working_sets(
+    format: UpstreamLinearFormat,
+    k: usize,
+    n: usize,
+    l2: i32,
+    modes: &[&str],
+    experiment: &str,
+) {
     const WARM: usize = 8;
     const PAIRS: usize = 16;
+    let m = 8;
+    let host_weights = weights(format, k, n);
+    let weight_bytes = host_weights.len();
+    for &mode in modes {
+        let count = if mode == "resident" {
+            1
+        } else {
+            3 * l2 as usize / weight_bytes + 1
+        };
+        let stride = weight_bytes.div_ceil(256) * 256;
+        let allocations = if mode == "arena_offset_ring" {
+            vec![Buffer::new(count * stride)]
+        } else {
+            (0..count)
+                .map(|_| Buffer::new(weight_bytes))
+                .collect::<Vec<_>>()
+        };
+        let addresses = (0..count)
+            .map(|index| unsafe {
+                if mode == "arena_offset_ring" {
+                    allocations[0].ptr.add(index * stride)
+                } else {
+                    allocations[index].ptr
+                }
+            })
+            .collect::<Vec<_>>();
+        for &address in &addresses {
+            unsafe {
+                ok(cudaMemcpy(
+                    address,
+                    host_weights.as_ptr().cast(),
+                    weight_bytes,
+                    1,
+                ));
+            }
+        }
+        let input = Buffer::new(m * k * 2);
+        input.write(
+            &(0..m * k)
+                .map(|i| f16::from_f32(((i * 17) % 101) as f32 / 2048.0 - 0.024).to_bits())
+                .collect::<Vec<_>>(),
+        );
+        let stream = Stream::new();
+        let routes = [UpstreamLinearAlgorithm::Mmq, UpstreamLinearAlgorithm::Mmvq]
+            .map(|a| Route::new(a, format, m as u32, k as u32, n as u32, count));
+        let mut stable = Vec::new();
+        for route in &routes {
+            for (index, &address) in addresses.iter().enumerate() {
+                route.scan(&stream, address, index);
+                route.enqueue(&stream, &input, address, index);
+            }
+            stream.sync();
+            stable.push(route.validate(format, &host_weights, count));
+        }
+        // At least 32 projections in each graph. A ring makes multiple
+        // complete laps without intervening host validation or resets.
+        let laps = 32_usize.div_ceil(count);
+        let graphs = routes.each_ref().map(|route| {
+            Graph::capture(&stream, || {
+                for _ in 0..laps {
+                    for (index, &address) in addresses.iter().enumerate() {
+                        route.enqueue(&stream, &input, address, index);
+                    }
+                }
+            })
+        });
+        let (start, end) = (Event::new(), Event::new());
+        // Reserve host storage before timing. Delay all JSON creation
+        // and formatting until every measured graph has completed.
+        let mut samples = Vec::with_capacity(PAIRS * 2);
+        for round in 0..WARM + PAIRS {
+            for order in 0..2 {
+                let route = (round + order) % 2;
+                let wall = Instant::now();
+                unsafe {
+                    ok(cudaEventRecord(start.0, stream.0));
+                }
+                graphs[route].launch(&stream);
+                unsafe {
+                    ok(cudaEventRecord(end.0, stream.0));
+                    ok(cudaEventSynchronize(end.0));
+                }
+                let wall_ns = wall.elapsed().as_nanos();
+                let mut ms = 0.0;
+                unsafe {
+                    ok(cudaEventElapsedTime(&mut ms, start.0, end.0));
+                }
+                if round >= WARM {
+                    samples.push((
+                        round - WARM,
+                        order,
+                        route,
+                        f64::from(ms) * 1_000_000.0,
+                        wall_ns,
+                    ));
+                }
+            }
+        }
+        stream.sync();
+        for (index, route) in routes.iter().enumerate() {
+            assert_eq!(route.validate(format, &host_weights, count), stable[index]);
+        }
+        input.guards();
+        for allocation in &allocations {
+            allocation.guards();
+        }
+        for (pair, order, route, gpu_ns, wall_ns) in samples {
+            let sample = serde_json::json!({"pair":pair,"order":order,
+                "algorithm":format!("{:?}",routes[route].algorithm),
+                "gpu_ns":gpu_ns,"wall_ns":wall_ns});
+            println!(
+                "{}",
+                serde_json::json!({"experiment":experiment,
+                "format":format!("{format:?}"),"M":m,"K":k,"N":n,"weight_mode":mode,
+                "weight_bytes":weight_bytes,"matrix_count":count,"working_set_bytes":count*weight_bytes,
+                "device_l2_bytes":l2,"same_physical_weights_between_algorithms":true,
+                "matrix_contents":"same deterministic bytes; distinct addresses in rings",
+                "laps":laps,"projections":laps*count,"warm_rounds":WARM,"pairs":PAIRS,
+                "timed":"F16-to-F32, MarkerV2 row checks/pack, dot/fixup, MarkerV2 cast",
+                "excluded":"cold plan/weight scan, allocation, input upload, oracle and readbacks",
+                "between_timed_routes":"events and graph submission only; no reset/readback",
+                "correctness":"all finite/cast bits/canaries/repeat; nine actual-pack F64 samples per route",
+                "sample":sample})
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "exclusive CUDA MarkerV2 paired diagnostic; run correctness first"]
+fn marker_v2_m8_mmq_mmvq_paired_working_sets() {
+    let l2 = paired_device_l2_bytes();
     for format in [
         UpstreamLinearFormat::Iq4Xs,
         UpstreamLinearFormat::Q4K,
         UpstreamLinearFormat::Q5K,
     ] {
         for (k, n) in [(5120, 17408), (17408, 5120)] {
-            let m = 8;
-            let host_weights = weights(format, k, n);
-            let weight_bytes = host_weights.len();
-            for mode in ["resident", "arena_offset_ring", "distinct_allocation_ring"] {
-                let count = if mode == "resident" {
-                    1
-                } else {
-                    3 * l2 as usize / weight_bytes + 1
-                };
-                let stride = weight_bytes.div_ceil(256) * 256;
-                let allocations = if mode == "arena_offset_ring" {
-                    vec![Buffer::new(count * stride)]
-                } else {
-                    (0..count)
-                        .map(|_| Buffer::new(weight_bytes))
-                        .collect::<Vec<_>>()
-                };
-                let addresses = (0..count)
-                    .map(|index| unsafe {
-                        if mode == "arena_offset_ring" {
-                            allocations[0].ptr.add(index * stride)
-                        } else {
-                            allocations[index].ptr
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                for &address in &addresses {
-                    unsafe {
-                        ok(cudaMemcpy(
-                            address,
-                            host_weights.as_ptr().cast(),
-                            weight_bytes,
-                            1,
-                        ));
-                    }
-                }
-                let input = Buffer::new(m * k * 2);
-                input.write(
-                    &(0..m * k)
-                        .map(|i| f16::from_f32(((i * 17) % 101) as f32 / 2048.0 - 0.024).to_bits())
-                        .collect::<Vec<_>>(),
-                );
-                let stream = Stream::new();
-                let routes = [UpstreamLinearAlgorithm::Mmq, UpstreamLinearAlgorithm::Mmvq]
-                    .map(|a| Route::new(a, format, m as u32, k as u32, n as u32, count));
-                let mut stable = Vec::new();
-                for route in &routes {
-                    for (index, &address) in addresses.iter().enumerate() {
-                        route.scan(&stream, address, index);
-                        route.enqueue(&stream, &input, address, index);
-                    }
-                    stream.sync();
-                    stable.push(route.validate(format, &host_weights, count));
-                }
-                // At least 32 projections in each graph. A ring makes multiple
-                // complete laps without intervening host validation or resets.
-                let laps = 32_usize.div_ceil(count);
-                let graphs = routes.each_ref().map(|route| {
-                    Graph::capture(&stream, || {
-                        for _ in 0..laps {
-                            for (index, &address) in addresses.iter().enumerate() {
-                                route.enqueue(&stream, &input, address, index);
-                            }
-                        }
-                    })
-                });
-                let (start, end) = (Event::new(), Event::new());
-                // Reserve host storage before timing. Delay all JSON creation
-                // and formatting until every measured graph has completed.
-                let mut samples = Vec::with_capacity(PAIRS * 2);
-                for round in 0..WARM + PAIRS {
-                    for order in 0..2 {
-                        let route = (round + order) % 2;
-                        let wall = Instant::now();
-                        unsafe {
-                            ok(cudaEventRecord(start.0, stream.0));
-                        }
-                        graphs[route].launch(&stream);
-                        unsafe {
-                            ok(cudaEventRecord(end.0, stream.0));
-                            ok(cudaEventSynchronize(end.0));
-                        }
-                        let wall_ns = wall.elapsed().as_nanos();
-                        let mut ms = 0.0;
-                        unsafe {
-                            ok(cudaEventElapsedTime(&mut ms, start.0, end.0));
-                        }
-                        if round >= WARM {
-                            samples.push((
-                                round - WARM,
-                                order,
-                                route,
-                                f64::from(ms) * 1_000_000.0,
-                                wall_ns,
-                            ));
-                        }
-                    }
-                }
-                stream.sync();
-                for (index, route) in routes.iter().enumerate() {
-                    assert_eq!(route.validate(format, &host_weights, count), stable[index]);
-                }
-                input.guards();
-                for allocation in &allocations {
-                    allocation.guards();
-                }
-                for (pair, order, route, gpu_ns, wall_ns) in samples {
-                    let sample = serde_json::json!({"pair":pair,"order":order,
-                        "algorithm":format!("{:?}",routes[route].algorithm),
-                        "gpu_ns":gpu_ns,"wall_ns":wall_ns});
-                    println!(
-                        "{}",
-                        serde_json::json!({"experiment":"marker_v2_direct_paired",
-                        "format":format!("{format:?}"),"M":m,"K":k,"N":n,"weight_mode":mode,
-                        "weight_bytes":weight_bytes,"matrix_count":count,"working_set_bytes":count*weight_bytes,
-                        "device_l2_bytes":l2,"same_physical_weights_between_algorithms":true,
-                        "matrix_contents":"same deterministic bytes; distinct addresses in rings",
-                        "laps":laps,"projections":laps*count,"warm_rounds":WARM,"pairs":PAIRS,
-                        "timed":"F16-to-F32, MarkerV2 row checks/pack, dot/fixup, MarkerV2 cast",
-                        "excluded":"cold plan/weight scan, allocation, input upload, oracle and readbacks",
-                        "between_timed_routes":"events and graph submission only; no reset/readback",
-                        "correctness":"all finite/cast bits/canaries/repeat; nine actual-pack F64 samples per route",
-                        "sample":sample})
-                    );
-                }
-            }
+            paired_m8_working_sets(
+                format,
+                k,
+                n,
+                l2,
+                &["resident", "arena_offset_ring", "distinct_allocation_ring"],
+                "marker_v2_direct_paired",
+            );
         }
     }
 }
