@@ -144,6 +144,49 @@ impl ProgramBindingUploadStrategy {
     }
 }
 
+/// Internal snapshot identity for an explicit CLI/config option, not an
+/// environment-variable interface. Environment-sourced entries are rejected.
+pub const SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY: &str =
+    "FERRUM_SEGMENT_BINDING_OWNER_VIEW_MODE";
+
+/// Representation of freshly checked decode-segment binding owners. Both
+/// modes retain the same current-wave authorization and exact physical ranges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SegmentBindingOwnerViewMode {
+    #[default]
+    Legacy,
+    Indexed,
+}
+
+impl SegmentBindingOwnerViewMode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Indexed => "indexed",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "indexed" => Ok(Self::Indexed),
+            _ => Err(format!("expected legacy or indexed; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select segment binding owner views through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Explicit one-shot faults used to prove product-path failure attribution.
 /// These are never inferred and remain disabled in normal execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +315,9 @@ pub struct RuntimeKnobs {
     /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    /// Fresh owner representation for CUDA decode segments; Legacy is default.
+    #[serde(default)]
+    pub segment_binding_owner_view_mode: SegmentBindingOwnerViewMode,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -419,6 +465,16 @@ impl EngineConfig {
             self.runtime.program_binding_upload_strategy =
                 ProgramBindingUploadStrategy::parse_runtime_value(value).map_err(|reason| {
                     format!("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
+        {
+            self.runtime.segment_binding_owner_view_mode =
+                SegmentBindingOwnerViewMode::parse_config_entry(entry).map_err(|reason| {
+                    format!("{SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY}: {reason}")
                 })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
@@ -1460,6 +1516,74 @@ mod tests {
             )]))
             .unwrap_err()
             .contains(key));
+    }
+
+    #[test]
+    fn segment_owner_mode_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Legacy
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("segment_binding_owner_view_mode");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Legacy
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                SegmentBindingOwnerViewMode::Indexed,
+                SegmentBindingOwnerViewMode::Legacy,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.segment_binding_owner_view_mode, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.segment_binding_owner_view_mode, mode);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+
+    #[test]
+    fn segment_owner_mode_environment_cannot_activate_or_override_typed_config() {
+        let key = SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key, "indexed"
+            )]))
+            .unwrap_err()
+            .contains("not environment"));
+        assert_eq!(
+            config.runtime.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Legacy
+        );
+        config.runtime.segment_binding_owner_view_mode = SegmentBindingOwnerViewMode::Indexed;
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(key, "legacy")]))
+            .is_err());
+        assert_eq!(
+            config.runtime.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Indexed
+        );
     }
 
     #[test]

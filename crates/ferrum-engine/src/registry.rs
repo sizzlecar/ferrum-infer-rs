@@ -898,6 +898,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         &self,
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+        validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
         validate_invocation_preparation_strategy(config, false)?;
         let vocab_size = config
@@ -1170,6 +1171,24 @@ fn validate_program_binding_upload_strategy(
     Ok(())
 }
 
+fn validate_segment_binding_owner_view_mode(
+    config: &ComponentConfig,
+    plan_runtime: bool,
+) -> Result<()> {
+    if config.engine_config.runtime.segment_binding_owner_view_mode
+        == ferrum_types::SegmentBindingOwnerViewMode::Indexed
+        && (!matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || config.engine_config.runtime.invocation_preparation_strategy
+                != ferrum_types::InvocationPreparationStrategy::DecodeSegment)
+    {
+        return Err(FerrumError::unsupported(
+            "indexed segment binding owner views require a CUDA plan runtime with decode-segment preparation",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_registered_vnext_backend(
     kind: ferrum_models::vnext::ProductionExecutionKind,
     device: &Device,
@@ -1211,6 +1230,7 @@ fn create_registered_vnext_executor(
 ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
     use ferrum_models::vnext::ProductionExecutionKind;
 
+    validate_segment_binding_owner_view_mode(config, true)?;
     validate_program_binding_upload_strategy(config, true)?;
     validate_invocation_preparation_strategy(config, true)?;
     validate_registered_vnext_backend(
@@ -1265,7 +1285,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_program_binding_upload_strategy(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_segment_binding_owner_view_mode(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1273,6 +1293,8 @@ fn create_registered_vnext_executor(
                             config.engine_config.kv_cache.dtype,
                         )?,
                         config.engine_config.runtime.program_binding_upload_strategy,
+                        ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+                        config.engine_config.runtime.segment_binding_owner_view_mode,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -1407,6 +1429,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use candle_core::{DType, Device as CandleDevice};
         use ferrum_models::weight_format::WeightFormat;
 
+        validate_segment_binding_owner_view_mode(config, true)?;
         validate_program_binding_upload_strategy(config, true)?;
         validate_invocation_preparation_strategy(config, true)?;
         // Try to load model from path
@@ -1492,6 +1515,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 }
             }
         }
+        validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
         validate_invocation_preparation_strategy(config, false)?;
         if checkpoint_capture_enabled {
@@ -2019,6 +2043,78 @@ mod tests {
         assert!(error
             .to_string()
             .contains("decode-segment invocation preparation requires a CUDA plan runtime"));
+    }
+
+    #[test]
+    fn segment_owner_mode_requires_cuda_decode_segment_and_keeps_upload_independent() {
+        use ferrum_types::{
+            InvocationPreparationStrategy, ProgramBindingUploadStrategy,
+            SegmentBindingOwnerViewMode,
+        };
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                for preparation in [
+                    InvocationPreparationStrategy::Full,
+                    InvocationPreparationStrategy::IdentityProjection,
+                    InvocationPreparationStrategy::DecodeSegment,
+                ] {
+                    config.engine_config.runtime.invocation_preparation_strategy = preparation;
+                    for upload in [
+                        ProgramBindingUploadStrategy::Sparse,
+                        ProgramBindingUploadStrategy::CompactScatter,
+                    ] {
+                        config.engine_config.runtime.program_binding_upload_strategy = upload;
+                        config.engine_config.runtime.segment_binding_owner_view_mode =
+                            SegmentBindingOwnerViewMode::Legacy;
+                        validate_segment_binding_owner_view_mode(&config, plan_runtime).unwrap();
+                        config.engine_config.runtime.segment_binding_owner_view_mode =
+                            SegmentBindingOwnerViewMode::Indexed;
+                        assert_eq!(
+                            validate_segment_binding_owner_view_mode(&config, plan_runtime).is_ok(),
+                            plan_runtime
+                                && matches!(config.device, Device::CUDA(_))
+                                && preparation == InvocationPreparationStrategy::DecodeSegment
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_segment_binding_owner_view_mode(&config, true).is_err());
+        }
+    }
+
+    #[test]
+    fn segment_owner_mode_rejects_unsupported_factories_before_loading() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.segment_binding_owner_view_mode =
+            ferrum_types::SegmentBindingOwnerViewMode::Indexed;
+        engine.runtime.invocation_preparation_strategy =
+            ferrum_types::InvocationPreparationStrategy::DecodeSegment;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("indexed segment binding owner views"));
+        config.device = Device::CUDA(0);
+        assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("indexed segment binding owner views"));
+        config.engine_config.runtime.invocation_preparation_strategy =
+            ferrum_types::InvocationPreparationStrategy::Full;
+        assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("indexed segment binding owner views"));
     }
 
     #[test]

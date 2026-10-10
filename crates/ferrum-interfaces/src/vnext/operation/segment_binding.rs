@@ -144,13 +144,7 @@ pub enum SegmentBindingOracleMode {
     CompareReference,
 }
 
-/// Representation only. Indexed facts still come from the current full permit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SegmentBindingOwnerViewMode {
-    #[default]
-    Legacy,
-    Indexed,
-}
+pub use ferrum_types::SegmentBindingOwnerViewMode;
 
 /// An index into one current patch, never a cross-wave ownership identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

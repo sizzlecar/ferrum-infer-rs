@@ -253,6 +253,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub program_binding_upload_strategy: Option<ferrum_types::ProgramBindingUploadStrategy>,
 
+    /// Fresh decode-segment owner representation. Indexed requires a CUDA plan runtime.
+    #[serde(default)]
+    pub segment_binding_owner_view_mode: Option<ferrum_types::SegmentBindingOwnerViewMode>,
+
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -487,6 +491,12 @@ impl RuntimeCliConfig {
             "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
             self.program_binding_upload_strategy
                 .map(ferrum_types::ProgramBindingUploadStrategy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+            self.segment_binding_owner_view_mode
+                .map(ferrum_types::SegmentBindingOwnerViewMode::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1109,6 +1119,27 @@ mod tests {
         );
         assert_eq!(config.server.port, 8000);
         assert!(config.models.default_model.is_none());
+    }
+
+    #[test]
+    fn segment_binding_owner_view_config_file_parses_explicit_mode() {
+        for value in ["legacy", "indexed"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\nsegment_binding_owner_view_mode = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nsegment_binding_owner_view_mode = \"automatic\"\n"
+        )
+        .is_err());
     }
 
     #[test]

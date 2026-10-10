@@ -135,6 +135,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
 
+    /// Fresh decode-segment owner views (default: legacy). Indexed requires a CUDA plan runtime.
+    #[arg(long, value_enum)]
+    pub segment_binding_owner_view_mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -420,6 +424,7 @@ async fn execute_with_compatibility(
         prefill_decode_execution,
         invocation_preparation_strategy,
         program_binding_upload_strategy,
+        segment_binding_owner_view_mode,
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
@@ -877,6 +882,10 @@ async fn execute_with_compatibility(
     push_program_binding_upload_strategy_cli_entry(
         &mut startup_cli_runtime_entries,
         program_binding_upload_strategy,
+    );
+    push_segment_binding_owner_view_mode_cli_entry(
+        &mut startup_cli_runtime_entries,
+        segment_binding_owner_view_mode,
     );
     startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
@@ -1603,6 +1612,17 @@ fn push_program_binding_upload_strategy_cli_entry(
         entries,
         "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
         strategy.map(crate::commands::ProgramBindingUploadStrategyArg::as_runtime_value),
+    );
+}
+
+fn push_segment_binding_owner_view_mode_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+        mode.map(crate::commands::SegmentBindingOwnerViewModeArg::as_runtime_value),
     );
 }
 
@@ -2539,6 +2559,61 @@ fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_binding_owner_view_serve_precedence_preserves_upload_policy() {
+        use crate::commands::SegmentBindingOwnerViewModeArg as Arg;
+        use ferrum_types::{
+            SegmentBindingOwnerViewMode as Mode, SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Legacy, None),
+            (
+                Some(Mode::Indexed),
+                None,
+                Mode::Indexed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Indexed),
+                Some(Arg::Legacy),
+                Mode::Legacy,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Legacy),
+                Some(Arg::Indexed),
+                Mode::Indexed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                segment_binding_owner_view_mode: config_mode,
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_segment_binding_owner_view_mode_cli_entry(&mut cli_entries, cli_mode);
+            let snapshot = merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.segment_binding_owner_view_mode, expected);
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
 
     #[test]
     fn invocation_preparation_serve_override_reaches_engine_config() {

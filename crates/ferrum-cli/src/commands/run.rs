@@ -882,6 +882,10 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
 
+    /// Fresh decode-segment owner views (default: legacy). Indexed requires a CUDA plan runtime.
+    #[arg(long, value_enum)]
+    pub segment_binding_owner_view_mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -2727,6 +2731,12 @@ fn run_startup_cli_runtime_entries(
         cmd.program_binding_upload_strategy
             .map(crate::commands::ProgramBindingUploadStrategyArg::as_runtime_value),
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+        cmd.segment_binding_owner_view_mode
+            .map(crate::commands::SegmentBindingOwnerViewModeArg::as_runtime_value),
+    );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
         "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
@@ -2922,6 +2932,61 @@ mod tests {
     }
 
     #[test]
+    fn segment_binding_owner_view_run_precedence_preserves_upload_policy() {
+        use crate::commands::SegmentBindingOwnerViewModeArg as Arg;
+        use ferrum_types::{
+            SegmentBindingOwnerViewMode as Mode, SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Legacy, None),
+            (
+                Some(Mode::Indexed),
+                None,
+                Mode::Indexed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Indexed),
+                Some(Arg::Legacy),
+                Mode::Legacy,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Legacy),
+                Some(Arg::Indexed),
+                Mode::Indexed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                segment_binding_owner_view_mode: config_mode,
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.segment_binding_owner_view_mode = cli_mode;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.segment_binding_owner_view_mode, expected);
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
     fn invocation_preparation_run_override_reaches_engine_config() {
         use crate::commands::InvocationPreparationStrategyArg;
         use ferrum_types::InvocationPreparationStrategy;
@@ -3006,6 +3071,7 @@ mod tests {
             prefill_decode_execution: None,
             invocation_preparation_strategy: None,
             program_binding_upload_strategy: None,
+            segment_binding_owner_view_mode: None,
             scheduler_slo: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
