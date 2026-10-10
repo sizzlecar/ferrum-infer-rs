@@ -4,6 +4,19 @@
 use super::*;
 use std::time::Instant;
 
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/shared_weight_decode.rs"]
+mod shared_weight_decode;
+
+type MmvqDot = unsafe extern "C" fn(
+    *const UpstreamLinearPlanV1,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+
 unsafe extern "C" {
     fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
     fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
@@ -111,6 +124,22 @@ impl Route {
         }
     }
     fn enqueue(&self, stream: &Stream, input: &Buffer, weight: *const c_void, index: usize) {
+        self.enqueue_with_mmvq_dot(
+            stream,
+            input,
+            weight,
+            index,
+            ffi::ferrum_upstream_mmvq_dot_v1,
+        );
+    }
+    fn enqueue_with_mmvq_dot(
+        &self,
+        stream: &Stream,
+        input: &Buffer,
+        weight: *const c_void,
+        index: usize,
+        dot: MmvqDot,
+    ) {
         let p = &self.plan;
         unsafe {
             let flag = self.flags.ptr.add(index * 4);
@@ -158,7 +187,7 @@ impl Route {
                         self.rows.ptr,
                         stream.0,
                     ));
-                    ok(ffi::ferrum_upstream_mmvq_dot_v1(
+                    ok(dot(
                         p,
                         weight,
                         self.packed.ptr,
