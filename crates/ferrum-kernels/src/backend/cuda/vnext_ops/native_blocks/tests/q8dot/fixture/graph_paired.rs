@@ -327,3 +327,6 @@ fn run_formats(formats: &[GgufBlockFormat], routes: &[Route]) {
 
 #[cfg(feature = "cuda-upstream-q6-f32-linear")]
 mod q6_mmq_f32;
+
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+mod q6_f16_adapter;

@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.upstream-q6-f32-linear",
   "source_package_kind": "ferrum-native-upstream-q6-f32-linear",
-  "source_package_revision": "q6-f32-d4-mmq-v1+d81235049384534c167caea52b85a694f6103d14",
+  "source_package_revision": "q6-f32-d4-mmq-v1+f16-adapter-probe-v1+d81235049384534c167caea52b85a694f6103d14",
   "upstream_sources": [
     {
       "repository": "https://github.com/ggml-org/llama.cpp.git",
@@ -17,6 +17,7 @@
   "headers": [
     "kernels/abi.h",
     "kernels/boundary.h",
+    "kernels/f16_adapter.cuh",
     "kernels/marker.cuh",
     "llama/ggml/include/ggml-alloc.h",
     "llama/ggml/include/ggml-backend.h",
@@ -57,6 +58,7 @@
       "headers": [
         "kernels/abi.h",
         "kernels/boundary.h",
+        "kernels/f16_adapter.cuh",
         "kernels/marker.cuh",
         "llama/ggml/include/ggml-alloc.h",
         "llama/ggml/include/ggml-backend.h",

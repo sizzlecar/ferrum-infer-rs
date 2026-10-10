@@ -378,3 +378,5 @@ extern "C" int ferrum_upstream_q6_f32_publish_v1(const FerrumUpstreamQ6F32PlanV1
         return cudaGetLastError();
     });
 }
+
+#include "f16_adapter.cuh"
