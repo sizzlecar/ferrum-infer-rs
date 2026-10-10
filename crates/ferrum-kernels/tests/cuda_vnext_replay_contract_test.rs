@@ -6,6 +6,8 @@ const RECURRENT_ATTENTION_SOURCE: &str =
 const TRANSFORMER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer.rs");
 const VNEXT_OPS_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops.rs");
 const RUNTIME_SOURCE: &str = include_str!("../src/backend/cuda/vnext_runtime.rs");
+const BINDING_UPLOAD_SOURCE: &str =
+    include_str!("../src/backend/cuda/vnext_runtime/pinned_binding_upload.rs");
 const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
 const GATED_DELTA_KERNEL_SOURCE: &str = include_str!("../kernels/gated_delta_rule.cu");
@@ -314,7 +316,13 @@ fn typed_program_binding_patches_form_one_layout_owned_sparse_prelude() {
     assert!(RUNTIME_SOURCE
         .contains("\"CUDA typed program bindings do not cover one compiled layout exactly\""));
     assert!(RUNTIME_SOURCE.contains("coalesce_program_binding_transfers("));
-    assert!(RUNTIME_SOURCE.contains("cuMemcpy2DAsync_v2("));
+    assert!(RUNTIME_SOURCE.contains("CudaEnqueueAction::ProgramBindingPrelude("));
+    assert!(RUNTIME_SOURCE.contains("shapes: transfer_shapes"));
+    assert!(BINDING_UPLOAD_SOURCE.contains("self.validate(regions, payloads)?"));
+    assert!(BINDING_UPLOAD_SOURCE.contains("cuMemcpy2DAsync_v2("));
+    assert!(BINDING_UPLOAD_SOURCE.contains("dstPitch: pitch"));
+    assert!(BINDING_UPLOAD_SOURCE.contains("WidthInBytes: width"));
+    assert!(BINDING_UPLOAD_SOURCE.contains("Height: rows"));
     assert!(RUNTIME_SOURCE.contains("let transfer_command_count = u64::try_from(transfers.len())"));
     assert!(RUNTIME_SOURCE.contains("executable: None"));
     assert!(!RUNTIME_SOURCE.contains("let mut host_patch = vec![0_u8; patch_bytes]"));
