@@ -1408,6 +1408,8 @@ pub(crate) struct RuntimeTrace {
     pub(crate) segment_oracle_enabled: bool,
     pub(crate) segment_regions: Vec<SegmentTestRegion>,
     pub(crate) segment_entry: Option<DeviceReusableExecutionEntryIdentity>,
+    pub(crate) segment_entries:
+        Option<BTreeMap<DeviceReusableExecutionProgramId, DeviceReusableExecutionEntryIdentity>>,
     pub(crate) segment_entry_error: bool,
     pub(crate) segment_entry_panic: bool,
     pub(crate) segment_trim_released: usize,
@@ -1786,12 +1788,15 @@ impl DeviceRuntime for TestRuntime {
     fn reusable_execution_entry_identity(
         &self,
         _stream: &Self::Stream,
-        _program: &DeviceReusableExecutionProgramId,
+        program: &DeviceReusableExecutionProgramId,
     ) -> Result<Option<DeviceReusableExecutionEntryIdentity>, Self::Error> {
         let (entry, error, panic) = {
             let trace = self.trace.lock().unwrap();
             (
-                trace.segment_entry.clone(),
+                match &trace.segment_entries {
+                    Some(entries) => entries.get(program).cloned(),
+                    None => trace.segment_entry.clone(),
+                },
                 trace.segment_entry_error,
                 trace.segment_entry_panic,
             )
@@ -1811,6 +1816,9 @@ impl DeviceRuntime for TestRuntime {
         let released = trace.segment_trim_released;
         if released != 0 {
             trace.segment_entry = None;
+            if let Some(entries) = &mut trace.segment_entries {
+                entries.clear();
+            }
         }
         Ok(DeviceReusableExecutionTrim::new(released, 0))
     }

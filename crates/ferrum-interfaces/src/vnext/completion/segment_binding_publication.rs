@@ -7,17 +7,61 @@ use crate::vnext::{
     DeviceReusableExecutionProgramId, StepParticipantFrameAssignment,
     StepParticipantRetirementDisposition, StepRetirementReceipt,
 };
+use std::num::NonZeroUsize;
+
+const DEFAULT_SEGMENT_BINDING_RECIPE_CAPACITY: NonZeroUsize =
+    NonZeroUsize::new(32).expect("nonzero recipe capacity");
 
 struct CachedSegmentBindingRecipe {
     recipe: Arc<CompiledSegmentBindingRecipe>,
     entry: DeviceReusableExecutionEntryIdentity,
     epoch: u64,
+    last_used: u64,
 }
 
 #[derive(Default)]
+struct SegmentBindingRecipeCacheState {
+    entries: BTreeMap<DeviceReusableExecutionProgramId, CachedSegmentBindingRecipe>,
+    age: u64,
+}
+
+impl SegmentBindingRecipeCacheState {
+    fn next_age(&mut self) -> u64 {
+        if self.age == u64::MAX {
+            // Preserve recency at rollover; this bounded slow path never wraps.
+            let mut ordered: Vec<_> = self.entries.values_mut().collect();
+            ordered.sort_by_key(|cached| cached.last_used);
+            self.age = 0;
+            for cached in ordered {
+                self.age += 1;
+                cached.last_used = self.age;
+            }
+        }
+        self.age += 1;
+        self.age
+    }
+}
+
 pub(super) struct SegmentBindingRecipeCache {
-    // Exactly one current entry per lane, never a history of shapes/requests.
-    current: Mutex<Option<CachedSegmentBindingRecipe>>,
+    // Values own immutable Plan recipes and entry tokens, never wave authorities.
+    capacity: NonZeroUsize,
+    state: Mutex<SegmentBindingRecipeCacheState>,
+}
+
+impl Default for SegmentBindingRecipeCache {
+    fn default() -> Self {
+        // Bound retained immutable recipes independently of device graph budgets.
+        Self::with_capacity(DEFAULT_SEGMENT_BINDING_RECIPE_CAPACITY)
+    }
+}
+
+impl SegmentBindingRecipeCache {
+    fn with_capacity(capacity: NonZeroUsize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(SegmentBindingRecipeCacheState::default()),
+        }
+    }
 }
 
 #[must_use = "publication requires the exact successful completion and normal retirement"]
@@ -214,26 +258,28 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             return Ok(None);
         }
         let entry = self.checked_segment_binding_entry(&state, program)?;
-        let mut current = cache
-            .current
+        let mut recipes = cache
+            .state
             .lock()
             .map_err(|_| invalid_completion("segment recipe cache mutex is poisoned"))?;
-        let matches = current.as_ref().is_some_and(|cached| {
-            cached.recipe.program_id == *program
-                && cached.epoch == self.reusable_execution_epoch()
+        let matches = recipes.entries.get(program).is_some_and(|cached| {
+            cached.epoch == self.reusable_execution_epoch()
                 && entry
                     .as_ref()
                     .is_some_and(|entry| cached.entry.same_entry(entry))
         });
         let (selected, retired) = if matches {
-            (
-                current.as_ref().map(|cached| Arc::clone(&cached.recipe)),
-                None,
-            )
+            let age = recipes.next_age();
+            let cached = recipes
+                .entries
+                .get_mut(program)
+                .ok_or_else(|| invalid_completion("matched segment recipe is missing"))?;
+            cached.last_used = age;
+            (Some(Arc::clone(&cached.recipe)), None)
         } else {
-            (None, current.take())
+            (None, recipes.entries.remove_entry(program))
         };
-        drop(current);
+        drop(recipes);
         drop(state);
         drop(retired);
         Ok(selected)
@@ -265,16 +311,35 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         let cache = self
             .segment_binding_recipe
             .get_or_init(SegmentBindingRecipeCache::default);
-        let mut current = cache
-            .current
+        let mut recipes = cache
+            .state
             .lock()
             .map_err(|_| invalid_completion("segment recipe cache mutex is poisoned"))?;
-        let retired = current.replace(CachedSegmentBindingRecipe {
-            recipe,
-            entry: expected_entry,
-            epoch,
-        });
-        drop(current);
+        let program = recipe.program_id.clone();
+        let last_used = recipes.next_age();
+        let retired = if recipes.entries.contains_key(&program) {
+            recipes.entries.remove_entry(&program)
+        } else if recipes.entries.len() == cache.capacity.get() {
+            let oldest = recipes
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(program, _)| program.clone())
+                .ok_or_else(|| invalid_completion("full segment recipe cache has no entries"))?;
+            recipes.entries.remove_entry(&oldest)
+        } else {
+            None
+        };
+        recipes.entries.insert(
+            program,
+            CachedSegmentBindingRecipe {
+                recipe,
+                entry: expected_entry,
+                epoch,
+                last_used,
+            },
+        );
+        drop(recipes);
         drop(state);
         drop(retired);
         Ok(true)
@@ -325,12 +390,36 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
     }
 
     #[cfg(test)]
+    pub(crate) fn configure_segment_binding_recipe_capacity_for_test(
+        &self,
+        capacity: NonZeroUsize,
+    ) -> Result<(), VNextError> {
+        self.segment_binding_recipe
+            .set(SegmentBindingRecipeCache::with_capacity(capacity))
+            .map_err(|_| invalid_completion("segment recipe cache is already initialized"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_segment_binding_recipe_age_for_test(&self) -> Result<(), VNextError> {
+        let cache = self
+            .segment_binding_recipe
+            .get()
+            .ok_or_else(|| invalid_completion("segment recipe cache is not initialized"))?;
+        cache
+            .state
+            .lock()
+            .map_err(|_| invalid_completion("segment recipe cache mutex is poisoned"))?
+            .age = u64::MAX;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn segment_binding_locks_available_for_test(&self) -> bool {
         let lane_available = self.state.try_lock().is_ok();
         let cache_available = self
             .segment_binding_recipe
             .get()
-            .is_none_or(|cache| cache.current.try_lock().is_ok());
+            .is_none_or(|cache| cache.state.try_lock().is_ok());
         lane_available && cache_available
     }
 
@@ -339,11 +428,12 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             return Ok(());
         };
         let retired = {
-            let mut current = cache
-                .current
+            let mut recipes = cache
+                .state
                 .lock()
                 .map_err(|_| invalid_completion("segment recipe cache mutex is poisoned"))?;
-            current.take()
+            recipes.age = 0;
+            std::mem::take(&mut recipes.entries)
         };
         drop(retired);
         Ok(())
@@ -360,15 +450,16 @@ impl<R: DeviceRuntime> ExecutionLaneEnqueue<'_, R> {
                 invalid_completion("segment recipe was not published on this lane")
             })?;
         let (entry, epoch) = {
-            let current = cache
-                .current
+            let recipes = cache
+                .state
                 .lock()
                 .map_err(|_| invalid_completion("segment recipe cache mutex is poisoned"))?;
-            let cached = current
-                .as_ref()
+            let cached = recipes
+                .entries
+                .get(&recipe.program_id)
                 .filter(|cached| Arc::ptr_eq(&cached.recipe, recipe))
                 .ok_or_else(|| {
-                    invalid_completion("segment recipe is no longer the current lane entry")
+                    invalid_completion("segment recipe is no longer a registered lane entry")
                 })?;
             (cached.entry.clone(), cached.epoch)
         };
