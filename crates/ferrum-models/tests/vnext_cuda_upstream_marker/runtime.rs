@@ -30,6 +30,25 @@ mod two_streams;
 #[path = "runtime/uniform_binding_prefix.rs"]
 mod uniform_binding_prefix;
 
+#[derive(Clone, Copy)]
+enum FixtureMemoryBudget {
+    Standard,
+    PairedWideQ6,
+}
+
+impl FixtureMemoryBudget {
+    fn capacity_bytes(self) -> u64 {
+        match self {
+            Self::Standard => 256 << 20,
+            // IP and DS keep two independent wide Plans alive together. Their
+            // measured static claims alone total 316,780,480 bytes. Two standard
+            // plan budgets also leave room for fresh states, scratch and both
+            // execution lanes; the real process-wide capacity checks still apply.
+            Self::PairedWideQ6 => 2 * (256 << 20),
+        }
+    }
+}
+
 impl Fixture {
     pub fn for_attention(kind: AttentionKind, reusable: bool, participants: u32) -> Self {
         Self::for_family(kind, reusable, participants, Family::new(kind))
@@ -82,6 +101,11 @@ impl Fixture {
         let attention_arithmetic = definition.attention_arithmetic();
         let swiglu_arithmetic = definition.swiglu_arithmetic();
         let selected = definition.attention_profile();
+        let memory_budget = if selected.q6_f16() {
+            FixtureMemoryBudget::PairedWideQ6
+        } else {
+            FixtureMemoryBudget::Standard
+        };
         let prefill = (selected.prefill() || selected.hybrid()) && maximum_tokens > MAX_TOKENS;
         let states = definition.states();
         let profile_id = definition.profile_id();
@@ -126,7 +150,7 @@ impl Fixture {
             SchedulingDiscipline::FirstReady,
             RuntimeMemoryPolicy {
                 checkpoint_capacity: None,
-                capacity_bytes: 256 << 20,
+                capacity_bytes: memory_budget.capacity_bytes(),
                 reserve_bytes: 1 << 20,
                 maximum_active_sequences: participants,
                 dynamic_storage_profile_order: runtime
