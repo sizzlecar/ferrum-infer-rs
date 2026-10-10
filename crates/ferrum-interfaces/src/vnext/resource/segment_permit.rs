@@ -11,6 +11,114 @@ use super::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::time::{Duration, Instant};
+
+use crate::vnext::{SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink};
+
+/// Durations only while pool guards exist. Declare this before retained results
+/// and guards: ordinary errors flush after both have dropped, while unwinding
+/// follows the existing dispatch timers' rule of not calling observers.
+struct SegmentBackingTimings<'a, S: SubmissionWaveDispatchTimingSink> {
+    sink: &'a S,
+    elapsed: [Option<Duration>; 4],
+    active: usize,
+    started: Option<Instant>,
+}
+
+impl<'a, S: SubmissionWaveDispatchTimingSink> SegmentBackingTimings<'a, S> {
+    const STAGES: [SubmissionWaveDispatchStage; 4] = [
+        SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
+        SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
+        SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
+        SubmissionWaveDispatchStage::SegmentBackingWindowIntersections,
+    ];
+
+    #[inline(always)]
+    fn new(sink: &'a S) -> Self {
+        Self {
+            sink,
+            elapsed: [None; 4],
+            active: 0,
+            started: S::ENABLED.then(Instant::now),
+        }
+    }
+
+    #[inline(always)]
+    fn next(&mut self) {
+        if let Some(started) = self.started {
+            let now = Instant::now();
+            self.elapsed[self.active] = Some(now.duration_since(started));
+            self.active += 1;
+            self.started = Some(now);
+        }
+    }
+
+    #[inline(always)]
+    fn finish(&mut self) {
+        if let Some(started) = self.started.take() {
+            self.elapsed[self.active] = Some(started.elapsed());
+        }
+    }
+}
+
+impl<S: SubmissionWaveDispatchTimingSink> Drop for SegmentBackingTimings<'_, S> {
+    fn drop(&mut self) {
+        if S::ENABLED && !std::thread::panicking() {
+            self.finish();
+            for (stage, elapsed) in Self::STAGES.into_iter().zip(self.elapsed) {
+                if let Some(elapsed) = elapsed {
+                    self.sink.record(stage, elapsed);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use crate::vnext::{DeviceSubmissionStage, DeviceSubmissionTimingSink};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Sink<const ENABLED: bool>(AtomicUsize);
+
+    impl<const ENABLED: bool> DeviceSubmissionTimingSink for Sink<ENABLED> {
+        const ENABLED: bool = ENABLED;
+
+        fn record_device_submission(&self, _: DeviceSubmissionStage, _: Duration) {
+            panic!("pool timing cannot submit device commands");
+        }
+    }
+
+    impl<const ENABLED: bool> SubmissionWaveDispatchTimingSink for Sink<ENABLED> {
+        fn record(&self, _: SubmissionWaveDispatchStage, _: Duration) {
+            assert!(ENABLED, "disabled sink cannot be called");
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn segment_backing_timing_off_has_no_clock_and_panic_does_not_flush() {
+        let disabled = Sink::<false>(AtomicUsize::new(0));
+        let mut timing = SegmentBackingTimings::new(&disabled);
+        assert!(timing.started.is_none());
+        timing.next();
+        timing.finish();
+        assert!(timing.started.is_none());
+        assert!(timing.elapsed.iter().all(Option::is_none));
+        drop(timing);
+        assert_eq!(disabled.0.load(Ordering::Relaxed), 0);
+
+        let enabled = Sink::<true>(AtomicUsize::new(0));
+        assert!(std::panic::catch_unwind(|| {
+            let mut timing = SegmentBackingTimings::new(&enabled);
+            timing.next();
+            panic!("diagnostic observers must not flush during unwinding");
+        })
+        .is_err());
+        assert_eq!(enabled.0.load(Ordering::Relaxed), 0);
+    }
+}
 
 pub(crate) struct SegmentPlanResourceRequest<'a> {
     pub slot_index: usize,
@@ -186,6 +294,22 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         expected: &[SegmentBackingExpectation],
         windows: &[SegmentBackingWindow],
     ) -> Result<SegmentBackingBatch<R::Buffer>, VNextError> {
+        self.segment_backing_batch_with_timing(
+            groups,
+            expected,
+            windows,
+            &crate::vnext::operation::DisabledSubmissionWaveDispatchTimingSink,
+        )
+    }
+
+    pub(super) fn segment_backing_batch_with_timing<S: SubmissionWaveDispatchTimingSink>(
+        &self,
+        groups: &[&[LogicalBackingSliceAuthority]],
+        expected: &[SegmentBackingExpectation],
+        windows: &[SegmentBackingWindow],
+        timing_sink: &S,
+    ) -> Result<SegmentBackingBatch<R::Buffer>, VNextError> {
+        let mut timings = SegmentBackingTimings::new(timing_sink);
         if groups.len() != expected.len() || groups.is_empty() {
             return Err(invalid_resource(
                 "segment resources require matching nonempty expectations",
@@ -269,6 +393,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                     .ok_or_else(|| invalid_resource("segment authority has no dynamic pool"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        timings.next();
         let guards = pools
             .iter()
             .map(|(_, pool)| {
@@ -277,6 +402,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                     .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        timings.next();
         let checked = (|| {
             for group in &unique_groups {
                 let first = &group[0];
@@ -389,6 +515,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                     bindings: bindings.clone(),
                 });
             }
+            timings.next();
             for window in windows {
                 let resource = result.resources.get(window.resource_index).ok_or_else(|| {
                     invalid_resource("segment window references an unknown resource")
@@ -461,6 +588,9 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
             }
             Ok(())
         })();
+        // Read the last locked interval without invoking the observer. It is
+        // flushed only after guard release, on both success and ordinary Err.
+        timings.finish();
         drop(guards);
         checked?;
         Ok(result)

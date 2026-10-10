@@ -2124,6 +2124,12 @@ struct VNextWaveTimingMetrics {
     segment_binding_prepare_encode: AtomicDurationMetrics,
     segment_fresh_authority_windows: AtomicDurationMetrics,
     segment_backing_permit_metadata: AtomicDurationMetrics,
+    segment_backing_snapshot_lookup: AtomicDurationMetrics,
+    segment_backing_dedup_reserve_pool_resolution: AtomicDurationMetrics,
+    segment_backing_lock_acquisition: AtomicDurationMetrics,
+    segment_backing_locked_validation: AtomicDurationMetrics,
+    segment_backing_window_intersections: AtomicDurationMetrics,
+    segment_backing_immutable_metadata_validation: AtomicDurationMetrics,
     segment_node_dependencies_regions: AtomicDurationMetrics,
     segment_backend_encode_validate: AtomicDurationMetrics,
     node_identity_materialize: AtomicDurationMetrics,
@@ -2275,6 +2281,7 @@ impl VNextWaveTimingMetrics {
                 "segment_hit_provider_node_encode is the overlapping subset of fully encoded hit waves, not an additive stage; segment_binding_prepare_encode measures hot-path attempts, including unsupported or failed attempts",
                 "segment_binding_prepare_encode children are mutually exclusive host intervals within that parent, not additional work; early returns record only entered stages and panic skips the active stage; compare child totals and sample counts before calculating shares",
                 "segment preparation includes pool lock waits, allocations and backend host calls, not pure CPU; errors may include local cleanup in the active child; successful parent residual includes timer transitions, sink recording, final local cleanup and dispatch result map/accounting; snapshots are not atomic",
+                "backing_permit_and_metadata children are nested, mutually exclusive host intervals, not additional work; only entered stages have samples and pool-stage observations are recorded after releasing pool guards, so compare counts and totals before calculating shares",
                 "identity_materialize includes one bulk identity materialization on eager waves; dynamic_binding_encode covers reusable binding payloads only; eager provider compute encoding and command assembly remain in the parent residual",
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
@@ -2290,8 +2297,21 @@ impl VNextWaveTimingMetrics {
             "collection": "profile_attached_only",
             "fresh_authority_and_windows": self.segment_fresh_authority_windows.snapshot(),
             "backing_permit_and_metadata": self.segment_backing_permit_metadata.snapshot(),
+            "backing_permit_and_metadata_breakdown": self.segment_backing_permit_metadata_breakdown(),
             "node_dependencies_and_regions": self.segment_node_dependencies_regions.snapshot(),
             "backend_encode_and_validate": self.segment_backend_encode_validate.snapshot(),
+        })
+    }
+
+    fn segment_backing_permit_metadata_breakdown(&self) -> serde_json::Value {
+        serde_json::json!({
+            "collection": "profile_attached_only",
+            "snapshot_lookup": self.segment_backing_snapshot_lookup.snapshot(),
+            "dedup_reserve_and_pool_resolution": self.segment_backing_dedup_reserve_pool_resolution.snapshot(),
+            "lock_acquisition": self.segment_backing_lock_acquisition.snapshot(),
+            "locked_validation": self.segment_backing_locked_validation.snapshot(),
+            "window_intersections": self.segment_backing_window_intersections.snapshot(),
+            "immutable_metadata_validation": self.segment_backing_immutable_metadata_validation.snapshot(),
         })
     }
 
@@ -2312,6 +2332,12 @@ impl VNextWaveTimingMetrics {
             &self.segment_binding_prepare_encode,
             &self.segment_fresh_authority_windows,
             &self.segment_backing_permit_metadata,
+            &self.segment_backing_snapshot_lookup,
+            &self.segment_backing_dedup_reserve_pool_resolution,
+            &self.segment_backing_lock_acquisition,
+            &self.segment_backing_locked_validation,
+            &self.segment_backing_window_intersections,
+            &self.segment_backing_immutable_metadata_validation,
             &self.segment_node_dependencies_regions,
             &self.segment_backend_encode_validate,
             &self.node_identity_materialize,
@@ -2479,6 +2505,24 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
             SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata => {
                 self.segment_backing_permit_metadata.record(elapsed)
             }
+            SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup => {
+                self.segment_backing_snapshot_lookup.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution => self
+                .segment_backing_dedup_reserve_pool_resolution
+                .record(elapsed),
+            SubmissionWaveDispatchStage::SegmentBackingLockAcquisition => {
+                self.segment_backing_lock_acquisition.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingLockedValidation => {
+                self.segment_backing_locked_validation.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingWindowIntersections => {
+                self.segment_backing_window_intersections.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation => self
+                .segment_backing_immutable_metadata_validation
+                .record(elapsed),
             SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions => {
                 self.segment_node_dependencies_regions.record(elapsed)
             }
@@ -11423,6 +11467,30 @@ mod tests {
                 "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata",
             ),
             (
+                SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/snapshot_lookup",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/dedup_reserve_and_pool_resolution",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/lock_acquisition",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/locked_validation",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingWindowIntersections,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/window_intersections",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/immutable_metadata_validation",
+            ),
+            (
                 SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
                 "segment_binding_prepare_encode_breakdown/node_dependencies_and_regions",
             ),
@@ -11464,6 +11532,34 @@ mod tests {
                 Some(&serde_json::json!(0))
             );
         }
+    }
+
+    #[test]
+    fn wave_timing_backing_partial_observations_keep_independent_parent_samples() {
+        use super::{SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink};
+
+        let metrics = VNextWaveTimingMetrics::default();
+        metrics.record(
+            SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+            Duration::from_nanos(11),
+        );
+        metrics.record(
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+            Duration::from_nanos(100),
+        );
+        metrics.record(
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+            Duration::from_nanos(200),
+        );
+
+        let snapshot = metrics.segment_binding_prepare_encode_breakdown();
+        assert_eq!(snapshot["backing_permit_and_metadata"]["samples"], 2);
+        assert_eq!(snapshot["backing_permit_and_metadata"]["total_ns"], 300);
+        let children = &snapshot["backing_permit_and_metadata_breakdown"];
+        assert_eq!(children["snapshot_lookup"]["samples"], 1);
+        assert_eq!(children["snapshot_lookup"]["total_ns"], 11);
+        assert_eq!(children["lock_acquisition"]["samples"], 0);
+        assert_eq!(children["immutable_metadata_validation"]["samples"], 0);
     }
 
     #[test]

@@ -87,6 +87,9 @@ pub use dispatch_contract::{
     SubmissionWaveDispatchError, SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink,
     SubmissionWaveInputUpload,
 };
+pub(crate) use dispatch_contract::{
+    DisabledSubmissionWaveDispatchTimingSink, SubmissionWaveDispatchStageTimer,
+};
 pub use identity::{
     BatchOperationIdentity, BatchOperationIdentityMaterializationSnapshot,
     BatchOperationNodeIdentity, BatchOperationParticipantIdentity,

@@ -1,5 +1,29 @@
 //! Actual multi-pool admission, replacement and whole-segment failure boundaries.
 use super::*;
+use crate::vnext::{
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, SubmissionWaveDispatchStage,
+    SubmissionWaveDispatchTimingSink,
+};
+
+struct PermitTiming<F> {
+    before_record: F,
+    stages: Mutex<Vec<SubmissionWaveDispatchStage>>,
+}
+
+impl<F: Fn() + Send + Sync> DeviceSubmissionTimingSink for PermitTiming<F> {
+    const ENABLED: bool = true;
+
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {
+        panic!("a resource permit does not submit device commands");
+    }
+}
+
+impl<F: Fn() + Send + Sync> SubmissionWaveDispatchTimingSink for PermitTiming<F> {
+    fn record(&self, stage: SubmissionWaveDispatchStage, _: std::time::Duration) {
+        (self.before_record)();
+        self.stages.lock().unwrap().push(stage);
+    }
+}
 
 fn two_pools() -> (Harness, Vec<LogicalBackingSliceAuthority>) {
     let catalog = combine_catalogs(&['a', 'b'].map(|digit| {
@@ -59,6 +83,146 @@ fn windows(expected: &[SegmentBackingExpectation]) -> Vec<SegmentBackingWindow> 
             alignment_bytes: e.alignment_bytes,
         })
         .collect()
+}
+
+#[test]
+fn segment_permit_timing_flushes_after_two_pool_unlock_and_preserves_views() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    // Deliberately present the requests in reverse pool order. Timing must not
+    // change canonical lock acquisition or caller resource/window indices.
+    let groups = [
+        std::slice::from_ref(&authorities[1]),
+        std::slice::from_ref(&authorities[0]),
+    ];
+    let expected = expectations(&groups);
+    let requested = windows(&expected);
+    let sink = PermitTiming {
+        before_record: || {
+            for pool in pools.pools.values() {
+                assert!(
+                    pool.state.try_lock().is_ok(),
+                    "observer ran under a pool lock"
+                );
+            }
+        },
+        stages: Mutex::new(Vec::new()),
+    };
+    let queries = harness.runtime.descriptor_queries.load(Ordering::Acquire);
+    let batch = pools
+        .segment_backing_batch_with_timing(&groups, &expected, &requested, &sink)
+        .unwrap();
+    for (index, group) in groups.iter().enumerate() {
+        let original = pools.view(&group[0]).unwrap();
+        let region = batch
+            .window(index)
+            .unwrap()
+            .physical_regions()
+            .next()
+            .unwrap();
+        assert!(std::ptr::eq(
+            region.buffer_and_physical_range().0,
+            original.segment_bindings()[0].buffer()
+        ));
+        assert_eq!(region.length_bytes(), expected[index].logical_bytes);
+    }
+    assert_eq!(
+        *sink.stages.lock().unwrap(),
+        [
+            SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
+            SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
+            SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
+            SubmissionWaveDispatchStage::SegmentBackingWindowIntersections,
+        ]
+    );
+    assert_eq!(
+        harness.runtime.descriptor_queries.load(Ordering::Acquire),
+        queries
+    );
+    drop(batch);
+    drop(sink);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn segment_permit_timing_error_flush_releases_partial_retention_and_marks_entered_stage() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let first = &pools.pools[&harness.pool_ids[0]];
+    let second = &pools.pools[&harness.pool_ids[1]];
+    let ordinal = authorities[0].evidence.segments[0].chunk_ordinal();
+    let chunk = Arc::clone(&first.state.lock().unwrap().chunks[&ordinal].backing);
+    let baseline = Arc::strong_count(&chunk);
+    let groups = authorities
+        .iter()
+        .map(std::slice::from_ref)
+        .collect::<Vec<_>>();
+    let expected = expectations(&groups);
+    let mut requested = windows(&expected);
+    let sink = PermitTiming {
+        before_record: || {
+            for pool in pools.pools.values() {
+                match pool.state.try_lock() {
+                    Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => {}
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        panic!("observer ran under a pool lock")
+                    }
+                }
+            }
+            assert_eq!(
+                Arc::strong_count(&chunk),
+                baseline,
+                "partial retention outlived error cleanup"
+            );
+        },
+        stages: Mutex::new(Vec::new()),
+    };
+    second.state.lock().unwrap().poisoned = true;
+    assert!(pools
+        .segment_backing_batch_with_timing(&groups, &expected, &requested, &sink)
+        .is_err());
+    let stages = std::mem::take(&mut *sink.stages.lock().unwrap());
+    assert_eq!(
+        stages.last(),
+        Some(&SubmissionWaveDispatchStage::SegmentBackingLockedValidation)
+    );
+    assert!(!stages.contains(&SubmissionWaveDispatchStage::SegmentBackingWindowIntersections));
+    second.state.lock().unwrap().poisoned = false;
+
+    requested[1].offset_bytes = u64::MAX;
+    assert!(pools
+        .segment_backing_batch_with_timing(&groups, &expected, &requested, &sink)
+        .is_err());
+    let stages = std::mem::take(&mut *sink.stages.lock().unwrap());
+    assert_eq!(
+        stages.last(),
+        Some(&SubmissionWaveDispatchStage::SegmentBackingWindowIntersections)
+    );
+
+    // A poisoned second mutex aborts collect after acquiring the first mutex.
+    // The partial guard vector must be destroyed before any observer callback.
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = second.state.lock().unwrap();
+        panic!("poison the second real pool mutex");
+    }))
+    .is_err());
+    assert!(pools
+        .segment_backing_batch_with_timing(&groups, &expected, &requested, &sink)
+        .is_err());
+    let stages = std::mem::take(&mut *sink.stages.lock().unwrap());
+    assert_eq!(
+        stages,
+        [
+            SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
+            SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
+        ]
+    );
+    second.state.clear_poison();
+    drop(sink);
+    drop(chunk);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]

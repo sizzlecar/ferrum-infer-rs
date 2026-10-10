@@ -243,6 +243,12 @@ pub enum SubmissionWaveDispatchStage {
     SegmentBindingPrepareAndEncode,
     SegmentFreshAuthorityAndWindows,
     SegmentBackingPermitAndMetadata,
+    SegmentBackingSnapshotLookup,
+    SegmentBackingDedupReserveAndPoolResolution,
+    SegmentBackingLockAcquisition,
+    SegmentBackingLockedValidation,
+    SegmentBackingWindowIntersections,
+    SegmentBackingImmutableMetadataValidation,
     SegmentNodeDependenciesAndRegions,
     SegmentBackendEncodeAndValidate,
     NodeIdentityMaterialize,
@@ -266,7 +272,7 @@ pub trait SubmissionWaveDispatchTimingSink: DeviceSubmissionTimingSink {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration);
 }
 
-pub(super) struct DisabledSubmissionWaveDispatchTimingSink;
+pub(crate) struct DisabledSubmissionWaveDispatchTimingSink;
 
 impl DeviceSubmissionTimingSink for DisabledSubmissionWaveDispatchTimingSink {
     const ENABLED: bool = false;
@@ -282,7 +288,7 @@ impl SubmissionWaveDispatchTimingSink for DisabledSubmissionWaveDispatchTimingSi
     }
 }
 
-pub(super) struct SubmissionWaveDispatchStageTimer<'sink, S>
+pub(crate) struct SubmissionWaveDispatchStageTimer<'sink, S>
 where
     S: SubmissionWaveDispatchTimingSink,
 {
@@ -296,7 +302,7 @@ where
     S: SubmissionWaveDispatchTimingSink,
 {
     #[inline(always)]
-    pub(super) fn start(sink: &'sink S, stage: SubmissionWaveDispatchStage) -> Self {
+    pub(crate) fn start(sink: &'sink S, stage: SubmissionWaveDispatchStage) -> Self {
         Self {
             sink,
             stage,
@@ -363,6 +369,12 @@ mod submission_wave_dispatch_timing_tests {
             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
             SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
             SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+            SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+            SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
+            SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
+            SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
+            SubmissionWaveDispatchStage::SegmentBackingWindowIntersections,
+            SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation,
             SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
             SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
         ] {

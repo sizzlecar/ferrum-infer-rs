@@ -441,8 +441,12 @@ where
     let backing = if requests.is_empty() {
         None
     } else {
-        Some(wave.prepare_segment_backings(&requests, &windows)?)
+        Some(wave.prepare_segment_backings_with_timing(&requests, &windows, timing_sink)?)
     };
+    let metadata_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation,
+    );
     let mut seen = BTreeMap::new();
     for plan in &plan_views {
         if plan.leased.generation() == 0 {
@@ -481,6 +485,7 @@ where
             }
         }
     }
+    drop(metadata_stage);
     drop(backing_stage);
     let node_stage = SubmissionWaveDispatchStageTimer::start(
         timing_sink,

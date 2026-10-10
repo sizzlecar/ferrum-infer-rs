@@ -30,8 +30,14 @@ impl SubmissionWaveDispatchTimingSink for SegmentTiming {
     }
 }
 
-const SEGMENT_PHASES: [SubmissionWaveDispatchStage; 4] = [
+const SEGMENT_PHASES: [SubmissionWaveDispatchStage; 10] = [
     SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+    SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+    SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
+    SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
+    SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
+    SubmissionWaveDispatchStage::SegmentBackingWindowIntersections,
+    SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation,
     SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
     SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
     SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
@@ -333,7 +339,7 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         run().is_err(),
         "Some capability cannot hide the actual getter"
     );
-    assert_eq!(timing.take(), SEGMENT_PHASES[..2]);
+    assert_eq!(timing.take(), SEGMENT_PHASES[..8]);
     fixture
         .runtime_trace
         .lock()

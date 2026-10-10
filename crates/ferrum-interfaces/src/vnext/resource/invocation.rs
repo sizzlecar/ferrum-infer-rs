@@ -1874,6 +1874,26 @@ where
         requests: &[super::SegmentBackingRequest],
         windows: &[super::SegmentBackingWindow],
     ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError> {
+        self.prepare_segment_backings_with_timing(
+            requests,
+            windows,
+            &crate::vnext::operation::DisabledSubmissionWaveDispatchTimingSink,
+        )
+    }
+
+    pub(crate) fn prepare_segment_backings_with_timing<S>(
+        &self,
+        requests: &[super::SegmentBackingRequest],
+        windows: &[super::SegmentBackingWindow],
+        timing_sink: &S,
+    ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError>
+    where
+        S: crate::vnext::SubmissionWaveDispatchTimingSink,
+    {
+        let snapshot_stage = crate::vnext::operation::SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            crate::vnext::SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+        );
         let node = self
             .nodes
             .first()
@@ -1940,7 +1960,8 @@ where
             groups.push(authorities);
             expected.push(request.expected);
         }
-        pools.segment_backing_batch(&groups, &expected, windows)
+        drop(snapshot_stage);
+        pools.segment_backing_batch_with_timing(&groups, &expected, windows, timing_sink)
     }
 
     pub(crate) fn backing_view(
