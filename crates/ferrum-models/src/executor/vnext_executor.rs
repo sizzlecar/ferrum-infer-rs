@@ -70,6 +70,7 @@ mod prefix_cache;
 mod program_binding_upload;
 mod request;
 mod reusable_catalog;
+mod reusable_cold_path;
 mod state_memory;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -1419,6 +1420,7 @@ struct VNextExecutorMetrics {
     reusable_catalog_misses: AtomicU64,
     reusable_catalog_epoch_misses: AtomicU64,
     reusable_catalog_miss_ledger: Mutex<VNextReusableExecutionCatalogMissLedger>,
+    reusable_cold_path: reusable_cold_path::Ledger,
     identity_waves: AtomicU64,
     identity_logical_nodes: AtomicU64,
     identity_nodes_materialized_before_submit: AtomicU64,
@@ -2907,6 +2909,7 @@ impl VNextExecutorMetrics {
         self.wave_timing.reset();
         self.prepared_wave_topology.reset();
         self.reusable_catalog_miss_ledger.lock().reset();
+        self.reusable_cold_path.reset();
         self.prefill_wave_timing.reset();
         self.decode_wave_timing.reset();
         self.mixed_wave_timing.reset();
@@ -7329,6 +7332,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        mut cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7579,6 +7583,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let mut reusable_catalog_miss = None;
             let catalog_snapshot = self.reusable_execution_catalog.read().clone();
             let catalog = catalog_snapshot.as_deref();
+            let mut diagnostic_program_id = None;
             let reusable_program = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
                 catalog.is_some(),
@@ -7600,6 +7605,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 };
                 match program_id {
                     Some(program_id) => {
+                        if cold_wave.is_some() {
+                            diagnostic_program_id = Some(program_id.clone());
+                        }
                         if catalog.is_none() {
                             self.record_startup_reusable_program(participants, kind, &program_id);
                         }
@@ -7676,15 +7684,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     program.per_wave_binding_node_indices().len() as u64,
                 )
             });
+            let observation = timing_enabled.then(|| {
+                reusable_cold_path::AttemptObservation::new(
+                    &timing_sink,
+                    diagnostic_program_id,
+                    self.lane.reusable_execution_epoch(),
+                    catalog.map(|catalog| catalog.lane_epoch),
+                    reusable_catalog_miss.map(|miss| miss.reason),
+                )
+            });
+            let mut provider_elapsed = None;
             let submission = {
-                let _timing = self
+                let timing = self
                     .metrics
                     .wave_timing
                     .provider_encode_submit
                     .start_if(timing_enabled);
-                let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
-                if let Some(reusable_program) = reusable_program {
-                    if timing_enabled {
+                let phase_timer = phase_timing.provider_encode_submit.start_if(timing_enabled);
+                let submission = if let Some(reusable_program) = reusable_program {
+                    if let Some(timing_sink) = observation.as_ref() {
                         OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                             self.providers.providers(),
                             &self.resolved_plan,
@@ -7695,7 +7713,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             reusable_program,
                             execution_policy,
                             self.invocation_preparation_strategy,
-                            &timing_sink,
+                            timing_sink,
                             &self.metrics.invocation_preparation,
                             wave,
                             &self.lane,
@@ -7721,7 +7739,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )
                         .map(|profiled| (profiled.into_parts().0, None))
                     }
-                } else if timing_enabled {
+                } else if let Some(timing_sink) = observation.as_ref() {
                     OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
@@ -7731,7 +7749,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &uploads,
                         execution_policy,
                         self.invocation_preparation_strategy,
-                        &timing_sink,
+                        timing_sink,
                         &self.metrics.invocation_preparation,
                         wave,
                         &self.lane,
@@ -7755,8 +7773,45 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &self.reaper,
                     )
                     .map(|profiled| (profiled.into_parts().0, None))
+                };
+                drop(phase_timer);
+                if cold_wave.is_some() {
+                    provider_elapsed = timing.and_then(|timer| timer.finish());
                 }
+                submission
             };
+            if let (Some(cold_wave), Some(observation)) = (cold_wave.as_mut(), observation) {
+                let outcome = match &submission {
+                    Ok(_) => reusable_cold_path::Outcome::Submitted,
+                    Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { .. }) => {
+                        reusable_cold_path::Outcome::DefinitelyNotSubmitted
+                    }
+                    Err(SubmissionWaveDispatchError::Contract(_)) => {
+                        reusable_cold_path::Outcome::ContractError
+                    }
+                    Err(SubmissionWaveDispatchError::Provider(_)) => {
+                        reusable_cold_path::Outcome::ProviderError
+                    }
+                    Err(SubmissionWaveDispatchError::Initialization(_)) => {
+                        reusable_cold_path::Outcome::InitializationError
+                    }
+                    Err(SubmissionWaveDispatchError::InputUpload(_)) => {
+                        reusable_cold_path::Outcome::InputUploadError
+                    }
+                    Err(SubmissionWaveDispatchError::SubmissionIndeterminate { .. }) => {
+                        reusable_cold_path::Outcome::SubmissionIndeterminate
+                    }
+                    Err(SubmissionWaveDispatchError::PostSubmitContract { .. }) => {
+                        reusable_cold_path::Outcome::PostSubmitContract
+                    }
+                };
+                cold_wave.record_attempt(
+                    observation,
+                    identity.preparation_snapshot(),
+                    outcome,
+                    provider_elapsed,
+                );
+            }
             match submission {
                 Ok((completion, attribution)) => {
                     let identity_materialization = identity.materialization_snapshot();
@@ -8145,9 +8200,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
+        let mut cold_wave = self
+            .metrics
+            .reusable_cold_path
+            .begin(self.host_dispatch_timing_enabled(), kind);
         let (mut token_mask_residency, dispatch) = {
-            let _timing = self.metrics.wave_timing.host_encode_submit.start();
-            let _phase_timing = phase_timing.host_encode_submit.start();
+            let timing = self.metrics.wave_timing.host_encode_submit.start();
+            let phase_timer = phase_timing.host_encode_submit.start();
             // Product-fixed inputs live in the lane-stable Step arena. One Step
             // slot lease is exclusive through terminal completion, while a
             // released slot retains its physical backing for later waves. Bind
@@ -8179,7 +8238,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 kind,
                 output_mode,
                 token_mask_residency.plans(),
+                cold_wave.as_mut(),
             );
+            drop(phase_timer);
+            if let Some(cold_wave) = cold_wave.take() {
+                cold_wave.finish(
+                    timing.finish(),
+                    reusable_cold_path::Outcome::from_dispatch(&dispatch),
+                );
+            }
             (token_mask_residency, dispatch)
         };
         let mut execution_event_error = None;
@@ -9926,6 +9993,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "catalog_misses": self.metrics.reusable_catalog_misses.load(Ordering::Relaxed),
                     "catalog_epoch_misses": self.metrics.reusable_catalog_epoch_misses.load(Ordering::Relaxed),
                     "catalog_miss_ledger": self.metrics.reusable_catalog_miss_ledger.lock().snapshot(),
+                    "cold_path": self.metrics.reusable_cold_path.snapshot(),
                 },
                 "identity_materialization": {
                     "waves": self.metrics.identity_waves.load(Ordering::Relaxed),

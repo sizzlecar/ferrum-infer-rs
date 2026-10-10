@@ -4362,6 +4362,20 @@ impl DeviceRuntime for CudaDeviceRuntime {
             for _ in 0..preparation.evicted_segments() {
                 replay_observation.observe_evicted_segment();
             }
+            timing_sink.record_reusable_preparation(
+                reusable_execution_capture
+                    .as_ref()
+                    .map(DeviceReusableExecutionCapture::program_id)
+                    .or_else(|| {
+                        commands.iter().find_map(|command| {
+                            command
+                                .reusable_execution_invocation()
+                                .map(|invocation| invocation.program_id())
+                        })
+                    }),
+                capture_allowed,
+                replay_observation,
+            );
         }
         if let Some(capture) = reusable_execution_capture.as_ref() {
             let command_node_indices = command_node_indices
@@ -4374,6 +4388,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 command_node_indices,
                 &commands,
                 &preparation,
+                timing_sink,
             ) {
                 stream.state.fail();
                 self.quarantine(stream, commands);

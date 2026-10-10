@@ -23,7 +23,7 @@ use ferrum_interfaces::vnext::{
     DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
     DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
-    DeviceReusableExecutionSegment, DeviceTimingMode, ElementType,
+    DeviceReusableExecutionSegment, DeviceSubmissionTimingSink, DeviceTimingMode, ElementType,
 };
 use sha2::{Digest, Sha256};
 
@@ -1413,7 +1413,7 @@ impl CudaExecutableCache {
         self.rejected.insert(key, now);
     }
 
-    pub(crate) fn register_program(
+    pub(crate) fn register_program<S: DeviceSubmissionTimingSink>(
         &mut self,
         capture: &DeviceReusableExecutionCapture,
         candidates: &[CudaExecutableCandidate],
@@ -1421,6 +1421,7 @@ impl CudaExecutableCache {
         command_node_indices: &[Option<u32>],
         commands: &[CudaDeviceCommand],
         preparation: &CudaExecutablePreparation,
+        timing_sink: &S,
     ) -> Result<(), CudaReplayError> {
         if !self.preparation.capture_is_open() {
             return Ok(());
@@ -1631,6 +1632,10 @@ impl CudaExecutableCache {
             if current == &program {
                 program.recipe_owner = current.recipe_owner.clone();
             }
+        }
+        if S::ENABLED {
+            timing_sink
+                .record_reusable_program_gaps(capture.program_id(), program.descriptor.gaps());
         }
         // Preserve resident identities across updates. With on-demand work,
         // do not retain an unbounded history of empty program tombstones.

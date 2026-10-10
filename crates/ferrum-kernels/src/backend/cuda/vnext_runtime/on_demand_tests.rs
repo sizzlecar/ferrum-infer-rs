@@ -258,6 +258,7 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
                 &nodes,
                 &commands,
                 &preparation,
+                &ferrum_interfaces::vnext::DisabledDeviceSubmissionTimingSink,
             )
             .unwrap();
         let catalog = h.cache.catalog().unwrap();

@@ -1820,6 +1820,24 @@ pub trait DeviceSubmissionTimingSink: Send + Sync {
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration);
 
     fn record_reusable_execution(&self, _observation: DeviceReusableExecutionObservation) {}
+
+    /// One submission's actual backend preparation, before command enqueue.
+    /// The borrowed identity is diagnostic only; callbacks must not retain it.
+    fn record_reusable_preparation(
+        &self,
+        _program_id: Option<&DeviceReusableExecutionProgramId>,
+        _capture_allowed: bool,
+        _observation: DeviceReusableExecutionObservation,
+    ) {
+    }
+
+    /// The actual node gaps before an on-demand empty program is discarded.
+    fn record_reusable_program_gaps(
+        &self,
+        _program_id: &DeviceReusableExecutionProgramId,
+        _gaps: &[DeviceReusableExecutionProgramGap],
+    ) {
+    }
 }
 
 pub struct DisabledDeviceSubmissionTimingSink;
