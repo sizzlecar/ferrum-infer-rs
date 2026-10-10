@@ -252,6 +252,9 @@ pub struct RuntimeCliConfig {
     /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: Option<ferrum_types::ProgramBindingUploadStrategy>,
+    /// Host-memory transport for CUDA plan-runtime binding uploads.
+    #[serde(default)]
+    pub program_binding_upload_transport: Option<ferrum_types::ProgramBindingUploadTransport>,
 
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
@@ -487,6 +490,12 @@ impl RuntimeCliConfig {
             "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
             self.program_binding_upload_strategy
                 .map(ferrum_types::ProgramBindingUploadStrategy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_PROGRAM_BINDING_UPLOAD_TRANSPORT",
+            self.program_binding_upload_transport
+                .map(ferrum_types::ProgramBindingUploadTransport::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1147,6 +1156,33 @@ mod tests {
         assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\nprogram_binding_upload_strategy = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn program_binding_upload_transport_config_is_independent_and_optional() {
+        let legacy: CliConfig =
+            toml::from_str("[runtime]\nprogram_binding_upload_strategy = \"sparse\"\n").unwrap();
+        assert_eq!(legacy.runtime.program_binding_upload_transport, None);
+        for strategy in ["sparse", "uniform-live-prefix"] {
+            for transport in ["pageable-direct", "pinned-direct"] {
+                let config: CliConfig = toml::from_str(&format!(
+                    "[runtime]\nprogram_binding_upload_strategy = \"{strategy}\"\nprogram_binding_upload_transport = \"{transport}\"\n"
+                )).unwrap();
+                let entries = config.runtime.runtime_config_entries();
+                for (key, value) in [
+                    ("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY", strategy),
+                    ("FERRUM_PROGRAM_BINDING_UPLOAD_TRANSPORT", transport),
+                ] {
+                    let entry = entries.iter().find(|entry| entry.key == key).unwrap();
+                    assert_eq!(entry.effective_value, value);
+                    assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+                }
+            }
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nprogram_binding_upload_transport = \"automatic\"\n"
         )
         .is_err());
     }

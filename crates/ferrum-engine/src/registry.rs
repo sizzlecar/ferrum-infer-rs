@@ -1166,6 +1166,17 @@ fn validate_program_binding_upload_strategy(
             "uniform-live-prefix program-binding uploads require a CUDA plan runtime",
         ));
     }
+    if config
+        .engine_config
+        .runtime
+        .program_binding_upload_transport
+        == ferrum_types::ProgramBindingUploadTransport::PinnedDirect
+        && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime)
+    {
+        return Err(FerrumError::unsupported(
+            "pinned-direct program-binding uploads require a CUDA plan runtime",
+        ));
+    }
     Ok(())
 }
 
@@ -1264,7 +1275,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_program_binding_upload_strategy(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_program_binding_upload_options(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1272,6 +1283,7 @@ fn create_registered_vnext_executor(
                             config.engine_config.kv_cache.dtype,
                         )?,
                         config.engine_config.runtime.program_binding_upload_strategy,
+                        config.engine_config.runtime.program_binding_upload_transport,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -2066,6 +2078,66 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("CUDA plan runtime"));
+    }
+
+    #[test]
+    fn program_binding_upload_transport_requires_cuda_plan_runtime() {
+        use ferrum_types::{ProgramBindingUploadStrategy, ProgramBindingUploadTransport};
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config
+                    .engine_config
+                    .runtime
+                    .program_binding_upload_transport =
+                    ProgramBindingUploadTransport::PageableDirect;
+                validate_program_binding_upload_strategy(&config, plan_runtime).unwrap();
+                config
+                    .engine_config
+                    .runtime
+                    .program_binding_upload_transport = ProgramBindingUploadTransport::PinnedDirect;
+                assert_eq!(
+                    validate_program_binding_upload_strategy(&config, plan_runtime).is_ok(),
+                    plan_runtime && matches!(config.device, Device::CUDA(_))
+                );
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_program_binding_upload_strategy(&config, true).is_err());
+        }
+        config.device = Device::CUDA(0);
+        for strategy in [
+            ProgramBindingUploadStrategy::Sparse,
+            ProgramBindingUploadStrategy::UniformLivePrefix,
+        ] {
+            config.engine_config.runtime.program_binding_upload_strategy = strategy;
+            validate_program_binding_upload_strategy(&config, true).unwrap();
+        }
+    }
+
+    #[test]
+    fn program_binding_upload_transport_rejects_unsupported_factories_before_loading() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.program_binding_upload_transport =
+            ferrum_types::ProgramBindingUploadTransport::PinnedDirect;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        let error = tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("pinned-direct program-binding uploads require a CUDA plan runtime"));
+        config.device = Device::CUDA(0);
+        let error = tokio_test::block_on(StubExecutorFactory.create(&config))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("pinned-direct program-binding uploads require a CUDA plan runtime"));
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

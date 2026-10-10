@@ -43,14 +43,21 @@ use ferrum_interfaces::vnext::{
     DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
-use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
+use ferrum_types::{
+    AttentionExecutionPolicy, ProgramBindingUploadStrategy, ProgramBindingUploadTransport,
+};
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 use super::vnext_tool_correlation;
 use crate::backend::program_binding_upload::ProgramBindingUploadCounters;
 
 mod binding_transfers;
+mod pinned_binding_upload;
 mod segment_oracle;
+
+use pinned_binding_upload::{
+    PinnedSources, PinnedUploadPool, PinnedUploadSubmission, ProgramBindingPrelude,
+};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -415,6 +422,7 @@ type ObservedEnqueueAction = Box<
 enum CudaEnqueueAction {
     Static(EnqueueAction),
     ConditionalDependency(ObservedEnqueueAction),
+    ProgramBindingPrelude(ProgramBindingPrelude),
 }
 
 /// CUDA work captured by a reusable executable. Submission-scoped resource
@@ -1472,65 +1480,18 @@ impl CudaDeviceCommand {
             ));
             host_storage.push(transfer.payload);
         }
-        let executable = Arc::new(CudaCommandExecutable::static_work(
+        let executable = Arc::new(CudaCommandExecutable {
             regions,
             host_storage,
-            Box::new(move |stream, _blas, regions, host_storage| {
-                let mut upload_attempt = upload_counters.attempt(upload_plan);
-                if regions.len() != host_storage.len() || regions.len() != transfer_shapes.len() {
-                    return Err(CudaDeviceRuntimeError::contract(
-                        "CUDA sparse program binding transfer storage differs from its shape",
-                    ));
-                }
-                for ((region, payload), &(destination_pitch, row_bytes, row_count)) in
-                    regions.iter().zip(host_storage).zip(&transfer_shapes)
-                {
-                    if row_count == 1 {
-                        unsafe {
-                            cudarc::driver::result::memcpy_htod_async(
-                                region.device_ptr,
-                                payload.as_ref(),
-                                stream.cu_stream(),
-                            )
-                        }
-                        .map_err(|error| {
-                            CudaDeviceRuntimeError::driver("sparse program binding upload", error)
-                        })?;
-                        upload_attempt.copied(payload.len() as u64, false);
-                        continue;
-                    }
-                    let copy = cudarc::driver::sys::CUDA_MEMCPY2D {
-                        srcXInBytes: 0,
-                        srcY: 0,
-                        srcMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST,
-                        srcHost: payload.as_ptr().cast(),
-                        srcDevice: 0,
-                        srcArray: std::ptr::null_mut(),
-                        srcPitch: row_bytes,
-                        dstXInBytes: 0,
-                        dstY: 0,
-                        dstMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                        dstHost: std::ptr::null_mut(),
-                        dstDevice: region.device_ptr,
-                        dstArray: std::ptr::null_mut(),
-                        dstPitch: destination_pitch,
-                        WidthInBytes: row_bytes,
-                        Height: row_count,
-                    };
-                    unsafe { cudarc::driver::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream()) }
-                        .result()
-                        .map_err(|error| {
-                            CudaDeviceRuntimeError::driver(
-                                "strided sparse program binding upload",
-                                error,
-                            )
-                        })?;
-                    upload_attempt.copied(payload.len() as u64, true);
-                }
-                upload_attempt.succeeded();
-                Ok(())
-            }),
-        ));
+            work_declaration: CudaWorkDeclaration::Static,
+            enqueue: Mutex::new(CudaEnqueueAction::ProgramBindingPrelude(
+                ProgramBindingPrelude {
+                    shapes: transfer_shapes,
+                    counters: upload_counters,
+                    plan: upload_plan,
+                },
+            )),
+        });
         Ok(vec![Self {
             runtime_instance,
             operation: "vnext_program_binding_prelude",
@@ -1618,6 +1579,15 @@ impl CudaDeviceCommand {
         stream: &CudaStream,
         blas: &CudaBlas,
     ) -> Result<CudaEnqueuedWork, CudaDeviceRuntimeError> {
+        self.enqueue_with_pinned_sources(stream, blas, None)
+    }
+
+    fn enqueue_with_pinned_sources(
+        &self,
+        stream: &CudaStream,
+        blas: &CudaBlas,
+        pinned_sources: Option<PinnedSources<'_>>,
+    ) -> Result<CudaEnqueuedWork, CudaDeviceRuntimeError> {
         let executable = self.executable.as_ref().ok_or_else(|| {
             CudaDeviceRuntimeError::contract(
                 "uncoalesced CUDA program binding patch cannot enqueue",
@@ -1634,6 +1604,15 @@ impl CudaDeviceCommand {
             }
             CudaEnqueueAction::ConditionalDependency(enqueue) => {
                 enqueue(stream, blas, &executable.regions, &executable.host_storage)?
+            }
+            CudaEnqueueAction::ProgramBindingPrelude(prelude) => {
+                prelude.enqueue(
+                    stream,
+                    &executable.regions,
+                    &executable.host_storage,
+                    pinned_sources,
+                )?;
+                CudaEnqueuedWork::Static
             }
         };
         for check in self
@@ -1986,6 +1965,7 @@ pub struct CudaDeviceStream {
     blas: Arc<CudaBlas>,
     state: Arc<CudaStreamState>,
     executable_cache: CudaExecutableCache,
+    pinned_upload_pool: Arc<PinnedUploadPool>,
 }
 
 impl fmt::Debug for CudaDeviceStream {
@@ -2100,6 +2080,7 @@ pub struct CudaDeviceFence {
     _stream: Arc<CudaStream>,
     _blas: Arc<CudaBlas>,
     _commands: Vec<CudaDeviceCommand>,
+    pinned_uploads: Mutex<PinnedUploadSubmission>,
 }
 
 enum CudaFenceTiming {
@@ -2281,9 +2262,13 @@ impl CudaDeviceFence {
         }
         DeviceTerminal::Succeeded
     }
-    fn mark_terminal(&self) {
+    fn mark_terminal(&self, successful: bool) {
         if !self.terminal_accounted.swap(true, Ordering::AcqRel) {
             self.stream_state.finish_one();
+            self.pinned_uploads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .completed(successful && self.stream_state.is_quiescent());
         }
     }
 
@@ -2351,6 +2336,7 @@ struct QuarantinedSubmission {
     _stream: Arc<CudaStream>,
     _blas: Arc<CudaBlas>,
     _commands: Vec<CudaDeviceCommand>,
+    pinned_uploads: PinnedUploadSubmission,
 }
 
 #[cfg(feature = "vllm-marlin")]
@@ -2396,6 +2382,7 @@ pub struct CudaDeviceRuntime {
     descriptor: DeviceDescriptor,
     attention_execution_policy: AttentionExecutionPolicy,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    program_binding_upload_transport: ProgramBindingUploadTransport,
     program_binding_upload_counters: Arc<ProgramBindingUploadCounters>,
     segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
     segment_binding_oracle_audited_nodes: AtomicU64,
@@ -2436,6 +2423,16 @@ impl CudaDeviceRuntime {
         strategy: ProgramBindingUploadStrategy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         Self::new_for_purpose(config, CudaRuntimePurpose::Execution, strategy)
+    }
+
+    /// Selects only binding-upload host transport. Arithmetic, fresh authority
+    /// validation and sparse destination geometry are unchanged.
+    pub fn with_program_binding_upload_transport(
+        mut self,
+        transport: ProgramBindingUploadTransport,
+    ) -> Self {
+        self.program_binding_upload_transport = transport;
+        self
     }
 
     /// Only the non-executing catalog exporter may use this constructor. Its
@@ -2588,6 +2585,7 @@ impl CudaDeviceRuntime {
             descriptor,
             attention_execution_policy: config.attention_execution_policy,
             program_binding_upload_strategy,
+            program_binding_upload_transport: ProgramBindingUploadTransport::PageableDirect,
             program_binding_upload_counters: Arc::new(ProgramBindingUploadCounters::default()),
             segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
             segment_binding_oracle_audited_nodes: AtomicU64::new(0),
@@ -2647,18 +2645,32 @@ impl CudaDeviceRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn quarantine(&self, stream: &CudaDeviceStream, commands: Vec<CudaDeviceCommand>) {
+    fn quarantine(
+        &self,
+        stream: &CudaDeviceStream,
+        commands: Vec<CudaDeviceCommand>,
+        pinned_uploads: PinnedUploadSubmission,
+    ) {
         self.quarantined().push(QuarantinedSubmission {
             stream_id: stream.id,
             _stream: Arc::clone(&stream.stream),
             _blas: Arc::clone(&stream.blas),
             _commands: commands,
+            pinned_uploads,
         });
     }
 
     fn release_quarantine(&self, stream_id: u64) {
-        self.quarantined()
-            .retain(|submission| submission.stream_id != stream_id);
+        let mut quarantined = self.quarantined();
+        for submission in quarantined
+            .iter_mut()
+            .filter(|item| item.stream_id == stream_id)
+        {
+            // The caller has synchronized the actual stream. Failed streams
+            // remain failed: drained pins may be freed but never republished.
+            submission.pinned_uploads.completed(false);
+        }
+        quarantined.retain(|submission| submission.stream_id != stream_id);
     }
 }
 
@@ -3771,6 +3783,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             blas,
             state: Arc::new(CudaStreamState::new()),
             executable_cache: CudaExecutableCache::new(),
+            pinned_upload_pool: Arc::new(PinnedUploadPool::default()),
         })
     }
 
@@ -4305,6 +4318,16 @@ impl DeviceRuntime for CudaDeviceRuntime {
             | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => Vec::new(),
         };
         let capture_allowed = stream.state.is_quiescent();
+        let mut pinned_uploads = match self.program_binding_upload_transport {
+            ProgramBindingUploadTransport::PageableDirect => PinnedUploadSubmission::default(),
+            ProgramBindingUploadTransport::PinnedDirect => PinnedUploadSubmission::prepare(
+                &self.context,
+                &stream.pinned_upload_pool,
+                capture_allowed,
+                &commands,
+            )
+            .map_err(DefinitelyNotSubmitted::new)?,
+        };
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
@@ -4325,7 +4348,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             Ok(preparation) => preparation,
             Err(error) => {
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands, pinned_uploads);
                 panic!(
                     "CUDA submission became indeterminate while preparing reusable executables: {error}"
                 );
@@ -4376,7 +4399,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 &preparation,
             ) {
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands, pinned_uploads);
                 panic!(
                     "CUDA submission became indeterminate while registering a reusable program: {error}"
                 );
@@ -4451,7 +4474,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                                 });
                             let Some(reusable_graph_node_count) = reusable_graph_node_count else {
                                 stream.state.fail();
-                                self.quarantine(stream, commands);
+                                self.quarantine(stream, commands, pinned_uploads);
                                 panic!(
                                     "CUDA submission became indeterminate because replay graph attribution overflowed u64"
                                 );
@@ -4465,7 +4488,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             );
                             let Some(replayed) = replayed else {
                                 stream.state.fail();
-                                self.quarantine(stream, commands);
+                                self.quarantine(stream, commands, pinned_uploads);
                                 panic!(
                                     "CUDA submission became indeterminate because sealed replay attribution drifted"
                                 );
@@ -4504,12 +4527,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     }
                     Ok(None) => {
                         stream.state.fail();
-                        self.quarantine(stream, commands);
+                        self.quarantine(stream, commands, pinned_uploads);
                         panic!("CUDA reusable execution disappeared after pre-submit validation");
                     }
                     Err(error) => {
                         stream.state.fail();
-                        self.quarantine(stream, commands);
+                        self.quarantine(stream, commands, pinned_uploads);
                         panic!(
                             "CUDA submission became indeterminate while launching a reusable program: {error}"
                         );
@@ -4615,7 +4638,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 Some(Err(error)) => {
                     stream.state.fail();
-                    self.quarantine(stream, commands);
+                    self.quarantine(stream, commands, pinned_uploads);
                     panic!(
                         "CUDA submission became indeterminate while launching a reusable executable: {error}"
                     );
@@ -4628,11 +4651,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
                     .ok()
             });
-            let work = match commands[index].enqueue(&stream.stream, &stream.blas) {
+            let work = match commands[index].enqueue_with_pinned_sources(
+                &stream.stream,
+                &stream.blas,
+                pinned_uploads.sources_for(index),
+            ) {
                 Ok(work) => work,
                 Err(error) => {
                     stream.state.fail();
-                    self.quarantine(stream, commands);
+                    self.quarantine(stream, commands, pinned_uploads);
                     panic!(
                         "CUDA submission became indeterminate while enqueueing its batch: {error}"
                     );
@@ -4678,7 +4705,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .try_for_each(|check| check.enqueue(&stream.stream));
         if let Err(error) = numerical_snapshot {
             stream.state.fail();
-            self.quarantine(stream, commands);
+            self.quarantine(stream, commands, pinned_uploads);
             panic!(
                 "CUDA submission became indeterminate while snapshotting numerical status: {error}"
             );
@@ -4705,7 +4732,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             Some(Ok(attribution)) => Some(attribution),
             Some(Err(error)) => {
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands, pinned_uploads);
                 panic!(
                     "CUDA submission became indeterminate while binding native attribution: {error}"
                 );
@@ -4745,13 +4772,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
             Ok(event) => event,
             Err(error) => {
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands, pinned_uploads);
                 panic!("CUDA submission became indeterminate while recording its fence: {error:?}");
             }
         };
         if let Err(error) = stream.state.submission_recorded() {
             stream.state.fail();
-            self.quarantine(stream, commands);
+            self.quarantine(stream, commands, pinned_uploads);
             panic!("CUDA submission became indeterminate while accounting its fence: {error}");
         }
         let fence = CudaDeviceFence {
@@ -4764,6 +4791,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             _stream: Arc::clone(&stream.stream),
             _blas: Arc::clone(&stream.blas),
             _commands: commands,
+            pinned_uploads: Mutex::new(pinned_uploads),
         };
         drop(fence_stage);
         Ok(fence)
@@ -4783,8 +4811,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         match unsafe { cudarc::driver::result::event::query(fence.event.cu_event()) } {
             Ok(()) => {
-                fence.mark_terminal();
-                FenceQuery::Terminal(fence.terminal_receipt(fence.numerical_terminal()))
+                let terminal = fence.numerical_terminal();
+                fence.mark_terminal(terminal.is_succeeded());
+                FenceQuery::Terminal(fence.terminal_receipt(terminal))
             }
             Err(error) if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
                 FenceQuery::Pending
@@ -4802,8 +4831,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
     ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
         match fence.event.synchronize() {
             Ok(()) => {
-                fence.mark_terminal();
-                Ok(fence.terminal_receipt(fence.numerical_terminal()))
+                let terminal = fence.numerical_terminal();
+                fence.mark_terminal(terminal.is_succeeded());
+                Ok(fence.terminal_receipt(terminal))
             }
             Err(error) => {
                 fence.stream_state.fail();
@@ -4998,6 +5028,7 @@ mod tests {
                 _stream: stream.stream.clone(),
                 _blas: stream.blas.clone(),
                 _commands: vec![command],
+                pinned_uploads: Mutex::new(PinnedUploadSubmission::default()),
             };
             fence.event.synchronize().unwrap();
             assert_eq!(fence.numerical_terminal().is_succeeded(), !should_fail);

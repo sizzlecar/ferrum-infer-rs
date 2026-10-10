@@ -134,6 +134,9 @@ pub struct ServeCommand {
     /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
+    /// CUDA binding host-memory transport (default: pageable-direct). Pinned-direct requires a CUDA plan runtime.
+    #[arg(long, value_enum)]
+    pub program_binding_upload_transport: Option<crate::commands::ProgramBindingUploadTransportArg>,
 
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
@@ -420,6 +423,7 @@ async fn execute_with_compatibility(
         prefill_decode_execution,
         invocation_preparation_strategy,
         program_binding_upload_strategy,
+        program_binding_upload_transport,
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
@@ -877,6 +881,10 @@ async fn execute_with_compatibility(
     push_program_binding_upload_strategy_cli_entry(
         &mut startup_cli_runtime_entries,
         program_binding_upload_strategy,
+    );
+    push_program_binding_upload_transport_cli_entry(
+        &mut startup_cli_runtime_entries,
+        program_binding_upload_transport,
     );
     startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
@@ -1603,6 +1611,17 @@ fn push_program_binding_upload_strategy_cli_entry(
         entries,
         "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
         strategy.map(crate::commands::ProgramBindingUploadStrategyArg::as_runtime_value),
+    );
+}
+
+fn push_program_binding_upload_transport_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    transport: Option<crate::commands::ProgramBindingUploadTransportArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        "FERRUM_PROGRAM_BINDING_UPLOAD_TRANSPORT",
+        transport.map(crate::commands::ProgramBindingUploadTransportArg::as_runtime_value),
     );
 }
 
@@ -2635,6 +2654,69 @@ mod tests {
                     RuntimeConfigSource::ConfigFile
                 }
             );
+        }
+    }
+
+    #[test]
+    fn program_binding_upload_transport_serve_precedence_reaches_engine() {
+        use crate::commands::ProgramBindingUploadTransportArg as Arg;
+        use ferrum_types::{
+            ProgramBindingUploadStrategy, ProgramBindingUploadTransport as Transport,
+        };
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_TRANSPORT";
+        let config_entries = crate::config::RuntimeCliConfig {
+            program_binding_upload_strategy: Some(ProgramBindingUploadStrategy::UniformLivePrefix),
+            program_binding_upload_transport: Some(Transport::PinnedDirect),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (env, cli, expected, source) in [
+            (
+                None,
+                None,
+                Transport::PinnedDirect,
+                RuntimeConfigSource::ConfigFile,
+            ),
+            (
+                Some("pageable-direct"),
+                None,
+                Transport::PageableDirect,
+                RuntimeConfigSource::Env,
+            ),
+            (
+                Some("pageable-direct"),
+                Some(Arg::PinnedDirect),
+                Transport::PinnedDirect,
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                Some("pinned-direct"),
+                Some(Arg::PageableDirect),
+                Transport::PageableDirect,
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            let mut entries = Vec::new();
+            push_program_binding_upload_transport_cli_entry(&mut entries, cli);
+            let env_snapshot = env
+                .map(|value| RuntimeConfigSnapshot::from_env_vars([(key, value)]))
+                .unwrap_or_default();
+            let snapshot =
+                merge_runtime_config_sources(config_entries.clone(), env_snapshot, entries);
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.program_binding_upload_transport, expected);
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ProgramBindingUploadStrategy::UniformLivePrefix
+            );
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, expected.as_runtime_value());
+            assert_eq!(entry.source, source);
         }
     }
 

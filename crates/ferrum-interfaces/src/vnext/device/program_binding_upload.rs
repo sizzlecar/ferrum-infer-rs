@@ -20,6 +20,14 @@ pub struct DeviceProgramBindingUploadSnapshot {
     pub successful_upload_bytes: u64,
     pub successful_1d_copies: u64,
     pub successful_2d_copies: u64,
+    /// Host staging operations, including a later submission failure.
+    /// These fields establish neither CUDA completion nor release authority.
+    pub pinned_upload_batches: u64,
+    pub pinned_upload_bytes: u64,
+    /// Cumulative newly allocated pinned bytes; this is not peak memory usage.
+    pub pinned_upload_allocation_bytes: u64,
+    pub pinned_upload_reuse_batches: u64,
+    pub pinned_upload_fallback_batches: u64,
 }
 
 impl DeviceProgramBindingUploadSnapshot {
@@ -40,6 +48,11 @@ impl DeviceProgramBindingUploadSnapshot {
                 snapshot.successful_upload_bytes,
                 snapshot.successful_1d_copies,
                 snapshot.successful_2d_copies,
+                snapshot.pinned_upload_batches,
+                snapshot.pinned_upload_bytes,
+                snapshot.pinned_upload_allocation_bytes,
+                snapshot.pinned_upload_reuse_batches,
+                snapshot.pinned_upload_fallback_batches,
             ]
             .contains(&u64::MAX)
             {
@@ -75,6 +88,21 @@ impl DeviceProgramBindingUploadSnapshot {
             successful_2d_copies: self
                 .successful_2d_copies
                 .checked_sub(baseline.successful_2d_copies)?,
+            pinned_upload_batches: self
+                .pinned_upload_batches
+                .checked_sub(baseline.pinned_upload_batches)?,
+            pinned_upload_bytes: self
+                .pinned_upload_bytes
+                .checked_sub(baseline.pinned_upload_bytes)?,
+            pinned_upload_allocation_bytes: self
+                .pinned_upload_allocation_bytes
+                .checked_sub(baseline.pinned_upload_allocation_bytes)?,
+            pinned_upload_reuse_batches: self
+                .pinned_upload_reuse_batches
+                .checked_sub(baseline.pinned_upload_reuse_batches)?,
+            pinned_upload_fallback_batches: self
+                .pinned_upload_fallback_batches
+                .checked_sub(baseline.pinned_upload_fallback_batches)?,
         })
     }
 }

@@ -50,6 +50,21 @@ impl ProgramBindingUploadStrategyArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProgramBindingUploadTransportArg {
+    PageableDirect,
+    PinnedDirect,
+}
+
+impl ProgramBindingUploadTransportArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PageableDirect => "pageable-direct",
+            Self::PinnedDirect => "pinned-direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
@@ -110,6 +125,13 @@ mod tests {
     }
 
     impl TestCli {
+        fn binding_upload_transport(self) -> Option<ProgramBindingUploadTransportArg> {
+            match self.command {
+                TestCommand::Run(command) => command.program_binding_upload_transport,
+                TestCommand::Serve(command) => command.program_binding_upload_transport,
+            }
+        }
+
         fn binding_upload_strategy(self) -> Option<ProgramBindingUploadStrategyArg> {
             match self.command {
                 TestCommand::Run(command) => command.program_binding_upload_strategy,
@@ -252,6 +274,50 @@ mod tests {
             .is_err());
         }
     }
+    #[test]
+    fn program_binding_upload_transport_cli_is_independent_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .binding_upload_transport(),
+                None
+            );
+            for strategy in ["sparse", "uniform-live-prefix"] {
+                for (value, expected) in [
+                    (
+                        "pageable-direct",
+                        ProgramBindingUploadTransportArg::PageableDirect,
+                    ),
+                    (
+                        "pinned-direct",
+                        ProgramBindingUploadTransportArg::PinnedDirect,
+                    ),
+                ] {
+                    let parsed = TestCli::try_parse_from([
+                        "ferrum",
+                        command,
+                        "test-model",
+                        "--program-binding-upload-strategy",
+                        strategy,
+                        "--program-binding-upload-transport",
+                        value,
+                    ])
+                    .unwrap();
+                    assert_eq!(parsed.binding_upload_transport(), Some(expected));
+                }
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--program-binding-upload-transport",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
     #[test]
     fn program_binding_upload_cli_values_and_default_match_for_run_and_serve() {
         for command in ["run", "serve"] {

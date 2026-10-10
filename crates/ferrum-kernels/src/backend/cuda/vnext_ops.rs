@@ -49,7 +49,7 @@ use ferrum_interfaces::vnext::{
 };
 use ferrum_types::{
     AttentionExecutionPolicy, NativeOperatorBackend, NativeOperatorProviderCatalog,
-    ProgramBindingUploadStrategy,
+    ProgramBindingUploadStrategy, ProgramBindingUploadTransport,
 };
 use sha2::{Digest, Sha256};
 
@@ -123,6 +123,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime.rs").as_bytes(),
         q6_head_fingerprint.as_bytes(),
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
+        include_str!("vnext_runtime/pinned_binding_upload.rs").as_bytes(),
         include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
         include_str!("../program_binding_rows.rs").as_bytes(),
         include_str!("../program_binding_upload.rs").as_bytes(),
@@ -1047,6 +1048,7 @@ impl CudaVNextComposition {
         requested_attention_policy: AttentionExecutionPolicy,
         purpose: CudaCompositionPurpose,
         upload_strategy: ProgramBindingUploadStrategy,
+        upload_transport: ProgramBindingUploadTransport,
         oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
@@ -1063,6 +1065,7 @@ impl CudaVNextComposition {
                     CudaDeviceRuntime::new_for_native_catalog(config)?
                 }
             }
+            .with_program_binding_upload_transport(upload_transport)
             .with_segment_binding_oracle(oracle),
         );
         let registry = cuda_vnext_operation_registry(&runtime)?;
@@ -1093,6 +1096,7 @@ impl CudaVNextComposition {
                 include_str!("vnext_runtime.rs").as_bytes(),
                 q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
+                include_str!("vnext_runtime/pinned_binding_upload.rs").as_bytes(),
                 include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
                 include_str!("../program_binding_rows.rs").as_bytes(),
                 include_str!("../program_binding_upload.rs").as_bytes(),
@@ -1135,13 +1139,33 @@ impl CudaVNextComposition {
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        Self::create_with_segment_binding_oracle(
+        Self::create_with_program_binding_upload_options(
             ordinal,
             device_id,
             requested_attention_policy,
             upload_strategy,
-            ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+            ProgramBindingUploadTransport::PageableDirect,
         )
+    }
+
+    pub fn create_with_program_binding_upload_options(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        upload_transport: ProgramBindingUploadTransport,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let composition = Self::prepare(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            CudaCompositionPurpose::Execution,
+            upload_strategy,
+            upload_transport,
+            ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+        )?;
+        composition.validate_compiled_native_operators()?;
+        Ok(composition)
     }
 
     /// Explicit test/diagnostic factory; normal product factories keep Disabled.
@@ -1158,6 +1182,7 @@ impl CudaVNextComposition {
             requested_attention_policy,
             CudaCompositionPurpose::Execution,
             upload_strategy,
+            ProgramBindingUploadTransport::PageableDirect,
             oracle,
         )?;
         composition.validate_compiled_native_operators()?;
@@ -1252,6 +1277,7 @@ pub fn cuda_validated_native_operator_catalog_input(
         requested_attention_policy,
         CudaCompositionPurpose::Execution,
         ProgramBindingUploadStrategy::Sparse,
+        ProgramBindingUploadTransport::PageableDirect,
         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
     )?;
     composition.validate_compiled_native_operators()?;
@@ -1275,6 +1301,7 @@ pub fn cuda_native_operator_catalog_input(
         requested_attention_policy,
         CudaCompositionPurpose::NativeCatalogDeclaration,
         ProgramBindingUploadStrategy::Sparse,
+        ProgramBindingUploadTransport::PageableDirect,
         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)

@@ -139,6 +139,34 @@ impl ProgramBindingUploadStrategy {
     }
 }
 
+/// Host-memory transport for CUDA program bindings, independent of row layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgramBindingUploadTransport {
+    #[default]
+    PageableDirect,
+    PinnedDirect,
+}
+
+impl ProgramBindingUploadTransport {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PageableDirect => "pageable-direct",
+            Self::PinnedDirect => "pinned-direct",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pageable-direct" => Ok(Self::PageableDirect),
+            "pinned-direct" => Ok(Self::PinnedDirect),
+            _ => Err(format!(
+                "expected pageable-direct or pinned-direct; got {raw:?}"
+            )),
+        }
+    }
+}
+
 /// Explicit one-shot faults used to prove product-path failure attribution.
 /// These are never inferred and remain disabled in normal execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +295,9 @@ pub struct RuntimeKnobs {
     /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    /// Host-memory transport; pinned-direct requires a CUDA plan runtime.
+    #[serde(default)]
+    pub program_binding_upload_transport: ProgramBindingUploadTransport,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -414,6 +445,14 @@ impl EngineConfig {
             self.runtime.program_binding_upload_strategy =
                 ProgramBindingUploadStrategy::parse_runtime_value(value).map_err(|reason| {
                     format!("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY: {reason}")
+                })?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_PROGRAM_BINDING_UPLOAD_TRANSPORT")
+        {
+            self.runtime.program_binding_upload_transport =
+                ProgramBindingUploadTransport::parse_runtime_value(value).map_err(|reason| {
+                    format!("FERRUM_PROGRAM_BINDING_UPLOAD_TRANSPORT: {reason}")
                 })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
@@ -1454,6 +1493,61 @@ mod tests {
             )]))
             .unwrap_err()
             .contains(key));
+    }
+
+    #[test]
+    fn program_binding_upload_transport_preserves_legacy_default_and_row_strategy() {
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_TRANSPORT";
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.program_binding_upload_transport,
+            ProgramBindingUploadTransport::PageableDirect
+        );
+        let mut legacy = serde_json::to_value(&config.runtime).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("program_binding_upload_transport");
+        let restored: RuntimeKnobs = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.program_binding_upload_transport,
+            ProgramBindingUploadTransport::PageableDirect
+        );
+        for strategy in [
+            ProgramBindingUploadStrategy::Sparse,
+            ProgramBindingUploadStrategy::UniformLivePrefix,
+        ] {
+            config.runtime.program_binding_upload_strategy = strategy;
+            for transport in [
+                ProgramBindingUploadTransport::PinnedDirect,
+                ProgramBindingUploadTransport::PageableDirect,
+            ] {
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                        key,
+                        transport.as_runtime_value(),
+                    )]))
+                    .unwrap();
+                assert_eq!(config.runtime.program_binding_upload_transport, transport);
+                assert_eq!(config.runtime.program_binding_upload_strategy, strategy);
+                assert_eq!(
+                    serde_json::to_value(transport).unwrap(),
+                    transport.as_runtime_value()
+                );
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.program_binding_upload_transport, transport);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "automatic"
+            )]))
+            .unwrap_err()
+            .contains(key));
+        assert!(serde_json::from_str::<ProgramBindingUploadTransport>("\"automatic\"").is_err());
     }
 
     #[test]
