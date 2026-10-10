@@ -485,6 +485,17 @@ fn marker_v2_m32_mmq_working_sets() {
                 input.guards();
                 allocation.guards();
                 let p = &route.plan;
+                let plan_report = serde_json::json!({"request_rows":p.request.rows,
+                    "request_inputs":p.request.inputs,"request_outputs":p.request.outputs,
+                    "sm_count":p.request.sm_count,"algorithm":p.algorithm,"pack_abi":p.pack_abi,
+                    "padded_inputs":p.padded_inputs,"padded_outputs":p.padded_outputs,
+                    "j":p.j,"i":p.i,"nthreads":p.nthreads,"nwarps":p.nwarps,
+                    "blocks":p.blocks,"tiles_y":p.tiles_y,"shared_bytes":p.shared_bytes,
+                    "fixup":p.fixup,"fixup_bytes":p.fixup_bytes,"guard_blocks":p.guard_blocks,
+                    "ncols":p.ncols,"channels":p.channels,"rows_per_block":p.rows_per_block,
+                    "small_k":p.small_k,"weight_bytes":p.weight_bytes,
+                    "converted_bytes":p.converted_bytes,"packed_bytes":p.packed_bytes,
+                    "output_bytes":p.output_bytes});
                 println!(
                     "{}",
                     serde_json::json!({"experiment":"marker_v2_m32_mmq",
@@ -498,18 +509,7 @@ fn marker_v2_m32_mmq_working_sets() {
                         "projection_layout":"standalone Columns leaf; input stride K, output stride N; not FFN joined-bank stride",
                         "validated_outputs_per_matrix":M*n,"actual_pack_f64_points_per_matrix":9,
                         "checks":"all finite, cast bits, row/weight flags, canaries, identical-address-content output bits",
-                        "plan":{"request_rows":p.request.rows,"request_inputs":p.request.inputs,
-                            "request_outputs":p.request.outputs,"sm_count":p.request.sm_count,
-                            "algorithm":p.algorithm,"pack_abi":p.pack_abi,
-                            "padded_inputs":p.padded_inputs,"padded_outputs":p.padded_outputs,
-                            "j":p.j,"i":p.i,"nthreads":p.nthreads,"nwarps":p.nwarps,
-                            "blocks":p.blocks,"tiles_y":p.tiles_y,"shared_bytes":p.shared_bytes,
-                            "fixup":p.fixup,"fixup_bytes":p.fixup_bytes,
-                            "guard_blocks":p.guard_blocks,"ncols":p.ncols,
-                            "channels":p.channels,"rows_per_block":p.rows_per_block,
-                            "small_k":p.small_k,"weight_bytes":p.weight_bytes,
-                            "converted_bytes":p.converted_bytes,"packed_bytes":p.packed_bytes,
-                            "output_bytes":p.output_bytes}})
+                        "plan":plan_report})
                 );
                 // A single complete projection per physical matrix per graph:
                 // no repeated laps obscure counter launch selection.
