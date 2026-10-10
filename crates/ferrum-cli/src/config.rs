@@ -1134,17 +1134,19 @@ mod tests {
 
     #[test]
     fn program_binding_upload_config_file_parses_explicit_strategy() {
-        let config: CliConfig = toml::from_str(
-            "[runtime]\nprogram_binding_upload_strategy = \"uniform-live-prefix\"\n",
-        )
-        .unwrap();
-        let entries = config.runtime.runtime_config_entries();
-        let entry = entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+        for strategy in ["uniform-live-prefix", "compact-scatter"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\nprogram_binding_upload_strategy = \"{strategy}\"\n",
+            ))
             .unwrap();
-        assert_eq!(entry.effective_value, "uniform-live-prefix");
-        assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+                .unwrap();
+            assert_eq!(entry.effective_value, strategy);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\nprogram_binding_upload_strategy = \"automatic\"\n"
         )

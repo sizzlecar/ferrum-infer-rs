@@ -3058,6 +3058,10 @@ mod tests {
                 Some(ProgramBindingUploadStrategyArg::UniformLivePrefix),
                 ProgramBindingUploadStrategy::UniformLivePrefix,
             ),
+            (
+                Some(ProgramBindingUploadStrategyArg::CompactScatter),
+                ProgramBindingUploadStrategy::CompactScatter,
+            ),
         ] {
             command.program_binding_upload_strategy = option;
             let snapshot = crate::commands::serve::merge_runtime_config_sources(

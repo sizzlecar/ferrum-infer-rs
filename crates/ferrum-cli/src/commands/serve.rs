@@ -2611,6 +2611,10 @@ mod tests {
                 Some(ProgramBindingUploadStrategyArg::UniformLivePrefix),
                 ProgramBindingUploadStrategy::UniformLivePrefix,
             ),
+            (
+                Some(ProgramBindingUploadStrategyArg::CompactScatter),
+                ProgramBindingUploadStrategy::CompactScatter,
+            ),
         ] {
             let mut cli = Vec::new();
             push_program_binding_upload_strategy_cli_entry(&mut cli, option);

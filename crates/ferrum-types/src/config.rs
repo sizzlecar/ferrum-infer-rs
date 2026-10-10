@@ -112,12 +112,15 @@ impl InvocationPreparationStrategy {
 
 /// Upload policy for CUDA program bindings. Uniform live prefixes pad rows
 /// only to the largest live payload in the same node and current batch.
+/// Compact scatter uploads one packed packet and scatters its live bytes on
+/// the GPU, falling back to sparse uploads when scratch capacity is unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProgramBindingUploadStrategy {
     #[default]
     Sparse,
     UniformLivePrefix,
+    CompactScatter,
 }
 
 impl ProgramBindingUploadStrategy {
@@ -125,6 +128,7 @@ impl ProgramBindingUploadStrategy {
         match self {
             Self::Sparse => "sparse",
             Self::UniformLivePrefix => "uniform-live-prefix",
+            Self::CompactScatter => "compact-scatter",
         }
     }
 
@@ -132,8 +136,9 @@ impl ProgramBindingUploadStrategy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "sparse" => Ok(Self::Sparse),
             "uniform-live-prefix" => Ok(Self::UniformLivePrefix),
+            "compact-scatter" => Ok(Self::CompactScatter),
             _ => Err(format!(
-                "expected sparse or uniform-live-prefix; got {raw:?}"
+                "expected sparse, uniform-live-prefix or compact-scatter; got {raw:?}"
             )),
         }
     }
@@ -1429,6 +1434,7 @@ mod tests {
         );
         for strategy in [
             ProgramBindingUploadStrategy::UniformLivePrefix,
+            ProgramBindingUploadStrategy::CompactScatter,
             ProgramBindingUploadStrategy::Sparse,
         ] {
             config

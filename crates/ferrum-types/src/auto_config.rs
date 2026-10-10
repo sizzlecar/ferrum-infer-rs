@@ -2583,13 +2583,16 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if strategy == crate::ProgramBindingUploadStrategy::UniformLivePrefix
+        if strategy != crate::ProgramBindingUploadStrategy::Sparse
             && (!self.is_cuda_backend()
                 || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
-                reason: "uniform-live-prefix requires a CUDA plan runtime".to_owned(),
+                reason: format!(
+                    "{} requires a CUDA plan runtime",
+                    strategy.as_runtime_value()
+                ),
             });
         }
         Ok(self.decision(
@@ -2597,7 +2600,7 @@ impl FerrumConfigBuilder {
             strategy.as_runtime_value(),
             source,
             source_key,
-            ["sparse", "uniform-live-prefix"],
+            ["sparse", "uniform-live-prefix", "compact-scatter"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5441,6 +5444,11 @@ mod tests {
                 AutoConfigSource::Env,
             ),
             (
+                Some("compact-scatter"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+            (
                 Some("sparse"),
                 RuntimeConfigSource::Cli,
                 AutoConfigSource::Cli,
@@ -5494,14 +5502,16 @@ mod tests {
         ] {
             let mut hardware = HardwareCapabilities::unknown();
             hardware.backend = backend.to_owned();
-            let error = FerrumConfigBuilder::new(snapshot(&[(key, "uniform-live-prefix")]))
-                .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority)
-                .resolve()
-                .unwrap_err();
-            assert!(
-                matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
-            );
+            for strategy in ["uniform-live-prefix", "compact-scatter"] {
+                let error = FerrumConfigBuilder::new(snapshot(&[(key, strategy)]))
+                    .with_hardware_capabilities(hardware.clone())
+                    .with_execution_resource_authority(authority)
+                    .resolve()
+                    .unwrap_err();
+                assert!(
+                    matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+                );
+            }
             scheduler_resolution(backend, authority, 4, snapshot(&[(key, "sparse")]));
         }
     }

@@ -1158,13 +1158,14 @@ fn validate_program_binding_upload_strategy(
     config: &ComponentConfig,
     plan_runtime: bool,
 ) -> Result<()> {
-    if config.engine_config.runtime.program_binding_upload_strategy
-        == ferrum_types::ProgramBindingUploadStrategy::UniformLivePrefix
+    let strategy = config.engine_config.runtime.program_binding_upload_strategy;
+    if strategy != ferrum_types::ProgramBindingUploadStrategy::Sparse
         && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime)
     {
-        return Err(FerrumError::unsupported(
-            "uniform-live-prefix program-binding uploads require a CUDA plan runtime",
-        ));
+        return Err(FerrumError::unsupported(format!(
+            "{} program-binding uploads require a CUDA plan runtime",
+            strategy.as_runtime_value()
+        )));
     }
     Ok(())
 }
@@ -2030,12 +2031,16 @@ mod tests {
                 config.engine_config.runtime.program_binding_upload_strategy =
                     ProgramBindingUploadStrategy::Sparse;
                 validate_program_binding_upload_strategy(&config, plan_runtime).unwrap();
-                config.engine_config.runtime.program_binding_upload_strategy =
-                    ProgramBindingUploadStrategy::UniformLivePrefix;
-                assert_eq!(
-                    validate_program_binding_upload_strategy(&config, plan_runtime).is_ok(),
-                    plan_runtime && matches!(config.device, Device::CUDA(_))
-                );
+                for strategy in [
+                    ProgramBindingUploadStrategy::UniformLivePrefix,
+                    ProgramBindingUploadStrategy::CompactScatter,
+                ] {
+                    config.engine_config.runtime.program_binding_upload_strategy = strategy;
+                    assert_eq!(
+                        validate_program_binding_upload_strategy(&config, plan_runtime).is_ok(),
+                        plan_runtime && matches!(config.device, Device::CUDA(_))
+                    );
+                }
             }
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]

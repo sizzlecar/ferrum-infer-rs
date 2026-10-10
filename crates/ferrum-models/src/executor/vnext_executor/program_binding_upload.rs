@@ -27,7 +27,8 @@ impl ProgramBindingUploadMetrics {
             "counters": delta,
             "accounting": {
                 "planned": "live_payload_bytes, planned_upload_bytes, logical_arena_bytes and physical_arena_bytes count plans when a prelude enqueue is attempted",
-                "successful": "successful_upload_bytes and successful_1d_copies/2d_copies count only CUDA calls returning success, including calls before a later error; not GPU completion",
+                "successful": "successful_upload_bytes, successful_1d_copies/2d_copies and successful_scatter_dispatches count only CUDA calls returning success, including calls before a later error; not GPU completion",
+                "compact_transport": "compact_scatter_preludes and compact_scatter_sparse_fallback_preludes count actual enqueue attempts on the selected compact route or its pre-enqueue scratch-capacity fallback",
                 "attempts": "succeeded_preludes completed all host enqueue calls; failed_preludes include ordinary error or unwind; pre-enqueue rejection has no attempted prelude",
                 "reset": "executor startup advances only this baseline; shared runtime cumulative counters are not reset",
                 "limitations": "counts include all users sharing this runtime and all timing modes; no latency or completion inference; unsupported, decreasing or saturated counters produce no window"
@@ -66,6 +67,7 @@ mod tests {
             successful_upload_bytes: 88,
             successful_1d_copies: 5,
             successful_2d_copies: 1,
+            ..Default::default()
         };
         let delta = metrics.snapshot(Some(current));
         assert_eq!(delta["counters"]["attempted_preludes"], 3);

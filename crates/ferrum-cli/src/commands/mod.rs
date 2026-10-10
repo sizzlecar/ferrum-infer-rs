@@ -38,6 +38,7 @@ impl InvocationPreparationStrategyArg {
 pub enum ProgramBindingUploadStrategyArg {
     Sparse,
     UniformLivePrefix,
+    CompactScatter,
 }
 
 impl ProgramBindingUploadStrategyArg {
@@ -45,6 +46,7 @@ impl ProgramBindingUploadStrategyArg {
         match self {
             Self::Sparse => "sparse",
             Self::UniformLivePrefix => "uniform-live-prefix",
+            Self::CompactScatter => "compact-scatter",
         }
     }
 }
@@ -266,6 +268,10 @@ mod tests {
                 (
                     "uniform-live-prefix",
                     ProgramBindingUploadStrategyArg::UniformLivePrefix,
+                ),
+                (
+                    "compact-scatter",
+                    ProgramBindingUploadStrategyArg::CompactScatter,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

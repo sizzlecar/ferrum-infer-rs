@@ -3176,7 +3176,9 @@ fn prepare_causal_program_binding_writes(
     logical_row_bytes: u64,
 ) -> Result<(), String> {
     match strategy {
-        ProgramBindingUploadStrategy::Sparse => Ok(()),
+        ProgramBindingUploadStrategy::Sparse | ProgramBindingUploadStrategy::CompactScatter => {
+            Ok(())
+        }
         ProgramBindingUploadStrategy::UniformLivePrefix => {
             super::CudaProgramBindingWrite::uniform_live_prefix(writes, logical_row_bytes)
                 .map_err(|error| error.to_string())

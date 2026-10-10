@@ -49,6 +49,7 @@ use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, Cuda
 use super::vnext_tool_correlation;
 use crate::backend::program_binding_upload::ProgramBindingUploadCounters;
 
+mod binding_scatter;
 mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
@@ -1232,6 +1233,7 @@ impl CudaDeviceCommand {
     fn coalesced_program_bindings(
         mut commands: Vec<Self>,
         upload_counters: Arc<ProgramBindingUploadCounters>,
+        scatter: Option<(&binding_scatter::BindingScatter, &Arc<CudaStream>)>,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         if commands.is_empty() {
             return Ok(commands);
@@ -1414,9 +1416,8 @@ impl CudaDeviceCommand {
             )
         })?;
         let mut regions = Vec::with_capacity(transfers.len());
-        let mut host_storage = Vec::with_capacity(transfers.len());
         let mut transfer_shapes = Vec::with_capacity(transfers.len());
-        for transfer in transfers {
+        for transfer in &transfers {
             let row_bytes_u64 = u64::try_from(transfer.row_bytes).map_err(|_| {
                 CudaDeviceRuntimeError::contract("CUDA sparse program binding row size exceeds u64")
             })?;
@@ -1472,8 +1473,64 @@ impl CudaDeviceCommand {
                 transfer.row_bytes,
                 transfer.row_count,
             ));
-            host_storage.push(transfer.payload);
         }
+        // Every original authority, layout, exact-allocation and range check
+        // above also applies to scatter. Opaque commands never reach this path.
+        let compact = match scatter {
+            Some((scatter, allocation_stream)) => {
+                scatter.prepare(allocation_stream, &transfers, layout_physical_size_bytes)?
+            }
+            None => None,
+        };
+        if let Some(binding_scatter::PreparedScatter { bytes, owner }) = compact {
+            upload_plan.compact_scatter_preludes = 1;
+            upload_plan.planned_upload_bytes = u64::try_from(bytes.len()).map_err(|_| {
+                CudaDeviceRuntimeError::contract("compact program binding packet exceeds u64")
+            })?;
+            let executable = Arc::new(CudaCommandExecutable::static_work(
+                regions,
+                vec![bytes],
+                Box::new(move |stream, _blas, _regions, host_storage| {
+                    let mut upload_attempt = upload_counters.attempt(upload_plan);
+                    let [payload] = host_storage else {
+                        return Err(CudaDeviceRuntimeError::contract(
+                            "compact program binding prelude requires exactly one packet",
+                        ));
+                    };
+                    owner.upload(stream, payload)?;
+                    upload_attempt.copied(payload.len() as u64, false);
+                    owner.scatter(stream, arena_device_ptr)?;
+                    upload_attempt.scatter_dispatched();
+                    upload_attempt.succeeded();
+                    Ok(())
+                }),
+            ));
+            return Ok(vec![Self {
+                runtime_instance,
+                operation: "vnext_program_binding_compact_scatter_v1",
+                batching_form: DeviceBatchingForm::ParticipantLoop,
+                participant_start,
+                participant_count,
+                token_count,
+                compute_dispatch_count: 1,
+                transfer_command_count: 1,
+                executable: Some(executable),
+                fence_dependencies,
+                replay_key: None,
+                reusable_address_scope: None,
+                replay_gap_reason: None,
+                program_binding_patch: None,
+                reusable_execution: None,
+                completion_checks,
+            }]);
+        }
+        if scatter.is_some() {
+            upload_plan.compact_scatter_sparse_fallback_preludes = 1;
+        }
+        let host_storage = transfers
+            .into_iter()
+            .map(|transfer| transfer.payload)
+            .collect();
         let executable = Arc::new(CudaCommandExecutable::static_work(
             regions,
             host_storage,
@@ -2399,6 +2456,7 @@ pub struct CudaDeviceRuntime {
     attention_execution_policy: AttentionExecutionPolicy,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     program_binding_upload_counters: Arc<ProgramBindingUploadCounters>,
+    binding_scatter: Option<binding_scatter::BindingScatter>,
     segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
     segment_binding_oracle_audited_nodes: AtomicU64,
     runtime_instance: u64,
@@ -2559,6 +2617,12 @@ impl CudaDeviceRuntime {
         let allocation_stream = context
             .new_stream()
             .map_err(|error| CudaDeviceRuntimeError::driver("allocation stream creation", error))?;
+        let binding_scatter =
+            if program_binding_upload_strategy == ProgramBindingUploadStrategy::CompactScatter {
+                Some(binding_scatter::BindingScatter::load(&context)?)
+            } else {
+                None
+            };
         #[cfg(feature = "vllm-marlin")]
         let mxfp4_marlin_prepare = Mxfp4MarlinPrepareFunctions::load(&context)?;
         let total_memory_bytes = u64::try_from(
@@ -2591,6 +2655,7 @@ impl CudaDeviceRuntime {
             attention_execution_policy: config.attention_execution_policy,
             program_binding_upload_strategy,
             program_binding_upload_counters: Arc::new(ProgramBindingUploadCounters::default()),
+            binding_scatter,
             segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
             segment_binding_oracle_audited_nodes: AtomicU64::new(0),
             runtime_instance,
@@ -4058,6 +4123,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
         CudaDeviceCommand::coalesced_program_bindings(
             commands,
             Arc::clone(&self.program_binding_upload_counters),
+            self.binding_scatter
+                .as_ref()
+                .map(|scatter| (scatter, &self.allocation_stream)),
         )
     }
 
