@@ -4916,6 +4916,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
 mod on_demand_tests;
 
 #[cfg(test)]
+mod sparse_upload_prelude_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "vllm-marlin")]
