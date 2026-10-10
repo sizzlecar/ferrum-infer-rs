@@ -1,10 +1,17 @@
 use super::super::{
     classify_device_error, BufferUsage, DeviceRuntime, ExecutionIdentityEnvelope,
-    HostTransferLayout, LogicalBackingBufferView,
+    HostTransferLayout, InputResidencyPublication, LogicalBackingBufferView, ResourceId,
 };
 use super::dispatch_contract::SubmissionWaveDispatchError;
 use super::foundation::invalid_operation;
 use super::storage_profile::ElementType;
+
+pub(super) struct InputUploadResidency<'a, R: DeviceRuntime> {
+    pub publication: &'a mut InputResidencyPublication<R>,
+    pub resource: &'a ResourceId,
+    pub participant: u32,
+    pub eligible: bool,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_submission_wave_backing_upload<R>(
@@ -17,6 +24,7 @@ pub(super) fn encode_submission_wave_backing_upload<R>(
     bytes: &[u8],
     context: &'static str,
     mut push: impl FnMut(R::Command),
+    mut residency: Option<InputUploadResidency<'_, R>>,
 ) -> Result<usize, SubmissionWaveDispatchError<R>>
 where
     R: DeviceRuntime,
@@ -104,24 +112,38 @@ where
             }
             let layout = HostTransferLayout::new(element_type, piece_bytes / element_bytes)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
-            let command = runtime
-                .encode_upload(
-                    &bytes[source_start..source_end],
-                    layout,
-                    segment.buffer(),
+            let reused = residency.as_mut().is_some_and(|residency| {
+                residency.publication.visit_piece(
+                    residency.eligible,
+                    residency.resource,
+                    residency.participant,
+                    overlap_start,
+                    &actual.resource_id,
                     destination_offset,
+                    segment.weak_physical_owner(),
+                    &bytes[source_start..source_end],
                 )
-                .map_err(|error| {
-                    classify_device_error(runtime, identity.clone(), &error)
-                        .map(SubmissionWaveDispatchError::InputUpload)
-                        .unwrap_or_else(SubmissionWaveDispatchError::Contract)
+            });
+            if !reused {
+                let command = runtime
+                    .encode_upload(
+                        &bytes[source_start..source_end],
+                        layout,
+                        segment.buffer(),
+                        destination_offset,
+                    )
+                    .map_err(|error| {
+                        classify_device_error(runtime, identity.clone(), &error)
+                            .map(SubmissionWaveDispatchError::InputUpload)
+                            .unwrap_or_else(SubmissionWaveDispatchError::Contract)
+                    })?;
+                push(command);
+                command_count = command_count.checked_add(1).ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(format!(
+                        "{context} command count overflows usize"
+                    )))
                 })?;
-            push(command);
-            command_count = command_count.checked_add(1).ok_or_else(|| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(format!(
-                    "{context} command count overflows usize"
-                )))
-            })?;
+            }
             encoded_bytes = encoded_bytes.checked_add(piece_bytes).ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(format!(
                     "{context} encoded byte count overflows"

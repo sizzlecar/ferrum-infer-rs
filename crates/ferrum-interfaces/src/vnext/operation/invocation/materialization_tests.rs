@@ -13,6 +13,10 @@ use vnext_device_operation_wave_contract::prepare_wave;
 mod coverage_tests;
 #[path = "descriptor_agreement_tests.rs"]
 mod descriptor_agreement_tests;
+#[path = "input_residency_bench.rs"]
+mod input_residency_bench;
+#[path = "resident_input_tests.rs"]
+mod resident_input_tests;
 #[path = "segment_authority_tests.rs"]
 mod segment_authority_tests;
 #[path = "segment_compile_tests.rs"]

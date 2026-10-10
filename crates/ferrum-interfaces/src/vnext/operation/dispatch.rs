@@ -8,13 +8,14 @@ use super::super::{
     DeviceCommandLogicalWork, DeviceComputePathRequirement, DeviceReusableExecutionCapture,
     DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram,
     DeviceReusableExecutionProgramId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, InvocationResourceLease, LaneSubmitOutcome, NodeId, NodeInvocationId,
-    OperationId, ParticipantNodeKey, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
-    ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment, SubmissionWavePurpose,
-    TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
+    DeviceTimingMode, DynamicBackingPoolSpec, DynamicResourceDemand, ExecutablePlanView,
+    ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, InvocationResourceLease,
+    LaneSubmitOutcome, NodeId, NodeInvocationId, OperationId, ParticipantNodeKey,
+    PreparedStepSubmissionWave, ProgramBindingNodeBinding, ProviderId, ResourceId, SpanId,
+    StateInitialization, StepParticipantFrameAssignment, StepResourceSlotKind,
+    SubmissionWavePurpose, TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
 };
-use super::backing_upload::encode_submission_wave_backing_upload;
+use super::backing_upload::{encode_submission_wave_backing_upload, InputUploadResidency};
 use super::determinism::{
     SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
     SubmissionWaveDeterminismRestore,
@@ -1651,6 +1652,9 @@ impl OperationDispatch {
             )));
         }
         if let Some(restore) = determinism_restore {
+            // Restores may write external inputs before their ordinary uploads.
+            lane.clear_input_residency()
+                .map_err(SubmissionWaveDispatchError::Contract)?;
             let restore_start = commands.len();
             let restore_command_count = encode_submission_wave_determinism_restore(
                 runtime,
@@ -1674,7 +1678,7 @@ impl OperationDispatch {
                 )));
             }
         }
-        encode_submission_wave_inputs(
+        let input_residency_publication = encode_submission_wave_inputs(
             runtime,
             resolved,
             batch_identity,
@@ -1682,6 +1686,7 @@ impl OperationDispatch {
             input_uploads,
             &mut commands,
         )?;
+        completion.set_input_residency_publication(input_residency_publication);
         drop(backing_stage);
 
         let provider_stage = SubmissionWaveDispatchStageTimer::start(
@@ -2577,6 +2582,7 @@ where
                 |command| {
                     commands.push_node_initialization(node_index_u32, logical_work, command);
                 },
+                None,
             )?;
             command_count = command_count.checked_add(encoded).ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -2595,7 +2601,7 @@ fn encode_submission_wave_inputs<R>(
     completion: &CompletionReservation<R>,
     uploads: &[SubmissionWaveInputUpload],
     commands: &mut DeviceCommandBatch<R::Command>,
-) -> Result<(), SubmissionWaveDispatchError<R>>
+) -> Result<Option<super::super::InputResidencyPublication<R>>, SubmissionWaveDispatchError<R>>
 where
     R: DeviceRuntime,
 {
@@ -2605,6 +2611,13 @@ where
         destination: std::ops::Range<u64>,
     }
 
+    let mut residency = completion
+        .begin_input_residency(
+            uploads
+                .iter()
+                .any(SubmissionWaveInputUpload::requests_stable_residency),
+        )
+        .map_err(SubmissionWaveDispatchError::Contract)?;
     let mut upload_cursor = 0_usize;
     while upload_cursor < uploads.len() {
         let first_upload = &uploads[upload_cursor];
@@ -2658,6 +2671,11 @@ where
             .step_resources()
             .dynamic_descriptor(component.resource_id())
             .map_err(SubmissionWaveDispatchError::Contract)?;
+        let residency_eligible = residency.is_some()
+            && uploads[upload_cursor..run_end]
+                .iter()
+                .any(SubmissionWaveInputUpload::requests_stable_residency)
+            && input_residency_eligible(resolved, component.resource_id());
         let participant_packed = descriptor.lifetime() == AllocationLifetime::Step
             && descriptor.kind() == &AllocationKind::Value;
         let prepared_work_shape = if participant_packed {
@@ -2770,7 +2788,7 @@ where
         let mut validated_cursor = 0_usize;
         while validated_cursor < validated.len() {
             let mut contiguous_end = validated_cursor + 1;
-            if participant_packed {
+            if participant_packed && !residency_eligible {
                 while contiguous_end < validated.len()
                     && validated[contiguous_end - 1].destination.end
                         == validated[contiguous_end].destination.start
@@ -2797,6 +2815,12 @@ where
                     first.upload.bytes(),
                     "submission input upload",
                     |command| commands.push_dynamic_binding(command),
+                    residency.as_mut().map(|publication| InputUploadResidency {
+                        publication,
+                        resource: component.resource_id(),
+                        participant: first.upload.participant_index(),
+                        eligible: residency_eligible && first.upload.requests_stable_residency(),
+                    }),
                 )?;
             } else {
                 let aggregate_byte_len = validated[validated_cursor..contiguous_end]
@@ -2824,11 +2848,88 @@ where
                     &aggregate_bytes,
                     "submission input upload aggregate",
                     |command| commands.push_dynamic_binding(command),
+                    residency.as_mut().map(|publication| InputUploadResidency {
+                        publication,
+                        resource: component.resource_id(),
+                        participant: first.upload.participant_index(),
+                        eligible: false,
+                    }),
                 )?;
             }
             validated_cursor = contiguous_end;
         }
         upload_cursor = run_end;
     }
-    Ok(())
+    Ok(residency)
+}
+
+/// A dedicated Step external input is immutable to every provider in this Plan.
+/// Dedicated packing alone is insufficient: another binding may name the same
+/// resource, so all such accesses and workspace roles are checked here.
+fn input_residency_eligible(resolved: &dyn ExecutablePlanView, resource: &ResourceId) -> bool {
+    let plan = resolved.execution_plan().payload();
+    let memory = plan.memory();
+    let Some(descriptor) = memory
+        .dynamic_descriptors()
+        .iter()
+        .find(|descriptor| descriptor.base_resource_id() == resource)
+    else {
+        return false;
+    };
+    if descriptor.lifetime() != AllocationLifetime::Step
+        || descriptor.kind() != &AllocationKind::Value
+        || descriptor.usage() != BufferUsage::Activations
+        || descriptor.initialization() != StateInitialization::None
+        || !matches!(
+            descriptor.demand(),
+            DynamicResourceDemand::ActualSequences { .. }
+        )
+    {
+        return false;
+    }
+    let mut slots = memory
+        .dynamic_pools()
+        .iter()
+        .flat_map(DynamicBackingPoolSpec::step_resource_slots)
+        .filter(|slot| slot.resource_ids().contains(resource));
+    let Some(slot) = slots.next() else {
+        return false;
+    };
+    if slots.next().is_some()
+        || slot.kind() != StepResourceSlotKind::Dedicated
+        || slot.resource_ids() != std::slice::from_ref(resource)
+    {
+        return false;
+    }
+    let mut found = false;
+    for node in plan.nodes() {
+        if [
+            node.scratch_resource(),
+            node.binding_resource(),
+            node.persistent_resource(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|id| id == resource)
+        {
+            return false;
+        }
+        for value in node.values() {
+            if value
+                .storage()
+                .components()
+                .iter()
+                .any(|c| c.resource_id() == resource)
+            {
+                found = true;
+                if value.role() != ResolvedValueRole::Input
+                    || value.access() != TensorAccess::Read
+                    || value.usage() != BufferUsage::Activations
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    found
 }

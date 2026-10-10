@@ -654,6 +654,12 @@ impl Default for SubmissionExecutionPolicy {
 /// One typed host input written into an exact participant's resolved plan
 /// input before any provider command executes. The request names semantic
 /// plan coordinates rather than exposing backend buffers or allocation ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputResidencyRequest {
+    AlwaysUpload,
+    CacheAfterSuccessfulCompletion,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionWaveInputUpload {
     node_id: NodeId,
@@ -662,6 +668,7 @@ pub struct SubmissionWaveInputUpload {
     logical_offset_bytes: u64,
     source_layout: HostTransferLayout,
     bytes: Vec<u8>,
+    residency: InputResidencyRequest,
 }
 
 impl SubmissionWaveInputUpload {
@@ -689,7 +696,19 @@ impl SubmissionWaveInputUpload {
             logical_offset_bytes,
             source_layout,
             bytes,
+            residency: InputResidencyRequest::AlwaysUpload,
         })
+    }
+
+    /// Request optional reuse of these exact bytes after a successful write.
+    /// The core still validates every fresh view and decides eligibility.
+    pub fn request_stable_residency(mut self) -> Self {
+        self.residency = InputResidencyRequest::CacheAfterSuccessfulCompletion;
+        self
+    }
+
+    pub(crate) fn requests_stable_residency(&self) -> bool {
+        self.residency == InputResidencyRequest::CacheAfterSuccessfulCompletion
     }
 
     pub fn node_id(&self) -> &NodeId {

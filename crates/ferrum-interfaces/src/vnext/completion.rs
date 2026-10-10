@@ -27,6 +27,9 @@ use super::{
 
 mod readback_collection;
 pub use readback_collection::*;
+mod input_residency;
+use input_residency::InputResidencyCache;
+pub use input_residency::{InputResidencyPublication, InputResidencyUploadCounts};
 mod segment_binding_publication;
 use segment_binding_publication::SegmentBindingRecipeCache;
 pub use segment_binding_publication::{ReadySegmentBindingPublication, SegmentBindingPublication};
@@ -122,6 +125,7 @@ pub struct ExecutionLane<R: DeviceRuntime> {
     fail_closed: AtomicBool,
     reusable_execution_epoch: AtomicU64,
     segment_binding_recipe: OnceLock<SegmentBindingRecipeCache>,
+    input_residency: OnceLock<InputResidencyCache>,
     state: Mutex<ExecutionLaneState<R::Stream>>,
 }
 
@@ -163,6 +167,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             fail_closed: AtomicBool::new(false),
             reusable_execution_epoch: AtomicU64::new(1),
             segment_binding_recipe: OnceLock::new(),
+            input_residency: OnceLock::new(),
             state: Mutex::new(ExecutionLaneState {
                 stream,
                 in_flight: 0,
@@ -419,6 +424,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 }
                 drop(state);
                 self.clear_segment_binding_recipe()?;
+                self.clear_input_residency()?;
                 Ok(true)
             }
             Ok(Ok(_)) => {
@@ -1951,6 +1957,9 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 "completion lane runtime is not the submission resource runtime instance",
             ));
         }
+        if matches!(&resources, CompletionResourceLease::Invocation(_)) {
+            lane.clear_input_residency()?;
+        }
         let (slot_id, record) = reaper.reserve_slot()?;
         #[derive(Serialize)]
         struct SubmissionFingerprintInput<'a> {
@@ -1976,6 +1985,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             record_receipt: Some(record_receipt),
             submission_may_have_happened: false,
             segment_binding_candidate: None,
+            input_residency_publication: None,
             finished: false,
         })
     }
@@ -3490,6 +3500,8 @@ pub struct CompletionHandle<R: DeviceRuntime> {
     reaper: Weak<CompletionReaper<R>>,
     receipt: SubmittedOperationReceipt,
     segment_binding_publication: Option<Arc<Mutex<Option<SegmentBindingPublication<R>>>>>,
+    input_residency_publication: Option<Arc<Mutex<Option<InputResidencyPublication<R>>>>>,
+    input_residency_upload_counts: Option<InputResidencyUploadCounts>,
 }
 
 impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
@@ -3498,6 +3510,8 @@ impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
             reaper: Weak::clone(&self.reaper),
             receipt: self.receipt.clone(),
             segment_binding_publication: self.segment_binding_publication.clone(),
+            input_residency_publication: self.input_residency_publication.clone(),
+            input_residency_upload_counts: self.input_residency_upload_counts,
         }
     }
 }
@@ -3580,6 +3594,7 @@ pub(crate) struct CompletionReservation<R: DeviceRuntime> {
     record_receipt: Option<SubmittedOperationReceipt>,
     submission_may_have_happened: bool,
     segment_binding_candidate: Option<SegmentBindingPublication<R>>,
+    input_residency_publication: Option<InputResidencyPublication<R>>,
     finished: bool,
 }
 
@@ -3734,10 +3749,21 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         } else {
             None
         };
+        let input_residency_upload_counts =
+            self.input_residency_publication.as_ref().map(|p| p.counts);
+        let input_residency_publication = if transition.is_ok() {
+            self.input_residency_publication
+                .take()
+                .map(|p| Arc::new(Mutex::new(Some(p))))
+        } else {
+            None
+        };
         let handle = CompletionHandle {
             reaper: Arc::downgrade(&self.reaper),
             receipt,
             segment_binding_publication,
+            input_residency_publication,
+            input_residency_upload_counts,
         };
         match transition {
             Ok(()) => Ok(handle),
@@ -3791,6 +3817,11 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
     fn drop(&mut self) {
         if self.finished {
             return;
+        }
+        // Revoke even failures before input encoding, while the reservation
+        // still owns its resources and before any lease can be released.
+        if let Some(lane) = &self.lane {
+            let _ = lane.clear_input_residency();
         }
         if self.submission_may_have_happened {
             let Some(mut resources) = self.resources.take() else {

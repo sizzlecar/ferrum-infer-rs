@@ -2,6 +2,7 @@ use super::*;
 use cudarc::driver::{CudaContext, DevicePtrMut};
 use half::f16;
 
+mod neutral_residency;
 mod partitioned;
 
 struct Case {

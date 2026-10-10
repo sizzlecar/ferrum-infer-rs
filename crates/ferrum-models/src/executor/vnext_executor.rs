@@ -1431,6 +1431,10 @@ struct VNextExecutorMetrics {
     wave_deferrals: AtomicU64,
     backing_deferrals: AtomicU64,
     uploaded_bytes: AtomicU64,
+    input_upload_encoded_commands: AtomicU64,
+    input_upload_encoded_bytes: AtomicU64,
+    input_upload_reused_commands: AtomicU64,
+    input_upload_reused_bytes: AtomicU64,
     readback_bytes: AtomicU64,
     full_logits_readback_waves: AtomicU64,
     greedy_token_readback_waves: AtomicU64,
@@ -2890,6 +2894,10 @@ impl VNextExecutorMetrics {
             &self.wave_deferrals,
             &self.backing_deferrals,
             &self.uploaded_bytes,
+            &self.input_upload_encoded_commands,
+            &self.input_upload_encoded_bytes,
+            &self.input_upload_reused_commands,
+            &self.input_upload_reused_bytes,
             &self.readback_bytes,
             &self.full_logits_readback_waves,
             &self.greedy_token_readback_waves,
@@ -5875,6 +5883,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // Startup waves are synthetic evidence. Forget their residency proof so
         // the first product wave establishes and accounts for its own upload.
         self.product_token_mask_residency.lock().clear();
+        self.lane
+            .clear_input_residency()
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
         self.metrics.reset_after_startup();
         self.metrics
             .program_binding_upload
@@ -7505,31 +7516,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .map_err(|error| FerrumError::backend(error.to_string()))?,
                     );
                 }
-                offset_uploads.push(
-                    SubmissionWaveInputUpload::new(
-                        self.io.repetition_offsets_input_node_id.clone(),
-                        participant_index,
-                        self.io.repetition_offsets_input_ordinal,
-                        0,
-                        repetition_offset_layout,
-                        [0_u32, repetition_count]
-                            .into_iter()
-                            .flat_map(u32::to_le_bytes)
-                            .collect(),
-                    )
-                    .map_err(|error| FerrumError::backend(error.to_string()))?,
-                );
-                penalty_uploads.push(
-                    SubmissionWaveInputUpload::new(
-                        self.io.repetition_penalty_input_node_id.clone(),
-                        participant_index,
-                        self.io.repetition_penalty_input_ordinal,
-                        0,
-                        repetition_penalty_layout,
-                        repetition.penalty.to_le_bytes().to_vec(),
-                    )
-                    .map_err(|error| FerrumError::backend(error.to_string()))?,
-                );
+                let offsets = SubmissionWaveInputUpload::new(
+                    self.io.repetition_offsets_input_node_id.clone(),
+                    participant_index,
+                    self.io.repetition_offsets_input_ordinal,
+                    0,
+                    repetition_offset_layout,
+                    [0_u32, repetition_count]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect(),
+                )
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+                let penalty = SubmissionWaveInputUpload::new(
+                    self.io.repetition_penalty_input_node_id.clone(),
+                    participant_index,
+                    self.io.repetition_penalty_input_ordinal,
+                    0,
+                    repetition_penalty_layout,
+                    repetition.penalty.to_le_bytes().to_vec(),
+                )
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+                if !repetition.is_active() {
+                    offset_uploads.push(offsets.request_stable_residency());
+                    penalty_uploads.push(penalty.request_stable_residency());
+                } else {
+                    offset_uploads.push(offsets);
+                    penalty_uploads.push(penalty);
+                }
             }
             Ok((token_id_uploads, offset_uploads, penalty_uploads))
         })();
@@ -7850,6 +7864,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> FerrumError {
         let message = message.into();
         self.metrics.record_failure(message.clone());
+        let _ = self.lane.clear_input_residency();
         match step.try_abort() {
             Ok(_) => FerrumError::backend(message),
             Err(failure) => FerrumError::backend(format!(
@@ -7867,6 +7882,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if !matches!(&error, FerrumError::ResourceExhausted { .. }) {
             self.metrics.record_failure(error.to_string());
         }
+        let _ = self.lane.clear_input_residency();
         match step.try_abort() {
             Ok(_) => error,
             Err(failure) => FerrumError::backend(format!(
@@ -8305,6 +8321,24 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         // Take the optional hint before the completion handle moves to the
         // worker. The ticket owns no Step or Sequence resources.
+        let input_residency_publication = completion.take_input_residency_publication();
+        if let Some(counts) = completion.input_residency_upload_counts() {
+            self.metrics
+                .input_upload_encoded_commands
+                .fetch_add(counts.encoded_commands, Ordering::Relaxed);
+            self.metrics
+                .input_upload_encoded_bytes
+                .fetch_add(counts.encoded_bytes, Ordering::Relaxed);
+            self.metrics
+                .input_upload_reused_commands
+                .fetch_add(counts.reused_commands, Ordering::Relaxed);
+            self.metrics
+                .input_upload_reused_bytes
+                .fetch_add(counts.reused_bytes, Ordering::Relaxed);
+            self.metrics
+                .uploaded_bytes
+                .fetch_sub(counts.reused_bytes, Ordering::Relaxed);
+        }
         let segment_publication = completion.take_segment_binding_publication();
         let reaper = Arc::clone(&self.reaper);
         let observation = {
@@ -8398,6 +8432,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // event attribution cannot mutate that input backing.
         token_mask_residency.publish();
         token_mask_residency.settle_success();
+        if let Some(publication) = input_residency_publication {
+            // The hint has no success obligation; failure only forces fresh
+            // uploads, without bypassing this successful Step's normal cleanup.
+            let _ = publication.publish(receipt.completion(), &step);
+        }
         if diagnostic_failure_requested {
             if diagnostic_failure_observed {
                 if let Err(error) = participants[0]
@@ -9941,6 +9980,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "wave_deferrals": self.metrics.wave_deferrals.load(Ordering::Relaxed),
                 "backing_deferrals": self.metrics.backing_deferrals.load(Ordering::Relaxed),
                 "uploaded_bytes": self.metrics.uploaded_bytes.load(Ordering::Relaxed),
+                "input_upload_residency": {
+                    "scope": "ordinary input commands in submitted waves requesting or following residency; excludes program-binding transfers",
+                    "encoded_commands": self.metrics.input_upload_encoded_commands.load(Ordering::Relaxed),
+                    "encoded_bytes": self.metrics.input_upload_encoded_bytes.load(Ordering::Relaxed),
+                    "reused_commands": self.metrics.input_upload_reused_commands.load(Ordering::Relaxed),
+                    "reused_bytes": self.metrics.input_upload_reused_bytes.load(Ordering::Relaxed),
+                },
                 "readback_bytes": self.metrics.readback_bytes.load(Ordering::Relaxed),
                 "product_readback": product_readback,
             },

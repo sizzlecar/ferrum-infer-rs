@@ -963,6 +963,24 @@ pub(crate) fn fixture_with_token_scaled_paged_state_and_provider_behavior(
     )
 }
 
+/// Fixed per-participant external inputs with a real lane-stable bucket.
+/// Token-scaled fixtures intentionally use a different input projection contract.
+pub(crate) fn fixture_with_fixed_inputs_and_bucket(
+    bucket: ReusableExecutionBucketSpec,
+    retain_determinism_outputs: bool,
+) -> Fixture {
+    fixture_with_configured_runtime_and_bucket(
+        TestStateProfile::from_zero_state(false),
+        ProviderBehavior::ProgramBinding,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        retain_determinism_outputs,
+        ContractVersion::new(1, 0),
+        |_| {},
+        Some(bucket),
+    )
+}
+
 pub(crate) fn fixture_with_token_scaled_paged_state_and_bucket(
     bucket: ReusableExecutionBucketSpec,
 ) -> Fixture {

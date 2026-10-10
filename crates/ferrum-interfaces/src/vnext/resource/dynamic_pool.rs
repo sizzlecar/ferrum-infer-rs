@@ -2230,6 +2230,14 @@ impl<B> LogicalBackingSegmentBinding<B> {
     pub(crate) fn retention(&self) -> DeviceBufferRetention {
         self.retention.clone()
     }
+
+    pub(crate) fn weak_physical_owner(&self) -> std::sync::Weak<dyn Send + Sync>
+    where
+        B: Send + Sync + 'static,
+    {
+        let owner: Arc<dyn Send + Sync> = self.chunk.clone();
+        Arc::downgrade(&owner)
+    }
 }
 
 impl<'a, B> LogicalBackingBufferView<'a, B> {
