@@ -190,6 +190,11 @@ fn sparse_upload_prelude_paired_net_cost() {
     const WARM_WAVES: usize = 4;
     const QUADS: usize = 8;
     const WAVES_PER_ARM: usize = 16;
+    const COMPARISONS: [(Route, Route); 3] = [
+        (Route::BoxDirect, Route::PinnedGraph),
+        (Route::PinnedDirect, Route::PinnedGraph),
+        (Route::BoxDirect, Route::PinnedDirect),
+    ];
     println!(
         "sparse_upload_prelude_plan {}",
         json!({
@@ -198,7 +203,7 @@ fn sparse_upload_prelude_paired_net_cost() {
             "causal_slot_bytes": 1048, "live_causal_bytes": [56, 64, 72],
             "warm_waves_per_route": WARM_WAVES, "quads_per_comparison": QUADS,
             "waves_per_arm": WAVES_PER_ARM,
-            "comparisons": ["BoxDirect/PinnedGraph", "PinnedDirect/PinnedGraph"],
+            "comparisons": COMPARISONS.iter().map(|(a, b)| format!("{a:?}/{b:?}")).collect::<Vec<_>>(),
             "order": "even quad A B B A; odd quad B A A B",
             "net_scope": "fresh Box payload fill + production sparse coalescer + validation + pinned staging if applicable + actual commands + events + fence + per-wave payload retirement",
             "stream_interval_scope": "prebuilt start after host fill, stop after last copy; includes host API gaps, not pure DMA or SM busy",
@@ -220,13 +225,13 @@ fn sparse_upload_prelude_paired_net_cost() {
                 wave += 1;
             }
         }
-        for direct in [Route::BoxDirect, Route::PinnedDirect] {
+        for (a, b) in COMPARISONS {
             for quad in 0..QUADS {
                 let quad_first_wave = wave;
                 let order = if quad % 2 == 0 {
-                    [direct, Route::PinnedGraph, Route::PinnedGraph, direct]
+                    [a, b, b, a]
                 } else {
-                    [Route::PinnedGraph, direct, direct, Route::PinnedGraph]
+                    [b, a, a, b]
                 };
                 for (position, route) in order.into_iter().enumerate() {
                     // Paired arms use exactly the same changing payload series.
@@ -246,7 +251,7 @@ fn sparse_upload_prelude_paired_net_cost() {
                     println!(
                         "sparse_upload_prelude_measurement {}",
                         json!({
-                            "participants": participants, "comparison": format!("{direct:?}/PinnedGraph"),
+                            "participants": participants, "comparison": format!("{a:?}/{b:?}"),
                             "quad": quad, "position": position, "route": format!("{route:?}"),
                             "waves": WAVES_PER_ARM, "first_wave": first_wave,
                             "net_ns": total.net_ns, "host_api_ns": total.host_api_ns,
