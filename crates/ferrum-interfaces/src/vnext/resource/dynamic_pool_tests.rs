@@ -54,6 +54,12 @@ mod completed_boundary_tests;
 #[path = "segment_permit_tests.rs"]
 mod segment_permit_tests;
 
+#[path = "projection_proof_tests.rs"]
+mod projection_proof_tests;
+
+#[path = "authority_projection_proof_bench.rs"]
+mod authority_projection_proof_bench;
+
 static NEXT_TEST_DEVICE: AtomicU64 = AtomicU64::new(1);
 const DYNAMIC_POOL_CONCURRENT_WORKERS: usize = 1;
 const MAX_DYNAMIC_POOL_TEST_WORKERS: usize = 2;

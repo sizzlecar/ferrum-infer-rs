@@ -25,7 +25,7 @@ impl<F: Fn() + Send + Sync> SubmissionWaveDispatchTimingSink for PermitTiming<F>
     }
 }
 
-fn two_pools() -> (Harness, Vec<LogicalBackingSliceAuthority>) {
+pub(super) fn two_pools() -> (Harness, Vec<LogicalBackingSliceAuthority>) {
     let catalog = combine_catalogs(&['a', 'b'].map(|digit| {
         pool_catalog(
             linear_profile(),
@@ -54,7 +54,9 @@ fn two_pools() -> (Harness, Vec<LogicalBackingSliceAuthority>) {
     (harness, authorities)
 }
 
-fn expectations(groups: &[&[LogicalBackingSliceAuthority]]) -> Vec<SegmentBackingExpectation> {
+pub(super) fn expectations(
+    groups: &[&[LogicalBackingSliceAuthority]],
+) -> Vec<SegmentBackingExpectation> {
     groups
         .iter()
         .map(|group| {
@@ -71,7 +73,7 @@ fn expectations(groups: &[&[LogicalBackingSliceAuthority]]) -> Vec<SegmentBackin
         .collect()
 }
 
-fn windows(expected: &[SegmentBackingExpectation]) -> Vec<SegmentBackingWindow> {
+pub(super) fn windows(expected: &[SegmentBackingExpectation]) -> Vec<SegmentBackingWindow> {
     expected
         .iter()
         .enumerate()
@@ -380,6 +382,7 @@ fn segment_permit_returns_current_arc_and_retains_it_after_unlock() {
     let donor_pool = &donor.root.dynamic_pools.pools[&donor.pool_ids[0]];
     let ordinal = authorities[0].evidence.segments[0].chunk_ordinal();
     let old_view = pools.view(&authorities[0]).unwrap();
+    assert!(authorities[0].projection_proof_matches(pool));
     let original = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
     let mut replacement = donor_pool
         .state
@@ -404,6 +407,7 @@ fn segment_permit_returns_current_arc_and_retains_it_after_unlock() {
     let batch = pools
         .segment_backing_batch(&groups, &expected, &windows(&expected))
         .unwrap();
+    assert!(authorities[0].projection_proof_matches(pool));
     assert!(Arc::ptr_eq(
         &batch.bindings()[0].chunk,
         &replacement_probe.upgrade().unwrap()

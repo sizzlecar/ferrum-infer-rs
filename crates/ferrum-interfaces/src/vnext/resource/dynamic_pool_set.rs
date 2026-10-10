@@ -2640,6 +2640,18 @@ where
         pool: &DynamicBackingPool<R>,
         authority: &LogicalBackingSliceAuthority,
     ) -> Result<(), VNextError> {
+        if authority.projection_proof_matches(pool) {
+            // Lane-stable admission may change this outer logical projection
+            // while retaining the exact immutable allocation and physical lease.
+            if authority.evidence.logical_size_bytes == 0
+                || authority.evidence.logical_size_bytes > authority.evidence.capacity_size_bytes
+            {
+                return Err(invalid_resource(
+                    "logical backing authority belongs to another dynamic pool instance",
+                ));
+            }
+            return Ok(());
+        }
         Self::validate_authority_identity_and_bounds(pool, authority)?;
         if authority.segment_lease.claim_identity != authority.evidence.physical_claim_identity
             || authority.evidence.physical_claim_identity.pool_id() != pool.domain.pool_id()
@@ -2664,6 +2676,7 @@ where
                 "logical backing projection differs from its shared physical extent",
             ));
         }
+        authority.remember_validated_projection(pool);
         Ok(())
     }
 

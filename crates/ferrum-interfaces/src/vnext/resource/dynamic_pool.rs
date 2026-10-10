@@ -14,6 +14,7 @@ use crate::vnext::{
     ReusableExecutionMemoryPlan,
 };
 use sha2::{Digest, Sha256};
+use std::sync::{OnceLock, Weak};
 
 pub(super) static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1694,6 +1695,7 @@ where
                     evidence,
                     segment_lease: Arc::clone(&segment_lease),
                     reusable_lane: None,
+                    projection_proof: Arc::new(OnceLock::new()),
                 }
             }));
         }
@@ -2132,9 +2134,59 @@ pub struct LogicalBackingSliceAuthority {
     pub(in crate::vnext::resource) evidence: LogicalBackingSliceEvidence,
     pub(in crate::vnext::resource) segment_lease: Arc<BackingSegmentLease>,
     pub(super) reusable_lane: Option<ExecutionLaneId>,
+    projection_proof: Arc<OnceLock<AuthorityProjectionProof>>,
+}
+
+/// Static projection validation for three exact live owners. Weak references
+/// neither retain the physical claim nor allow its sealed allocation/lease to
+/// be edited through Arc::get_mut. A different owner takes the full path again.
+/// Logical size, lane scope and the pool's mutable chunk state are not sealed.
+pub(super) struct AuthorityProjectionProof {
+    allocation: Weak<LogicalBackingSliceAllocationEvidence>,
+    lease: Weak<BackingSegmentLease>,
+    pool: Weak<dyn BackingExtentOwner>,
 }
 
 impl LogicalBackingSliceAuthority {
+    pub(super) fn projection_proof_matches<R: DeviceRuntime>(
+        &self,
+        pool: &DynamicBackingPool<R>,
+    ) -> bool {
+        self.projection_proof.get().is_some_and(|proof| {
+            std::ptr::eq(
+                proof.allocation.as_ptr(),
+                Arc::as_ptr(&self.evidence.allocation),
+            ) && std::ptr::eq(proof.lease.as_ptr(), Arc::as_ptr(&self.segment_lease))
+                && std::ptr::addr_eq(proof.pool.as_ptr(), pool as *const DynamicBackingPool<R>)
+        })
+    }
+
+    /// Called only after the original complete authority validation succeeds.
+    /// A live authority owns the allocation and lease; that lease owns its pool,
+    /// so pointer matches cannot revive an expired owner at a reused address.
+    pub(super) fn remember_validated_projection<R: DeviceRuntime>(
+        &self,
+        pool: &DynamicBackingPool<R>,
+    ) {
+        if self.projection_proof.get().is_none()
+            && std::ptr::addr_eq(
+                Arc::as_ptr(&self.segment_lease.owner),
+                pool as *const DynamicBackingPool<R>,
+            )
+        {
+            let _ = self.projection_proof.set(AuthorityProjectionProof {
+                allocation: Arc::downgrade(&self.evidence.allocation),
+                lease: Arc::downgrade(&self.segment_lease),
+                pool: Arc::downgrade(&self.segment_lease.owner),
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn projection_proof_for_test(&self) -> Arc<OnceLock<AuthorityProjectionProof>> {
+        Arc::clone(&self.projection_proof)
+    }
+
     pub fn evidence(&self) -> &LogicalBackingSliceEvidence {
         &self.evidence
     }
@@ -2144,6 +2196,7 @@ impl LogicalBackingSliceAuthority {
             evidence: self.evidence.clone(),
             segment_lease: Arc::clone(&self.segment_lease),
             reusable_lane: self.reusable_lane,
+            projection_proof: Arc::clone(&self.projection_proof),
         }
     }
 
@@ -2152,6 +2205,7 @@ impl LogicalBackingSliceAuthority {
             evidence: self.evidence.clone(),
             segment_lease: Arc::clone(&self.segment_lease),
             reusable_lane: Some(lane_id),
+            projection_proof: Arc::clone(&self.projection_proof),
         }
     }
 
