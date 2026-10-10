@@ -50,6 +50,8 @@ use super::vnext_tool_correlation;
 use crate::backend::program_binding_upload::ProgramBindingUploadCounters;
 
 mod binding_transfers;
+#[cfg(test)]
+mod compact_upload_scatter_tests;
 mod segment_oracle;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
