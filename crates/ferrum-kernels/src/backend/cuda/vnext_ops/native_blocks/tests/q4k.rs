@@ -137,15 +137,52 @@ impl<T: Scalar> Fixture<T> {
         row_tile: u32,
         iterations: u32,
     ) -> (f64, f64) {
-        assert!(iterations > 0);
+        self.run_with_columns(stream, kernel, row_tile, 4, iterations)
+    }
+
+    pub(super) fn reset(&mut self, stream: &Arc<CudaStream>) {
         stream
             .memcpy_htod(&self.output_initial, &mut self.output_gpu)
             .unwrap();
         stream.synchronize().unwrap();
+    }
+
+    pub(super) fn run_with_columns(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        kernel: &CudaFunction,
+        row_tile: u32,
+        columns_per_block: u32,
+        iterations: u32,
+    ) -> (f64, f64) {
+        assert!(iterations > 0);
+        self.reset(stream);
         let wall = std::time::Instant::now();
         let start = stream
             .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
             .unwrap();
+        self.enqueue(stream, kernel, row_tile, columns_per_block, iterations);
+        let end = stream
+            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        end.synchronize().unwrap();
+        let wall_ns = wall.elapsed().as_secs_f64() * 1e9;
+        let gpu_ns = f64::from(start.elapsed_ms(&end).unwrap()) * 1e6;
+        (wall_ns, gpu_ns)
+    }
+
+    /// Enqueue only: the caller retains this fixture through synchronization
+    /// and graph destruction. `columns_per_block` must match the kernel export.
+    pub(super) fn enqueue(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        kernel: &CudaFunction,
+        row_tile: u32,
+        columns_per_block: u32,
+        iterations: u32,
+    ) {
+        assert!(row_tile > 0 && iterations > 0);
+        assert!(matches!(columns_per_block, 1 | 4));
         {
             let input = self
                 .input_gpu
@@ -178,24 +215,17 @@ impl<T: Scalar> Fixture<T> {
                 unsafe {
                     launch.launch(LaunchConfig {
                         grid_dim: (
-                            (self.outputs as u32).div_ceil(4),
+                            (self.outputs as u32).div_ceil(columns_per_block),
                             (self.rows as u32).div_ceil(row_tile),
                             1,
                         ),
-                        block_dim: (128, 1, 1),
+                        block_dim: (32 * columns_per_block, 1, 1),
                         shared_mem_bytes: 0,
                     })
                 }
                 .unwrap();
             }
         }
-        let end = stream
-            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-            .unwrap();
-        end.synchronize().unwrap();
-        let wall_ns = wall.elapsed().as_secs_f64() * 1e9;
-        let gpu_ns = f64::from(start.elapsed_ms(&end).unwrap()) * 1e6;
-        (wall_ns, gpu_ns)
     }
 
     pub(super) fn run_dispatch(

@@ -42,6 +42,8 @@ pub(super) struct CudaNativeBlockKernels {
     linear_q4k_tiled_f16: CudaFunction,
     linear_q8_0_f16: CudaFunction,
     #[cfg(test)]
+    linear_q8_0_warp_f16: CudaFunction,
+    #[cfg(test)]
     linear_q8_0_tiled_f16: CudaFunction,
     linear_q5k_f16: CudaFunction,
     linear_q5k_tiled_f16: CudaFunction,
@@ -189,6 +191,8 @@ impl CudaNativeBlockKernels {
             linear_q4k_f16: load("vnext_gguf_linear_q4k_f16")?,
             linear_q4k_tiled_f16: load("vnext_gguf_linear_q4k_tiled_f16")?,
             linear_q8_0_f16: load("vnext_gguf_linear_q8_0_f16")?,
+            #[cfg(test)]
+            linear_q8_0_warp_f16: load("vnext_gguf_linear_q8_0_warp_f16")?,
             #[cfg(test)]
             linear_q8_0_tiled_f16: load("vnext_gguf_linear_q8_0_tiled_f16")?,
             linear_q5k_f16: load("vnext_gguf_linear_q5k_f16")?,

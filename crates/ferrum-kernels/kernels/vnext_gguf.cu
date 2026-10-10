@@ -206,12 +206,12 @@ NATIVE_Q4K_LINEAR(tiled_f16, 8)
 // Q8_0 has one signed byte per lane and one F16 scale per 32-value block.
 // Fix the physical stride without changing coefficient reconstruction, each
 // lane's K order, cross-row reuse, or the final warp reduction.
-template<unsigned RowTile>
+template<unsigned RowTile, unsigned ColumnWarps>
 __device__ void native_q8_0_linear(const half* x, const byte* w, half* y,
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
     const unsigned row = blockIdx.y * RowTile;
     const unsigned lane = threadIdx.x % 32;
-    const unsigned column = blockIdx.x * 4 + threadIdx.x / 32;
+    const unsigned column = blockIdx.x * ColumnWarps + threadIdx.x / 32;
     if (row >= rows || column >= outputs) return;
     const unsigned blocks = inputs / 32;
     const byte* weights = w + size_t(column) * blocks * 34;
@@ -236,15 +236,17 @@ __device__ void native_q8_0_linear(const half* x, const byte* w, half* y,
     }
 }
 
-#define NATIVE_Q8_0_LINEAR(suffix, tile) \
+#define NATIVE_Q8_0_LINEAR(suffix, tile, column_warps) \
 extern "C" __global__ void vnext_gguf_linear_q8_0_##suffix(const half* x, const byte* w, half* y, \
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
     unsigned format, unsigned values, unsigned bytes) { \
     if (format != 8 || values != 32 || bytes != 34 || inputs % 32 != 0) return; \
-    native_q8_0_linear<tile>(x, w, y, rows, inputs, outputs, stride, offset); \
+    native_q8_0_linear<tile, column_warps>(x, w, y, rows, inputs, outputs, stride, offset); \
 }
-NATIVE_Q8_0_LINEAR(f16, 1)
-NATIVE_Q8_0_LINEAR(tiled_f16, 8)
+NATIVE_Q8_0_LINEAR(f16, 1, 4)
+NATIVE_Q8_0_LINEAR(tiled_f16, 8, 4)
+// Test-reachable geometry variant; production dispatch retains four warps.
+NATIVE_Q8_0_LINEAR(warp_f16, 1, 1)
 #undef NATIVE_Q8_0_LINEAR
 
 // Fix a 256-value block's format and byte stride without changing reconstructed

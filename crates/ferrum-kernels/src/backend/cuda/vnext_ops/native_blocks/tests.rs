@@ -9,6 +9,7 @@ use half::f16;
 #[cfg(feature = "cuda-upstream-extra-linear")]
 mod extra_qualification;
 
+mod captured;
 mod format_specialization;
 mod iq4xs_register;
 mod q4k;

@@ -2,6 +2,8 @@
 
 use super::{q4k::Fixture, *};
 
+mod warp_grid;
+
 fn boundary_weights(inputs: usize, outputs: usize) -> Vec<u8> {
     assert_eq!(inputs % 32, 0);
     // Both zero signs, subnormal endpoints, normal endpoints and ordinary
