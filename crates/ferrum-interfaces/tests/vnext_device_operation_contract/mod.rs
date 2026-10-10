@@ -1433,6 +1433,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
     pub(crate) tamper_buffer_descriptor: bool,
+    pub(crate) tamper_weight_buffer_descriptor: bool,
     pub(crate) persistent_descriptor_fault: Option<PersistentDescriptorFault>,
     pub(crate) drift_on_submit: bool,
     pub(crate) next_fence: u64,
@@ -1845,7 +1846,10 @@ impl DeviceRuntime for TestRuntime {
                 None => {}
             }
         }
-        if self.trace.lock().unwrap().tamper_buffer_descriptor {
+        let trace = self.trace.lock().unwrap();
+        if trace.tamper_buffer_descriptor
+            || (trace.tamper_weight_buffer_descriptor && descriptor.usage == BufferUsage::Weights)
+        {
             descriptor.size_bytes += 1;
         }
         descriptor

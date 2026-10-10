@@ -6,6 +6,10 @@ use super::{
     ResourceTransactionIdentity, ResourceWorkShape, StaticProvisioningBinding, VNextError,
 };
 
+#[cfg(test)]
+#[path = "static_lease_tests.rs"]
+mod tests;
+
 pub(super) struct OwnedLeaseSlot<B> {
     pub(super) entry: ResourceLeaseEntry,
     pub(super) actual_resource_id: Option<ResourceId>,
@@ -62,6 +66,39 @@ pub struct LeasedBufferView<'a, B> {
     pub(super) generation: u64,
     pub(super) descriptor: &'a BufferDescriptor,
     pub(super) buffer: &'a B,
+}
+
+/// A successful slot check over exact, immutably borrowed operands. This
+/// proves only the lease's stored fields, never a runtime buffer descriptor.
+pub(crate) struct CheckedPlanStaticSlot<'a, R: DeviceRuntime> {
+    lease: &'a StaticProvisioningLease<R>,
+    allocation: &'a ResourceAllocation,
+    slot_index: usize,
+}
+
+impl<'a, R: DeviceRuntime> CheckedPlanStaticSlot<'a, R> {
+    pub(crate) fn reborrow(
+        &self,
+        lease: &'a StaticProvisioningLease<R>,
+        allocation: &'a ResourceAllocation,
+        slot_index: usize,
+    ) -> Option<LeasedBufferView<'a, R::Buffer>> {
+        if !std::ptr::eq(self.lease, lease)
+            || !std::ptr::eq(self.allocation, allocation)
+            || self.slot_index != slot_index
+        {
+            return None;
+        }
+        let slot = lease.slots.get(slot_index)?;
+        Some(LeasedBufferView {
+            identity: &lease.identity,
+            admission: &lease.admission,
+            resource_id: &slot.entry.resource_id,
+            generation: slot.entry.generation,
+            descriptor: slot.descriptor.as_ref()?,
+            buffer: slot.buffer.as_ref()?,
+        })
+    }
 }
 
 impl<'a, B> LeasedBufferView<'a, B> {
@@ -250,6 +287,28 @@ where
             descriptor,
             buffer,
         })
+    }
+
+    pub(crate) fn checked_plan_static_view<'a>(
+        &'a self,
+        slot_index: usize,
+        allocation: &'a ResourceAllocation,
+    ) -> Result<
+        (
+            LeasedBufferView<'a, R::Buffer>,
+            CheckedPlanStaticSlot<'a, R>,
+        ),
+        VNextError,
+    > {
+        let view = self.plan_static_view(slot_index, allocation)?;
+        Ok((
+            view,
+            CheckedPlanStaticSlot {
+                lease: self,
+                allocation,
+                slot_index,
+            },
+        ))
     }
 
     pub(super) fn buffer(&self, order: usize) -> Option<&R::Buffer> {

@@ -13,6 +13,8 @@ use vnext_device_operation_wave_contract::prepare_wave;
 mod coverage_tests;
 #[path = "descriptor_agreement_tests.rs"]
 mod descriptor_agreement_tests;
+#[path = "plan_static_reuse_tests.rs"]
+mod plan_static_reuse_tests;
 #[path = "segment_authority_tests.rs"]
 mod segment_authority_tests;
 #[path = "segment_compile_tests.rs"]

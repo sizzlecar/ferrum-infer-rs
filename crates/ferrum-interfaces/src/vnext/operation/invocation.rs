@@ -28,6 +28,8 @@ mod descriptor_agreement;
 #[cfg(test)]
 mod materialization_tests;
 use descriptor_agreement::DeviceDescriptorAgreement;
+mod plan_static_reuse;
+use plan_static_reuse::SharedInvocationResource;
 mod view_coverage;
 #[cfg(test)]
 pub(crate) use view_coverage::test_only_backing_window_coverage;
@@ -843,7 +845,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         active_binding: &TrustedActiveSequenceBinding,
         participant_index: usize,
         reusable_bindings_only: bool,
-        shared_backings: &mut [Option<Arc<LogicalBackingBufferView<'a, B>>>],
+        shared_resources: &mut [SharedInvocationResource<'a, R>],
         device_agreements: &mut [DeviceDescriptorAgreement<'runtime, 'a>; 2],
     ) -> Result<Self, VNextError>
     where
@@ -904,7 +906,11 @@ impl<'a, B> OperationInvocation<'a, B> {
                             "plan-static resource `{resource_id}` lacks static provisioning"
                         ))
                     })?;
-                    let leased = lease.plan_static_view(slot_index, allocation)?;
+                    let leased = if let Some(entry) = shared_resources.get_mut(resource_index) {
+                        entry.plan_static_view(lease, slot_index, allocation)?
+                    } else {
+                        lease.plan_static_view(slot_index, allocation)?
+                    };
                     views.push(OperationBufferView::from_static(
                         leased,
                         participant.device_buffer_retention(),
@@ -939,13 +945,16 @@ impl<'a, B> OperationInvocation<'a, B> {
                             )
                         }
                         AllocationLifetime::Step | AllocationLifetime::Invocation => {
-                            if let Some(entry) = shared_backings.get_mut(resource_index) {
-                                let retained = if let Some(retained) = entry {
+                            if let Some(entry) = shared_resources.get_mut(resource_index) {
+                                let retained = if let SharedInvocationResource::Dynamic(retained) =
+                                    entry
+                                {
                                     resources.revalidate_backing_view(resource_id, retained)?;
                                     Arc::clone(retained)
                                 } else {
                                     let retained = Arc::new(resources.backing_view(resource_id)?);
-                                    *entry = Some(Arc::clone(&retained));
+                                    *entry =
+                                        SharedInvocationResource::Dynamic(Arc::clone(&retained));
                                     retained
                                 };
                                 OperationBacking::Shared(retained)
@@ -1401,14 +1410,15 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         let node = prepared.node(resolved, node_identity.node_id())?;
         let operation = resolved.capabilities().operation(node.operation_id())?;
         // A new table for each node/wave construction, never stored in a Plan,
-        // lane or returned invocation. Only the immutable payload is shared;
-        // each later participant rechecks live pool authority before using it.
-        let mut shared_backings = if share_materialization
+        // lane or returned invocation. Static checks require exact borrowed
+        // operands; dynamic payloads still recheck live pool authority for
+        // each later participant. All runtime descriptor checks remain per-P.
+        let mut shared_resources = if share_materialization
             && participant_count > 1
             && matches!(resources, OperationInvocationResources::Wave { .. })
         {
             (0..prepared.resources.len())
-                .map(|_| None)
+                .map(|_| SharedInvocationResource::Vacant)
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -1438,7 +1448,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     active_binding,
                     index,
                     reusable_bindings_only,
-                    &mut shared_backings,
+                    &mut shared_resources,
                     &mut device_agreements,
                 )
             })
