@@ -8,6 +8,7 @@ use serde_json::json;
 use std::time::Instant;
 
 mod fixture;
+mod fresh_lifecycle;
 mod packet;
 use fixture::Fixture;
 use packet::Packet;
