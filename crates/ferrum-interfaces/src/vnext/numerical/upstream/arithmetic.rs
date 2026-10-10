@@ -7,7 +7,9 @@ use super::super::{
     StrictProjectionFallback, NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM,
     NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA,
     NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL,
+    NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY,
 };
+use super::UpstreamProjectionGeometrySelection;
 
 /// Numerical versions follow the pinned upstream projection equations,
 /// not the adapter's function names or a performance threshold. Changing any
@@ -288,6 +290,10 @@ pub struct UpstreamProjectionPolicy {
     pub format: ProjectionBlockFormat,
     pub routes: Vec<UpstreamProjectionRouteDeclaration>,
     pub fallback: StrictProjectionFallback,
+    /// Omitted on every legacy declaration to preserve its exact wire identity.
+    /// A present selection requires the separate geometry arithmetic schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_selection: Option<UpstreamProjectionGeometrySelection>,
 }
 
 impl UpstreamProjectionPolicy {
@@ -344,13 +350,18 @@ impl UpstreamProjectionPolicy {
                 }
             }
         }
+        if let Some(selection) = self.geometry_selection {
+            selection.validate(self)?;
+        }
         Ok(())
     }
 
     pub fn staged(self) -> Result<StagedNumericalArithmetic, String> {
         self.validate()?;
         Ok(StagedNumericalArithmetic {
-            schema_version: if self.format.is_extra()
+            schema_version: if self.geometry_selection.is_some() {
+                NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
+            } else if self.format.is_extra()
                 && self.routes.iter().any(|route| route.prefill_rows.is_some())
             {
                 NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL

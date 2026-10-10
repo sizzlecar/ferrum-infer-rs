@@ -350,10 +350,13 @@ impl UpstreamPlanFactory {
         });
         let selection = policy.and_then(|policy| {
             policy
-                .routes
-                .iter()
-                .find(|route| route.layout == facts.layout && route.contains_rows(facts.local_rows))
-                .map(|route| (policy.format, route.arithmetic))
+                .select_arithmetic(
+                    facts.layout,
+                    facts.local_rows,
+                    projection.input_features(),
+                    leaf.output_features(),
+                )
+                .map(|arithmetic| (policy.format, arithmetic))
         });
         let native = if leaf.is_staged() && facts.weight_byte_offset % 4 == 0 {
             selection

@@ -7,6 +7,9 @@ use super::super::prepared::tests::binding;
 #[path = "extra_tests.rs"]
 mod extra;
 
+#[path = "geometry_tests.rs"]
+mod geometry;
+
 #[test]
 fn upstream_prefill_interval_preserves_legacy_wire_and_rejects_ambiguous_domains() {
     for (old, new) in [
@@ -143,6 +146,7 @@ fn policy(
     rows: &[u32],
 ) -> UpstreamProjectionPolicy {
     UpstreamProjectionPolicy {
+        geometry_selection: None,
         format,
         routes: vec![UpstreamProjectionRouteDeclaration {
             arithmetic,

@@ -6,9 +6,11 @@
 //! and implement the declared V1 domain check or V2 device marker protocol.
 
 mod arithmetic;
+mod geometry;
 mod plan;
 mod scratch;
 pub use arithmetic::*;
+pub use geometry::*;
 pub use plan::*;
 pub use scratch::*;
 

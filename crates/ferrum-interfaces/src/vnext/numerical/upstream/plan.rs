@@ -178,6 +178,7 @@ impl PreparedUpstreamProjectionWave {
                 | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ
                 | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                 | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | super::super::COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
         ) {
             return Err(
                 "per-wave upstream planning requires the explicit upstream composite".into(),
@@ -274,10 +275,7 @@ impl PreparedUpstreamProjectionWave {
             .arithmetic
             .upstream_policy()
             .ok_or("missing upstream leaf policy")?;
-        let Some(selection) = policy
-            .routes
-            .iter()
-            .find(|r| r.layout == facts.layout && r.contains_rows(facts.local_rows))
+        let Some(arithmetic) = policy.select_arithmetic(facts.layout, facts.local_rows, k, n)
         else {
             return strict(UpstreamStrictReason::RowsOrLayoutNotDeclared);
         };
@@ -301,7 +299,7 @@ impl PreparedUpstreamProjectionWave {
         }
         let (padded_k, packed_bytes, fixup_bytes) = match (
             &native.geometry,
-            selection.arithmetic.finite_expression(),
+            arithmetic.finite_expression(),
         ) {
             (
                 UpstreamNativeGeometry::Mmq {
@@ -438,7 +436,7 @@ impl PreparedUpstreamProjectionWave {
             (UpstreamScratchRole::StreamKFixup, fixup_bytes),
             (
                 UpstreamScratchRole::RowPoisonFlags,
-                if selection.arithmetic.is_marker_v2() {
+                if arithmetic.is_marker_v2() {
                     mul(m, 4)?
                 } else {
                     0
@@ -461,16 +459,16 @@ impl PreparedUpstreamProjectionWave {
             facts: facts.clone(),
             route: PreparedUpstreamProjectionRoute::Selected {
                 format: policy.format,
-                arithmetic: selection.arithmetic,
-                pack: selection.arithmetic.semantics(policy.format)?.pack,
+                arithmetic,
+                pack: arithmetic.semantics(policy.format)?.pack,
                 native: native.clone(),
                 scratch,
                 scratch_bytes: size,
-                retained_weight_validation: selection.arithmetic.is_marker_v2().then(|| {
+                retained_weight_validation: arithmetic.is_marker_v2().then(|| {
                     UpstreamRetainedWeightValidation {
                         component_id: facts.component_id.clone(),
                         weight_byte_offset: facts.weight_byte_offset,
-                        arithmetic: selection.arithmetic,
+                        arithmetic,
                         format: policy.format,
                         input_features: k,
                         output_features: n,

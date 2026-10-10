@@ -392,6 +392,7 @@ impl UpstreamMarkerV2Profile {
                                     input_features_multiple: 256,
                                 },
                                 arithmetic: UpstreamProjectionPolicy {
+                                    geometry_selection: None,
                                     format,
                                     fallback: StrictProjectionFallback::RetainBaseArithmetic {},
                                     routes,

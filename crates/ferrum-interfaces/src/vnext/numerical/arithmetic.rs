@@ -16,6 +16,8 @@ pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ: u32 = 3;
 pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA: u32 = 4;
 /// Extra-format MMQ prefill; version 5 is reserved for the separate k8 hybrid.
 pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL: u32 = 6;
+/// Explicit physical-leaf geometry selection; legacy route schemas stay closed.
+pub const NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +171,19 @@ impl StagedNumericalArithmetic {
     /// Family registration still has to reproduce this declaration; operation
     /// and provider versions must implement it before any plan can execute it.
     pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version == NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY {
+            return match self.stages.as_slice() {
+                [NumericalArithmeticStage::UpstreamProjection { policy }]
+                    if policy.geometry_selection.is_some() =>
+                {
+                    policy.validate()
+                }
+                _ => Err(
+                    "geometry schema requires one explicit geometry-selected upstream policy"
+                        .into(),
+                ),
+            };
+        }
         if self.schema_version == super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION_Q6_MMQ_F32 {
             return match self.stages.as_slice() {
                 [NumericalArithmeticStage::Q6MmqF32Projection { policy }] => policy.validate(),
@@ -189,6 +204,9 @@ impl StagedNumericalArithmetic {
         ) {
             return match self.stages.as_slice() {
                 [NumericalArithmeticStage::UpstreamProjection { policy }] => {
+                    if policy.geometry_selection.is_some() {
+                        return Err("legacy upstream schema cannot carry geometry selection".into());
+                    }
                     if policy.format.is_extra()
                         != matches!(
                             self.schema_version,

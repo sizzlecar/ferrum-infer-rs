@@ -91,6 +91,7 @@ fn policy(format: ProjectionBlockFormat) -> UpstreamProjectionPolicy {
         _ => unreachable!("closed extra policy builder"),
     };
     UpstreamProjectionPolicy {
+        geometry_selection: None,
         format,
         fallback: StrictProjectionFallback::RetainBaseArithmetic {},
         routes: [

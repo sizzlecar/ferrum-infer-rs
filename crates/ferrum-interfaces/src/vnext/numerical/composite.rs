@@ -31,6 +31,8 @@ pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA: u32 = 5;
 /// Six-format upstream with explicitly qualified extra-format MMQ prefill.
 /// Schema 6 is reserved for the independent k8 hybrid candidate.
 pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL: u32 = 7;
+/// Extra-prefill attention with explicitly declared physical-leaf geometry routing.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,14 +174,16 @@ impl CompositeNumericalArithmetic {
                 COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
-                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY,
                 GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
             ) => gated_delta_recurrent_attention_f32_master_contract(),
             (
                 COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
-                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY,
                 CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
             ) => causal_paged_attention_f32_master_contract(),
             (COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION, DENSE_SWIGLU_OPERATION_ID) => {
@@ -241,6 +245,7 @@ impl CompositeNumericalArithmetic {
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                 | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
         ) {
             return Err(
                 "unsupported composite arithmetic schema version; explicit migration required"
@@ -255,6 +260,7 @@ impl CompositeNumericalArithmetic {
         }
         let mut roles = BTreeSet::new();
         let mut slots = BTreeSet::new();
+        let mut has_geometry_selection = false;
         for projection in &self.projections {
             let (slot, rank) = self.role_port(projection.role)?;
             if !roles.insert(projection.role) || !slots.insert(projection.weight_input_ordinal) {
@@ -291,6 +297,7 @@ impl CompositeNumericalArithmetic {
                         self.schema_version,
                         COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                             | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                            | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
                     )
                 {
                     return Err(
@@ -326,15 +333,29 @@ impl CompositeNumericalArithmetic {
                     COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
                         | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                         | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
                 ) {
                     let [NumericalArithmeticStage::UpstreamProjection { policy }] =
                         leaf.arithmetic.stages.as_slice()
                     else {
                         return Err("upstream composite leaves require upstream arithmetic".into());
                     };
+                    if policy.geometry_selection.is_some() {
+                        if self.schema_version
+                            != COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
+                        {
+                            return Err(
+                                "geometry-selected leaf requires its separate composite schema"
+                                    .into(),
+                            );
+                        }
+                        has_geometry_selection = true;
+                    }
                     if leaf.format.is_extra()
                         && (leaf.arithmetic.schema_version == super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL)
-                            != (self.schema_version == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL)
+                            != matches!(self.schema_version,
+                                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                                    | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY)
                     {
                         return Err("extra prefill leaf requires its separate composite schema".into());
                     }
@@ -410,6 +431,11 @@ impl CompositeNumericalArithmetic {
                     );
                 }
             }
+        }
+        if self.schema_version == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_GEOMETRY
+            && !has_geometry_selection
+        {
+            return Err("geometry composite requires an explicit geometry-selected leaf".into());
         }
         Ok(())
     }
