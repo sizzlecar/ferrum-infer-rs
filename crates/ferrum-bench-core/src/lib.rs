@@ -25,6 +25,7 @@
 pub mod arrivals;
 pub mod client_slo;
 pub mod dataset;
+pub mod decode_cycle;
 pub mod decode_isolation;
 pub mod env;
 pub mod jsonl_journal;
