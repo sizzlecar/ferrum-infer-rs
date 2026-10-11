@@ -25,6 +25,7 @@ pub struct Q6F32Workspace {
     pub bytes: u64,
 }
 impl Q6F32Workspace {
+    #[cfg(any(feature = "cuda-upstream-q6-f32-linear", test))]
     fn new(plan: &UpstreamQ6F32PlanV1) -> Result<Self, Error> {
         let mut cursor = 0u64;
         let mut take = |bytes: u64| -> Result<u64, Error> {

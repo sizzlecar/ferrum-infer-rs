@@ -30,6 +30,7 @@ pub(crate) fn activation(packed: &[u8], rows: usize, row: usize, column: usize) 
 
 /// (actual-pack target, expanded magnitude, original F32 target, original magnitude,
 ///  conservative measured activation-quantization error bound).
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
 pub(crate) fn dot(w: &[u8], x: &[f32], packed: &[u8], rows: usize, row: usize) -> [f64; 5] {
     assert_eq!(x.len() % 256, 0);
     assert_eq!(w.len(), x.len() / 256 * 210);

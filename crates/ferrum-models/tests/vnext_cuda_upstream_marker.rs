@@ -10,13 +10,18 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
+// These shared fixtures also contain helpers used by other integration targets.
+#[allow(dead_code)]
 #[path = "vnext_checkpoint_continuation/family.rs"]
 mod legacy_family;
 use legacy_family::{AttentionKind, HIDDEN, MAX_TOKENS};
+#[allow(dead_code)]
 #[path = "vnext_cuda_q8act_attention/family.rs"]
 mod attention_family;
+#[allow(dead_code)]
 #[path = "vnext_cuda_upstream_marker/family.rs"]
 mod family;
+#[cfg(feature = "cuda")]
 use family::Family;
 
 #[cfg(feature = "cuda")]

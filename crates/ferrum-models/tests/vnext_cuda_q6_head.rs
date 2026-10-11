@@ -8,13 +8,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+// This target uses only part of the shared checkpoint fixture.
+#[allow(dead_code)]
 #[path = "vnext_checkpoint_continuation/family.rs"]
 mod legacy_family;
 use legacy_family::AttentionKind;
 
 #[path = "vnext_cuda_q6_head/family.rs"]
 mod family;
-use family::{Family, Head, Weights, HIDDEN, MAX_TOKENS, OUTPUTS, PROFILE};
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+use family::MAX_TOKENS;
+use family::{Family, Head, Weights, OUTPUTS, PROFILE};
 
 fn id<T>(value: impl Into<String>) -> T
 where

@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.upstream_linear",
   "source_package": {
     "kind": "ferrum-native-upstream-linear",
-    "revision": "marker-v2-prefill-j32-r1+d81235049384534c167caea52b85a694f6103d14",
-    "sha256": "4929902bd114118a50969b4b8f170002170abbf5c254939ea2f2bd4abdabbfbd"
+    "revision": "marker-v2-tail-safe-r1+d81235049384534c167caea52b85a694f6103d14",
+    "sha256": "260c1c130610384fb188d239554909d7001fc233edbb186ea969ffa0a169b1ec"
   },
   "upstream_sources": [
     {
@@ -20,7 +20,7 @@
     },
     {
       "path": "kernels/mmq.cu",
-      "sha256": "2e02cc3d2db4359f386bf99bed2689b25bc5fe703638d2202694e41dedbfbba3"
+      "sha256": "3f811bb970f178471825cc19d0b546e5b292a3d82de0f87792f40c6e0293ec32"
     },
     {
       "path": "kernels/mmvq.cu",
@@ -280,7 +280,7 @@
           "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
         }
       ],
-      "closure_sha256": "e20a46828dc9c818f79d772fc08d474416b43d74467186a5f43e95abed737816"
+      "closure_sha256": "eb3a15cba3b379c3c8d712b47b0325632278c6898f59ab93f956d59c208a57a0"
     },
     {
       "translation_unit": "kernels/mmvq.cu",

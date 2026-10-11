@@ -54,7 +54,7 @@ pub(super) fn api(family: Family, algorithm: u32) -> Result<&'static Api, Error>
         (Family::Extra, 1) => Ok(&EXTRA_MMQ),
         #[cfg(feature = "cuda-upstream-extra-linear")]
         (Family::Extra, 2) => Ok(&EXTRA_MMVQ),
-        #[cfg(not(feature = "cuda-upstream-extra-linear"))]
+        #[cfg(all(test, not(feature = "cuda-upstream-extra-linear")))]
         (Family::Extra, _) => Err(Error::Unavailable),
         _ => Err(Error::AbiMismatch),
     }

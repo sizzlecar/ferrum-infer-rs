@@ -5,9 +5,10 @@
 //! launch methods only validate retained geometry/spans and enqueue work.
 //! Every unsafe method requires same-device live leases through stream completion.
 pub use ferrum_native_ops::upstream_extra_linear::UpstreamExtraLinearFormat as ExtraFormat;
+#[cfg(any(feature = "cuda-upstream-extra-linear", test))]
+use ferrum_native_ops::upstream_extra_linear::UPSTREAM_EXTRA_LINEAR_OPERATOR;
 use ferrum_native_ops::upstream_extra_linear::{
     UpstreamExtraLinearPrefillRequestV2, UpstreamExtraLinearRequestV1,
-    UPSTREAM_EXTRA_LINEAR_OPERATOR,
 };
 use ferrum_native_ops::upstream_linear::*;
 pub use ferrum_native_ops::upstream_linear::{
@@ -70,13 +71,17 @@ pub(super) fn strided_bytes(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
+    #[cfg(any(feature = "cuda-upstream-linear", test))]
     Original,
+    #[cfg(any(feature = "cuda-upstream-extra-linear", test))]
     Extra,
 }
 impl Family {
     const fn operator(self) -> &'static str {
         match self {
+            #[cfg(any(feature = "cuda-upstream-linear", test))]
             Self::Original => UPSTREAM_LINEAR_OPERATOR,
+            #[cfg(any(feature = "cuda-upstream-extra-linear", test))]
             Self::Extra => UPSTREAM_EXTRA_LINEAR_OPERATOR,
         }
     }
