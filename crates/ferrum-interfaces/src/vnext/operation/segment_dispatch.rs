@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::buffer_view::sequence_execution_shape;
 use super::dispatch_contract::SubmissionWaveDispatchStageTimer;
 use super::foundation::invalid_operation;
-use super::invocation::{validate_segment_wave_authority, OperationInvocationResources};
+use super::invocation::validate_segment_wave_authority;
 use super::preparation::SegmentPreparationMissReason;
 use super::retained_dependency::{issue_segment_plan_dependency, SegmentPlanDependencyInput};
 use super::segment_binding::SegmentBindingPhysicalSource;
@@ -169,10 +169,6 @@ where
         ));
     }
     let participant_count = first.participant_count() as usize;
-    let current = OperationInvocationResources::Wave {
-        wave,
-        node_index: 0,
-    };
     let memory = resolved.execution_plan().payload().memory();
     let plan_requests = recipe
         .plan_slots
@@ -189,7 +185,14 @@ where
         })
         .collect::<Result<Vec<_>, VNextError>>()?;
     let plan_views = wave.prepare_segment_plan_views(&plan_requests)?;
-    let mut requests: Vec<SegmentBackingRequest> = Vec::new();
+    let snapshot_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+    );
+    let context = wave.segment_backing_context()?;
+    drop(snapshot_stage);
+    let mut groups = Vec::new();
+    let mut expected: Vec<SegmentBackingExpectation> = Vec::new();
     let mut fresh = Vec::with_capacity(recipe.resources.len());
     for resource in &recipe.resources {
         let mut participants = Vec::with_capacity(participant_count);
@@ -220,10 +223,10 @@ where
                     lifetime,
                     AllocationLifetime::Invocation | AllocationLifetime::Step
                 );
-                let first_request = requests.len();
+                let first_request = expected.len();
                 for participant_index in 0..participant_count {
                     let expected_bytes = if shared && participant_index != 0 {
-                        requests[first_request].expected.logical_bytes
+                        expected[first_request].logical_bytes
                     } else {
                         match lifetime {
                             AllocationLifetime::Invocation => descriptor
@@ -235,8 +238,6 @@ where
                                     wave.step_resources().work_shape().immediate_shape(),
                                 )?,
                             AllocationLifetime::Sequence => {
-                                let backing =
-                                    current.participant_backing_snapshot(participant_index)?;
                                 let tokens = first
                                     .work_shape()
                                     .participant_token_ranges()
@@ -248,16 +249,13 @@ where
                                     })?;
                                 descriptor.evaluate_request_bytes_for_shape(
                                     sequence_execution_shape(
-                                        backing.committed_shape(),
+                                        context.sequence_shape(participant_index)?,
                                         tokens.source_token_range().end,
                                     )?,
                                 )?
                             }
                             AllocationLifetime::Request => descriptor.evaluate_fit_request_bytes(
-                                current
-                                    .participant(participant_index)?
-                                    .request_resources()
-                                    .work_shape(),
+                                context.request_shape(participant_index)?,
                             )?,
                             AllocationLifetime::Plan => {
                                 return Err(invalid_operation(
@@ -269,23 +267,23 @@ where
                     let request_index = if shared && participant_index != 0 {
                         first_request
                     } else {
-                        let index = requests.len();
-                        requests.push(SegmentBackingRequest {
+                        let index = expected.len();
+                        groups.push(context.resolve(
                             participant_index,
-                            resource_id: resource.resource_id.clone(),
+                            &resource.resource_id,
                             lifetime,
-                            expected: SegmentBackingExpectation {
-                                logical_bytes: expected_bytes,
-                                logical_size_rule: if lifetime == AllocationLifetime::Sequence {
-                                    SegmentLogicalSizeRule::AtLeast
-                                } else {
-                                    SegmentLogicalSizeRule::Exact
-                                },
-                                usage: descriptor.usage(),
-                                storage_profile: descriptor.storage().profile(),
-                                element_type: descriptor.element_type(),
-                                alignment_bytes: descriptor.alignment_bytes(),
+                        )?);
+                        expected.push(SegmentBackingExpectation {
+                            logical_bytes: expected_bytes,
+                            logical_size_rule: if lifetime == AllocationLifetime::Sequence {
+                                SegmentLogicalSizeRule::AtLeast
+                            } else {
+                                SegmentLogicalSizeRule::Exact
                             },
+                            usage: descriptor.usage(),
+                            storage_profile: descriptor.storage().profile(),
+                            element_type: descriptor.element_type(),
+                            alignment_bytes: descriptor.alignment_bytes(),
                         });
                         index
                     };
@@ -335,15 +333,15 @@ where
     }
     // Validate full physical coverage, including captured resources not patched
     // by the backend. Declared subwindows are consumed under the same permit.
-    let mut windows = requests
+    let mut windows = expected
         .iter()
         .enumerate()
-        .map(|(resource_index, request)| SegmentBackingWindow {
+        .map(|(resource_index, expectation)| SegmentBackingWindow {
             resource_index,
             offset_bytes: 0,
-            length_bytes: request.expected.logical_bytes,
-            element_type: request.expected.element_type,
-            alignment_bytes: request.expected.alignment_bytes,
+            length_bytes: expectation.logical_bytes,
+            element_type: expectation.element_type,
+            alignment_bytes: expectation.alignment_bytes,
         })
         .collect::<Vec<_>>();
     let mut node_windows = Vec::with_capacity(recipe.nodes.len());
@@ -369,8 +367,8 @@ where
                         )
                     }
                     FreshResource::Dynamic { request, bytes, .. } => {
-                        let request = &requests[request];
-                        let kind = match request.expected.storage_profile.view() {
+                        let expectation = &expected[request];
+                        let kind = match expectation.storage_profile.view() {
                             DynamicStorageView::Contiguous => {
                                 OperationBufferStorageKind::DynamicContiguous
                             }
@@ -380,11 +378,13 @@ where
                         };
                         (
                             BufferDescriptor {
-                                resource_id: request.resource_id.clone(),
+                                resource_id: recipe.resources[region.resource_index]
+                                    .resource_id
+                                    .clone(),
                                 size_bytes: bytes,
-                                alignment_bytes: request.expected.alignment_bytes,
-                                usage: request.expected.usage,
-                                element_type: request.expected.element_type,
+                                alignment_bytes: expectation.alignment_bytes,
+                                usage: expectation.usage,
+                                element_type: expectation.element_type,
                             },
                             kind,
                             bytes,
@@ -439,10 +439,15 @@ where
         timing_sink,
         SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
     );
-    let backing = if requests.is_empty() {
+    let backing = if expected.is_empty() {
         None
     } else {
-        Some(wave.prepare_segment_backings_with_timing(&requests, &windows, timing_sink)?)
+        Some(context.prepare(
+            &groups,
+            &expected,
+            crate::vnext::resource::SegmentBackingWindowInput::Slice(&windows),
+            timing_sink,
+        )?)
     };
     let metadata_stage = SubmissionWaveDispatchStageTimer::start(
         timing_sink,
@@ -476,8 +481,8 @@ where
                 return Ok(None);
             }
         }
-        for (index, request) in requests.iter().enumerate() {
-            if request.expected.storage_profile.view() == DynamicStorageView::Contiguous
+        for (index, expectation) in expected.iter().enumerate() {
+            if expectation.storage_profile.view() == DynamicStorageView::Contiguous
                 && backing.window(index).unwrap().physical_regions().len() != 1
             {
                 return Err(invalid_operation(
@@ -658,7 +663,7 @@ where
         ));
     }
     let facts = SegmentPreparationFacts {
-        dynamic_resource_requests: requests.len() as u64,
+        dynamic_resource_requests: expected.len() as u64,
         unique_physical_buffers: seen.len() as u64,
     };
     Ok(Some((

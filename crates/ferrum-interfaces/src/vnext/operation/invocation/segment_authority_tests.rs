@@ -1,5 +1,6 @@
 //! The common segment gate consumes real admitted waves and active sessions.
 use super::*;
+use crate::vnext::operation::segment_dispatch::encode_segment_wave;
 use ferrum_types::InvocationPreparationStrategy;
 
 pub(super) fn segment_identity(
@@ -76,7 +77,12 @@ fn segment_wave_authority_matches_constructor_and_rejects_full_or_reordered_acti
 
 #[test]
 fn segment_wave_authority_rejects_previous_frames_and_replaced_live_sessions() {
-    let fixture = fixture();
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("execution.segment-authority").unwrap(),
+        ReusableExecutionCapacity::new(2, 2, 1).unwrap(),
+    )
+    .unwrap();
+    let fixture = fixture_with_token_scaled_paged_state_and_bucket(bucket);
     let lane = fixture.plan_resources.create_execution_lane().unwrap();
     let sequences = (0..2)
         .map(|i| {
@@ -97,10 +103,21 @@ fn segment_wave_authority_rejects_previous_frames_and_replaced_live_sessions() {
         .iter()
         .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
         .collect::<Vec<_>>();
-    let first_step = step_for(&batch, &lane, vec![one_token_span(), one_token_span()]);
+    let first_step = super::segment_hot_tests::resident_step_for(
+        &fixture,
+        &batch,
+        &lane,
+        vec![one_token_span(), one_token_span()],
+    );
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &first_step);
     let previous = segment_identity(&fixture, &wave, &active);
     validate(&fixture, &wave, &previous, &active).unwrap();
+    let recipe = super::segment_hot_tests::compile(&fixture, &wave);
+    {
+        let mut trace = fixture.runtime_trace.lock().unwrap();
+        trace.segment_metadata_enabled = true;
+        trace.segment_encoder_enabled = true;
+    }
     let frames = wave.nodes()[0]
         .participant_frames()
         .iter()
@@ -115,7 +132,12 @@ fn segment_wave_authority_rejects_previous_frames_and_replaced_live_sessions() {
         .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
         .collect::<Vec<_>>();
 
-    let step = step_for(&batch, &lane, vec![one_token_span(), one_token_span()]);
+    let step = super::segment_hot_tests::resident_step_for(
+        &fixture,
+        &batch,
+        &lane,
+        vec![one_token_span(), one_token_span()],
+    );
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     assert!(wave.nodes()[0]
         .participant_frames()
@@ -124,7 +146,34 @@ fn segment_wave_authority_rejects_previous_frames_and_replaced_live_sessions() {
         .all(|(current, old)| current.frame_id() > *old));
     let current = segment_identity(&fixture, &wave, &active);
     assert!(validate(&fixture, &wave, &previous, &active).is_err());
+    assert!(encode_segment_wave(
+        fixture.runtime.as_ref(),
+        &fixture.resolved,
+        &previous,
+        &wave,
+        active.iter(),
+        &recipe,
+    )
+    .is_err());
     validate(&fixture, &wave, &current, &active).unwrap();
+    drop(
+        encode_segment_wave(
+            fixture.runtime.as_ref(),
+            &fixture.resolved,
+            &current,
+            &wave,
+            active.iter(),
+            &recipe,
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    fixture
+        .runtime_trace
+        .lock()
+        .unwrap()
+        .segment_retained_owners
+        .clear();
     drop(wave);
     step.try_retire_normal().unwrap();
     drop(batch);
@@ -153,7 +202,12 @@ fn segment_wave_authority_rejects_previous_frames_and_replaced_live_sessions() {
         .iter()
         .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
         .collect::<Vec<_>>();
-    let step = step_for(&batch, &lane, vec![one_token_span(), one_token_span()]);
+    let step = super::segment_hot_tests::resident_step_for(
+        &fixture,
+        &batch,
+        &lane,
+        vec![one_token_span(), one_token_span()],
+    );
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let identity = segment_identity(&fixture, &wave, &fresh);
     assert_ne!(

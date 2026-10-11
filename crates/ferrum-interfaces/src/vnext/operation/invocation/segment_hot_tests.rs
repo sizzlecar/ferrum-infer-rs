@@ -31,8 +31,8 @@ impl SubmissionWaveDispatchTimingSink for SegmentTiming {
 }
 
 const SEGMENT_PHASES: [SubmissionWaveDispatchStage; 10] = [
-    SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
     SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+    SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
     SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
     SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
     SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
@@ -42,6 +42,38 @@ const SEGMENT_PHASES: [SubmissionWaveDispatchStage; 10] = [
     SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
     SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
 ];
+
+pub(super) fn resident_step_for(
+    fixture: &Fixture,
+    batch: &ExecutionBatchParticipants<TestRuntime>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
+    spans: Vec<TokenSpanWork>,
+) -> Arc<StepResourceLease<TestRuntime>> {
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(spans).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap()
+    .with_reusable_execution_bucket(
+        fixture
+            .reusable_execution_bucket
+            .as_ref()
+            .unwrap()
+            .bucket_id()
+            .clone(),
+    );
+    for attempt in 0..=3 {
+        match batch.try_begin_step(request.clone(), lane).unwrap() {
+            StepResourceAdmissionDecision::Admitted(step) => return step,
+            StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
+                deferred.maintain().unwrap();
+            }
+            _ => panic!("resident segment fixture step admission cannot progress"),
+        }
+    }
+    unreachable!("bounded admission returns or reports failure")
+}
 
 pub(super) fn compile(
     fixture: &Fixture,
@@ -291,6 +323,115 @@ fn segment_hot_matches_real_state_binding_and_plan_workspace_views_and_fresh_sco
 }
 
 #[test]
+fn segment_hot_borrowed_backings_preserve_canonical_participants_and_distinct_extents() {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("execution.segment-borrowed").unwrap(),
+        ReusableExecutionCapacity::new(2, 6, 3).unwrap(),
+    )
+    .unwrap();
+    let fixture = fixture_with_token_scaled_paged_state_and_bucket(bucket);
+    let tokens = [1, 2, 3, 4, 5];
+    let spans = [1, 5]
+        .into_iter()
+        .map(|length| TokenSpanWork::from_token_ids(&tokens[..length], 0..length).unwrap())
+        .collect::<Vec<_>>();
+    let sequences = spans
+        .iter()
+        .enumerate()
+        .map(|(i, span)| {
+            logical_resources_with_work(
+                &fixture.plan_resources,
+                &format!("run.segment.borrowed.{i}"),
+                &format!("request.segment.borrowed.{i}"),
+                span.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sessions = sequences
+        .iter()
+        .map(|sequence| sequence.open_session().unwrap())
+        .collect::<Vec<_>>();
+    let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+    let lane = fixture.plan_resources.create_execution_lane().unwrap();
+    let step = resident_step_for(&fixture, &batch, &lane, spans);
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active = batch
+        .sessions()
+        .iter()
+        .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
+        .collect::<Vec<_>>();
+    let identity = super::segment_authority_tests::segment_identity(&fixture, &wave, &active);
+    let recipe = compile(&fixture, &wave);
+    let expected = oracle(&fixture, &wave, &identity, &active, &recipe);
+    {
+        let mut trace = fixture.runtime_trace.lock().unwrap();
+        trace.segment_metadata_enabled = true;
+        trace.segment_encoder_enabled = true;
+    }
+    let (encoded, _) = encode_segment_wave(
+        fixture.runtime.as_ref(),
+        &fixture.resolved,
+        &identity,
+        &wave,
+        active.iter(),
+        &recipe,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        fixture.runtime_trace.lock().unwrap().segment_regions,
+        expected
+    );
+    // The provider declares a four-byte state window for both participants.
+    // Their token-scaled backings occupy one and two sixteen-byte pages.
+    let state_resource: ResourceId = id("resource.state");
+    let backing_extents = step
+        .participants()
+        .map(|sequence| {
+            let snapshot = step
+                .participant_backing_snapshot(BatchParticipantAuthority::new(
+                    sequence.sequence_authority(),
+                    sequence.request_authority(),
+                ))
+                .unwrap();
+            let bytes = snapshot
+                .backing_slices()
+                .iter()
+                .filter(|slice| slice.resource_id() == &state_resource)
+                .map(|slice| slice.size_bytes())
+                .sum::<u64>();
+            (snapshot.committed_tokens(), bytes)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backing_extents, [(1, 16), (5, 32)]);
+    let reordered = active.iter().rev().collect::<Vec<_>>();
+    assert!(encode_segment_wave(
+        fixture.runtime.as_ref(),
+        &fixture.resolved,
+        &identity,
+        &wave,
+        reordered.into_iter(),
+        &recipe,
+    )
+    .is_err());
+    drop(encoded);
+    fixture
+        .runtime_trace
+        .lock()
+        .unwrap()
+        .segment_retained_owners
+        .clear();
+    drop(identity);
+    drop(active);
+    drop(wave);
+    step.try_retire_normal().unwrap();
+    drop(batch);
+    for session in &sessions {
+        session.try_complete().unwrap();
+    }
+}
+
+#[test]
 fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_drift_rejects() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_retained_dependencies(16, DependencyMode::Valid),
@@ -313,7 +454,10 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         )
     };
     assert!(run().unwrap().is_none());
-    assert_eq!(timing.take(), SEGMENT_PHASES[..1]);
+    assert_eq!(
+        timing.take(),
+        [SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows]
+    );
     assert!(!oracle(&fixture, &wave, &identity, &active, &recipe).is_empty());
     fixture
         .runtime_trace
@@ -336,7 +480,10 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         .unwrap()
         .segment_foreign_runtime_metadata = true;
     assert!(run().is_err());
-    assert_eq!(timing.take(), SEGMENT_PHASES[..1]);
+    assert_eq!(
+        timing.take(),
+        [SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows]
+    );
     fixture
         .runtime_trace
         .lock()
