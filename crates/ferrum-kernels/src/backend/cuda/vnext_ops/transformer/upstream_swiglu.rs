@@ -135,8 +135,13 @@ impl CudaUpstreamSwiGluProvider {
                 .then(|| Q8ActKernels::load_attention(runtime.context()))
                 .transpose()?,
             plans: Arc::new(
-                UpstreamPlanFactory::new(runtime.context(), fingerprint)
-                    .map_err(CudaDeviceRuntimeError::contract)?,
+                UpstreamPlanFactory::new(
+                    runtime.context(),
+                    fingerprint,
+                    ferrum_types::Q4MmvqWeightDecode::Baseline,
+                    runtime.q4_shared_weight_decode_counter(),
+                )
+                .map_err(CudaDeviceRuntimeError::contract)?,
             ),
             validation: Arc::new(WeightValidationRegistry::default()),
             arithmetic: profile.arithmetic(),

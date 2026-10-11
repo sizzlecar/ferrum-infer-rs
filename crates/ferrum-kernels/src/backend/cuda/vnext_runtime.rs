@@ -3030,6 +3030,8 @@ pub struct CudaDeviceRuntime {
     segment_binding_indexed_encodes: AtomicU64,
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q4_shared_weight_decode_encodes: Arc<AtomicU64>,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -3235,6 +3237,8 @@ impl CudaDeviceRuntime {
             packed_decode_prepare_gate: false,
             causal_decode_attention_grouping:
                 ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
+            q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
+            q4_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
             runtime_instance,
             context,
             allocation_stream,
@@ -3296,6 +3300,30 @@ impl CudaDeviceRuntime {
         &self,
     ) -> ferrum_types::CausalDecodeAttentionGrouping {
         self.causal_decode_attention_grouping
+    }
+
+    pub fn with_q4_mmvq_weight_decode(mut self, mode: ferrum_types::Q4MmvqWeightDecode) -> Self {
+        self.q4_mmvq_weight_decode = mode;
+        self
+    }
+
+    /// Selected weight decoding for eligible original Q4_K M8 MMVQ plans.
+    pub fn q4_mmvq_weight_decode(&self) -> ferrum_types::Q4MmvqWeightDecode {
+        self.q4_mmvq_weight_decode
+    }
+
+    /// Successful host enqueues under the explicit CompareReference diagnostic,
+    /// including capture. Disabled product execution does not update this counter.
+    /// Hot graph replay does not call the adapter and does not advance this
+    /// diagnostic counter; this is not a count of hardware kernel executions.
+    pub fn q4_shared_weight_decode_encodes(&self) -> u64 {
+        self.q4_shared_weight_decode_encodes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn q4_shared_weight_decode_counter(&self) -> Option<Arc<AtomicU64>> {
+        (self.segment_binding_oracle
+            == ferrum_interfaces::vnext::SegmentBindingOracleMode::CompareReference)
+            .then(|| self.q4_shared_weight_decode_encodes.clone())
     }
 
     pub(super) fn program_binding_upload_strategy(&self) -> ProgramBindingUploadStrategy {

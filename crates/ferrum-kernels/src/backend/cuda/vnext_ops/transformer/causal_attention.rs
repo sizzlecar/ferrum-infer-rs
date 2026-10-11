@@ -496,6 +496,12 @@ impl CudaCausalPagedAttentionProvider {
 
         if upstream {
             provider_sources.extend(super::q8act_attention::upstream::fingerprint_sources());
+            provider_sources.push(
+                runtime
+                    .q4_mmvq_weight_decode()
+                    .as_runtime_value()
+                    .as_bytes(),
+            );
         }
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
@@ -712,6 +718,8 @@ impl CudaCausalPagedAttentionProvider {
                         runtime.context(),
                         descriptor.provider_implementation_fingerprint(),
                         upstream_profile.expect("upstream selected"),
+                        runtime.q4_mmvq_weight_decode(),
+                        runtime.q4_shared_weight_decode_counter(),
                     )
                 })
                 .transpose()?,

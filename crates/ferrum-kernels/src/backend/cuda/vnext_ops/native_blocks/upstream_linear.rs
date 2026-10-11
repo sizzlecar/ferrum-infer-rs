@@ -2,6 +2,7 @@
 //! Native planning (including shared-memory configuration) never runs in capture.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{sys::CUdevice_attribute::*, CudaContext, CudaStream};
@@ -32,7 +33,7 @@ enum NativeFamily {
     Extra,
 }
 
-type NativeKey = (NativeFamily, u32, u32, u32, u32, u32);
+type NativeKey = (NativeFamily, u32, u32, u32, u32, u32, bool);
 
 /// Retained matrix validation follows this explicit profile's format family;
 /// the original G32 validator remains restricted to its own three formats.
@@ -73,13 +74,20 @@ pub(in crate::backend::cuda::vnext_ops) struct UpstreamPlanFactory {
     context: Arc<CudaContext>,
     device: Device,
     fingerprint: String,
+    q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    shared_weight_decode_encodes: Option<Arc<AtomicU64>>,
     // Geometry contains no allocation addresses or resource authorization.
     plans: Mutex<BTreeMap<NativeKey, Arc<PreparedUpstreamLinear>>>,
     waves: Mutex<BTreeMap<(String, UpstreamProjectionWaveFacts), Arc<PreparedUpstreamLeaf>>>,
 }
 
 impl UpstreamPlanFactory {
-    pub fn new(context: &Arc<CudaContext>, fingerprint: String) -> Result<Self, String> {
+    pub fn new(
+        context: &Arc<CudaContext>,
+        fingerprint: String,
+        q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        shared_weight_decode_encodes: Option<Arc<AtomicU64>>,
+    ) -> Result<Self, String> {
         let attr = |key| context.attribute(key).map_err(|error| error.to_string());
         let major = u32::try_from(attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?)
             .map_err(|_| "invalid CUDA major capability")?;
@@ -101,6 +109,8 @@ impl UpstreamPlanFactory {
             context: context.clone(),
             device,
             fingerprint,
+            q4_weight_decode,
+            shared_weight_decode_encodes,
             plans: Mutex::new(BTreeMap::new()),
             waves: Mutex::new(BTreeMap::new()),
         })
@@ -139,7 +149,20 @@ impl UpstreamPlanFactory {
             .map(|format| format as u32)
             .or_else(|| extra.map(|format| format as u32))
             .ok_or("native format is absent")?;
-        let key = (family, algorithm as u32, format_code, rows, inputs, outputs);
+        let shared_dot = self.q4_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM8
+            && family == NativeFamily::Base
+            && algorithm == Algorithm::Mmvq
+            && base == Some(Format::Q4K)
+            && rows == 8;
+        let key = (
+            family,
+            algorithm as u32,
+            format_code,
+            rows,
+            inputs,
+            outputs,
+            shared_dot,
+        );
         let mut plans = self
             .plans
             .lock()
@@ -186,6 +209,12 @@ impl UpstreamPlanFactory {
             _ => return Err("native format family is ambiguous".into()),
         }
         .map_err(|error| format!("{error}; family={family:?} algorithm={algorithm:?} format={format_code} rows={rows} inputs={inputs} outputs={outputs}"))?;
+        let plan = if shared_dot {
+            plan.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8)
+                .map_err(|error| format!("{error}; shared Q4 MMVQ native geometry"))?
+        } else {
+            plan
+        };
         let plan = Arc::new(plan);
         plans.insert(key, plan.clone());
         Ok(plan)
@@ -410,6 +439,7 @@ impl UpstreamPlanFactory {
             decision,
             native,
             output_offset: leaf.output_offset(),
+            shared_weight_decode_encodes: self.shared_weight_decode_encodes.clone(),
         })
     }
 
@@ -437,7 +467,10 @@ impl UpstreamPlanFactory {
             }
         };
         UpstreamNativePlanFacts {
-            implementation_fingerprint: self.fingerprint.clone(),
+            implementation_fingerprint: super::super::implementation_fingerprint(&[
+                self.fingerprint.as_bytes(),
+                plan.q4_mmvq_weight_decode().as_runtime_value().as_bytes(),
+            ]),
             device_architecture: self.device.architecture,
             multiprocessors: self.device.multiprocessors,
             maximum_dynamic_shared_bytes: self.device.maximum_dynamic_shared_bytes,
@@ -451,6 +484,7 @@ pub(in crate::backend::cuda::vnext_ops) struct PreparedUpstreamLeaf {
     pub native: Option<Arc<PreparedUpstreamLinear>>,
     output_offset: u64,
     fingerprint: ReplayFingerprint,
+    shared_weight_decode_encodes: Option<Arc<AtomicU64>>,
 }
 
 impl PreparedUpstreamLeaf {
@@ -554,6 +588,11 @@ impl PreparedUpstreamLeaf {
             native
                 .dot(weights, packed, temporary, fixup, stream.cu_stream().cast())
                 .map_err(|e| error(e.to_string()))?;
+            if native.q4_mmvq_weight_decode() == ferrum_types::Q4MmvqWeightDecode::SharedM8 {
+                if let Some(counter) = &self.shared_weight_decode_encodes {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             native
                 .cast(
                     temporary,

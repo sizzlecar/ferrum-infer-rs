@@ -4,17 +4,18 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_causal_decode_attention_grouping;
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_q4_mmvq_weight_decode;
 use ferrum_types::{
     AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
+    Q4MmvqWeightDecode,
 };
 use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if !matches!(arguments.len(), 5 | 6 | 7) {
+    if !matches!(arguments.len(), 5 | 6 | 7 | 8) {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping]",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode]",
             arguments
                 .first()
                 .map(String::as_str)
@@ -36,12 +37,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|value| CausalDecodeAttentionGrouping::parse_runtime_value(value))
         .transpose()?
         .unwrap_or_default();
-    let snapshot = cuda_native_operator_catalog_input_with_causal_decode_attention_grouping(
+    let q4_mmvq_weight_decode = arguments
+        .get(7)
+        .map(|value| Q4MmvqWeightDecode::parse_runtime_value(value))
+        .transpose()?
+        .unwrap_or_default();
+    let snapshot = cuda_native_operator_catalog_input_with_q4_mmvq_weight_decode(
         ordinal,
         DeviceId::new(format!("cuda:{ordinal}"))?,
         policy,
         causal_decode_preparation,
         causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
     )?;
     let capability_fingerprint = snapshot.capability_catalog().fingerprint()?;
     let (provider_catalog, capability_catalog) = snapshot.into_parts();

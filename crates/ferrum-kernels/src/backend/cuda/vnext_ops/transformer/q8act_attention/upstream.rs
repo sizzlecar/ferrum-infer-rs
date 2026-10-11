@@ -32,12 +32,19 @@ impl Runtime {
         context: &Arc<CudaContext>,
         fingerprint: &str,
         profile: UpstreamMarkerV2Profile,
+        q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        shared_weight_decode_encodes: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<Arc<Self>, CudaDeviceRuntimeError> {
         Ok(Arc::new(Self {
             profile,
             arithmetic: profile.arithmetic(),
-            plans: UpstreamPlanFactory::new(context, fingerprint.to_owned())
-                .map_err(CudaDeviceRuntimeError::contract)?,
+            plans: UpstreamPlanFactory::new(
+                context,
+                fingerprint.to_owned(),
+                q4_weight_decode,
+                shared_weight_decode_encodes,
+            )
+            .map_err(CudaDeviceRuntimeError::contract)?,
             validation: WeightValidationRegistry::default(),
             fingerprint: fingerprint.to_owned(),
             scratch: Mutex::new(BTreeMap::new()),

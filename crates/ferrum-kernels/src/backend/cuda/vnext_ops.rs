@@ -353,6 +353,28 @@ pub(crate) fn upstream_profile_compiled(prefill: bool) -> bool {
             })
 }
 
+fn q4_shared_weight_decode_exports_present(exports: &[String]) -> bool {
+    upstream_marker_v2_exports_present(exports)
+        && exports
+            .iter()
+            .any(|name| name == "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1")
+}
+
+/// Whether the opt-in Q4_K M8 dot and its original MarkerV2 contract are linked.
+pub fn q4_shared_weight_decode_compiled() -> bool {
+    cfg!(feature = "cuda-q4-shared-weight-decode")
+        && upstream_marker_v2_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && q4_shared_weight_decode_exports_present(&artifact.exports)
+            })
+}
+
 fn upstream_extra_exports_present(exports: &[String]) -> bool {
     ["mmq", "mmvq"].iter().all(|algorithm| {
         [
@@ -401,6 +423,28 @@ mod upstream_marker_registration_tests {
         upstream_marker_v2_exports_present, upstream_profile_exports_present,
         UPSTREAM_MARKER_V2_EXPORTS,
     };
+
+    #[cfg(feature = "cuda-q4-shared-weight-decode")]
+    #[test]
+    fn shared_weight_decode_requires_additive_dot_and_complete_original_marker_contract() {
+        let baseline = UPSTREAM_MARKER_V2_EXPORTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        assert!(upstream_marker_v2_exports_present(&baseline));
+        assert!(!super::q4_shared_weight_decode_exports_present(&baseline));
+        let mut shared = baseline;
+        shared.push("ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1".into());
+        assert!(super::q4_shared_weight_decode_exports_present(&shared));
+        for missing in &shared {
+            let incomplete = shared
+                .iter()
+                .filter(|name| *name != missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(!super::q4_shared_weight_decode_exports_present(&incomplete));
+        }
+    }
 
     #[test]
     fn extra_marker_capability_requires_its_own_complete_symbol_family() {
@@ -1075,7 +1119,17 @@ impl CudaVNextComposition {
         owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        if q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM8
+            && (!cfg!(feature = "cuda-q4-shared-weight-decode")
+                || (matches!(purpose, CudaCompositionPurpose::Execution)
+                    && !q4_shared_weight_decode_compiled()))
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "shared M8 Q4 weight decode requires its compiled upstream native export",
+            ));
+        }
         if causal_decode_attention_grouping == ferrum_types::CausalDecodeAttentionGrouping::Indexed
             && !cfg!(feature = "cuda-indexed-causal-attention")
         {
@@ -1117,7 +1171,8 @@ impl CudaVNextComposition {
             .with_packed_decode_prepare_gate(
                 causal_decode_preparation == ferrum_types::CausalDecodePreparationMode::Packed,
             )
-            .with_causal_decode_attention_grouping(causal_decode_attention_grouping),
+            .with_causal_decode_attention_grouping(causal_decode_attention_grouping)
+            .with_q4_mmvq_weight_decode(q4_mmvq_weight_decode),
         );
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[allow(unused_mut)]
@@ -1272,6 +1327,32 @@ impl CudaVNextComposition {
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_q4_mmvq_weight_decode(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            causal_decode_preparation,
+            causal_decode_attention_grouping,
+            ferrum_types::Q4MmvqWeightDecode::Baseline,
+        )
+    }
+
+    /// Select the bit-preserving native dot variant before constructing the registry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_q4_mmvq_weight_decode(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+        causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let composition = Self::prepare(
             ordinal,
             device_id,
@@ -1282,6 +1363,7 @@ impl CudaVNextComposition {
             owner_view_mode,
             causal_decode_preparation,
             causal_decode_attention_grouping,
+            q4_mmvq_weight_decode,
         )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
@@ -1401,6 +1483,24 @@ pub fn cuda_validated_native_operator_catalog_input_with_causal_decode_attention
     causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        ferrum_types::Q4MmvqWeightDecode::Baseline,
+    )
+}
+
+pub fn cuda_validated_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1411,6 +1511,7 @@ pub fn cuda_validated_native_operator_catalog_input_with_causal_decode_attention
         ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
         causal_decode_preparation,
         causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
     )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
@@ -1459,6 +1560,24 @@ pub fn cuda_native_operator_catalog_input_with_causal_decode_attention_grouping(
     causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        ferrum_types::Q4MmvqWeightDecode::Baseline,
+    )
+}
+
+pub fn cuda_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1469,6 +1588,7 @@ pub fn cuda_native_operator_catalog_input_with_causal_decode_attention_grouping(
         ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
         causal_decode_preparation,
         causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }
