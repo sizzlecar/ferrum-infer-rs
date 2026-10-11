@@ -301,9 +301,21 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
             let owners: Vec<_> = (0..participants)
                 .filter(|&p| positions[p] < leads[p])
                 .collect();
+            // This profile admits at most 160 scheduled tokens across the
+            // whole batch. Six independent 32-token chunks would exceed that
+            // bound before reaching either attention implementation.
+            let scheduled_limit = fixtures[0]
+                .compilation
+                .executable()
+                .execution_plan()
+                .payload()
+                .maximum_scheduled_tokens();
+            let prefill_chunk =
+                32.min(usize::try_from(scheduled_limit / owners.len() as u64).unwrap());
+            assert!(prefill_chunk > 0);
             let ranges: Vec<_> = owners
                 .iter()
-                .map(|&p| positions[p]..(positions[p] + 32).min(leads[p]))
+                .map(|&p| positions[p]..(positions[p] + prefill_chunk).min(leads[p]))
                 .collect();
             let mut outputs = Vec::new();
             for (arm, fixture) in fixtures.iter().enumerate() {
