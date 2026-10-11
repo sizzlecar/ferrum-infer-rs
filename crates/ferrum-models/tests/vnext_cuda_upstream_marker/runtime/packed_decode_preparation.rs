@@ -412,16 +412,35 @@ fn verify(leads: &[usize]) {
                     );
                 }
                 if wave >= 3 {
-                    assert_eq!(stats.segment_hits, 1);
-                    assert_eq!(stats.segment_misses, 0);
-                    assert!(!observation.segment_published);
-                    assert!(audited > 0);
                     let program = observation.reusable_program_id.as_ref().unwrap();
                     if let Some(previous) = &stable_programs[arm] {
                         assert_eq!(previous, program);
                     }
                     stable_programs[arm] = Some(program.clone());
-                    hot_hits[arm] += stats.segment_hits;
+                    // Adaptive warm/capture does not supply the resident
+                    // program to Core's binding-recipe lookup. The first
+                    // direct replay may therefore prepare and publish that
+                    // recipe only after successful completion and retirement.
+                    if generation == 0 && wave == 3 {
+                        assert_eq!(stats.segment_hits, 0, "first direct replay: {stats:?}");
+                    }
+                    if wave == 3 && stats.segment_hits == 0 {
+                        assert_eq!(stats.segment_misses, 1, "{stats:?}");
+                        assert_eq!(stats.segment_no_cached_recipe, 1, "{stats:?}");
+                        assert_eq!(stats.segment_no_resident_program, 0, "{stats:?}");
+                        assert_eq!(stats.segment_incomplete_declarations, 0, "{stats:?}");
+                        assert_eq!(stats.segment_encoded_nodes, 0, "{stats:?}");
+                        assert!(observation.segment_published, "{stats:?}");
+                    } else {
+                        // This includes the following 64 -> 65 physical-page
+                        // growth: the exact program must now encode hot using
+                        // the newly authorized KV extent, without republishing.
+                        assert_eq!(stats.segment_hits, 1, "{stats:?}");
+                        assert_eq!(stats.segment_misses, 0, "{stats:?}");
+                        assert!(!observation.segment_published);
+                        assert!(audited > 0);
+                        hot_hits[arm] += stats.segment_hits;
+                    }
                 }
                 let mut canonical_frames = vec![None; participants];
                 for (caller, &owner) in order.iter().enumerate() {
@@ -442,6 +461,7 @@ fn verify(leads: &[usize]) {
                     "generation":generation,"participants":participants,"ranges":ranges,"caller_order":order,
                     "path":format!("{path:?}"),"physical_64k_pages":pages,"program":observation.reusable_program_id,
                     "hits":stats.segment_hits,"indexed_host_encodes":indexed,"oracle_nodes":audited,
+                    "preparation":stats,
                     "published":observation.segment_published,"all_valid_output_kv_and_existing_bytes_checked":true})
                 );
                 observations.push(observation);
