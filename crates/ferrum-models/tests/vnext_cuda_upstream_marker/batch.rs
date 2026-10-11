@@ -28,6 +28,24 @@ pub enum Path {
     EagerBoundary,
 }
 
+/// Optional observations for the native-adaptive preparation oracle. Existing
+/// callers retain Off timing, their reusable bucket and valid-state-only reads.
+pub(super) struct BatchObservationOptions {
+    pub timing: DeviceTimingMode,
+    pub retain_raw_kv: bool,
+    pub use_reusable_bucket: bool,
+}
+
+impl Default for BatchObservationOptions {
+    fn default() -> Self {
+        Self {
+            timing: DeviceTimingMode::Off,
+            retain_raw_kv: false,
+            use_reusable_bucket: true,
+        }
+    }
+}
+
 pub struct BatchObservation {
     pub values: BTreeMap<(u32, String), Vec<u8>>,
     types: BTreeMap<String, ElementType>,
@@ -37,6 +55,10 @@ pub struct BatchObservation {
     pub segment_published: bool,
     pub reusable_program_id: Option<DeviceReusableExecutionProgramId>,
     pub participant_frames: Vec<ExecutionFrameId>,
+    pub attribution: Option<BoundDeviceSubmissionAttribution>,
+    /// Complete authorized blocks read by Core, including currently invalid
+    /// token positions. Only same-owner preservation may compare those bytes.
+    pub raw_kv_blocks: BTreeMap<u32, Vec<u8>>,
 }
 
 impl BatchObservation {
@@ -155,6 +177,34 @@ impl Fixture {
         preparation_sink: &P,
         binding_row_bytes: Option<usize>,
     ) -> BatchObservation {
+        self.execute_participant_ranges_observed(
+            lane,
+            reaper,
+            sessions,
+            tokens,
+            ranges,
+            path,
+            preparation_strategy,
+            preparation_sink,
+            binding_row_bytes,
+            BatchObservationOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_participant_ranges_observed<P: InvocationPreparationSink>(
+        &self,
+        lane: &Arc<ExecutionLane<Runtime>>,
+        reaper: &Arc<CompletionReaper<Runtime>>,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        ranges: &[Range<usize>],
+        path: Path,
+        preparation_strategy: InvocationPreparationStrategy,
+        preparation_sink: &P,
+        binding_row_bytes: Option<usize>,
+        observation: BatchObservationOptions,
+    ) -> BatchObservation {
         assert_eq!(sessions.len(), tokens.len());
         assert_eq!(sessions.len(), ranges.len());
         let participants = sessions.len() as u32;
@@ -194,7 +244,11 @@ impl Fixture {
             AdmissionPressureAction::WaitForRelease,
         )
         .unwrap();
-        if let Some(bucket) = &self.reusable_bucket {
+        if let Some(bucket) = self
+            .reusable_bucket
+            .as_ref()
+            .filter(|_| observation.use_reusable_bucket)
+        {
             request = request.with_reusable_execution_bucket(bucket.clone());
         }
         let step = loop {
@@ -405,7 +459,7 @@ impl Fixture {
             .iter()
             .position(|n| n.node_id() == attention.id())
             .unwrap() as u32;
-        let handle = if matches!(path, Path::Replay) {
+        let profiled = if matches!(path, Path::Replay) {
             let program_id = program_id
                 .as_ref()
                 .expect("single-token attention must authorize reusable topology");
@@ -518,7 +572,7 @@ impl Fixture {
                 executable,
                 &identity,
                 active.iter(),
-                DeviceTimingMode::Off,
+                observation.timing,
                 &uploads,
                 program,
                 SubmissionExecutionPolicy::determinism_replayed(0xa5),
@@ -530,8 +584,6 @@ impl Fixture {
                 reaper,
             )
             .unwrap()
-            .into_parts()
-            .0
         } else {
             let policy = if matches!(path, Path::Eager) {
                 SubmissionExecutionPolicy::determinism_eager(0x5a)
@@ -543,7 +595,7 @@ impl Fixture {
                 executable,
                 &identity,
                 active.iter(),
-                DeviceTimingMode::Off,
+                observation.timing,
                 &uploads,
                 policy,
                 preparation_strategy,
@@ -554,9 +606,8 @@ impl Fixture {
                 reaper,
             )
             .unwrap()
-            .into_parts()
-            .0
         };
+        let (handle, attribution) = profiled.into_parts();
         let segment_publication = handle.take_segment_binding_publication();
         let receipt = match handle
             .wait_with_readback_collection(
@@ -587,6 +638,7 @@ impl Fixture {
             );
         }
         let mut values = BTreeMap::new();
+        let mut raw_kv_blocks = BTreeMap::new();
         let mut binding_rows = binding_row_bytes.map(|_| vec![Vec::new(); participants as usize]);
         for disposition in receipt.dispositions() {
             let CompletionReadbackDisposition::Succeeded(result) = disposition else {
@@ -600,6 +652,11 @@ impl Fixture {
                 continue;
             }
             let bytes = if name == "state.kv" {
+                if observation.retain_raw_kv {
+                    assert!(raw_kv_blocks
+                        .insert(caller_participant as u32, result.bytes().to_vec())
+                        .is_none());
+                }
                 valid_kv_positions(result.bytes(), ranges[participant].end)
             } else {
                 result.bytes().to_vec()
@@ -643,6 +700,8 @@ impl Fixture {
             segment_published,
             reusable_program_id: program_id,
             participant_frames,
+            attribution,
+            raw_kv_blocks,
         }
     }
 }
