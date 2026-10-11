@@ -210,9 +210,12 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
         &lane,
     )
     .unwrap();
+    let identity = batch_identity.participants()[0].identity();
+    let cloned_identity: ExecutionIdentityEnvelope = identity.clone();
+    assert!(std::ptr::eq(identity.parts(), cloned_identity.parts()));
     assert_eq!(
-        std::mem::size_of::<ExecutionIdentityEnvelope>(),
-        std::mem::size_of::<Arc<()>>()
+        serde_json::to_value(&cloned_identity).unwrap(),
+        serde_json::to_value(identity.parts()).unwrap()
     );
     assert_eq!(
         std::mem::size_of::<BatchOperationParticipantIdentity>(),

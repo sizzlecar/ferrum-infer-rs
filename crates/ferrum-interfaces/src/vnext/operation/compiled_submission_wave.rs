@@ -97,6 +97,26 @@ impl OperationDispatch {
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
+        Self::bind_compiled_submission_wave_identity_with_preparation(
+            topology,
+            active_bindings,
+            wave,
+            lane,
+            ferrum_types::InvocationPreparationStrategy::Full,
+        )
+    }
+
+    pub fn bind_compiled_submission_wave_identity_with_preparation<'binding, R, I>(
+        topology: &CompiledSubmissionWaveIdentity,
+        active_bindings: I,
+        wave: &PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        strategy: ferrum_types::InvocationPreparationStrategy,
+    ) -> Result<BatchOperationIdentity, VNextError>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
         let Some(first_node) = wave.nodes().first() else {
             return Err(invalid_operation(
                 "compiled submission wave requires a non-empty immutable plan",
@@ -231,6 +251,7 @@ impl OperationDispatch {
             wave.fingerprint().to_owned(),
             first_node.work_shape().fingerprint().to_owned(),
             participant_seeds,
+            strategy,
         )
     }
 }

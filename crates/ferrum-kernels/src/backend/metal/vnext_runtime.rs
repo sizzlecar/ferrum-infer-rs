@@ -629,7 +629,9 @@ impl MetalBufferRegion {
 }
 
 const METAL_COUNTER_SAMPLES_PER_PAGE: u64 = 256;
-const METAL_COUNTER_MAX_PAGES: usize = 16;
+// Each physical encoder interval consumes two samples. Keep capture bounded,
+// while allowing packed submissions with more than 2048 encoder intervals.
+const METAL_COUNTER_MAX_PAGES: usize = 32;
 const METAL_COUNTER_ERROR_VALUE: u64 = u64::MAX;
 
 #[derive(Clone)]
@@ -2691,6 +2693,9 @@ impl DeviceRuntime for MetalDeviceRuntime {
         DeviceErrorReport::new(code, error.to_string(), retryable)
     }
 }
+
+#[cfg(test)]
+mod counter_capacity_tests;
 
 #[cfg(test)]
 mod counter_lifecycle_tests;

@@ -135,6 +135,25 @@ impl<R> StepResourceLease<R>
 where
     R: DeviceRuntime,
 {
+    /// Child completions, indeterminate submissions and quarantine all own this
+    /// step. Keep exact Plan dependencies until their last device use is reaped,
+    /// even if a backend prefix command drops its borrowed region too early.
+    pub(crate) fn retain_plan_dependencies(
+        &self,
+        leases: Vec<crate::vnext::RetainedPlanDependencyAuthority>,
+    ) -> Result<(), VNextError> {
+        let mut retained = self
+            .retained_plan_dependencies
+            .lock()
+            .map_err(|_| invalid_resource("Plan dependency retention lock poisoned"))?;
+        for lease in leases {
+            if !retained.iter().any(|old| old.identity == lease.identity) {
+                retained.push(lease);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn new(
         participants: Vec<AdmittedStepParticipant<R>>,
         execution_lane: Arc<ExecutionLane<R>>,
@@ -193,6 +212,7 @@ where
             reusable_execution_bucket,
             batch_step_id,
             completed_boundary: super::Mutex::new(super::StepCompletedBoundarySlot::default()),
+            retained_plan_dependencies: super::Mutex::new(Vec::new()),
             finalized: false,
         })
     }
@@ -505,6 +525,26 @@ where
         Err(invalid_resource(format!(
             "resource `{resource_id}` is not step-shared backing"
         )))
+    }
+
+    pub(crate) fn revalidate_backing_view(
+        &self,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<(), VNextError> {
+        let authority = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+            .ok_or_else(|| invalid_resource("retained resource is not step-shared backing"))?;
+        self.participants[0]
+            .session
+            .resources()
+            .request
+            .plan
+            .dynamic_pools()
+            .revalidate_view(authority, retained)
     }
 
     pub(crate) fn dynamic_descriptor(
@@ -1692,10 +1732,141 @@ where
     purpose: SubmissionWavePurpose,
 }
 
+/// One attempt's borrowed participant mapping. Captured snapshots remain owned
+/// by this Step; resolving them does not authorize their current pool chunks.
+pub(crate) struct SegmentBackingContext<'w, R: DeviceRuntime> {
+    wave: &'w PreparedStepSubmissionWave<R>,
+    pools: &'w super::DynamicPoolSet<R>,
+    snapshots: Vec<&'w SequenceBackingSnapshot<R>>,
+}
+
+impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
+    pub(crate) fn sequence_shape(
+        &self,
+        participant: usize,
+    ) -> Result<crate::vnext::DynamicResourceShape, VNextError> {
+        self.snapshots
+            .get(participant)
+            .map(|snapshot| snapshot.committed_shape())
+            .ok_or_else(|| invalid_resource("segment participant snapshot is absent"))
+    }
+
+    pub(crate) fn request_shape(
+        &self,
+        participant: usize,
+    ) -> Result<&'w crate::vnext::ResourceWorkShape, VNextError> {
+        self.wave
+            .nodes
+            .first()
+            .and_then(|node| node.participant_authority.participants.get(participant))
+            .map(|participant| participant.request.work_shape())
+            .ok_or_else(|| invalid_resource("segment request participant is absent"))
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        participant_index: usize,
+        resource: &ResourceId,
+        lifetime: AllocationLifetime,
+    ) -> Result<&'w [LogicalBackingSliceAuthority], VNextError> {
+        let participant = self
+            .wave
+            .nodes
+            .first()
+            .and_then(|node| {
+                node.participant_authority
+                    .participants
+                    .get(participant_index)
+            })
+            .ok_or_else(|| invalid_resource("segment participant index is out of bounds"))?;
+        let authorities = match lifetime {
+            AllocationLifetime::Request => participant
+                .request
+                .backing_slices()
+                .iter()
+                .find(|authority| authority.resource_id() == resource)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Sequence => {
+                // The map was built in this exact prepared participant order.
+                let authorities = self.snapshots[participant_index].backing_slices_for(resource);
+                (!authorities.is_empty()).then_some(authorities)
+            }
+            AllocationLifetime::Step => self
+                .wave
+                .step
+                .backing_slices()
+                .iter()
+                .find(|authority| authority.resource_id() == resource)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Invocation => self
+                .wave
+                .claimed_backing
+                .backing_slices()
+                .iter()
+                .find(|authority| authority.resource_id() == resource)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Plan => None,
+        };
+        authorities.ok_or_else(|| {
+            invalid_resource("segment resource has no exact current captured authority")
+        })
+    }
+
+    pub(crate) fn prepare<S: crate::vnext::SubmissionWaveDispatchTimingSink>(
+        &self,
+        groups: &[&[LogicalBackingSliceAuthority]],
+        expected: &[super::SegmentBackingExpectation],
+        windows: super::SegmentBackingWindowInput<'_>,
+        timing: &S,
+    ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError> {
+        self.pools
+            .segment_backing_batch_with_window_input(groups, expected, windows, timing)
+    }
+}
+
 impl<R> PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
+    pub(crate) fn segment_backing_context(
+        &self,
+    ) -> Result<SegmentBackingContext<'_, R>, VNextError> {
+        let participants = &self
+            .nodes
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no nodes"))?
+            .participant_authority
+            .participants;
+        let first = participants
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no participants"))?;
+        let pools = first.request.plan.dynamic_pools();
+        let mut snapshots = Vec::new();
+        snapshots
+            .try_reserve_exact(participants.len())
+            .map_err(|_| invalid_resource("segment participant mapping allocation failed"))?;
+        for participant in participants {
+            if !std::ptr::eq(pools, participant.request.plan.dynamic_pools()) {
+                return Err(invalid_resource(
+                    "segment participants have different physical pool owners",
+                ));
+            }
+            snapshots.push(
+                self.step
+                    .participant_backing_snapshot(BatchParticipantAuthority::new(
+                        participant.sequence_authority(),
+                        participant.request_authority(),
+                    ))?
+                    .as_ref(),
+            );
+        }
+        Ok(SegmentBackingContext {
+            wave: self,
+            pools,
+            snapshots,
+        })
+    }
+
     pub fn batch_step_id(&self) -> BatchStepId {
         self.step.batch_step_id()
     }
@@ -1770,6 +1941,160 @@ where
         self.step.claimed_backing().has_shared_physical_claims()
     }
 
+    /// Bind the segment's unique static slots once to this wave's exact Plan.
+    /// Pointer agreement here proves shared immutable lease state, not active
+    /// sequence authorization; the operation layer still checks each binding.
+    pub(crate) fn prepare_segment_plan_views(
+        &self,
+        requests: &[super::SegmentPlanResourceRequest<'_>],
+    ) -> Result<Vec<super::SegmentPlanResourceView<'_, R::Buffer>>, VNextError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let node = self
+            .nodes
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no nodes"))?;
+        let participants = &node.participant_authority.participants;
+        let first = participants
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no participants"))?;
+        let lease = first
+            .static_provisioning()
+            .ok_or_else(|| invalid_resource("segment Plan resources lack static provisioning"))?;
+        for participant in participants {
+            let current = participant
+                .static_provisioning()
+                .ok_or_else(|| invalid_resource("segment participant lacks static provisioning"))?;
+            if !Arc::ptr_eq(
+                &first.request.plan.resources,
+                &participant.request.plan.resources,
+            ) || !std::ptr::eq(lease, current)
+                || lease.identity() != current.identity()
+                || lease.admission() != current.admission()
+            {
+                return Err(invalid_resource(
+                    "segment participants do not share one exact current Plan lease",
+                ));
+            }
+        }
+        let mut slots = std::collections::BTreeSet::new();
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(requests.len())
+            .map_err(|_| invalid_resource("segment Plan view allocation failed"))?;
+        for request in requests {
+            if !slots.insert(request.slot_index) {
+                return Err(invalid_resource(
+                    "segment Plan slot requirements are not unique",
+                ));
+            }
+            let leased = lease.plan_static_view(request.slot_index, request.allocation)?;
+            result.push(super::SegmentPlanResourceView {
+                leased,
+                retention: first.device_buffer_retention(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Consumes the complete compiled segment's fresh resource requirements in
+    /// one canonical pool observation. No per-node invocation is materialized.
+    pub(crate) fn prepare_segment_backings(
+        &self,
+        requests: &[super::SegmentBackingRequest],
+        windows: &[super::SegmentBackingWindow],
+    ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError> {
+        self.prepare_segment_backings_with_timing(
+            requests,
+            windows,
+            &crate::vnext::operation::DisabledSubmissionWaveDispatchTimingSink,
+        )
+    }
+
+    pub(crate) fn prepare_segment_backings_with_timing<S>(
+        &self,
+        requests: &[super::SegmentBackingRequest],
+        windows: &[super::SegmentBackingWindow],
+        timing_sink: &S,
+    ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError>
+    where
+        S: crate::vnext::SubmissionWaveDispatchTimingSink,
+    {
+        let snapshot_stage = crate::vnext::operation::SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            crate::vnext::SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+        );
+        let node = self
+            .nodes
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no nodes"))?;
+        let participants = &node.participant_authority.participants;
+        let first = participants
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no participants"))?;
+        let pools = first.request.plan.dynamic_pools();
+        for participant in participants {
+            if !std::ptr::eq(pools, participant.request.plan.dynamic_pools()) {
+                return Err(invalid_resource(
+                    "segment participants have different physical pool owners",
+                ));
+            }
+        }
+        let mut groups = Vec::new();
+        let mut expected = Vec::new();
+        groups
+            .try_reserve_exact(requests.len())
+            .map_err(|_| invalid_resource("segment authority allocation failed"))?;
+        expected
+            .try_reserve_exact(requests.len())
+            .map_err(|_| invalid_resource("segment expectation allocation failed"))?;
+        for request in requests {
+            let participant = participants
+                .get(request.participant_index)
+                .ok_or_else(|| invalid_resource("segment participant index is out of bounds"))?;
+            let resource_id = &request.resource_id;
+            let authorities = match request.lifetime {
+                AllocationLifetime::Request => participant
+                    .request
+                    .backing_slices()
+                    .iter()
+                    .find(|authority| authority.resource_id() == resource_id)
+                    .map(std::slice::from_ref),
+                AllocationLifetime::Sequence => {
+                    let snapshot =
+                        self.step
+                            .participant_backing_snapshot(BatchParticipantAuthority::new(
+                                participant.sequence_authority(),
+                                participant.request_authority(),
+                            ))?;
+                    let authorities = snapshot.backing_slices_for(resource_id);
+                    (!authorities.is_empty()).then_some(authorities)
+                }
+                AllocationLifetime::Step => self
+                    .step
+                    .backing_slices()
+                    .iter()
+                    .find(|authority| authority.resource_id() == resource_id)
+                    .map(std::slice::from_ref),
+                AllocationLifetime::Invocation => self
+                    .claimed_backing
+                    .backing_slices()
+                    .iter()
+                    .find(|authority| authority.resource_id() == resource_id)
+                    .map(std::slice::from_ref),
+                AllocationLifetime::Plan => None,
+            }
+            .ok_or_else(|| {
+                invalid_resource("segment resource has no exact current captured authority")
+            })?;
+            groups.push(authorities);
+            expected.push(request.expected);
+        }
+        drop(snapshot_stage);
+        pools.segment_backing_batch_with_timing(&groups, &expected, windows, timing_sink)
+    }
+
     pub(crate) fn backing_view(
         &self,
         node_index: usize,
@@ -1792,6 +2117,31 @@ where
                 .view(authority);
         }
         self.step.backing_view(resource_id)
+    }
+
+    pub(crate) fn revalidate_backing_view(
+        &self,
+        node_index: usize,
+        resource_id: &ResourceId,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<(), VNextError> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?;
+        if let Some(authority) = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+        {
+            return node.participant_authority.participants[0]
+                .request
+                .plan
+                .dynamic_pools()
+                .revalidate_view(authority, retained);
+        }
+        self.step.revalidate_backing_view(resource_id, retained)
     }
 
     pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {

@@ -1619,6 +1619,7 @@ name = "ferrum-native-ops"
 version = "0.12.2"
 dependencies = [
  "ferrum-types",
+ "half",
  "libc",
  "object",
  "serde",

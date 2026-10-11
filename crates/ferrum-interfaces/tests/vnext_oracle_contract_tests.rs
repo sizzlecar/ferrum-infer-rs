@@ -556,6 +556,20 @@ fn reference_operation_chain_resolves_to_one_terminal_oracle() {
 }
 
 #[test]
+fn operation_defined_oracle_rejects_generic_output_only_comparison() {
+    let same = result(f32_tensor(&[1.0, -2.0]));
+    assert_invalid(
+        compare_oracle_results(&OracleSpec::OperationDefined, &same, &same),
+        "requires operation-specific input and arithmetic evidence",
+    );
+    let wire = serde_json::to_vec(&OracleSpec::OperationDefined).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<OracleSpec>(&wire).unwrap(),
+        OracleSpec::OperationDefined
+    );
+}
+
+#[test]
 fn exact_absolute_and_relative_comparison_are_fail_closed() {
     let plus_zero = result(f32_tensor(&[0.0, 1.0]));
     let minus_zero = result(f32_tensor(&[-0.0, 1.0]));

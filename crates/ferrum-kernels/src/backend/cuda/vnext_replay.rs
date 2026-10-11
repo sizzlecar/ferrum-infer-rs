@@ -17,12 +17,14 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_interfaces::vnext::{
-    DeviceCommandPhase, DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
-    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
-    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
-    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
-    DeviceReusableExecutionSegment, DeviceTimingMode, ElementType,
+    DeviceCommandPhase, DeviceComputePathRequirement, DeviceReplayedLogicalCommandAttribution,
+    DeviceReusableAddressScope, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionEntryIdentity, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionPreparationState, DeviceReusableExecutionProgram,
+    DeviceReusableExecutionProgramGap, DeviceReusableExecutionProgramGapReason,
+    DeviceReusableExecutionProgramId, DeviceReusableExecutionSegment, DeviceSubmissionTimingSink,
+    DeviceTimingMode, ElementType,
 };
 use sha2::{Digest, Sha256};
 
@@ -855,14 +857,32 @@ struct CudaExecutableProgramSegment {
     logical_commands: Option<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct CudaExecutableProgram {
     descriptor: DeviceReusableExecutionProgram,
     segments: Vec<CudaExecutableProgramSegment>,
+    // Lazily issued only for the opt-in recipe consumer. Keeping this token
+    // alive does not retain a graph or authorize a missing cache entry.
+    recipe_owner: OnceLock<DeviceReusableExecutionEntryIdentity>,
 }
+
+impl PartialEq for CudaExecutableProgram {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor && self.segments == other.segments
+    }
+}
+
+impl Eq for CudaExecutableProgram {}
 
 impl CudaExecutableProgram {
     fn validate_monotonic_update(&self, next: &Self) -> Result<(), CudaReplayError> {
+        self.descriptor
+            .validate_retained_plan_dependency_seal(&next.descriptor)
+            .map_err(|error| CudaReplayError {
+                stage: "update reusable execution program",
+                detail: error.to_string(),
+                eager_fallback_safe: false,
+            })?;
         if self.descriptor.program_id() != next.descriptor.program_id()
             || self.descriptor.node_count() != next.descriptor.node_count()
             || self.descriptor.eager_boundary_node_indices()
@@ -989,17 +1009,7 @@ impl CudaExecutableProgram {
                     .any(|segment| segment.descriptor.contains_node(*node_index))
             })
             .collect::<Vec<_>>();
-        let capture = DeviceReusableExecutionCapture::new(
-            self.descriptor.program_id().clone(),
-            self.descriptor.node_count(),
-            self.descriptor.eager_boundary_node_indices().to_vec(),
-            binding_node_indices.clone(),
-        )
-        .map_err(|error| CudaReplayError {
-            stage: "evict reusable execution segment",
-            detail: error.to_string(),
-            eager_fallback_safe: false,
-        })?;
+        let capture = self.descriptor.reclassification_capture();
         let descriptor = DeviceReusableExecutionProgram::new(
             &capture,
             segments
@@ -1017,6 +1027,7 @@ impl CudaExecutableProgram {
         Ok(Some(Self {
             descriptor,
             segments,
+            recipe_owner: OnceLock::new(),
         }))
     }
 }
@@ -1335,6 +1346,16 @@ impl CudaExecutableCache {
         report.captured_segments = captured.len();
         for (key, entry) in captured {
             let previous = self.entries.insert(key, entry);
+            if previous.is_some() {
+                // Preserve the original insertion/fallback behavior. An
+                // actual replacement only invalidates the optional recipe
+                // capability, even if program metadata is byte-identical.
+                for program in self.programs.values_mut() {
+                    if program.segments.iter().any(|segment| segment.key == key) {
+                        program.recipe_owner = OnceLock::new();
+                    }
+                }
+            }
             debug_assert!(previous.is_none());
         }
         for key in upload_keys {
@@ -1393,15 +1414,25 @@ impl CudaExecutableCache {
         self.rejected.insert(key, now);
     }
 
-    pub(crate) fn register_program(
+    pub(crate) fn register_program<S: DeviceSubmissionTimingSink>(
         &mut self,
+        compute_path: DeviceComputePathRequirement,
         capture: &DeviceReusableExecutionCapture,
         candidates: &[CudaExecutableCandidate],
         command_phases: &[DeviceCommandPhase],
         command_node_indices: &[Option<u32>],
         commands: &[CudaDeviceCommand],
         preparation: &CudaExecutablePreparation,
+        timing_sink: &S,
     ) -> Result<(), CudaReplayError> {
+        // Only Adaptive discovers candidates for this submission. A forced
+        // eager or direct replay submission supplies no candidates; that is
+        // not evidence that an existing resident segment was evicted. Leave
+        // its descriptor and recipe identity unchanged until an actual cache
+        // update or explicit eviction takes place.
+        if compute_path != DeviceComputePathRequirement::Adaptive {
+            return Ok(());
+        }
         if !self.preparation.capture_is_open() {
             return Ok(());
         }
@@ -1601,12 +1632,20 @@ impl CudaExecutableCache {
             detail: error.to_string(),
             eager_fallback_safe: false,
         })?;
-        let program = CudaExecutableProgram {
+        let mut program = CudaExecutableProgram {
             descriptor,
             segments,
+            recipe_owner: OnceLock::new(),
         };
         if let Some(current) = self.programs.get(capture.program_id()) {
             current.validate_monotonic_update(&program)?;
+            if current == &program {
+                program.recipe_owner = current.recipe_owner.clone();
+            }
+        }
+        if S::ENABLED {
+            timing_sink
+                .record_reusable_program_gaps(capture.program_id(), program.descriptor.gaps());
         }
         // Preserve resident identities across updates. With on-demand work,
         // do not retain an unbounded history of empty program tombstones.
@@ -1670,6 +1709,31 @@ impl CudaExecutableCache {
             .collect::<Vec<_>>();
         catalog.sort_by(|left, right| left.program_id().cmp(right.program_id()));
         Ok(catalog)
+    }
+
+    /// Exact current entry identity, queried under the owning stream lock.
+    /// The caller must compare a freshly queried token, not a retained token's
+    /// strong count; eviction and recapture can preserve all numeric IDs.
+    pub(crate) fn recipe_program_owner(
+        &self,
+        program_id: &DeviceReusableExecutionProgramId,
+    ) -> Option<DeviceReusableExecutionEntryIdentity> {
+        let program = self.programs.get(program_id)?;
+        if !program.descriptor.is_determinism_ready()
+            || program.segments.is_empty()
+            || program
+                .segments
+                .iter()
+                .any(|segment| !self.entries.contains_key(&segment.key))
+        {
+            return None;
+        }
+        Some(
+            program
+                .recipe_owner
+                .get_or_init(DeviceReusableExecutionEntryIdentity::new)
+                .clone(),
+        )
     }
 
     pub(crate) fn launch_program_segment(

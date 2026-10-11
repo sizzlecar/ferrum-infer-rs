@@ -18,6 +18,93 @@ impl PrefillDecodeExecutionArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InvocationPreparationStrategyArg {
+    Full,
+    IdentityProjection,
+    DecodeSegment,
+    DecodeSegmentProgram,
+}
+
+impl InvocationPreparationStrategyArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::IdentityProjection => "identity-projection",
+            Self::DecodeSegment => "decode-segment",
+            Self::DecodeSegmentProgram => "decode-segment-program",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProgramBindingUploadStrategyArg {
+    Sparse,
+    UniformLivePrefix,
+    CompactScatter,
+}
+
+impl ProgramBindingUploadStrategyArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Sparse => "sparse",
+            Self::UniformLivePrefix => "uniform-live-prefix",
+            Self::CompactScatter => "compact-scatter",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SegmentBindingOwnerViewModeArg {
+    Legacy,
+    Indexed,
+}
+
+impl SegmentBindingOwnerViewModeArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Legacy => ferrum_types::SegmentBindingOwnerViewMode::Legacy.as_runtime_value(),
+            Self::Indexed => ferrum_types::SegmentBindingOwnerViewMode::Indexed.as_runtime_value(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CausalDecodePreparationModeArg {
+    PerParticipant,
+    Packed,
+}
+
+impl CausalDecodePreparationModeArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PerParticipant => {
+                ferrum_types::CausalDecodePreparationMode::PerParticipant.as_runtime_value()
+            }
+            Self::Packed => ferrum_types::CausalDecodePreparationMode::Packed.as_runtime_value(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CausalDecodeAttentionGroupingArg {
+    Contiguous,
+    Indexed,
+}
+
+impl CausalDecodeAttentionGroupingArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Contiguous => {
+                ferrum_types::CausalDecodeAttentionGrouping::Contiguous.as_runtime_value()
+            }
+            Self::Indexed => {
+                ferrum_types::CausalDecodeAttentionGrouping::Indexed.as_runtime_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
@@ -78,11 +165,151 @@ mod tests {
     }
 
     impl TestCli {
+        fn segment_binding_owner_view_mode(self) -> Option<SegmentBindingOwnerViewModeArg> {
+            match self.command {
+                TestCommand::Run(command) => command.segment_binding_owner_view_mode,
+                TestCommand::Serve(command) => command.segment_binding_owner_view_mode,
+            }
+        }
+
+        fn causal_decode_preparation_mode(self) -> Option<CausalDecodePreparationModeArg> {
+            match self.command {
+                TestCommand::Run(command) => command.causal_decode_preparation_mode,
+                TestCommand::Serve(command) => command.causal_decode_preparation_mode,
+            }
+        }
+
+        fn causal_decode_attention_grouping(self) -> Option<CausalDecodeAttentionGroupingArg> {
+            match self.command {
+                TestCommand::Run(command) => command.causal_decode_attention_grouping,
+                TestCommand::Serve(command) => command.causal_decode_attention_grouping,
+            }
+        }
+
+        fn binding_upload_strategy(self) -> Option<ProgramBindingUploadStrategyArg> {
+            match self.command {
+                TestCommand::Run(command) => command.program_binding_upload_strategy,
+                TestCommand::Serve(command) => command.program_binding_upload_strategy,
+            }
+        }
+
+        fn preparation_strategy(self) -> Option<InvocationPreparationStrategyArg> {
+            match self.command {
+                TestCommand::Run(command) => command.invocation_preparation_strategy,
+                TestCommand::Serve(command) => command.invocation_preparation_strategy,
+            }
+        }
+
         fn execution(self) -> Option<PrefillDecodeExecutionArg> {
             match self.command {
                 TestCommand::Run(command) => command.prefill_decode_execution,
                 TestCommand::Serve(command) => command.prefill_decode_execution,
             }
+        }
+    }
+
+    #[test]
+    fn segment_binding_owner_view_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .segment_binding_owner_view_mode(),
+                None
+            );
+            for (value, expected) in [
+                ("legacy", SegmentBindingOwnerViewModeArg::Legacy),
+                ("indexed", SegmentBindingOwnerViewModeArg::Indexed),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--segment-binding-owner-view-mode",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.segment_binding_owner_view_mode(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--segment-binding-owner-view-mode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .causal_decode_preparation_mode(),
+                None
+            );
+            for (value, expected) in [
+                (
+                    "per-participant",
+                    CausalDecodePreparationModeArg::PerParticipant,
+                ),
+                ("packed", CausalDecodePreparationModeArg::Packed),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--causal-decode-preparation-mode",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.causal_decode_preparation_mode(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--causal-decode-preparation-mode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .causal_decode_attention_grouping(),
+                None
+            );
+            for (value, expected) in [
+                ("contiguous", CausalDecodeAttentionGroupingArg::Contiguous),
+                ("indexed", CausalDecodeAttentionGroupingArg::Indexed),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--causal-decode-attention-grouping",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.causal_decode_attention_grouping(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--causal-decode-attention-grouping",
+                "automatic",
+            ])
+            .is_err());
         }
     }
 
@@ -161,6 +388,90 @@ mod tests {
                 command,
                 "test-model",
                 "--prefill-decode-execution",
+                "automatic"
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn invocation_preparation_cli_values_and_default_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .preparation_strategy(),
+                None
+            );
+            for (value, expected) in [
+                ("full", InvocationPreparationStrategyArg::Full),
+                (
+                    "identity-projection",
+                    InvocationPreparationStrategyArg::IdentityProjection,
+                ),
+                (
+                    "decode-segment",
+                    InvocationPreparationStrategyArg::DecodeSegment,
+                ),
+                (
+                    "decode-segment-program",
+                    InvocationPreparationStrategyArg::DecodeSegmentProgram,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--invocation-preparation-strategy",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.preparation_strategy(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--invocation-preparation-strategy",
+                "automatic"
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn program_binding_upload_cli_values_and_default_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .binding_upload_strategy(),
+                None
+            );
+            for (value, expected) in [
+                ("sparse", ProgramBindingUploadStrategyArg::Sparse),
+                (
+                    "uniform-live-prefix",
+                    ProgramBindingUploadStrategyArg::UniformLivePrefix,
+                ),
+                (
+                    "compact-scatter",
+                    ProgramBindingUploadStrategyArg::CompactScatter,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--program-binding-upload-strategy",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.binding_upload_strategy(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--program-binding-upload-strategy",
                 "automatic"
             ])
             .is_err());

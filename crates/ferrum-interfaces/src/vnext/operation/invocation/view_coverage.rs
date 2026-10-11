@@ -16,19 +16,12 @@ impl<'views, 'lease, B> FullyCoveredOperationViews<'views, 'lease, B> {
         lease_identity: Option<&ResourceTransactionIdentity>,
     ) -> Result<Self, VNextError> {
         for view in views {
-            view.validate_runtime(runtime, lease_identity)?;
-            let translated = view.translate(0, view.descriptor().size_bytes)?;
-            let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
-                total
-                    .checked_add(region.length_bytes())
-                    .ok_or_else(|| invalid_operation("translated operation regions overflow u64"))
-            })?;
-            if translated_bytes != view.descriptor().size_bytes {
-                return Err(invalid_operation(format!(
-                    "operation resource `{}` is not fully backed by physical regions",
-                    view.resource_id()
-                )));
+            #[cfg(test)]
+            if REFERENCE_COVERAGE.get() {
+                validate_reference(view, runtime, lease_identity)?;
+                continue;
             }
+            view.validate_full_runtime_coverage(runtime, lease_identity)?;
         }
         Ok(Self { views })
     }
@@ -56,6 +49,47 @@ impl<'views, 'lease, B> FullyCoveredOperationViews<'views, 'lease, B> {
             length_bytes,
         )
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Test-only, thread-local and scoped: never a product configuration or a
+    // cache. Both paired arms use the same real invocation construction path.
+    static REFERENCE_COVERAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn with_reference_coverage<T>(reference: bool, run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REFERENCE_COVERAGE.set(self.0);
+        }
+    }
+    let _reset = Reset(REFERENCE_COVERAGE.replace(reference));
+    run()
+}
+
+#[cfg(test)]
+fn validate_reference<R: DeviceRuntime>(
+    view: &OperationBufferView<'_, R::Buffer>,
+    runtime: &R,
+    lease_identity: Option<&ResourceTransactionIdentity>,
+) -> Result<(), VNextError> {
+    view.validate_runtime(runtime, lease_identity)?;
+    let translated = view.translate(0, view.descriptor().size_bytes)?;
+    let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
+        total
+            .checked_add(region.length_bytes())
+            .ok_or_else(|| invalid_operation("translated operation regions overflow u64"))
+    })?;
+    if translated_bytes != view.descriptor().size_bytes {
+        return Err(invalid_operation(format!(
+            "operation resource `{}` is not fully backed by physical regions",
+            view.resource_id()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_subrange_bounds(
@@ -95,6 +129,14 @@ pub(crate) fn test_only_backing_window_coverage<R: DeviceRuntime>(
         window_offset_bytes,
         crate::vnext::AllocationLifetime::Request,
     )];
+    // Compare acceptance before consuming a potentially invalid backing. This
+    // also checks invalid fixtures against the frozen multi-pass reference.
+    assert_eq!(
+        validate_reference(&views[0], runtime, None).is_ok(),
+        views[0]
+            .validate_full_runtime_coverage(runtime, None)
+            .is_ok(),
+    );
     let proof = FullyCoveredOperationViews::validate(&views, runtime, None)?;
     Ok(ranges
         .iter()

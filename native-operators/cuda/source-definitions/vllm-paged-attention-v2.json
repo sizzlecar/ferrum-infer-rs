@@ -1,8 +1,8 @@
 {
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_paged_attention_v2",
-  "source_package_kind": "ferrum-native-source-bundle",
-  "source_package_revision": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
+  "source_package_kind": "ferrum-native-source-overlay",
+  "source_package_revision": "ferrum-vllm-addressed-indexed-v1+sha256.3dca5c7432c174ed9b2e905c67fd4314de8e0ad04319788366cf66465841a4d5",
   "upstream_sources": [
     {
       "repository": "https://github.com/vllm-project/vllm.git",
@@ -47,7 +47,9 @@
   "include_dirs": [
     "kernels/vllm_attn"
   ],
-  "defines": [],
+  "defines": [
+
+  ],
   "nvcc_policy": {
     "cpp_standard": "cpp17",
     "optimization": "o3",

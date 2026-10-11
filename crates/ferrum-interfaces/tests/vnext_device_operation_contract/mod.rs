@@ -641,6 +641,10 @@ fn catalog_with_resource_options_execution_semantics_storage_and_operation_versi
     .unwrap()
 }
 
+#[path = "persistent.rs"]
+mod persistent;
+pub(crate) use persistent::*;
+
 pub(crate) struct TestOperationContract {
     pub(crate) descriptor: OperationDescriptor,
 }
@@ -1396,8 +1400,34 @@ pub(crate) enum FenceBehavior {
     Panic,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) enum SegmentProgramFault {
+    #[default]
+    None,
+    LeaveDependency,
+    ReverseNodes,
+}
+
+struct TestSegmentProgram(Vec<(u32, usize, usize)>);
+
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) segment_metadata_enabled: bool,
+    pub(crate) segment_foreign_runtime_metadata: bool,
+    pub(crate) segment_encoder_enabled: bool,
+    pub(crate) segment_oracle_enabled: bool,
+    pub(crate) segment_owner_view_mode: SegmentBindingOwnerViewMode,
+    pub(crate) segment_capture_owners: bool,
+    pub(crate) segment_owner_count: usize,
+    pub(crate) segment_retained_owners: Vec<DeviceBufferRetention>,
+    pub(crate) segment_regions: Vec<SegmentTestRegion>,
+    pub(crate) segment_program_compile_calls: usize,
+    pub(crate) segment_program_encode_calls: usize,
+    pub(crate) segment_program_fault: SegmentProgramFault,
+    pub(crate) segment_entry: Option<DeviceReusableExecutionEntryIdentity>,
+    pub(crate) segment_entry_error: bool,
+    pub(crate) segment_entry_panic: bool,
+    pub(crate) segment_trim_released: usize,
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
@@ -1420,6 +1450,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
     pub(crate) tamper_buffer_descriptor: bool,
+    pub(crate) persistent_descriptor_fault: Option<PersistentDescriptorFault>,
     pub(crate) drift_on_submit: bool,
     pub(crate) next_fence: u64,
     pub(crate) submit_behavior: SubmitBehavior,
@@ -1435,6 +1466,15 @@ pub(crate) struct RuntimeTrace {
     pub(crate) static_weight_import_seal_calls: u64,
     pub(crate) imported_component_count: usize,
     pub(crate) imported_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegmentTestRegion {
+    pub(crate) node: u32,
+    pub(crate) participant: usize,
+    pub(crate) region: usize,
+    pub(crate) descriptor: BufferDescriptor,
+    pub(crate) physical: Vec<(usize, std::ops::Range<u64>, u64)>,
 }
 
 pub(crate) struct TestRuntime {
@@ -1662,6 +1702,310 @@ impl DeviceRuntime for TestRuntime {
         }
     }
 
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_, Self>> {
+        let (enabled, foreign) = {
+            let trace = self.trace.lock().unwrap();
+            (
+                trace.segment_metadata_enabled,
+                trace.segment_foreign_runtime_metadata,
+            )
+        };
+        if !enabled {
+            return None;
+        }
+        if foreign {
+            // A real different runtime object with equal metadata; no resource
+            // or admission is minted for this intentionally invalid capability.
+            static FOREIGN: std::sync::OnceLock<TestRuntime> = std::sync::OnceLock::new();
+            let owner = FOREIGN.get_or_init(|| TestRuntime {
+                descriptor: self.descriptor.clone(),
+                alternate_descriptor: self.alternate_descriptor.clone(),
+                use_alternate_descriptor: AtomicBool::new(false),
+                descriptor_reads_until_drift: AtomicU64::new(0),
+                trace: Arc::new(Mutex::new(RuntimeTrace::default())),
+            });
+            return Some(ImmutableRuntimeMetadata::declare(owner, &self.descriptor));
+        }
+        Some(ImmutableRuntimeMetadata::declare(self, &self.descriptor))
+    }
+
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        buffer: &'a Self::Buffer,
+    ) -> Option<ImmutableBufferMetadata<'a, Self>> {
+        self.trace
+            .lock()
+            .unwrap()
+            .segment_metadata_enabled
+            .then(|| ImmutableBufferMetadata::declare(self, buffer, &buffer.descriptor))
+    }
+
+    fn segment_binding_oracle_mode(&self) -> SegmentBindingOracleMode {
+        if self.trace.lock().unwrap().segment_oracle_enabled {
+            SegmentBindingOracleMode::CompareReference
+        } else {
+            SegmentBindingOracleMode::Disabled
+        }
+    }
+
+    fn segment_binding_owner_view_mode(&self) -> SegmentBindingOwnerViewMode {
+        self.trace.lock().unwrap().segment_owner_view_mode
+    }
+
+    fn encode_segment_bindings(
+        &self,
+        patch: PreparedSegmentBindingPatch<'_, Self::Buffer>,
+    ) -> Result<Option<Vec<EncodedSegmentBindingNode<Self::Command>>>, Self::Error> {
+        let (enabled, capture_owners) = {
+            let trace = self.trace.lock().unwrap();
+            (trace.segment_encoder_enabled, trace.segment_capture_owners)
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        let mode = patch.owner_view_mode();
+        let (owners, nodes) = patch.into_parts();
+        if mode == SegmentBindingOwnerViewMode::Legacy {
+            assert!(owners.is_empty());
+        }
+        let mut snapshots = Vec::new();
+        let mut retained_owners = Vec::new();
+        let mut encoded = Vec::new();
+        for node in nodes {
+            for participant in 0..node.participant_count() {
+                for region in 0..node.declaration().regions().len() {
+                    let value = node
+                        .region(participant, region)
+                        .map_err(|_| TestRuntimeError("segment region absent"))?;
+                    let mut covered = 0_u64;
+                    let physical = value
+                        .physical_regions()
+                        .map(|part| {
+                            let (buffer, range, retention) =
+                                part.borrowed_buffer_and_physical_range();
+                            match part.owner_index() {
+                                Some(index) => {
+                                    assert_eq!(mode, SegmentBindingOwnerViewMode::Indexed);
+                                    let (owner_buffer, owner_retention) =
+                                        owners[index.get()].buffer_and_retention();
+                                    assert!(std::ptr::eq(buffer, owner_buffer));
+                                    assert!(retention.same_owners(owner_retention));
+                                }
+                                None => assert_eq!(mode, SegmentBindingOwnerViewMode::Legacy),
+                            }
+                            if capture_owners {
+                                retained_owners.push(retention.clone());
+                            }
+                            assert!(
+                                range.start < range.end
+                                    && range.end <= buffer.descriptor.size_bytes
+                            );
+                            covered += range.end - range.start;
+                            (
+                                buffer as *const TestBuffer as usize,
+                                range,
+                                part.logical_offset_bytes(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(covered, value.descriptor().size_bytes);
+                    snapshots.push(SegmentTestRegion {
+                        node: node.node_index(),
+                        participant,
+                        region,
+                        descriptor: value.descriptor().clone(),
+                        physical,
+                    });
+                }
+            }
+            encoded.push(EncodedSegmentBindingNode {
+                node_index: node.node_index(),
+                bindings: EncodedReusableExecutionBindings::empty(),
+            });
+        }
+        let mut trace = self.trace.lock().unwrap();
+        trace.segment_regions = snapshots;
+        trace.segment_owner_count = owners.len();
+        trace.segment_retained_owners = retained_owners;
+        Ok(Some(encoded))
+    }
+
+    fn compile_segment_binding_program(
+        &self,
+        declarations: &[(u32, &SegmentBindingDeclaration)],
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        if !trace.segment_encoder_enabled {
+            return Ok(None);
+        }
+        trace.segment_program_compile_calls += 1;
+        // Only immutable ordinals/counts enter this cold test program.
+        Ok(Some(Arc::new(TestSegmentProgram(
+            declarations
+                .iter()
+                .map(|(node, declaration)| {
+                    (
+                        *node,
+                        declaration.regions().len(),
+                        declaration.dependencies().len(),
+                    )
+                })
+                .collect(),
+        ))))
+    }
+
+    fn encode_compiled_segment_bindings(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        frame: &mut PreparedSegmentBindingFrame<'_, Self::Buffer>,
+    ) -> Result<Option<EncodedSegmentBindingProgram<Self::Command>>, Self::Error> {
+        let program = program
+            .downcast_ref::<TestSegmentProgram>()
+            .ok_or(TestRuntimeError("foreign compiled segment test program"))?;
+        let (capture_owners, fault) = {
+            let mut trace = self.trace.lock().unwrap();
+            trace.segment_program_encode_calls += 1;
+            (trace.segment_capture_owners, trace.segment_program_fault)
+        };
+        assert_eq!(frame.node_count(), program.0.len());
+        assert!(frame.node(frame.node_count()).is_err());
+        let mut snapshots = Vec::new();
+        let mut retained_owners = Vec::new();
+        let mut nodes = Vec::new();
+        let mut program_binding_nodes = Vec::new();
+        for (ordinal, &(node_index, region_count, dependency_count)) in program.0.iter().enumerate()
+        {
+            {
+                let node = frame
+                    .node(ordinal)
+                    .map_err(|_| TestRuntimeError("frame node absent"))?;
+                assert_eq!(node.node_index(), node_index);
+                assert_eq!(node.declaration().regions().len(), region_count);
+                assert_eq!(node.declaration().dependencies().len(), dependency_count);
+                assert!(node.region(node.participant_count(), 0).is_err());
+                assert!(node.region(0, region_count).is_err());
+                if node.program_binding().is_some() {
+                    program_binding_nodes.push(node_index);
+                }
+                for participant in 0..node.participant_count() {
+                    for region in 0..region_count {
+                        let value = node
+                            .region(participant, region)
+                            .map_err(|_| TestRuntimeError("frame region absent"))?;
+                        let descriptor = value.descriptor();
+                        let mut covered = 0;
+                        let physical = value
+                            .physical_regions()
+                            .map(|part| {
+                                let (buffer, range, retention) =
+                                    part.borrowed_buffer_and_physical_range();
+                                let index = part.owner_index().expect("Core frame owner index");
+                                let (owner_buffer, owner_retention) =
+                                    frame.owners()[index.get()].buffer_and_retention();
+                                assert!(std::ptr::eq(buffer, owner_buffer));
+                                assert!(retention.same_owners(owner_retention));
+                                assert_eq!(part.logical_offset_bytes(), covered);
+                                assert!(
+                                    range.start < range.end
+                                        && range.end <= buffer.descriptor.size_bytes
+                                );
+                                covered += range.end - range.start;
+                                if capture_owners {
+                                    retained_owners.push(retention.clone());
+                                }
+                                (
+                                    buffer as *const TestBuffer as usize,
+                                    range,
+                                    part.logical_offset_bytes(),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(covered, descriptor.size_bytes);
+                        snapshots.push(SegmentTestRegion {
+                            node: node_index,
+                            participant,
+                            region,
+                            descriptor: BufferDescriptor {
+                                resource_id: descriptor.resource_id.clone(),
+                                size_bytes: descriptor.size_bytes,
+                                alignment_bytes: descriptor.alignment_bytes,
+                                usage: descriptor.usage,
+                                element_type: descriptor.element_type,
+                            },
+                            physical,
+                        });
+                    }
+                }
+            }
+            let mut bindings = EncodedReusableExecutionBindings::empty();
+            if !matches!(fault, SegmentProgramFault::LeaveDependency) {
+                for dependency in 0..dependency_count {
+                    let authority = frame
+                        .take_dependency(ordinal, dependency)
+                        .map_err(|_| TestRuntimeError("frame dependency absent"))?;
+                    assert!(frame.take_dependency(ordinal, dependency).is_err());
+                    bindings = bindings.with_retained_plan_dependency(
+                        authority.encode(TestCommand::DynamicBinding),
+                    );
+                }
+            }
+            assert!(frame.take_dependency(ordinal, dependency_count).is_err());
+            nodes.push(EncodedSegmentBindingNode {
+                node_index,
+                bindings,
+            });
+        }
+        assert!(frame.take_dependency(frame.node_count(), 0).is_err());
+        if matches!(fault, SegmentProgramFault::ReverseNodes) {
+            nodes.reverse();
+        }
+        let mut trace = self.trace.lock().unwrap();
+        trace.segment_regions = snapshots;
+        trace.segment_owner_count = frame.owners().len();
+        trace.segment_retained_owners = retained_owners;
+        Ok(Some(EncodedSegmentBindingProgram {
+            nodes,
+            program_bindings: if program_binding_nodes.is_empty() {
+                vec![]
+            } else {
+                vec![TestCommand::CoalescedProgramBinding]
+            },
+            program_binding_nodes,
+        }))
+    }
+
+    fn reusable_execution_entry_identity(
+        &self,
+        _stream: &Self::Stream,
+        _program: &DeviceReusableExecutionProgramId,
+    ) -> Result<Option<DeviceReusableExecutionEntryIdentity>, Self::Error> {
+        let (entry, error, panic) = {
+            let trace = self.trace.lock().unwrap();
+            (
+                trace.segment_entry.clone(),
+                trace.segment_entry_error,
+                trace.segment_entry_panic,
+            )
+        };
+        assert!(!panic, "injected entry inspection panic");
+        if error {
+            return Err(TestRuntimeError("injected entry inspection error"));
+        }
+        Ok(entry)
+    }
+
+    fn trim_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        let released = trace.segment_trim_released;
+        if released != 0 {
+            trace.segment_entry = None;
+        }
+        Ok(DeviceReusableExecutionTrim::new(released, 0))
+    }
+
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
         ferrum_types::AttentionExecutionPolicy::Portable
     }
@@ -1682,6 +2026,16 @@ impl DeviceRuntime for TestRuntime {
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
         let mut descriptor = buffer.descriptor.clone();
+        if descriptor.usage == BufferUsage::Persistent {
+            match self.trace.lock().unwrap().persistent_descriptor_fault {
+                Some(PersistentDescriptorFault::Short) => descriptor.size_bytes = 16,
+                Some(PersistentDescriptorFault::Type) => descriptor.element_type = ElementType::F32,
+                Some(PersistentDescriptorFault::Identity) => {
+                    descriptor.resource_id = id("resource.foreign-persistent")
+                }
+                None => {}
+            }
+        }
         if self.trace.lock().unwrap().tamper_buffer_descriptor {
             descriptor.size_bytes += 1;
         }

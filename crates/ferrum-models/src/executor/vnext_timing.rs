@@ -69,7 +69,7 @@ impl AtomicDurationMetrics {
     pub(super) fn start(&self) -> AtomicDurationTimer<'_> {
         AtomicDurationTimer {
             metrics: self,
-            started: Instant::now(),
+            started: Some(Instant::now()),
         }
     }
 
@@ -109,12 +109,24 @@ impl AtomicDurationMetrics {
 
 pub(super) struct AtomicDurationTimer<'a> {
     metrics: &'a AtomicDurationMetrics,
-    started: Instant,
+    started: Option<Instant>,
+}
+
+impl AtomicDurationTimer<'_> {
+    /// Reuse the same measurement for a diagnostic receipt, without a second
+    /// clock read or a second update when this timer subsequently drops.
+    pub(super) fn finish(mut self) -> Option<Duration> {
+        let elapsed = self.started.take()?.elapsed();
+        self.metrics.record(elapsed);
+        Some(elapsed)
+    }
 }
 
 impl Drop for AtomicDurationTimer<'_> {
     fn drop(&mut self) {
-        self.metrics.record(self.started.elapsed());
+        if let Some(started) = self.started.take() {
+            self.metrics.record(started.elapsed());
+        }
     }
 }
 

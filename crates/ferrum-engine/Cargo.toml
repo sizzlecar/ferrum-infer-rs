@@ -101,6 +101,7 @@ candle-cuda-compat = [
     "ferrum-models/candle-cuda-compat",
     "ferrum-kernels/candle-cuda-compat",
 ]
+cuda-indexed-causal-attention = ["cuda", "ferrum-kernels/cuda-indexed-causal-attention", "ferrum-models/cuda-indexed-causal-attention"]
 marlin = ["cuda"]  # kept for backward compat, cuda already enables marlin
 tensor-parallel = ["cuda"]  # backward compat alias
 # Forward the triton-kernels feature so cuda_decode launches use triton-rs

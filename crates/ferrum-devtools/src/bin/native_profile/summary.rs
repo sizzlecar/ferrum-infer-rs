@@ -19,6 +19,10 @@ pub(super) struct Counts {
 #[derive(Debug, Default, Clone, Serialize)]
 pub(super) struct Timing {
     commands: u64,
+    observed_compute_dispatch_count: u128,
+    observed_transfer_command_count: u128,
+    observed_dependency_wait_count: u128,
+    commands_missing_physical_work_counts: u64,
     timing_statuses: BTreeMap<String, u64>,
     unavailable_reasons: BTreeMap<String, u64>,
     measured_commands: u64,
@@ -43,6 +47,8 @@ pub(super) struct Breakdown {
     operations: BTreeMap<String, Timing>,
     /// Decomposes command intervals; never added to the command total again.
     subwork: BTreeMap<String, Subwork>,
+    /// A separate decomposition of measured intervals, including dependency waits.
+    interval_kinds: BTreeMap<String, Subwork>,
     command_phases: BTreeMap<String, u64>,
 }
 
@@ -78,6 +84,9 @@ struct Shape {
     command_index: Option<u64>,
     command_count: Option<u64>,
     token_count: Option<u64>,
+    physical_compute_dispatch_count: Option<u64>,
+    physical_transfer_command_count: Option<u64>,
+    physical_dependency_wait_count: Option<u64>,
     device_elapsed_ns: Option<u64>,
     device_interval_count: Option<u64>,
 }
@@ -303,6 +312,8 @@ pub(super) fn summarize(reader: impl BufRead) -> Result<Report> {
         limitations: vec![
             "Native command times are counted once per physical submission and command index, never once per participant.",
             "Subwork and unlabeled intervals decompose command time; do not add them to operation totals. Encoder gaps are excluded from the sum of intervals.",
+            "Interval kinds separately decompose measured time. Dependency intervals measure ordering spans, not compute or transfer work; mixed commands may enclose more than one kind of work.",
+            "Physical work counts sum observed fields once per command, independently of timing availability. Missing legacy count fields are reported as incomplete, not evidence of zero work.",
             "Token counts are observed command shapes, not request counts. A maximum command token count is not proof of a prefill or decode phase; single-token prefill, output heads and mixed waves can coexist.",
             "Phase remains unclassified without explicit wave_phase evidence. Conflicting explicit phases are preserved and leave the phase unclassified.",
             "Unavailable, invalid and missing measurements are excluded from measured time, not treated as zero-duration commands. Missing interval details leave subwork coverage incomplete.",
@@ -338,6 +349,12 @@ impl Breakdown {
             .or_default() += 1;
         if measured.valid {
             for interval in measured.intervals {
+                let kind = self
+                    .interval_kinds
+                    .entry(interval.kind.clone())
+                    .or_default();
+                kind.interval_count += 1;
+                kind.measured_ns += u128::from(interval.end_offset_ns - interval.start_offset_ns);
                 if let Some(id) = &interval.subwork_id {
                     let entry = self.subwork.entry(id.clone()).or_default();
                     entry.interval_count += 1;
@@ -400,6 +417,17 @@ fn measure(event: &Event) -> Measurement<'_> {
 impl Timing {
     fn record(&mut self, event: &Event, measured: &Measurement<'_>) {
         self.commands += 1;
+        self.observed_compute_dispatch_count +=
+            u128::from(event.shape.physical_compute_dispatch_count.unwrap_or(0));
+        self.observed_transfer_command_count +=
+            u128::from(event.shape.physical_transfer_command_count.unwrap_or(0));
+        self.observed_dependency_wait_count +=
+            u128::from(event.shape.physical_dependency_wait_count.unwrap_or(0));
+        self.commands_missing_physical_work_counts += u64::from(
+            event.shape.physical_compute_dispatch_count.is_none()
+                || event.shape.physical_transfer_command_count.is_none()
+                || event.shape.physical_dependency_wait_count.is_none(),
+        );
         let status = event
             .attributes
             .device_timing_status

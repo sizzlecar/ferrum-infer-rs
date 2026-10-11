@@ -72,6 +72,214 @@ impl PrefillDecodeExecution {
     }
 }
 
+/// Host invocation preparation for native plan runtimes. Identity projection
+/// borrows compiled identity metadata while preserving per-invocation validation.
+/// DecodeSegment enables supported CUDA decode segments; unsupported or cold
+/// segments retain the full preparation path. Full remains the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InvocationPreparationStrategy {
+    #[default]
+    Full,
+    IdentityProjection,
+    DecodeSegment,
+    /// Compile the entire binding write program and bind it from one fresh frame.
+    DecodeSegmentProgram,
+}
+
+impl InvocationPreparationStrategy {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::IdentityProjection => "identity-projection",
+            Self::DecodeSegment => "decode-segment",
+            Self::DecodeSegmentProgram => "decode-segment-program",
+        }
+    }
+
+    pub const fn uses_identity_projection(self) -> bool {
+        matches!(
+            self,
+            Self::IdentityProjection | Self::DecodeSegment | Self::DecodeSegmentProgram
+        )
+    }
+
+    pub const fn uses_decode_segment(self) -> bool {
+        matches!(self, Self::DecodeSegment | Self::DecodeSegmentProgram)
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "identity-projection" => Ok(Self::IdentityProjection),
+            "decode-segment" => Ok(Self::DecodeSegment),
+            "decode-segment-program" => Ok(Self::DecodeSegmentProgram),
+            _ => Err(format!(
+                "expected full, identity-projection, decode-segment or decode-segment-program; got {raw:?}"
+            )),
+        }
+    }
+}
+
+/// Upload policy for CUDA program bindings. Uniform live prefixes pad rows
+/// only to the largest live payload in the same node and current batch.
+/// Compact scatter uploads one packed packet and scatters its live bytes on
+/// the GPU, falling back to sparse uploads when scratch capacity is unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgramBindingUploadStrategy {
+    #[default]
+    Sparse,
+    UniformLivePrefix,
+    CompactScatter,
+}
+
+impl ProgramBindingUploadStrategy {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Sparse => "sparse",
+            Self::UniformLivePrefix => "uniform-live-prefix",
+            Self::CompactScatter => "compact-scatter",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sparse" => Ok(Self::Sparse),
+            "uniform-live-prefix" => Ok(Self::UniformLivePrefix),
+            "compact-scatter" => Ok(Self::CompactScatter),
+            _ => Err(format!(
+                "expected sparse, uniform-live-prefix or compact-scatter; got {raw:?}"
+            )),
+        }
+    }
+}
+
+/// Internal snapshot identity for an explicit CLI/config option, not an
+/// environment-variable interface. Environment-sourced entries are rejected.
+pub const SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY: &str =
+    "FERRUM_SEGMENT_BINDING_OWNER_VIEW_MODE";
+
+/// Snapshot identity for an explicit CLI/config option, never an environment switch.
+pub const CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECODE_PREPARATION_MODE";
+
+/// Snapshot identity for explicit attention grouping, never an environment switch.
+pub const CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY: &str =
+    "FERRUM_CAUSAL_DECODE_ATTENTION_GROUPING";
+
+/// Grouping of already selected native V1/V2 causal decode rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalDecodeAttentionGrouping {
+    #[default]
+    Contiguous,
+    Indexed,
+}
+
+impl CausalDecodeAttentionGrouping {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Contiguous => "contiguous",
+            Self::Indexed => "indexed",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "contiguous" => Ok(Self::Contiguous),
+            "indexed" => Ok(Self::Indexed),
+            _ => Err(format!("expected contiguous or indexed; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select causal decode attention grouping through CLI or config, not environment"
+                    .into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
+/// Preparation of rows in an eligible native batched causal decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalDecodePreparationMode {
+    #[default]
+    PerParticipant,
+    Packed,
+}
+
+impl CausalDecodePreparationMode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PerParticipant => "per-participant",
+            Self::Packed => "packed",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "per-participant" => Ok(Self::PerParticipant),
+            "packed" => Ok(Self::Packed),
+            _ => Err(format!("expected per-participant or packed; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select causal decode preparation through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
+/// Representation of freshly checked decode-segment binding owners. Both
+/// modes retain the same current-wave authorization and exact physical ranges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SegmentBindingOwnerViewMode {
+    #[default]
+    Legacy,
+    Indexed,
+}
+
+impl SegmentBindingOwnerViewMode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Indexed => "indexed",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "indexed" => Ok(Self::Indexed),
+            _ => Err(format!("expected legacy or indexed; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select segment binding owner views through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Explicit one-shot faults used to prove product-path failure attribution.
 /// These are never inferred and remain disabled in normal execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +402,21 @@ pub struct RuntimeKnobs {
     pub prefix_state_cache_enabled: bool,
     pub recurrent_state_max_slots: Option<usize>,
     pub attention_execution_policy: AttentionExecutionPolicy,
+    /// Host invocation preparation policy; full preparation is the default.
+    #[serde(default)]
+    pub invocation_preparation_strategy: InvocationPreparationStrategy,
+    /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
+    #[serde(default)]
+    pub program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    /// Fresh owner representation for CUDA decode segments; Legacy is default.
+    #[serde(default)]
+    pub segment_binding_owner_view_mode: SegmentBindingOwnerViewMode,
+    /// Packed preparation applies only to eligible native batched causal decode.
+    #[serde(default)]
+    pub causal_decode_preparation_mode: CausalDecodePreparationMode,
+    /// Indexed grouping requires packed preparation with native CUDA attention.
+    #[serde(default)]
+    pub causal_decode_attention_grouping: CausalDecodeAttentionGrouping,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -326,6 +549,52 @@ impl EngineConfig {
             self.runtime.attention_execution_policy =
                 AttentionExecutionPolicy::parse_runtime_value(value)
                     .map_err(|reason| format!("FERRUM_ATTENTION_POLICY: {reason}"))?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+        {
+            self.runtime.invocation_preparation_strategy =
+                InvocationPreparationStrategy::parse_runtime_value(value).map_err(|reason| {
+                    format!("FERRUM_INVOCATION_PREPARATION_STRATEGY: {reason}")
+                })?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+        {
+            self.runtime.program_binding_upload_strategy =
+                ProgramBindingUploadStrategy::parse_runtime_value(value).map_err(|reason| {
+                    format!("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
+        {
+            self.runtime.segment_binding_owner_view_mode =
+                SegmentBindingOwnerViewMode::parse_config_entry(entry).map_err(|reason| {
+                    format!("{SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY}: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+        {
+            self.runtime.causal_decode_preparation_mode =
+                CausalDecodePreparationMode::parse_config_entry(entry).map_err(|reason| {
+                    format!("{CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY}: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY)
+        {
+            self.runtime.causal_decode_attention_grouping =
+                CausalDecodeAttentionGrouping::parse_config_entry(entry).map_err(|reason| {
+                    format!("{CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY}: {reason}")
+                })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =
@@ -1271,6 +1540,311 @@ impl Default for BatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invocation_preparation_defaults_to_full_and_rejects_unknown_overrides() {
+        let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.invocation_preparation_strategy,
+            InvocationPreparationStrategy::Full
+        );
+        let mut legacy = serde_json::to_value(&config.runtime).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("invocation_preparation_strategy");
+        let restored: RuntimeKnobs = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.invocation_preparation_strategy,
+            InvocationPreparationStrategy::Full
+        );
+        for strategy in [
+            InvocationPreparationStrategy::IdentityProjection,
+            InvocationPreparationStrategy::DecodeSegment,
+            InvocationPreparationStrategy::DecodeSegmentProgram,
+            InvocationPreparationStrategy::Full,
+        ] {
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    key,
+                    strategy.as_runtime_value(),
+                )]))
+                .unwrap();
+            assert_eq!(config.runtime.invocation_preparation_strategy, strategy);
+            assert_eq!(
+                serde_json::to_value(strategy).unwrap(),
+                strategy.as_runtime_value()
+            );
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                .unwrap();
+            assert_eq!(config.runtime.invocation_preparation_strategy, strategy);
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "automatic"
+            )]))
+            .unwrap_err()
+            .contains(key));
+    }
+
+    #[test]
+    fn program_binding_upload_defaults_to_sparse_and_rejects_unknown_overrides() {
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY";
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.program_binding_upload_strategy,
+            ProgramBindingUploadStrategy::Sparse
+        );
+        let mut legacy = serde_json::to_value(&config.runtime).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("program_binding_upload_strategy");
+        let restored: RuntimeKnobs = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.program_binding_upload_strategy,
+            ProgramBindingUploadStrategy::Sparse
+        );
+        for strategy in [
+            ProgramBindingUploadStrategy::UniformLivePrefix,
+            ProgramBindingUploadStrategy::CompactScatter,
+            ProgramBindingUploadStrategy::Sparse,
+        ] {
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    key,
+                    strategy.as_runtime_value(),
+                )]))
+                .unwrap();
+            assert_eq!(config.runtime.program_binding_upload_strategy, strategy);
+            assert_eq!(
+                serde_json::to_value(strategy).unwrap(),
+                strategy.as_runtime_value()
+            );
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                .unwrap();
+            assert_eq!(config.runtime.program_binding_upload_strategy, strategy);
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "automatic"
+            )]))
+            .unwrap_err()
+            .contains(key));
+    }
+
+    #[test]
+    fn segment_owner_mode_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Legacy
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("segment_binding_owner_view_mode");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Legacy
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                SegmentBindingOwnerViewMode::Indexed,
+                SegmentBindingOwnerViewMode::Legacy,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.segment_binding_owner_view_mode, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.segment_binding_owner_view_mode, mode);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+
+    #[test]
+    fn causal_decode_preparation_mode_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::PerParticipant
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("causal_decode_preparation_mode");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::PerParticipant
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                CausalDecodePreparationMode::Packed,
+                CausalDecodePreparationMode::PerParticipant,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.causal_decode_preparation_mode, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.causal_decode_preparation_mode, mode);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Contiguous
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("causal_decode_attention_grouping");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Contiguous
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                CausalDecodeAttentionGrouping::Indexed,
+                CausalDecodeAttentionGrouping::Contiguous,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.causal_decode_attention_grouping, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.causal_decode_attention_grouping, mode);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+
+    #[test]
+    fn segment_owner_mode_environment_cannot_activate_or_override_typed_config() {
+        let key = SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key, "indexed"
+            )]))
+            .unwrap_err()
+            .contains("not environment"));
+        assert_eq!(
+            config.runtime.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Legacy
+        );
+        config.runtime.segment_binding_owner_view_mode = SegmentBindingOwnerViewMode::Indexed;
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(key, "legacy")]))
+            .is_err());
+        assert_eq!(
+            config.runtime.segment_binding_owner_view_mode,
+            SegmentBindingOwnerViewMode::Indexed
+        );
+    }
+
+    #[test]
+    fn causal_decode_preparation_mode_environment_cannot_activate_or_override_typed_config() {
+        let key = CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(key, "packed")]))
+            .unwrap_err()
+            .contains("not environment"));
+        assert_eq!(
+            config.runtime.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::PerParticipant
+        );
+        config.runtime.causal_decode_preparation_mode = CausalDecodePreparationMode::Packed;
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "per-participant"
+            )]))
+            .is_err());
+        assert_eq!(
+            config.runtime.causal_decode_preparation_mode,
+            CausalDecodePreparationMode::Packed
+        );
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_environment_cannot_activate_or_override_typed_config() {
+        let key = CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key, "indexed"
+            )]))
+            .unwrap_err()
+            .contains("not environment"));
+        assert_eq!(
+            config.runtime.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Contiguous
+        );
+        config.runtime.causal_decode_attention_grouping = CausalDecodeAttentionGrouping::Indexed;
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "contiguous"
+            )]))
+            .is_err());
+        assert_eq!(
+            config.runtime.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Indexed
+        );
+    }
 
     #[test]
     fn prefill_decode_execution_defaults_to_split_and_validates_runtime_overrides() {

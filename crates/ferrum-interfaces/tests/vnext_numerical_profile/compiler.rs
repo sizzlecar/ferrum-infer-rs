@@ -55,6 +55,8 @@ impl ModelFamilyProvider for TwoStageFamily {
                 version: ContractVersion::new(1, 0),
                 multiplication_type: Some(ElementType::F32),
                 accumulation_type: Some(ElementType::F32),
+                staged_arithmetic: None,
+                composite_arithmetic: None,
             });
         }
         FamilyNumericalProfiles::new(

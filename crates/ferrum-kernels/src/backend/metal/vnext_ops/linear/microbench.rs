@@ -19,6 +19,7 @@ use metal::{
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
+mod native_four_row_groups;
 mod q6_shared_groups;
 
 const WARMUP_ROUNDS: usize = 2;

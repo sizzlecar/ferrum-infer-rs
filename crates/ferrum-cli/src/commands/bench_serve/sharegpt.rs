@@ -38,6 +38,10 @@ pub struct ShareGptArgs {
     /// Explicitly replace reference-answer output lengths with a fixed budget.
     #[arg(long)]
     pub sharegpt_fixed_output_tokens: Option<u32>,
+    /// Sample and shuffle this many eligible records, then use the request-count
+    /// prefix. Keep this and warmup fixed when comparing different request counts.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub sharegpt_selection_pool_size: Option<u32>,
 }
 
 impl Default for ShareGptArgs {
@@ -50,11 +54,25 @@ impl Default for ShareGptArgs {
             sharegpt_max_total_tokens: 2048,
             sharegpt_chat_template_reserve_tokens: 0,
             sharegpt_fixed_output_tokens: None,
+            sharegpt_selection_pool_size: None,
         }
     }
 }
 
 impl ShareGptArgs {
+    fn pool_size(&self, required: usize) -> Result<usize> {
+        let pool = self
+            .sharegpt_selection_pool_size
+            .map(|size| size as usize)
+            .unwrap_or(required);
+        if pool == 0 || pool < required {
+            return Err(FerrumError::model(
+                "--sharegpt-selection-pool-size must be positive and at least warmup + measured requests",
+            ));
+        }
+        Ok(pool)
+    }
+
     fn filter(&self) -> ShareGptFilter {
         ShareGptFilter {
             min_input_tokens: self.sharegpt_min_input_tokens,
@@ -70,12 +88,24 @@ impl ShareGptArgs {
 
 pub(super) fn validate(cmd: &BenchServeCommand) -> Result<()> {
     if cmd.dataset != "sharegpt" {
+        if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
+            return Err(FerrumError::model(
+                "--sharegpt-selection-pool-size requires --dataset sharegpt",
+            ));
+        }
         return Ok(());
     }
     if cmd.sharegpt_path.is_none() || cmd.seed.is_none() {
         return Err(FerrumError::model(
             "--dataset sharegpt requires --sharegpt-path and --seed",
         ));
+    }
+    if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
+        let required = cmd
+            .num_prompts
+            .checked_add(cmd.warmup_requests)
+            .ok_or_else(|| FerrumError::model("ShareGPT sample count overflow"))?;
+        cmd.sharegpt.pool_size(required as usize)?;
     }
     let f = cmd.sharegpt.filter();
     if f.min_input_tokens == 0
@@ -132,6 +162,7 @@ pub(super) fn load(
     count: usize,
 ) -> Result<(Vec<PromptCase>, ShareGptDatasetEvidence)> {
     validate(cmd)?;
+    let pool_size = cmd.sharegpt.pool_size(count)?;
     let mut unbounded_tokenizer = tok.clone();
     unbounded_tokenizer
         .with_truncation(None)
@@ -148,9 +179,9 @@ pub(super) fn load(
         tok,
         filter: &filter,
         rng: &mut rng,
-        count,
+        count: pool_size,
         counts: ShareGptCounts::default(),
-        selected: Vec::with_capacity(count),
+        selected: Vec::with_capacity(pool_size),
     };
     let receipt = visit_sharegpt_records(file, ShareGptReadLimits::default(), |index, record| {
         if index != selector.counts.records {
@@ -168,14 +199,15 @@ pub(super) fn load(
         }
     })?;
     let source_sha256 = receipt.source_sha256;
-    if selector.selected.len() != count {
+    if selector.selected.len() != pool_size {
         return Err(FerrumError::model(format!(
-            "ShareGPT has {} eligible records, but {count} distinct warmup+measured records are required; no repetition or truncation is allowed; source_sha256={source_sha256}; counts={}",
+            "ShareGPT has {} eligible records, but {pool_size} distinct selection-pool records are required for {count} warmup+measured requests; no repetition or truncation is allowed; source_sha256={source_sha256}; counts={}",
             selector.counts.eligible,
             serde_json::to_string(&selector.counts).expect("serialize counts")
         )));
     }
     selector.selected.shuffle(selector.rng);
+    selector.selected.truncate(count);
     let mut prompts = Vec::with_capacity(count);
     let mut samples = Vec::with_capacity(count);
     for (index, (prompt, mut sample)) in selector.selected.into_iter().enumerate() {
@@ -207,7 +239,13 @@ pub(super) fn load(
         filter,
         counts,
         prompt_seed: seed,
-        sampling: "reservoir_without_replacement_then_shuffle_v1".into(),
+        sampling: if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
+            "reservoir_without_replacement_then_shuffle_prefix_v1"
+        } else {
+            "reservoir_without_replacement_then_shuffle_v1"
+        }
+        .into(),
+        selection_pool_size: cmd.sharegpt.sharegpt_selection_pool_size,
         ignore_eos: cmd.ignore_eos,
         enable_thinking: cmd.enable_thinking,
         repeats: vec![ShareGptSelection {
@@ -229,9 +267,11 @@ pub(super) fn append_evidence(
             || first.tokenizer_sha256 != next.tokenizer_sha256
             || first.counts != next.counts
             || first.filter != next.filter
+            || first.sampling != next.sampling
+            || first.selection_pool_size != next.selection_pool_size
         {
             return Err(FerrumError::model(
-                "ShareGPT dataset/tokenizer changed between repeats",
+                "ShareGPT dataset/tokenizer or selection settings changed between repeats",
             ));
         }
         first.repeats.append(&mut next.repeats);

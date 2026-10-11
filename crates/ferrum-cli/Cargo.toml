@@ -106,11 +106,15 @@ interactive = [] # Enable interactive mode
 accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches PyTorch precision)
 metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/metal"]  # Apple GPU
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
+cuda-upstream-linear = ["cuda", "ferrum-kernels/cuda-upstream-linear"] # Explicit locked upstream quantized projection artifact.
+cuda-upstream-extra-linear = ["cuda-upstream-linear", "ferrum-kernels/cuda-upstream-extra-linear"] # Independent locked extra-format artifact.
+cuda-upstream-q6-f32-linear = ["cuda-upstream-extra-linear", "ferrum-kernels/cuda-upstream-q6-f32-linear"] # Independent locked Q6 F32 head artifact.
 candle-cuda-compat = ["cuda", "ferrum-engine/candle-cuda-compat", "ferrum-kernels/candle-cuda-compat"]
 marlin = ["cuda"]  # backward compat alias
 vllm-marlin = ["cuda", "ferrum-kernels/vllm-marlin"]  # Phase 12 — vLLM gptq_marlin port (opt-in)
 vllm-moe-marlin = ["cuda", "ferrum-kernels/vllm-moe-marlin"]  # Stage 14 — vLLM marlin_moe_wna16 port (opt-in)
 vllm-paged-attn-v2 = ["cuda", "ferrum-kernels/vllm-paged-attn-v2"]  # 2026-05-12 — vLLM paged_attention_v2 port (opt-in, runtime-gated via FERRUM_USE_VLLM_PAGED_ATTN=1)
+cuda-indexed-causal-attention = ["vllm-paged-attn-v2", "ferrum-kernels/cuda-indexed-causal-attention", "ferrum-engine/cuda-indexed-causal-attention", "ferrum-models/cuda-indexed-causal-attention"]
 fa2-source = ["cuda", "ferrum-kernels/fa2-source"]  # Obsolete compatibility alias; FA2 now requires a native operator artifact.
 native-op-artifact = ["cuda", "ferrum-kernels/native-op-artifact"]  # Consume explicit Ferrum native operator artifact manifests during CUDA builds.
 tensor-parallel = ["cuda"]  # backward compat alias

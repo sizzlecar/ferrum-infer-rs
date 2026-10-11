@@ -38,9 +38,9 @@ use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
-    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RequestId, Result,
-    ReusableExecutionCaptureConfig, ReusableExecutionPreparationMode, SchedulingPolicy,
-    SequenceFitPolicy, TokenId, VNextDiagnosticFault,
+    InvocationPreparationStrategy, ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint,
+    RequestId, Result, ReusableExecutionCaptureConfig, ReusableExecutionPreparationMode,
+    SchedulingPolicy, SequenceFitPolicy, TokenId, VNextDiagnosticFault,
     MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH,
 };
 use parking_lot::{Mutex, RwLock};
@@ -63,11 +63,14 @@ use super::{
 mod backing_maintenance;
 mod composition;
 mod determinism;
+mod invocation_preparation;
 mod mixed_batch;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
+mod program_binding_upload;
 mod request;
 mod reusable_catalog;
+mod reusable_cold_path;
 mod state_memory;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -531,6 +534,7 @@ pub struct VNextExecutorConfig {
     pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
+    pub invocation_preparation_strategy: InvocationPreparationStrategy,
     pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
@@ -793,6 +797,7 @@ impl VNextExecutorConfig {
             startup_memory_plan: engine.runtime.startup_memory_plan.clone(),
             static_initialization,
             runtime_policy,
+            invocation_preparation_strategy: engine.runtime.invocation_preparation_strategy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
@@ -1398,6 +1403,8 @@ impl VNextReusableExecutionCatalogMissLedger {
 #[derive(Default)]
 struct VNextExecutorMetrics {
     prefix_cache: Arc<prefix_cache::PrefixCacheMetrics>,
+    invocation_preparation: invocation_preparation::PreparationMetrics,
+    program_binding_upload: program_binding_upload::ProgramBindingUploadMetrics,
     prefill_operations: AtomicU64,
     prefill_frontier_narrowings: AtomicU64,
     decode_operations: AtomicU64,
@@ -1413,6 +1420,7 @@ struct VNextExecutorMetrics {
     reusable_catalog_misses: AtomicU64,
     reusable_catalog_epoch_misses: AtomicU64,
     reusable_catalog_miss_ledger: Mutex<VNextReusableExecutionCatalogMissLedger>,
+    reusable_cold_path: reusable_cold_path::Ledger,
     identity_waves: AtomicU64,
     identity_logical_nodes: AtomicU64,
     identity_nodes_materialized_before_submit: AtomicU64,
@@ -2114,6 +2122,18 @@ struct VNextWaveTimingMetrics {
     contract_validate_reserve: AtomicDurationMetrics,
     backing_input_encode: AtomicDurationMetrics,
     provider_node_encode: AtomicDurationMetrics,
+    segment_hit_provider_node_encode: AtomicDurationMetrics,
+    segment_binding_prepare_encode: AtomicDurationMetrics,
+    segment_fresh_authority_windows: AtomicDurationMetrics,
+    segment_backing_permit_metadata: AtomicDurationMetrics,
+    segment_backing_snapshot_lookup: AtomicDurationMetrics,
+    segment_backing_dedup_reserve_pool_resolution: AtomicDurationMetrics,
+    segment_backing_lock_acquisition: AtomicDurationMetrics,
+    segment_backing_locked_validation: AtomicDurationMetrics,
+    segment_backing_window_intersections: AtomicDurationMetrics,
+    segment_backing_immutable_metadata_validation: AtomicDurationMetrics,
+    segment_node_dependencies_regions: AtomicDurationMetrics,
+    segment_backend_encode_validate: AtomicDurationMetrics,
     node_identity_materialize: AtomicDurationMetrics,
     node_invocation_construct: AtomicDurationMetrics,
     provider_dynamic_binding_encode: AtomicDurationMetrics,
@@ -2223,12 +2243,15 @@ impl VNextWaveTimingMetrics {
                     "contract_validate_reserve": self.contract_validate_reserve.snapshot(),
                     "backing_input_encode": self.backing_input_encode.snapshot(),
                     "provider_node_encode": self.provider_node_encode.snapshot(),
+                    "segment_hit_provider_node_encode": self.segment_hit_provider_node_encode.snapshot(),
                     "provider_node_encode_breakdown": {
                         "collection": "profile_attached_only",
                         "identity_materialize": self.node_identity_materialize.snapshot(),
                         "invocation_construct": self.node_invocation_construct.snapshot(),
                         "dynamic_binding_encode": self.provider_dynamic_binding_encode.snapshot(),
                         "binding_validate_coalesce": self.binding_validate_coalesce.snapshot(),
+                        "segment_binding_prepare_encode": self.segment_binding_prepare_encode.snapshot(),
+                        "segment_binding_prepare_encode_breakdown": self.segment_binding_prepare_encode_breakdown(),
                     },
                     "lane_reserve_submit_arm": self.lane_reserve_submit_arm.snapshot(),
                     "lane_reserve_submit_arm_breakdown": {
@@ -2257,6 +2280,10 @@ impl VNextWaveTimingMetrics {
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
                 "provider_node_encode children sample node or patch operations, not waves; compare total_ns over parent wave samples rather than adding child averages",
+                "segment_hit_provider_node_encode is the overlapping subset of fully encoded hit waves, not an additive stage; segment_binding_prepare_encode measures hot-path attempts, including unsupported or failed attempts",
+                "segment_binding_prepare_encode children are mutually exclusive host intervals within that parent, not additional work; early returns record only entered stages and panic skips the active stage; compare child totals and sample counts before calculating shares",
+                "segment preparation includes pool lock waits, allocations and backend host calls, not pure CPU; errors may include local cleanup in the active child; successful parent residual includes timer transitions, sink recording, final local cleanup and dispatch result map/accounting; snapshots are not atomic",
+                "backing_permit_and_metadata children are nested, mutually exclusive host intervals, not additional work; only entered stages have samples and pool-stage observations are recorded after releasing pool guards, so compare counts and totals before calculating shares",
                 "identity_materialize includes one bulk identity materialization on eager waves; dynamic_binding_encode covers reusable binding payloads only; eager provider compute encoding and command assembly remain in the parent residual",
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
@@ -2264,6 +2291,29 @@ impl VNextWaveTimingMetrics {
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
             ],
+        })
+    }
+
+    fn segment_binding_prepare_encode_breakdown(&self) -> serde_json::Value {
+        serde_json::json!({
+            "collection": "profile_attached_only",
+            "fresh_authority_and_windows": self.segment_fresh_authority_windows.snapshot(),
+            "backing_permit_and_metadata": self.segment_backing_permit_metadata.snapshot(),
+            "backing_permit_and_metadata_breakdown": self.segment_backing_permit_metadata_breakdown(),
+            "node_dependencies_and_regions": self.segment_node_dependencies_regions.snapshot(),
+            "backend_encode_and_validate": self.segment_backend_encode_validate.snapshot(),
+        })
+    }
+
+    fn segment_backing_permit_metadata_breakdown(&self) -> serde_json::Value {
+        serde_json::json!({
+            "collection": "profile_attached_only",
+            "snapshot_lookup": self.segment_backing_snapshot_lookup.snapshot(),
+            "dedup_reserve_and_pool_resolution": self.segment_backing_dedup_reserve_pool_resolution.snapshot(),
+            "lock_acquisition": self.segment_backing_lock_acquisition.snapshot(),
+            "locked_validation": self.segment_backing_locked_validation.snapshot(),
+            "window_intersections": self.segment_backing_window_intersections.snapshot(),
+            "immutable_metadata_validation": self.segment_backing_immutable_metadata_validation.snapshot(),
         })
     }
 
@@ -2280,6 +2330,18 @@ impl VNextWaveTimingMetrics {
             &self.contract_validate_reserve,
             &self.backing_input_encode,
             &self.provider_node_encode,
+            &self.segment_hit_provider_node_encode,
+            &self.segment_binding_prepare_encode,
+            &self.segment_fresh_authority_windows,
+            &self.segment_backing_permit_metadata,
+            &self.segment_backing_snapshot_lookup,
+            &self.segment_backing_dedup_reserve_pool_resolution,
+            &self.segment_backing_lock_acquisition,
+            &self.segment_backing_locked_validation,
+            &self.segment_backing_window_intersections,
+            &self.segment_backing_immutable_metadata_validation,
+            &self.segment_node_dependencies_regions,
+            &self.segment_backend_encode_validate,
             &self.node_identity_materialize,
             &self.node_invocation_construct,
             &self.provider_dynamic_binding_encode,
@@ -2432,6 +2494,42 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
             }
             SubmissionWaveDispatchStage::ProviderNodeEncode => {
                 self.provider_node_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentHitProviderNodeEncode => {
+                self.segment_hit_provider_node_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode => {
+                self.segment_binding_prepare_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows => {
+                self.segment_fresh_authority_windows.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata => {
+                self.segment_backing_permit_metadata.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup => {
+                self.segment_backing_snapshot_lookup.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution => self
+                .segment_backing_dedup_reserve_pool_resolution
+                .record(elapsed),
+            SubmissionWaveDispatchStage::SegmentBackingLockAcquisition => {
+                self.segment_backing_lock_acquisition.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingLockedValidation => {
+                self.segment_backing_locked_validation.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingWindowIntersections => {
+                self.segment_backing_window_intersections.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation => self
+                .segment_backing_immutable_metadata_validation
+                .record(elapsed),
+            SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions => {
+                self.segment_node_dependencies_regions.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate => {
+                self.segment_backend_encode_validate.record(elapsed)
             }
             SubmissionWaveDispatchStage::NodeIdentityMaterialize => {
                 self.node_identity_materialize.record(elapsed)
@@ -2767,6 +2865,7 @@ impl VNextExecutorMetrics {
 
     fn reset_after_startup(&self) {
         self.prefix_cache.reset();
+        self.invocation_preparation.reset();
         for counter in [
             &self.prefill_operations,
             &self.prefill_frontier_narrowings,
@@ -2810,6 +2909,7 @@ impl VNextExecutorMetrics {
         self.wave_timing.reset();
         self.prepared_wave_topology.reset();
         self.reusable_catalog_miss_ledger.lock().reset();
+        self.reusable_cold_path.reset();
         self.prefill_wave_timing.reset();
         self.decode_wave_timing.reset();
         self.mixed_wave_timing.reset();
@@ -4505,6 +4605,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     runtime: Arc<R>,
     providers: BoundOperationProviderSet<R>,
     policy: ResolvedRuntimePolicy,
+    invocation_preparation_strategy: InvocationPreparationStrategy,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
     submission_wave_identity: CompiledSubmissionWaveIdentity,
@@ -5055,6 +5156,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             })
             .transpose()?;
 
+        let metrics = VNextExecutorMetrics::default();
+        metrics
+            .program_binding_upload
+            .reset_baseline(runtime.program_binding_upload_snapshot());
         Ok(Self {
             info,
             resolved_plan,
@@ -5062,6 +5167,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             runtime,
             providers,
             policy: config.runtime_policy,
+            invocation_preparation_strategy: config.invocation_preparation_strategy,
             plan_resources,
             lane,
             submission_wave_identity,
@@ -5093,7 +5199,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             diagnostic_fault: config.diagnostic_fault,
             diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
-            metrics: VNextExecutorMetrics::default(),
+            metrics,
         })
     }
 
@@ -5773,6 +5879,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // the first product wave establishes and accounts for its own upload.
         self.product_token_mask_residency.lock().clear();
         self.metrics.reset_after_startup();
+        self.metrics
+            .program_binding_upload
+            .reset_baseline(self.runtime.program_binding_upload_snapshot());
         Ok(())
     }
 
@@ -7223,6 +7332,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        mut cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7453,11 +7563,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .wave_identity_bind
                     .start_if(timing_enabled);
                 let _phase_timing = phase_timing.wave_identity_bind.start_if(timing_enabled);
-                OperationDispatch::bind_compiled_submission_wave_identity(
+                OperationDispatch::bind_compiled_submission_wave_identity_with_preparation(
                     &self.submission_wave_identity,
                     active_bindings(),
                     &wave,
                     &self.lane,
+                    self.invocation_preparation_strategy,
                 )
             } {
                 Ok(identity) => identity,
@@ -7472,6 +7583,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let mut reusable_catalog_miss = None;
             let catalog_snapshot = self.reusable_execution_catalog.read().clone();
             let catalog = catalog_snapshot.as_deref();
+            let mut diagnostic_program_id = None;
             let reusable_program = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
                 catalog.is_some(),
@@ -7493,6 +7605,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 };
                 match program_id {
                     Some(program_id) => {
+                        if cold_wave.is_some() {
+                            diagnostic_program_id = Some(program_id.clone());
+                        }
                         if catalog.is_none() {
                             self.record_startup_reusable_program(participants, kind, &program_id);
                         }
@@ -7569,16 +7684,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     program.per_wave_binding_node_indices().len() as u64,
                 )
             });
+            let observation = timing_enabled.then(|| {
+                reusable_cold_path::AttemptObservation::new(
+                    &timing_sink,
+                    diagnostic_program_id,
+                    self.lane.reusable_execution_epoch(),
+                    catalog.map(|catalog| catalog.lane_epoch),
+                    reusable_catalog_miss.map(|miss| miss.reason),
+                )
+            });
+            let mut provider_elapsed = None;
             let submission = {
-                let _timing = self
+                let timing = self
                     .metrics
                     .wave_timing
                     .provider_encode_submit
                     .start_if(timing_enabled);
-                let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
-                if let Some(reusable_program) = reusable_program {
-                    if timing_enabled {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
+                let phase_timer = phase_timing.provider_encode_submit.start_if(timing_enabled);
+                let submission = if let Some(reusable_program) = reusable_program {
+                    if let Some(timing_sink) = observation.as_ref() {
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
@@ -7587,14 +7712,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             &uploads,
                             reusable_program,
                             execution_policy,
-                            &timing_sink,
+                            self.invocation_preparation_strategy,
+                            timing_sink,
+                            &self.metrics.invocation_preparation,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
                         .map(ProfiledSubmissionHandle::into_parts)
                     } else {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
@@ -7602,14 +7729,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             device_timing_mode,
                             &uploads,
                             reusable_program,
+                            execution_policy,
+                            self.invocation_preparation_strategy,
+                            &invocation_preparation::DisabledTiming,
+                            &self.metrics.invocation_preparation,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
-                        .map(|completion| (completion, None))
+                        .map(|profiled| (profiled.into_parts().0, None))
                     }
-                } else if timing_enabled {
-                    OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+                } else if let Some(timing_sink) = observation.as_ref() {
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
@@ -7617,27 +7748,70 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         device_timing_mode,
                         &uploads,
                         execution_policy,
-                        &timing_sink,
+                        self.invocation_preparation_strategy,
+                        timing_sink,
+                        &self.metrics.invocation_preparation,
                         wave,
                         &self.lane,
                         &self.reaper,
                     )
                     .map(ProfiledSubmissionHandle::into_parts)
                 } else {
-                    OperationDispatch::encode_and_submit_wave_with_inputs(
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
                         active_bindings(),
                         device_timing_mode,
                         &uploads,
+                        execution_policy,
+                        self.invocation_preparation_strategy,
+                        &invocation_preparation::DisabledTiming,
+                        &self.metrics.invocation_preparation,
                         wave,
                         &self.lane,
                         &self.reaper,
                     )
-                    .map(|completion| (completion, None))
+                    .map(|profiled| (profiled.into_parts().0, None))
+                };
+                drop(phase_timer);
+                if cold_wave.is_some() {
+                    provider_elapsed = timing.and_then(|timer| timer.finish());
                 }
+                submission
             };
+            if let (Some(cold_wave), Some(observation)) = (cold_wave.as_mut(), observation) {
+                let outcome = match &submission {
+                    Ok(_) => reusable_cold_path::Outcome::Submitted,
+                    Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { .. }) => {
+                        reusable_cold_path::Outcome::DefinitelyNotSubmitted
+                    }
+                    Err(SubmissionWaveDispatchError::Contract(_)) => {
+                        reusable_cold_path::Outcome::ContractError
+                    }
+                    Err(SubmissionWaveDispatchError::Provider(_)) => {
+                        reusable_cold_path::Outcome::ProviderError
+                    }
+                    Err(SubmissionWaveDispatchError::Initialization(_)) => {
+                        reusable_cold_path::Outcome::InitializationError
+                    }
+                    Err(SubmissionWaveDispatchError::InputUpload(_)) => {
+                        reusable_cold_path::Outcome::InputUploadError
+                    }
+                    Err(SubmissionWaveDispatchError::SubmissionIndeterminate { .. }) => {
+                        reusable_cold_path::Outcome::SubmissionIndeterminate
+                    }
+                    Err(SubmissionWaveDispatchError::PostSubmitContract { .. }) => {
+                        reusable_cold_path::Outcome::PostSubmitContract
+                    }
+                };
+                cold_wave.record_attempt(
+                    observation,
+                    identity.preparation_snapshot(),
+                    outcome,
+                    provider_elapsed,
+                );
+            }
             match submission {
                 Ok((completion, attribution)) => {
                     let identity_materialization = identity.materialization_snapshot();
@@ -8026,9 +8200,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
+        let mut cold_wave = self
+            .metrics
+            .reusable_cold_path
+            .begin(self.host_dispatch_timing_enabled(), kind);
         let (mut token_mask_residency, dispatch) = {
-            let _timing = self.metrics.wave_timing.host_encode_submit.start();
-            let _phase_timing = phase_timing.host_encode_submit.start();
+            let timing = self.metrics.wave_timing.host_encode_submit.start();
+            let phase_timer = phase_timing.host_encode_submit.start();
             // Product-fixed inputs live in the lane-stable Step arena. One Step
             // slot lease is exclusive through terminal completion, while a
             // released slot retains its physical backing for later waves. Bind
@@ -8060,7 +8238,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 kind,
                 output_mode,
                 token_mask_residency.plans(),
+                cold_wave.as_mut(),
             );
+            drop(phase_timer);
+            if let Some(cold_wave) = cold_wave.take() {
+                cold_wave.finish(
+                    timing.finish(),
+                    reusable_cold_path::Outcome::from_dispatch(&dispatch),
+                );
+            }
             (token_mask_residency, dispatch)
         };
         let mut execution_event_error = None;
@@ -8184,6 +8370,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
+        // Take the optional hint before the completion handle moves to the
+        // worker. The ticket owns no Step or Sequence resources.
+        let segment_publication = completion.take_segment_binding_publication();
         let reaper = Arc::clone(&self.reaper);
         let observation = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
@@ -8310,6 +8499,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             self.metrics.record_failure(message.clone());
             return Err(FerrumError::resource_exhausted(message));
         }
+        // Only this successful, non-diagnostic terminal may qualify a hint.
+        // Readback/output/event/retirement failures below still discard it.
+        let ready_segment_publication =
+            segment_publication.and_then(|ticket| ticket.bind_completion(receipt.completion()));
         let processed = (|| -> Result<(
             Vec<ExecutorSamplingOutput>,
             u64,
@@ -8525,13 +8718,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         drop(receipt);
         match step.try_retire_normal() {
-            Ok(_) => {
+            Ok(retirement) => {
                 self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
                 if let Some(error) = execution_event_error {
                     let message = format!("vNext execution event emission failed: {error}");
                     self.metrics.record_failure(message.clone());
                     Err(FerrumError::backend(message))
                 } else {
+                    if let Some(ready) = ready_segment_publication {
+                        // Publication checks exact retirement and current entry.
+                        // A stale or cancelled hint cannot fail a completed wave.
+                        let _ = ready.publish(&retirement);
+                    }
                     Ok(logits)
                 }
             }
@@ -9795,6 +9993,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "catalog_misses": self.metrics.reusable_catalog_misses.load(Ordering::Relaxed),
                     "catalog_epoch_misses": self.metrics.reusable_catalog_epoch_misses.load(Ordering::Relaxed),
                     "catalog_miss_ledger": self.metrics.reusable_catalog_miss_ledger.lock().snapshot(),
+                    "cold_path": self.metrics.reusable_cold_path.snapshot(),
                 },
                 "identity_materialization": {
                     "waves": self.metrics.identity_waves.load(Ordering::Relaxed),
@@ -9840,6 +10039,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // values, including disabled/zero, so text-LCP fallback cannot stand in
         // for sequence checkpoint reuse on this executor.
         fields.extend(self.prefix_cache_metrics_snapshot());
+        fields.insert(
+            "program_binding_upload".to_owned(),
+            self.metrics
+                .program_binding_upload
+                .snapshot(self.runtime.program_binding_upload_snapshot()),
+        );
+        fields.insert(
+            "invocation_preparation".to_owned(),
+            self.metrics.invocation_preparation.snapshot(),
+        );
+        fields.insert(
+            "invocation_preparation_strategy".to_owned(),
+            serde_json::json!(self.invocation_preparation_strategy),
+        );
         fields.insert(
             "attention_execution_policy".to_owned(),
             serde_json::json!(self.policy.attention_execution()),
@@ -11313,6 +11526,46 @@ mod tests {
                 SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 "binding_validate_coalesce",
             ),
+            (
+                SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+                "segment_binding_prepare_encode_breakdown/fresh_authority_and_windows",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/snapshot_lookup",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/dedup_reserve_and_pool_resolution",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/lock_acquisition",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/locked_validation",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingWindowIntersections,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/window_intersections",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation,
+                "segment_binding_prepare_encode_breakdown/backing_permit_and_metadata_breakdown/immutable_metadata_validation",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+                "segment_binding_prepare_encode_breakdown/node_dependencies_and_regions",
+            ),
+            (
+                SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
+                "segment_binding_prepare_encode_breakdown/backend_encode_and_validate",
+            ),
         ];
         for (index, (stage, _)) in stages.iter().enumerate() {
             sink.record(*stage, Duration::from_nanos(100 + index as u64));
@@ -11327,20 +11580,54 @@ mod tests {
             let snapshot = child(metrics);
             assert_eq!(snapshot["collection"], "profile_attached_only");
             for (index, (_, field)) in stages.iter().enumerate() {
-                assert_eq!(snapshot[field]["samples"], 2);
-                assert_eq!(snapshot[field]["total_ns"], 300 + 2 * index as u64);
+                let sample = snapshot.pointer(&format!("/{field}")).unwrap();
+                assert_eq!(sample["samples"], 2);
+                assert_eq!(sample["total_ns"], 300 + 2 * index as u64);
             }
             // Recording a nested interval does not invent a parent wave sample.
             assert_eq!(metrics.snapshot()["submitted_wave_total"]["samples"], 0);
             metrics.reset();
             for (_, field) in stages {
-                assert_eq!(child(metrics)[field]["samples"], 0);
-                assert_eq!(child(metrics)[field]["total_ns"], 0);
+                let snapshot = child(metrics);
+                let sample = snapshot.pointer(&format!("/{field}")).unwrap();
+                assert_eq!(sample["samples"], 0);
+                assert_eq!(sample["total_ns"], 0);
             }
         }
         for (_, field) in stages {
-            assert_eq!(child(&other_phase)[field]["samples"], 0);
+            assert_eq!(
+                child(&other_phase).pointer(&format!("/{field}/samples")),
+                Some(&serde_json::json!(0))
+            );
         }
+    }
+
+    #[test]
+    fn wave_timing_backing_partial_observations_keep_independent_parent_samples() {
+        use super::{SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink};
+
+        let metrics = VNextWaveTimingMetrics::default();
+        metrics.record(
+            SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+            Duration::from_nanos(11),
+        );
+        metrics.record(
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+            Duration::from_nanos(100),
+        );
+        metrics.record(
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+            Duration::from_nanos(200),
+        );
+
+        let snapshot = metrics.segment_binding_prepare_encode_breakdown();
+        assert_eq!(snapshot["backing_permit_and_metadata"]["samples"], 2);
+        assert_eq!(snapshot["backing_permit_and_metadata"]["total_ns"], 300);
+        let children = &snapshot["backing_permit_and_metadata_breakdown"];
+        assert_eq!(children["snapshot_lookup"]["samples"], 1);
+        assert_eq!(children["snapshot_lookup"]["total_ns"], 11);
+        assert_eq!(children["lock_acquisition"]["samples"], 0);
+        assert_eq!(children["immutable_metadata_validation"]["samples"], 0);
     }
 
     #[test]

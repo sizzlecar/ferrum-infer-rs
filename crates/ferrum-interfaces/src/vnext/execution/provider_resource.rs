@@ -21,6 +21,8 @@ pub struct ProviderResourcePlan {
     pub(super) scratch: Option<ProviderWorkspaceRequirement>,
     pub(super) binding: Option<ProviderWorkspaceRequirement>,
     pub(super) persistent: Option<ProviderWorkspaceRequirement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) projection_numerics: Option<crate::vnext::PreparedProjectionNumerics>,
 }
 
 impl ProviderResourcePlan {
@@ -53,6 +55,7 @@ impl ProviderResourcePlan {
             scratch: estimate.scratch().cloned(),
             binding: estimate.binding().cloned(),
             persistent: estimate.persistent().cloned(),
+            projection_numerics: estimate.projection_numerics().cloned(),
         };
         plan.validate_fields()?;
         plan.estimate_fingerprint = plan.compute_estimate_fingerprint()?;
@@ -139,6 +142,7 @@ impl ProviderResourcePlan {
                 scratch: &self.scratch,
                 binding: &self.binding,
                 persistent: &self.persistent,
+                projection_numerics: &self.projection_numerics,
             },
             "fingerprint provider resource estimate",
         )
@@ -183,6 +187,10 @@ impl ProviderResourcePlan {
     pub fn persistent(&self) -> Option<&ProviderWorkspaceRequirement> {
         self.persistent.as_ref()
     }
+
+    pub fn projection_numerics(&self) -> Option<&crate::vnext::PreparedProjectionNumerics> {
+        self.projection_numerics.as_ref()
+    }
 }
 
 #[derive(Serialize)]
@@ -196,4 +204,6 @@ pub(super) struct ProviderEstimateFingerprintMaterial<'a> {
     pub(super) scratch: &'a Option<ProviderWorkspaceRequirement>,
     pub(super) binding: &'a Option<ProviderWorkspaceRequirement>,
     pub(super) persistent: &'a Option<ProviderWorkspaceRequirement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) projection_numerics: &'a Option<crate::vnext::PreparedProjectionNumerics>,
 }

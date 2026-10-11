@@ -186,6 +186,8 @@ pub struct UnvalidatedProviderResourcePlan {
     pub(super) scratch: Option<ProviderWorkspaceRequirement>,
     pub(super) binding: Option<ProviderWorkspaceRequirement>,
     pub(super) persistent: Option<ProviderWorkspaceRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) projection_numerics: Option<crate::vnext::PreparedProjectionNumerics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

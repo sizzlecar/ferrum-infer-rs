@@ -84,6 +84,39 @@ fn validate_program_binding_patch(
     Ok(())
 }
 
+fn validate_segment_program_binding_patch(
+    resolved: &dyn ExecutablePlanView,
+    node_index: usize,
+    program_binding: Option<&ProgramBindingNodeBinding>,
+    count: usize,
+    resources: &mut BTreeSet<ResourceId>,
+) -> Result<(), VNextError> {
+    if program_binding.is_some() != (count == 1) {
+        return Err(invalid_operation(
+            "segment binding patch cardinality differs from its current slot",
+        ));
+    }
+    let Some(binding) = program_binding else {
+        return Ok(());
+    };
+    let node = resolved
+        .execution_plan()
+        .payload()
+        .nodes()
+        .get(node_index)
+        .ok_or_else(|| invalid_operation("segment program binding has no Plan node"))?;
+    if binding.node_index() != node_index
+        || binding.slot().node_id() != node.id()
+        || Some(binding.slot().resource_id()) != node.binding_resource()
+        || !resources.insert(binding.slot().resource_id().clone())
+    {
+        return Err(invalid_operation(
+            "segment program binding differs from its exact current slot",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_determinism_replay_coverage(
     program: &DeviceReusableExecutionProgram,
     node_count: usize,
@@ -814,8 +847,9 @@ impl OperationDispatch {
                 &mut commands,
             )?;
         }
+        let dependency_scope = invocation.retained_dependency_scope.clone();
         let expected_phase = invocation.operation().profile_phase;
-        let operation = match provider.provider().encode_selected(invocation) {
+        let mut operation = match provider.provider().encode_selected(invocation) {
             Ok(operation) => operation,
             Err(failure)
                 if batch_identity.contains_identity(failure.identity())
@@ -833,6 +867,25 @@ impl OperationDispatch {
             return Err(OperationDispatchError::Contract(invalid_operation(
                 "operation encode completion runtime drifted",
             )));
+        }
+        let mut dependency_identities = Vec::new();
+        let mut dependency_commands = Vec::new();
+        let mut dependency_leases = Vec::new();
+        super::retained_dependency::append_dependencies(
+            &dependency_scope,
+            operation.take_retained_plan_dependencies(),
+            &mut dependency_identities,
+            &mut dependency_commands,
+            &mut dependency_leases,
+        )
+        .map_err(OperationDispatchError::Contract)?;
+        completion
+            .invocation()
+            .step_resources()
+            .retain_plan_dependencies(dependency_leases)
+            .map_err(OperationDispatchError::Contract)?;
+        for command in dependency_commands {
+            commands.push_dynamic_binding(command);
         }
         commands.push_operation(0, operation);
         let timing_mode = commands.timing_mode();
@@ -1003,6 +1056,54 @@ impl OperationDispatch {
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
         S: SubmissionWaveDispatchTimingSink,
     {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            None,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_inputs_and_preparation<'binding, R, I, S, P>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        strategy: ferrum_types::InvocationPreparationStrategy,
+        timing_sink: &S,
+        preparation_sink: &P,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+        P: super::InvocationPreparationSink,
+    {
+        let _observation = super::preparation::PreparationObservation {
+            identity: batch_identity,
+            sink: preparation_sink,
+        };
+        if batch_identity.preparation_strategy() != strategy {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "identity preparation strategy differs from the fresh wave binding",
+            )));
+        }
         Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
@@ -1255,6 +1356,55 @@ impl OperationDispatch {
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
         S: SubmissionWaveDispatchTimingSink,
     {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            Some(reusable_program),
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_reusable_wave_with_inputs_and_preparation<'binding, R, I, S, P>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: &DeviceReusableExecutionProgram,
+        execution_policy: SubmissionExecutionPolicy,
+        strategy: ferrum_types::InvocationPreparationStrategy,
+        timing_sink: &S,
+        preparation_sink: &P,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+        P: super::InvocationPreparationSink,
+    {
+        let _observation = super::preparation::PreparationObservation {
+            identity: batch_identity,
+            sink: preparation_sink,
+        };
+        if batch_identity.preparation_strategy() != strategy {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "identity preparation strategy differs from the fresh wave binding",
+            )));
+        }
         Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
@@ -1541,9 +1691,164 @@ impl OperationDispatch {
         let pre_provider_command_count = commands.len();
         let mut encoded_provider_command_count = 0_usize;
         let mut program_bindings = Vec::new();
+        let mut retained_dependencies = Vec::new();
+        let mut retained_dependency_commands = Vec::new();
+        let mut retained_dependency_leases = Vec::new();
         let mut program_binding_resources = BTreeSet::new();
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
+        let use_compiled_segment = batch_identity.preparation_strategy()
+            == ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram;
+        let use_segment = batch_identity.preparation_strategy().uses_decode_segment()
+            && determinism_restore.is_none()
+            && completion
+                .wave()
+                .nodes()
+                .iter()
+                .enumerate()
+                .all(|(index, node)| node.plan_node_index() == index);
+        let mut segment_recipe = if use_segment {
+            reusable_program
+                .map(|program| lane.lookup_segment_binding_recipe(program.program_id()))
+                .transpose()
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .flatten()
+        } else {
+            None
+        };
+        if use_segment && segment_recipe.is_none() {
+            batch_identity.record_segment_miss_reason(if reusable_program.is_none() {
+                super::preparation::SegmentPreparationMissReason::NoResidentProgram
+            } else {
+                super::preparation::SegmentPreparationMissReason::NoCachedRecipe
+            });
+        }
+        // A compiled prelude replaces all binding uploads in this wave. A
+        // resident segment may coexist with an eager binding node; that legal
+        // mixed wave still needs the ordinary typed-patch coalescing path.
+        // Decide before consuming any fresh frame/dependency authority. Keep
+        // the cached recipe intact: another wave can still cover it exactly.
+        let compiled_partial_binding_coverage = use_compiled_segment
+            && segment_recipe.as_ref().is_some_and(|recipe| {
+                completion.wave().nodes().iter().any(|node| {
+                    let index = node.plan_node_index();
+                    completion
+                        .wave()
+                        .claimed_backing()
+                        .program_binding_node(index)
+                        .is_some()
+                        && recipe
+                            .nodes
+                            .binary_search_by_key(&index, |node| node.node_index)
+                            .is_err()
+                })
+            });
+        if compiled_partial_binding_coverage {
+            batch_identity.record_segment_miss_reason(
+                super::preparation::SegmentPreparationMissReason::UnsupportedEncoder,
+            );
+            segment_recipe = None;
+        }
+        let mut compiled_binding_nodes = BTreeSet::new();
+        let mut segment_encoded = if let Some(recipe) = &segment_recipe {
+            let _segment_stage = SubmissionWaveDispatchStageTimer::start(
+                timing_sink,
+                SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode,
+            );
+            let prepared = if use_compiled_segment {
+                super::segment_dispatch::encode_compiled_segment_wave_with_timing(
+                    runtime,
+                    resolved,
+                    batch_identity,
+                    completion.wave(),
+                    active_bindings.clone(),
+                    recipe,
+                    timing_sink,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .map(|(mut program, facts)| {
+                    let expected = recipe.nodes.iter().filter(|node| {
+                        completion.wave().claimed_backing().program_binding_node(node.node_index).is_some()
+                    }).map(|node| {
+                        u32::try_from(node.node_index).map_err(|_| {
+                            SubmissionWaveDispatchError::Contract(invalid_operation(
+                                "compiled segment binding node index exceeds u32",
+                            ))
+                        })
+                    }).collect::<Result<Vec<_>, _>>()?;
+                    if program.program_binding_nodes != expected
+                        || program.program_bindings.len() != usize::from(!expected.is_empty())
+                        || program.nodes.iter().any(|node| node.bindings.program_binding_count() != 0)
+                    {
+                        return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "compiled segment prelude does not cover the current binding nodes exactly",
+                        )));
+                    }
+                    super::segment_oracle::audit_compiled_segment_wave(
+                        runtime, providers, resolved, batch_identity, completion.wave(),
+                        active_bindings.clone(), &program,
+                    )?;
+                    compiled_binding_nodes.extend(expected.into_iter().map(|index| index as usize));
+                    program_bindings.append(&mut program.program_bindings);
+                    Ok((program.nodes, facts))
+                }).transpose()?
+            } else {
+                super::segment_dispatch::encode_segment_wave_with_timing(
+                    runtime,
+                    resolved,
+                    batch_identity,
+                    completion.wave(),
+                    active_bindings.clone(),
+                    recipe,
+                    timing_sink,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+            };
+            prepared.map(|(nodes, facts)| {
+                batch_identity.record_segment_preparation(
+                    true,
+                    nodes.len() as u64,
+                    facts.dynamic_resource_requests,
+                    facts.unique_physical_buffers,
+                );
+                nodes
+                    .into_iter()
+                    .map(|node| (node.node_index, node))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+        } else {
+            None
+        };
+        if let Some(encoded) = &segment_encoded {
+            if !use_compiled_segment {
+                super::segment_oracle::audit_segment_wave(
+                    runtime,
+                    providers,
+                    resolved,
+                    batch_identity,
+                    completion.wave(),
+                    active_bindings.clone(),
+                    encoded,
+                )?;
+            }
+        }
+        if segment_encoded.is_none() {
+            segment_recipe = None;
+            if use_segment {
+                batch_identity.record_segment_preparation(false, 0, 0, 0);
+            }
+        }
+        let segment_cold_entry =
+            if use_segment && segment_recipe.is_none() && !compiled_partial_binding_coverage {
+                reusable_program
+                    .map(|program| lane.try_segment_binding_entry(program.program_id()))
+                    .transpose()
+                    .map_err(SubmissionWaveDispatchError::Contract)?
+                    .flatten()
+            } else {
+                None
+            };
+        let mut segment_declarations = Vec::new();
         if let Some(reusable_program) = reusable_program {
             let mut node_index = 0_usize;
             let mut segment_index = 0_usize;
@@ -1567,65 +1872,104 @@ impl OperationDispatch {
                                     "reusable execution binding node exceeds usize",
                                 ))
                             })?;
-                        let provider = &providers[binding_node_index];
-                        let identity_stage = SubmissionWaveDispatchStageTimer::start(
-                            timing_sink,
-                            SubmissionWaveDispatchStage::NodeIdentityMaterialize,
-                        );
-                        let node_identity = batch_identity
-                            .materialize_node(binding_node_index)
-                            .map_err(SubmissionWaveDispatchError::Contract)?;
-                        drop(identity_stage);
-                        let invocation_stage = SubmissionWaveDispatchStageTimer::start(
-                            timing_sink,
-                            SubmissionWaveDispatchStage::NodeInvocationConstruct,
-                        );
-                        let invocation = BatchedOperationInvocation::from_reusable_wave_node(
-                            runtime,
-                            resolved,
-                            provider.dispatch(),
-                            batch_identity,
-                            node_identity,
-                            completion.wave(),
-                            binding_node_index,
-                            active_bindings.clone(),
-                        )
-                        .map_err(SubmissionWaveDispatchError::Contract)?;
-                        drop(invocation_stage);
-                        let expected_phase = invocation.operation().profile_phase;
-                        let program_binding = invocation.program_binding().cloned();
-                        let binding_stage = SubmissionWaveDispatchStageTimer::start(
-                            timing_sink,
-                            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
-                        );
-                        let bindings = match provider
-                            .provider()
-                            .encode_reusable_execution_bindings(invocation)
+                        let (mut bindings, program_binding, dependency_scope) = if let Some(
+                            encoded,
+                        ) =
+                            &mut segment_encoded
                         {
-                            Ok(bindings) => bindings,
-                            Err(failure)
-                                if node_identity.contains_identity(failure.identity())
-                                    && failure.phase() == expected_phase =>
-                            {
-                                return Err(SubmissionWaveDispatchError::Provider(failure));
-                            }
-                            Err(_) => {
-                                return Err(SubmissionWaveDispatchError::Contract(
+                            let encoded = encoded.remove(&binding_node_index).ok_or_else(|| {
+                                SubmissionWaveDispatchError::Contract(invalid_operation(
+                                    "segment encoder omitted a required binding node",
+                                ))
+                            })?;
+                            (encoded.bindings, encoded.program_binding, encoded.scope)
+                        } else {
+                            let provider = &providers[binding_node_index];
+                            let identity_stage = SubmissionWaveDispatchStageTimer::start(
+                                timing_sink,
+                                SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+                            );
+                            let node_identity = batch_identity
+                                .materialize_node(binding_node_index)
+                                .map_err(SubmissionWaveDispatchError::Contract)?;
+                            drop(identity_stage);
+                            let invocation_stage = SubmissionWaveDispatchStageTimer::start(
+                                timing_sink,
+                                SubmissionWaveDispatchStage::NodeInvocationConstruct,
+                            );
+                            let constructor = if segment_cold_entry.is_some() {
+                                BatchedOperationInvocation::from_wave_node
+                            } else {
+                                BatchedOperationInvocation::from_reusable_wave_node
+                            };
+                            let invocation = constructor(
+                                runtime,
+                                resolved,
+                                provider.dispatch(),
+                                batch_identity,
+                                node_identity,
+                                completion.wave(),
+                                binding_node_index,
+                                active_bindings.clone(),
+                            )
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
+                            drop(invocation_stage);
+                            let expected_phase = invocation.operation().profile_phase;
+                            let program_binding = invocation.program_binding().cloned();
+                            let dependency_scope = invocation.retained_dependency_scope.clone();
+                            let binding_stage = SubmissionWaveDispatchStageTimer::start(
+                                timing_sink,
+                                SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+                            );
+                            let encoded = if segment_cold_entry.is_some() {
+                                provider.provider().encode_selected_with_segment_declaration(invocation)
+                                .map(|(operation, declaration)| {
+                                    if let Some(declaration) = declaration {
+                                        segment_declarations.push((binding_node_index, declaration));
+                                    }
+                                    crate::vnext::EncodedReusableExecutionBindings::from_operation(operation)
+                                })
+                            } else {
+                                provider
+                                    .provider()
+                                    .encode_reusable_execution_bindings(invocation)
+                            };
+                            let bindings = match encoded {
+                                Ok(bindings) => bindings,
+                                Err(failure)
+                                    if node_identity.contains_identity(failure.identity())
+                                        && failure.phase() == expected_phase =>
+                                {
+                                    return Err(SubmissionWaveDispatchError::Provider(failure));
+                                }
+                                Err(_) => {
+                                    return Err(SubmissionWaveDispatchError::Contract(
                                     invalid_operation(
                                         "reusable provider returned a failure for another node identity or profile phase",
                                     ),
                                 ));
-                            }
+                                }
+                            };
+                            drop(binding_stage);
+                            (bindings, program_binding, dependency_scope)
                         };
-                        drop(binding_stage);
                         let validation_stage = SubmissionWaveDispatchStageTimer::start(
                             timing_sink,
                             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                         );
-                        let program_binding_count = bindings.program_binding_count();
-                        validate_program_binding_patch(
+                        let program_binding_count = bindings.program_binding_count()
+                            + usize::from(compiled_binding_nodes.contains(&binding_node_index));
+                        super::retained_dependency::append_dependencies(
+                            &dependency_scope,
+                            bindings.take_retained_plan_dependencies(),
+                            &mut retained_dependencies,
+                            &mut retained_dependency_commands,
+                            &mut retained_dependency_leases,
+                        )
+                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        validate_segment_program_binding_patch(
                             resolved,
-                            node_identity,
+                            completion.wave().nodes()[binding_node_index].plan_node_index(),
                             program_binding.as_ref(),
                             program_binding_count,
                             &mut program_binding_resources,
@@ -1727,7 +2071,8 @@ impl OperationDispatch {
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
-                let operation = match provider.provider().encode_selected(invocation) {
+                let dependency_scope = invocation.retained_dependency_scope.clone();
+                let mut operation = match provider.provider().encode_selected(invocation) {
                     Ok(operation) => operation,
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())
@@ -1746,6 +2091,14 @@ impl OperationDispatch {
                     SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 );
                 let program_binding_count = operation.program_binding_count();
+                super::retained_dependency::append_dependencies(
+                    &dependency_scope,
+                    operation.take_retained_plan_dependencies(),
+                    &mut retained_dependencies,
+                    &mut retained_dependency_commands,
+                    &mut retained_dependency_leases,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
                 validate_program_binding_patch(
                     resolved,
                     node_identity,
@@ -1792,6 +2145,53 @@ impl OperationDispatch {
                     "reusable execution program contains an unreachable segment",
                 )));
             }
+            if segment_encoded
+                .as_ref()
+                .is_some_and(|encoded| !encoded.is_empty())
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "segment encoder returned unused binding nodes",
+                )));
+            }
+            if let Some((entry, epoch)) = segment_cold_entry {
+                let required = reusable_program
+                    .per_wave_binding_node_indices()
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        reusable_program
+                            .segments()
+                            .iter()
+                            .any(|segment| segment.contains_node(*index))
+                    })
+                    .map(|index| index as usize)
+                    .collect::<Vec<_>>();
+                if !required.is_empty()
+                    && required
+                        .iter()
+                        .copied()
+                        .eq(segment_declarations.iter().map(|(index, _)| *index))
+                {
+                    let mut recipe = super::segment_compile::CompiledSegmentBindingRecipe::compile(
+                        resolved,
+                        reusable_program.program_id().clone(),
+                        segment_declarations,
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                    if use_compiled_segment {
+                        recipe
+                            .compile_backend(runtime)
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
+                    }
+                    completion
+                        .set_segment_binding_candidate(Arc::new(recipe), entry, epoch)
+                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                } else {
+                    batch_identity.record_segment_miss_reason(
+                        super::preparation::SegmentPreparationMissReason::IncompleteDeclarations,
+                    );
+                }
+            }
         } else {
             let identity_stage = SubmissionWaveDispatchStageTimer::start(
                 timing_sink,
@@ -1820,7 +2220,8 @@ impl OperationDispatch {
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
-                let operation = match provider.provider().encode_selected(invocation) {
+                let dependency_scope = invocation.retained_dependency_scope.clone();
+                let mut operation = match provider.provider().encode_selected(invocation) {
                     Ok(operation) => operation,
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())
@@ -1839,6 +2240,15 @@ impl OperationDispatch {
                     SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 );
                 let program_binding_count = operation.program_binding_count();
+                let retained_dependency_count = operation.retained_plan_dependency_count();
+                super::retained_dependency::append_dependencies(
+                    &dependency_scope,
+                    operation.take_retained_plan_dependencies(),
+                    &mut retained_dependencies,
+                    &mut retained_dependency_commands,
+                    &mut retained_dependency_leases,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
                 validate_program_binding_patch(
                     resolved,
                     node_identity,
@@ -1857,7 +2267,8 @@ impl OperationDispatch {
                             "provider operation command count overflows usize",
                         ))
                     })?;
-                let has_per_wave_bindings = program_binding_count > 0
+                let has_per_wave_bindings = retained_dependency_count > 0
+                    || program_binding_count > 0
                     || operation.dynamic_binding_count() > 0
                     || operation.result_binding_count() > 0;
                 encoded_provider_command_count = encoded_provider_command_count
@@ -1908,6 +2319,13 @@ impl OperationDispatch {
                 )));
             }
         }
+        if reusable_program.is_some_and(|program| {
+            program.retained_plan_dependencies() != retained_dependencies.as_slice()
+        }) {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "retained Plan dependency identities differ from the resident compute program",
+            )));
+        }
         let uncoalesced_program_binding_count = program_bindings.len();
         let coalesced_program_bindings = runtime
             .coalesce_program_bindings(program_bindings)
@@ -1926,11 +2344,20 @@ impl OperationDispatch {
         drop(validation_stage);
         encoded_provider_command_count = encoded_provider_command_count
             .checked_add(coalesced_program_bindings.len())
+            .and_then(|n| n.checked_add(retained_dependency_commands.len()))
             .ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
                     "coalesced program binding command count overflows usize",
                 ))
             })?;
+        completion
+            .wave()
+            .step_resources()
+            .retain_plan_dependencies(retained_dependency_leases)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+        for command in retained_dependency_commands {
+            commands.push_dynamic_binding(command);
+        }
         for command in coalesced_program_bindings {
             commands.push_dynamic_binding(command);
         }
@@ -1951,7 +2378,8 @@ impl OperationDispatch {
                             authority.eager_boundary_node_indices,
                             reusable_execution_binding_nodes,
                         )
-                        .map_err(SubmissionWaveDispatchError::Contract)?,
+                        .map_err(SubmissionWaveDispatchError::Contract)?
+                        .with_retained_plan_dependencies(retained_dependencies),
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
             }
@@ -1964,7 +2392,12 @@ impl OperationDispatch {
                 "wave encode command phases differ from provider-declared operation boundaries",
             )));
         }
-        drop(provider_stage);
+        if segment_recipe.is_some() {
+            provider_stage
+                .finish_with_subset(SubmissionWaveDispatchStage::SegmentHitProviderNodeEncode);
+        } else {
+            drop(provider_stage);
+        }
 
         let lane_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
@@ -1977,6 +2410,11 @@ impl OperationDispatch {
         let mut lane_reservation = lane
             .reserve_enqueue()
             .map_err(SubmissionWaveDispatchError::Contract)?;
+        if let Some(recipe) = &segment_recipe {
+            lane_reservation
+                .validate_segment_binding_recipe(recipe)
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+        }
         drop(lane_reserve_stage);
 
         let device_submit_stage = SubmissionWaveDispatchStageTimer::start(

@@ -433,6 +433,7 @@ pub struct OperationResourceEstimate {
     scratch: Option<ProviderWorkspaceRequirement>,
     binding: Option<ProviderWorkspaceRequirement>,
     persistent: Option<ProviderWorkspaceRequirement>,
+    projection_numerics: Option<crate::vnext::PreparedProjectionNumerics>,
 }
 
 impl OperationResourceEstimate {
@@ -455,12 +456,25 @@ impl OperationResourceEstimate {
             scratch,
             binding: None,
             persistent,
+            projection_numerics: None,
         }
     }
 
     pub fn with_binding(mut self, binding: ProviderWorkspaceRequirement) -> Self {
         self.binding = Some(binding);
         self
+    }
+
+    pub fn with_projection_numerics(
+        mut self,
+        numerics: crate::vnext::PreparedProjectionNumerics,
+    ) -> Self {
+        self.projection_numerics = Some(numerics);
+        self
+    }
+
+    pub fn projection_numerics(&self) -> Option<&crate::vnext::PreparedProjectionNumerics> {
+        self.projection_numerics.as_ref()
     }
 
     pub fn estimator_id(&self) -> &str {
@@ -617,6 +631,23 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
         &self,
         invocation: BatchedOperationInvocation<'_, R::Buffer>,
     ) -> Result<EncodedDeviceOperation<R::Command>, OperationFailure>;
+
+    /// Cold full encoding may declare a closed whole-segment binding rule.
+    /// The default remains unsupported; a successful ordinary encode alone
+    /// never authorizes skipping later provider callbacks.
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, R::Buffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<R::Command>,
+            Option<super::SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        self.encode_selected(invocation)
+            .map(|encoded| (encoded, None))
+    }
 
     /// Encodes only the request-varying boundaries around a compute segment
     /// that was already prepared as a reusable backend executable.

@@ -1,3 +1,4 @@
+use super::super::operation::CompiledOperationIdentity;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -114,17 +115,48 @@ impl From<UnvalidatedExecutionIdentityParts> for ExecutionIdentityParts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ExecutionIdentityEnvelope {
-    parts: Arc<ExecutionIdentityParts>,
+    representation: ExecutionIdentityRepresentation,
 }
+
+#[derive(Clone)]
+enum ExecutionIdentityRepresentation {
+    Owned(Arc<ExecutionIdentityParts>),
+    Compiled(Arc<CompiledOperationIdentity>),
+}
+
+impl std::fmt::Debug for ExecutionIdentityEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionIdentityEnvelope")
+            .field("parts", self.parts())
+            .finish()
+    }
+}
+impl PartialEq for ExecutionIdentityEnvelope {
+    fn eq(&self, other: &Self) -> bool {
+        let same_owner = match (&self.representation, &other.representation) {
+            (
+                ExecutionIdentityRepresentation::Owned(left),
+                ExecutionIdentityRepresentation::Owned(right),
+            ) => Arc::ptr_eq(left, right),
+            (
+                ExecutionIdentityRepresentation::Compiled(left),
+                ExecutionIdentityRepresentation::Compiled(right),
+            ) => Arc::ptr_eq(left, right),
+            _ => false,
+        };
+        same_owner || self.parts() == other.parts()
+    }
+}
+impl Eq for ExecutionIdentityEnvelope {}
 
 impl Serialize for ExecutionIdentityEnvelope {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        self.parts.as_ref().serialize(serializer)
+        self.parts().serialize(serializer)
     }
 }
 
@@ -244,11 +276,112 @@ impl ExecutionIdentityEnvelope {
             ));
         }
         Ok(Self {
-            parts: Arc::new(parts),
+            representation: ExecutionIdentityRepresentation::Owned(Arc::new(parts)),
         })
     }
 
     pub fn parts(&self) -> &ExecutionIdentityParts {
-        self.parts.as_ref()
+        match &self.representation {
+            ExecutionIdentityRepresentation::Owned(parts) => parts,
+            ExecutionIdentityRepresentation::Compiled(identity) => identity.parts(),
+        }
+    }
+
+    pub(crate) fn from_compiled(identity: CompiledOperationIdentity) -> Self {
+        Self {
+            representation: ExecutionIdentityRepresentation::Compiled(Arc::new(identity)),
+        }
+    }
+
+    pub(crate) fn projection(&self) -> ExecutionIdentityProjection<'_> {
+        match &self.representation {
+            ExecutionIdentityRepresentation::Owned(parts) => {
+                ExecutionIdentityProjection::from_parts(parts)
+            }
+            ExecutionIdentityRepresentation::Compiled(identity) => identity.projection(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projected_owner_alive_probe(&self) -> Option<Box<dyn Fn() -> bool>> {
+        match &self.representation {
+            ExecutionIdentityRepresentation::Owned(_) => None,
+            ExecutionIdentityRepresentation::Compiled(identity) => {
+                let weak = Arc::downgrade(identity);
+                Some(Box::new(move || weak.strong_count() != 0))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projected_parts_materialized(&self) -> Option<bool> {
+        match &self.representation {
+            ExecutionIdentityRepresentation::Owned(_) => None,
+            ExecutionIdentityRepresentation::Compiled(identity) => Some(identity.is_materialized()),
+        }
+    }
+}
+
+/// Non-owning logical fields; never carries resource or submission authority.
+pub(crate) struct ExecutionIdentityProjection<'a> {
+    pub(crate) version: ContractVersion,
+    pub(crate) run_id: &'a RunId,
+    pub(crate) request_id: &'a RequestIdentity,
+    pub(crate) sequence: u64,
+    pub(crate) plan_id: Option<&'a PlanId>,
+    pub(crate) plan_hash: Option<&'a PlanHash>,
+    pub(crate) frame_id: Option<ExecutionFrameId>,
+    pub(crate) node_invocation_id: Option<NodeInvocationId>,
+    pub(crate) node_id: Option<&'a NodeId>,
+    pub(crate) operation_id: Option<&'a OperationId>,
+    pub(crate) provider_id: Option<&'a ProviderId>,
+    pub(crate) device_id: Option<&'a DeviceId>,
+    pub(crate) resource_pool_id: Option<&'a ResourcePoolId>,
+    pub(crate) resource_pool_identity_fingerprint: Option<&'a str>,
+    pub(crate) provisioning_run_id: Option<&'a RunId>,
+    pub(crate) provisioning_request_id: Option<&'a RequestIdentity>,
+    pub(crate) transaction_id: Option<&'a TransactionId>,
+    pub(crate) active_sequence_slot: Option<u32>,
+    pub(crate) admission_generation: Option<u64>,
+    pub(crate) activation_epoch: Option<u64>,
+    pub(crate) runtime_implementation_fingerprint: Option<&'a str>,
+    pub(crate) active_sequence_fingerprint: Option<&'a str>,
+    pub(crate) completed_sequence_fingerprint: Option<&'a str>,
+    pub(crate) aborted_sequence_fingerprint: Option<&'a str>,
+    pub(crate) resource_id: Option<&'a ResourceId>,
+    pub(crate) resource_generation: Option<u64>,
+    pub(crate) resource_batch_fingerprint: Option<&'a str>,
+}
+impl<'a> ExecutionIdentityProjection<'a> {
+    fn from_parts(parts: &'a ExecutionIdentityParts) -> Self {
+        Self {
+            version: parts.version,
+            run_id: &parts.run_id,
+            request_id: &parts.request_id,
+            sequence: parts.sequence,
+            plan_id: parts.plan_id.as_ref(),
+            plan_hash: parts.plan_hash.as_ref(),
+            frame_id: parts.frame_id,
+            node_invocation_id: parts.node_invocation_id,
+            node_id: parts.node_id.as_ref(),
+            operation_id: parts.operation_id.as_ref(),
+            provider_id: parts.provider_id.as_ref(),
+            device_id: parts.device_id.as_ref(),
+            resource_pool_id: parts.resource_pool_id.as_ref(),
+            resource_pool_identity_fingerprint: parts.resource_pool_identity_fingerprint.as_deref(),
+            provisioning_run_id: parts.provisioning_run_id.as_ref(),
+            provisioning_request_id: parts.provisioning_request_id.as_ref(),
+            transaction_id: parts.transaction_id.as_ref(),
+            active_sequence_slot: parts.active_sequence_slot,
+            admission_generation: parts.admission_generation,
+            activation_epoch: parts.activation_epoch,
+            runtime_implementation_fingerprint: parts.runtime_implementation_fingerprint.as_deref(),
+            active_sequence_fingerprint: parts.active_sequence_fingerprint.as_deref(),
+            completed_sequence_fingerprint: parts.completed_sequence_fingerprint.as_deref(),
+            aborted_sequence_fingerprint: parts.aborted_sequence_fingerprint.as_deref(),
+            resource_id: parts.resource_id.as_ref(),
+            resource_generation: parts.resource_generation,
+            resource_batch_fingerprint: parts.resource_batch_fingerprint.as_deref(),
+        }
     }
 }

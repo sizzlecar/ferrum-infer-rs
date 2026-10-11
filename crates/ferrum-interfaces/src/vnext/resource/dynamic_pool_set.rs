@@ -106,6 +106,50 @@ enum ReclaimTargetPolicy {
     PreserveAll,
 }
 
+/// Minted only after full authority validation and materialization. Resource
+/// siblings may inspect this slice, but cannot retarget a view to unvalidated
+/// authority evidence by replacing a raw reference.
+pub(super) struct ValidatedBackingAuthorities<'lease> {
+    authorities: &'lease [LogicalBackingSliceAuthority],
+}
+
+impl<'lease> ValidatedBackingAuthorities<'lease> {
+    pub(super) fn as_slice(&self) -> &'lease [LogicalBackingSliceAuthority] {
+        self.authorities
+    }
+}
+
+/// A previously materialized view may prove immutable claim relationships only
+/// for its exact borrowed authority slice. It does not prove current pool or
+/// chunk validity, which every reuse must check again.
+struct ExactRetainedBackingView<'view, 'lease, B> {
+    view: &'view LogicalBackingBufferView<'lease, B>,
+}
+
+impl<'view, 'lease, B> ExactRetainedBackingView<'view, 'lease, B> {
+    fn new(
+        authorities: &[LogicalBackingSliceAuthority],
+        view: &'view LogicalBackingBufferView<'lease, B>,
+    ) -> Result<Self, VNextError> {
+        if !std::ptr::eq(view.authorities.as_slice(), authorities) {
+            return Err(invalid_resource(
+                "retained backing differs from its exact live authority",
+            ));
+        }
+        Ok(Self { view })
+    }
+
+    fn revalidate_authorities<R>(&self, pool: &DynamicBackingPool<R>) -> Result<(), VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+    {
+        for authority in self.view.authorities.as_slice() {
+            DynamicPoolSet::<R>::validate_authority_identity_and_bounds(pool, authority)?;
+        }
+        Ok(())
+    }
+}
+
 impl<R> DynamicPoolSet<R>
 where
     R: DeviceRuntime,
@@ -2435,6 +2479,27 @@ where
         &'lease self,
         authorities: &'lease [LogicalBackingSliceAuthority],
     ) -> Result<LogicalBackingBufferView<'lease, R::Buffer>, VNextError> {
+        self.materialize_or_revalidate(authorities, None)?
+            .ok_or_else(|| invalid_resource("backing materialization did not return a view"))
+    }
+
+    /// Reuse only an exact authority slice from the same caller-owned lease.
+    /// Authority, pool poison, generation, current chunk and ranges are checked
+    /// again even though the immutable segment/retention payload is shared.
+    pub(in crate::vnext::resource) fn revalidate_view(
+        &self,
+        authority: &LogicalBackingSliceAuthority,
+        retained: &LogicalBackingBufferView<'_, R::Buffer>,
+    ) -> Result<(), VNextError> {
+        self.materialize_or_revalidate(std::slice::from_ref(authority), Some(retained))?;
+        Ok(())
+    }
+
+    fn materialize_or_revalidate<'lease>(
+        &'lease self,
+        authorities: &'lease [LogicalBackingSliceAuthority],
+        retained: Option<&LogicalBackingBufferView<'_, R::Buffer>>,
+    ) -> Result<Option<LogicalBackingBufferView<'lease, R::Buffer>>, VNextError> {
         let first = authorities
             .first()
             .ok_or_else(|| invalid_resource("logical backing view requires an authority"))?;
@@ -2442,6 +2507,12 @@ where
             .pools
             .get(&first.evidence.pool_id)
             .ok_or_else(|| invalid_resource("logical backing authority has no dynamic pool"))?;
+        let retained = retained
+            .map(|view| ExactRetainedBackingView::new(authorities, view))
+            .transpose()?;
+        if let Some(proof) = &retained {
+            proof.revalidate_authorities(pool)?;
+        }
         let mut logical_size_bytes = 0_u64;
         let mut capacity_size_bytes = 0_u64;
         let mut segment_count = 0_usize;
@@ -2458,7 +2529,9 @@ where
                     "logical backing authorities have incompatible resource metadata",
                 ));
             }
-            Self::validate_authority(pool, authority)?;
+            if retained.is_none() {
+                Self::validate_authority(pool, authority)?;
+            }
             if index + 1 < authorities.len()
                 && authority.evidence.logical_size_bytes != authority.evidence.capacity_size_bytes
             {
@@ -2483,7 +2556,25 @@ where
         if state.poisoned {
             return Err(invalid_resource("dynamic backing pool is fail-closed"));
         }
-        let mut bindings = Vec::with_capacity(segment_count);
+        if let Some(proof) = &retained {
+            let view = proof.view;
+            if view.logical_size_bytes != logical_size_bytes
+                || view.capacity_size_bytes != capacity_size_bytes
+                || view.alignment_bytes != first.evidence.alignment_bytes
+                || view.usage != first.evidence.usage
+                || view.element_type != first.evidence.element_type
+                || view.storage_profile != first.evidence.storage_profile
+                || view.bindings.len() != segment_count
+            {
+                return Err(invalid_resource(
+                    "retained backing differs from its exact live authority",
+                ));
+            }
+        }
+        let mut bindings = retained
+            .is_none()
+            .then(|| Vec::with_capacity(segment_count));
+        let mut binding_index = 0;
         for authority in authorities {
             for segment in &authority.evidence.segments {
                 let chunk = state.chunks.get(&segment.chunk_ordinal()).ok_or_else(|| {
@@ -2500,48 +2591,57 @@ where
                         "logical backing references a stale or out-of-bounds chunk region",
                     ));
                 }
-                let retention = match authority.reusable_lane {
-                    Some(lane_id) => DeviceBufferRetention::lane_pair(
-                        lane_id,
-                        Arc::clone(&authority.segment_lease),
-                        Arc::clone(&chunk.backing),
-                    ),
-                    None => DeviceBufferRetention::pair(
-                        Arc::clone(&authority.segment_lease),
-                        Arc::clone(&chunk.backing),
-                    ),
-                };
-                bindings.push(LogicalBackingSegmentBinding {
-                    segment: segment.clone(),
-                    chunk: Arc::clone(&chunk.backing),
-                    retention,
-                });
+                if let Some(proof) = &retained {
+                    let view = proof.view;
+                    let binding = &view.bindings[binding_index];
+                    if binding.segment != *segment || !Arc::ptr_eq(&binding.chunk, &chunk.backing) {
+                        return Err(invalid_resource(
+                            "retained backing references another live chunk",
+                        ));
+                    }
+                } else {
+                    let retention = match authority.reusable_lane {
+                        Some(lane_id) => DeviceBufferRetention::lane_pair(
+                            lane_id,
+                            Arc::clone(&authority.segment_lease),
+                            Arc::clone(&chunk.backing),
+                        ),
+                        None => DeviceBufferRetention::pair(
+                            Arc::clone(&authority.segment_lease),
+                            Arc::clone(&chunk.backing),
+                        ),
+                    };
+                    bindings
+                        .as_mut()
+                        .expect("materialization allocates bindings")
+                        .push(LogicalBackingSegmentBinding {
+                            segment: segment.clone(),
+                            chunk: Arc::clone(&chunk.backing),
+                            retention,
+                        });
+                }
+                binding_index += 1;
             }
         }
         drop(state);
-        Ok(LogicalBackingBufferView {
+        Ok(bindings.map(|bindings| LogicalBackingBufferView {
             bindings,
-            authorities,
+            authorities: ValidatedBackingAuthorities { authorities },
             logical_size_bytes,
             capacity_size_bytes,
             alignment_bytes: first.evidence.alignment_bytes,
             usage: first.evidence.usage,
             element_type: first.evidence.element_type,
             storage_profile: first.evidence.storage_profile,
-        })
+        }))
     }
 
-    fn validate_authority(
+    pub(super) fn validate_authority(
         pool: &DynamicBackingPool<R>,
         authority: &LogicalBackingSliceAuthority,
     ) -> Result<(), VNextError> {
-        if pool.instance_id != authority.evidence.pool_instance_id
-            || authority.segment_lease.owner_instance_id != pool.instance_id
-            || authority.segment_lease.owner.instance_id() != pool.instance_id
-            || authority.segment_lease.claim_identity != authority.evidence.physical_claim_identity
-            || authority.segment_lease.segment_generation != authority.evidence.segment_generation
-            || authority.segment_lease.size_bytes != authority.evidence.physical_size_bytes
-            || authority.evidence.domain_id != pool.domain.domain_id
+        Self::validate_authority_identity_and_bounds(pool, authority)?;
+        if authority.segment_lease.claim_identity != authority.evidence.physical_claim_identity
             || authority.evidence.physical_claim_identity.pool_id() != pool.domain.pool_id()
             || authority
                 .evidence
@@ -2549,14 +2649,6 @@ where
                 .resource_ids()
                 .binary_search(&authority.evidence.resource_id)
                 .is_err()
-            || authority.evidence.logical_size_bytes == 0
-            || authority.evidence.logical_size_bytes > authority.evidence.capacity_size_bytes
-            || authority
-                .evidence
-                .physical_offset_bytes
-                .checked_add(authority.evidence.capacity_size_bytes)
-                .is_none_or(|end| end > authority.evidence.physical_size_bytes)
-            || authority.evidence.storage_profile != pool.domain.pool.compatibility().profile()
         {
             return Err(invalid_resource(
                 "logical backing authority belongs to another dynamic pool instance",
@@ -2570,6 +2662,32 @@ where
         )? {
             return Err(invalid_resource(
                 "logical backing projection differs from its shared physical extent",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_authority_identity_and_bounds(
+        pool: &DynamicBackingPool<R>,
+        authority: &LogicalBackingSliceAuthority,
+    ) -> Result<(), VNextError> {
+        if pool.instance_id != authority.evidence.pool_instance_id
+            || authority.segment_lease.owner_instance_id != pool.instance_id
+            || authority.segment_lease.owner.instance_id() != pool.instance_id
+            || authority.segment_lease.segment_generation != authority.evidence.segment_generation
+            || authority.segment_lease.size_bytes != authority.evidence.physical_size_bytes
+            || authority.evidence.domain_id != pool.domain.domain_id
+            || authority.evidence.logical_size_bytes == 0
+            || authority.evidence.logical_size_bytes > authority.evidence.capacity_size_bytes
+            || authority
+                .evidence
+                .physical_offset_bytes
+                .checked_add(authority.evidence.capacity_size_bytes)
+                .is_none_or(|end| end > authority.evidence.physical_size_bytes)
+            || authority.evidence.storage_profile != pool.domain.pool.compatibility().profile()
+        {
+            return Err(invalid_resource(
+                "logical backing authority belongs to another dynamic pool instance",
             ));
         }
         Ok(())

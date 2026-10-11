@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 description = "Native operator ABI and artifact resolver for Ferrum"
 
+[features]
+# Explicit native ABI conformance only. The caller supplies a source-builder
+# archive through the standard linker search path; default builds stay CPU-only.
+cuda-upstream-linear-tests = []
+
 [dependencies]
 ferrum-types = { workspace = true }
 libc = "0.2"
@@ -15,3 +20,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
+
+[dev-dependencies]
+half = { workspace = true }

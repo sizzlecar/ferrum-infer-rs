@@ -874,6 +874,27 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
+    /// Host invocation preparation policy for native plan runtimes (default: full).
+    /// Decode segments require a CUDA plan runtime; decode-segment-program also
+    /// requires indexed owner views and compact-scatter binding uploads.
+    #[arg(long, value_enum)]
+    pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
+    /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).
+    #[arg(long, value_enum)]
+    pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
+
+    /// Fresh decode-segment owner views (default: legacy). Indexed requires a CUDA plan runtime.
+    #[arg(long, value_enum)]
+    pub segment_binding_owner_view_mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
+
+    /// Causal decode preparation (default: per-participant). Packed requires native CUDA attention.
+    #[arg(long, value_enum)]
+    pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
+
+    /// Causal decode grouping (default: contiguous). Indexed requires packed native CUDA attention.
+    #[arg(long, value_enum)]
+    pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -2707,6 +2728,36 @@ fn run_startup_cli_runtime_entries(
         cmd.prefill_decode_execution
             .map(crate::commands::PrefillDecodeExecutionArg::as_runtime_value),
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+        cmd.invocation_preparation_strategy
+            .map(crate::commands::InvocationPreparationStrategyArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+        cmd.program_binding_upload_strategy
+            .map(crate::commands::ProgramBindingUploadStrategyArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+        cmd.segment_binding_owner_view_mode
+            .map(crate::commands::SegmentBindingOwnerViewModeArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+        cmd.causal_decode_preparation_mode
+            .map(crate::commands::CausalDecodePreparationModeArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+        cmd.causal_decode_attention_grouping
+            .map(crate::commands::CausalDecodeAttentionGroupingArg::as_runtime_value),
+    );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
         "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
@@ -2901,6 +2952,231 @@ mod tests {
         }
     }
 
+    #[test]
+    fn segment_binding_owner_view_run_precedence_preserves_upload_policy() {
+        use crate::commands::SegmentBindingOwnerViewModeArg as Arg;
+        use ferrum_types::{
+            SegmentBindingOwnerViewMode as Mode, SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Legacy, None),
+            (
+                Some(Mode::Indexed),
+                None,
+                Mode::Indexed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Indexed),
+                Some(Arg::Legacy),
+                Mode::Legacy,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Legacy),
+                Some(Arg::Indexed),
+                Mode::Indexed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                segment_binding_owner_view_mode: config_mode,
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.segment_binding_owner_view_mode = cli_mode;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.segment_binding_owner_view_mode, expected);
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_run_precedence_preserves_upload_policy() {
+        use crate::commands::CausalDecodePreparationModeArg as Arg;
+        use ferrum_types::{
+            CausalDecodePreparationMode as Mode, CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::PerParticipant, None),
+            (
+                Some(Mode::Packed),
+                None,
+                Mode::Packed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Packed),
+                Some(Arg::PerParticipant),
+                Mode::PerParticipant,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::PerParticipant),
+                Some(Arg::Packed),
+                Mode::Packed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                causal_decode_preparation_mode: config_mode,
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.causal_decode_preparation_mode = cli_mode;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.causal_decode_preparation_mode, expected);
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_run_precedence_preserves_upload_policy() {
+        use crate::commands::CausalDecodeAttentionGroupingArg as Arg;
+        use ferrum_types::{
+            CausalDecodeAttentionGrouping as Mode,
+            CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Contiguous, None),
+            (
+                Some(Mode::Indexed),
+                None,
+                Mode::Indexed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Indexed),
+                Some(Arg::Contiguous),
+                Mode::Contiguous,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Contiguous),
+                Some(Arg::Indexed),
+                Mode::Indexed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                causal_decode_attention_grouping: config_mode,
+                causal_decode_preparation_mode: Some(
+                    ferrum_types::CausalDecodePreparationMode::Packed,
+                ),
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.causal_decode_attention_grouping = cli_mode;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.causal_decode_attention_grouping, expected);
+            assert_eq!(
+                engine.runtime.causal_decode_preparation_mode,
+                ferrum_types::CausalDecodePreparationMode::Packed
+            );
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn invocation_preparation_run_override_reaches_engine_config() {
+        use crate::commands::InvocationPreparationStrategyArg;
+        use ferrum_types::InvocationPreparationStrategy;
+        let mut command = test_run_cmd();
+        let config_entries = crate::config::RuntimeCliConfig {
+            invocation_preparation_strategy: Some(
+                InvocationPreparationStrategy::IdentityProjection,
+            ),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, expected) in [
+            (None, InvocationPreparationStrategy::IdentityProjection),
+            (
+                Some(InvocationPreparationStrategyArg::Full),
+                InvocationPreparationStrategy::Full,
+            ),
+            (
+                Some(InvocationPreparationStrategyArg::IdentityProjection),
+                InvocationPreparationStrategy::IdentityProjection,
+            ),
+            (
+                Some(InvocationPreparationStrategyArg::DecodeSegment),
+                InvocationPreparationStrategy::DecodeSegment,
+            ),
+        ] {
+            command.invocation_preparation_strategy = option;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.invocation_preparation_strategy, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if option.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
+            );
+        }
+    }
+
     fn test_run_cmd() -> RunCommand {
         RunCommand {
             model: Some("tinyllama".to_string()),
@@ -2932,6 +3208,11 @@ mod tests {
             max_num_seqs: None,
             max_num_batched_tokens: None,
             prefill_decode_execution: None,
+            invocation_preparation_strategy: None,
+            program_binding_upload_strategy: None,
+            segment_binding_owner_view_mode: None,
+            causal_decode_preparation_mode: None,
+            causal_decode_attention_grouping: None,
             scheduler_slo: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
@@ -2961,6 +3242,56 @@ mod tests {
             request_dump_dir: None,
             profile_sample_rate: crate::observability_product::default_profile_sample_rate(),
             output_format: OutputFormat::Text,
+        }
+    }
+
+    #[test]
+    fn program_binding_upload_run_override_reaches_engine_config() {
+        use crate::commands::ProgramBindingUploadStrategyArg;
+        use ferrum_types::ProgramBindingUploadStrategy;
+        let mut command = test_run_cmd();
+        let config_entries = crate::config::RuntimeCliConfig {
+            program_binding_upload_strategy: Some(ProgramBindingUploadStrategy::UniformLivePrefix),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, expected) in [
+            (None, ProgramBindingUploadStrategy::UniformLivePrefix),
+            (
+                Some(ProgramBindingUploadStrategyArg::Sparse),
+                ProgramBindingUploadStrategy::Sparse,
+            ),
+            (
+                Some(ProgramBindingUploadStrategyArg::UniformLivePrefix),
+                ProgramBindingUploadStrategy::UniformLivePrefix,
+            ),
+            (
+                Some(ProgramBindingUploadStrategyArg::CompactScatter),
+                ProgramBindingUploadStrategy::CompactScatter,
+            ),
+        ] {
+            command.program_binding_upload_strategy = option;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.program_binding_upload_strategy, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if option.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
+            );
         }
     }
 

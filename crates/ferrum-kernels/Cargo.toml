@@ -53,6 +53,7 @@ vllm-paged-attn-v2 = ["cuda"]  # vLLM paged-attention-v2 native artifact.
                         # Pairs with the core PTX kernel that writes its K/V
                         # layout. Runtime selection remains a typed product
                         # policy; source compilation is external to Cargo.
+cuda-indexed-causal-attention = ["vllm-paged-attn-v2"] # Opt-in additive indexed native ABI.
 fa2-source = ["cuda"]  # Backward-compatible obsolete alias. It no longer
                         # compiles vendored FlashAttention/CUTLASS source;
                         # FA2 must come from a Ferrum native operator artifact.
@@ -60,6 +61,9 @@ native-op-artifact = []  # Internal build-graph marker, enabled by `cuda`.
                         # CUDA native units fail closed when the explicit
                         # artifact-set lock is absent or partial; product builds
                         # never compile third-party CUDA/C++.
+cuda-upstream-linear = ["cuda"] # Optional locked MMQ/MMVQ artifact; no default routing.
+cuda-upstream-extra-linear = ["cuda-upstream-linear"] # Independent locked extra-format artifact.
+cuda-upstream-q6-f32-linear = ["cuda-upstream-extra-linear"] # Independent locked Q6 F32 head artifact.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compatibility.
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

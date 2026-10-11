@@ -158,6 +158,8 @@ impl F16LanguageProfile {
             version: ContractVersion::new(major, 0),
             multiplication_type: multiply.then_some(ElementType::F32),
             accumulation_type: accumulate.then_some(ElementType::F32),
+            staged_arithmetic: None,
+            composite_arithmetic: None,
         });
         Ok(())
     }

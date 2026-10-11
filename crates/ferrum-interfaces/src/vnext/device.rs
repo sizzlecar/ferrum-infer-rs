@@ -10,11 +10,19 @@ use std::time::Duration;
 
 use ferrum_types::AttentionExecutionPolicy;
 
+mod immutable_metadata;
+pub use immutable_metadata::{
+    DeviceReusableExecutionEntryIdentity, ImmutableBufferMetadata, ImmutableRuntimeMetadata,
+};
+mod program_binding_upload;
+pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
+
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
-    ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, PlanHash,
-    ReusableExecutionBucketId, ReusableExecutionCatalogLifetime, StaticWeightTransformPlan,
-    VNextError, WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
+    EncodedRetainedPlanDependency, ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope,
+    IdentifiedFailure, PlanHash, RetainedPlanDependencyIdentity, ReusableExecutionBucketId,
+    ReusableExecutionCatalogLifetime, StaticWeightTransformPlan, VNextError,
+    WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
 /// Backend-neutral device capability for an explicit cold-path reusable
@@ -529,6 +537,18 @@ pub enum DeviceReusableAddressScope {
 }
 
 impl DeviceBufferRetention {
+    /// Compares the exact retained owners without exposing or issuing ownership.
+    /// Equal allocation addresses or descriptors do not establish this identity.
+    pub fn same_owners(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self._primary_owner, &other._primary_owner)
+            && match (&self._secondary_owner, &other._secondary_owner) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+            && self.reusable_address_scope == other.reusable_address_scope
+    }
+
     pub(crate) fn plan<T>(owner: Arc<T>) -> Self
     where
         T: Send + Sync + 'static,
@@ -1213,9 +1233,22 @@ pub struct DeviceReusableExecutionCapture {
     node_count: u32,
     eager_boundary_node_indices: Box<[u32]>,
     per_wave_binding_node_indices: Box<[u32]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    retained_plan_dependencies: Vec<RetainedPlanDependencyIdentity>,
 }
 
 impl DeviceReusableExecutionCapture {
+    pub(crate) fn with_retained_plan_dependencies(
+        mut self,
+        identities: Vec<RetainedPlanDependencyIdentity>,
+    ) -> Self {
+        self.retained_plan_dependencies = identities;
+        self
+    }
+    pub fn retained_plan_dependencies(&self) -> &[RetainedPlanDependencyIdentity] {
+        &self.retained_plan_dependencies
+    }
+
     pub fn new(
         program_id: DeviceReusableExecutionProgramId,
         node_count: u32,
@@ -1250,6 +1283,7 @@ impl DeviceReusableExecutionCapture {
             node_count,
             eager_boundary_node_indices: eager_boundary_node_indices.into_boxed_slice(),
             per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+            retained_plan_dependencies: Vec::new(),
         })
     }
 
@@ -1397,9 +1431,38 @@ pub struct DeviceReusableExecutionProgram {
     segments: Box<[DeviceReusableExecutionSegment]>,
     per_wave_binding_node_indices: Box<[u32]>,
     gaps: Box<[DeviceReusableExecutionProgramGap]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    retained_plan_dependencies: Vec<RetainedPlanDependencyIdentity>,
 }
 
 impl DeviceReusableExecutionProgram {
+    /// Reclassification (for example backend eviction) may change residency,
+    /// never the immutable Plan prerequisites of this same typed program.
+    pub fn reclassification_capture(&self) -> DeviceReusableExecutionCapture {
+        DeviceReusableExecutionCapture {
+            program_id: self.program_id.clone(),
+            node_count: self.node_count,
+            eager_boundary_node_indices: self.eager_boundary_node_indices.clone(),
+            per_wave_binding_node_indices: self.per_wave_binding_node_indices.clone(),
+            retained_plan_dependencies: self.retained_plan_dependencies.clone(),
+        }
+    }
+
+    pub fn validate_retained_plan_dependency_seal(&self, next: &Self) -> Result<(), VNextError> {
+        if self.program_id != next.program_id
+            || self.retained_plan_dependencies != next.retained_plan_dependencies
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "resident program changed its retained Plan dependency seal".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn retained_plan_dependencies(&self) -> &[RetainedPlanDependencyIdentity] {
+        &self.retained_plan_dependencies
+    }
+
     pub fn new(
         capture: &DeviceReusableExecutionCapture,
         segments: Vec<DeviceReusableExecutionSegment>,
@@ -1493,6 +1556,7 @@ impl DeviceReusableExecutionProgram {
             segments: segments.into_boxed_slice(),
             per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
             gaps: gaps.into_boxed_slice(),
+            retained_plan_dependencies: capture.retained_plan_dependencies.clone(),
         })
     }
 
@@ -1768,6 +1832,24 @@ pub trait DeviceSubmissionTimingSink: Send + Sync {
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration);
 
     fn record_reusable_execution(&self, _observation: DeviceReusableExecutionObservation) {}
+
+    /// One submission's actual backend preparation, before command enqueue.
+    /// The borrowed identity is diagnostic only; callbacks must not retain it.
+    fn record_reusable_preparation(
+        &self,
+        _program_id: Option<&DeviceReusableExecutionProgramId>,
+        _capture_allowed: bool,
+        _observation: DeviceReusableExecutionObservation,
+    ) {
+    }
+
+    /// The actual node gaps before an on-demand empty program is discarded.
+    fn record_reusable_program_gaps(
+        &self,
+        _program_id: &DeviceReusableExecutionProgramId,
+        _gaps: &[DeviceReusableExecutionProgramGap],
+    ) {
+    }
 }
 
 pub struct DisabledDeviceSubmissionTimingSink;
@@ -1842,6 +1924,8 @@ impl DeviceExecutionTiming {
 pub enum DeviceExecutionIntervalKind {
     Compute,
     Transfer,
+    /// Device ordering work, such as waiting on a previously published event.
+    Dependency,
 }
 
 impl DeviceExecutionIntervalKind {
@@ -1849,6 +1933,7 @@ impl DeviceExecutionIntervalKind {
         match self {
             Self::Compute => "compute",
             Self::Transfer => "transfer",
+            Self::Dependency => "dependency",
         }
     }
 }
@@ -2522,6 +2607,7 @@ pub struct DeviceNativeWorkAttribution {
     token_count: u64,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
+    dependency_wait_count: u64,
     reusable_graph_node_count: Option<u64>,
 }
 
@@ -2571,7 +2657,55 @@ impl DeviceNativeWorkAttribution {
         transfer_command_count: u64,
         reusable_graph_node_count: Option<u64>,
     ) -> Option<Self> {
-        if (compute_dispatch_count == 0 && transfer_command_count == 0)
+        Self::with_participant_range_and_dependencies(
+            command_index,
+            node_index,
+            command_phase,
+            native_op_id,
+            execution_path,
+            batching_form,
+            participant_start,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            transfer_command_count,
+            reusable_graph_node_count,
+            0,
+        )
+    }
+
+    /// Observe an eager dynamic binding's actual dependency waits after enqueue.
+    ///
+    /// Dependency waits carry no logical node or participant work. Conditional
+    /// preparation may also enqueue compute and transfers; those counters must
+    /// describe the work actually enqueued, not a preflight declaration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_participant_range_and_dependencies(
+        command_index: u32,
+        node_index: Option<u32>,
+        command_phase: DeviceCommandPhase,
+        native_op_id: DeviceNativeOperationId,
+        execution_path: DeviceExecutionPath,
+        batching_form: DeviceBatchingForm,
+        participant_start: u32,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+        reusable_graph_node_count: Option<u64>,
+        dependency_wait_count: u64,
+    ) -> Option<Self> {
+        if (compute_dispatch_count == 0
+            && transfer_command_count == 0
+            && dependency_wait_count == 0)
+            || (dependency_wait_count > 0
+                && (command_phase != DeviceCommandPhase::DynamicBinding
+                    || batching_form != DeviceBatchingForm::Scalar
+                    || node_index.is_some()
+                    || participant_start != 0
+                    || participant_count != 0
+                    || token_count != 0
+                    || execution_path != DeviceExecutionPath::Eager))
             || (node_index.is_some() && participant_count == 0)
             || participant_start.checked_add(participant_count).is_none()
             || (node_index.is_none() && participant_start != 0)
@@ -2592,6 +2726,7 @@ impl DeviceNativeWorkAttribution {
             token_count,
             compute_dispatch_count,
             transfer_command_count,
+            dependency_wait_count,
             reusable_graph_node_count,
         })
     }
@@ -2642,6 +2777,11 @@ impl DeviceNativeWorkAttribution {
 
     pub const fn transfer_command_count(&self) -> u64 {
         self.transfer_command_count
+    }
+
+    /// Successful device dependency-wait enqueues, excluding event recording.
+    pub const fn dependency_wait_count(&self) -> u64 {
+        self.dependency_wait_count
     }
 
     /// Actual native graph nodes captured for this replayed command.
@@ -2893,6 +3033,7 @@ impl DeviceSubmissionAttribution {
 /// either dynamic boundary into a reusable executable.
 #[must_use = "encoded device operations must be appended to a submission batch"]
 pub struct EncodedDeviceOperation<C> {
+    retained_plan_dependencies: Vec<EncodedRetainedPlanDependency<C>>,
     program_bindings: Vec<C>,
     dynamic_bindings: Vec<C>,
     compute: C,
@@ -2900,8 +3041,25 @@ pub struct EncodedDeviceOperation<C> {
 }
 
 impl<C> EncodedDeviceOperation<C> {
+    pub fn with_retained_plan_dependency(
+        mut self,
+        dependency: EncodedRetainedPlanDependency<C>,
+    ) -> Self {
+        self.retained_plan_dependencies.push(dependency);
+        self
+    }
+    pub fn retained_plan_dependency_count(&self) -> usize {
+        self.retained_plan_dependencies.len()
+    }
+    pub(crate) fn take_retained_plan_dependencies(
+        &mut self,
+    ) -> Vec<EncodedRetainedPlanDependency<C>> {
+        std::mem::take(&mut self.retained_plan_dependencies)
+    }
+
     pub fn compute(command: C) -> Self {
         Self {
+            retained_plan_dependencies: Vec::new(),
             program_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
             compute: command,
@@ -2942,6 +3100,10 @@ impl<C> EncodedDeviceOperation<C> {
     }
 
     pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, C, Vec<C>) {
+        assert!(
+            self.retained_plan_dependencies.is_empty(),
+            "retained dependency channel was not consumed by core"
+        );
         (
             self.program_bindings,
             self.dynamic_bindings,
@@ -2956,14 +3118,53 @@ impl<C> EncodedDeviceOperation<C> {
 /// and result bindings preserve their position around the segment launch.
 #[must_use = "reusable execution bindings must accompany their segment launch"]
 pub struct EncodedReusableExecutionBindings<C> {
+    retained_plan_dependencies: Vec<EncodedRetainedPlanDependency<C>>,
     program_bindings: Vec<C>,
     dynamic_bindings: Vec<C>,
     result_bindings: Vec<C>,
 }
 
 impl<C> EncodedReusableExecutionBindings<C> {
+    pub(crate) fn segment_binding_oracle_commands(
+        &self,
+    ) -> super::SegmentBindingOracleCommands<'_, C> {
+        super::SegmentBindingOracleCommands {
+            program_bindings: &self.program_bindings,
+            dynamic_bindings: &self.dynamic_bindings,
+            result_bindings: &self.result_bindings,
+            retained_dependencies: self
+                .retained_plan_dependencies
+                .iter()
+                .map(|d| &d.command)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn retained_dependency_identities(
+        &self,
+    ) -> impl Iterator<Item = &RetainedPlanDependencyIdentity> {
+        self.retained_plan_dependencies.iter().map(|d| d.identity())
+    }
+
+    pub fn with_retained_plan_dependency(
+        mut self,
+        dependency: EncodedRetainedPlanDependency<C>,
+    ) -> Self {
+        self.retained_plan_dependencies.push(dependency);
+        self
+    }
+    pub fn retained_plan_dependency_count(&self) -> usize {
+        self.retained_plan_dependencies.len()
+    }
+    pub(crate) fn take_retained_plan_dependencies(
+        &mut self,
+    ) -> Vec<EncodedRetainedPlanDependency<C>> {
+        std::mem::take(&mut self.retained_plan_dependencies)
+    }
+
     pub fn empty() -> Self {
         Self {
+            retained_plan_dependencies: Vec::new(),
             program_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
             result_bindings: Vec::new(),
@@ -2985,10 +3186,12 @@ impl<C> EncodedReusableExecutionBindings<C> {
         self
     }
 
-    pub fn from_operation(operation: EncodedDeviceOperation<C>) -> Self {
+    pub fn from_operation(mut operation: EncodedDeviceOperation<C>) -> Self {
+        let retained_plan_dependencies = operation.take_retained_plan_dependencies();
         let (program_bindings, dynamic_bindings, _compute, result_bindings) =
             operation.into_parts();
         Self {
+            retained_plan_dependencies,
             program_bindings,
             dynamic_bindings,
             result_bindings,
@@ -3008,6 +3211,10 @@ impl<C> EncodedReusableExecutionBindings<C> {
     }
 
     pub(crate) fn into_parts(self) -> (Vec<C>, Vec<C>, Vec<C>) {
+        assert!(
+            self.retained_plan_dependencies.is_empty(),
+            "retained dependency channel was not consumed by core"
+        );
         (
             self.program_bindings,
             self.dynamic_bindings,
@@ -3408,6 +3615,104 @@ pub trait DeviceRuntime: Send + Sync + 'static {
 
     fn descriptor(&self) -> &DeviceDescriptor;
 
+    /// Optional lifetime-stable metadata bound to this exact runtime owner.
+    /// This is not resource admission or permission to reuse a prior wave.
+    fn immutable_runtime_metadata(&self) -> Option<ImmutableRuntimeMetadata<'_, Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Optional lifetime-stable metadata for this exact buffer facade and
+    /// runtime. Current pool ownership and each wave's windows remain checked.
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        _buffer: &'a Self::Buffer,
+    ) -> Option<ImmutableBufferMetadata<'a, Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Identifies an exact resident entry, including replacement at the same
+    /// logical program ID. Unsupported runtimes use the complete encoder.
+    fn reusable_execution_entry_identity(
+        &self,
+        _stream: &Self::Stream,
+        _program_id: &DeviceReusableExecutionProgramId,
+    ) -> Result<Option<DeviceReusableExecutionEntryIdentity>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Encodes all declared binding boundaries of one resident segment from
+    /// freshly checked, retained physical facts. This runs after the core's
+    /// resource permit has been consumed; no pool guards cross this call.
+    fn encode_segment_bindings(
+        &self,
+        _patch: super::PreparedSegmentBindingPatch<'_, Self::Buffer>,
+    ) -> Result<Option<Vec<super::EncodedSegmentBindingNode<Self::Command>>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Cold compilation of a closed, ordered binding write program. The
+    /// returned state contains immutable rules, never current-wave authority.
+    /// Unsupported declarations are rejected here before any dependency is taken.
+    fn compile_segment_binding_program(
+        &self,
+        _declarations: &[(u32, &super::SegmentBindingDeclaration)],
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Execute the cold write program against this wave's freshly checked
+    /// frame after pool guards have been released. None after successful cold
+    /// compilation is a contract failure, never permission to consume twice.
+    fn encode_compiled_segment_bindings(
+        &self,
+        _program: &(dyn std::any::Any + Send + Sync),
+        _frame: &mut super::PreparedSegmentBindingFrame<'_, Self::Buffer>,
+    ) -> Result<Option<super::EncodedSegmentBindingProgram<Self::Command>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Selects only the representation of this wave's freshly checked facts.
+    /// Neither representation permits reusing authority from another wave.
+    fn segment_binding_owner_view_mode(&self) -> super::SegmentBindingOwnerViewMode {
+        super::SegmentBindingOwnerViewMode::Legacy
+    }
+
+    /// Explicit diagnostic selection, immutable after runtime construction.
+    fn segment_binding_oracle_mode(&self) -> super::SegmentBindingOracleMode {
+        super::SegmentBindingOracleMode::Disabled
+    }
+
+    /// Compare encoded bytes and metadata without enqueuing either view.
+    /// None means unsupported and is an error when the diagnostic is enabled.
+    fn compare_segment_binding_reference(
+        &self,
+        _actual: super::SegmentBindingOracleCommands<'_, Self::Command>,
+        _reference: super::SegmentBindingOracleCommands<'_, Self::Command>,
+    ) -> Result<Option<()>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Whole-program encoding oracle. References are encoded in the same wave
+    /// for this explicit diagnostic only and are never enqueued.
+    fn compare_segment_binding_program_reference(
+        &self,
+        _program_bindings: &[Self::Command],
+        _program_binding_nodes: &[u32],
+        _nodes: &[(
+            u32,
+            super::SegmentBindingOracleCommands<'_, Self::Command>,
+            super::SegmentBindingOracleCommands<'_, Self::Command>,
+        )],
+    ) -> Result<Option<()>, Self::Error> {
+        Ok(None)
+    }
+
     /// Resolved attention provider-family policy installed by this runtime
     /// composition. `Auto` is never valid after composition.
     fn attention_execution_policy(&self) -> AttentionExecutionPolicy;
@@ -3541,6 +3846,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         commands: Vec<Self::Command>,
     ) -> Result<Vec<Self::Command>, Self::Error> {
         Ok(commands)
+    }
+
+    /// Cumulative typed binding-prelude upload observations for this runtime.
+    /// Successful copies mean the host CUDA API returned success, not that a
+    /// GPU fence completed. Unsupported backends retain the default `None`.
+    fn program_binding_upload_snapshot(&self) -> Option<DeviceProgramBindingUploadSnapshot> {
+        None
     }
 
     /// Submits one non-empty ordered command batch and returns its exact
@@ -3972,6 +4284,176 @@ mod execution_timing_tests {
             None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn native_dependency_wait_attribution_requires_eager_dynamic_binding() {
+        let row = |phase, node, start, participants, tokens, path, compute, transfers, waits| {
+            DeviceNativeWorkAttribution::with_participant_range_and_dependencies(
+                0,
+                node,
+                phase,
+                DeviceNativeOperationId::new("test.retained_validation").unwrap(),
+                path,
+                DeviceBatchingForm::Scalar,
+                start,
+                participants,
+                tokens,
+                compute,
+                transfers,
+                None,
+                waits,
+            )
+        };
+        for (compute, transfers) in [(1, 1), (0, 0)] {
+            let work = row(
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+                compute,
+                transfers,
+                1,
+            )
+            .unwrap();
+            assert_eq!(work.compute_dispatch_count(), compute);
+            assert_eq!(work.transfer_command_count(), transfers);
+            assert_eq!(work.dependency_wait_count(), 1);
+            assert_eq!(
+                serde_json::to_value(work).unwrap()["dependency_wait_count"],
+                1
+            );
+        }
+        for (phase, node, start, participants, tokens, path) in [
+            (
+                DeviceCommandPhase::Compute,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::Initialization,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::ResultBinding,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                Some(0),
+                0,
+                1,
+                1,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                1,
+                0,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                1,
+                0,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                0,
+                1,
+                DeviceExecutionPath::Eager,
+            ),
+            (
+                DeviceCommandPhase::DynamicBinding,
+                None,
+                0,
+                0,
+                0,
+                DeviceExecutionPath::Replayed,
+            ),
+        ] {
+            assert!(row(phase, node, start, participants, tokens, path, 0, 0, 1).is_none());
+        }
+        for form in [
+            DeviceBatchingForm::Packed,
+            DeviceBatchingForm::ParticipantLoop,
+        ] {
+            assert!(
+                DeviceNativeWorkAttribution::with_participant_range_and_dependencies(
+                    0,
+                    None,
+                    DeviceCommandPhase::DynamicBinding,
+                    DeviceNativeOperationId::new("test.retained_validation").unwrap(),
+                    DeviceExecutionPath::Eager,
+                    form,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    1,
+                )
+                .is_none()
+            );
+        }
+        assert!(row(
+            DeviceCommandPhase::DynamicBinding,
+            None,
+            0,
+            0,
+            0,
+            DeviceExecutionPath::Eager,
+            0,
+            0,
+            0,
+        )
+        .is_none());
+        assert!(DeviceNativeWorkAttribution::new(
+            0,
+            None,
+            DeviceCommandPhase::DynamicBinding,
+            DeviceNativeOperationId::new("test.retained_validation").unwrap(),
+            DeviceExecutionPath::Eager,
+            DeviceBatchingForm::Scalar,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn dependency_interval_remains_distinct_from_compute_and_transfer() {
+        let interval =
+            DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Dependency, 10, 25).unwrap();
+        assert_eq!(interval.kind().as_str(), "dependency");
+        assert_eq!(
+            serde_json::to_value(interval).unwrap()["kind"],
+            "dependency"
+        );
     }
 
     fn replay_test_program_id() -> DeviceReusableExecutionProgramId {

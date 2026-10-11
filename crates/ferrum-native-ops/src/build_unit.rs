@@ -13,14 +13,22 @@ pub enum CudaNativeBuildUnit {
     VllmMarlin,
     VllmMoeMarlin,
     VllmPagedAttentionV2,
+    VllmIndexedPagedAttentionV2,
+    UpstreamLinear,
+    UpstreamExtraLinear,
+    UpstreamQ6F32Linear,
 }
 
 impl CudaNativeBuildUnit {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 8] = [
         Self::Marlin,
         Self::VllmMarlin,
         Self::VllmMoeMarlin,
         Self::VllmPagedAttentionV2,
+        Self::VllmIndexedPagedAttentionV2,
+        Self::UpstreamLinear,
+        Self::UpstreamExtraLinear,
+        Self::UpstreamQ6F32Linear,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -29,6 +37,10 @@ impl CudaNativeBuildUnit {
             Self::VllmMarlin => "vllm_marlin",
             Self::VllmMoeMarlin => "vllm_moe_marlin",
             Self::VllmPagedAttentionV2 => "vllm_paged_attention_v2",
+            Self::VllmIndexedPagedAttentionV2 => "vllm_indexed_paged_attention_v2",
+            Self::UpstreamLinear => "upstream_linear",
+            Self::UpstreamExtraLinear => "upstream_extra_linear",
+            Self::UpstreamQ6F32Linear => "upstream_q6_f32_linear",
         }
     }
 
@@ -37,10 +49,17 @@ impl CudaNativeBuildUnit {
             Self::Marlin => "ferrum.cuda.marlin",
             Self::VllmMarlin => "ferrum.cuda.vllm_marlin",
             Self::VllmMoeMarlin => "ferrum.cuda.vllm_moe_marlin",
-            Self::VllmPagedAttentionV2 => "ferrum.cuda.vllm_paged_attention_v2",
+            Self::VllmPagedAttentionV2 | Self::VllmIndexedPagedAttentionV2 => {
+                "ferrum.cuda.vllm_paged_attention_v2"
+            }
+            Self::UpstreamLinear => "ferrum.cuda.upstream_linear",
+            Self::UpstreamExtraLinear => "ferrum.cuda.upstream_extra_linear",
+            Self::UpstreamQ6F32Linear => "ferrum.cuda.upstream-q6-f32-linear",
         }
     }
 
+    /// Return the baseline build unit for an operator. Optional extensions of
+    /// that same artifact are requested explicitly by the active Cargo graph.
     pub fn from_artifact_operator(operator: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -49,6 +68,45 @@ impl CudaNativeBuildUnit {
 
     pub const fn required_exports(self) -> &'static [&'static str] {
         match self {
+            Self::UpstreamQ6F32Linear => &[
+                "ferrum_upstream_q6_f32_check_weights_v1",
+                "ferrum_upstream_q6_f32_dot_v1",
+                "ferrum_upstream_q6_f32_pack_v1",
+                "ferrum_upstream_q6_f32_plan_v1",
+                "ferrum_upstream_q6_f32_publish_v1",
+            ],
+            Self::UpstreamLinear => &[
+                "ferrum_upstream_mmq_cast_v1",
+                "ferrum_upstream_mmq_cast_v2",
+                "ferrum_upstream_mmq_check_weights_v2",
+                "ferrum_upstream_mmq_dot_v1",
+                "ferrum_upstream_mmq_pack_v1",
+                "ferrum_upstream_mmq_pack_v2",
+                "ferrum_upstream_mmq_plan_v1",
+                "ferrum_upstream_mmvq_cast_v1",
+                "ferrum_upstream_mmvq_cast_v2",
+                "ferrum_upstream_mmvq_check_weights_v2",
+                "ferrum_upstream_mmvq_dot_v1",
+                "ferrum_upstream_mmvq_pack_v1",
+                "ferrum_upstream_mmvq_pack_v2",
+                "ferrum_upstream_mmvq_plan_v1",
+            ],
+            Self::UpstreamExtraLinear => &[
+                "ferrum_upstream_extra_mmq_cast_v1",
+                "ferrum_upstream_extra_mmq_cast_v2",
+                "ferrum_upstream_extra_mmq_check_weights_v2",
+                "ferrum_upstream_extra_mmq_dot_v1",
+                "ferrum_upstream_extra_mmq_pack_v1",
+                "ferrum_upstream_extra_mmq_pack_v2",
+                "ferrum_upstream_extra_mmq_plan_v1",
+                "ferrum_upstream_extra_mmvq_cast_v1",
+                "ferrum_upstream_extra_mmvq_cast_v2",
+                "ferrum_upstream_extra_mmvq_check_weights_v2",
+                "ferrum_upstream_extra_mmvq_dot_v1",
+                "ferrum_upstream_extra_mmvq_pack_v1",
+                "ferrum_upstream_extra_mmvq_pack_v2",
+                "ferrum_upstream_extra_mmvq_plan_v1",
+            ],
             Self::Marlin => &["marlin_cuda", "marlin_cuda_moe"],
             Self::VllmMarlin => &[
                 "ferrum_block_fp8_group128_repack",
@@ -73,6 +131,20 @@ impl CudaNativeBuildUnit {
                 "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed",
                 "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed",
                 "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed",
+            ],
+            Self::VllmIndexedPagedAttentionV2 => &[
+                "ferrum_vllm_paged_attention_v1_f16_h128_b16",
+                "ferrum_vllm_paged_attention_v1_f16_h256_b16",
+                "ferrum_vllm_paged_attention_v2_f16_h128_b16",
+                "ferrum_vllm_paged_attention_v2_f16_h256_b16",
+                "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed",
+                "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed_indexed_v1",
+                "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed",
+                "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed_indexed_v1",
+                "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed",
+                "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed_indexed_v1",
+                "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed",
+                "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed_indexed_v1",
             ],
         }
     }
@@ -184,14 +256,25 @@ mod tests {
 
     #[test]
     fn resolves_exact_required_build_units() {
-        let operator_exports = CudaNativeBuildUnit::ALL.map(exports);
-        let artifacts = CudaNativeBuildUnit::ALL
+        // Several build capabilities may share one artifact; materialize one
+        // view with the union of that artifact's requested exports.
+        let mut by_operator = std::collections::BTreeMap::<&str, BTreeSet<String>>::new();
+        for unit in CudaNativeBuildUnit::ALL {
+            by_operator
+                .entry(unit.artifact_operator())
+                .or_default()
+                .extend(exports(unit));
+        }
+        let operator_exports = by_operator
+            .into_iter()
+            .map(|(operator, symbols)| (operator, symbols.into_iter().collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let artifacts = operator_exports
             .iter()
-            .enumerate()
-            .map(|(index, unit)| ArtifactView {
-                operator: unit.artifact_operator(),
+            .map(|(operator, symbols)| ArtifactView {
+                operator,
                 backend: NativeOperatorBackend::Cuda,
-                exports: &operator_exports[index],
+                exports: symbols,
             })
             .collect::<Vec<_>>();
 
@@ -259,6 +342,121 @@ mod tests {
                 unit: "vllm_moe_marlin",
                 export: "ferrum_vllm_marlin_moe_fp8_f16",
             }
+        );
+    }
+    #[test]
+    fn extra_artifact_cannot_be_satisfied_by_original_operator_or_symbols() {
+        let old = exports(CudaNativeBuildUnit::UpstreamLinear);
+        let extra = CudaNativeBuildUnit::UpstreamExtraLinear;
+        let old_operator = [ArtifactView {
+            operator: CudaNativeBuildUnit::UpstreamLinear.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &old,
+        }];
+        assert!(matches!(
+            resolve_views(&old_operator, [extra]),
+            Err(CudaNativeBuildCoverageError::MissingArtifact { .. })
+        ));
+        let wrong_symbols = [ArtifactView {
+            operator: extra.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &old,
+        }];
+        assert!(matches!(
+            resolve_views(&wrong_symbols, [extra]),
+            Err(CudaNativeBuildCoverageError::MissingExport { .. })
+        ));
+        let new = exports(extra);
+        let both = [
+            ArtifactView {
+                operator: CudaNativeBuildUnit::UpstreamLinear.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &old,
+            },
+            ArtifactView {
+                operator: extra.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &new,
+            },
+        ];
+        assert!(resolve_views(&both, [CudaNativeBuildUnit::UpstreamLinear, extra]).is_ok());
+    }
+
+    #[test]
+    fn q6_f32_requires_its_own_operator_and_every_export() {
+        let q6 = CudaNativeBuildUnit::UpstreamQ6F32Linear;
+        let old = exports(CudaNativeBuildUnit::UpstreamLinear);
+        let old_artifact = [ArtifactView {
+            operator: CudaNativeBuildUnit::UpstreamLinear.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &old,
+        }];
+        assert!(matches!(
+            resolve_views(&old_artifact, [q6]),
+            Err(CudaNativeBuildCoverageError::MissingArtifact { .. })
+        ));
+        for missing in q6.required_exports() {
+            let available = q6
+                .required_exports()
+                .iter()
+                .filter(|e| *e != missing)
+                .map(|e| (*e).to_owned())
+                .collect::<Vec<_>>();
+            let artifact = [ArtifactView {
+                operator: q6.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &available,
+            }];
+            assert!(
+                matches!(resolve_views(&artifact,[q6]), Err(CudaNativeBuildCoverageError::MissingExport { export, .. }) if export == *missing)
+            );
+        }
+    }
+    #[test]
+    fn indexed_paged_attention_requires_indexed_and_retained_addressed_exports() {
+        let unit = CudaNativeBuildUnit::VllmIndexedPagedAttentionV2;
+        let complete = exports(unit);
+        assert!(resolve_views(
+            &[ArtifactView {
+                operator: unit.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &complete,
+            }],
+            [unit]
+        )
+        .is_ok());
+        for missing in unit.required_exports() {
+            let available = complete
+                .iter()
+                .filter(|symbol| symbol.as_str() != *missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            let artifact = [ArtifactView {
+                operator: unit.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                exports: &available,
+            }];
+            assert!(matches!(resolve_views(&artifact, [unit]),
+                Err(CudaNativeBuildCoverageError::MissingExport { export, .. }) if export == *missing));
+        }
+    }
+    #[test]
+    fn original_paged_attention_artifact_remains_valid_without_indexed_capability() {
+        let original = CudaNativeBuildUnit::VllmPagedAttentionV2;
+        let indexed = CudaNativeBuildUnit::VllmIndexedPagedAttentionV2;
+        let symbols = exports(original);
+        let artifact = [ArtifactView {
+            operator: original.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &symbols,
+        }];
+        assert!(resolve_views(&artifact, [original]).is_ok());
+        assert!(matches!(resolve_views(&artifact, [original, indexed]),
+            Err(CudaNativeBuildCoverageError::MissingExport { unit, export })
+                if unit == indexed.as_str() && export.ends_with("_addressed_indexed_v1")));
+        assert_eq!(
+            CudaNativeBuildUnit::from_artifact_operator(original.artifact_operator()),
+            Some(original)
         );
     }
 }

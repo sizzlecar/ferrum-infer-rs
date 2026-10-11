@@ -139,6 +139,11 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     assert!(artifact["attribution"]["physical_commands"]
         .as_array()
         .is_some_and(|commands| !commands.is_empty()));
+    assert!(artifact["attribution"]["physical_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|command| command["dependency_wait_count"] == 0));
     assert_eq!(
         artifact["attribution"]["replayed_segments"],
         serde_json::json!([])

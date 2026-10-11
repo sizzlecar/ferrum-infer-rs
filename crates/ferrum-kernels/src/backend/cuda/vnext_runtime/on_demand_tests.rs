@@ -82,10 +82,10 @@ impl CaptureHarness {
         // The fixture owns the same allocation for the cache lifetime. The
         // executable retains it so an evicted caller command cannot free it.
         command.reusable_address_scope = Some(DeviceReusableAddressScope::Plan);
-        command.executable = Some(Arc::new(CudaCommandExecutable {
-            regions: Vec::new(),
-            host_storage: Vec::new(),
-            enqueue: Mutex::new(Box::new(move |stream, _, _, _| {
+        command.executable = Some(Arc::new(CudaCommandExecutable::static_work(
+            Vec::new(),
+            Vec::new(),
+            Box::new(move |stream, _, _, _| {
                 let _retained_counter = &counter;
                 if reject_capture {
                     let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
@@ -108,8 +108,8 @@ impl CaptureHarness {
                 }
                 .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
                 Ok(())
-            })),
-        }));
+            }),
+        )));
         command
     }
 
@@ -252,12 +252,14 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
             .unwrap();
         h.cache
             .register_program(
+                DeviceComputePathRequirement::Adaptive,
                 &capture,
                 &candidates,
                 &phases,
                 &nodes,
                 &commands,
                 &preparation,
+                &ferrum_interfaces::vnext::DisabledDeviceSubmissionTimingSink,
             )
             .unwrap();
         let catalog = h.cache.catalog().unwrap();
@@ -273,4 +275,145 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
         prior_invocation = Some(invocation);
     }
     assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![2]);
+}
+
+#[test]
+fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
+    let mut h = CaptureHarness::new(1);
+    h.execute(h.command(1, false), true, 1);
+    h.execute(h.command(1, false), true, 2);
+    let config = crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config(
+        0,
+        DeviceId::new("device.cuda.eager-catalog-test").unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
+    )
+    .unwrap();
+    let implementation = config.runtime_implementation_fingerprint.clone();
+    let runtime = Arc::new(CudaDeviceRuntime::new(config).unwrap());
+    let owner = ExecutionLane::create(runtime).unwrap();
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("fixture.decode").unwrap(),
+        ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+    )
+    .unwrap();
+    let id = DeviceReusableExecutionProgramId::new(
+        serde_json::from_value(serde_json::json!("a".repeat(64))).unwrap(),
+        implementation,
+        owner.id(),
+        bucket.bucket_id().clone(),
+        "c".repeat(64),
+        "d".repeat(64),
+        0,
+        1,
+        1,
+        1,
+    )
+    .unwrap();
+    let capture =
+        DeviceReusableExecutionCapture::new(id.clone(), 1, Vec::new(), Vec::new()).unwrap();
+    let commands = [h.command(1, false)];
+    let phases = [DeviceCommandPhase::Compute];
+    let nodes = [Some(0)];
+    let sink = ferrum_interfaces::vnext::DisabledDeviceSubmissionTimingSink;
+    let candidates = cuda_executable_candidates(&phases, &commands, Some(&nodes), &[]).unwrap();
+    let preparation = h
+        .cache
+        .prepare_all(&h.context, &h.stream, &h.blas, &commands, &candidates, true)
+        .unwrap();
+    h.cache
+        .register_program(
+            DeviceComputePathRequirement::Adaptive,
+            &capture,
+            &candidates,
+            &phases,
+            &nodes,
+            &commands,
+            &preparation,
+            &sink,
+        )
+        .unwrap();
+    let catalog = h.cache.catalog().unwrap();
+    assert_eq!(catalog.len(), 1);
+    assert!(catalog[0].is_determinism_ready());
+    let recipe_owner = h.cache.recipe_program_owner(&id).unwrap();
+    let residency = h.cache.preparation().unwrap();
+    let invocation =
+        DeviceReusableExecutionInvocation::new(id.clone(), catalog[0].segments()[0].clone(), 1, 1)
+            .unwrap();
+    assert!(h
+        .cache
+        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false)
+        .unwrap()
+        .is_some());
+    h.stream.synchronize().unwrap();
+    assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![3]);
+
+    // Match submit_with_timing's forced-eager path: fresh caller commands and
+    // capture metadata still exist, but there is no candidate discovery.
+    let eager_commands = [h.command(1, false)];
+    let eager_preparation = h
+        .cache
+        .prepare_all(&h.context, &h.stream, &h.blas, &eager_commands, &[], true)
+        .unwrap();
+    assert_eq!(eager_preparation, CudaExecutablePreparation::default());
+    h.cache
+        .register_program(
+            DeviceComputePathRequirement::EagerOnly,
+            &capture,
+            &[],
+            &phases,
+            &nodes,
+            &eager_commands,
+            &eager_preparation,
+            &sink,
+        )
+        .unwrap();
+    eager_commands[0].enqueue(&h.stream, &h.blas).unwrap();
+    h.stream.synchronize().unwrap();
+    assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![4]);
+    assert_eq!(h.cache.catalog().unwrap(), catalog);
+    assert!(recipe_owner.same_entry(&h.cache.recipe_program_owner(&id).unwrap()));
+    let after = h.cache.preparation().unwrap();
+    assert_eq!(
+        after.resident_executables(),
+        residency.resident_executables()
+    );
+    assert_eq!(after.maximum_executables(), residency.maximum_executables());
+
+    // An actual Adaptive update remains subject to the monotonic seal. Empty
+    // candidates must not silently delete this resident program in that path.
+    assert!(h
+        .cache
+        .register_program(
+            DeviceComputePathRequirement::Adaptive,
+            &capture,
+            &[],
+            &phases,
+            &nodes,
+            &eager_commands,
+            &eager_preparation,
+            &sink,
+        )
+        .is_err());
+    assert_eq!(h.cache.catalog().unwrap(), catalog);
+    assert!(recipe_owner.same_entry(&h.cache.recipe_program_owner(&id).unwrap()));
+    assert!(h
+        .cache
+        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false)
+        .unwrap()
+        .is_some());
+    h.stream.synchronize().unwrap();
+    assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![5]);
+
+    // Keeping the recipe token alive cannot authorize an explicitly evicted
+    // graph. The original invocation must miss before issuing another launch.
+    h.cache.trim_quiescent();
+    assert!(h.cache.recipe_program_owner(&id).is_none());
+    assert!(!h.cache.contains_program_segment(&invocation).unwrap());
+    assert!(h
+        .cache
+        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false)
+        .unwrap()
+        .is_none());
+    assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![5]);
 }

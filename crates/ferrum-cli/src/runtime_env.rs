@@ -38,6 +38,12 @@ pub fn push_cli_runtime_usize(
 pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in entries {
+        if entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
+            || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
+            || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
+        {
+            continue;
+        }
         if std::env::var_os(&entry.key).is_none() {
             std::env::set_var(&entry.key, &entry.effective_value);
             materialized.push(entry.key.clone());
@@ -49,6 +55,12 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
 pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in &snapshot.entries {
+        if entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
+            || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
+            || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
+        {
+            continue;
+        }
         if entry.source != RuntimeConfigSource::Env {
             std::env::set_var(&entry.key, &entry.effective_value);
             materialized.push(entry.key.clone());
@@ -128,6 +140,60 @@ mod tests {
                 .iter()
                 .map(|(key, value, source)| RuntimeConfigEntry::new(*key, *value, *source)),
         )
+    }
+
+    #[test]
+    fn segment_binding_owner_view_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "indexed", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(runtime_snapshot_value(&current, key), Some("indexed"));
+            assert_eq!(current.entries[0].source, source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "packed", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(runtime_snapshot_value(&current, key), Some("packed"));
+            assert_eq!(current.entries[0].source, source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "indexed", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(runtime_snapshot_value(&current, key), Some("indexed"));
+            assert_eq!(current.entries[0].source, source);
+        }
     }
 
     #[test]

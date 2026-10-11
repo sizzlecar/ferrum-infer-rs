@@ -4,15 +4,17 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input;
-use ferrum_types::AttentionExecutionPolicy;
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_causal_decode_attention_grouping;
+use ferrum_types::{
+    AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
+};
 use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments.len() != 5 {
+    if !matches!(arguments.len(), 5 | 6 | 7) {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out>",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping]",
             arguments
                 .first()
                 .map(String::as_str)
@@ -24,10 +26,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let policy = AttentionExecutionPolicy::parse_runtime_value(&arguments[2])?;
     let provider_catalog_path = Path::new(&arguments[3]);
     let capability_catalog_path = Path::new(&arguments[4]);
-    let snapshot = cuda_native_operator_catalog_input(
+    let causal_decode_preparation = arguments
+        .get(5)
+        .map(|value| CausalDecodePreparationMode::parse_runtime_value(value))
+        .transpose()?
+        .unwrap_or_default();
+    let causal_decode_attention_grouping = arguments
+        .get(6)
+        .map(|value| CausalDecodeAttentionGrouping::parse_runtime_value(value))
+        .transpose()?
+        .unwrap_or_default();
+    let snapshot = cuda_native_operator_catalog_input_with_causal_decode_attention_grouping(
         ordinal,
         DeviceId::new(format!("cuda:{ordinal}"))?,
         policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
     )?;
     let capability_fingerprint = snapshot.capability_catalog().fingerprint()?;
     let (provider_catalog, capability_catalog) = snapshot.into_parts();

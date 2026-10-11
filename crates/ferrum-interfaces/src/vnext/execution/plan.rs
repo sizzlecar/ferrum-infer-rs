@@ -329,6 +329,12 @@ impl ExecutionPlan {
             execution_determinism,
         )?;
         provider_resources.validate_shape()?;
+        super::resolution::validate_projection_numerics(
+            family,
+            &program_node.operation_id,
+            &resolution.values,
+            provider_resources.projection_numerics(),
+        )?;
         if provider_resources.provider_id != selection.selected_provider {
             return Err(invalid_plan(format!(
                 "node `{}` resource estimate belongs to provider `{}` instead of selected provider `{}`",

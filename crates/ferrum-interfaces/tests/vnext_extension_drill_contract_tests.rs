@@ -134,6 +134,8 @@ impl ModelFamilyProvider for SyntheticExtensionFamily {
                     version: self.required_version,
                     multiplication_type: None,
                     accumulation_type: None,
+                    staged_arithmetic: None,
+                    composite_arithmetic: None,
                 }],
             }],
             vec![profile_id],

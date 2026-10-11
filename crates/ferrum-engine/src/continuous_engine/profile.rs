@@ -1211,6 +1211,10 @@ impl VNextProfileEventContext {
                     serde_json::json!(command.transfer_command_count()),
                 ),
                 (
+                    "physical_dependency_wait_count".to_string(),
+                    serde_json::json!(command.dependency_wait_count()),
+                ),
+                (
                     "reusable_graph_node_count".to_string(),
                     serde_json::json!(command.reusable_graph_node_count()),
                 ),

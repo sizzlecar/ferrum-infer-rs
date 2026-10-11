@@ -28,9 +28,10 @@ use ferrum_interfaces::vnext::{
 };
 use sha2::{Digest, Sha256};
 
+use super::replay_encoding::{Encoding, EncodingTarget};
 use super::{
     attach_invocation_binding, contiguous_bindings, ensure_estimator_request, estimate,
-    launch_gemm_f16,
+    launch_gemm_f16, provider_failure,
 };
 #[cfg(feature = "vllm-marlin")]
 use super::{
@@ -65,7 +66,11 @@ use crate::marlin_fp8_materializer::{
 
 mod native_projection;
 mod precision;
+pub(in crate::backend::cuda::vnext_ops) mod segment_bindings;
+use super::q8act_attention::PreparedAttentionProjections;
+use crate::backend::cuda::vnext_ops::native_blocks::q8act::Q8ActKernels;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
+use ferrum_interfaces::vnext::{ProjectionRole, Q8ActAttentionProfile};
 use precision::AttentionPrecision;
 const PREPARE_FUNCTION: &str =
     "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect";
@@ -100,6 +105,9 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
 #[derive(Clone)]
 struct AttentionFunctions {
     native: CudaNativeBlockKernels,
+    q8act: Option<Q8ActKernels>,
+
+    upstream: Option<Arc<super::q8act_attention::upstream::Runtime>>,
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     prepare_negative_rate: CudaFunction,
@@ -117,6 +125,50 @@ struct AttentionFunctions {
 }
 
 impl CudaGatedDeltaRecurrentAttentionProvider {
+    pub(in crate::backend::cuda::vnext_ops) fn new_upstream(
+        runtime: &CudaDeviceRuntime,
+        prefill: bool,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(
+            runtime,
+            if prefill {
+                AttentionPrecision::F32MasterUpstreamPrefill
+            } else {
+                AttentionPrecision::F32MasterUpstream
+            },
+        )
+    }
+    pub(in crate::backend::cuda::vnext_ops) fn new_upstream_extra(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterUpstreamExtraPrefill)
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_upstream_extra_prefill(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(
+            runtime,
+            AttentionPrecision::F32MasterUpstreamExtraLargePrefill,
+        )
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_upstream_extra_all_rows(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterUpstreamExtraAllRows)
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_g32_mmq_prefill(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterG32MmqPrefill)
+    }
+    pub(in crate::backend::cuda::vnext_ops) fn new_q8act(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterQ8Act)
+    }
     pub(in crate::backend::cuda::vnext_ops) fn new(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
@@ -153,9 +205,14 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             source.as_bytes(),
             precision.operation().as_bytes(),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("q8act_attention.rs"),
+            include_bytes!("replay_encoding.rs"),
+            include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
+            include_bytes!("attention/segment_bindings.rs"),
+            include_bytes!("segment_bindings.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
@@ -176,9 +233,16 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID.as_bytes(),
             COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
         ]);
+
+        if precision.upstream() {
+            provider_fingerprint_parts
+                .extend(super::q8act_attention::upstream::fingerprint_sources());
+        }
         let provider_fingerprint = implementation_fingerprint(&provider_fingerprint_parts);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
+            include_bytes!("q8act_attention.rs"),
+            include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("attention/precision.rs"),
             include_bytes!("gguf_f16_projection.rs"),
             include_bytes!("attention/native_projection.rs"),
@@ -328,6 +392,21 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             .map_err(|error| CudaDeviceRuntimeError::driver("attention residual module", error))?;
         let functions = AttentionFunctions {
             native: CudaNativeBlockKernels::load(runtime.context())?,
+
+            upstream: precision
+                .upstream()
+                .then(|| {
+                    super::q8act_attention::upstream::Runtime::new(
+                        runtime.context(),
+                        descriptor.provider_implementation_fingerprint(),
+                        precision.upstream_profile(),
+                    )
+                })
+                .transpose()?,
+            q8act: (precision.q8act()
+                || matches!(precision, AttentionPrecision::F32MasterG32MmqPrefill))
+            .then(|| Q8ActKernels::load_attention(runtime.context()))
+            .transpose()?,
             rms_norm: load_function(&rms_module, precision.norm(), "attention RMSNorm")?,
             prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
             prepare_negative_rate: load_function(
@@ -402,6 +481,36 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
         ensure_estimator_request(&self.descriptor, &request, self.precision.operation())?;
+        let q8act = self
+            .precision
+            .q8act()
+            .then(|| {
+                PreparedAttentionProjections::prepare(
+                    Q8ActAttentionProfile::GatedDelta,
+                    request.values(),
+                )
+            })
+            .transpose()
+            .map_err(invalid_plan)?;
+
+        let q8act = if let Some(runtime) = &self.functions.upstream {
+            Some(
+                PreparedAttentionProjections::prepare_upstream(
+                    Q8ActAttentionProfile::GatedDelta,
+                    request.values(),
+                    runtime.clone(),
+                )
+                .map_err(invalid_plan)?,
+            )
+        } else {
+            q8act
+        };
+        let pack_per_token = q8act
+            .as_ref()
+            .map_or(0, PreparedAttentionProjections::bytes_per_token);
+        let pack_slop = q8act
+            .as_ref()
+            .map_or(0, PreparedAttentionProjections::alignment_slop);
         let shape = AttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
         let projection = AttentionProjection::from_values(
             request.values(),
@@ -416,6 +525,14 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                     .and_then(|bytes| {
                         bytes
                             .checked_add(projection.workspace_reservation_bytes()?)
+                            .and_then(|bytes| bytes.checked_add(pack_slop))
+                            .and_then(|bytes| {
+                                bytes.checked_add(
+                                    q8act
+                                        .as_ref()
+                                        .map_or(0, PreparedAttentionProjections::fixed_bytes),
+                                )
+                            })
                             .ok_or_else(|| "attention fixed scratch size overflows".to_owned())
                     })
                     .map_err(invalid_plan)?,
@@ -428,6 +545,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                                 projection
                                     .staging_bytes_per_token(shape.projection_staging_features())?,
                             )
+                            .and_then(|bytes| bytes.checked_add(pack_per_token))
                             .ok_or_else(|| {
                                 "attention projection staging estimate overflows".to_owned()
                             })
@@ -446,16 +564,37 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
             DynamicStorageRequirement::contiguous(),
         )?;
-        Ok(
-            estimate(&self.descriptor, request.input_fingerprint(), Some(scratch))
-                .with_binding(binding),
+        let persistent = q8act
+            .as_ref()
+            .map(PreparedAttentionProjections::persistent_requirement)
+            .transpose()
+            .map_err(invalid_plan)?
+            .flatten();
+        let estimate = OperationResourceEstimate::new(
+            self.descriptor.resource_estimator_id(),
+            self.descriptor.resource_estimator_version(),
+            self.descriptor
+                .resource_estimator_implementation_fingerprint(),
+            request.input_fingerprint(),
+            VALUE_ALIGNMENT_BYTES,
+            Some(scratch),
+            persistent,
         )
+        .with_binding(binding);
+        Ok(match q8act {
+            Some(plan) => estimate.with_projection_numerics(plan.into_numerics()),
+            None => estimate,
+        })
     }
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
     fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
-        ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+        if self.precision.upstream() {
+            ferrum_interfaces::vnext::ReusableBindingResources::All
+        } else {
+            ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+        }
     }
 
     fn reusable_execution_topology(
@@ -472,14 +611,15 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 9),
             ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
         ]);
+        let mut workspaces = vec![
+            ReusableExecutionWorkspaceAddress::Scratch,
+            ReusableExecutionWorkspaceAddress::Binding,
+        ];
+        if self.precision.upstream() {
+            workspaces.push(ReusableExecutionWorkspaceAddress::Persistent);
+        }
         if request
-            .reusable_address_scope(
-                &values,
-                &[
-                    ReusableExecutionWorkspaceAddress::Scratch,
-                    ReusableExecutionWorkspaceAddress::Binding,
-                ],
-            )?
+            .reusable_address_scope(&values, &workspaces)?
             .is_none()
         {
             return Ok(ReusableExecutionTopology::EagerBoundary);
@@ -502,7 +642,46 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
             invocation,
+            EncodingTarget::Full,
+            None,
         )
+        .and_then(Encoding::full)
+        .map_err(|message| {
+            OperationFailure::new(
+                identity,
+                ProfilePhase::Forward,
+                "cuda.gated_delta_recurrent_attention.encode",
+                message.chars().take(2048).collect::<String>(),
+                false,
+            )
+            .expect("core-issued CUDA attention identity must be valid")
+        })
+    }
+
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<CudaDeviceCommand>,
+            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        let mut declaration = None;
+        let identity = invocation.participants()[0].identity().clone();
+        encode_attention(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.functions,
+            self.precision,
+            self.execution_capabilities,
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+            invocation,
+            EncodingTarget::Full,
+            Some(&mut declaration),
+        )
+        .and_then(|encoded| encoded.full().map(|operation| (operation, declaration)))
         .map_err(|message| {
             OperationFailure::new(
                 identity,
@@ -520,6 +699,47 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        let small_hybrid = self
+            .functions
+            .upstream
+            .as_ref()
+            .map(|r| r.g32_binding_only(&invocation))
+            .transpose()
+            .map_err(|message| {
+                provider_failure(
+                    identity.clone(),
+                    "cuda.gated_delta_recurrent_attention.hybrid_bindings",
+                    message,
+                )
+            })?
+            .unwrap_or(false);
+        if self.precision.upstream() && !small_hybrid {
+            if invocation.program_binding().is_none() {
+                // Preserve dynamic-binding placement without a compiled slot.
+                return self
+                    .encode_selected(invocation)
+                    .map(EncodedReusableExecutionBindings::from_operation);
+            }
+            return encode_attention(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.functions,
+                self.precision,
+                self.execution_capabilities,
+                #[cfg(feature = "vllm-marlin")]
+                self.projection_runtime,
+                invocation,
+                EncodingTarget::BindingsOnly,
+                None,
+            )
+            .and_then(Encoding::bindings)
+            .map_err(|message| {
+                provider_failure(
+                    identity,
+                    "cuda.attention.upstream_reusable_bindings",
+                    message,
+                )
+            });
+        }
         encode_reusable_attention_bindings(invocation, self.precision).map_err(|message| {
             OperationFailure::new(
                 identity,
@@ -1399,13 +1619,37 @@ fn encode_attention(
     execution_capabilities: GatedDeltaExecutionCapabilities,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
+    target: EncodingTarget,
+    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
+) -> Result<Encoding<CudaDeviceCommand>, String> {
+    let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     if invocation.participants().is_empty()
         || invocation.operation().id.as_str() != precision.operation()
     {
         return Err("CUDA recurrent attention received another or empty operation".to_owned());
     }
     let first = &invocation.participants()[0];
+    let q8act = precision
+        .q8act()
+        .then(|| {
+            PreparedAttentionProjections::from_invocation(
+                Q8ActAttentionProfile::GatedDelta,
+                &invocation,
+            )
+        })
+        .transpose()?;
+
+    let q8act = if let Some(runtime) = &functions.upstream {
+        Some(PreparedAttentionProjections::from_upstream_invocation(
+            Q8ActAttentionProfile::GatedDelta,
+            &invocation,
+            runtime.clone(),
+            target.projection_preparation(),
+        )?)
+    } else {
+        q8act
+    };
+    let mut q8act = q8act;
     let shape = AttentionShape::from_attributes(first.attributes())?;
     let projection = AttentionProjection::from_values(
         first.bindings(),
@@ -1427,6 +1671,9 @@ fn encode_attention(
         .map_err(|_| "CUDA recurrent attention participant count exceeds u64".to_owned())?;
     shape.validate_launch_extents(total_tokens)?;
     let layout = ScratchLayout::new(shape, total_tokens, participant_count_usize, projection)?;
+    let required_bytes = q8act.as_ref().map_or(Ok(layout.required_bytes), |plan| {
+        plan.required_bytes(layout.required_bytes, total_tokens)
+    })?;
     let binding_layout = StateBindingLayout::new(participant_count_usize)?;
     let cuda_shape = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
@@ -1458,7 +1705,7 @@ fn encode_attention(
         )?,
         scratch: {
             let index = compute_regions.len();
-            compute_regions.push(shared_scratch_region(&invocation, layout.required_bytes)?);
+            compute_regions.push(shared_scratch_region(&invocation, required_bytes)?);
             index
         },
         binding: {
@@ -1470,6 +1717,18 @@ fn encode_attention(
             index
         },
     };
+    if let Some(plan) = &q8act {
+        for (role, weight) in [
+            (ProjectionRole::GatedDeltaInput, &shared.qkvzba),
+            (ProjectionRole::GatedDeltaOutput, &shared.output),
+        ] {
+            if let SharedProjectionWeight::Native { parts, .. } = weight {
+                plan.validate_parts(role, parts)?;
+            } else if plan.projection(role)?.has_staged_leaf() {
+                return Err("staged recurrent projection is not a native matrix".into());
+            }
+        }
+    }
     let packed_regions = if use_packed {
         let input_region = compute_regions.len();
         compute_regions.push(super::shared_token_region(
@@ -1643,55 +1902,50 @@ fn encode_attention(
         });
     }
 
-    let functions = functions.clone();
-    let transfers_per_launch = attention_transfers_per_launch(&shared.qkvzba, &shared.output)?;
-    let mut replay_key = CudaCommandReplayKeyBuilder::new(
-        provider_fingerprint,
-        "vnext_gated_delta_recurrent_attention",
-    )
-    .bytes(projection.replay_tag().as_bytes())
-    .u64(shape.hidden_size)
-    .u64(shape.key_heads)
-    .u64(shape.value_heads)
-    .u64(shape.key_head_dim)
-    .u64(shape.value_head_dim)
-    .u64(shape.qkv_features)
-    .u64(shape.value_features)
-    .u64(shape.qkvz_features)
-    .u64(shape.ba_features)
-    .u64(shape.conv_kernel)
-    .u64(shape.conv_state_width)
-    .f32(shape.epsilon)
-    .u64(shape.layer_index)
-    .bytes(shape.decay_parameterization.as_str().as_bytes())
-    .bytes(shape.value_head_mapping.as_str().as_bytes())
-    .u64(total_tokens)
-    .u64(layout.required_bytes)
-    .u64(binding_layout.required_bytes)
-    .u64(STATE_BINDING_SLOT_BYTES)
-    .boolean(use_packed)
-    .u64(launches.len() as u64);
-    replay_key = shared.qkvzba.bind_replay_topology(replay_key);
-    replay_key = shared.output.bind_replay_topology(replay_key);
-    for tokens in &participant_token_counts {
-        replay_key = replay_key.u64(*tokens);
+    if let Some(plan) = q8act.as_mut().filter(|p| p.is_upstream()) {
+        for launch in &launches {
+            for (role, weight, input, output) in [
+                (
+                    ProjectionRole::GatedDeltaInput,
+                    &shared.qkvzba,
+                    layout.normalized,
+                    layout.qkvzba,
+                ),
+                (
+                    ProjectionRole::GatedDeltaOutput,
+                    &shared.output,
+                    layout.z_or_activation,
+                    layout.projected,
+                ),
+            ] {
+                if let SharedProjectionWeight::Native {
+                    first_region,
+                    parts,
+                } = weight
+                {
+                    plan.prepare_upstream_projection(
+                        &invocation,
+                        role,
+                        parts,
+                        &compute_regions
+                            [*first_region..*first_region + weights::region_count(parts)],
+                        &compute_regions[shared.scratch],
+                        input,
+                        output,
+                        u32::try_from(launch.tokens).map_err(|_| "attention rows exceed u32")?,
+                    )?;
+                } else if plan.projection(role)?.has_staged_leaf() {
+                    return Err("upstream attention requires native physical projections".into());
+                }
+            }
+        }
     }
-    for launch in &launches {
-        replay_key = replay_key
-            .u64(launch.input_region as u64)
-            .u64(launch.output_region as u64)
-            .u64(launch.state_binding_offset)
-            .u64(launch.host_control as u64)
-            .u64(
-                launch
-                    .host_token_seq_indices
-                    .map_or(u64::MAX, |index| index as u64),
-            )
-            .bytes(launch.execution_form.as_str().as_bytes())
-            .i32(launch.batch_i32)
-            .u64(launch.tokens)
-            .i32(launch.tokens_i32);
-    }
+
+    let upstream_bindings = q8act
+        .as_ref()
+        .map(|projections| projections.upstream_bindings(&invocation, segment_validations.as_mut()))
+        .transpose()?
+        .unwrap_or_default();
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
     let attributed_launches = if use_packed {
@@ -1702,15 +1956,6 @@ fn encode_attention(
     if u64::try_from(launches.len()).ok() != Some(attributed_launches) {
         return Err("CUDA recurrent attention launch attribution is inconsistent".to_owned());
     }
-    let logical_compute_dispatches = launches.iter().try_fold(0_u64, |total, launch| {
-        let count = attention_dispatches_per_launch(&shared.qkvzba, &shared.output, launch.tokens)?;
-        total
-            .checked_add(count)
-            .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())
-    })?;
-    let physical_transfer_commands = attributed_launches
-        .checked_mul(transfers_per_launch)
-        .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())?;
     let (binding_command, has_compiled_program_slot) =
         if let Some(program_binding) = program_binding {
             let mut regions = binding_regions.into_iter();
@@ -1773,6 +2018,117 @@ fn encode_attention(
         })
         .map_err(|error| error.to_string())?;
 
+    if target == EncodingTarget::BindingsOnly {
+        if !has_compiled_program_slot {
+            return Err("binding-only attention encoding requires a compiled slot".into());
+        }
+        let bindings = upstream_bindings.into_iter().fold(
+            EncodedReusableExecutionBindings::empty().with_program_binding(binding_command),
+            |encoded, dependency| encoded.with_retained_plan_dependency(dependency),
+        );
+        return Ok(Encoding::Bindings(bindings));
+    }
+
+    if let Some(declaration) = segment_declaration {
+        *declaration =
+            segment_bindings::declare(&invocation, segment_validations.unwrap_or_default())?;
+    }
+
+    let q8act = q8act.map(PreparedAttentionProjections::into_owned);
+    let functions = functions.clone();
+    let transfers_per_launch = attention_transfers_per_launch(&shared.qkvzba, &shared.output)?;
+    let mut replay_key = CudaCommandReplayKeyBuilder::new(
+        provider_fingerprint,
+        "vnext_gated_delta_recurrent_attention",
+    )
+    .bytes(projection.replay_tag().as_bytes())
+    .u64(shape.hidden_size)
+    .u64(shape.key_heads)
+    .u64(shape.value_heads)
+    .u64(shape.key_head_dim)
+    .u64(shape.value_head_dim)
+    .u64(shape.qkv_features)
+    .u64(shape.value_features)
+    .u64(shape.qkvz_features)
+    .u64(shape.ba_features)
+    .u64(shape.conv_kernel)
+    .u64(shape.conv_state_width)
+    .f32(shape.epsilon)
+    .u64(shape.layer_index)
+    .bytes(shape.decay_parameterization.as_str().as_bytes())
+    .bytes(shape.value_head_mapping.as_str().as_bytes())
+    .u64(total_tokens)
+    .u64(layout.required_bytes)
+    .u64(binding_layout.required_bytes)
+    .u64(STATE_BINDING_SLOT_BYTES)
+    .boolean(use_packed)
+    .u64(launches.len() as u64);
+    replay_key = shared.qkvzba.bind_replay_topology(replay_key);
+    replay_key = shared.output.bind_replay_topology(replay_key);
+    if let Some(plan) = &q8act {
+        replay_key = plan.replay_key(replay_key)?.u64(required_bytes);
+    }
+    for tokens in &participant_token_counts {
+        replay_key = replay_key.u64(*tokens);
+    }
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.input_region as u64)
+            .u64(launch.output_region as u64)
+            .u64(launch.state_binding_offset)
+            .u64(launch.host_control as u64)
+            .u64(
+                launch
+                    .host_token_seq_indices
+                    .map_or(u64::MAX, |index| index as u64),
+            )
+            .bytes(launch.execution_form.as_str().as_bytes())
+            .i32(launch.batch_i32)
+            .u64(launch.tokens)
+            .i32(launch.tokens_i32);
+    }
+    let logical_compute_dispatches = launches.iter().try_fold(0_u64, |total, launch| {
+        let count = attention_dispatches_per_launch(&shared.qkvzba, &shared.output, launch.tokens)?
+            .checked_add(
+                q8act
+                    .as_ref()
+                    .map_or(Ok(0), |p| p.pack_count(launch.tokens as u32))?,
+            )
+            .ok_or("Q8act recurrent dispatch count overflows")?;
+
+        let count = count
+            .checked_add(
+                q8act
+                    .as_ref()
+                    .map(|p| p.upstream_work(launch.tokens as u32))
+                    .transpose()?
+                    .unwrap_or_default()
+                    .0,
+            )
+            .ok_or("attention upstream dispatch overflow")?;
+        total
+            .checked_add(count)
+            .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())
+    })?;
+    let physical_transfer_commands = attributed_launches
+        .checked_mul(transfers_per_launch)
+        .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())?;
+
+    let physical_transfer_commands =
+        launches
+            .iter()
+            .try_fold(physical_transfer_commands, |n, l| {
+                n.checked_add(
+                    q8act
+                        .as_ref()
+                        .map(|p| p.upstream_work(l.tokens as u32))
+                        .transpose()?
+                        .unwrap_or_default()
+                        .1,
+                )
+                .ok_or_else(|| "attention transfer count overflows".to_owned())
+            })?;
+
     let compute_command =
         CudaDeviceCommand::replayable_operation_with_host_storage_blas_and_fence_dependencies(
             "vnext_gated_delta_recurrent_attention",
@@ -1791,6 +2147,7 @@ fn encode_attention(
                         layout,
                         &shared,
                         projection,
+                        q8act.as_ref(),
                         *launch,
                         regions,
                         host_storage,
@@ -1814,11 +2171,18 @@ fn encode_attention(
         })
         .map_err(|error| error.to_string())?;
 
-    Ok(attach_invocation_binding(
+    let operation = attach_invocation_binding(
         EncodedDeviceOperation::compute(compute_command),
         binding_command,
         has_compiled_program_slot,
-    ))
+    );
+
+    let operation = upstream_bindings
+        .into_iter()
+        .fold(operation, |op, binding| {
+            op.with_retained_plan_dependency(binding)
+        });
+    Ok(Encoding::Full(operation))
 }
 
 fn encode_reusable_attention_bindings(
@@ -1973,6 +2337,7 @@ fn enqueue_attention(
     layout: ScratchLayout,
     shared: &SharedRegions,
     projection: AttentionProjection,
+    q8act: Option<&PreparedAttentionProjections>,
     launch: AttentionLaunch,
     regions: &[CudaBufferRegion],
     host_storage: &[Box<[u8]>],
@@ -2079,6 +2444,8 @@ fn enqueue_attention(
             .map_err(CudaDeviceRuntimeError::contract)?,
         cuda.hidden_size,
         "attention QKVZBA GEMM",
+        q8act.map(|plan| (plan, ProjectionRole::GatedDeltaInput)),
+        functions.q8act.as_ref(),
     )?;
 
     launch_prepare(AttentionPrepareRequest {
@@ -2185,6 +2552,8 @@ fn enqueue_attention(
         cuda.hidden_size,
         cuda.value_features,
         "attention output GEMM",
+        q8act.map(|plan| (plan, ProjectionRole::GatedDeltaOutput)),
+        functions.q8act.as_ref(),
     )?;
     launch_residual(
         stream,
@@ -2216,7 +2585,81 @@ fn launch_attention_projection(
     output_features: i32,
     input_features: i32,
     operation: &'static str,
+    q8act: Option<(&PreparedAttentionProjections, ProjectionRole)>,
+    q8_kernels: Option<&Q8ActKernels>,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    if let Some((plan, role)) = q8act {
+        if plan.is_upstream_for_rows(rows as u32)
+            && matches!(weight, SharedProjectionWeight::Native { .. })
+        {
+            return plan.launch_upstream(
+                native,
+                stream,
+                role,
+                input,
+                output,
+                u32::try_from(rows).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("invalid upstream attention rows")
+                })?,
+                u32::try_from(output_features).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("invalid upstream attention stride")
+                })?,
+                scratch,
+                layout.required_bytes,
+                layout
+                    .projection_staging
+                    .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                    .transpose()?
+                    .unwrap_or(0),
+            );
+        }
+        let retained = plan
+            .projection(role)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        if let SharedProjectionWeight::Native {
+            first_region,
+            parts,
+        } = weight
+        {
+            let kernels = q8_kernels.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "retained attention Q8act plan has no implementation",
+                )
+            })?;
+            let (workspace, bytes) = plan.workspace(scratch, layout.required_bytes, rows as u64)?;
+            let pointers = regions[*first_region..*first_region + weights::region_count(parts)]
+                .iter()
+                .map(CudaBufferRegion::device_ptr)
+                .collect::<Vec<_>>();
+            return kernels.launch(
+                native,
+                stream,
+                retained,
+                parts,
+                &pointers,
+                input,
+                output,
+                u32::try_from(rows).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("invalid attention projection rows")
+                })?,
+                u32::try_from(output_features).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("invalid attention projection width")
+                })?,
+                workspace,
+                bytes,
+                layout
+                    .projection_staging
+                    .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                    .transpose()?
+                    .unwrap_or(0),
+            );
+        }
+        if retained.has_staged_leaf() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "staged attention leaf has no native physical projection",
+            ));
+        }
+    }
     match *weight {
         SharedProjectionWeight::Native {
             first_region,

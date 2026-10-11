@@ -43,6 +43,8 @@ pub(crate) fn fixture_f32_profiles(
                     version: ContractVersion::new(1, 0),
                     multiplication_type: None,
                     accumulation_type: None,
+                    staged_arithmetic: None,
+                    composite_arithmetic: None,
                 })
                 .collect(),
         }],

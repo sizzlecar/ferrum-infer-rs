@@ -246,6 +246,25 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub prefill_decode_execution: Option<ferrum_types::PrefillDecodeExecution>,
 
+    /// Host invocation preparation policy for native plan runtimes.
+    #[serde(default)]
+    pub invocation_preparation_strategy: Option<ferrum_types::InvocationPreparationStrategy>,
+    /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
+    #[serde(default)]
+    pub program_binding_upload_strategy: Option<ferrum_types::ProgramBindingUploadStrategy>,
+
+    /// Fresh decode-segment owner representation. Indexed requires a CUDA plan runtime.
+    #[serde(default)]
+    pub segment_binding_owner_view_mode: Option<ferrum_types::SegmentBindingOwnerViewMode>,
+
+    /// Preparation of eligible native CUDA batched causal decode rows.
+    #[serde(default)]
+    pub causal_decode_preparation_mode: Option<ferrum_types::CausalDecodePreparationMode>,
+
+    /// Group selected native causal decode paths (default: contiguous).
+    #[serde(default)]
+    pub causal_decode_attention_grouping: Option<ferrum_types::CausalDecodeAttentionGrouping>,
+
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -468,6 +487,36 @@ impl RuntimeCliConfig {
             "FERRUM_ATTENTION_POLICY",
             self.attention_policy
                 .map(AttentionExecutionPolicy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+            self.invocation_preparation_strategy
+                .map(ferrum_types::InvocationPreparationStrategy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+            self.program_binding_upload_strategy
+                .map(ferrum_types::ProgramBindingUploadStrategy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+            self.segment_binding_owner_view_mode
+                .map(ferrum_types::SegmentBindingOwnerViewMode::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+            self.causal_decode_preparation_mode
+                .map(ferrum_types::CausalDecodePreparationMode::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+            self.causal_decode_attention_grouping
+                .map(ferrum_types::CausalDecodeAttentionGrouping::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1090,6 +1139,113 @@ mod tests {
         );
         assert_eq!(config.server.port, 8000);
         assert!(config.models.default_model.is_none());
+    }
+
+    #[test]
+    fn segment_binding_owner_view_config_file_parses_explicit_mode() {
+        for value in ["legacy", "indexed"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\nsegment_binding_owner_view_mode = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nsegment_binding_owner_view_mode = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn causal_decode_preparation_config_file_parses_explicit_mode() {
+        for value in ["per-participant", "packed"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\ncausal_decode_preparation_mode = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\ncausal_decode_preparation_mode = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_config_file_parses_explicit_mode() {
+        for value in ["contiguous", "indexed"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\ncausal_decode_attention_grouping = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| {
+                    entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
+                })
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\ncausal_decode_attention_grouping = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn invocation_preparation_config_file_parses_explicit_strategy() {
+        for value in ["full", "identity-projection", "decode-segment"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\ninvocation_preparation_strategy = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_INVOCATION_PREPARATION_STRATEGY")
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\ninvocation_preparation_strategy = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn program_binding_upload_config_file_parses_explicit_strategy() {
+        for strategy in ["uniform-live-prefix", "compact-scatter"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\nprogram_binding_upload_strategy = \"{strategy}\"\n",
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+                .unwrap();
+            assert_eq!(entry.effective_value, strategy);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nprogram_binding_upload_strategy = \"automatic\"\n"
+        )
+        .is_err());
     }
 
     #[test]

@@ -5,6 +5,271 @@ use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::*;
 
 #[test]
+fn retained_plan_dependencies_validate_live_scope_and_form_one_wave_prefix() {
+    for mode in [
+        DependencyMode::Valid,
+        DependencyMode::Conflict,
+        DependencyMode::Stale,
+    ] {
+        let (fixture, sequence, session, batch, step) =
+            setup_with_fixture(fixture_with_retained_dependencies(24, mode));
+        let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let active = wave_active_bindings(&wave, &session);
+        let lane = Arc::clone(step.execution_lane());
+        let reaper = CompletionReaper::new();
+        let providers = fixture
+            .plan
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+            .collect::<Vec<_>>();
+        let identity = OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap();
+        if matches!(mode, DependencyMode::Valid) {
+            fixture.runtime_trace.lock().unwrap().fence_behavior = FenceBehavior::Pending;
+        }
+        let result = OperationDispatch::encode_and_submit_wave(
+            &providers,
+            &fixture.resolved,
+            &identity,
+            active.iter(),
+            DeviceTimingMode::Off,
+            wave,
+            &lane,
+            &reaper,
+        );
+        let step = if matches!(mode, DependencyMode::Valid) {
+            let completed = result.unwrap();
+            let trace = fixture.runtime_trace.lock().unwrap();
+            let commands = trace.submitted_commands.last().unwrap();
+            let first_compute = commands
+                .iter()
+                .position(|c| *c == TestCommand::Provider)
+                .unwrap();
+            let first_binding = commands
+                .iter()
+                .position(|c| *c == TestCommand::CoalescedProgramBinding)
+                .expect("real compiled binding workspace precedes compute");
+            assert!(commands[..first_binding]
+                .iter()
+                .all(|c| *c == TestCommand::DynamicBinding));
+            assert!(commands[first_binding..first_compute]
+                .iter()
+                .all(|c| *c == TestCommand::CoalescedProgramBinding));
+            assert!(commands[first_compute..]
+                .iter()
+                .all(|c| *c == TestCommand::Provider));
+            // Each exact duplicate bank was deduplicated within this single
+            // stream, while each operation still contributes its own bank.
+            assert_eq!(first_binding, providers.len());
+            assert!(
+                trace.submitted_command_node_indices.last().unwrap()[..first_compute]
+                    .iter()
+                    .all(Option::is_none)
+            );
+            let capture = trace
+                .submitted_reusable_captures
+                .last()
+                .unwrap()
+                .as_ref()
+                .expect("real reusable policy must publish the dependency seal");
+            assert!(!capture.retained_plan_dependencies().is_empty());
+            let complete = DeviceReusableExecutionProgram::new(
+                capture,
+                vec![DeviceReusableExecutionSegment::new(
+                    0,
+                    0,
+                    capture.node_count(),
+                    capture.node_count(),
+                )
+                .unwrap()],
+                capture.per_wave_binding_node_indices().to_vec(),
+                vec![],
+            )
+            .unwrap();
+            let eviction_capture = complete.reclassification_capture();
+            let gaps = (0..capture.node_count())
+                .map(|node| {
+                    DeviceReusableExecutionProgramGap::new(
+                        node,
+                        DeviceReusableExecutionProgramGapReason::Evicted,
+                    )
+                })
+                .collect();
+            let evicted =
+                DeviceReusableExecutionProgram::new(&eviction_capture, vec![], vec![], gaps)
+                    .unwrap();
+            assert_eq!(
+                evicted.retained_plan_dependencies(),
+                complete.retained_plan_dependencies()
+            );
+            evicted
+                .validate_retained_plan_dependency_seal(&complete)
+                .unwrap();
+            // A reconstruction that drops the live seal is invalid even when
+            // the current catalog is partial/fully evicted, not only Ready.
+            let missing = DeviceReusableExecutionCapture::new(
+                capture.program_id().clone(),
+                capture.node_count(),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+            let missing = DeviceReusableExecutionProgram::new(
+                &missing,
+                complete.segments().to_vec(),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+            assert!(evicted
+                .validate_retained_plan_dependency_seal(&missing)
+                .is_err());
+            drop(trace);
+            assert!(matches!(
+                completed.poll().unwrap(),
+                CompletionObservation::Pending
+            ));
+            let weak_step = Arc::downgrade(&step);
+            drop(step);
+            drop(completed);
+            let step = weak_step
+                .upgrade()
+                .expect("pending completion owns the step and dependency leases");
+            fixture.runtime_trace.lock().unwrap().fence_behavior = FenceBehavior::Succeeded;
+            assert_eq!(reaper.poll_bounded(1).unwrap().retained_after(), 0);
+            assert_eq!(reaper.retained_count(), 0);
+            step
+        } else {
+            let error = result
+                .err()
+                .expect("conflicting bank or stale invocation must be rejected before submission");
+            let diagnostic = format!("{error:?}");
+            assert!(
+                diagnostic.contains(if matches!(mode, DependencyMode::Conflict) {
+                    "banks conflict"
+                } else {
+                    "live invocation"
+                })
+            );
+            assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
+            step
+        };
+        let weak_step = Arc::downgrade(&step);
+        drop(providers);
+        drop(active);
+        drop(reaper);
+        drop(lane);
+        teardown(fixture, sequence, session, batch, step);
+        assert!(
+            weak_step.upgrade().is_none(),
+            "terminal dependency ownership releases"
+        );
+    }
+}
+
+#[test]
+fn plan_persistent_padding_preserves_payload_view_and_rejects_runtime_drift() {
+    // Exercise both padded odd-leaf payloads and exact-alignment neighbours.
+    for (bytes, fault) in [
+        (8, None),
+        (24, None),
+        (32, None),
+        (40, None),
+        (24, Some(PersistentDescriptorFault::Short)),
+        (24, Some(PersistentDescriptorFault::Type)),
+        (24, Some(PersistentDescriptorFault::Identity)),
+    ] {
+        let fixture = fixture_with_padded_persistent(bytes);
+        for node in fixture.plan.payload().nodes() {
+            let required = node.provider_resources().persistent().unwrap();
+            let allocation = fixture
+                .plan
+                .payload()
+                .memory()
+                .static_allocations()
+                .iter()
+                .find(|a| Some(a.resource_id()) == node.persistent_resource())
+                .unwrap();
+            assert_eq!(required.fixed_bytes(), Some(bytes));
+            assert_eq!(allocation.per_instance_bytes(), bytes);
+            assert_eq!(allocation.size_bytes(), required.minimum_bytes().unwrap());
+            assert_eq!(allocation.size_bytes() % allocation.alignment_bytes(), 0);
+            assert_eq!(allocation.element_type(), ElementType::U8);
+        }
+        let (fixture, sequence, session, batch, step) = setup_with_fixture(fixture);
+        let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let active = wave_active_bindings(&wave, &session);
+        let lane = Arc::clone(step.execution_lane());
+        let reaper = CompletionReaper::new();
+        let providers = fixture
+            .plan
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+            .collect::<Vec<_>>();
+        let identity = OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap();
+        // Mutation happens after genuine reserve/commit. The core must reject
+        // live descriptor drift before any provider consumes the padded view.
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .persistent_descriptor_fault = fault;
+        let result = OperationDispatch::encode_and_submit_wave(
+            &providers,
+            &fixture.resolved,
+            &identity,
+            active.iter(),
+            DeviceTimingMode::Off,
+            wave,
+            &lane,
+            &reaper,
+        );
+        if fault.is_some() {
+            assert!(result.is_err());
+            assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
+            assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
+            drop(result);
+        } else {
+            let completed = result.unwrap();
+            assert!(matches!(
+                completed.wait().unwrap(),
+                CompletionObservation::Terminal(_)
+            ));
+            assert_eq!(
+                fixture.provider_trace.lock().unwrap().encode_calls as usize,
+                providers.len()
+            );
+            drop(completed);
+        }
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .persistent_descriptor_fault = None;
+        drop(providers);
+        drop(active);
+        drop(reaper);
+        drop(lane);
+        teardown(fixture, sequence, session, batch, step);
+    }
+}
+
+#[test]
 fn definitely_not_submitted_retries_the_same_whole_wave() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);

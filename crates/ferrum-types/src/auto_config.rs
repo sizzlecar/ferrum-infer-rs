@@ -160,6 +160,8 @@ pub struct CompiledNativeOperatorArtifact {
 pub struct CompiledKernelFeatures {
     pub cuda: bool,
     pub vllm_paged_attn: bool,
+    #[serde(default)]
+    pub cuda_indexed_causal_attention: bool,
     pub vllm_moe_marlin: bool,
     pub cuda_graph: bool,
     pub greedy_argmax: bool,
@@ -177,6 +179,7 @@ impl Default for CompiledKernelFeatures {
         Self {
             cuda: false,
             vllm_paged_attn: false,
+            cuda_indexed_causal_attention: false,
             vllm_moe_marlin: false,
             cuda_graph: false,
             greedy_argmax: false,
@@ -194,6 +197,7 @@ impl CompiledKernelFeatures {
         Self {
             cuda: true,
             vllm_paged_attn: true,
+            cuda_indexed_causal_attention: false,
             vllm_moe_marlin: true,
             cuda_graph: true,
             greedy_argmax: true,
@@ -1148,10 +1152,60 @@ impl FerrumConfigBuilder {
                 );
             }
         }
+        if self
+            .entry("FERRUM_INVOCATION_PREPARATION_STRATEGY")
+            .is_none()
+        {
+            runtime_config.upsert(
+                "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                crate::InvocationPreparationStrategy::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if self.entry("FERRUM_PREFILL_DECODE_EXECUTION").is_none() {
             runtime_config.upsert(
                 "FERRUM_PREFILL_DECODE_EXECUTION",
                 crate::PrefillDecodeExecution::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
+        if self
+            .entry("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+            .is_none()
+        {
+            runtime_config.upsert(
+                "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                crate::ProgramBindingUploadStrategy::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
+        if self
+            .entry(crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+                crate::SegmentBindingOwnerViewMode::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
+        if self
+            .entry(crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                crate::CausalDecodePreparationMode::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
+        if self
+            .entry(crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+                crate::CausalDecodeAttentionGrouping::default().as_runtime_value(),
                 RuntimeConfigSource::Default,
             );
         }
@@ -1230,6 +1284,15 @@ impl FerrumConfigBuilder {
             default_active_decode_prefill_chunk,
         )?);
         decisions.push(self.prefill_decode_execution_decision()?);
+        decisions.push(self.invocation_preparation_strategy_decision()?);
+        decisions.push(self.program_binding_upload_strategy_decision()?);
+        decisions.push(self.segment_binding_owner_view_mode_decision()?);
+        decisions.push(self.causal_decode_attention_grouping_decision(
+            plan_attention.as_ref().map(|(_, compiled)| compiled.value),
+        )?);
+        decisions.push(self.causal_decode_preparation_mode_decision(
+            plan_attention.as_ref().map(|(_, compiled)| compiled.value),
+        )?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -2508,6 +2571,276 @@ impl FerrumConfigBuilder {
             Vec::new(),
             vec![effect],
         )
+    }
+
+    fn invocation_preparation_strategy_decision(
+        &self,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
+        let (strategy, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::InvocationPreparationStrategy::parse_runtime_value(&entry.effective_value)
+                    .map_err(|reason| AutoConfigError::InvalidOverride {
+                    key: key.to_owned(),
+                    reason,
+                })?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::InvocationPreparationStrategy::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if strategy == crate::InvocationPreparationStrategy::DecodeSegmentProgram {
+            let owner_mode = self
+                .entry(crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
+                .map(crate::SegmentBindingOwnerViewMode::parse_config_entry)
+                .transpose()
+                .map_err(|reason| AutoConfigError::InvalidOverride {
+                    key: crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY.to_owned(),
+                    reason,
+                })?
+                .unwrap_or_default();
+            let upload = self
+                .entry("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+                .map(|entry| {
+                    crate::ProgramBindingUploadStrategy::parse_runtime_value(&entry.effective_value)
+                })
+                .transpose()
+                .map_err(|reason| AutoConfigError::InvalidOverride {
+                    key: "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY".to_owned(),
+                    reason,
+                })?
+                .unwrap_or_default();
+            if !self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || owner_mode != crate::SegmentBindingOwnerViewMode::Indexed
+                || upload != crate::ProgramBindingUploadStrategy::CompactScatter
+            {
+                return Err(AutoConfigError::InvalidOverride {
+                    key: key.to_owned(),
+                    reason: "decode-segment-program requires a CUDA plan runtime, indexed owner views and compact-scatter uploads".to_owned(),
+                });
+            }
+        }
+        Ok(self.decision(
+            "invocation_preparation_strategy",
+            strategy.as_runtime_value(),
+            source,
+            source_key,
+            [
+                "full",
+                "identity-projection",
+                "decode-segment",
+                "decode-segment-program",
+            ],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn program_binding_upload_strategy_decision(
+        &self,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY";
+        let (strategy, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::ProgramBindingUploadStrategy::parse_runtime_value(&entry.effective_value)
+                    .map_err(|reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    })?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::ProgramBindingUploadStrategy::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if strategy != crate::ProgramBindingUploadStrategy::Sparse
+            && (!self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
+        {
+            return Err(AutoConfigError::InvalidOverride {
+                key: key.to_owned(),
+                reason: format!(
+                    "{} requires a CUDA plan runtime",
+                    strategy.as_runtime_value()
+                ),
+            });
+        }
+        Ok(self.decision(
+            "program_binding_upload_strategy",
+            strategy.as_runtime_value(),
+            source,
+            source_key,
+            ["sparse", "uniform-live-prefix", "compact-scatter"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn segment_binding_owner_view_mode_decision(
+        &self,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::SegmentBindingOwnerViewMode::parse_config_entry(entry).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::SegmentBindingOwnerViewMode::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::SegmentBindingOwnerViewMode::Indexed {
+            let preparation = self
+                .entry("FERRUM_INVOCATION_PREPARATION_STRATEGY")
+                .map(|entry| {
+                    crate::InvocationPreparationStrategy::parse_runtime_value(
+                        &entry.effective_value,
+                    )
+                })
+                .transpose()
+                .map_err(|reason| AutoConfigError::InvalidOverride {
+                    key: "FERRUM_INVOCATION_PREPARATION_STRATEGY".to_owned(),
+                    reason,
+                })?
+                .unwrap_or_default();
+            if !self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || !preparation.uses_decode_segment()
+            {
+                return Err(AutoConfigError::InvalidOverride {
+                    key: key.to_owned(),
+                    reason: "indexed segment binding owner views require a CUDA plan runtime with decode-segment preparation".to_owned(),
+                });
+            }
+        }
+        Ok(self.decision(
+            "segment_binding_owner_view_mode",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["legacy", "indexed"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn causal_decode_preparation_mode_decision(
+        &self,
+        compiled_attention: Option<AttentionExecutionPolicy>,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::CausalDecodePreparationMode::parse_config_entry(entry).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::CausalDecodePreparationMode::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::CausalDecodePreparationMode::Packed
+            && (!self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || !self.hardware.compiled_features.vllm_paged_attn
+                || compiled_attention != Some(AttentionExecutionPolicy::NativeAdaptive))
+        {
+            return Err(AutoConfigError::InvalidOverride {
+                key: key.to_owned(),
+                reason: "packed causal decode preparation requires a CUDA plan runtime with compiled native-adaptive paged attention and F16 KV storage".to_owned(),
+            });
+        }
+        Ok(self.decision(
+            "causal_decode_preparation_mode",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["per-participant", "packed"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn causal_decode_attention_grouping_decision(
+        &self,
+        compiled_attention: Option<AttentionExecutionPolicy>,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let (grouping, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::CausalDecodeAttentionGrouping::parse_config_entry(entry).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::CausalDecodeAttentionGrouping::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if grouping == crate::CausalDecodeAttentionGrouping::Indexed {
+            let preparation = self
+                .entry(crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+                .map(crate::CausalDecodePreparationMode::parse_config_entry)
+                .transpose()
+                .map_err(|reason| AutoConfigError::InvalidOverride {
+                    key: crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY.to_owned(),
+                    reason,
+                })?
+                .unwrap_or_default();
+            if !self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || !self.hardware.compiled_features.vllm_paged_attn
+                || !self
+                    .hardware
+                    .compiled_features
+                    .cuda_indexed_causal_attention
+                || compiled_attention != Some(AttentionExecutionPolicy::NativeAdaptive)
+                || preparation != crate::CausalDecodePreparationMode::Packed
+            {
+                return Err(AutoConfigError::InvalidOverride {
+                    key: key.to_owned(),
+                    reason: "indexed causal decode attention grouping requires the cuda-indexed-causal-attention build feature, a CUDA plan runtime with native-adaptive paged attention, F16 KV storage, and explicit packed causal decode preparation".to_owned(),
+                });
+            }
+        }
+        Ok(self.decision(
+            "causal_decode_attention_grouping",
+            grouping.as_runtime_value(),
+            source,
+            source_key,
+            ["contiguous", "indexed"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
     }
 
     fn prefill_decode_execution_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
@@ -5245,6 +5578,883 @@ mod tests {
         assert!(
             matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
         );
+    }
+
+    #[test]
+    fn invocation_preparation_records_full_default_and_explicit_sources() {
+        let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
+        for (value, runtime_source, source) in [
+            (
+                Some("decode-segment"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+            (
+                Some("decode-segment"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                None,
+                RuntimeConfigSource::Default,
+                AutoConfigSource::Default,
+            ),
+            (
+                Some("identity-projection"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("identity-projection"),
+                RuntimeConfigSource::Env,
+                AutoConfigSource::Env,
+            ),
+            (
+                Some("full"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+        ] {
+            let snapshot = value
+                .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
+                .unwrap_or_default();
+            let resolved = scheduler_resolution(
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                4,
+                snapshot,
+            );
+            let expected = value.unwrap_or("full");
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, expected);
+            assert_eq!(entry.source, runtime_source);
+            let decision = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "invocation_preparation_strategy")
+                .unwrap();
+            assert_eq!(decision.selected, expected);
+            assert_eq!(decision.source, source);
+            assert_eq!(decision.source_key.as_deref(), value.map(|_| key));
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .runtime
+                    .invocation_preparation_strategy
+                    .as_runtime_value(),
+                expected
+            );
+        }
+        let error = FerrumConfigBuilder::new(snapshot(&[(key, "automatic")]))
+            .resolve()
+            .unwrap_err();
+        assert!(
+            matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+        );
+    }
+
+    #[test]
+    fn segment_owner_mode_reports_default_and_explicit_sources() {
+        let key = crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        for (mode, runtime_source, source) in [
+            (
+                None,
+                RuntimeConfigSource::Default,
+                AutoConfigSource::Default,
+            ),
+            (
+                Some("indexed"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("legacy"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+            (
+                Some("indexed"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+        ] {
+            for upload in ["sparse", "compact-scatter"] {
+                let mut entries = vec![
+                    RuntimeConfigEntry::new(
+                        "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                        "decode-segment",
+                        RuntimeConfigSource::Cli,
+                    ),
+                    RuntimeConfigEntry::new(
+                        "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                        upload,
+                        RuntimeConfigSource::Cli,
+                    ),
+                ];
+                if let Some(mode) = mode {
+                    entries.push(RuntimeConfigEntry::new(key, mode, runtime_source));
+                }
+                let resolved = scheduler_resolution(
+                    "cuda",
+                    ExecutionResourceAuthority::PlanRuntime,
+                    4,
+                    RuntimeConfigSnapshot::from_entries(entries),
+                );
+                let expected = mode.unwrap_or("legacy");
+                let entry = resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .unwrap();
+                assert_eq!(entry.effective_value, expected);
+                assert_eq!(entry.source, runtime_source);
+                assert_eq!(entry.affects, vec![RuntimeConfigEffect::Performance]);
+                let decision = resolved
+                    .decisions
+                    .iter()
+                    .find(|decision| decision.selection == "segment_binding_owner_view_mode")
+                    .unwrap();
+                assert_eq!(decision.selected, expected);
+                assert_eq!(decision.source, source);
+                assert_eq!(decision.source_key.as_deref(), mode.map(|_| key));
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .runtime
+                        .segment_binding_owner_view_mode
+                        .as_runtime_value(),
+                    expected
+                );
+                assert_eq!(
+                    engine
+                        .runtime
+                        .program_binding_upload_strategy
+                        .as_runtime_value(),
+                    upload
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_segments_require_cuda_plan_and_checked_compact_transport() {
+        let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
+        for (backend, authority, owner, upload, supported) in [
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                "indexed",
+                "compact-scatter",
+                true,
+            ),
+            (
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                "indexed",
+                "compact-scatter",
+                false,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::LegacyEngine,
+                "indexed",
+                "compact-scatter",
+                false,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                "legacy",
+                "compact-scatter",
+                false,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                "indexed",
+                "sparse",
+                false,
+            ),
+        ] {
+            let entries = snapshot_with_sources(&[
+                (key, "decode-segment-program", RuntimeConfigSource::Cli),
+                (
+                    crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+                    owner,
+                    RuntimeConfigSource::Cli,
+                ),
+                (
+                    "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                    upload,
+                    RuntimeConfigSource::Cli,
+                ),
+            ]);
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            hardware.compiled_features.cuda = backend == "cuda";
+            let result = FerrumConfigBuilder::new(entries)
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(authority)
+                .resolve();
+            if supported {
+                let resolved = result.unwrap();
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine.runtime.invocation_preparation_strategy,
+                    crate::InvocationPreparationStrategy::DecodeSegmentProgram
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_resolves_defaults_and_explicit_sources() {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        for (grouping, source) in [
+            (None, RuntimeConfigSource::Default),
+            (Some("contiguous"), RuntimeConfigSource::Cli),
+            (Some("indexed"), RuntimeConfigSource::ConfigFile),
+            (Some("indexed"), RuntimeConfigSource::Cli),
+        ] {
+            for (preparation, upload, owner) in [
+                ("full", "sparse", "legacy"),
+                ("decode-segment", "compact-scatter", "indexed"),
+            ] {
+                let mut entries = vec![
+                    RuntimeConfigEntry::new(
+                        crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                        "packed",
+                        RuntimeConfigSource::ConfigFile,
+                    ),
+                    RuntimeConfigEntry::new(
+                        "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                        preparation,
+                        RuntimeConfigSource::Cli,
+                    ),
+                    RuntimeConfigEntry::new(
+                        "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                        upload,
+                        RuntimeConfigSource::Cli,
+                    ),
+                    RuntimeConfigEntry::new(
+                        crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+                        owner,
+                        RuntimeConfigSource::Cli,
+                    ),
+                ];
+                if let Some(grouping) = grouping {
+                    entries.push(RuntimeConfigEntry::new(key, grouping, source));
+                }
+                let mut hardware = HardwareCapabilities::unknown();
+                hardware.backend = "cuda".to_owned();
+                hardware.compiled_features.cuda = true;
+                hardware.compiled_features.vllm_paged_attn = true;
+                hardware.compiled_features.cuda_indexed_causal_attention = true;
+                let resolved =
+                    FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
+                        .with_hardware_capabilities(hardware)
+                        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                        .resolve()
+                        .unwrap();
+                let expected = grouping.unwrap_or("contiguous");
+                let entry = resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .find(|e| e.key == key)
+                    .unwrap();
+                assert_eq!(entry.effective_value, expected);
+                assert_eq!(entry.source, source);
+                let decision = resolved
+                    .decisions
+                    .iter()
+                    .find(|d| d.selection == "causal_decode_attention_grouping")
+                    .unwrap();
+                assert_eq!(decision.selected, expected);
+                assert_eq!(decision.source, auto_config_source_from_runtime(source));
+                assert_eq!(decision.source_key.as_deref(), grouping.map(|_| key));
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .runtime
+                        .causal_decode_attention_grouping
+                        .as_runtime_value(),
+                    expected
+                );
+                assert_eq!(
+                    engine.runtime.causal_decode_preparation_mode,
+                    crate::CausalDecodePreparationMode::Packed
+                );
+                assert_eq!(
+                    engine
+                        .runtime
+                        .invocation_preparation_strategy
+                        .as_runtime_value(),
+                    preparation
+                );
+                assert_eq!(
+                    engine
+                        .runtime
+                        .program_binding_upload_strategy
+                        .as_runtime_value(),
+                    upload
+                );
+                assert_eq!(
+                    engine
+                        .runtime
+                        .segment_binding_owner_view_mode
+                        .as_runtime_value(),
+                    owner
+                );
+            }
+        }
+        // The default does not impose CUDA or Packed prerequisites on existing configurations.
+        let resolved = FerrumConfigBuilder::new(RuntimeConfigSnapshot::default())
+            .resolve()
+            .unwrap();
+        let mut engine = crate::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(
+            engine.runtime.causal_decode_attention_grouping,
+            crate::CausalDecodeAttentionGrouping::Contiguous
+        );
+        assert_eq!(
+            engine.runtime.causal_decode_preparation_mode,
+            crate::CausalDecodePreparationMode::PerParticipant
+        );
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_rejects_env_and_unsupported_execution() {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        for (backend, authority, compiled, policy, kv, preparation, source) in [
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Env,
+            ),
+            (
+                "cpu",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::LegacyEngine,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                false,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "portable",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "int8",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("per-participant"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                None,
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            let mut entries = vec![
+                RuntimeConfigEntry::new(key, "indexed", source),
+                RuntimeConfigEntry::new(
+                    "FERRUM_ATTENTION_POLICY",
+                    policy,
+                    RuntimeConfigSource::Cli,
+                ),
+                RuntimeConfigEntry::new("FERRUM_KV_DTYPE", kv, RuntimeConfigSource::Cli),
+            ];
+            if let Some(preparation) = preparation {
+                entries.push(RuntimeConfigEntry::new(
+                    crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                    preparation,
+                    RuntimeConfigSource::Cli,
+                ));
+            }
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            hardware.compiled_features.cuda = backend == "cuda";
+            hardware.compiled_features.vllm_paged_attn = compiled;
+            hardware.compiled_features.cuda_indexed_causal_attention = true;
+            hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
+            let error = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(&error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_requires_its_additive_compiled_capability() {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let old_features = CompiledKernelFeatures::m3_fast_path_without_fa2();
+        assert!(old_features.vllm_paged_attn);
+        assert!(!old_features.cuda_indexed_causal_attention);
+        let mut old_serialized = serde_json::to_value(&old_features).unwrap();
+        old_serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("cuda_indexed_causal_attention");
+        let decoded: CompiledKernelFeatures = serde_json::from_value(old_serialized).unwrap();
+        assert!(!decoded.cuda_indexed_causal_attention);
+
+        for compiled in [false, true] {
+            for grouping in ["contiguous", "indexed"] {
+                let entries = snapshot_with_sources(&[
+                    (key, grouping, RuntimeConfigSource::Cli),
+                    (
+                        crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                        "packed",
+                        RuntimeConfigSource::Cli,
+                    ),
+                ]);
+                let mut hardware = HardwareCapabilities::unknown();
+                hardware.backend = "cuda".to_owned();
+                hardware.compiled_features.cuda = true;
+                hardware.compiled_features.vllm_paged_attn = true;
+                hardware.compiled_features.cuda_indexed_causal_attention = compiled;
+                let result = FerrumConfigBuilder::new(entries)
+                    .with_hardware_capabilities(hardware)
+                    .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                    .resolve();
+                if grouping == "indexed" && !compiled {
+                    assert!(
+                        matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+                    );
+                } else {
+                    let resolved = result.unwrap();
+                    assert_eq!(
+                        resolved
+                            .decisions
+                            .iter()
+                            .find(|d| d.selection == "causal_decode_attention_grouping")
+                            .unwrap()
+                            .selected,
+                        grouping
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_reports_sources_and_preserves_independent_policies() {
+        let key = crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        for (mode, source) in [
+            (None, RuntimeConfigSource::Default),
+            (Some("packed"), RuntimeConfigSource::ConfigFile),
+            (Some("per-participant"), RuntimeConfigSource::Cli),
+            (Some("packed"), RuntimeConfigSource::Cli),
+        ] {
+            for preparation in ["full", "decode-segment"] {
+                for upload in ["sparse", "compact-scatter"] {
+                    let mut entries = vec![
+                        RuntimeConfigEntry::new(
+                            "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                            preparation,
+                            RuntimeConfigSource::Cli,
+                        ),
+                        RuntimeConfigEntry::new(
+                            "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                            upload,
+                            RuntimeConfigSource::Cli,
+                        ),
+                    ];
+                    if let Some(mode) = mode {
+                        entries.push(RuntimeConfigEntry::new(key, mode, source));
+                    }
+                    let mut hardware = HardwareCapabilities::unknown();
+                    hardware.backend = "cuda".to_owned();
+                    hardware.compiled_features.cuda = true;
+                    hardware.compiled_features.vllm_paged_attn = true;
+                    let resolved =
+                        FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
+                            .with_hardware_capabilities(hardware)
+                            .with_execution_resource_authority(
+                                ExecutionResourceAuthority::PlanRuntime,
+                            )
+                            .resolve()
+                            .unwrap();
+                    let expected = mode.unwrap_or("per-participant");
+                    let entry = resolved
+                        .runtime_config
+                        .entries
+                        .iter()
+                        .find(|entry| entry.key == key)
+                        .unwrap();
+                    assert_eq!(entry.effective_value, expected);
+                    assert_eq!(entry.source, source);
+                    let decision = resolved
+                        .decisions
+                        .iter()
+                        .find(|decision| decision.selection == "causal_decode_preparation_mode")
+                        .unwrap();
+                    assert_eq!(decision.selected, expected);
+                    assert_eq!(decision.source, auto_config_source_from_runtime(source));
+                    assert_eq!(decision.source_key.as_deref(), mode.map(|_| key));
+                    let mut engine = crate::EngineConfig::default();
+                    engine
+                        .apply_runtime_config_snapshot(&resolved.runtime_config)
+                        .unwrap();
+                    assert_eq!(
+                        engine
+                            .runtime
+                            .causal_decode_preparation_mode
+                            .as_runtime_value(),
+                        expected
+                    );
+                    assert_eq!(
+                        engine
+                            .runtime
+                            .program_binding_upload_strategy
+                            .as_runtime_value(),
+                        upload
+                    );
+                    assert_eq!(
+                        engine
+                            .runtime
+                            .invocation_preparation_strategy
+                            .as_runtime_value(),
+                        preparation
+                    );
+                    assert_eq!(
+                        resolved.compiled_attention_policy,
+                        Some(AttentionExecutionPolicy::NativeAdaptive)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn causal_decode_preparation_rejects_env_and_unavailable_native_execution() {
+        let key = crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY;
+        for (backend, authority, compiled, policy, kv, source) in [
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Env,
+            ),
+            (
+                "cpu",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::LegacyEngine,
+                true,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                false,
+                "auto",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "portable",
+                "fp16",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "int8",
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            let entries = snapshot_with_sources(&[
+                (key, "packed", source),
+                ("FERRUM_ATTENTION_POLICY", policy, RuntimeConfigSource::Cli),
+                ("FERRUM_KV_DTYPE", kv, RuntimeConfigSource::Cli),
+            ]);
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            hardware.compiled_features.cuda = backend == "cuda";
+            hardware.compiled_features.vllm_paged_attn = compiled;
+            // INT8 is a valid storage choice for this fixture; the packed
+            // preparation mode must reject its resolved portable attention.
+            hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
+            let error = FerrumConfigBuilder::new(entries)
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(&error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key),
+                "backend={backend}, authority={authority:?}, compiled={compiled}, policy={policy}, kv={kv}, source={source:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_owner_mode_rejects_environment_and_unsupported_execution() {
+        let key = crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        for (backend, authority, preparation, source) in [
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                "decode-segment",
+                RuntimeConfigSource::Env,
+            ),
+            (
+                "cpu",
+                ExecutionResourceAuthority::PlanRuntime,
+                "decode-segment",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                "decode-segment",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::LegacyEngine,
+                "decode-segment",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                "full",
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                "identity-projection",
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            let snapshot = snapshot_with_sources(&[
+                (key, "indexed", source),
+                (
+                    "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                    preparation,
+                    RuntimeConfigSource::Cli,
+                ),
+            ]);
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            let error = FerrumConfigBuilder::new(snapshot)
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+            );
+        }
+        for backend in ["cpu", "metal", "cuda"] {
+            scheduler_resolution(
+                backend,
+                ExecutionResourceAuthority::LegacyEngine,
+                4,
+                RuntimeConfigSnapshot::default(),
+            );
+        }
+    }
+
+    #[test]
+    fn program_binding_upload_records_sparse_default_and_explicit_sources() {
+        let key = "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY";
+        for (value, runtime_source, source) in [
+            (
+                None,
+                RuntimeConfigSource::Default,
+                AutoConfigSource::Default,
+            ),
+            (
+                Some("uniform-live-prefix"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("uniform-live-prefix"),
+                RuntimeConfigSource::Env,
+                AutoConfigSource::Env,
+            ),
+            (
+                Some("compact-scatter"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+            (
+                Some("sparse"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+        ] {
+            let snapshot = value
+                .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
+                .unwrap_or_default();
+            let resolved =
+                scheduler_resolution("cuda", ExecutionResourceAuthority::PlanRuntime, 4, snapshot);
+            let expected = value.unwrap_or("sparse");
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, expected);
+            assert_eq!(entry.source, runtime_source);
+            let decision = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "program_binding_upload_strategy")
+                .unwrap();
+            assert_eq!(decision.selected, expected);
+            assert!(decision.candidates.contains(&decision.selected));
+            assert_eq!(decision.source, source);
+            assert_eq!(decision.source_key.as_deref(), value.map(|_| key));
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .runtime
+                    .program_binding_upload_strategy
+                    .as_runtime_value(),
+                expected
+            );
+        }
+        let error = FerrumConfigBuilder::new(snapshot(&[(key, "automatic")]))
+            .resolve()
+            .unwrap_err();
+        assert!(
+            matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+        );
+        for (backend, authority) in [
+            ("cpu", ExecutionResourceAuthority::PlanRuntime),
+            ("metal", ExecutionResourceAuthority::PlanRuntime),
+            ("cuda", ExecutionResourceAuthority::LegacyEngine),
+        ] {
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            for strategy in ["uniform-live-prefix", "compact-scatter"] {
+                let error = FerrumConfigBuilder::new(snapshot(&[(key, strategy)]))
+                    .with_hardware_capabilities(hardware.clone())
+                    .with_execution_resource_authority(authority)
+                    .resolve()
+                    .unwrap_err();
+                assert!(
+                    matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+                );
+            }
+            scheduler_resolution(backend, authority, 4, snapshot(&[(key, "sparse")]));
+        }
     }
 
     #[test]

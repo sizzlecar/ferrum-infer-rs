@@ -1,7 +1,9 @@
 //! Mixed native gate/up/down matrices with bounded F16 activation scratch.
 
+use super::super::native_blocks::q8act::{self, Q8ActKernels};
 use super::super::native_blocks::{weights, CudaNativeBlockKernels};
 use super::*;
+use ferrum_interfaces::vnext::{PreparedProjectionNumerics, ProjectionRole};
 
 pub(super) fn uses_native(values: &[ResolvedValueBinding]) -> bool {
     values.iter().any(|value| {
@@ -56,8 +58,37 @@ pub(super) fn encode(
     silu: &CudaFunction,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(&invocation, DENSE_SWIGLU_OPERATION_ID)?;
+    encode_with_q8(fingerprint, kernels, silu, None, invocation)
+}
+
+pub(super) fn encode_with_q8(
+    fingerprint: &str,
+    kernels: &CudaNativeBlockKernels,
+    silu: &CudaFunction,
+    q8: Option<&Q8ActKernels>,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    ensure_invocation(
+        &invocation,
+        q8.map_or(DENSE_SWIGLU_OPERATION_ID, |q8| q8.profile().operation_id()),
+    )?;
     let first = &invocation.participants()[0];
+    let prepared = if let Some(q8) = q8 {
+        let prepared = first
+            .projection_numerics()
+            .ok_or("Q8act invocation has no retained numerical decision")?;
+        if prepared.contract() != &q8.profile().arithmetic()
+            || invocation
+                .participants()
+                .iter()
+                .any(|p| p.projection_numerics() != Some(prepared))
+        {
+            return Err("Q8act participants disagree with the fixed prepared arithmetic".into());
+        }
+        Some(prepared.clone())
+    } else {
+        None
+    };
     let hidden = unsigned_attribute(first.attributes(), "hidden_size")?;
     let intermediate = unsigned_attribute(first.attributes(), "intermediate_size")?;
     let mut matrices = Vec::new();
@@ -102,16 +133,52 @@ pub(super) fn encode(
     let mut parts = parts.into_iter();
     let gate_up = parts.next().ok_or("missing native gate/up matrix")?;
     let down = parts.next().ok_or("missing native down matrix")?;
+    if let Some(plan) = &prepared {
+        let profile = q8
+            .ok_or("prepared Q8act numerics have no implementation")?
+            .profile();
+        Q8ActKernels::validate_parts_for_profile(
+            profile,
+            plan.projection(ProjectionRole::SwiGluGateUp)
+                .ok_or("missing prepared gate/up")?,
+            &gate_up,
+        )?;
+        Q8ActKernels::validate_parts_for_profile(
+            profile,
+            plan.projection(ProjectionRole::SwiGluDown)
+                .ok_or("missing prepared down")?,
+            &down,
+        )?;
+        key = key.bytes(&serde_json::to_vec(plan).map_err(|e| e.to_string())?);
+    }
     let tokens = invocation.work_shape().immediate_tokens();
     let scratch_layout = ScratchLayout::new(tokens, intermediate)?;
     let transform_bytes =
         super::super::native_blocks::hadamard::workspace_bytes_per_token(first.bindings())?
             .checked_mul(tokens)
             .ok_or("native SwiGLU Hadamard scratch overflows")?;
-    let required_bytes = scratch_layout
+    let base_bytes = scratch_layout
         .total_bytes
         .checked_add(transform_bytes)
         .ok_or("native SwiGLU scratch overflows")?;
+    let q8_bytes = prepared
+        .as_ref()
+        .map(q8act::workspace_per_token)
+        .transpose()?
+        .unwrap_or(0)
+        .checked_mul(tokens)
+        .ok_or("Q8act scratch overflows")?;
+    let q8_offset = if q8_bytes > 0 {
+        base_bytes
+            .checked_add(15)
+            .ok_or("Q8act alignment overflows")?
+            & !15
+    } else {
+        base_bytes
+    };
+    let required_bytes = q8_offset
+        .checked_add(q8_bytes)
+        .ok_or("Q8act scratch overflows")?;
     let scratch_index = regions.len();
     regions.push(shared_scratch_region(&invocation, required_bytes)?);
     let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
@@ -212,7 +279,17 @@ pub(super) fn encode(
         "native SwiGLU participants",
     )?;
     let dispatches = (launches.len() as u64)
-        .checked_mul(weights::dispatches(&gate_up) + weights::dispatches(&down) + 1)
+        .checked_mul(
+            weights::dispatches(&gate_up)
+                + weights::dispatches(&down)
+                + 1
+                + prepared.as_ref().map_or(0, |plan| {
+                    plan.projections()
+                        .iter()
+                        .filter(|p| p.has_staged_leaf())
+                        .count() as u64
+                }),
+        )
         .ok_or("native SwiGLU dispatch count overflows")?;
     let hidden = checked_u32(hidden, "native SwiGLU hidden")?;
     let intermediate = checked_u32(intermediate, "native SwiGLU intermediate")?;
@@ -222,6 +299,7 @@ pub(super) fn encode(
         .u64(transform_bytes);
     let kernels = kernels.clone();
     let silu = silu.clone();
+    let q8 = q8.cloned();
     CudaDeviceCommand::replayable_operation(
         "vnext_native_swiglu",
         regions,
@@ -276,6 +354,16 @@ pub(super) fn encode(
                     } else {
                         0
                     },
+                    q8.as_ref(),
+                    prepared.as_ref(),
+                    if q8_bytes > 0 {
+                        transform_scratch.checked_add(q8_offset).ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract("Q8act workspace pointer overflows")
+                        })?
+                    } else {
+                        0
+                    },
+                    q8_bytes,
                 )?;
             }
             Ok(())
@@ -315,7 +403,16 @@ fn launch(
     hidden: u32,
     intermediate: u32,
     transform_scratch: u64,
+    q8: Option<&Q8ActKernels>,
+    prepared: Option<&PreparedProjectionNumerics>,
+    q8_workspace: u64,
+    q8_workspace_bytes: u64,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    if q8.is_some() != prepared.is_some() {
+        return Err(CudaDeviceRuntimeError::contract(
+            "Q8act implementation and prepared decision must be supplied together",
+        ));
+    }
     let layout = ScratchLayout::new(u64::from(tokens), u64::from(intermediate))
         .map_err(CudaDeviceRuntimeError::contract)?;
     let doubled = intermediate
@@ -337,19 +434,37 @@ fn launch(
             "native SwiGLU matrix pointer inventory differs",
         ));
     }
-    for (index, part) in gate_up.iter().enumerate() {
-        kernels.transformed_linear(
+    if let (Some(q8), Some(plan)) = (q8, prepared) {
+        q8.launch(
+            kernels,
             stream,
+            plan.projection(ProjectionRole::SwiGluGateUp)
+                .ok_or_else(|| CudaDeviceRuntimeError::contract("missing prepared gate/up"))?,
+            gate_up,
+            &weights[..down_start],
             input,
-            weights[index],
             gate_up_output,
-            part,
             tokens,
             doubled,
-            ElementType::F16,
-            part.signs_region.map_or(0, |index| weights[index]),
+            q8_workspace,
+            q8_workspace_bytes,
             transform_scratch,
         )?;
+    } else {
+        for (index, part) in gate_up.iter().enumerate() {
+            kernels.transformed_linear(
+                stream,
+                input,
+                weights[index],
+                gate_up_output,
+                part,
+                tokens,
+                doubled,
+                ElementType::F16,
+                part.signs_region.map_or(0, |index| weights[index]),
+                transform_scratch,
+            )?;
+        }
     }
     launch_silu_mul(
         stream,
@@ -359,23 +474,43 @@ fn launch(
         intermediate_i32,
         layout.activation_elements,
     )?;
-    for (index, part) in down.iter().enumerate() {
-        kernels.transformed_linear(
+    if let (Some(q8), Some(plan)) = (q8, prepared) {
+        q8.launch(
+            kernels,
             stream,
+            plan.projection(ProjectionRole::SwiGluDown)
+                .ok_or_else(|| CudaDeviceRuntimeError::contract("missing prepared down"))?,
+            down,
+            &weights[down_start..],
             activation,
-            weights[down_start + index],
             output,
-            part,
             tokens,
             hidden,
-            ElementType::F16,
-            part.signs_region
-                .map_or(0, |index| weights[down_start + index]),
+            q8_workspace,
+            q8_workspace_bytes,
             transform_scratch,
         )?;
+    } else {
+        for (index, part) in down.iter().enumerate() {
+            kernels.transformed_linear(
+                stream,
+                activation,
+                weights[down_start + index],
+                output,
+                part,
+                tokens,
+                hidden,
+                ElementType::F16,
+                part.signs_region
+                    .map_or(0, |index| weights[down_start + index]),
+                transform_scratch,
+            )?;
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
+mod q8act_tests;
 #[cfg(test)]
 mod tests;

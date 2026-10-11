@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use ferrum_native_ops_builder::{
     assemble_native_operator_set, lock_native_operator_source_definition,
-    materialize_native_operator_package_spec, package_native_operator,
-    run_native_operator_source_build, NativeOperatorPackageRequest,
+    materialize_native_operator_package_spec, materialize_native_operator_source_overlay,
+    package_native_operator, run_native_operator_source_build, NativeOperatorPackageRequest,
     NativeOperatorPackageSpecRequest, NativeOperatorSetRequest, NativeOperatorSourceBuildRequest,
 };
 
@@ -18,6 +18,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    MaterializeSource {
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        base_source_root: PathBuf,
+        #[arg(long)]
+        override_source_root: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     LockSource {
         #[arg(long)]
         definition: PathBuf,
@@ -105,6 +115,20 @@ fn main() {
 
 fn run(cli: Cli) -> ferrum_native_ops_builder::Result<()> {
     match cli.command {
+        Command::MaterializeSource {
+            spec,
+            base_source_root,
+            override_source_root,
+            out,
+        } => {
+            materialize_native_operator_source_overlay(
+                &spec,
+                &base_source_root,
+                &override_source_root,
+                &out,
+            )?;
+            println!("FERRUM NATIVE SOURCE MATERIALIZED: {}", out.display());
+        }
         Command::LockSource {
             definition,
             source_root,

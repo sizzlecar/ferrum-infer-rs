@@ -18,6 +18,25 @@ pub(crate) use invocation::test_only_backing_window_coverage;
 mod provider;
 mod registry;
 mod resolved_value;
+pub(crate) mod retained_dependency;
+pub use retained_dependency::{
+    EncodedRetainedPlanDependency, RetainedPlanDependencyAuthority, RetainedPlanDependencyIdentity,
+    RetainedPlanDependencySpec,
+};
+mod segment_binding;
+pub(crate) mod segment_compile;
+mod segment_dispatch;
+mod segment_oracle;
+pub use segment_binding::{
+    EncodedSegmentBindingNode, EncodedSegmentBindingProgram, PreparedSegmentBindingFrame,
+    PreparedSegmentBindingNode, PreparedSegmentBindingNodeView, PreparedSegmentBindingPatch,
+    PreparedSegmentBindingRegion, SegmentBindingDeclaration, SegmentBindingDependency,
+    SegmentBindingDescriptorView, SegmentBindingOracleCommands, SegmentBindingOracleMode,
+    SegmentBindingOwnerIndex, SegmentBindingOwnerView, SegmentBindingOwnerViewMode,
+    SegmentBindingPhysicalRegion, SegmentBindingPhysicalRegionView, SegmentBindingPhysicalRegions,
+    SegmentBindingRegionExtent, SegmentBindingRegionRequest, SegmentBindingRegionSelector,
+    SegmentBindingRegionView,
+};
 mod semantic;
 mod storage_profile;
 mod tensor_contract;
@@ -43,7 +62,9 @@ pub use checkpoint::{
     ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
     PROVIDER_CHECKPOINT_CONTRACT_VERSION,
 };
+pub(crate) use compiled_identity::CompiledOperationIdentity;
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
+mod preparation;
 pub use descriptor::{
     OperationContract, OperationDescriptor, OracleSpec, ProfilePhase, ProviderRequirement,
     ResourcePresenceRequirement, ResourceRequirements,
@@ -70,11 +91,15 @@ pub use dispatch_contract::{
     SubmissionWaveDispatchError, SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink,
     SubmissionWaveInputUpload,
 };
+pub(crate) use dispatch_contract::{
+    DisabledSubmissionWaveDispatchTimingSink, SubmissionWaveDispatchStageTimer,
+};
 pub use identity::{
     BatchOperationIdentity, BatchOperationIdentityMaterializationSnapshot,
     BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
 };
 pub use invocation::{BatchedOperationInvocation, OperationInvocation};
+pub use preparation::{InvocationPreparationSink, InvocationPreparationStats};
 pub use provider::{
     EngineProviderDescriptor, ExecutionDeterminismRequirement, OperationFailure,
     OperationProviderDescriptor, ProviderCompatibilityRejectReason, ProviderCompatibilityRejection,

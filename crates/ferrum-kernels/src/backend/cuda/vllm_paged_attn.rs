@@ -175,6 +175,91 @@ extern "C" {
         max_seq_len: i32,
         stream: *mut std::ffi::c_void,
     );
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    fn ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed_indexed_v1(
+        out: *mut std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_addresses: *const std::ffi::c_void,
+        seq_lens: *const std::ffi::c_void,
+        row_map: *const i32,
+        num_seqs: i32,
+        original_num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    );
+
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    fn ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed_indexed_v1(
+        out: *mut std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_addresses: *const std::ffi::c_void,
+        seq_lens: *const std::ffi::c_void,
+        row_map: *const i32,
+        num_seqs: i32,
+        original_num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    );
+
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    fn ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed_indexed_v1(
+        out: *mut std::ffi::c_void,
+        exp_sums: *mut std::ffi::c_void,
+        max_logits: *mut std::ffi::c_void,
+        tmp_out: *mut std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_addresses: *const std::ffi::c_void,
+        seq_lens: *const std::ffi::c_void,
+        row_map: *const i32,
+        num_seqs: i32,
+        original_num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    );
+
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    fn ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed_indexed_v1(
+        out: *mut std::ffi::c_void,
+        exp_sums: *mut std::ffi::c_void,
+        max_logits: *mut std::ffi::c_void,
+        tmp_out: *mut std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_addresses: *const std::ffi::c_void,
+        seq_lens: *const std::ffi::c_void,
+        row_map: *const i32,
+        num_seqs: i32,
+        original_num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +281,14 @@ impl VnextAddressedPagedAttentionKernel {
         match self {
             Self::V1 => "vllm.paged_attention_v1.addressed",
             Self::V2 => "vllm.paged_attention_v2.addressed",
+        }
+    }
+
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    pub(crate) fn indexed_native_kernel_id(self) -> &'static str {
+        match self {
+            Self::V1 => "vllm.paged_attention_v1.addressed_indexed_v1",
+            Self::V2 => "vllm.paged_attention_v2.addressed_indexed_v1",
         }
     }
 
@@ -404,6 +497,226 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_batch_raw(
                     block_addresses as *const std::ffi::c_void,
                     sequence_length_device as *const std::ffi::c_void,
                     num_seqs,
+                    num_heads,
+                    max_num_blocks_per_seq,
+                    q_stride,
+                    kv_block_stride,
+                    kv_head_stride,
+                    sequence_length_i32,
+                    raw_stream,
+                );
+            }
+        }
+    }
+    Ok(kernel)
+}
+
+/// Dispatch one explicitly selected path over an indexed subset of dense rows.
+///
+/// # Safety
+/// `row_map` contains `num_group_rows` unique, nonnegative i32 indices smaller
+/// than `num_original_rows`. Query/output, lengths and addressed-table pointers
+/// refer to the original dense rows; every selected length is nonzero, within
+/// `sequence_length`, and selects `expected_kernel`. V2 scratch is compact over
+/// group ordinal, with `ceil(sequence_length / 512)` partitions per head. Each
+/// pointer and the immutable row map must remain valid through completion/replay.
+/// The caller validates every selected physical KV range and preserves ownership;
+/// this raw launch neither copies nor grants authority to a mapped row.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda-indexed-causal-attention")]
+pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_indexed_batch_raw(
+    stream: &CudaStream,
+    out: u64,
+    query: u64,
+    block_addresses: u64,
+    sequence_length_device: u64,
+    row_map: u64,
+    sequence_length: u64,
+    exp_sums: Option<u64>,
+    max_logits: Option<u64>,
+    temporary_output: Option<u64>,
+    num_group_rows: i32,
+    num_original_rows: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    max_num_blocks_per_seq: i32,
+    expected_kernel: VnextAddressedPagedAttentionKernel,
+) -> Result<VnextAddressedPagedAttentionKernel> {
+    if out == 0
+        || query == 0
+        || block_addresses == 0
+        || sequence_length_device == 0
+        || row_map == 0
+        || sequence_length == 0
+    {
+        return Err(FerrumError::model(
+            "vNext addressed paged attention received a null pointer or empty sequence",
+        ));
+    }
+    if !matches!(head_dim, 128 | 256)
+        || num_group_rows <= 0
+        || num_group_rows > 65_535
+        || num_group_rows > num_original_rows
+        || num_heads <= 0
+        || num_kv_heads <= 0
+        || num_heads % num_kv_heads != 0
+        || max_num_blocks_per_seq <= 0
+    {
+        return Err(FerrumError::unsupported(format!(
+            "vNext addressed paged attention requires heads>0, divisible GQA, head_dim=128/256, and a non-empty block table; got heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, blocks={max_num_blocks_per_seq}"
+        )));
+    }
+    if out % 2 != 0
+        || query % 2 != 0
+        || block_addresses % 8 != 0
+        || sequence_length_device % 4 != 0
+        || row_map % 4 != 0
+    {
+        return Err(FerrumError::model(
+            "vNext indexed paged attention received an unaligned pointer",
+        ));
+    }
+    if VnextAddressedPagedAttentionKernel::for_sequence_length(sequence_length) != expected_kernel {
+        return Err(FerrumError::model(
+            "vNext indexed paged attention path differs from the declared group length",
+        ));
+    }
+    let sequence_length_i32 = i32::try_from(sequence_length).map_err(|_| {
+        FerrumError::model("vNext addressed paged attention sequence length exceeds i32")
+    })?;
+    sequence_length_i32
+        .checked_add(511)
+        .ok_or_else(|| FerrumError::model("vNext addressed native partition rounding overflows"))?;
+    let required_blocks = sequence_length.div_ceil(VNEXT_VLLM_BLOCK_TOKENS);
+    if u64::try_from(max_num_blocks_per_seq).unwrap_or(0) < required_blocks {
+        return Err(FerrumError::model(format!(
+            "vNext addressed paged attention block table has {max_num_blocks_per_seq} entries but needs {required_blocks}"
+        )));
+    }
+    let q_stride = num_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| FerrumError::model("vNext addressed query stride overflows"))?;
+    // Native kernels use i32 products for sequence/head/partition indexing.
+    let partition_rows = num_group_rows
+        .checked_mul(num_heads)
+        .and_then(|rows| rows.checked_mul(sequence_length.div_ceil(512) as i32))
+        .ok_or_else(|| FerrumError::model("vNext addressed partition rows overflow"))?;
+    partition_rows
+        .checked_mul(head_dim)
+        .ok_or_else(|| FerrumError::model("vNext addressed temporary-output indexing overflows"))?;
+    num_original_rows
+        .checked_mul(q_stride)
+        .ok_or_else(|| FerrumError::model("vNext addressed batch query indexing overflows"))?;
+    num_original_rows
+        .checked_mul(max_num_blocks_per_seq)
+        .ok_or_else(|| FerrumError::model("vNext addressed batch table indexing overflows"))?;
+    let kv_head_stride = head_dim
+        .checked_mul(VNEXT_VLLM_BLOCK_TOKENS as i32)
+        .ok_or_else(|| FerrumError::model("vNext addressed KV head stride overflows"))?;
+    let kv_block_stride = num_kv_heads
+        .checked_mul(kv_head_stride)
+        .ok_or_else(|| FerrumError::model("vNext addressed KV block stride overflows"))?;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+    let kernel = expected_kernel;
+    match kernel {
+        VnextAddressedPagedAttentionKernel::V1 => {
+            if head_dim == 128 {
+                ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed_indexed_v1(
+                    out as *mut std::ffi::c_void,
+                    query as *const std::ffi::c_void,
+                    num_kv_heads,
+                    scale,
+                    block_addresses as *const std::ffi::c_void,
+                    sequence_length_device as *const std::ffi::c_void,
+                    row_map as *const i32,
+                    num_group_rows,
+                    num_original_rows,
+                    num_heads,
+                    max_num_blocks_per_seq,
+                    q_stride,
+                    kv_block_stride,
+                    kv_head_stride,
+                    sequence_length_i32,
+                    raw_stream,
+                );
+            } else {
+                ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed_indexed_v1(
+                    out as *mut std::ffi::c_void,
+                    query as *const std::ffi::c_void,
+                    num_kv_heads,
+                    scale,
+                    block_addresses as *const std::ffi::c_void,
+                    sequence_length_device as *const std::ffi::c_void,
+                    row_map as *const i32,
+                    num_group_rows,
+                    num_original_rows,
+                    num_heads,
+                    max_num_blocks_per_seq,
+                    q_stride,
+                    kv_block_stride,
+                    kv_head_stride,
+                    sequence_length_i32,
+                    raw_stream,
+                );
+            }
+        }
+        VnextAddressedPagedAttentionKernel::V2 => {
+            let (Some(exp_sums), Some(max_logits), Some(temporary_output)) =
+                (exp_sums, max_logits, temporary_output)
+            else {
+                return Err(FerrumError::model(
+                    "vNext addressed paged attention v2 requires caller-owned scratch",
+                ));
+            };
+            if exp_sums == 0
+                || max_logits == 0
+                || temporary_output == 0
+                || exp_sums % 4 != 0
+                || max_logits % 4 != 0
+                || temporary_output % 2 != 0
+            {
+                return Err(FerrumError::model(
+                    "vNext addressed paged attention v2 received null scratch",
+                ));
+            }
+            if head_dim == 128 {
+                ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed_indexed_v1(
+                    out as *mut std::ffi::c_void,
+                    exp_sums as *mut std::ffi::c_void,
+                    max_logits as *mut std::ffi::c_void,
+                    temporary_output as *mut std::ffi::c_void,
+                    query as *const std::ffi::c_void,
+                    num_kv_heads,
+                    scale,
+                    block_addresses as *const std::ffi::c_void,
+                    sequence_length_device as *const std::ffi::c_void,
+                    row_map as *const i32,
+                    num_group_rows,
+                    num_original_rows,
+                    num_heads,
+                    max_num_blocks_per_seq,
+                    q_stride,
+                    kv_block_stride,
+                    kv_head_stride,
+                    sequence_length_i32,
+                    raw_stream,
+                );
+            } else {
+                ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed_indexed_v1(
+                    out as *mut std::ffi::c_void,
+                    exp_sums as *mut std::ffi::c_void,
+                    max_logits as *mut std::ffi::c_void,
+                    temporary_output as *mut std::ffi::c_void,
+                    query as *const std::ffi::c_void,
+                    num_kv_heads,
+                    scale,
+                    block_addresses as *const std::ffi::c_void,
+                    sequence_length_device as *const std::ffi::c_void,
+                    row_map as *const i32,
+                    num_group_rows,
+                    num_original_rows,
                     num_heads,
                     max_num_blocks_per_seq,
                     q_stride,

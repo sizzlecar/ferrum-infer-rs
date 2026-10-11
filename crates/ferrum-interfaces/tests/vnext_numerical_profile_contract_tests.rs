@@ -11,6 +11,14 @@ use sha2::{Digest, Sha256};
 
 #[path = "vnext_numerical_profile/compiler.rs"]
 mod compiler;
+#[path = "vnext_numerical_profile/composite.rs"]
+mod composite;
+#[path = "vnext_numerical_profile/q8act_attention.rs"]
+mod q8act_attention;
+#[path = "vnext_numerical_profile/q8act_profiles.rs"]
+mod q8act_profiles;
+#[path = "vnext_numerical_profile/staged.rs"]
+mod staged;
 
 fn id<T: TryFrom<String>>(value: &str) -> T
 where
@@ -66,6 +74,8 @@ impl Family {
                 version: ContractVersion::new(1, 0),
                 multiplication_type: Some(ElementType::F32),
                 accumulation_type: Some(ElementType::F32),
+                staged_arithmetic: None,
+                composite_arithmetic: None,
             }],
         }
     }

@@ -48,6 +48,10 @@ pub struct ResourceRequirements {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OracleSpec {
+    /// The operation's numerical version defines an input-dependent oracle,
+    /// e.g. observed quantization plus expanded-absolute-sum F64 bounds. A
+    /// generic output-only scalar tolerance cannot establish this contract.
+    OperationDefined,
     Exact,
     AbsoluteTolerance {
         tolerance: CanonicalRational,
