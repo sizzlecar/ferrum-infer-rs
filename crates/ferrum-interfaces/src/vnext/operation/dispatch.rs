@@ -1697,8 +1697,9 @@ impl OperationDispatch {
         let mut program_binding_resources = BTreeSet::new();
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
-        let use_segment = batch_identity.preparation_strategy()
-            == ferrum_types::InvocationPreparationStrategy::DecodeSegment
+        let use_compiled_segment = batch_identity.preparation_strategy()
+            == ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram;
+        let use_segment = batch_identity.preparation_strategy().uses_decode_segment()
             && determinism_restore.is_none()
             && completion
                 .wave()
@@ -1722,22 +1723,88 @@ impl OperationDispatch {
                 super::preparation::SegmentPreparationMissReason::NoCachedRecipe
             });
         }
+        // A compiled prelude replaces all binding uploads in this wave. A
+        // resident segment may coexist with an eager binding node; that legal
+        // mixed wave still needs the ordinary typed-patch coalescing path.
+        // Decide before consuming any fresh frame/dependency authority. Keep
+        // the cached recipe intact: another wave can still cover it exactly.
+        let compiled_partial_binding_coverage = use_compiled_segment
+            && segment_recipe.as_ref().is_some_and(|recipe| {
+                completion.wave().nodes().iter().any(|node| {
+                    let index = node.plan_node_index();
+                    completion
+                        .wave()
+                        .claimed_backing()
+                        .program_binding_node(index)
+                        .is_some()
+                        && recipe
+                            .nodes
+                            .binary_search_by_key(&index, |node| node.node_index)
+                            .is_err()
+                })
+            });
+        if compiled_partial_binding_coverage {
+            batch_identity.record_segment_miss_reason(
+                super::preparation::SegmentPreparationMissReason::UnsupportedEncoder,
+            );
+            segment_recipe = None;
+        }
+        let mut compiled_binding_nodes = BTreeSet::new();
         let mut segment_encoded = if let Some(recipe) = &segment_recipe {
             let _segment_stage = SubmissionWaveDispatchStageTimer::start(
                 timing_sink,
                 SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode,
             );
-            super::segment_dispatch::encode_segment_wave_with_timing(
-                runtime,
-                resolved,
-                batch_identity,
-                completion.wave(),
-                active_bindings.clone(),
-                recipe,
-                timing_sink,
-            )
-            .map_err(SubmissionWaveDispatchError::Contract)?
-            .map(|(nodes, facts)| {
+            let prepared = if use_compiled_segment {
+                super::segment_dispatch::encode_compiled_segment_wave_with_timing(
+                    runtime,
+                    resolved,
+                    batch_identity,
+                    completion.wave(),
+                    active_bindings.clone(),
+                    recipe,
+                    timing_sink,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .map(|(mut program, facts)| {
+                    let expected = recipe.nodes.iter().filter(|node| {
+                        completion.wave().claimed_backing().program_binding_node(node.node_index).is_some()
+                    }).map(|node| {
+                        u32::try_from(node.node_index).map_err(|_| {
+                            SubmissionWaveDispatchError::Contract(invalid_operation(
+                                "compiled segment binding node index exceeds u32",
+                            ))
+                        })
+                    }).collect::<Result<Vec<_>, _>>()?;
+                    if program.program_binding_nodes != expected
+                        || program.program_bindings.len() != usize::from(!expected.is_empty())
+                        || program.nodes.iter().any(|node| node.bindings.program_binding_count() != 0)
+                    {
+                        return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "compiled segment prelude does not cover the current binding nodes exactly",
+                        )));
+                    }
+                    super::segment_oracle::audit_compiled_segment_wave(
+                        runtime, providers, resolved, batch_identity, completion.wave(),
+                        active_bindings.clone(), &program,
+                    )?;
+                    compiled_binding_nodes.extend(expected.into_iter().map(|index| index as usize));
+                    program_bindings.append(&mut program.program_bindings);
+                    Ok((program.nodes, facts))
+                }).transpose()?
+            } else {
+                super::segment_dispatch::encode_segment_wave_with_timing(
+                    runtime,
+                    resolved,
+                    batch_identity,
+                    completion.wave(),
+                    active_bindings.clone(),
+                    recipe,
+                    timing_sink,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+            };
+            prepared.map(|(nodes, facts)| {
                 batch_identity.record_segment_preparation(
                     true,
                     nodes.len() as u64,
@@ -1753,15 +1820,17 @@ impl OperationDispatch {
             None
         };
         if let Some(encoded) = &segment_encoded {
-            super::segment_oracle::audit_segment_wave(
-                runtime,
-                providers,
-                resolved,
-                batch_identity,
-                completion.wave(),
-                active_bindings.clone(),
-                encoded,
-            )?;
+            if !use_compiled_segment {
+                super::segment_oracle::audit_segment_wave(
+                    runtime,
+                    providers,
+                    resolved,
+                    batch_identity,
+                    completion.wave(),
+                    active_bindings.clone(),
+                    encoded,
+                )?;
+            }
         }
         if segment_encoded.is_none() {
             segment_recipe = None;
@@ -1769,15 +1838,16 @@ impl OperationDispatch {
                 batch_identity.record_segment_preparation(false, 0, 0, 0);
             }
         }
-        let segment_cold_entry = if use_segment && segment_recipe.is_none() {
-            reusable_program
-                .map(|program| lane.try_segment_binding_entry(program.program_id()))
-                .transpose()
-                .map_err(SubmissionWaveDispatchError::Contract)?
-                .flatten()
-        } else {
-            None
-        };
+        let segment_cold_entry =
+            if use_segment && segment_recipe.is_none() && !compiled_partial_binding_coverage {
+                reusable_program
+                    .map(|program| lane.try_segment_binding_entry(program.program_id()))
+                    .transpose()
+                    .map_err(SubmissionWaveDispatchError::Contract)?
+                    .flatten()
+            } else {
+                None
+            };
         let mut segment_declarations = Vec::new();
         if let Some(reusable_program) = reusable_program {
             let mut node_index = 0_usize;
@@ -1887,7 +1957,8 @@ impl OperationDispatch {
                             timing_sink,
                             SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                         );
-                        let program_binding_count = bindings.program_binding_count();
+                        let program_binding_count = bindings.program_binding_count()
+                            + usize::from(compiled_binding_nodes.contains(&binding_node_index));
                         super::retained_dependency::append_dependencies(
                             &dependency_scope,
                             bindings.take_retained_plan_dependencies(),
@@ -2101,12 +2172,17 @@ impl OperationDispatch {
                         .copied()
                         .eq(segment_declarations.iter().map(|(index, _)| *index))
                 {
-                    let recipe = super::segment_compile::CompiledSegmentBindingRecipe::compile(
+                    let mut recipe = super::segment_compile::CompiledSegmentBindingRecipe::compile(
                         resolved,
                         reusable_program.program_id().clone(),
                         segment_declarations,
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
+                    if use_compiled_segment {
+                        recipe
+                            .compile_backend(runtime)
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
+                    }
                     completion
                         .set_segment_binding_candidate(Arc::new(recipe), entry, epoch)
                         .map_err(SubmissionWaveDispatchError::Contract)?;

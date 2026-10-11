@@ -7,11 +7,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::foundation::invalid_operation;
+use super::segment_compile::CompiledSegmentBindingRecipe;
 use super::{OperationBufferStorageKind, ResolvedValueRole, RetainedPlanDependencyAuthority};
+use crate::vnext::resource::{SegmentPlanResourceView, SegmentWindowResource};
 use crate::vnext::{
-    BatchWorkShape, BufferDescriptor, DeviceBufferRetention, ElementType,
-    EncodedReusableExecutionBindings, ProgramBindingNodeBinding, SegmentBackingWindowView,
-    VNextError, WeightId,
+    BatchWorkShape, BufferDescriptor, BufferUsage, DeviceBufferRetention, ElementType,
+    EncodedReusableExecutionBindings, ProgramBindingNodeBinding, ResourceId,
+    SegmentBackingWindowView, VNextError, WeightId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +163,13 @@ impl SegmentBindingOwnerIndex {
 pub struct SegmentBindingOwnerView<'a, B> {
     pub(crate) buffer: &'a B,
     pub(crate) retention: &'a DeviceBufferRetention,
+}
+
+impl<B> Copy for SegmentBindingOwnerView<'_, B> {}
+impl<B> Clone for SegmentBindingOwnerView<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<'a, B> SegmentBindingOwnerView<'a, B> {
@@ -445,6 +454,243 @@ impl<'a, B> PreparedSegmentBindingPatch<'a, B> {
 pub struct EncodedSegmentBindingNode<C> {
     pub node_index: u32,
     pub bindings: EncodedReusableExecutionBindings<C>,
+}
+
+/// A whole prelude with its original ordered node/dependency receipts.
+pub struct EncodedSegmentBindingProgram<C> {
+    pub nodes: Vec<EncodedSegmentBindingNode<C>>,
+    pub program_bindings: Vec<C>,
+    pub program_binding_nodes: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SegmentBindingDescriptorView<'a> {
+    pub resource_id: &'a ResourceId,
+    pub size_bytes: u64,
+    pub alignment_bytes: u64,
+    pub usage: BufferUsage,
+    pub element_type: ElementType,
+}
+
+pub struct SegmentBindingRegionView<'a, B> {
+    descriptor: SegmentBindingDescriptorView<'a>,
+    storage_kind: OperationBufferStorageKind,
+    source: SegmentBindingPhysicalSource<'a, B>,
+}
+
+impl<B> SegmentBindingRegionView<'_, B> {
+    pub fn descriptor(&self) -> SegmentBindingDescriptorView<'_> {
+        self.descriptor
+    }
+    pub fn storage_kind(&self) -> OperationBufferStorageKind {
+        self.storage_kind
+    }
+    pub fn physical_regions(&self) -> SegmentBindingPhysicalRegions<'_, B> {
+        let len = match &self.source {
+            SegmentBindingPhysicalSource::Legacy(regions) => regions.len(),
+            SegmentBindingPhysicalSource::Plan { .. } => 1,
+            SegmentBindingPhysicalSource::Dynamic { window, .. } => window.region_count(),
+        };
+        SegmentBindingPhysicalRegions {
+            source: &self.source,
+            next: 0,
+            len,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SegmentFrameResource {
+    Plan(usize),
+    Dynamic(SegmentWindowResource),
+}
+
+/// Borrows one fully validated attempt. Storage stays in the Core caller;
+/// therefore neither owner views nor node projections can outlive its permit
+/// result. No self references or authority from a preceding wave are stored.
+pub struct PreparedSegmentBindingFrame<'w, B> {
+    pub(super) recipe: &'w CompiledSegmentBindingRecipe,
+    pub(super) plan_views: &'w [SegmentPlanResourceView<'w, B>],
+    pub(super) backing: Option<&'w crate::vnext::SegmentBackingBatch<B>>,
+    pub(super) resources: &'w [SegmentFrameResource],
+    pub(super) expected: &'w [crate::vnext::SegmentBackingExpectation],
+    pub(super) owners: Vec<SegmentBindingOwnerView<'w, B>>,
+    pub(super) work_shape: &'w BatchWorkShape,
+    pub(super) program_bindings: Vec<Option<ProgramBindingNodeBinding>>,
+    pub(super) dependencies: Vec<Vec<Option<RetainedPlanDependencyAuthority>>>,
+}
+
+impl<'w, B> PreparedSegmentBindingFrame<'w, B> {
+    pub fn node_count(&self) -> usize {
+        self.recipe.nodes.len()
+    }
+    pub fn owners(&self) -> &[SegmentBindingOwnerView<'w, B>] {
+        &self.owners
+    }
+    pub fn node<'f>(
+        &'f self,
+        index: usize,
+    ) -> Result<PreparedSegmentBindingNodeView<'f, 'w, B>, VNextError> {
+        if index >= self.node_count() {
+            return Err(invalid_operation("compiled segment node ordinal is absent"));
+        }
+        Ok(PreparedSegmentBindingNodeView { frame: self, index })
+    }
+    /// node is the recipe ordinal, not a potentially sparse Plan node index.
+    pub fn take_dependency(
+        &mut self,
+        node: usize,
+        dependency: usize,
+    ) -> Result<RetainedPlanDependencyAuthority, VNextError> {
+        self.dependencies
+            .get_mut(node)
+            .and_then(|dependencies| dependencies.get_mut(dependency))
+            .and_then(Option::take)
+            .ok_or_else(|| invalid_operation("segment binding dependency is absent or consumed"))
+    }
+}
+
+pub struct PreparedSegmentBindingNodeView<'f, 'w, B> {
+    frame: &'f PreparedSegmentBindingFrame<'w, B>,
+    index: usize,
+}
+
+impl<'f, 'w, B> PreparedSegmentBindingNodeView<'f, 'w, B> {
+    pub fn node_index(&self) -> u32 {
+        self.frame.recipe.nodes[self.index].node_index as u32
+    }
+    pub fn declaration(&self) -> &'f SegmentBindingDeclaration {
+        &self.frame.recipe.nodes[self.index].declaration
+    }
+    pub fn program_binding(&self) -> Option<&'f ProgramBindingNodeBinding> {
+        self.frame.program_bindings[self.index].as_ref()
+    }
+    pub fn work_shape(&self) -> &'f BatchWorkShape {
+        self.frame.work_shape
+    }
+    pub fn participant_count(&self) -> usize {
+        self.frame.work_shape.participant_token_ranges().len()
+    }
+
+    pub fn region(
+        &self,
+        participant: usize,
+        declaration: usize,
+    ) -> Result<SegmentBindingRegionView<'f, B>, VNextError> {
+        if participant >= self.participant_count() {
+            return Err(invalid_operation(
+                "segment participant ordinal is outside its schema",
+            ));
+        }
+        let node = &self.frame.recipe.nodes[self.index];
+        let region = node
+            .regions
+            .get(declaration)
+            .ok_or_else(|| invalid_operation("segment region ordinal is outside its schema"))?;
+        let fact = self
+            .frame
+            .resources
+            .get(region.resource_index)
+            .ok_or_else(|| invalid_operation("segment resource ordinal is outside its frame"))?;
+        let (mut descriptor, storage_kind, source) = match *fact {
+            SegmentFrameResource::Plan(index) => {
+                let plan = self
+                    .frame
+                    .plan_views
+                    .get(index)
+                    .ok_or_else(|| invalid_operation("segment Plan view is absent"))?;
+                let descriptor = plan.leased.committed_descriptor();
+                let length = region.length_for_current_view(descriptor.size_bytes)?;
+                (
+                    SegmentBindingDescriptorView {
+                        resource_id: &descriptor.resource_id,
+                        size_bytes: length,
+                        alignment_bytes: descriptor.alignment_bytes,
+                        usage: descriptor.usage,
+                        element_type: descriptor.element_type,
+                    },
+                    OperationBufferStorageKind::StaticContiguous,
+                    SegmentBindingPhysicalSource::Plan {
+                        owner_index: SegmentBindingOwnerIndex(index),
+                        buffer: plan.leased.buffer(),
+                        physical_range: region.offset_bytes..region.offset_bytes + length,
+                        retention: &plan.retention,
+                    },
+                )
+            }
+            SegmentFrameResource::Dynamic(resource) => {
+                let (request, _, bytes) = resource.row(participant, self.frame.expected)?;
+                let expected = &self.frame.expected[request];
+                let length = region.length_for_current_view(bytes)?;
+                let ordinal = region.dynamic_ordinal.ok_or_else(|| {
+                    invalid_operation("compiled dynamic window ordinal is absent")
+                })?;
+                let window_index = node
+                    .dynamic_window_base
+                    .checked_mul(self.participant_count())
+                    .and_then(|base| {
+                        participant
+                            .checked_mul(node.dynamic_window_count)
+                            .and_then(|offset| base.checked_add(offset))
+                    })
+                    .and_then(|base| base.checked_add(ordinal))
+                    .and_then(|base| base.checked_add(self.frame.expected.len()))
+                    .ok_or_else(|| {
+                        invalid_operation("compiled dynamic window ordinal overflows")
+                    })?;
+                let window = self
+                    .frame
+                    .backing
+                    .and_then(|batch| batch.window(window_index))
+                    .ok_or_else(|| invalid_operation("compiled dynamic window is absent"))?;
+                let kind = match expected.storage_profile.view() {
+                    crate::vnext::DynamicStorageView::Contiguous => {
+                        OperationBufferStorageKind::DynamicContiguous
+                    }
+                    crate::vnext::DynamicStorageView::PagedRegions { .. } => {
+                        OperationBufferStorageKind::DynamicPaged
+                    }
+                };
+                (
+                    SegmentBindingDescriptorView {
+                        resource_id: &self.frame.recipe.resources[region.resource_index]
+                            .resource_id,
+                        size_bytes: length,
+                        alignment_bytes: expected.alignment_bytes,
+                        usage: expected.usage,
+                        element_type: expected.element_type,
+                    },
+                    kind,
+                    SegmentBindingPhysicalSource::Dynamic {
+                        window,
+                        owner_base: self.frame.plan_views.len(),
+                    },
+                )
+            }
+        };
+        if descriptor.element_type != region.request.element_type
+            || descriptor.alignment_bytes < region.request.alignment_bytes
+            || !region
+                .offset_bytes
+                .is_multiple_of(region.request.alignment_bytes)
+        {
+            return Err(invalid_operation(
+                "segment region type or alignment differs from its resource",
+            ));
+        }
+        // The returned descriptor is a borrowed identity plus exact view size.
+        descriptor.size_bytes = match &source {
+            SegmentBindingPhysicalSource::Plan { physical_range, .. } => {
+                physical_range.end - physical_range.start
+            }
+            _ => descriptor.size_bytes,
+        };
+        Ok(SegmentBindingRegionView {
+            descriptor,
+            storage_kind,
+            source,
+        })
+    }
 }
 
 #[cfg(test)]

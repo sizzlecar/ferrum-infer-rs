@@ -118,6 +118,136 @@ mod timing_tests {
         .is_err());
         assert_eq!(enabled.0.load(Ordering::Relaxed), 0);
     }
+
+    fn expectation(bytes: u64) -> SegmentBackingExpectation {
+        SegmentBackingExpectation {
+            logical_bytes: bytes,
+            logical_size_rule: SegmentLogicalSizeRule::Exact,
+            usage: BufferUsage::Activations,
+            storage_profile: DynamicStorageProfile::new(
+                crate::vnext::DynamicStorageAllocator::LinearArena,
+                crate::vnext::DynamicStorageView::Contiguous,
+            )
+            .unwrap(),
+            element_type: ElementType::U8,
+            alignment_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn compiled_segment_windows_preserve_node_participant_order_and_fresh_growth() {
+        // One shared Step allocation with two rows, followed by each current
+        // Sequence. Two nodes have different declaration counts; no flattened
+        // node/participant index may refer to a different resource or row.
+        let mut expected = [expectation(32), expectation(24), expectation(40)];
+        let resources = [
+            Some(SegmentWindowResource {
+                first_request: 0,
+                shared: true,
+                participant_stride: Some(16),
+            }),
+            Some(SegmentWindowResource {
+                first_request: 1,
+                shared: false,
+                participant_stride: None,
+            }),
+        ];
+        let rule = |resource_index, offset_bytes, length_bytes| SegmentWindowRule {
+            resource_index,
+            offset_bytes,
+            length_bytes,
+            element_type: ElementType::U8,
+            alignment_bytes: 1,
+        };
+        let rules = [rule(0, 4, Some(8)), rule(1, 8, None), rule(1, 0, Some(4))];
+        let nodes = [0..2, 2..3];
+        let collect = |expected: &[SegmentBackingExpectation]| {
+            SegmentBackingWindowInput::compiled(expected, &resources, &rules, &nodes, 2)
+                .unwrap()
+                .iter()
+                .map(|window| {
+                    let window = window.unwrap();
+                    (
+                        window.resource_index,
+                        window.offset_bytes,
+                        window.length_bytes,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            collect(&expected),
+            vec![
+                (0, 0, 32),
+                (1, 0, 24),
+                (2, 0, 40),
+                (0, 4, 8),
+                (1, 8, 16),
+                (0, 20, 8),
+                (2, 8, 32),
+                (1, 0, 4),
+                (2, 0, 4),
+            ]
+        );
+        expected[2].logical_bytes = 56;
+        let grown = collect(&expected);
+        assert_eq!(grown[2], (2, 0, 56));
+        assert_eq!(grown[6], (2, 8, 48));
+        assert_eq!(grown[8], (2, 0, 4));
+        let input =
+            SegmentBackingWindowInput::compiled(&expected, &resources, &rules, &nodes, 2).unwrap();
+        assert!(input.get(input.len()).is_err());
+    }
+
+    #[test]
+    fn compiled_segment_windows_reject_invalid_ordinals_rows_and_shape() {
+        let expected = [expectation(16)];
+        let resources = [Some(SegmentWindowResource {
+            first_request: 0,
+            shared: true,
+            participant_stride: Some(16),
+        })];
+        let rules = [SegmentWindowRule {
+            resource_index: 0,
+            offset_bytes: 0,
+            length_bytes: None,
+            element_type: ElementType::U8,
+            alignment_bytes: 1,
+        }];
+        let nodes = [0..1];
+        let input =
+            SegmentBackingWindowInput::compiled(&expected, &resources, &rules, &nodes, 2).unwrap();
+        assert!(input.get(1).is_ok());
+        assert!(input.get(2).is_err()); // second participant is outside this Step
+        assert!(
+            SegmentBackingWindowInput::compiled(&expected, &resources, &rules, &[1..2], 1,)
+                .is_err()
+        );
+        assert!(
+            SegmentBackingWindowInput::compiled(&expected, &resources, &rules, &nodes, 0,).is_err()
+        );
+        assert!(SegmentBackingWindowInput::compiled(
+            &expected,
+            &resources,
+            &rules,
+            &nodes,
+            usize::MAX,
+        )
+        .is_err());
+        let absent = [None];
+        assert!(
+            SegmentBackingWindowInput::compiled(&expected, &absent, &rules, &nodes, 1,)
+                .unwrap()
+                .get(1)
+                .is_err()
+        );
+        let per_participant = SegmentWindowResource {
+            first_request: 0,
+            shared: false,
+            participant_stride: None,
+        };
+        assert!(per_participant.row(1, &expected).is_err());
+    }
 }
 
 pub(crate) struct SegmentPlanResourceRequest<'a> {
@@ -165,6 +295,184 @@ pub struct SegmentBackingWindow {
     pub length_bytes: u64,
     pub element_type: ElementType,
     pub alignment_bytes: u64,
+}
+
+/// Immutable window instructions. They name resource ordinals, never owners.
+pub(crate) struct SegmentWindowRule {
+    pub resource_index: usize,
+    pub offset_bytes: u64,
+    pub length_bytes: Option<u64>,
+    pub element_type: ElementType,
+    pub alignment_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentWindowResource {
+    pub first_request: usize,
+    pub shared: bool,
+    pub participant_stride: Option<u64>,
+}
+
+impl SegmentWindowResource {
+    pub(crate) fn row(
+        self,
+        participant: usize,
+        expected: &[SegmentBackingExpectation],
+    ) -> Result<(usize, u64, u64), VNextError> {
+        let request = self
+            .first_request
+            .checked_add(if self.shared { 0 } else { participant })
+            .ok_or_else(|| invalid_resource("segment resource ordinal overflows"))?;
+        let requirement = expected
+            .get(request)
+            .ok_or_else(|| invalid_resource("segment resource ordinal is absent"))?;
+        let (offset, bytes) = match self.participant_stride {
+            Some(stride) => (
+                stride
+                    .checked_mul(participant as u64)
+                    .ok_or_else(|| invalid_resource("segment participant offset overflows"))?,
+                stride,
+            ),
+            None => (0, requirement.logical_bytes),
+        };
+        if bytes == 0
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > requirement.logical_bytes)
+        {
+            return Err(invalid_resource(
+                "segment participant exceeds its current resource",
+            ));
+        }
+        Ok((request, offset, bytes))
+    }
+}
+
+/// Closed, pure data access under the permit. No backend callback is invoked.
+#[derive(Clone, Copy)]
+pub(crate) enum SegmentBackingWindowInput<'a> {
+    Slice(&'a [SegmentBackingWindow]),
+    Compiled {
+        expected: &'a [SegmentBackingExpectation],
+        resources: &'a [Option<SegmentWindowResource>],
+        rules: &'a [SegmentWindowRule],
+        nodes: &'a [Range<usize>],
+        participants: usize,
+        length: usize,
+    },
+}
+
+impl<'a> SegmentBackingWindowInput<'a> {
+    pub(crate) fn compiled(
+        expected: &'a [SegmentBackingExpectation],
+        resources: &'a [Option<SegmentWindowResource>],
+        rules: &'a [SegmentWindowRule],
+        nodes: &'a [Range<usize>],
+        participants: usize,
+    ) -> Result<Self, VNextError> {
+        let length = rules
+            .len()
+            .checked_mul(participants)
+            .and_then(|n| n.checked_add(expected.len()))
+            .ok_or_else(|| invalid_resource("compiled segment window count overflows"))?;
+        let mut next = 0;
+        for node in nodes {
+            if node.start != next || node.start >= node.end || node.end > rules.len() {
+                return Err(invalid_resource(
+                    "compiled segment window order is incomplete",
+                ));
+            }
+            next = node.end;
+        }
+        if next != rules.len() || participants == 0 {
+            return Err(invalid_resource(
+                "compiled segment windows have no complete participants",
+            ));
+        }
+        Ok(Self::Compiled {
+            expected,
+            resources,
+            rules,
+            nodes,
+            participants,
+            length,
+        })
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Slice(windows) => windows.len(),
+            Self::Compiled { length, .. } => length,
+        }
+    }
+
+    pub(crate) fn get(self, index: usize) -> Result<SegmentBackingWindow, VNextError> {
+        match self {
+            Self::Slice(windows) => windows
+                .get(index)
+                .copied()
+                .ok_or_else(|| invalid_resource("segment window ordinal is absent")),
+            Self::Compiled {
+                expected,
+                resources,
+                rules,
+                nodes,
+                participants,
+                length,
+            } => {
+                if index >= length {
+                    return Err(invalid_resource(
+                        "compiled segment window ordinal is absent",
+                    ));
+                }
+                if let Some(requirement) = expected.get(index) {
+                    return Ok(SegmentBackingWindow {
+                        resource_index: index,
+                        offset_bytes: 0,
+                        length_bytes: requirement.logical_bytes,
+                        element_type: requirement.element_type,
+                        alignment_bytes: requirement.alignment_bytes,
+                    });
+                }
+                let index = index - expected.len();
+                let node_index = nodes
+                    .partition_point(|node| node.start * participants <= index)
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid_resource("compiled segment node window is absent"))?;
+                let node = &nodes[node_index];
+                let within = index - node.start * participants;
+                let participant = within / node.len();
+                let rule = &rules[node.start + within % node.len()];
+                let resource = resources
+                    .get(rule.resource_index)
+                    .and_then(|r| *r)
+                    .ok_or_else(|| {
+                        invalid_resource("compiled segment window has no dynamic resource")
+                    })?;
+                let (resource_index, offset, available) = resource.row(participant, expected)?;
+                let length_bytes = match rule.length_bytes {
+                    Some(length) => length,
+                    None => available
+                        .checked_sub(rule.offset_bytes)
+                        .ok_or_else(|| invalid_resource("compiled segment resource shrank"))?,
+                };
+                let offset_bytes = offset
+                    .checked_add(rule.offset_bytes)
+                    .ok_or_else(|| invalid_resource("compiled segment window offset overflows"))?;
+                Ok(SegmentBackingWindow {
+                    resource_index,
+                    offset_bytes,
+                    length_bytes,
+                    element_type: rule.element_type,
+                    alignment_bytes: rule.alignment_bytes,
+                })
+            }
+        }
+    }
+
+    fn iter(self) -> impl ExactSizeIterator<Item = Result<SegmentBackingWindow, VNextError>> + 'a {
+        (0..self.len()).map(move |index| self.get(index))
+    }
 }
 
 /// Only the permit can construct these summaries. The effective view is the
@@ -335,6 +643,21 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         windows: &[SegmentBackingWindow],
         timing_sink: &S,
     ) -> Result<SegmentBackingBatch<R::Buffer>, VNextError> {
+        self.segment_backing_batch_with_window_input(
+            groups,
+            expected,
+            SegmentBackingWindowInput::Slice(windows),
+            timing_sink,
+        )
+    }
+
+    pub(super) fn segment_backing_batch_with_window_input<S: SubmissionWaveDispatchTimingSink>(
+        &self,
+        groups: &[&[LogicalBackingSliceAuthority]],
+        expected: &[SegmentBackingExpectation],
+        windows: SegmentBackingWindowInput<'_>,
+        timing_sink: &S,
+    ) -> Result<SegmentBackingBatch<R::Buffer>, VNextError> {
         let mut timings = SegmentBackingTimings::new(timing_sink);
         if groups.len() != expected.len() || groups.is_empty() {
             return Err(invalid_resource(
@@ -381,6 +704,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
             group_indices.push(index);
         }
         let region_capacity = windows.iter().try_fold(0usize, |total, window| {
+            let window = window?;
             let group = groups
                 .get(window.resource_index)
                 .ok_or_else(|| invalid_resource("segment window references an unknown resource"))?;
@@ -542,7 +866,8 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                 });
             }
             timings.next();
-            for window in windows {
+            for window in windows.iter() {
+                let window = window?;
                 let resource = result.resources.get(window.resource_index).ok_or_else(|| {
                     invalid_resource("segment window references an unknown resource")
                 })?;

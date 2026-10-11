@@ -638,8 +638,7 @@ where
     // DecodeSegment is only issued by from_compiled_wave, whose immutable
     // recipe derives every node from one shared participant-seed array. A
     // general materialized batch must keep the original per-node validation.
-    if batch_identity.preparation_strategy()
-        != ferrum_types::InvocationPreparationStrategy::DecodeSegment
+    if !batch_identity.preparation_strategy().uses_decode_segment()
         || count == 0
         || count != active_bindings.len()
         || count != first.participant_frames().len()

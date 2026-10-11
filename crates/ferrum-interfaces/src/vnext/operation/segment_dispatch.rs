@@ -677,3 +677,453 @@ where
         facts,
     )))
 }
+
+pub(super) struct SegmentEncodedProgram<C> {
+    pub nodes: Vec<SegmentEncodedNode<C>>,
+    pub program_bindings: Vec<C>,
+    pub program_binding_nodes: Vec<u32>,
+}
+
+/// Compiled write rules consume only this attempt's freshly validated frame.
+pub(super) fn encode_compiled_segment_wave_with_timing<'binding, R, I, S>(
+    runtime: &R,
+    resolved: &dyn ExecutablePlanView,
+    identity: &BatchOperationIdentity,
+    wave: &PreparedStepSubmissionWave<R>,
+    active: I,
+    recipe: &CompiledSegmentBindingRecipe,
+    timing_sink: &S,
+) -> Result<Option<(SegmentEncodedProgram<R::Command>, SegmentPreparationFacts)>, VNextError>
+where
+    R: DeviceRuntime,
+    I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    S: SubmissionWaveDispatchTimingSink,
+{
+    use super::segment_binding::SegmentFrameResource;
+    use crate::vnext::resource::{SegmentBackingWindowInput, SegmentWindowResource};
+    let Some(program) = recipe.backend_program.as_ref() else {
+        identity.record_segment_miss_reason(SegmentPreparationMissReason::UnsupportedEncoder);
+        return Ok(None);
+    };
+    let authority_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+    );
+    let Some(capability) = runtime.immutable_runtime_metadata() else {
+        identity.record_segment_miss_reason(
+            SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
+        );
+        return Ok(None);
+    };
+    let declared = capability.for_owner(runtime).ok_or_else(|| {
+        invalid_operation("immutable segment runtime metadata has a foreign owner")
+    })?;
+    if declared != runtime.descriptor()
+        || declared != resolved.device()
+        || declared != resolved.capabilities().device()
+    {
+        return Err(invalid_operation(
+            "segment runtime metadata differs from the exact Plan",
+        ));
+    }
+    validate_segment_wave_authority(runtime, resolved, identity, wave, active)?;
+    let first = wave
+        .nodes()
+        .first()
+        .ok_or_else(|| invalid_operation("segment wave is empty"))?;
+    if recipe.program_id.plan_hash() != identity.plan_hash()
+        || recipe.program_id.lane_id() != wave.execution_lane_id()
+        || recipe.program_id.runtime_implementation_fingerprint()
+            != identity.runtime_implementation_fingerprint()
+        || recipe.program_id.immediate_sequences() != first.work_shape().immediate_sequences()
+        || recipe.program_id.immediate_tokens() != first.work_shape().immediate_tokens()
+        || recipe.program_id.immediate_pages() != first.work_shape().immediate_pages()
+    {
+        return Err(invalid_operation(
+            "segment recipe differs from its current Plan, lane, or exact work shape",
+        ));
+    }
+    let participant_count = first.participant_count() as usize;
+    let memory = resolved.execution_plan().payload().memory();
+    let plan_requests = recipe
+        .plan_slots
+        .iter()
+        .map(|&slot_index| {
+            let allocation = memory
+                .static_allocations()
+                .get(slot_index)
+                .ok_or_else(|| invalid_operation("segment Plan slot no longer exists"))?;
+            Ok(SegmentPlanResourceRequest {
+                slot_index,
+                allocation,
+            })
+        })
+        .collect::<Result<Vec<_>, VNextError>>()?;
+    let plan_views = wave.prepare_segment_plan_views(&plan_requests)?;
+
+    let snapshot_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+    );
+    let context = wave.segment_backing_context()?;
+    let mut groups = Vec::new();
+    let mut expected = Vec::new();
+    let mut resources = Vec::with_capacity(recipe.resources.len());
+    let mut window_resources = Vec::with_capacity(recipe.resources.len());
+    for resource in &recipe.resources {
+        match resource.source {
+            CompiledSegmentResourceSource::PlanStatic { slot_index } => {
+                let index = recipe.plan_slots.binary_search(&slot_index).map_err(|_| {
+                    invalid_operation("segment Plan slot is absent from its schema")
+                })?;
+                if plan_views[index].leased.committed_descriptor().size_bytes
+                    < resource.required_minimum_bytes
+                {
+                    return Err(invalid_operation(
+                        "segment Plan resource is smaller than its compiled requirements",
+                    ));
+                }
+                resources.push(SegmentFrameResource::Plan(index));
+                window_resources.push(None);
+            }
+            CompiledSegmentResourceSource::Dynamic { descriptor_index } => {
+                let descriptor = memory
+                    .dynamic_descriptors()
+                    .get(descriptor_index)
+                    .filter(|descriptor| descriptor.base_resource_id() == &resource.resource_id)
+                    .ok_or_else(|| {
+                        invalid_operation("segment descriptor differs from its exact Plan")
+                    })?;
+                let lifetime = descriptor.lifetime();
+                let shared = matches!(
+                    lifetime,
+                    AllocationLifetime::Invocation | AllocationLifetime::Step
+                );
+                let first_request = expected.len();
+                let participant_stride = match (lifetime, descriptor.kind(), descriptor.demand()) {
+                    (
+                        AllocationLifetime::Step,
+                        AllocationKind::Value,
+                        DynamicResourceDemand::ActualSequences {
+                            bytes_per_sequence,
+                            maximum_sequences,
+                        },
+                    ) => {
+                        let shape = wave.step_resources().work_shape();
+                        if shape.immediate_sequences() > *maximum_sequences
+                            || participant_count > shape.participants().len()
+                        {
+                            return Err(invalid_operation(
+                                "segment participant exceeds the Step work shape",
+                            ));
+                        }
+                        Some(*bytes_per_sequence)
+                    }
+                    _ => None,
+                };
+                let rows = SegmentWindowResource {
+                    first_request,
+                    shared,
+                    participant_stride,
+                };
+                for participant in 0..if shared { 1 } else { participant_count } {
+                    let logical_bytes = match lifetime {
+                        AllocationLifetime::Invocation => descriptor
+                            .evaluate_request_bytes_for_shape(
+                                first.work_shape().immediate_shape(),
+                            )?,
+                        AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
+                            wave.step_resources().work_shape().immediate_shape(),
+                        )?,
+                        AllocationLifetime::Sequence => {
+                            let tokens = first
+                                .work_shape()
+                                .participant_token_ranges()
+                                .get(participant)
+                                .ok_or_else(|| {
+                                    invalid_operation("segment participant token range is missing")
+                                })?;
+                            descriptor.evaluate_request_bytes_for_shape(
+                                sequence_execution_shape(
+                                    context.sequence_shape(participant)?,
+                                    tokens.source_token_range().end,
+                                )?,
+                            )?
+                        }
+                        AllocationLifetime::Request => descriptor
+                            .evaluate_fit_request_bytes(context.request_shape(participant)?)?,
+                        AllocationLifetime::Plan => {
+                            return Err(invalid_operation(
+                                "dynamic segment resource claims Plan lifetime",
+                            ))
+                        }
+                    };
+                    groups.push(context.resolve(participant, &resource.resource_id, lifetime)?);
+                    expected.push(SegmentBackingExpectation {
+                        logical_bytes,
+                        logical_size_rule: if lifetime == AllocationLifetime::Sequence {
+                            SegmentLogicalSizeRule::AtLeast
+                        } else {
+                            SegmentLogicalSizeRule::Exact
+                        },
+                        usage: descriptor.usage(),
+                        storage_profile: descriptor.storage().profile(),
+                        element_type: descriptor.element_type(),
+                        alignment_bytes: descriptor.alignment_bytes(),
+                    });
+                }
+                for participant in 0..participant_count {
+                    if rows.row(participant, &expected)?.2 < resource.required_minimum_bytes {
+                        return Err(invalid_operation(
+                            "segment current resource is smaller than its compiled requirements",
+                        ));
+                    }
+                }
+                resources.push(SegmentFrameResource::Dynamic(rows));
+                window_resources.push(Some(rows));
+            }
+        }
+    }
+    drop(snapshot_stage);
+    // Validate the entire schema before any backend encoding. Only the borrowed
+    // projection is repeated below; no authority or check is deferred to submit.
+    for node in &recipe.nodes {
+        for participant in 0..participant_count {
+            for region in &node.regions {
+                let (bytes, element_type, alignment) = match resources
+                    .get(region.resource_index)
+                    .ok_or_else(|| invalid_operation("segment region resource index is invalid"))?
+                {
+                    SegmentFrameResource::Plan(index) => {
+                        let descriptor = plan_views[*index].leased.committed_descriptor();
+                        (
+                            descriptor.size_bytes,
+                            descriptor.element_type,
+                            descriptor.alignment_bytes,
+                        )
+                    }
+                    SegmentFrameResource::Dynamic(rows) => {
+                        let (request, _, bytes) = rows.row(participant, &expected)?;
+                        (
+                            bytes,
+                            expected[request].element_type,
+                            expected[request].alignment_bytes,
+                        )
+                    }
+                };
+                region.length_for_current_view(bytes)?;
+                if element_type != region.request.element_type
+                    || alignment < region.request.alignment_bytes
+                    || !region
+                        .offset_bytes
+                        .is_multiple_of(region.request.alignment_bytes)
+                {
+                    return Err(invalid_operation(
+                        "segment region type or alignment differs from its resource",
+                    ));
+                }
+            }
+        }
+    }
+    let windows = SegmentBackingWindowInput::compiled(
+        &expected,
+        &window_resources,
+        &recipe.window_rules,
+        &recipe.window_nodes,
+        participant_count,
+    )?;
+    drop(authority_stage);
+    let backing_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+    );
+    let backing = if expected.is_empty() {
+        None
+    } else {
+        Some(context.prepare(&groups, &expected, windows, timing_sink)?)
+    };
+    let metadata_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingImmutableMetadataValidation,
+    );
+    let mut seen = BTreeMap::new();
+    for plan in &plan_views {
+        if plan.leased.generation() == 0 {
+            return Err(invalid_operation(
+                "segment Plan resource has no committed generation",
+            ));
+        }
+        if !validate_buffer(
+            runtime,
+            plan.leased.buffer(),
+            plan.leased.committed_descriptor(),
+            &mut seen,
+        )? {
+            identity.record_segment_miss_reason(
+                SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
+            );
+            return Ok(None);
+        }
+    }
+    if let Some(backing) = &backing {
+        for binding in backing.bindings() {
+            if !validate_buffer(runtime, binding.buffer(), binding.descriptor(), &mut seen)? {
+                identity.record_segment_miss_reason(
+                    SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
+                );
+                return Ok(None);
+            }
+        }
+        for (index, requirement) in expected.iter().enumerate() {
+            if matches!(
+                requirement.storage_profile.view(),
+                DynamicStorageView::Contiguous
+            ) && backing
+                .window(index)
+                .ok_or_else(|| invalid_operation("segment full resource window is absent"))?
+                .physical_regions()
+                .len()
+                != 1
+            {
+                return Err(invalid_operation(
+                    "segment contiguous resource has multiple physical regions",
+                ));
+            }
+        }
+    }
+    drop(metadata_stage);
+    drop(backing_stage);
+    let node_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+    );
+    let owner_count = plan_views
+        .len()
+        .checked_add(backing.as_ref().map_or(0, |batch| batch.bindings().len()))
+        .ok_or_else(|| invalid_operation("segment owner table length overflows"))?;
+    let mut owners = Vec::new();
+    owners
+        .try_reserve_exact(owner_count)
+        .map_err(|_| invalid_operation("segment owner view allocation failed"))?;
+    owners.extend(plan_views.iter().map(|plan| SegmentBindingOwnerView {
+        buffer: plan.leased.buffer(),
+        retention: &plan.retention,
+    }));
+    if let Some(backing) = &backing {
+        owners.extend(
+            backing
+                .bindings()
+                .iter()
+                .map(|binding| SegmentBindingOwnerView {
+                    buffer: binding.buffer(),
+                    retention: binding.retention_ref(),
+                }),
+        );
+    }
+    let mut scopes = Vec::with_capacity(recipe.nodes.len());
+    let mut dependencies = Vec::with_capacity(recipe.nodes.len());
+    let mut program_bindings = Vec::with_capacity(recipe.nodes.len());
+    for compiled in &recipe.nodes {
+        let node = resolved
+            .execution_plan()
+            .payload()
+            .nodes()
+            .get(compiled.node_index)
+            .ok_or_else(|| invalid_operation("segment node is absent from the current Plan"))?;
+        let scope = Arc::new(());
+        let mut issued = Vec::with_capacity(compiled.dependencies.len());
+        for dependency in &compiled.dependencies {
+            let plan_view =
+                |resource: usize| -> Result<&SegmentPlanResourceView<'_, R::Buffer>, VNextError> {
+                    match resources.get(resource) {
+                        Some(SegmentFrameResource::Plan(index)) => Ok(&plan_views[*index]),
+                        _ => Err(invalid_operation(
+                            "segment dependency is not a fresh Plan resource",
+                        )),
+                    }
+                };
+            issued.push(Some(issue_segment_plan_dependency(
+                SegmentPlanDependencyInput {
+                    scope: &scope,
+                    node: node.id(),
+                    provider: node.selection().selected_provider(),
+                    binding: &node.values()[dependency.binding_index],
+                    source: plan_view(dependency.source_resource_index)?,
+                    destination: plan_view(dependency.destination_resource_index)?,
+                    persistent_preserve: compiled.persistent_preserve,
+                },
+                dependency.spec.as_spec(),
+            )?));
+        }
+        dependencies.push(issued);
+        program_bindings.push(
+            wave.claimed_backing()
+                .program_binding_node(compiled.node_index),
+        );
+        scopes.push(scope);
+    }
+    let mut frame = PreparedSegmentBindingFrame {
+        recipe,
+        plan_views: &plan_views,
+        backing: backing.as_ref(),
+        resources: &resources,
+        expected: &expected,
+        owners,
+        work_shape: first.work_shape(),
+        program_bindings,
+        dependencies,
+    };
+    drop(node_stage);
+    let _backend_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
+    );
+    let encoded = runtime
+        .encode_compiled_segment_bindings(program.as_ref(), &mut frame)
+        .map_err(|error| {
+            invalid_operation(format!("compiled segment binding encode failed: {error}"))
+        })?
+        .ok_or_else(|| {
+            invalid_operation("compiled segment backend declined its accepted program")
+        })?;
+    if encoded.nodes.len() != recipe.nodes.len()
+        || encoded
+            .nodes
+            .iter()
+            .zip(&recipe.nodes)
+            .any(|(encoded, compiled)| encoded.node_index as usize != compiled.node_index)
+    {
+        return Err(invalid_operation(
+            "segment encoder returned a different node sequence",
+        ));
+    }
+    if frame.dependencies.iter().flatten().any(Option::is_some) {
+        return Err(invalid_operation(
+            "compiled segment backend did not consume every fresh dependency",
+        ));
+    }
+    let facts = SegmentPreparationFacts {
+        dynamic_resource_requests: expected.len() as u64,
+        unique_physical_buffers: seen.len() as u64,
+    };
+    Ok(Some((
+        SegmentEncodedProgram {
+            nodes: encoded
+                .nodes
+                .into_iter()
+                .zip(scopes)
+                .map(|(encoded, scope)| SegmentEncodedNode {
+                    node_index: encoded.node_index as usize,
+                    scope,
+                    program_binding: wave
+                        .claimed_backing()
+                        .program_binding_node(encoded.node_index as usize),
+                    bindings: encoded.bindings,
+                })
+                .collect(),
+            program_bindings: encoded.program_bindings,
+            program_binding_nodes: encoded.program_binding_nodes,
+        },
+        facts,
+    )))
+}

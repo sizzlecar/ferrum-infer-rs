@@ -304,7 +304,8 @@ impl Fixture {
                 )
             }
             InvocationPreparationStrategy::IdentityProjection
-            | InvocationPreparationStrategy::DecodeSegment => {
+            | InvocationPreparationStrategy::DecodeSegment
+            | InvocationPreparationStrategy::DecodeSegmentProgram => {
                 let topology =
                     OperationDispatch::compile_submission_wave_identity(executable, lane).unwrap();
                 OperationDispatch::bind_compiled_submission_wave_identity_with_preparation(

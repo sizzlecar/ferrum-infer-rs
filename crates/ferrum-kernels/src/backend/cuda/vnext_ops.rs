@@ -112,6 +112,26 @@ pub(crate) fn encode_segment_bindings(
     transformer::segment_bindings::encode(patch)
 }
 
+pub(crate) fn compile_segment_binding_program(
+    declarations: &[(u32, &ferrum_interfaces::vnext::SegmentBindingDeclaration)],
+) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, CudaDeviceRuntimeError> {
+    transformer::segment_bindings::compile_program(declarations)
+}
+
+pub(crate) fn encode_compiled_segment_bindings(
+    program: &(dyn std::any::Any + Send + Sync),
+    frame: &mut ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
+) -> Result<
+    (
+        Vec<ferrum_interfaces::vnext::EncodedSegmentBindingNode<CudaDeviceCommand>>,
+        super::vnext_runtime::CudaBindingProgramSink,
+        Arc<super::vnext_runtime::CudaSegmentOwnerTable>,
+    ),
+    CudaDeviceRuntimeError,
+> {
+    transformer::segment_bindings::encode_program(program, frame)
+}
+
 /// Typed CUDA runtime input for the currently installed vNext provider bundle.
 pub fn cuda_vnext_runtime_config(
     ordinal: usize,
@@ -125,6 +145,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
         include_str!("vnext_runtime/binding_scatter.rs").as_bytes(),
         include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
+        include_str!("vnext_runtime/segment_oracle/packet.rs").as_bytes(),
         include_str!("vnext_runtime/segment_owners.rs").as_bytes(),
         include_str!("../program_binding_rows.rs").as_bytes(),
         include_str!("../program_binding_upload.rs").as_bytes(),
@@ -1111,6 +1132,7 @@ impl CudaVNextComposition {
                 q6_head::fingerprint().as_bytes(),
                 include_str!("vnext_runtime/binding_transfers.rs").as_bytes(),
                 include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
+                include_str!("vnext_runtime/segment_oracle/packet.rs").as_bytes(),
                 include_str!("vnext_runtime/segment_owners.rs").as_bytes(),
                 include_str!("../program_binding_rows.rs").as_bytes(),
                 include_str!("../program_binding_upload.rs").as_bytes(),

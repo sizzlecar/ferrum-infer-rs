@@ -1,7 +1,11 @@
 //! Cold Plan-only compilation for a complete resident binding segment.
 //! No current wave, physical view, lease, dependency authority, or command is
 //! retained here. Exact live owners and entry identity belong to the fresh path.
+use crate::vnext::resource::SegmentWindowRule;
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::sync::Arc;
 
 use super::buffer_view::{validate_value_binding_physical_coverage, ValueBindingPhysicalCoverage};
 use super::foundation::invalid_operation;
@@ -39,6 +43,7 @@ pub(super) struct CompiledSegmentRegion {
     /// is a minimum and the fresh permit supplies its current authorized size.
     pub component_length: Option<u64>,
     pub request: SegmentBindingRegionRequest,
+    pub dynamic_ordinal: Option<usize>,
 }
 impl CompiledSegmentRegion {
     pub(super) fn length_for_current_view(&self, available: u64) -> Result<u64, VNextError> {
@@ -73,6 +78,8 @@ pub(super) struct CompiledSegmentBindingNode {
     pub persistent_preserve: bool,
     /// Full captured node closure, including resources not exported as patches.
     pub resource_indices: Vec<usize>,
+    pub dynamic_window_base: usize,
+    pub dynamic_window_count: usize,
 }
 
 pub(crate) struct CompiledSegmentBindingRecipe {
@@ -81,9 +88,67 @@ pub(crate) struct CompiledSegmentBindingRecipe {
     pub(super) resources: Vec<CompiledSegmentResource>,
     /// Sorted, unique indices into the exact Plan's static allocations.
     pub(super) plan_slots: Vec<usize>,
+    pub(super) window_rules: Vec<SegmentWindowRule>,
+    pub(super) window_nodes: Vec<Range<usize>>,
+    pub(crate) backend_program: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl CompiledSegmentBindingRecipe {
+    pub(crate) fn compile_backend<R: crate::vnext::DeviceRuntime>(
+        &mut self,
+        runtime: &R,
+    ) -> Result<(), VNextError> {
+        let mut window_rules = Vec::new();
+        let mut window_nodes = Vec::new();
+        for node in &mut self.nodes {
+            node.dynamic_window_count = 0;
+            node.dynamic_window_base = window_rules.len();
+            for region in &mut node.regions {
+                if matches!(
+                    self.resources[region.resource_index].source,
+                    CompiledSegmentResourceSource::Dynamic { .. }
+                ) {
+                    region.dynamic_ordinal = Some(node.dynamic_window_count);
+                    node.dynamic_window_count += 1;
+                    window_rules.push(SegmentWindowRule {
+                        resource_index: region.resource_index,
+                        offset_bytes: region.offset_bytes,
+                        length_bytes: match region.request.extent {
+                            SegmentBindingRegionExtent::Exact(bytes) => Some(bytes),
+                            SegmentBindingRegionExtent::CurrentResource => None,
+                        },
+                        element_type: region.request.element_type,
+                        alignment_bytes: region.request.alignment_bytes,
+                    });
+                }
+            }
+            if node.dynamic_window_count != 0 {
+                window_nodes.push(node.dynamic_window_base..window_rules.len());
+            }
+        }
+        self.window_rules = window_rules;
+        self.window_nodes = window_nodes;
+        let declarations = self
+            .nodes
+            .iter()
+            .map(|node| {
+                Ok((
+                    u32::try_from(node.node_index)
+                        .map_err(|_| invalid_operation("segment node index exceeds u32"))?,
+                    &node.declaration,
+                ))
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        self.backend_program = runtime
+            .compile_segment_binding_program(&declarations)
+            .map_err(|error| {
+                invalid_operation(format!(
+                    "segment binding program compilation failed: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
     pub(super) fn compile(
         resolved: &dyn ExecutablePlanView,
         program_id: DeviceReusableExecutionProgramId,
@@ -359,6 +424,7 @@ impl CompiledSegmentBindingRecipe {
                     offset_bytes,
                     component_length,
                     request: request.clone(),
+                    dynamic_ordinal: None,
                 });
             }
             let mut dependencies = Vec::with_capacity(declaration.dependencies().len());
@@ -454,6 +520,8 @@ impl CompiledSegmentBindingRecipe {
                 dependencies,
                 persistent_preserve,
                 resource_indices,
+                dynamic_window_base: 0,
+                dynamic_window_count: 0,
             });
         }
         let plan_slots = resources
@@ -470,6 +538,9 @@ impl CompiledSegmentBindingRecipe {
             nodes,
             resources,
             plan_slots,
+            window_rules: Vec::new(),
+            window_nodes: Vec::new(),
+            backend_program: None,
         })
     }
 }

@@ -3656,6 +3656,27 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Cold compilation of a closed, ordered binding write program. The
+    /// returned state contains immutable rules, never current-wave authority.
+    /// Unsupported declarations are rejected here before any dependency is taken.
+    fn compile_segment_binding_program(
+        &self,
+        _declarations: &[(u32, &super::SegmentBindingDeclaration)],
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Execute the cold write program against this wave's freshly checked
+    /// frame after pool guards have been released. None after successful cold
+    /// compilation is a contract failure, never permission to consume twice.
+    fn encode_compiled_segment_bindings(
+        &self,
+        _program: &(dyn std::any::Any + Send + Sync),
+        _frame: &mut super::PreparedSegmentBindingFrame<'_, Self::Buffer>,
+    ) -> Result<Option<super::EncodedSegmentBindingProgram<Self::Command>>, Self::Error> {
+        Ok(None)
+    }
+
     /// Selects only the representation of this wave's freshly checked facts.
     /// Neither representation permits reusing authority from another wave.
     fn segment_binding_owner_view_mode(&self) -> super::SegmentBindingOwnerViewMode {
@@ -3673,6 +3694,21 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         &self,
         _actual: super::SegmentBindingOracleCommands<'_, Self::Command>,
         _reference: super::SegmentBindingOracleCommands<'_, Self::Command>,
+    ) -> Result<Option<()>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Whole-program encoding oracle. References are encoded in the same wave
+    /// for this explicit diagnostic only and are never enqueued.
+    fn compare_segment_binding_program_reference(
+        &self,
+        _program_bindings: &[Self::Command],
+        _program_binding_nodes: &[u32],
+        _nodes: &[(
+            u32,
+            super::SegmentBindingOracleCommands<'_, Self::Command>,
+            super::SegmentBindingOracleCommands<'_, Self::Command>,
+        )],
     ) -> Result<Option<()>, Self::Error> {
         Ok(None)
     }

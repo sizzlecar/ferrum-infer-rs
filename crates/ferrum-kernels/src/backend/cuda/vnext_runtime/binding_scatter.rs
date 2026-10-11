@@ -113,12 +113,40 @@ impl BindingScatter {
         else {
             return Ok(None);
         };
-        let Some(reservation) = self.budget.reserve(packet.bytes.len()) else {
+        let Some(owner) =
+            self.prepare_encoded(allocation_stream, packet.bytes.len(), packet.count)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PreparedScatter {
+            bytes: packet.bytes.into_boxed_slice(),
+            owner,
+        }))
+    }
+
+    /// Called only after the closed binding-program sink has checked and
+    /// serialized every descriptor and live destination range.
+    pub(super) fn prepare_encoded(
+        &self,
+        allocation_stream: &Arc<CudaStream>,
+        bytes: usize,
+        count: u32,
+    ) -> Result<Option<ScatterOwner>> {
+        if count == 0
+            || (count as usize)
+                .checked_mul(DESCRIPTOR_BYTES)
+                .is_none_or(|header| header >= bytes)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "encoded binding packet has no payload",
+            ));
+        }
+        let Some(reservation) = self.budget.reserve(bytes) else {
             return Ok(None);
         };
         // No H2D or destination writes occur during preparation. Allocation
         // failure can still safely choose the original sparse-copy prelude.
-        let device = match unsafe { allocation_stream.alloc::<u8>(packet.bytes.len()) } {
+        let device = match unsafe { allocation_stream.alloc::<u8>(bytes) } {
             Ok(device) => device,
             Err(error) if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY => {
                 return Ok(None);
@@ -134,7 +162,7 @@ impl BindingScatter {
             device,
             _reservation: reservation,
             function: self.function.clone(),
-            count: packet.count,
+            count,
             submitted: AtomicBool::new(false),
         };
         // Event tracking is disabled by this runtime. Establish allocation
@@ -148,10 +176,7 @@ impl BindingScatter {
                 error,
             ));
         }
-        Ok(Some(PreparedScatter {
-            bytes: packet.bytes.into_boxed_slice(),
-            owner,
-        }))
+        Ok(Some(owner))
     }
 }
 

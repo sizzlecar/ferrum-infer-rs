@@ -69,7 +69,10 @@ pub use segment_permit::{
     SegmentBackingBatch, SegmentBackingExpectation, SegmentBackingRequest, SegmentBackingResource,
     SegmentBackingWindow, SegmentBackingWindowView, SegmentLogicalSizeRule, SegmentPhysicalRegion,
 };
-pub(crate) use segment_permit::{SegmentPlanResourceRequest, SegmentPlanResourceView};
+pub(crate) use segment_permit::{
+    SegmentBackingWindowInput, SegmentPlanResourceRequest, SegmentPlanResourceView,
+    SegmentWindowResource, SegmentWindowRule,
+};
 mod dynamic_pool_maintenance;
 mod pool_resident_reclaim;
 pub use dynamic_pool_maintenance::*;

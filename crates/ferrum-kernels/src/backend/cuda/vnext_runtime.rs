@@ -613,6 +613,495 @@ fn coalesce_program_binding_transfers(
         .collect()
 }
 
+/// Read-only logical projections of one compiled prelude. Payload ranges point
+/// into its sole host-storage packet; no per-node payload copy is retained.
+struct CudaBindingProgramWrite {
+    destination_offset_bytes: u64,
+    payload: Range<usize>,
+    live_payload_bytes: u64,
+}
+
+struct CudaBindingProgramNode {
+    runtime_instance: u64,
+    operation: &'static str,
+    batching_form: DeviceBatchingForm,
+    participant_start: u32,
+    compute_dispatch_count: u64,
+    transfer_command_count: u64,
+    reusable_address_scope: Option<DeviceReusableAddressScope>,
+    binding: ProgramBindingNodeBinding,
+    destination: CudaBufferRegion,
+    writes: Vec<CudaBindingProgramWrite>,
+    ranges: Vec<CudaSegmentRange>,
+    numerical_status: Option<(Vec<u64>, u32)>,
+    numerical_status_deferred: bool,
+    participants: u32,
+    tokens: u64,
+}
+
+struct CudaBindingProgramProjection {
+    nodes: Vec<CudaBindingProgramNode>,
+    owners: Arc<CudaSegmentOwnerTable>,
+    descriptor_count: u32,
+    compact: bool,
+}
+
+/// One fresh frame writes directly into a shared byte buffer. Rules are visited
+/// in compiled node order, without constructing provider commands or patches.
+pub(crate) struct CudaBindingProgramSink {
+    payload: Vec<u8>,
+    nodes: Vec<CudaBindingProgramNode>,
+}
+
+impl CudaBindingProgramSink {
+    pub(crate) fn new() -> Self {
+        Self {
+            payload: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn begin_node(
+        &mut self,
+        operation: &'static str,
+        binding: ProgramBindingNodeBinding,
+        destination: CudaBufferRegion,
+        participants: u32,
+        tokens: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        if participants == 0
+            || destination.element_type != ElementType::U8
+            || destination.length_bytes == 0
+            || destination.length_bytes > binding.slot().capacity_size_bytes()
+            || self.nodes.last().is_some_and(|previous| {
+                previous.binding.node_index() >= binding.node_index() || previous.writes.is_empty()
+            })
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "compiled binding node order, destination or work differs",
+            ));
+        }
+        if let Some(first) = self.nodes.first() {
+            if binding.plan_hash() != first.binding.plan_hash()
+                || binding.layout().fingerprint() != first.binding.layout().fingerprint()
+                || binding.lane_slot_identity() != first.binding.lane_slot_identity()
+                || participants != first.participants
+                || tokens != first.tokens
+                || destination.runtime_instance != first.destination.runtime_instance
+                || !Arc::ptr_eq(&destination._allocation, &first.destination._allocation)
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "compiled binding nodes do not share one exact arena and wave",
+                ));
+            }
+        }
+        self.nodes.push(CudaBindingProgramNode {
+            runtime_instance: destination.runtime_instance,
+            batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_start: 0,
+            compute_dispatch_count: 0,
+            transfer_command_count: u64::from(participants),
+            reusable_address_scope: None,
+            operation,
+            binding,
+            destination,
+            participants,
+            tokens,
+            writes: Vec::new(),
+            ranges: Vec::new(),
+            numerical_status: None,
+            numerical_status_deferred: true,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn write(
+        &mut self,
+        offset: u64,
+        bytes: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> Result<(), String>,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let node = self.nodes.last_mut().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("compiled binding write has no node")
+        })?;
+        let count = u64::try_from(bytes)
+            .map_err(|_| CudaDeviceRuntimeError::contract("compiled binding bytes exceed u64"))?;
+        let end = offset
+            .checked_add(count)
+            .filter(|end| *end <= node.destination.length_bytes)
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("compiled binding write exceeds its live slot")
+            })?;
+        if bytes == 0
+            || node.writes.last().is_some_and(|last| {
+                last.destination_offset_bytes
+                    .checked_add(last.live_payload_bytes)
+                    .is_none_or(|end| offset < end)
+            })
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "compiled binding writes overlap or are empty",
+            ));
+        }
+        let start = self.payload.len();
+        let expected = start.checked_add(bytes).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("compiled binding payload overflows")
+        })?;
+        self.payload.try_reserve(bytes).map_err(|_| {
+            CudaDeviceRuntimeError::contract("compiled binding payload allocation failed")
+        })?;
+        fill(&mut self.payload).map_err(CudaDeviceRuntimeError::contract)?;
+        if self.payload.len() != expected || end < offset {
+            return Err(CudaDeviceRuntimeError::contract(
+                "compiled binding rule emitted a different payload length",
+            ));
+        }
+        node.writes.push(CudaBindingProgramWrite {
+            destination_offset_bytes: offset,
+            payload: start..expected,
+            live_payload_bytes: count,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn end_node(
+        &mut self,
+        ranges: Vec<CudaSegmentRange>,
+        numerical_status: Option<(Vec<u64>, u32)>,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let node = self.nodes.last_mut().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("compiled binding completion has no node")
+        })?;
+        if node.writes.is_empty() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "compiled binding node emitted no live writes",
+            ));
+        }
+        if let Some((offsets, mask)) = &numerical_status {
+            if offsets.is_empty()
+                || *mask == 0
+                || offsets.iter().any(|offset| {
+                    offset % 4 != 0
+                        || offset
+                            .checked_add(4)
+                            .is_none_or(|end| end > node.destination.length_bytes)
+                })
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "compiled binding status differs from its exact destination",
+                ));
+            }
+        }
+        node.ranges = ranges;
+        node.numerical_status = numerical_status;
+        Ok(())
+    }
+
+    pub(crate) fn node_indices(&self) -> Result<Vec<u32>, CudaDeviceRuntimeError> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                u32::try_from(node.binding.node_index()).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("compiled binding node index exceeds u32")
+                })
+            })
+            .collect()
+    }
+
+    fn finish(
+        mut self,
+        owners: Arc<CudaSegmentOwnerTable>,
+        scatter: &binding_scatter::BindingScatter,
+        allocation_stream: &Arc<CudaStream>,
+        upload_counters: Arc<ProgramBindingUploadCounters>,
+    ) -> Result<CudaDeviceCommand, CudaDeviceRuntimeError> {
+        let invalid = CudaDeviceRuntimeError::contract;
+        let first = self
+            .nodes
+            .first()
+            .ok_or_else(|| invalid("compiled binding program has no live prelude"))?;
+        let layout = first.binding.layout();
+        if self.nodes.len() != layout.slots().len()
+            || self
+                .nodes
+                .iter()
+                .zip(layout.slots())
+                .any(|(node, slot)| node.binding.slot() != slot || node.writes.is_empty())
+        {
+            return Err(invalid(
+                "compiled binding program does not cover its complete layout",
+            ));
+        }
+        let physical_bytes = layout.physical_size_bytes();
+        let arena_ptr = first
+            .destination
+            .device_ptr
+            .checked_sub(first.binding.slot().physical_offset_bytes())
+            .ok_or_else(|| invalid("compiled arena pointer underflows"))?;
+        let arena_end = arena_ptr
+            .checked_add(physical_bytes)
+            .ok_or_else(|| invalid("compiled arena end overflows"))?;
+        let allocation_end = first
+            .destination
+            ._allocation
+            .aligned_ptr
+            .checked_add(first.destination._allocation.requested_bytes)
+            .ok_or_else(|| invalid("compiled allocation end overflows"))?;
+        if arena_ptr < first.destination._allocation.aligned_ptr || arena_end > allocation_end {
+            return Err(invalid(
+                "compiled arena exceeds its actual admitted allocation",
+            ));
+        }
+        let runtime_instance = first.destination.runtime_instance;
+        let participants = first.participants;
+        let tokens = first.tokens;
+        let mut upload_plan = DeviceProgramBindingUploadSnapshot {
+            physical_arena_bytes: physical_bytes,
+            ..Default::default()
+        };
+        let mut row_indices = Vec::new();
+        let mut checks = Vec::new();
+        for (node_index, node) in self.nodes.iter().enumerate() {
+            let slot_offset = node.binding.slot().physical_offset_bytes();
+            if arena_ptr.checked_add(slot_offset) != Some(node.destination.device_ptr) {
+                return Err(invalid(
+                    "compiled binding destination differs from the current arena slot",
+                ));
+            }
+            upload_plan.logical_arena_bytes = upload_plan
+                .logical_arena_bytes
+                .checked_add(node.destination.length_bytes)
+                .ok_or_else(|| invalid("compiled logical byte count overflows"))?;
+            for range in &node.ranges {
+                if owners.region(range)?.runtime_instance != runtime_instance {
+                    return Err(invalid("compiled binding owner has a foreign runtime"));
+                }
+            }
+            for (write_index, write) in node.writes.iter().enumerate() {
+                upload_plan.live_payload_bytes = upload_plan
+                    .live_payload_bytes
+                    .checked_add(write.live_payload_bytes)
+                    .ok_or_else(|| invalid("compiled live byte count overflows"))?;
+                let destination = slot_offset
+                    .checked_add(write.destination_offset_bytes)
+                    .ok_or_else(|| invalid("compiled write offset overflows"))?;
+                row_indices.push((destination, node_index, write_index));
+            }
+            if let Some((offsets, failure_mask)) = &node.numerical_status {
+                let mut host = unsafe {
+                    node.destination
+                        ._allocation
+                        ._base
+                        .context()
+                        .alloc_pinned::<u32>(offsets.len())
+                }
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("numerical status host allocation", error)
+                })?;
+                host.as_mut_slice()
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("numerical status initialization", error)
+                    })?
+                    .fill(0);
+                checks.push(Arc::new(CudaCompletionReadback {
+                    source: node.destination.clone(),
+                    offsets: offsets.clone(),
+                    failure_mask: *failure_mask,
+                    deferred: true,
+                    host: Mutex::new(host),
+                }));
+            }
+        }
+        // Only scalar positions are ordered; no node command is constructed or
+        // decomposed. Reuse the original sparse grouping policy exactly.
+        row_indices.sort_by_key(|row| row.0);
+        let spans = row_indices
+            .iter()
+            .map(|(offset, n, w)| {
+                binding_transfers::BindingWrite::new(
+                    *offset,
+                    self.nodes[*n].writes[*w].live_payload_bytes,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transfers = binding_transfers::coalesce_sorted_writes(&spans, physical_bytes)?;
+        let count = u32::try_from(transfers.len())
+            .map_err(|_| invalid("compiled transfer count exceeds u32"))?;
+        let header = transfers
+            .len()
+            .checked_mul(40)
+            .ok_or_else(|| invalid("compiled packet header overflows"))?;
+        let total = header
+            .checked_add(self.payload.len())
+            .ok_or_else(|| invalid("compiled packet overflows"))?;
+        let mut packet = Vec::new();
+        packet
+            .try_reserve_exact(total)
+            .map_err(|_| invalid("compiled packet allocation failed"))?;
+        packet.resize(header, 0);
+        let mut copies = Vec::with_capacity(transfers.len());
+        for (descriptor, transfer) in transfers.iter().enumerate() {
+            let start = packet.len();
+            for source_rows in &transfer.source_write_ranges {
+                for row in source_rows.clone() {
+                    let (_, node, write) = row_indices[row];
+                    let write = &mut self.nodes[node].writes[write];
+                    let begin = packet.len();
+                    packet.extend_from_slice(&self.payload[write.payload.clone()]);
+                    write.payload = begin..packet.len();
+                }
+            }
+            let bytes = checked_usize(transfer.row_bytes, "compiled row bytes")?;
+            if bytes.checked_mul(transfer.row_count) != Some(packet.len() - start) {
+                return Err(invalid("compiled transfer payload differs from its rows"));
+            }
+            for (field, value) in [
+                start as u64,
+                transfer.destination_offset_bytes,
+                transfer.row_bytes,
+                transfer.row_count as u64,
+                transfer.destination_stride_bytes,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let offset = descriptor * 40 + field * 8;
+                packet[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            copies.push((
+                start..packet.len(),
+                transfer.destination_offset_bytes,
+                bytes,
+                transfer.row_count,
+                checked_usize(transfer.destination_stride_bytes, "compiled row pitch")?,
+            ));
+        }
+        if packet.len() != total {
+            return Err(invalid(
+                "compiled packet omitted or duplicated a live write",
+            ));
+        }
+        let owner = scatter.prepare_encoded(allocation_stream, packet.len(), count)?;
+        let compact = owner.is_some();
+        upload_plan.compact_scatter_preludes = u64::from(compact);
+        upload_plan.compact_scatter_sparse_fallback_preludes = u64::from(!compact);
+        upload_plan.planned_upload_bytes = if compact {
+            packet.len() as u64
+        } else {
+            upload_plan.live_payload_bytes
+        };
+        let projection = Arc::new(CudaBindingProgramProjection {
+            nodes: self.nodes,
+            owners: Arc::clone(&owners),
+            descriptor_count: count,
+            compact,
+        });
+        let destinations = projection
+            .nodes
+            .iter()
+            .map(|node| node.destination.clone())
+            .collect();
+        let executable = Arc::new(CudaCommandExecutable::static_work(
+            destinations,
+            vec![packet.into_boxed_slice()],
+            Box::new(move |stream, _blas, _regions, host_storage| {
+                let [packet] = host_storage else {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "compiled prelude requires one packet",
+                    ));
+                };
+                let mut attempt = upload_counters.attempt(upload_plan);
+                if let Some(owner) = &owner {
+                    owner.upload(stream, packet)?;
+                    attempt.copied(packet.len() as u64, false);
+                    owner.scatter(stream, arena_ptr)?;
+                    attempt.scatter_dispatched();
+                } else {
+                    for (source, destination, width, rows, pitch) in &copies {
+                        let payload = &packet[source.clone()];
+                        let device = arena_ptr.checked_add(*destination).ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract("compiled fallback pointer overflows")
+                        })?;
+                        if *rows == 1 {
+                            unsafe {
+                                cudarc::driver::result::memcpy_htod_async(
+                                    device,
+                                    payload,
+                                    stream.cu_stream(),
+                                )
+                            }
+                            .map_err(|error| {
+                                CudaDeviceRuntimeError::driver(
+                                    "compiled sparse binding upload",
+                                    error,
+                                )
+                            })?;
+                        } else {
+                            let copy = cudarc::driver::sys::CUDA_MEMCPY2D {
+                                srcXInBytes: 0,
+                                srcY: 0,
+                                srcMemoryType:
+                                    cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST,
+                                srcHost: payload.as_ptr().cast(),
+                                srcDevice: 0,
+                                srcArray: std::ptr::null_mut(),
+                                srcPitch: *width,
+                                dstXInBytes: 0,
+                                dstY: 0,
+                                dstMemoryType:
+                                    cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                                dstHost: std::ptr::null_mut(),
+                                dstDevice: device,
+                                dstArray: std::ptr::null_mut(),
+                                dstPitch: *pitch,
+                                WidthInBytes: *width,
+                                Height: *rows,
+                            };
+                            unsafe {
+                                cudarc::driver::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream())
+                            }
+                            .result()
+                            .map_err(|error| {
+                                CudaDeviceRuntimeError::driver(
+                                    "compiled strided binding upload",
+                                    error,
+                                )
+                            })?;
+                        }
+                        attempt.copied(payload.len() as u64, *rows != 1);
+                    }
+                }
+                attempt.succeeded();
+                Ok(())
+            }),
+        ));
+        Ok(CudaDeviceCommand {
+            runtime_instance,
+            operation: if compact {
+                "vnext_program_binding_compact_scatter_v1"
+            } else {
+                "vnext_program_binding_prelude"
+            },
+            batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_start: 0,
+            participant_count: participants,
+            token_count: tokens,
+            compute_dispatch_count: u64::from(compact),
+            transfer_command_count: if compact { 1 } else { u64::from(count) },
+            executable: Some(executable),
+            fence_dependencies: Vec::new(),
+            binding_owner_tables: vec![owners],
+            replay_key: None,
+            reusable_address_scope: None,
+            replay_gap_reason: None,
+            program_binding_patch: None,
+            binding_program: Some(projection),
+            reusable_execution: None,
+            completion_checks: checks,
+        })
+    }
+}
+
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
 /// returned fence reaches a terminal state.
 pub struct CudaDeviceCommand {
@@ -633,6 +1122,7 @@ pub struct CudaDeviceCommand {
     reusable_address_scope: Option<DeviceReusableAddressScope>,
     replay_gap_reason: Option<DeviceReusableExecutionProgramGapReason>,
     program_binding_patch: Option<CudaProgramBindingPatch>,
+    binding_program: Option<Arc<CudaBindingProgramProjection>>,
     reusable_execution: Option<DeviceReusableExecutionInvocation>,
 }
 
@@ -791,6 +1281,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
@@ -1003,6 +1494,7 @@ impl CudaDeviceCommand {
             replay_key,
             reusable_address_scope,
             replay_gap_reason,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
@@ -1047,6 +1539,7 @@ impl CudaDeviceCommand {
             replay_key,
             reusable_address_scope,
             replay_gap_reason,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
@@ -1080,6 +1573,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
@@ -1182,6 +1676,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
+            binding_program: None,
             program_binding_patch: Some(CudaProgramBindingPatch {
                 binding,
                 destination,
@@ -1276,6 +1771,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: Some(invocation),
             completion_checks: Vec::new(),
@@ -1581,6 +2077,7 @@ impl CudaDeviceCommand {
                 replay_key: None,
                 reusable_address_scope: None,
                 replay_gap_reason: None,
+                binding_program: None,
                 program_binding_patch: None,
                 reusable_execution: None,
                 completion_checks,
@@ -1667,6 +2164,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks,
@@ -1734,6 +2232,7 @@ impl CudaDeviceCommand {
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
@@ -4047,6 +4546,62 @@ impl DeviceRuntime for CudaDeviceRuntime {
         Ok(encoded)
     }
 
+    fn compile_segment_binding_program(
+        &self,
+        declarations: &[(u32, &ferrum_interfaces::vnext::SegmentBindingDeclaration)],
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        if self.segment_binding_owner_view_mode
+            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+            || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
+            || self.binding_scatter.is_none()
+        {
+            return Ok(None);
+        }
+        super::vnext_ops::compile_segment_binding_program(declarations)
+    }
+
+    fn encode_compiled_segment_bindings(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        frame: &mut ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, Self::Buffer>,
+    ) -> Result<
+        Option<ferrum_interfaces::vnext::EncodedSegmentBindingProgram<Self::Command>>,
+        Self::Error,
+    > {
+        if self.segment_binding_owner_view_mode
+            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+            || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "compiled segment runtime configuration changed",
+            ));
+        }
+        let scatter = self.binding_scatter.as_ref().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("compiled segment scatter module is absent")
+        })?;
+        let (nodes, sink, owners) =
+            super::vnext_ops::encode_compiled_segment_bindings(program, frame)?;
+        let program_binding_nodes = sink.node_indices()?;
+        let command = sink.finish(
+            owners,
+            scatter,
+            &self.allocation_stream,
+            Arc::clone(&self.program_binding_upload_counters),
+        )?;
+        self.segment_binding_indexed_encodes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| CudaDeviceRuntimeError::contract("indexed segment count exhausted"))?;
+        Ok(Some(
+            ferrum_interfaces::vnext::EncodedSegmentBindingProgram {
+                nodes,
+                program_bindings: vec![command],
+                program_binding_nodes,
+            },
+        ))
+    }
+
     fn segment_binding_owner_view_mode(
         &self,
     ) -> ferrum_interfaces::vnext::SegmentBindingOwnerViewMode {
@@ -4071,6 +4626,33 @@ impl DeviceRuntime for CudaDeviceRuntime {
         self.segment_binding_oracle_audited_nodes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
+            })
+            .map_err(|_| CudaDeviceRuntimeError::contract("segment oracle count exhausted"))?;
+        Ok(Some(()))
+    }
+
+    fn compare_segment_binding_program_reference(
+        &self,
+        program_bindings: &[Self::Command],
+        program_binding_nodes: &[u32],
+        nodes: &[(
+            u32,
+            ferrum_interfaces::vnext::SegmentBindingOracleCommands<'_, Self::Command>,
+            ferrum_interfaces::vnext::SegmentBindingOracleCommands<'_, Self::Command>,
+        )],
+    ) -> Result<Option<()>, Self::Error> {
+        if self.segment_binding_oracle
+            == ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled
+        {
+            return Ok(None);
+        }
+        segment_oracle::compare_program(program_bindings, program_binding_nodes, nodes)?;
+        let count = u64::try_from(nodes.len()).map_err(|_| {
+            CudaDeviceRuntimeError::contract("segment oracle node count exceeds u64")
+        })?;
+        self.segment_binding_oracle_audited_nodes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(count)
             })
             .map_err(|_| CudaDeviceRuntimeError::contract("segment oracle count exhausted"))?;
         Ok(Some(()))
@@ -5745,6 +6327,7 @@ mod tests {
             replay_key: None,
             reusable_address_scope: None,
             replay_gap_reason: None,
+            binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),

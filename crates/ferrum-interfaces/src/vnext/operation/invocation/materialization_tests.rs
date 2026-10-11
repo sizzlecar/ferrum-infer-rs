@@ -23,6 +23,8 @@ mod segment_dependency_tests;
 mod segment_hot_tests;
 #[path = "segment_owner_tests.rs"]
 mod segment_owner_tests;
+#[path = "segment_program_tests.rs"]
+mod segment_program_tests;
 #[path = "segment_publication_tests.rs"]
 mod segment_publication_tests;
 

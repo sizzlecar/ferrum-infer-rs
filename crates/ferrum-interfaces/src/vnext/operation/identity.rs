@@ -1046,7 +1046,8 @@ impl BatchOperationIdentity {
                         ParticipantIdentitySeeds::Full(participant_seeds)
                     }
                     InvocationPreparationStrategy::IdentityProjection
-                    | InvocationPreparationStrategy::DecodeSegment => {
+                    | InvocationPreparationStrategy::DecodeSegment
+                    | InvocationPreparationStrategy::DecodeSegmentProgram => {
                         ParticipantIdentitySeeds::Projected(participant_seeds.into())
                     }
                 },
@@ -1054,7 +1055,8 @@ impl BatchOperationIdentity {
                     IdentityProjectionCounts {
                         projected_identities: AtomicU64::new(0),
                         materializations: Arc::new(AtomicU64::new(0)),
-                        segment: (strategy == InvocationPreparationStrategy::DecodeSegment)
+                        segment: strategy
+                            .uses_decode_segment()
                             .then(|| Box::new(SegmentPreparationCounts::default())),
                     }
                 }),

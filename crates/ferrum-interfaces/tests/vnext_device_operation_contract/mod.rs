@@ -1400,6 +1400,16 @@ pub(crate) enum FenceBehavior {
     Panic,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) enum SegmentProgramFault {
+    #[default]
+    None,
+    LeaveDependency,
+    ReverseNodes,
+}
+
+struct TestSegmentProgram(Vec<(u32, usize, usize)>);
+
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
     pub(crate) segment_metadata_enabled: bool,
@@ -1411,6 +1421,9 @@ pub(crate) struct RuntimeTrace {
     pub(crate) segment_owner_count: usize,
     pub(crate) segment_retained_owners: Vec<DeviceBufferRetention>,
     pub(crate) segment_regions: Vec<SegmentTestRegion>,
+    pub(crate) segment_program_compile_calls: usize,
+    pub(crate) segment_program_encode_calls: usize,
+    pub(crate) segment_program_fault: SegmentProgramFault,
     pub(crate) segment_entry: Option<DeviceReusableExecutionEntryIdentity>,
     pub(crate) segment_entry_error: bool,
     pub(crate) segment_entry_panic: bool,
@@ -1815,6 +1828,150 @@ impl DeviceRuntime for TestRuntime {
         trace.segment_owner_count = owners.len();
         trace.segment_retained_owners = retained_owners;
         Ok(Some(encoded))
+    }
+
+    fn compile_segment_binding_program(
+        &self,
+        declarations: &[(u32, &SegmentBindingDeclaration)],
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        if !trace.segment_encoder_enabled {
+            return Ok(None);
+        }
+        trace.segment_program_compile_calls += 1;
+        // Only immutable ordinals/counts enter this cold test program.
+        Ok(Some(Arc::new(TestSegmentProgram(
+            declarations
+                .iter()
+                .map(|(node, declaration)| {
+                    (
+                        *node,
+                        declaration.regions().len(),
+                        declaration.dependencies().len(),
+                    )
+                })
+                .collect(),
+        ))))
+    }
+
+    fn encode_compiled_segment_bindings(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        frame: &mut PreparedSegmentBindingFrame<'_, Self::Buffer>,
+    ) -> Result<Option<EncodedSegmentBindingProgram<Self::Command>>, Self::Error> {
+        let program = program
+            .downcast_ref::<TestSegmentProgram>()
+            .ok_or(TestRuntimeError("foreign compiled segment test program"))?;
+        let (capture_owners, fault) = {
+            let mut trace = self.trace.lock().unwrap();
+            trace.segment_program_encode_calls += 1;
+            (trace.segment_capture_owners, trace.segment_program_fault)
+        };
+        assert_eq!(frame.node_count(), program.0.len());
+        assert!(frame.node(frame.node_count()).is_err());
+        let mut snapshots = Vec::new();
+        let mut retained_owners = Vec::new();
+        let mut nodes = Vec::new();
+        let mut program_binding_nodes = Vec::new();
+        for (ordinal, &(node_index, region_count, dependency_count)) in program.0.iter().enumerate()
+        {
+            {
+                let node = frame
+                    .node(ordinal)
+                    .map_err(|_| TestRuntimeError("frame node absent"))?;
+                assert_eq!(node.node_index(), node_index);
+                assert_eq!(node.declaration().regions().len(), region_count);
+                assert_eq!(node.declaration().dependencies().len(), dependency_count);
+                assert!(node.region(node.participant_count(), 0).is_err());
+                assert!(node.region(0, region_count).is_err());
+                if node.program_binding().is_some() {
+                    program_binding_nodes.push(node_index);
+                }
+                for participant in 0..node.participant_count() {
+                    for region in 0..region_count {
+                        let value = node
+                            .region(participant, region)
+                            .map_err(|_| TestRuntimeError("frame region absent"))?;
+                        let descriptor = value.descriptor();
+                        let mut covered = 0;
+                        let physical = value
+                            .physical_regions()
+                            .map(|part| {
+                                let (buffer, range, retention) =
+                                    part.borrowed_buffer_and_physical_range();
+                                let index = part.owner_index().expect("Core frame owner index");
+                                let (owner_buffer, owner_retention) =
+                                    frame.owners()[index.get()].buffer_and_retention();
+                                assert!(std::ptr::eq(buffer, owner_buffer));
+                                assert!(retention.same_owners(owner_retention));
+                                assert_eq!(part.logical_offset_bytes(), covered);
+                                assert!(
+                                    range.start < range.end
+                                        && range.end <= buffer.descriptor.size_bytes
+                                );
+                                covered += range.end - range.start;
+                                if capture_owners {
+                                    retained_owners.push(retention.clone());
+                                }
+                                (
+                                    buffer as *const TestBuffer as usize,
+                                    range,
+                                    part.logical_offset_bytes(),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(covered, descriptor.size_bytes);
+                        snapshots.push(SegmentTestRegion {
+                            node: node_index,
+                            participant,
+                            region,
+                            descriptor: BufferDescriptor {
+                                resource_id: descriptor.resource_id.clone(),
+                                size_bytes: descriptor.size_bytes,
+                                alignment_bytes: descriptor.alignment_bytes,
+                                usage: descriptor.usage,
+                                element_type: descriptor.element_type,
+                            },
+                            physical,
+                        });
+                    }
+                }
+            }
+            let mut bindings = EncodedReusableExecutionBindings::empty();
+            if !matches!(fault, SegmentProgramFault::LeaveDependency) {
+                for dependency in 0..dependency_count {
+                    let authority = frame
+                        .take_dependency(ordinal, dependency)
+                        .map_err(|_| TestRuntimeError("frame dependency absent"))?;
+                    assert!(frame.take_dependency(ordinal, dependency).is_err());
+                    bindings = bindings.with_retained_plan_dependency(
+                        authority.encode(TestCommand::DynamicBinding),
+                    );
+                }
+            }
+            assert!(frame.take_dependency(ordinal, dependency_count).is_err());
+            nodes.push(EncodedSegmentBindingNode {
+                node_index,
+                bindings,
+            });
+        }
+        assert!(frame.take_dependency(frame.node_count(), 0).is_err());
+        if matches!(fault, SegmentProgramFault::ReverseNodes) {
+            nodes.reverse();
+        }
+        let mut trace = self.trace.lock().unwrap();
+        trace.segment_regions = snapshots;
+        trace.segment_owner_count = frame.owners().len();
+        trace.segment_retained_owners = retained_owners;
+        Ok(Some(EncodedSegmentBindingProgram {
+            nodes,
+            program_bindings: if program_binding_nodes.is_empty() {
+                vec![]
+            } else {
+                vec![TestCommand::CoalescedProgramBinding]
+            },
+            program_binding_nodes,
+        }))
     }
 
     fn reusable_execution_entry_identity(

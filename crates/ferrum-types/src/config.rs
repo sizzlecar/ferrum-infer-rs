@@ -83,6 +83,8 @@ pub enum InvocationPreparationStrategy {
     Full,
     IdentityProjection,
     DecodeSegment,
+    /// Compile the entire binding write program and bind it from one fresh frame.
+    DecodeSegmentProgram,
 }
 
 impl InvocationPreparationStrategy {
@@ -91,11 +93,19 @@ impl InvocationPreparationStrategy {
             Self::Full => "full",
             Self::IdentityProjection => "identity-projection",
             Self::DecodeSegment => "decode-segment",
+            Self::DecodeSegmentProgram => "decode-segment-program",
         }
     }
 
     pub const fn uses_identity_projection(self) -> bool {
-        matches!(self, Self::IdentityProjection | Self::DecodeSegment)
+        matches!(
+            self,
+            Self::IdentityProjection | Self::DecodeSegment | Self::DecodeSegmentProgram
+        )
+    }
+
+    pub const fn uses_decode_segment(self) -> bool {
+        matches!(self, Self::DecodeSegment | Self::DecodeSegmentProgram)
     }
 
     pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
@@ -103,8 +113,9 @@ impl InvocationPreparationStrategy {
             "full" => Ok(Self::Full),
             "identity-projection" => Ok(Self::IdentityProjection),
             "decode-segment" => Ok(Self::DecodeSegment),
+            "decode-segment-program" => Ok(Self::DecodeSegmentProgram),
             _ => Err(format!(
-                "expected full, identity-projection or decode-segment; got {raw:?}"
+                "expected full, identity-projection, decode-segment or decode-segment-program; got {raw:?}"
             )),
         }
     }
@@ -1496,6 +1507,7 @@ mod tests {
         for strategy in [
             InvocationPreparationStrategy::IdentityProjection,
             InvocationPreparationStrategy::DecodeSegment,
+            InvocationPreparationStrategy::DecodeSegmentProgram,
             InvocationPreparationStrategy::Full,
         ] {
             config

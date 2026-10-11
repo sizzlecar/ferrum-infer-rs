@@ -28,12 +28,14 @@ pub(crate) mod segment_compile;
 mod segment_dispatch;
 mod segment_oracle;
 pub use segment_binding::{
-    EncodedSegmentBindingNode, PreparedSegmentBindingNode, PreparedSegmentBindingPatch,
+    EncodedSegmentBindingNode, EncodedSegmentBindingProgram, PreparedSegmentBindingFrame,
+    PreparedSegmentBindingNode, PreparedSegmentBindingNodeView, PreparedSegmentBindingPatch,
     PreparedSegmentBindingRegion, SegmentBindingDeclaration, SegmentBindingDependency,
-    SegmentBindingOracleCommands, SegmentBindingOracleMode, SegmentBindingOwnerIndex,
-    SegmentBindingOwnerView, SegmentBindingOwnerViewMode, SegmentBindingPhysicalRegion,
-    SegmentBindingPhysicalRegionView, SegmentBindingPhysicalRegions, SegmentBindingRegionExtent,
-    SegmentBindingRegionRequest, SegmentBindingRegionSelector,
+    SegmentBindingDescriptorView, SegmentBindingOracleCommands, SegmentBindingOracleMode,
+    SegmentBindingOwnerIndex, SegmentBindingOwnerView, SegmentBindingOwnerViewMode,
+    SegmentBindingPhysicalRegion, SegmentBindingPhysicalRegionView, SegmentBindingPhysicalRegions,
+    SegmentBindingRegionExtent, SegmentBindingRegionRequest, SegmentBindingRegionSelector,
+    SegmentBindingRegionView,
 };
 mod semantic;
 mod storage_profile;

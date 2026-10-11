@@ -128,7 +128,8 @@ pub struct ServeCommand {
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
     /// Host invocation preparation policy for native plan runtimes (default: full).
-    /// Decode-segment requires a CUDA plan runtime.
+    /// Decode segments require a CUDA plan runtime; decode-segment-program also
+    /// requires indexed owner views and compact-scatter binding uploads.
     #[arg(long, value_enum)]
     pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
     /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).

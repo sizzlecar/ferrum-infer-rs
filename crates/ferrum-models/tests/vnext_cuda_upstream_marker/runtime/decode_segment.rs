@@ -21,6 +21,46 @@ impl Preparation {
     }
 }
 
+fn check_compiled_upload(
+    fixture: &Fixture,
+    before: Option<DeviceProgramBindingUploadSnapshot>,
+    stats: InvocationPreparationStats,
+) {
+    let Some(before) = before else { return };
+    let uploads = fixture
+        ._composition
+        ._runtime
+        .program_binding_upload_snapshot()
+        .unwrap()
+        .checked_since(before)
+        .unwrap();
+    assert_eq!(uploads.failed_preludes, 0);
+    assert_eq!(uploads.attempted_preludes, uploads.succeeded_preludes);
+    assert_eq!(uploads.compact_scatter_preludes, uploads.succeeded_preludes);
+    assert_eq!(uploads.compact_scatter_sparse_fallback_preludes, 0);
+    assert_eq!(
+        uploads.successful_scatter_dispatches,
+        uploads.succeeded_preludes
+    );
+    assert_eq!(uploads.successful_1d_copies, uploads.succeeded_preludes);
+    assert_eq!(uploads.successful_2d_copies, 0);
+    assert_eq!(
+        uploads.successful_upload_bytes,
+        uploads.planned_upload_bytes
+    );
+    if stats.segment_hits != 0 {
+        assert_eq!(
+            uploads.succeeded_preludes, stats.segment_hits,
+            "one final packet is actually submitted for each complete hot binding program"
+        );
+        assert!(uploads.planned_upload_bytes > uploads.live_payload_bytes);
+        assert_eq!(
+            (uploads.planned_upload_bytes - uploads.live_payload_bytes) % 40,
+            0
+        );
+    }
+}
+
 fn physical_pages(
     fixture: &Fixture,
     session: &Arc<SequenceSession<Runtime>>,
@@ -122,27 +162,54 @@ fn check_binding_controls(
 }
 
 fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
+    compare_strategy(
+        kind,
+        owner_mode,
+        InvocationPreparationStrategy::DecodeSegment,
+    );
+}
+
+fn compare_strategy(
+    kind: AttentionKind,
+    owner_mode: SegmentBindingOwnerViewMode,
+    segment_strategy: InvocationPreparationStrategy,
+) {
+    let compiled = segment_strategy == InvocationPreparationStrategy::DecodeSegmentProgram;
     let modes = [
         InvocationPreparationStrategy::IdentityProjection,
-        InvocationPreparationStrategy::DecodeSegment,
+        segment_strategy,
     ];
     let maximum_tokens = 8192;
     let fixtures = modes.map(|mode| {
-        Fixture::for_family_with_segment_owner_views(
+        Fixture::for_family_with_causal_decode_preparation(
             kind,
             true,
             2,
             Family::new(kind).with_maximum_tokens(maximum_tokens),
-            ProgramBindingUploadStrategy::Sparse,
-            if mode == InvocationPreparationStrategy::DecodeSegment {
+            if compiled {
+                ProgramBindingUploadStrategy::CompactScatter
+            } else {
+                ProgramBindingUploadStrategy::Sparse
+            },
+            if mode == segment_strategy {
                 SegmentBindingOracleMode::CompareReference
             } else {
                 SegmentBindingOracleMode::Disabled
             },
-            if mode == InvocationPreparationStrategy::DecodeSegment {
+            if mode == segment_strategy {
                 owner_mode
             } else {
                 SegmentBindingOwnerViewMode::Legacy
+            },
+            if compiled {
+                ferrum_types::AttentionExecutionPolicy::NativeAdaptive
+            } else {
+                ferrum_types::AttentionExecutionPolicy::Portable
+            },
+            if compiled {
+                ferrum_types::CausalDecodePreparationMode::Packed
+            } else {
+                ferrum_types::CausalDecodePreparationMode::PerParticipant
             },
         )
     });
@@ -218,7 +285,14 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
     let mut previous_frames: [Vec<ExecutionFrameId>; 2] = [Vec::new(), Vec::new()];
     let mut previous_programs: [Option<DeviceReusableExecutionProgramId>; 2] = [None, None];
     for position in 0..joint_waves {
-        let ranges = [lead + position..lead + position + 1, position..position + 1];
+        let caller_order = if compiled && position >= joint_waves - 2 {
+            [1, 0]
+        } else {
+            [0, 1]
+        };
+        let original_ranges = [lead + position..lead + position + 1, position..position + 1];
+        let ranges = caller_order.map(|p| original_ranges[p].clone());
+        let wave_tokens = caller_order.map(|p| Arc::clone(&tokens[p]));
         let changed_extent = kind == AttentionKind::Causal && position == 4;
         let path = if position < 2 {
             Path::Warm
@@ -227,19 +301,21 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
         };
         let mut observations = Vec::new();
         for (arm, (fixture, group)) in fixtures.iter().zip(&sessions).enumerate() {
-            for ((session, t), range) in group.iter().zip(&tokens).zip(&ranges) {
+            let group = caller_order.map(|p| Arc::clone(&group[p]));
+            for ((session, t), range) in group.iter().zip(&wave_tokens).zip(&ranges) {
                 fixture.extend(session, Arc::from(&t[..range.end]));
             }
             let pages = if kind == AttentionKind::Causal {
                 let pages = group
                     .iter()
-                    .zip(&tokens)
+                    .zip(&wave_tokens)
                     .zip(&ranges)
                     .map(|((session, t), range)| {
                         physical_pages(fixture, session, Arc::from(&t[..range.end]), range.end)
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(pages, if position < 4 { vec![1, 1] } else { vec![2, 1] });
+                let expected_pages = if position < 4 { [1, 1] } else { [2, 1] };
+                assert_eq!(pages, caller_order.map(|p| expected_pages[p]));
                 Some(pages)
             } else {
                 None
@@ -252,11 +328,18 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
                 ._composition
                 ._runtime
                 .segment_binding_indexed_encodes();
+            let uploads_before = compiled.then(|| {
+                fixture
+                    ._composition
+                    ._runtime
+                    .program_binding_upload_snapshot()
+                    .unwrap()
+            });
             let observation = fixture.execute_participant_ranges_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
-                group,
-                &tokens,
+                &group,
+                &wave_tokens,
                 &ranges,
                 path,
                 modes[arm],
@@ -264,6 +347,7 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
                 Some(row_bytes),
             );
             let stats = sinks[arm].last();
+            check_compiled_upload(fixture, uploads_before, stats);
             let indexed_encodes = fixture
                 ._composition
                 ._runtime
@@ -351,7 +435,7 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
             println!(
                 "{}",
                 serde_json::json!({"kind":"decode_segment_wave", "attention":format!("{kind:?}"), "strategy":modes[arm],
-                "ranges":ranges, "physical_kv_pages":pages, "reusable_program_id":program_id,
+                "ranges":ranges, "caller_order":caller_order, "physical_kv_pages":pages, "reusable_program_id":program_id,
                 "owner_view_mode":format!("{:?}",fixture._composition._runtime.segment_binding_owner_view_mode()),
                 "indexed_host_encodes":indexed_encodes,
                 "program_immediate_pages":program_id.immediate_pages(), "published":observation.segment_published,
@@ -419,11 +503,25 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
                 ._composition
                 ._runtime
                 .segment_binding_oracle_audited_nodes();
+            let caller_order = if compiled && position >= 6 {
+                [1, 0]
+            } else {
+                [0, 1]
+            };
+            let wave_group = caller_order.map(|p| Arc::clone(&group[p]));
+            let wave_tokens = caller_order.map(|p| Arc::clone(&fresh_tokens[p]));
+            let uploads_before = compiled.then(|| {
+                fixture
+                    ._composition
+                    ._runtime
+                    .program_binding_upload_snapshot()
+                    .unwrap()
+            });
             let output = fixture.execute_participants_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
-                group,
-                &fresh_tokens,
+                &wave_group,
+                &wave_tokens,
                 position..position + 1,
                 if position < 2 {
                     Path::Warm
@@ -434,6 +532,7 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
                 &sinks[arm],
             );
             let stats = sinks[arm].last();
+            check_compiled_upload(fixture, uploads_before, stats);
             assert_eq!(stats.parts_materialized, 0);
             assert_eq!(
                 fixture
@@ -505,7 +604,8 @@ fn compare(kind: AttentionKind, owner_mode: SegmentBindingOwnerViewMode) {
         "{}",
         serde_json::json!({"kind":"decode_segment_actual_cuda", "attention":format!("{kind:?}"),
         "participants":2, "lead_waves":lead, "joint_waves":joint_waves, "fresh_request_waves":8,
-        "owner_view_mode":format!("{owner_mode:?}"), "indexed_host_encodes":indexed_encodes,
+        "owner_view_mode":format!("{owner_mode:?}"), "segment_strategy":segment_strategy,
+        "compiled_binding_program":compiled, "indexed_host_encodes":indexed_encodes,
         "hot_before_extent_change":hot_before_growth, "hot_after_extent_change":hot_after_growth,
         "publications":publications, "fresh_request_hits":fresh_hits, "full_output_and_valid_state_equal":true,
         "same_wave_oracle_audited_nodes":audited_nodes, "binding_readback_scope":"exact current control/status bytes and nonzero pointers", "same_wave_oracle_scope":"all encoded patch bytes/owners/ranges/status/attribution and fresh Plan dependency identities; reference never submitted"})
@@ -540,4 +640,24 @@ fn decode_segment_indexed_gdn_matches_ip_across_fresh_frames_and_requests() {
 #[ignore = "requires exclusive CUDA, indexed owner views and actual hot physical KV extension"]
 fn decode_segment_indexed_causal_matches_ip_across_hot_physical_kv_extension() {
     compare(AttentionKind::Causal, SegmentBindingOwnerViewMode::Indexed);
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA and actual compiled binding program with complete same-wave oracle"]
+fn decode_segment_program_gdn_matches_ip_across_fresh_requests_and_reorder() {
+    compare_strategy(
+        AttentionKind::GatedDelta,
+        SegmentBindingOwnerViewMode::Indexed,
+        InvocationPreparationStrategy::DecodeSegmentProgram,
+    );
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA and compiled binding program across current physical KV growth"]
+fn decode_segment_program_causal_matches_ip_across_hot_kv_growth_and_reorder() {
+    compare_strategy(
+        AttentionKind::Causal,
+        SegmentBindingOwnerViewMode::Indexed,
+        InvocationPreparationStrategy::DecodeSegmentProgram,
+    );
 }

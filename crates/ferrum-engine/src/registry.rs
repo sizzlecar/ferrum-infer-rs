@@ -1145,12 +1145,26 @@ fn validate_invocation_preparation_strategy(
     config: &ComponentConfig,
     plan_runtime: bool,
 ) -> Result<()> {
-    if config.engine_config.runtime.invocation_preparation_strategy
-        == ferrum_types::InvocationPreparationStrategy::DecodeSegment
+    if config
+        .engine_config
+        .runtime
+        .invocation_preparation_strategy
+        .uses_decode_segment()
         && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime)
     {
         return Err(FerrumError::unsupported(
             "decode-segment invocation preparation requires a CUDA plan runtime",
+        ));
+    }
+    if config.engine_config.runtime.invocation_preparation_strategy
+        == ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram
+        && (config.engine_config.runtime.segment_binding_owner_view_mode
+            != ferrum_types::SegmentBindingOwnerViewMode::Indexed
+            || config.engine_config.runtime.program_binding_upload_strategy
+                != ferrum_types::ProgramBindingUploadStrategy::CompactScatter)
+    {
+        return Err(FerrumError::unsupported(
+            "decode-segment-program requires indexed owner views and compact-scatter uploads",
         ));
     }
     Ok(())
@@ -1180,8 +1194,11 @@ fn validate_segment_binding_owner_view_mode(
         == ferrum_types::SegmentBindingOwnerViewMode::Indexed
         && (!matches!(config.device, Device::CUDA(_))
             || !plan_runtime
-            || config.engine_config.runtime.invocation_preparation_strategy
-                != ferrum_types::InvocationPreparationStrategy::DecodeSegment)
+            || !config
+                .engine_config
+                .runtime
+                .invocation_preparation_strategy
+                .uses_decode_segment())
     {
         return Err(FerrumError::unsupported(
             "indexed segment binding owner views require a CUDA plan runtime with decode-segment preparation",
@@ -2107,6 +2124,7 @@ mod tests {
                     InvocationPreparationStrategy::Full,
                     InvocationPreparationStrategy::IdentityProjection,
                     InvocationPreparationStrategy::DecodeSegment,
+                    InvocationPreparationStrategy::DecodeSegmentProgram,
                 ] {
                     config.engine_config.runtime.invocation_preparation_strategy = preparation;
                     for upload in [
@@ -2123,7 +2141,7 @@ mod tests {
                             validate_segment_binding_owner_view_mode(&config, plan_runtime).is_ok(),
                             plan_runtime
                                 && matches!(config.device, Device::CUDA(_))
-                                && preparation == InvocationPreparationStrategy::DecodeSegment
+                                && preparation.uses_decode_segment()
                         );
                     }
                 }

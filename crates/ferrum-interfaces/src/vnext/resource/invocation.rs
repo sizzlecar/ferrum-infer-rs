@@ -1732,10 +1732,141 @@ where
     purpose: SubmissionWavePurpose,
 }
 
+/// One attempt's borrowed participant mapping. Captured snapshots remain owned
+/// by this Step; resolving them does not authorize their current pool chunks.
+pub(crate) struct SegmentBackingContext<'w, R: DeviceRuntime> {
+    wave: &'w PreparedStepSubmissionWave<R>,
+    pools: &'w super::DynamicPoolSet<R>,
+    snapshots: Vec<&'w SequenceBackingSnapshot<R>>,
+}
+
+impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
+    pub(crate) fn sequence_shape(
+        &self,
+        participant: usize,
+    ) -> Result<crate::vnext::DynamicResourceShape, VNextError> {
+        self.snapshots
+            .get(participant)
+            .map(|snapshot| snapshot.committed_shape())
+            .ok_or_else(|| invalid_resource("segment participant snapshot is absent"))
+    }
+
+    pub(crate) fn request_shape(
+        &self,
+        participant: usize,
+    ) -> Result<&'w crate::vnext::ResourceWorkShape, VNextError> {
+        self.wave
+            .nodes
+            .first()
+            .and_then(|node| node.participant_authority.participants.get(participant))
+            .map(|participant| participant.request.work_shape())
+            .ok_or_else(|| invalid_resource("segment request participant is absent"))
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        participant_index: usize,
+        resource: &ResourceId,
+        lifetime: AllocationLifetime,
+    ) -> Result<&'w [LogicalBackingSliceAuthority], VNextError> {
+        let participant = self
+            .wave
+            .nodes
+            .first()
+            .and_then(|node| {
+                node.participant_authority
+                    .participants
+                    .get(participant_index)
+            })
+            .ok_or_else(|| invalid_resource("segment participant index is out of bounds"))?;
+        let authorities = match lifetime {
+            AllocationLifetime::Request => participant
+                .request
+                .backing_slices()
+                .iter()
+                .find(|authority| authority.resource_id() == resource)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Sequence => {
+                // The map was built in this exact prepared participant order.
+                let authorities = self.snapshots[participant_index].backing_slices_for(resource);
+                (!authorities.is_empty()).then_some(authorities)
+            }
+            AllocationLifetime::Step => self
+                .wave
+                .step
+                .backing_slices()
+                .iter()
+                .find(|authority| authority.resource_id() == resource)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Invocation => self
+                .wave
+                .claimed_backing
+                .backing_slices()
+                .iter()
+                .find(|authority| authority.resource_id() == resource)
+                .map(std::slice::from_ref),
+            AllocationLifetime::Plan => None,
+        };
+        authorities.ok_or_else(|| {
+            invalid_resource("segment resource has no exact current captured authority")
+        })
+    }
+
+    pub(crate) fn prepare<S: crate::vnext::SubmissionWaveDispatchTimingSink>(
+        &self,
+        groups: &[&[LogicalBackingSliceAuthority]],
+        expected: &[super::SegmentBackingExpectation],
+        windows: super::SegmentBackingWindowInput<'_>,
+        timing: &S,
+    ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError> {
+        self.pools
+            .segment_backing_batch_with_window_input(groups, expected, windows, timing)
+    }
+}
+
 impl<R> PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
+    pub(crate) fn segment_backing_context(
+        &self,
+    ) -> Result<SegmentBackingContext<'_, R>, VNextError> {
+        let participants = &self
+            .nodes
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no nodes"))?
+            .participant_authority
+            .participants;
+        let first = participants
+            .first()
+            .ok_or_else(|| invalid_resource("segment wave has no participants"))?;
+        let pools = first.request.plan.dynamic_pools();
+        let mut snapshots = Vec::new();
+        snapshots
+            .try_reserve_exact(participants.len())
+            .map_err(|_| invalid_resource("segment participant mapping allocation failed"))?;
+        for participant in participants {
+            if !std::ptr::eq(pools, participant.request.plan.dynamic_pools()) {
+                return Err(invalid_resource(
+                    "segment participants have different physical pool owners",
+                ));
+            }
+            snapshots.push(
+                self.step
+                    .participant_backing_snapshot(BatchParticipantAuthority::new(
+                        participant.sequence_authority(),
+                        participant.request_authority(),
+                    ))?
+                    .as_ref(),
+            );
+        }
+        Ok(SegmentBackingContext {
+            wave: self,
+            pools,
+            snapshots,
+        })
+    }
+
     pub fn batch_step_id(&self) -> BatchStepId {
         self.step.batch_step_id()
     }

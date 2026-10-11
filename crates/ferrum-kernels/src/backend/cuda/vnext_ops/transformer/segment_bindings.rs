@@ -14,22 +14,144 @@ use ferrum_interfaces::vnext::{
 };
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) struct ValidationRecipe {
     pub state: Arc<WeightValidation>,
     pub declaration: SegmentBindingDependency,
     pub weight_element_type: ElementType,
 }
 
+#[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) enum DynamicRecipe {
     PlanDependencies,
     GatedDelta(super::attention::segment_bindings::GatedDeltaRecipe),
     Causal(super::causal_attention::segment_bindings::CausalRecipe),
 }
 
+#[derive(Clone)]
 struct CudaSegmentBindingRecipe {
     dynamic: DynamicRecipe,
     validations: Vec<ValidationRecipe>,
     dependency_region_start: usize,
+}
+
+/// Owns only the cold provider rules. Current resource owners and dependency
+/// authorities are supplied by a new checked frame on every invocation.
+struct CudaSegmentBindingProgram {
+    nodes: Vec<(u32, CudaSegmentBindingRecipe)>,
+}
+
+pub(crate) fn compile_program(
+    declarations: &[(u32, &SegmentBindingDeclaration)],
+) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, CudaDeviceRuntimeError> {
+    if declarations.is_empty() {
+        return Ok(None);
+    }
+    let mut nodes = Vec::with_capacity(declarations.len());
+    let mut has_bindings = false;
+    for (node_index, declaration) in declarations {
+        let Some(recipe) = declaration
+            .provider_state()
+            .downcast_ref::<CudaSegmentBindingRecipe>()
+        else {
+            return Ok(None);
+        };
+        if nodes
+            .last()
+            .is_some_and(|(previous, _)| previous >= node_index)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "compiled segment nodes are not in Plan order",
+            ));
+        }
+        match &recipe.dynamic {
+            DynamicRecipe::PlanDependencies => (),
+            DynamicRecipe::GatedDelta(_) => has_bindings = true,
+            DynamicRecipe::Causal(recipe) if recipe.supports_program() => has_bindings = true,
+            DynamicRecipe::Causal(_) => return Ok(None),
+        }
+        nodes.push((*node_index, recipe.clone()));
+    }
+    Ok(has_bindings.then(|| {
+        Arc::new(CudaSegmentBindingProgram { nodes }) as Arc<dyn std::any::Any + Send + Sync>
+    }))
+}
+
+pub(crate) fn encode_program(
+    program: &(dyn std::any::Any + Send + Sync),
+    frame: &mut ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
+) -> Result<
+    (
+        Vec<EncodedSegmentBindingNode<CudaDeviceCommand>>,
+        crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
+        Arc<CudaSegmentOwnerTable>,
+    ),
+    CudaDeviceRuntimeError,
+> {
+    let program = program
+        .downcast_ref::<CudaSegmentBindingProgram>()
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "compiled CUDA binding program has another provider type",
+            )
+        })?;
+    if program.nodes.len() != frame.node_count() {
+        return Err(CudaDeviceRuntimeError::contract(
+            "compiled CUDA binding node count differs from its fresh frame",
+        ));
+    }
+    let mut owners = CudaSegmentOwnerBuilder::new(frame.owners().to_vec());
+    let mut sink = crate::backend::cuda::vnext_runtime::CudaBindingProgramSink::new();
+    let mut encoded = Vec::with_capacity(program.nodes.len());
+    for (ordinal, (node_index, recipe)) in program.nodes.iter().enumerate() {
+        let node = frame
+            .node(ordinal)
+            .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+        if node.node_index() != *node_index {
+            return Err(CudaDeviceRuntimeError::contract(
+                "compiled CUDA node order differs from its fresh frame",
+            ));
+        }
+        match &recipe.dynamic {
+            DynamicRecipe::PlanDependencies => Ok(()),
+            DynamicRecipe::GatedDelta(recipe) => super::attention::segment_bindings::write_program(
+                &node,
+                recipe,
+                &mut owners,
+                &mut sink,
+            ),
+            DynamicRecipe::Causal(recipe) => {
+                super::causal_attention::segment_bindings::write_program(
+                    &node,
+                    recipe,
+                    &mut owners,
+                    &mut sink,
+                )
+            }
+        }
+        .map_err(CudaDeviceRuntimeError::contract)?;
+        let mut commands = Vec::with_capacity(recipe.validations.len());
+        for (index, validation) in recipe.validations.iter().enumerate() {
+            let weight = shared_program_region(&node, recipe.dependency_region_start + index * 2)
+                .map_err(CudaDeviceRuntimeError::contract)?;
+            let flag = shared_program_region(&node, recipe.dependency_region_start + index * 2 + 1)
+                .map_err(CudaDeviceRuntimeError::contract)?;
+            validation.state.validate_segment_owners(&weight, &flag)?;
+            commands.push(validation.state.dynamic_command()?);
+        }
+        let mut bindings = EncodedReusableExecutionBindings::empty();
+        for (index, command) in commands.into_iter().enumerate() {
+            let authority = frame
+                .take_dependency(ordinal, index)
+                .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+            bindings = bindings.with_retained_plan_dependency(authority.encode(command));
+        }
+        encoded.push(EncodedSegmentBindingNode {
+            node_index: *node_index,
+            bindings,
+        });
+    }
+    Ok((encoded, sink, owners.finish()))
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn declaration(
@@ -349,4 +471,75 @@ fn encode_legacy(
         });
     }
     Ok(Some(encoded))
+}
+
+pub(in crate::backend::cuda::vnext_ops) fn shared_program_region(
+    node: &ferrum_interfaces::vnext::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
+    region: usize,
+) -> Result<CudaBufferRegion, String> {
+    let first_view = node.region(0, region).map_err(|e| e.to_string())?;
+    let mut first_physical = first_view.physical_regions();
+    if first_physical.len() != 1 {
+        return Err("segment shared region is not contiguous".into());
+    }
+    let first_physical = first_physical
+        .next()
+        .ok_or("segment shared region is absent")?;
+    let (buffer, range, retention) = first_physical.borrowed_buffer_and_physical_range();
+    let first = buffer
+        .borrowed_region(range, retention)
+        .map_err(|e| e.to_string())?;
+    for participant in 1..node.participant_count() {
+        let next_view = node
+            .region(participant, region)
+            .map_err(|e| e.to_string())?;
+        let mut next_physical = next_view.physical_regions();
+        if next_physical.len() != 1 {
+            return Err("segment shared region is not contiguous".into());
+        }
+        let next_physical = next_physical
+            .next()
+            .ok_or("segment shared region is absent")?;
+        let (buffer, range, retention) = next_physical.borrowed_buffer_and_physical_range();
+        let next = buffer
+            .borrowed_region(range, retention)
+            .map_err(|e| e.to_string())?;
+        // Shared physical storage need not have one opaque wrapper across
+        // participants. Preserve the ordinary path's predicate and select P0;
+        // the same-wave oracle compares that selected retention exactly.
+        if first.device_ptr() != next.device_ptr()
+            || first.length_bytes() != next.length_bytes()
+            || first.element_type() != next.element_type()
+        {
+            return Err(
+                "segment binding shared physical region differs across participants".into(),
+            );
+        }
+    }
+    Ok(first.to_owned())
+}
+
+pub(in crate::backend::cuda::vnext_ops) fn program_contiguous_region(
+    node: &ferrum_interfaces::vnext::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
+    participant: usize,
+    region: usize,
+    owners: &mut CudaSegmentOwnerBuilder<'_>,
+) -> Result<CudaSegmentRange, String> {
+    let view = node
+        .region(participant, region)
+        .map_err(|e| e.to_string())?;
+    let mut physicals = view.physical_regions();
+    if physicals.len() != 1 {
+        return Err("segment binding requires one contiguous physical region".into());
+    }
+    let physical = physicals
+        .next()
+        .ok_or("segment contiguous physical region is absent")?;
+    let index = physical
+        .owner_index()
+        .ok_or("indexed segment region has no owner index")?;
+    let (buffer, range, retention) = physical.borrowed_buffer_and_physical_range();
+    owners
+        .retain(index, buffer, range, retention)
+        .map_err(|e| e.to_string())
 }
