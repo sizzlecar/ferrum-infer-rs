@@ -123,6 +123,12 @@ pub enum ExecutionEventSinkEnablement {
 }
 
 pub trait ExecutionEventSink: Send + Sync {
+    /// Optional shared clock/collector for explicit coarse cycle diagnostics.
+    /// Ordinary sinks retain no recorder and require no additional clocks.
+    fn decode_cycle_trace(&self) -> Option<crate::DecodeCycleTrace> {
+        None
+    }
+
     /// Resolves stable event enablement once when an emitter is constructed.
     ///
     /// Dynamically filtered sinks keep the conservative `PerKind` default.

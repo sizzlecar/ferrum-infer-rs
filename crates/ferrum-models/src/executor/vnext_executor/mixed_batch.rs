@@ -52,6 +52,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prefills: &[PlanRuntimePrefillInput],
         decodes: &[PlanRuntimeDecodeInput],
     ) -> Result<PlanRuntimeMixedBatchOutcome> {
+        self.cycle_prepare_start(decodes.first().and_then(|input| input.decode_cycle_context));
         // Diagnostic checkpoint capture assigns separate phase counters and
         // teacher-forced ownership. Preserve its existing execution contract.
         if prefills.is_empty()
@@ -289,6 +290,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             candidates: &decode_candidates,
             armed: true,
         };
+        let mut cycle = self.cycle_call(|| {
+            canonical_indices
+                .iter()
+                .map(|index| match *index {
+                    MixedParticipantIndex::Prefill(index) => {
+                        let candidate = &prefill_candidates[index];
+                        cycle::caller(&candidate.sequence, candidate.original_index, None)
+                    }
+                    MixedParticipantIndex::Decode(index) => {
+                        let candidate = &decode_candidates[index];
+                        cycle::caller(
+                            &candidate.sequence,
+                            candidate.original_index,
+                            decodes[candidate.original_index].decode_cycle_context,
+                        )
+                    }
+                })
+                .collect()
+        });
         let sampling_outputs = match self
             .execute_batch_step(
                 &batch,
@@ -297,6 +317,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &spans,
                 VNextExecutionWaveKind::Mixed,
                 &output_roles,
+                cycle.as_mut(),
             )
             .await?
         {
@@ -348,7 +369,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         let mut ordered_prefills = (0..prefills.len()).map(|_| None).collect::<Vec<_>>();
         let mut ordered_decodes = (0..decodes.len()).map(|_| None).collect::<Vec<_>>();
-        for ((index, output), span) in canonical_indices.iter().zip(sampling_outputs).zip(&spans) {
+        for (canonical, ((index, output), span)) in canonical_indices
+            .iter()
+            .zip(sampling_outputs)
+            .zip(&spans)
+            .enumerate()
+        {
             match *index {
                 MixedParticipantIndex::Prefill(index) => {
                     let candidate = &prefill_candidates[index];
@@ -381,10 +407,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let end = usize::try_from(span.immediate_token_range().end).map_err(|_| {
                         FerrumError::backend("mixed decode frontier exceeds host address space")
                     })?;
-                    ordered_decodes[candidate.original_index] = Some(PlanRuntimeDecodeOutput::new(
+                    let mut output = PlanRuntimeDecodeOutput::new(
                         output,
                         self.cache_handle(&candidate.sequence, end),
-                    ));
+                    );
+                    if let Some(witness) = cycle
+                        .as_ref()
+                        .and_then(|cycle| cycle.participant(canonical))
+                    {
+                        output = output.with_decode_cycle_witness(witness);
+                    }
+                    ordered_decodes[candidate.original_index] = Some(output);
                 }
             }
         }
@@ -451,6 +484,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         );
         // Shared wave timing is reported under "mixed", never added to both
         // phase timers as if it were two disjoint device intervals.
+        if let Some(cycle) = &cycle {
+            cycle.mark(DecodeCycleStage::ProductReturn);
+        }
         Ok(PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes })
     }
 }

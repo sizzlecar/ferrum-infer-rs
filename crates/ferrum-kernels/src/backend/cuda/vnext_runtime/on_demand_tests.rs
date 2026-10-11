@@ -144,7 +144,7 @@ impl CaptureHarness {
         );
         if self
             .cache
-            .launch(&self.stream, &candidates[0], DeviceTimingMode::Off)
+            .launch(&self.stream, &candidates[0], DeviceTimingMode::Off, None)
             .unwrap()
             .is_none()
         {
@@ -342,7 +342,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             .unwrap();
     assert!(h
         .cache
-        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false)
+        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false, None)
         .unwrap()
         .is_some());
     h.stream.synchronize().unwrap();
@@ -399,7 +399,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
     assert!(recipe_owner.same_entry(&h.cache.recipe_program_owner(&id).unwrap()));
     assert!(h
         .cache
-        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false)
+        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false, None)
         .unwrap()
         .is_some());
     h.stream.synchronize().unwrap();
@@ -412,7 +412,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
     assert!(!h.cache.contains_program_segment(&invocation).unwrap());
     assert!(h
         .cache
-        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false)
+        .launch_program_segment(&h.stream, &invocation, DeviceTimingMode::Off, false, None)
         .unwrap()
         .is_none());
     assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![5]);

@@ -1624,9 +1624,13 @@ impl EngineInner {
 
     /// Run one iteration: ask the scheduler for a batch, then process it.
     pub(super) async fn run_iteration(&self) -> Result<EngineIterationOutcome> {
+        let cycle_iteration = self.iteration_count.load(Ordering::Relaxed);
+        self.decode_cycle_iteration_mark(cycle_iteration, DecodeCycleStage::IterationLockStart);
         let lock_wait_start = Instant::now();
         let iteration_guard = self.iteration_lock.lock().await;
+        self.decode_cycle_iteration_mark(cycle_iteration, DecodeCycleStage::IterationLockEnd);
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
+        self.decode_cycle_iteration_mark(cycle_iteration, DecodeCycleStage::AdmissionStart);
         self.cancel_abandoned_requests().await?;
         self.complete_execution_readiness_failures().await?;
         self.prepare_prefix_rendezvous()?;
@@ -1674,6 +1678,7 @@ impl EngineInner {
         let plan_runtime_managed = self.model_executor.execution_resource_authority()
             == ExecutionResourceAuthority::PlanRuntime;
         if plan_runtime_managed && self.prepare_plan_runtime_prefill_cohort(&hint).await? {
+            self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::AdmissionEnd);
             return Ok(EngineIterationOutcome::Progressed);
         }
         let mut prefill_maintenance = Vec::new();
@@ -1702,11 +1707,14 @@ impl EngineInner {
                     &availability,
                 );
                 let mut observations = Vec::new();
+                self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::AdmissionEnd);
+                self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::ScheduleStart);
                 let scheduled = self.scheduler.next_batch_with_prepared_admission_observed(
                     hint,
                     wake,
                     &mut |observation| observations.push(observation),
                 );
+                self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::ScheduleEnd);
                 drop(availability);
                 for observation in observations {
                     self.trace_executor_admission_queue_observation(observation);
@@ -1755,6 +1763,8 @@ impl EngineInner {
                 }
                 result.outcome
             };
+            self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::AdmissionEnd);
+            self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::ScheduleStart);
             let scheduled = if let Some(records) = &scheduler_trace_records {
                 self.scheduler.next_batch_with_dynamic_admission_observed(
                     hint,
@@ -1770,6 +1780,7 @@ impl EngineInner {
                 self.scheduler
                     .next_batch_with_dynamic_admission(hint, wake, &mut probe)
             };
+            self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::ScheduleEnd);
             drop(availability);
             drop(probe);
             if let Some(records) = scheduler_trace_records {
@@ -1793,7 +1804,11 @@ impl EngineInner {
             }
             scheduled?
         } else {
-            self.scheduler.next_batch(hint).await
+            self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::AdmissionEnd);
+            self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::ScheduleStart);
+            let scheduled = self.scheduler.next_batch(hint).await;
+            self.decode_cycle_iteration_mark(iteration, DecodeCycleStage::ScheduleEnd);
+            scheduled
         };
         self.complete_typed_admission_failures().await?;
         let sched_elapsed = sched_t0.elapsed();

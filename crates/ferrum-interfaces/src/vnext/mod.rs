@@ -21,6 +21,7 @@ mod standard_operations;
 mod static_initialization;
 mod weight_source;
 
+pub use crate::decode_cycle::*;
 pub use admission::*;
 pub use completion::*;
 pub use device::*;

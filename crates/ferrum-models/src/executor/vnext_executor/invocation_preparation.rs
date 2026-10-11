@@ -117,16 +117,6 @@ impl PreparationMetrics {
     }
 }
 
-/// Off avoids timing calls while retaining independent preparation accounting.
-pub(super) struct DisabledTiming;
-impl DeviceSubmissionTimingSink for DisabledTiming {
-    const ENABLED: bool = false;
-    fn record_device_submission(&self, _stage: DeviceSubmissionStage, _elapsed: Duration) {}
-}
-impl SubmissionWaveDispatchTimingSink for DisabledTiming {
-    fn record(&self, _stage: SubmissionWaveDispatchStage, _elapsed: Duration) {}
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

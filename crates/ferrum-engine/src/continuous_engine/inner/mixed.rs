@@ -1,5 +1,6 @@
 use super::*;
 use ferrum_interfaces::model_executor::PlanRuntimeMixedBatchOutcome;
+use ferrum_interfaces::{DecodeCycleOutcome, DecodeCycleStage};
 
 pub(in crate::continuous_engine) enum MixedBatchDisposition {
     Completed,
@@ -34,7 +35,7 @@ impl EngineInner {
                 prefills.push(input);
             }
         }
-        let decodes = self.prepare_plan_runtime_decodes(decode_ids);
+        let mut decodes = self.prepare_plan_runtime_decodes(decode_ids);
         let prefill_ids = prefills
             .iter()
             .map(|input| input.request_id.clone())
@@ -58,11 +59,26 @@ impl EngineInner {
             .profile_detail
             .captures_engine_token_timing()
             .then(Instant::now);
-        let (prefill_outputs, decode_outputs) = match self
+        // Decode contexts use the original decode API order; prefill rows belong
+        // to a separate domain and do not shift these diagnostic ordinals.
+        let cycle_call = self.decode_cycle_call_contexts(&mut decodes);
+        self.decode_cycle_call_mark(cycle_call, DecodeCycleStage::CallStarted, None);
+        let outcome = self
             .model_executor
             .plan_runtime_mixed_batch_with_capacity(&prefills, &decodes)
-            .await?
-        {
+            .await;
+        let cycle_outcome = match &outcome {
+            Ok(PlanRuntimeMixedBatchOutcome::Completed { .. }) => DecodeCycleOutcome::Success,
+            Ok(PlanRuntimeMixedBatchOutcome::Unsupported)
+            | Ok(PlanRuntimeMixedBatchOutcome::NotSubmitted(_)) => DecodeCycleOutcome::Unavailable,
+            Err(_) => DecodeCycleOutcome::Failed,
+        };
+        self.decode_cycle_call_mark(
+            cycle_call,
+            DecodeCycleStage::CallReturned,
+            Some(cycle_outcome),
+        );
+        let (prefill_outputs, decode_outputs) = match outcome? {
             PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes } => (prefills, decodes),
             PlanRuntimeMixedBatchOutcome::Unsupported => {
                 return Ok(MixedBatchDisposition::Split {

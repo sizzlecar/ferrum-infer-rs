@@ -1829,6 +1829,13 @@ impl DeviceReusableExecutionTrim {
 pub trait DeviceSubmissionTimingSink: Send + Sync {
     const ENABLED: bool;
 
+    /// Coarse launch observation is independent of detailed duration timing.
+    /// A backend may observe an actual graph API with `ENABLED = false` while
+    /// preserving the production timing mode and reusable-execution policy.
+    fn decode_cycle_context(&self) -> Option<&crate::DecodeCycleWaveContext> {
+        None
+    }
+
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration);
 
     fn record_reusable_execution(&self, _observation: DeviceReusableExecutionObservation) {}

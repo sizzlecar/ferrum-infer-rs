@@ -292,11 +292,32 @@ impl EngineInner {
         self.send_stream_text(request_id, Some(token), None).await;
     }
 
+    pub(super) async fn send_stream_update_with_cycle(
+        &self,
+        request_id: &RequestId,
+        token: TokenId,
+        witness: Option<&DecodeCycleParticipantWitness>,
+    ) {
+        self.send_stream_text_with_cycle(request_id, Some(token), None, witness)
+            .await;
+    }
+
     async fn send_stream_text(
         &self,
         request_id: &RequestId,
         token: Option<TokenId>,
         terminal: Option<FinishReason>,
+    ) {
+        self.send_stream_text_with_cycle(request_id, token, terminal, None)
+            .await;
+    }
+
+    async fn send_stream_text_with_cycle(
+        &self,
+        request_id: &RequestId,
+        token: Option<TokenId>,
+        terminal: Option<FinishReason>,
+        witness: Option<&DecodeCycleParticipantWitness>,
     ) {
         // Decode the full generated-token history (skip_special=true matches
         // the final-response decode in `complete_request`) and emit only
@@ -314,12 +335,25 @@ impl EngineInner {
         // past `streamed_text_len` and bump the watermark. Possible stop
         // prefixes are held until they match, diverge, or generation ends.
         let (sender, delta, ttft_s, itl_s, first_emit_prof) = {
+            self.decode_cycle_participant_mark(witness, DecodeCycleStage::TextLockStart, None);
             let mut sequences = self.sequences.write();
+            self.decode_cycle_participant_mark(witness, DecodeCycleStage::TextLockEnd, None);
             let Some(seq) = sequences.get_mut(request_id) else {
                 return;
             };
             let sender = seq.stream_sender.clone();
-            let Ok(mut full) = self.tokenizer.decode(&seq.generated_tokens, true) else {
+            self.decode_cycle_participant_mark(witness, DecodeCycleStage::TextDecodeStart, None);
+            let decoded = self.tokenizer.decode(&seq.generated_tokens, true);
+            self.decode_cycle_participant_mark(
+                witness,
+                DecodeCycleStage::TextDecodeEnd,
+                Some(if decoded.is_ok() {
+                    DecodeCycleOutcome::Success
+                } else {
+                    DecodeCycleOutcome::Failed
+                }),
+            );
+            let Ok(mut full) = decoded else {
                 return;
             };
             let incomplete_utf8 = full.ends_with('\u{FFFD}');
@@ -430,13 +464,34 @@ impl EngineInner {
                 api_response: None,
                 execution_evidence: None,
             };
-            if tx.send(Ok(chunk)).await.is_ok() {
+            self.decode_cycle_participant_mark(witness, DecodeCycleStage::StreamSendStart, None);
+            let sent = tx.send(Ok(chunk)).await;
+            self.decode_cycle_participant_mark(
+                witness,
+                DecodeCycleStage::StreamSendEnd,
+                Some(if sent.is_ok() {
+                    DecodeCycleOutcome::Success
+                } else {
+                    DecodeCycleOutcome::Canceled
+                }),
+            );
+            if sent.is_ok() {
                 // A bounded channel send often completes immediately, so a
                 // hot decode loop can keep running without giving the CLI /
                 // HTTP stream receiver a chance to flush visible output. Yield
                 // after successful streaming sends to preserve token-level UX;
                 // non-streaming requests do not enter this branch.
+                self.decode_cycle_participant_mark(
+                    witness,
+                    DecodeCycleStage::StreamYieldStart,
+                    None,
+                );
                 tokio::task::yield_now().await;
+                self.decode_cycle_participant_mark(
+                    witness,
+                    DecodeCycleStage::StreamYieldResumed,
+                    None,
+                );
             }
         }
     }

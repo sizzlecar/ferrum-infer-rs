@@ -43,6 +43,7 @@ use ferrum_interfaces::vnext::{
     DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
+use ferrum_interfaces::DecodeCycleStage;
 use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
@@ -4876,6 +4877,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             ));
         }
         let timing_mode = commands.timing_mode();
+        let cycle = timing_sink.decode_cycle_context();
         let compute_path_requirement = commands.compute_path_requirement();
         let declared_eager_compute_node_indices = commands
             .declared_eager_compute_node_indices()
@@ -5206,6 +5208,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
         let enqueue_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
+        if let Some(cycle) = cycle {
+            cycle.mark(DecodeCycleStage::CommandEnqueueStart);
+        }
         let mut command_spans =
             physical_span_attribution.then(|| Vec::with_capacity(commands.len()));
         let mut replayed_segments = logical_attribution.then(Vec::new);
@@ -5227,6 +5232,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     invocation,
                     timing_mode,
                     logical_attribution,
+                    cycle,
                 );
                 let end = command_spans.as_ref().and_then(|_| {
                     stream
@@ -5338,10 +5344,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             ))
                             .ok()
                     });
-                    let launched =
-                        stream
-                            .executable_cache
-                            .launch(&stream.stream, candidate, timing_mode);
+                    let launched = stream.executable_cache.launch(
+                        &stream.stream,
+                        candidate,
+                        timing_mode,
+                        cycle,
+                    );
                     let end = command_spans.as_ref().and_then(|_| {
                         stream
                             .stream
@@ -5362,10 +5370,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     }
                 }
                 Some(candidate) if !physical_span_attribution => {
-                    match stream
-                        .executable_cache
-                        .launch(&stream.stream, candidate, timing_mode)
-                    {
+                    match stream.executable_cache.launch(
+                        &stream.stream,
+                        candidate,
+                        timing_mode,
+                        cycle,
+                    ) {
                         Ok(Some(_)) => Some(Ok((candidate.end(), None, None, None))),
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
@@ -5483,6 +5493,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             panic!(
                 "CUDA submission became indeterminate while snapshotting numerical status: {error}"
             );
+        }
+        if let Some(cycle) = cycle {
+            cycle.mark(DecodeCycleStage::CommandEnqueueEnd);
         }
         drop(enqueue_stage);
         if S::ENABLED {

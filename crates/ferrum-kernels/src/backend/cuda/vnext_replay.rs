@@ -26,6 +26,7 @@ use ferrum_interfaces::vnext::{
     DeviceReusableExecutionProgramId, DeviceReusableExecutionSegment, DeviceSubmissionTimingSink,
     DeviceTimingMode, ElementType,
 };
+use ferrum_interfaces::{DecodeCycleOutcome, DecodeCycleStage, DecodeCycleWaveContext};
 use sha2::{Digest, Sha256};
 
 use crate::backend::reusable_execution::{
@@ -778,6 +779,7 @@ impl CudaExecutableSegment {
         stream: &CudaStream,
         last_used: u64,
         timing_mode: DeviceTimingMode,
+        cycle: Option<&DecodeCycleWaveContext>,
     ) -> Result<(Option<Arc<str>>, Option<Arc<[u32]>>), CudaReplayError> {
         if !self.uploaded {
             return Err(CudaReplayError {
@@ -792,6 +794,10 @@ impl CudaExecutableSegment {
         });
         // Replay retains the executable identity for physical spans; only full
         // kernel attribution may load and enter external tool correlation.
+        let graph_cycle = cycle.filter(|cycle| cycle.claim_first_graph_launch());
+        if let Some(cycle) = graph_cycle {
+            cycle.mark(DecodeCycleStage::ComputeGraphLaunchStart);
+        }
         let status = if timing_mode.kernel_attribution_enabled() {
             let identity = profile_identity
                 .expect("CUDA kernel attribution retains a replay profile identity");
@@ -801,6 +807,16 @@ impl CudaExecutableSegment {
         } else {
             unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) }
         };
+        if let Some(cycle) = graph_cycle {
+            cycle.mark_with_outcome(
+                DecodeCycleStage::ComputeGraphLaunchEnd,
+                if status == sys::CUresult::CUDA_SUCCESS {
+                    DecodeCycleOutcome::Success
+                } else {
+                    DecodeCycleOutcome::Failed
+                },
+            );
+        }
         if status != sys::CUresult::CUDA_SUCCESS {
             return Err(CudaReplayError::cuda(
                 "launch reusable executable",
@@ -1742,6 +1758,7 @@ impl CudaExecutableCache {
         invocation: &DeviceReusableExecutionInvocation,
         timing_mode: DeviceTimingMode,
         retain_logical_attribution: bool,
+        cycle: Option<&DecodeCycleWaveContext>,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let Some(program) = self.programs.get(invocation.program_id()) else {
             return Ok(None);
@@ -1785,7 +1802,7 @@ impl CudaExecutableCache {
             });
         };
         let (profile_fingerprint, reusable_graph_node_counts) =
-            entry.launch(stream, now, timing_mode)?;
+            entry.launch(stream, now, timing_mode, cycle)?;
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint: profile_fingerprint.or(sealed_fingerprint),
             reusable_graph_node_counts,
@@ -1843,13 +1860,14 @@ impl CudaExecutableCache {
         stream: &CudaStream,
         candidate: &CudaExecutableCandidate,
         timing_mode: DeviceTimingMode,
+        cycle: Option<&DecodeCycleWaveContext>,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let now = self.tick();
         let Some(entry) = self.entries.get_mut(&candidate.key) else {
             return Ok(None);
         };
         let (reusable_executable_fingerprint, reusable_graph_node_counts) =
-            entry.launch(stream, now, timing_mode)?;
+            entry.launch(stream, now, timing_mode, cycle)?;
         Ok(Some(CudaExecutableLaunch {
             reusable_executable_fingerprint,
             reusable_graph_node_counts,

@@ -752,6 +752,8 @@ pub struct PlanRuntimeDecodeInput {
     pub input_token: TokenId,
     pub kv_cache: Arc<dyn KvCacheHandle>,
     pub logits_policy: LogitsReturnPolicy,
+    /// Read-only correlation for explicit coarse cycle profiling.
+    pub decode_cycle_context: Option<crate::DecodeCycleCallContext>,
 }
 
 impl PlanRuntimeDecodeInput {
@@ -765,11 +767,17 @@ impl PlanRuntimeDecodeInput {
             input_token,
             kv_cache,
             logits_policy: LogitsReturnPolicy::FullLogits,
+            decode_cycle_context: None,
         }
     }
 
     pub fn with_logits_policy(mut self, logits_policy: LogitsReturnPolicy) -> Self {
         self.logits_policy = logits_policy;
+        self
+    }
+
+    pub fn with_decode_cycle_context(mut self, context: crate::DecodeCycleCallContext) -> Self {
+        self.decode_cycle_context = Some(context);
         self
     }
 }
@@ -862,6 +870,8 @@ impl DecodeOutput {
 pub struct PlanRuntimeDecodeOutput {
     pub sampling_output: ExecutorSamplingOutput,
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Primitive diagnostic data; never retains executor resource ownership.
+    pub decode_cycle_witness: Option<crate::DecodeCycleParticipantWitness>,
 }
 
 impl PlanRuntimeDecodeOutput {
@@ -869,7 +879,16 @@ impl PlanRuntimeDecodeOutput {
         Self {
             sampling_output,
             kv_cache,
+            decode_cycle_witness: None,
         }
+    }
+
+    pub fn with_decode_cycle_witness(
+        mut self,
+        witness: crate::DecodeCycleParticipantWitness,
+    ) -> Self {
+        self.decode_cycle_witness = Some(witness);
+        self
     }
 }
 

@@ -24,6 +24,8 @@ pub enum ProfileDetailArg {
     Basic,
     Resource,
     Latency,
+    /// Coarse shared-clock host-cycle diagnostics; requires --scheduler-trace-jsonl.
+    Cycle,
     Kernel,
     Debug,
     Replay,
@@ -38,6 +40,7 @@ impl ProfileDetailArg {
             Self::Basic => "basic",
             Self::Resource => "resource",
             Self::Latency => "latency",
+            Self::Cycle => "cycle",
             Self::Kernel => "kernel",
             Self::Debug => "debug",
             Self::Replay => "replay",
@@ -54,6 +57,7 @@ impl From<ProfileDetailArg> for ObservabilityProfileDetail {
             ProfileDetailArg::Basic => Self::Basic,
             ProfileDetailArg::Resource => Self::Resource,
             ProfileDetailArg::Latency => Self::Latency,
+            ProfileDetailArg::Cycle => Self::Cycle,
             ProfileDetailArg::Kernel => Self::Kernel,
             ProfileDetailArg::Debug => Self::Debug,
             ProfileDetailArg::Replay => Self::Replay,
@@ -1950,6 +1954,45 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_profile_argument_maps_to_the_shared_typed_product_configuration() {
+        let argument = ProfileDetailArg::from_str("cycle", false)
+            .expect("clap accepts the declared cycle option");
+        assert_eq!(argument, ProfileDetailArg::Cycle);
+        assert_eq!(argument.as_str(), "cycle");
+        let detail = ObservabilityProfileDetail::from(argument);
+        assert_eq!(detail, ObservabilityProfileDetail::Cycle);
+        assert!(detail.diagnostic_only());
+        assert!(!detail.captures_engine_token_timing());
+        let trace_path = PathBuf::from("cycle-trace.jsonl");
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            let missing = ProductObservabilityConfig::new(
+                entrypoint,
+                "model",
+                None,
+                argument,
+                None,
+                None,
+                None,
+                default_profile_sample_rate(),
+            );
+            assert!(missing.validate().is_err());
+            let configured = ProductObservabilityConfig::new(
+                entrypoint,
+                "model",
+                None,
+                argument,
+                None,
+                Some(&trace_path),
+                None,
+                default_profile_sample_rate(),
+            );
+            assert!(configured.validate().is_ok());
+            assert_eq!(configured.profile_detail, ObservabilityProfileDetail::Cycle);
+            assert_eq!(configured.scheduler_trace_jsonl.as_ref(), Some(&trace_path));
+        }
+    }
 
     #[test]
     fn basic_metrics_only_product_writers_skip_artifacts_and_keep_validation() {

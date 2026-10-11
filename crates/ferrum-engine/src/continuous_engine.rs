@@ -39,8 +39,9 @@ use ferrum_interfaces::{
         ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
         OperationCompletionReceipt,
     },
-    KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
-    Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
+    DecodeCycleOutcome, DecodeCycleParticipantWitness, DecodeCycleStage, KvCacheHandle,
+    KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager, Sampler,
+    SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
@@ -1431,6 +1432,7 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
+    cycle_diagnostic: Option<cycle::CycleDiagnostic>,
     profile_trace_jsonl: Option<SchedulerTraceJournal>,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
@@ -2620,6 +2622,8 @@ fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
 mod profile;
 use profile::*;
 
+mod cycle;
+
 mod inner;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2784,9 +2788,27 @@ impl ContinuousBatchEngine {
             recurrent_state_manager
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
+        let cycle_diagnostic = if config.runtime.profile_detail == ObservabilityProfileDetail::Cycle
+        {
+            if executor_authority != ExecutionResourceAuthority::PlanRuntime
+                || draft_executor.is_some()
+            {
+                return Err(FerrumError::config("cycle profile requires the PlanRuntime batch executor without speculative decoding"));
+            }
+            let path = runtime_config
+                .scheduler_trace_jsonl
+                .as_deref()
+                .ok_or_else(|| {
+                    FerrumError::config("cycle profile requires scheduler_trace_jsonl")
+                })?;
+            Some(cycle::CycleDiagnostic::new(path)?)
+        } else {
+            None
+        };
         let profile_trace_jsonl = runtime_config
             .profile_jsonl
             .as_ref()
+            .filter(|_| cycle_diagnostic.is_none())
             .map(|path| {
                 SchedulerTraceJournal::create(path.clone()).map_err(|error| {
                     FerrumError::io(format!(
@@ -2796,7 +2818,11 @@ impl ContinuousBatchEngine {
                 })
             })
             .transpose()?;
-        let scheduler_trace_jsonl = match runtime_config.scheduler_trace_jsonl.as_deref() {
+        let scheduler_trace_jsonl = match runtime_config
+            .scheduler_trace_jsonl
+            .as_deref()
+            .filter(|_| cycle_diagnostic.is_none())
+        {
             Some(path)
                 if profile_trace_jsonl
                     .as_ref()
@@ -2807,7 +2833,10 @@ impl ContinuousBatchEngine {
             path => create_scheduler_trace_sink(path),
         };
         let legacy_scheduler_trace_jsonl = create_legacy_scheduler_trace_sink(
-            runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
+            runtime_config
+                .legacy_scheduler_trace_jsonl
+                .as_deref()
+                .filter(|_| cycle_diagnostic.is_none()),
         );
         let mut execution_profile_journals = Vec::with_capacity(2);
         if let Some(journal) = profile_trace_jsonl.as_ref() {
@@ -2822,7 +2851,9 @@ impl ContinuousBatchEngine {
             }
         }
         let execution_sink: Option<Arc<dyn ExecutionEventSink>> =
-            if !execution_profile_journals.is_empty() {
+            if let Some(cycle) = cycle_diagnostic.as_ref() {
+                Some(cycle.sink())
+            } else if !execution_profile_journals.is_empty() {
                 Some(Arc::new(VNextProfileExecutionEventSink::with_journals(
                     execution_profile_journals,
                     runtime_config
@@ -2862,6 +2893,7 @@ impl ContinuousBatchEngine {
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
+                cycle_diagnostic,
                 profile_trace_jsonl,
                 scheduler_trace_jsonl,
                 legacy_scheduler_trace_jsonl,
@@ -2941,6 +2973,8 @@ impl ContinuousBatchEngine {
                 } else {
                     None
                 };
+                let iteration = inner.iteration_count.load(Ordering::Relaxed);
+                inner.decode_cycle_iteration_mark(iteration, DecodeCycleStage::LoopResumed);
                 let outcome = match inner.run_iteration().await {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -2948,6 +2982,7 @@ impl ContinuousBatchEngine {
                         EngineIterationOutcome::Progressed
                     }
                 };
+                inner.decode_cycle_iteration_mark(iteration, DecodeCycleStage::IterationEnd);
                 if prof {
                     let n = GAP_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n.is_multiple_of(8) {
@@ -2961,7 +2996,17 @@ impl ContinuousBatchEngine {
                     break;
                 }
                 match outcome {
-                    EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
+                    EngineIterationOutcome::Progressed => {
+                        inner.decode_cycle_iteration_mark(
+                            iteration,
+                            DecodeCycleStage::LoopYieldStart,
+                        );
+                        tokio::task::yield_now().await;
+                        inner.decode_cycle_iteration_mark(
+                            iteration,
+                            DecodeCycleStage::LoopYieldResumed,
+                        );
+                    }
                     EngineIterationOutcome::Idle => {
                         tokio::select! {
                             _ = inner.wait_for_prefix_deadline() => {}
@@ -3316,6 +3361,8 @@ impl InferenceEngine for ContinuousBatchEngine {
         let prefix_restores = std::mem::take(&mut *self.inner.prefix_restore_pending.lock());
         drop(prefix_restores);
 
+        let cycle_result = self.inner.close_decode_cycle_capture().await;
+
         let mut trace_journals = Vec::with_capacity(2);
         if let Some(journal) = self.inner.profile_trace_jsonl.clone() {
             trace_journals.push(journal);
@@ -3348,6 +3395,7 @@ impl InferenceEngine for ContinuousBatchEngine {
 
         loop_result?;
         readiness_result?;
+        cycle_result?;
         trace_result
     }
 

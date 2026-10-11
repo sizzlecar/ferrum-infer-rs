@@ -12,6 +12,7 @@
 #[cfg(test)]
 extern crate self as ferrum_interfaces;
 
+pub mod decode_cycle;
 pub mod engine;
 pub mod kv_cache;
 pub mod kv_dtype;
@@ -29,6 +30,14 @@ pub mod tokenizer;
 pub mod vnext;
 
 // Re-export core traits and important types
+pub use decode_cycle::{
+    DecodeCycleCallContext, DecodeCycleCaller, DecodeCycleCapture, DecodeCycleClock,
+    DecodeCycleClockId, DecodeCycleDrainOwner, DecodeCycleEvent, DecodeCycleOutcome,
+    DecodeCycleParticipantOwner, DecodeCycleParticipantWitness, DecodeCycleProducerGuard,
+    DecodeCycleRecordStatus, DecodeCycleScope, DecodeCycleStage, DecodeCycleStats,
+    DecodeCycleSubmissionWitness, DecodeCycleTimestamp, DecodeCycleTrace, DecodeCycleTraceError,
+    DecodeCycleWaveContext, DecodeCycleWaveKind, DecodeCycleWaveWitness, DecodeCycleWorkerTiming,
+};
 pub use engine::InferenceEngine;
 pub use kv_cache::{
     AllocationRequest, BlockTable, CacheHandleStats, KvCacheHandle, KvCacheManager,

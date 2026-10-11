@@ -102,7 +102,7 @@ impl EngineInner {
         &self,
         request_ids: &[RequestId],
     ) -> Result<PlanRuntimeDecodeBatchOutcome> {
-        let inputs = self.prepare_plan_runtime_decodes(request_ids);
+        let mut inputs = self.prepare_plan_runtime_decodes(request_ids);
         if inputs.is_empty() {
             return Ok(PlanRuntimeDecodeBatchOutcome::Completed { submitted_width: 0 });
         }
@@ -112,11 +112,23 @@ impl EngineInner {
             .map(|input| input.request_id.clone())
             .collect::<Vec<_>>();
         let decode_execution_started_at = self.close_plan_runtime_decode_scheduling(&rids);
-        let (outputs, postprocess_started_at) = match self
+        let cycle_call = self.decode_cycle_call_contexts(&mut inputs);
+        self.decode_cycle_call_mark(cycle_call, DecodeCycleStage::CallStarted, None);
+        let decode_outcome = self
             .model_executor
             .plan_runtime_batch_decode_with_capacity(&inputs)
-            .await
-        {
+            .await;
+        let cycle_outcome = match &decode_outcome {
+            Ok(PlanRuntimeBatchDecodeOutcome::Completed(_)) => DecodeCycleOutcome::Success,
+            Ok(PlanRuntimeBatchDecodeOutcome::Deferred(_)) => DecodeCycleOutcome::Unavailable,
+            Err(_) => DecodeCycleOutcome::Failed,
+        };
+        self.decode_cycle_call_mark(
+            cycle_call,
+            DecodeCycleStage::CallReturned,
+            Some(cycle_outcome),
+        );
+        let (outputs, postprocess_started_at) = match decode_outcome {
             Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {
                 let completed_at = decode_execution_started_at.map(|_| Instant::now());
                 if let (Some(started_at), Some(ended_at)) =
@@ -176,36 +188,76 @@ impl EngineInner {
         postprocess_started_at: Option<Instant>,
     ) -> Result<()> {
         for (rid, output) in rids.iter().zip(outputs) {
+            let cycle_witness = output.decode_cycle_witness.as_ref();
+            self.decode_cycle_participant_mark(
+                cycle_witness,
+                DecodeCycleStage::RequestLockStart,
+                None,
+            );
             let next_token_result = {
                 let mut sequences = self.sequences.write();
+                self.decode_cycle_participant_mark(
+                    cycle_witness,
+                    DecodeCycleStage::RequestLockEnd,
+                    None,
+                );
                 sequences.get_mut(rid).map(|sequence| {
-                    let token = match output.sampling_output {
-                        ExecutorSamplingOutput::GreedyToken(token) => {
-                            sequence.validate_and_commit_model_greedy_argmax_token(
+                    self.decode_cycle_participant_mark(
+                        cycle_witness,
+                        DecodeCycleStage::SampleStart,
+                        None,
+                    );
+                    let sampled = match output.sampling_output {
+                        ExecutorSamplingOutput::GreedyToken(token) => sequence
+                            .validate_and_commit_model_greedy_argmax_token(
                                 Some(self.tokenizer.as_ref()),
                                 token,
-                            )?;
-                            token
-                        }
+                            )
+                            .map(|()| token),
                         ExecutorSamplingOutput::FullLogits(mut logits) => sequence
                             .sample_and_commit_with_processors_and_tokenizer(
                                 &mut logits,
                                 Some(self.tokenizer.as_ref()),
-                            )?,
+                            ),
                     };
+                    self.decode_cycle_participant_mark(
+                        cycle_witness,
+                        DecodeCycleStage::SampleEnd,
+                        Some(if sampled.is_ok() {
+                            DecodeCycleOutcome::Success
+                        } else {
+                            DecodeCycleOutcome::Failed
+                        }),
+                    );
+                    let token = sampled?;
                     sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
                     sequence.record_generated_token_commit_with_decode_postprocess(
                         postprocess_started_at,
+                    );
+                    self.decode_cycle_participant_mark(
+                        cycle_witness,
+                        DecodeCycleStage::TokenCommit,
+                        None,
                     );
                     Ok::<TokenId, FerrumError>(token)
                 })
             };
             let Some(next_token_result) = next_token_result else {
+                self.decode_cycle_participant_mark(
+                    cycle_witness,
+                    DecodeCycleStage::FailureObserved,
+                    Some(DecodeCycleOutcome::Canceled),
+                );
                 continue;
             };
             let next_token = match next_token_result {
                 Ok(token) => token,
                 Err(error) => {
+                    self.decode_cycle_participant_mark(
+                        cycle_witness,
+                        DecodeCycleStage::FailureObserved,
+                        Some(DecodeCycleOutcome::Failed),
+                    );
                     warn!("PlanRuntime batch decode post-process failed for {rid}: {error}");
                     self.complete_request_with_error(rid, error).await?;
                     continue;
@@ -222,12 +274,45 @@ impl EngineInner {
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 
+            self.decode_cycle_participant_mark(
+                cycle_witness,
+                DecodeCycleStage::StopCheckStart,
+                None,
+            );
             let stop_reason = self.stop_reason_for_request(rid);
-            if self.should_stream_generated_token(rid, next_token, stop_reason) {
-                self.send_stream_update(rid, next_token).await;
+            let should_stream = self.should_stream_generated_token(rid, next_token, stop_reason);
+            self.decode_cycle_participant_mark(cycle_witness, DecodeCycleStage::StopCheckEnd, None);
+            if should_stream {
+                self.decode_cycle_participant_mark(
+                    cycle_witness,
+                    DecodeCycleStage::StreamUpdateStart,
+                    None,
+                );
+                self.send_stream_update_with_cycle(rid, next_token, cycle_witness)
+                    .await;
+                self.decode_cycle_participant_mark(
+                    cycle_witness,
+                    DecodeCycleStage::StreamUpdateEnd,
+                    None,
+                );
             }
             if let Some(reason) = stop_reason {
-                self.complete_request(rid, reason).await?;
+                self.decode_cycle_participant_mark(
+                    cycle_witness,
+                    DecodeCycleStage::RequestCompleteStart,
+                    None,
+                );
+                let completion = self.complete_request(rid, reason).await;
+                self.decode_cycle_participant_mark(
+                    cycle_witness,
+                    DecodeCycleStage::RequestCompleteEnd,
+                    Some(if completion.is_ok() {
+                        DecodeCycleOutcome::Success
+                    } else {
+                        DecodeCycleOutcome::Failed
+                    }),
+                );
+                completion?;
             }
         }
         Ok(())

@@ -35,7 +35,9 @@ use ferrum_interfaces::model_executor::{
     PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
 };
 use ferrum_interfaces::vnext::*;
-use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
+use ferrum_interfaces::{
+    DecodeCycleStage, DecodeCycleTrace, KvCacheHandle, ModelExecutor, TensorRef,
+};
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
     InvocationPreparationStrategy, ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint,
@@ -62,6 +64,7 @@ use super::{
 
 mod backing_maintenance;
 mod composition;
+mod cycle;
 mod determinism;
 mod invocation_preparation;
 mod mixed_batch;
@@ -72,6 +75,7 @@ mod request;
 mod reusable_catalog;
 mod reusable_cold_path;
 mod state_memory;
+use cycle::VNextCycleCall;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
     VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
@@ -4636,6 +4640,8 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     prefix_capture_identity: Arc<()>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
+    decode_cycle_trace: RwLock<Option<DecodeCycleTrace>>,
+    decode_cycle_enabled: AtomicBool,
     device_timing_mode: AtomicU8,
     diagnostic_fault: Option<VNextDiagnosticFault>,
     diagnostic_fault_armed: AtomicBool,
@@ -5196,6 +5202,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             prefix_capture_identity: Arc::new(()),
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
+            decode_cycle_trace: RwLock::new(None),
+            decode_cycle_enabled: AtomicBool::new(false),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             diagnostic_fault: config.diagnostic_fault,
             diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
@@ -7333,6 +7341,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
         mut cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
+        cycle: Option<&VNextCycleCall>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7694,6 +7703,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )
             });
             let mut provider_elapsed = None;
+            let coarse_timing = cycle::CycleTiming {
+                context: cycle.and_then(VNextCycleCall::context),
+            };
             let submission = {
                 let timing = self
                     .metrics
@@ -7731,7 +7743,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             reusable_program,
                             execution_policy,
                             self.invocation_preparation_strategy,
-                            &invocation_preparation::DisabledTiming,
+                            &coarse_timing,
                             &self.metrics.invocation_preparation,
                             wave,
                             &self.lane,
@@ -7766,7 +7778,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &uploads,
                         execution_policy,
                         self.invocation_preparation_strategy,
-                        &invocation_preparation::DisabledTiming,
+                        &coarse_timing,
                         &self.metrics.invocation_preparation,
                         wave,
                         &self.lane,
@@ -8020,6 +8032,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
+        mut cycle: Option<&mut VNextCycleCall>,
     ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
@@ -8123,9 +8136,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 },
             )
             .collect::<Vec<_>>();
-        self.execute_prepared_participants(&participants, prepared, kind)
-            .await
-            .map(VNextExecutionCapacityDecision::Ready)
+        let result = self
+            .execute_prepared_participants(&participants, prepared, kind, cycle.as_deref_mut())
+            .await;
+        if result.is_err() {
+            if let Some(cycle) = cycle {
+                cycle.failed();
+            }
+        }
+        result.map(VNextExecutionCapacityDecision::Ready)
     }
 
     async fn execute_prepared_step(
@@ -8144,7 +8163,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             output_role: &output_role,
         };
         let mut logits = self
-            .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind)
+            .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind, None)
             .await?;
         logits
             .pop()
@@ -8156,11 +8175,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
+        mut cycle: Option<&mut VNextCycleCall>,
     ) -> Result<Vec<ExecutorSamplingOutput>> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
         let PreparedVNextPrefill { step, wave } = prepared;
+        if let Some(cycle) = cycle.as_deref_mut() {
+            cycle.prepare(&wave, kind);
+        }
         let capture_claim = match (kind, self.checkpoint_capture.as_ref()) {
             (VNextExecutionWaveKind::Prefill, Some(capture)) => {
                 let first = participants.first();
@@ -8232,6 +8255,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )
                 }),
             );
+            if let Some(cycle) = cycle.as_deref() {
+                cycle.mark(DecodeCycleStage::EncodeStart);
+            }
             let dispatch = self.dispatch_participant_wave(
                 participants,
                 wave,
@@ -8239,7 +8265,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 output_mode,
                 token_mask_residency.plans(),
                 cold_wave.as_mut(),
+                cycle.as_deref(),
             );
+            if let Some(cycle) = cycle.as_deref() {
+                cycle.mark(DecodeCycleStage::EncodeEnd);
+            }
             drop(phase_timer);
             if let Some(cold_wave) = cold_wave.take() {
                 cold_wave.finish(
@@ -8324,6 +8354,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
+        if let Some(cycle) = cycle.as_deref_mut() {
+            cycle.bind(&completion);
+        }
         for participant in participants {
             if let Some(events) = &participant.sequence.events {
                 if let Err(error) = events.lock().submitted(completion.receipt()) {
@@ -8374,24 +8407,48 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // worker. The ticket owns no Step or Sequence resources.
         let segment_publication = completion.take_segment_binding_publication();
         let reaper = Arc::clone(&self.reaper);
+        let worker_cycle = cycle.as_deref().and_then(VNextCycleCall::context).cloned();
+        let readback_cycle = worker_cycle.clone();
         let observation = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
             let _phase_timing = phase_timing.completion_round_trip.start();
             self.completion_worker
-                .execute(VNextCompletionTaskKind::WaveReadback, move || {
-                    let observation = match readbacks {
-                        VNextTerminalReadbacks::Batch(request) => {
-                            completion.wait_with_readbacks(request)
+                .execute_with_cycle(
+                    VNextCompletionTaskKind::WaveReadback,
+                    worker_cycle,
+                    move || {
+                        if let Some(cycle) = &readback_cycle {
+                            cycle.mark(DecodeCycleStage::TerminalReadbackStart);
                         }
-                        VNextTerminalReadbacks::Collection(request) => {
-                            completion.wait_with_readback_collection(request)
+                        let observation = match readbacks {
+                            VNextTerminalReadbacks::Batch(request) => {
+                                completion.wait_with_readbacks(request)
+                            }
+                            VNextTerminalReadbacks::Collection(request) => {
+                                completion.wait_with_readback_collection(request)
+                            }
+                        };
+                        if let Some(cycle) = &readback_cycle {
+                            cycle.mark(DecodeCycleStage::TerminalReadbackEnd);
+                            if !matches!(
+                                &observation,
+                                Ok(CompletionReadbackBatchObservation::Terminal(_))
+                            ) {
+                                cycle.mark_with_outcome(
+                                    DecodeCycleStage::FailureObserved,
+                                    ferrum_interfaces::DecodeCycleOutcome::Failed,
+                                );
+                            }
                         }
-                    };
-                    drop(reaper);
-                    observation
-                })
+                        drop(reaper);
+                        observation
+                    },
+                )
                 .await
                 .map_err(|error| {
+                    if let Some(cycle) = cycle.as_deref() {
+                        cycle.failed();
+                    }
                     FerrumError::backend(format!("vNext completion task failed: {error}"))
                 })?
                 .map_err(|error| FerrumError::backend(error.to_string()))?
@@ -8717,7 +8774,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
         drop(receipt);
-        match step.try_retire_normal() {
+        if let Some(cycle) = cycle.as_deref() {
+            cycle.mark(DecodeCycleStage::RetirementStart);
+        }
+        let retirement = step.try_retire_normal();
+        if let Some(cycle) = cycle.as_deref() {
+            cycle.mark(DecodeCycleStage::RetirementEnd);
+        }
+        match retirement {
             Ok(retirement) => {
                 self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
                 if let Some(error) = execution_event_error {
@@ -8925,6 +8989,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         inputs: &[PlanRuntimeDecodeInput],
     ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        self.cycle_prepare_start(inputs.first().and_then(|input| input.decode_cycle_context));
         let started = Instant::now();
         if inputs.is_empty() {
             return Ok(PlanRuntimeBatchDecodeOutcome::Completed(Vec::new()));
@@ -9052,6 +9117,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .map(|candidate| VNextParticipantOutputRole::Decode(candidate.logits_policy.clone()))
             .collect::<Vec<_>>();
+        let mut cycle = self.cycle_call(|| {
+            canonical_candidates
+                .iter()
+                .map(|candidate| {
+                    cycle::caller(
+                        &candidate.sequence,
+                        candidate.original_index,
+                        inputs[candidate.original_index].decode_cycle_context,
+                    )
+                })
+                .collect()
+        });
         let logits = match self
             .execute_batch_step(
                 &batch,
@@ -9060,6 +9137,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &spans,
                 VNextExecutionWaveKind::Decode,
                 &output_roles,
+                cycle.as_mut(),
             )
             .await
         {
@@ -9097,18 +9175,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
 
         let mut ordered_outputs = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-        for (((candidate, tokens), previous_len), sampling_output) in canonical_candidates
-            .iter()
-            .zip(token_batches)
-            .zip(previous_lengths)
-            .zip(logits)
+        for (canonical, (((candidate, tokens), previous_len), sampling_output)) in
+            canonical_candidates
+                .iter()
+                .zip(token_batches)
+                .zip(previous_lengths)
+                .zip(logits)
+                .enumerate()
         {
             if candidate.sequence.active.load(Ordering::Acquire) {
                 *candidate.sequence.tokens.lock() = tokens;
             }
             let cache = self.cache_handle(&candidate.sequence, previous_len + 1);
-            ordered_outputs[candidate.original_index] =
-                Some(PlanRuntimeDecodeOutput::new(sampling_output, cache));
+            let mut output = PlanRuntimeDecodeOutput::new(sampling_output, cache);
+            if let Some(witness) = cycle
+                .as_ref()
+                .and_then(|cycle| cycle.participant(canonical))
+            {
+                output = output.with_decode_cycle_witness(witness);
+            }
+            ordered_outputs[candidate.original_index] = Some(output);
         }
 
         let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
@@ -9130,6 +9216,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        if let Some(cycle) = &cycle {
+            cycle.mark(DecodeCycleStage::ProductReturn);
+        }
         Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
     }
 
@@ -9259,6 +9348,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         let mut completed_chunk = planned_chunk;
         let mut capacity_probe_count = 0_u32;
+        let mut cycle =
+            self.cycle_call(|| cycle::caller(&sequence, 0, None).map(|caller| vec![caller]));
         let mut logits = loop {
             let extension_tokens = &tokens[..completed_chunk.end()];
             let extension_span =
@@ -9310,6 +9401,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::slice::from_ref(&span),
                     VNextExecutionWaveKind::Prefill,
                     &[VNextParticipantOutputRole::prefill(completed_chunk)],
+                    cycle.as_mut(),
                 )
                 .await?
             {
@@ -9381,14 +9473,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
-        Ok(PlanRuntimePrefillOutcome::Completed(
-            PlanRuntimePrefillCompletion::new(
-                output,
-                planned_chunk,
-                completed_chunk,
-                capacity_probe_count,
-            )?,
-        ))
+        let completion = PlanRuntimePrefillCompletion::new(
+            output,
+            planned_chunk,
+            completed_chunk,
+            capacity_probe_count,
+        )?;
+        if let Some(cycle) = &cycle {
+            cycle.mark(DecodeCycleStage::ProductReturn);
+        }
+        Ok(PlanRuntimePrefillOutcome::Completed(completion))
     }
 
     async fn execute_plan_runtime_prefill_batch_with_capacity(
@@ -9546,6 +9640,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map(|candidate| candidate.planned_chunk)
             .collect::<Vec<_>>();
         let mut capacity_probe_counts = vec![0_u32; candidates.len()];
+        let mut cycle = self.cycle_call(|| {
+            candidates
+                .iter()
+                .map(|candidate| cycle::caller(&candidate.sequence, candidate.original_index, None))
+                .collect()
+        });
 
         let logits = 'capacity: loop {
             for (index, candidate) in candidates.iter().enumerate() {
@@ -9615,6 +9715,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     &spans,
                     VNextExecutionWaveKind::Prefill,
                     &output_roles,
+                    cycle.as_mut(),
                 )
                 .await?
             {
@@ -9772,6 +9873,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ordering::Relaxed,
         );
         drop(operation_guards);
+        if let Some(cycle) = &cycle {
+            cycle.mark(DecodeCycleStage::ProductReturn);
+        }
         Ok(PlanRuntimeBatchPrefillOutcome::Completed(outputs))
     }
 
@@ -10227,6 +10331,11 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
         self.device_timing_mode
             .store(sink.device_timing_mode() as u8, Ordering::Release);
+        let cycle_trace = sink.decode_cycle_trace();
+        let cycle_enabled = cycle_trace.is_some();
+        *self.decode_cycle_trace.write() = cycle_trace;
+        self.decode_cycle_enabled
+            .store(cycle_enabled, Ordering::Release);
         *self.event_sink.write() = Some(sink);
     }
 

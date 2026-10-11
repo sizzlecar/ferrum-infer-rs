@@ -172,6 +172,8 @@ pub enum ObservabilityProfileDetail {
     Basic,
     Resource,
     Latency,
+    /// Bounded coarse host-cycle diagnostics, drained to the scheduler trace.
+    Cycle,
     Kernel,
     Debug,
     Replay,
@@ -186,6 +188,7 @@ impl ObservabilityProfileDetail {
             "basic" => Some(Self::Basic),
             "resource" => Some(Self::Resource),
             "latency" => Some(Self::Latency),
+            "cycle" => Some(Self::Cycle),
             "kernel" => Some(Self::Kernel),
             "debug" => Some(Self::Debug),
             "replay" => Some(Self::Replay),
@@ -201,6 +204,7 @@ impl ObservabilityProfileDetail {
             Self::Basic => "basic",
             Self::Resource => "resource",
             Self::Latency => "latency",
+            Self::Cycle => "cycle",
             Self::Kernel => "kernel",
             Self::Debug => "debug",
             Self::Replay => "replay",
@@ -212,7 +216,7 @@ impl ObservabilityProfileDetail {
     pub fn diagnostic_only(self) -> bool {
         matches!(
             self,
-            Self::Kernel | Self::Debug | Self::Replay | Self::Verify | Self::Full
+            Self::Cycle | Self::Kernel | Self::Debug | Self::Replay | Self::Verify | Self::Full
         )
     }
 
@@ -294,6 +298,13 @@ impl FerrumObservabilityConfig {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.profile_detail == ObservabilityProfileDetail::Cycle
+            && self.scheduler_trace_jsonl.is_none()
+        {
+            return Err(
+                "cycle profile requires scheduler_trace_jsonl for the drained capture".to_string(),
+            );
+        }
         if !self.profile_sample_rate.is_finite()
             || self.profile_sample_rate < 0.0
             || self.profile_sample_rate > 1.0
@@ -536,6 +547,48 @@ mod tests {
         let mut missing_shape = base_event();
         missing_shape.shape.clear();
         assert!(missing_shape.validate().is_err());
+    }
+
+    #[test]
+    fn cycle_profile_detail_is_typed_and_avoids_request_token_timing() {
+        let detail = ObservabilityProfileDetail::parse(" CYCLE ")
+            .expect("coarse cycle profile is a declared option");
+        assert_eq!(detail, ObservabilityProfileDetail::Cycle);
+        assert_eq!(detail.as_str(), "cycle");
+        assert!(detail.diagnostic_only());
+        assert!(!detail.captures_engine_token_timing());
+        let wire = serde_json::to_string(&detail).expect("serialize typed profile detail");
+        assert_eq!(
+            serde_json::from_str::<ObservabilityProfileDetail>(&wire)
+                .expect("deserialize typed profile detail"),
+            detail
+        );
+    }
+
+    #[test]
+    fn cycle_configuration_requires_scheduler_trace_for_both_product_entrypoints() {
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            let mut config = FerrumObservabilityConfig::new(
+                entrypoint,
+                "model",
+                None,
+                ObservabilityProfileDetail::Cycle,
+                None,
+                None,
+                None,
+                DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE,
+            );
+            assert!(config.enabled());
+            assert!(!config.metrics_only());
+            assert!(config.validate().is_err());
+            config.profile_jsonl = Some(PathBuf::from("profile.jsonl"));
+            assert!(
+                config.validate().is_err(),
+                "a general profile path does not enable the cycle recorder"
+            );
+            config.scheduler_trace_jsonl = Some(PathBuf::from("cycle-trace.jsonl"));
+            assert!(config.validate().is_ok());
+        }
     }
 
     #[test]

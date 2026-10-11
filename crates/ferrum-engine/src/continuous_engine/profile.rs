@@ -1663,6 +1663,7 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
     fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
         match self.context.profile_detail {
             ObservabilityProfileDetail::Off
+            | ObservabilityProfileDetail::Cycle
             | ObservabilityProfileDetail::Resource
             | ObservabilityProfileDetail::Latency => {
                 ferrum_interfaces::vnext::DeviceTimingMode::Off

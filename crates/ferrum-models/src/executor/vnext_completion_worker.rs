@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use ferrum_interfaces::{DecodeCycleOutcome, DecodeCycleStage, DecodeCycleWaveContext};
 use tokio::sync::{mpsc, oneshot};
 
 use super::vnext_timing::AtomicDurationMetrics;
@@ -168,15 +169,39 @@ impl VNextCompletionWorker {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let sender = self
-            .sender
-            .as_ref()
-            .ok_or(VNextCompletionWorkerError::QueueClosed)?;
+        self.execute_with_cycle(kind, None, task).await
+    }
+
+    pub(super) async fn execute_with_cycle<T, F>(
+        &self,
+        kind: VNextCompletionTaskKind,
+        cycle: Option<DecodeCycleWaveContext>,
+        task: F,
+    ) -> Result<T, VNextCompletionWorkerError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            if let Some(cycle) = &cycle {
+                cycle.mark_with_outcome(
+                    DecodeCycleStage::FailureObserved,
+                    DecodeCycleOutcome::Unavailable,
+                );
+            }
+            VNextCompletionWorkerError::QueueClosed
+        })?;
         let reservation_started = Instant::now();
-        let permit = sender
-            .reserve()
-            .await
-            .map_err(|_| VNextCompletionWorkerError::QueueClosed)?;
+        let permit = sender.reserve().await.map_err(|_| {
+            if let Some(cycle) = &cycle {
+                cycle.mark_with_outcome(
+                    DecodeCycleStage::FailureObserved,
+                    DecodeCycleOutcome::Unavailable,
+                );
+            }
+            VNextCompletionWorkerError::QueueClosed
+        })?;
+        let cycle_producer = cycle.as_ref().map(|cycle| cycle.trace().producer_guard());
         let class = self.counters.task_class(kind);
         class.reservation_wait.record(reservation_started.elapsed());
         class.scheduled_tasks.fetch_add(1, Ordering::Relaxed);
@@ -190,9 +215,16 @@ impl VNextCompletionWorker {
         let counters = Arc::clone(&self.counters);
         let (result_sender, result_receiver) = oneshot::channel();
         let queued_at = Instant::now();
+        if let Some(cycle) = &cycle {
+            cycle.mark(DecodeCycleStage::CompletionQueued);
+        }
+        let task_cycle = cycle.clone();
         let job = Box::new(move || {
             let class = counters.task_class(kind);
             class.queued_wait.record(queued_at.elapsed());
+            if let Some(cycle) = &task_cycle {
+                cycle.mark(DecodeCycleStage::CompletionWorkerStarted);
+            }
             let task_started = Instant::now();
             let result = catch_unwind(AssertUnwindSafe(task)).map_err(|_| {
                 counters.panicked_tasks.fetch_add(1, Ordering::Relaxed);
@@ -202,12 +234,33 @@ impl VNextCompletionWorker {
             class.completed_tasks.fetch_add(1, Ordering::Relaxed);
             counters.completed_tasks.fetch_add(1, Ordering::Relaxed);
             drop(guard);
+            if let Some(cycle) = &task_cycle {
+                if result.is_err() {
+                    cycle.trace().mark_with_outcome(
+                        DecodeCycleStage::FailureObserved,
+                        cycle.scope(),
+                        DecodeCycleOutcome::Panicked,
+                    );
+                }
+                cycle.mark(DecodeCycleStage::CompletionResultReady);
+            }
             let _ = result_sender.send(result);
+            drop(cycle_producer);
         }) as VNextCompletionTask;
         permit.send(job);
-        result_receiver
-            .await
-            .map_err(|_| VNextCompletionWorkerError::ResultChannelClosed)?
+        let result = result_receiver.await;
+        if let Some(cycle) = &cycle {
+            cycle.mark(DecodeCycleStage::CompletionAwaitResumed);
+        }
+        result.map_err(|_| {
+            if let Some(cycle) = &cycle {
+                cycle.mark_with_outcome(
+                    DecodeCycleStage::FailureObserved,
+                    DecodeCycleOutcome::Unavailable,
+                );
+            }
+            VNextCompletionWorkerError::ResultChannelClosed
+        })?
     }
 
     fn pending_tasks(&self) -> usize {
