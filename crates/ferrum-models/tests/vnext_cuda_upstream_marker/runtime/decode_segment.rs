@@ -3,6 +3,7 @@
 use super::*;
 use ferrum_types::{InvocationPreparationStrategy, ProgramBindingUploadStrategy};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 #[derive(Default)]
 struct Preparation(RefCell<Vec<InvocationPreparationStats>>);
@@ -282,7 +283,7 @@ fn compare_strategy(
     let mut hot_before_growth = 0;
     let mut hot_after_growth = 0;
     let mut publications = 0;
-    let mut previous_frames: [Vec<ExecutionFrameId>; 2] = [Vec::new(), Vec::new()];
+    let mut previous_frames = [BTreeMap::new(), BTreeMap::new()];
     let mut previous_programs: [Option<DeviceReusableExecutionProgramId>; 2] = [None, None];
     for position in 0..joint_waves {
         let caller_order = if compiled && position >= joint_waves - 2 {
@@ -423,14 +424,25 @@ fn compare_strategy(
                     assert!(!observation.segment_published);
                 }
             }
+            assert_eq!(observation.participant_frames.len(), group.len());
+            // The helper returns frames in caller order, which may change.
+            // Freshness belongs to the actual sequence authority, not its slot.
+            let current_frames = group
+                .iter()
+                .zip(&observation.participant_frames)
+                .map(|(session, frame)| (session.sequence_authority(), *frame))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(current_frames.len(), group.len());
             if !previous_frames[arm].is_empty() {
-                assert!(observation
-                    .participant_frames
-                    .iter()
-                    .zip(&previous_frames[arm])
-                    .all(|(current, previous)| current > previous));
+                assert!(current_frames.keys().eq(previous_frames[arm].keys()));
+                for (authority, current) in &current_frames {
+                    assert!(
+                        current > &previous_frames[arm][authority],
+                        "each sequence must advance its frame even when callers reorder"
+                    );
+                }
             }
-            previous_frames[arm] = observation.participant_frames.clone();
+            previous_frames[arm] = current_frames;
             previous_programs[arm] = Some(program_id.clone());
             println!(
                 "{}",
