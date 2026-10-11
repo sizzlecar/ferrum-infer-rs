@@ -2,6 +2,7 @@
 
 mod package_platform;
 pub mod source_build;
+pub mod source_overlay;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -33,6 +34,7 @@ pub const NATIVE_OPERATOR_PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 5;
 
 use package_platform::*;
 pub use source_build::*;
+pub use source_overlay::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

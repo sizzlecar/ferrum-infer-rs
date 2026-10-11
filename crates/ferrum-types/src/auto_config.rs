@@ -160,6 +160,8 @@ pub struct CompiledNativeOperatorArtifact {
 pub struct CompiledKernelFeatures {
     pub cuda: bool,
     pub vllm_paged_attn: bool,
+    #[serde(default)]
+    pub cuda_indexed_causal_attention: bool,
     pub vllm_moe_marlin: bool,
     pub cuda_graph: bool,
     pub greedy_argmax: bool,
@@ -177,6 +179,7 @@ impl Default for CompiledKernelFeatures {
         Self {
             cuda: false,
             vllm_paged_attn: false,
+            cuda_indexed_causal_attention: false,
             vllm_moe_marlin: false,
             cuda_graph: false,
             greedy_argmax: false,
@@ -194,6 +197,7 @@ impl CompiledKernelFeatures {
         Self {
             cuda: true,
             vllm_paged_attn: true,
+            cuda_indexed_causal_attention: false,
             vllm_moe_marlin: true,
             cuda_graph: true,
             greedy_argmax: true,
@@ -1195,6 +1199,16 @@ impl FerrumConfigBuilder {
                 RuntimeConfigSource::Default,
             );
         }
+        if self
+            .entry(crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+                crate::CausalDecodeAttentionGrouping::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
             if self
                 .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
@@ -1273,6 +1287,9 @@ impl FerrumConfigBuilder {
         decisions.push(self.invocation_preparation_strategy_decision()?);
         decisions.push(self.program_binding_upload_strategy_decision()?);
         decisions.push(self.segment_binding_owner_view_mode_decision()?);
+        decisions.push(self.causal_decode_attention_grouping_decision(
+            plan_attention.as_ref().map(|(_, compiled)| compiled.value),
+        )?);
         decisions.push(self.causal_decode_preparation_mode_decision(
             plan_attention.as_ref().map(|(_, compiled)| compiled.value),
         )?);
@@ -2762,6 +2779,65 @@ impl FerrumConfigBuilder {
             source,
             source_key,
             ["per-participant", "packed"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn causal_decode_attention_grouping_decision(
+        &self,
+        compiled_attention: Option<AttentionExecutionPolicy>,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let (grouping, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::CausalDecodeAttentionGrouping::parse_config_entry(entry).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::CausalDecodeAttentionGrouping::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if grouping == crate::CausalDecodeAttentionGrouping::Indexed {
+            let preparation = self
+                .entry(crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
+                .map(crate::CausalDecodePreparationMode::parse_config_entry)
+                .transpose()
+                .map_err(|reason| AutoConfigError::InvalidOverride {
+                    key: crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY.to_owned(),
+                    reason,
+                })?
+                .unwrap_or_default();
+            if !self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || !self.hardware.compiled_features.vllm_paged_attn
+                || !self
+                    .hardware
+                    .compiled_features
+                    .cuda_indexed_causal_attention
+                || compiled_attention != Some(AttentionExecutionPolicy::NativeAdaptive)
+                || preparation != crate::CausalDecodePreparationMode::Packed
+            {
+                return Err(AutoConfigError::InvalidOverride {
+                    key: key.to_owned(),
+                    reason: "indexed causal decode attention grouping requires the cuda-indexed-causal-attention build feature, a CUDA plan runtime with native-adaptive paged attention, F16 KV storage, and explicit packed causal decode preparation".to_owned(),
+                });
+            }
+        }
+        Ok(self.decision(
+            "causal_decode_attention_grouping",
+            grouping.as_runtime_value(),
+            source,
+            source_key,
+            ["contiguous", "indexed"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5746,6 +5822,301 @@ mod tests {
                 assert!(
                     matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_resolves_defaults_and_explicit_sources() {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        for (grouping, source) in [
+            (None, RuntimeConfigSource::Default),
+            (Some("contiguous"), RuntimeConfigSource::Cli),
+            (Some("indexed"), RuntimeConfigSource::ConfigFile),
+            (Some("indexed"), RuntimeConfigSource::Cli),
+        ] {
+            for (preparation, upload, owner) in [
+                ("full", "sparse", "legacy"),
+                ("decode-segment", "compact-scatter", "indexed"),
+            ] {
+                let mut entries = vec![
+                    RuntimeConfigEntry::new(
+                        crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                        "packed",
+                        RuntimeConfigSource::ConfigFile,
+                    ),
+                    RuntimeConfigEntry::new(
+                        "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                        preparation,
+                        RuntimeConfigSource::Cli,
+                    ),
+                    RuntimeConfigEntry::new(
+                        "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                        upload,
+                        RuntimeConfigSource::Cli,
+                    ),
+                    RuntimeConfigEntry::new(
+                        crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+                        owner,
+                        RuntimeConfigSource::Cli,
+                    ),
+                ];
+                if let Some(grouping) = grouping {
+                    entries.push(RuntimeConfigEntry::new(key, grouping, source));
+                }
+                let mut hardware = HardwareCapabilities::unknown();
+                hardware.backend = "cuda".to_owned();
+                hardware.compiled_features.cuda = true;
+                hardware.compiled_features.vllm_paged_attn = true;
+                hardware.compiled_features.cuda_indexed_causal_attention = true;
+                let resolved =
+                    FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
+                        .with_hardware_capabilities(hardware)
+                        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                        .resolve()
+                        .unwrap();
+                let expected = grouping.unwrap_or("contiguous");
+                let entry = resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .find(|e| e.key == key)
+                    .unwrap();
+                assert_eq!(entry.effective_value, expected);
+                assert_eq!(entry.source, source);
+                let decision = resolved
+                    .decisions
+                    .iter()
+                    .find(|d| d.selection == "causal_decode_attention_grouping")
+                    .unwrap();
+                assert_eq!(decision.selected, expected);
+                assert_eq!(decision.source, auto_config_source_from_runtime(source));
+                assert_eq!(decision.source_key.as_deref(), grouping.map(|_| key));
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .runtime
+                        .causal_decode_attention_grouping
+                        .as_runtime_value(),
+                    expected
+                );
+                assert_eq!(
+                    engine.runtime.causal_decode_preparation_mode,
+                    crate::CausalDecodePreparationMode::Packed
+                );
+                assert_eq!(
+                    engine
+                        .runtime
+                        .invocation_preparation_strategy
+                        .as_runtime_value(),
+                    preparation
+                );
+                assert_eq!(
+                    engine
+                        .runtime
+                        .program_binding_upload_strategy
+                        .as_runtime_value(),
+                    upload
+                );
+                assert_eq!(
+                    engine
+                        .runtime
+                        .segment_binding_owner_view_mode
+                        .as_runtime_value(),
+                    owner
+                );
+            }
+        }
+        // The default does not impose CUDA or Packed prerequisites on existing configurations.
+        let resolved = FerrumConfigBuilder::new(RuntimeConfigSnapshot::default())
+            .resolve()
+            .unwrap();
+        let mut engine = crate::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(
+            engine.runtime.causal_decode_attention_grouping,
+            crate::CausalDecodeAttentionGrouping::Contiguous
+        );
+        assert_eq!(
+            engine.runtime.causal_decode_preparation_mode,
+            crate::CausalDecodePreparationMode::PerParticipant
+        );
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_rejects_env_and_unsupported_execution() {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        for (backend, authority, compiled, policy, kv, preparation, source) in [
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Env,
+            ),
+            (
+                "cpu",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::LegacyEngine,
+                true,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                false,
+                "auto",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "portable",
+                "fp16",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "int8",
+                Some("packed"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                Some("per-participant"),
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                true,
+                "auto",
+                "fp16",
+                None,
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            let mut entries = vec![
+                RuntimeConfigEntry::new(key, "indexed", source),
+                RuntimeConfigEntry::new(
+                    "FERRUM_ATTENTION_POLICY",
+                    policy,
+                    RuntimeConfigSource::Cli,
+                ),
+                RuntimeConfigEntry::new("FERRUM_KV_DTYPE", kv, RuntimeConfigSource::Cli),
+            ];
+            if let Some(preparation) = preparation {
+                entries.push(RuntimeConfigEntry::new(
+                    crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                    preparation,
+                    RuntimeConfigSource::Cli,
+                ));
+            }
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            hardware.compiled_features.cuda = backend == "cuda";
+            hardware.compiled_features.vllm_paged_attn = compiled;
+            hardware.compiled_features.cuda_indexed_causal_attention = true;
+            hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
+            let error = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(&error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_requires_its_additive_compiled_capability() {
+        let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let old_features = CompiledKernelFeatures::m3_fast_path_without_fa2();
+        assert!(old_features.vllm_paged_attn);
+        assert!(!old_features.cuda_indexed_causal_attention);
+        let mut old_serialized = serde_json::to_value(&old_features).unwrap();
+        old_serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("cuda_indexed_causal_attention");
+        let decoded: CompiledKernelFeatures = serde_json::from_value(old_serialized).unwrap();
+        assert!(!decoded.cuda_indexed_causal_attention);
+
+        for compiled in [false, true] {
+            for grouping in ["contiguous", "indexed"] {
+                let entries = snapshot_with_sources(&[
+                    (key, grouping, RuntimeConfigSource::Cli),
+                    (
+                        crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                        "packed",
+                        RuntimeConfigSource::Cli,
+                    ),
+                ]);
+                let mut hardware = HardwareCapabilities::unknown();
+                hardware.backend = "cuda".to_owned();
+                hardware.compiled_features.cuda = true;
+                hardware.compiled_features.vllm_paged_attn = true;
+                hardware.compiled_features.cuda_indexed_causal_attention = compiled;
+                let result = FerrumConfigBuilder::new(entries)
+                    .with_hardware_capabilities(hardware)
+                    .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                    .resolve();
+                if grouping == "indexed" && !compiled {
+                    assert!(
+                        matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+                    );
+                } else {
+                    let resolved = result.unwrap();
+                    assert_eq!(
+                        resolved
+                            .decisions
+                            .iter()
+                            .find(|d| d.selection == "causal_decode_attention_grouping")
+                            .unwrap()
+                            .selected,
+                        grouping
+                    );
+                }
             }
         }
     }

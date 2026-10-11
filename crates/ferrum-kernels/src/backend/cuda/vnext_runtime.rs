@@ -3029,6 +3029,7 @@ pub struct CudaDeviceRuntime {
     segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
     segment_binding_indexed_encodes: AtomicU64,
     packed_decode_prepare_gate: bool,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -3232,6 +3233,8 @@ impl CudaDeviceRuntime {
                 ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
             segment_binding_indexed_encodes: AtomicU64::new(0),
             packed_decode_prepare_gate: false,
+            causal_decode_attention_grouping:
+                ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
             runtime_instance,
             context,
             allocation_stream,
@@ -3278,6 +3281,21 @@ impl CudaDeviceRuntime {
 
     pub(super) fn packed_decode_prepare_gate_enabled(&self) -> bool {
         self.packed_decode_prepare_gate
+    }
+
+    /// Constructor-only selection, before providers and replay identities are built.
+    pub fn with_causal_decode_attention_grouping(
+        mut self,
+        grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    ) -> Self {
+        self.causal_decode_attention_grouping = grouping;
+        self
+    }
+
+    pub(super) fn causal_decode_attention_grouping(
+        &self,
+    ) -> ferrum_types::CausalDecodeAttentionGrouping {
+        self.causal_decode_attention_grouping
     }
 
     pub(super) fn program_binding_upload_strategy(&self) -> ProgramBindingUploadStrategy {

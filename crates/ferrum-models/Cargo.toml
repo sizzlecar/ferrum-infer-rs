@@ -97,6 +97,7 @@ default = []
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["ferrum-kernels/metal"]
 cuda = ["ferrum-kernels/cuda"]
+cuda-indexed-causal-attention = ["cuda", "ferrum-kernels/cuda-indexed-causal-attention"]
 cuda-upstream-linear = ["cuda", "ferrum-kernels/cuda-upstream-linear"] # Explicit locked upstream projection artifact.
 cuda-upstream-extra-linear = ["cuda-upstream-linear", "ferrum-kernels/cuda-upstream-extra-linear"] # Independent locked extra-format artifact.
 cuda-upstream-q6-f32-linear = ["cuda-upstream-extra-linear", "ferrum-kernels/cuda-upstream-q6-f32-linear"] # Independent locked Q6 F32 head artifact.

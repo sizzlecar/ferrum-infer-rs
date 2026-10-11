@@ -1,12 +1,12 @@
 //! Real Core admission and provider submission. The two independent histories
-//! differ only in causal preparation mode; no fixture asserts KV independence
+//! differ only in causal preparation or grouping; no fixture asserts KV independence
 //! on the backend's behalf. Kernel attribution is a submission declaration,
 //! not a hardware counter. Ordinary warm/capture/replay remains timing Off.
 use super::*;
 use batch::BatchObservationOptions;
 use ferrum_types::{
-    AttentionExecutionPolicy, CausalDecodePreparationMode, InvocationPreparationStrategy,
-    ProgramBindingUploadStrategy,
+    AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
+    InvocationPreparationStrategy, ProgramBindingUploadStrategy,
 };
 use std::cell::RefCell;
 
@@ -193,14 +193,30 @@ fn attention_work(
 }
 
 fn verify(leads: &[usize]) {
+    verify_modes(leads, false);
+}
+
+fn verify_modes(leads: &[usize], indexed_grouping: bool) {
     let participants = leads.len();
     let mixed = leads.iter().any(|&lead| lead > 512);
-    let modes = [
-        CausalDecodePreparationMode::PerParticipant,
-        CausalDecodePreparationMode::Packed,
+    let modes = if indexed_grouping {
+        [CausalDecodePreparationMode::Packed; 2]
+    } else {
+        [
+            CausalDecodePreparationMode::PerParticipant,
+            CausalDecodePreparationMode::Packed,
+        ]
+    };
+    let groupings = [
+        CausalDecodeAttentionGrouping::Contiguous,
+        if indexed_grouping {
+            CausalDecodeAttentionGrouping::Indexed
+        } else {
+            CausalDecodeAttentionGrouping::Contiguous
+        },
     ];
-    let fixtures = modes.map(|mode| {
-        Fixture::for_family_with_causal_decode_preparation(
+    let fixtures = std::array::from_fn::<_, 2, _>(|arm| {
+        Fixture::for_family_with_decode_attention_grouping(
             AttentionKind::Causal,
             true,
             participants as u32,
@@ -209,7 +225,8 @@ fn verify(leads: &[usize]) {
             SegmentBindingOracleMode::CompareReference,
             SegmentBindingOwnerViewMode::Indexed,
             AttentionExecutionPolicy::NativeAdaptive,
-            mode,
+            modes[arm],
+            groupings[arm],
         )
     });
     for fixture in &fixtures {
@@ -249,7 +266,7 @@ fn verify(leads: &[usize]) {
             })
             .collect();
         // Assign lengths in each real batch's canonical order. The independent
-        // runtimes have different IDs/addresses, but the same V1,V1,V2,V2 order.
+        // runtimes have different IDs/addresses, but the same per-row lengths.
         let sessions = fixtures.each_ref().map(|fixture| {
             let group = (0..participants)
                 .map(|owner| {
@@ -323,9 +340,17 @@ fn verify(leads: &[usize]) {
             }
         }
         let mut stable_programs = [None, None];
+        let mut before_transition = [None, None];
         let mut frames = [Vec::new(), Vec::new()];
         let mut hot_hits = [0, 0];
         for wave in 0..DECODE_WAVES {
+            // Only the new Indexed comparison crosses the native 512 boundary.
+            // Warm/capture the changed topology before requiring ReplayOnly.
+            let replay_start = if indexed_grouping && wave >= 4 { 6 } else { 3 };
+            if indexed_grouping && wave == 4 {
+                before_transition = stable_programs.clone();
+                stable_programs = [None, None];
+            }
             let order: Vec<_> = if wave >= 6 {
                 (0..participants).rev().collect()
             } else {
@@ -337,7 +362,7 @@ fn verify(leads: &[usize]) {
                 .collect();
             let path = if wave == 0 {
                 Path::Eager
-            } else if wave < 3 {
+            } else if wave < replay_start {
                 Path::Warm
             } else {
                 Path::Replay
@@ -411,8 +436,15 @@ fn verify(leads: &[usize]) {
                         "ordinary capture/replay must remain Off"
                     );
                 }
-                if wave >= 3 {
+                if wave >= replay_start {
                     let program = observation.reusable_program_id.as_ref().unwrap();
+                    if indexed_grouping && wave >= 4 {
+                        assert_ne!(
+                            before_transition[arm].as_ref().unwrap(),
+                            program,
+                            "512 -> 513 must select a new exact native topology"
+                        );
+                    }
                     if let Some(previous) = &stable_programs[arm] {
                         assert_eq!(previous, program);
                     }
@@ -421,10 +453,10 @@ fn verify(leads: &[usize]) {
                     // program to Core's binding-recipe lookup. The first
                     // direct replay may therefore prepare and publish that
                     // recipe only after successful completion and retirement.
-                    if generation == 0 && wave == 3 {
+                    if generation == 0 && wave == replay_start {
                         assert_eq!(stats.segment_hits, 0, "first direct replay: {stats:?}");
                     }
-                    if wave == 3 && stats.segment_hits == 0 {
+                    if wave == replay_start && stats.segment_hits == 0 {
                         assert_eq!(stats.segment_misses, 1, "{stats:?}");
                         assert_eq!(stats.segment_no_cached_recipe, 1, "{stats:?}");
                         assert_eq!(stats.segment_no_resident_program, 0, "{stats:?}");
@@ -457,7 +489,7 @@ fn verify(leads: &[usize]) {
                 retain_observation(&mut previous[arm], &observation, &order, &ranges);
                 println!(
                     "{}",
-                    serde_json::json!({"kind":"packed_preparation_model_wave", "mode":modes[arm],
+                    serde_json::json!({"kind":"packed_preparation_model_wave", "mode":modes[arm],"grouping":groupings[arm],
                     "generation":generation,"participants":participants,"ranges":ranges,"caller_order":order,
                     "path":format!("{path:?}"),"physical_64k_pages":pages,"program":observation.reusable_program_id,
                     "hits":stats.segment_hits,"indexed_host_encodes":indexed,"oracle_nodes":audited,
@@ -468,12 +500,20 @@ fn verify(leads: &[usize]) {
             }
             observations[0].assert_same(&observations[1]);
             if wave == 0 {
-                assert_eq!(work[0].compute_dispatch_count() - work[1].compute_dispatch_count(), 2 * (participants as u64 - 1),
-                    "actual selected BatchDecode must collapse both Sequence prepare and enabled gate; common projection/attention work is unchanged");
+                let expected_removed = if indexed_grouping {
+                    // V1,V1,V2,V1,V1,V2: four contiguous groups use six
+                    // attention kernels; indexed V1 + V2 main/reduce use three.
+                    3
+                } else {
+                    2 * (participants as u64 - 1)
+                };
+                assert_eq!(work[0].compute_dispatch_count() - work[1].compute_dispatch_count(), expected_removed,
+                    "actual selected preparation/grouping must have the declared native work difference");
                 println!(
                     "{}",
                     serde_json::json!({"kind":"packed_preparation_model_qualification", "generation":generation,
-                    "per_participant":work[0],"packed":work[1],"scope":"actual submitted attribution; declared dispatch count, not hardware kernel count"})
+                    "preparation_modes":modes,"attention_groupings":groupings,
+                    "reference":work[0],"candidate":work[1],"scope":"actual submitted attribution; declared dispatch count, not hardware kernel count"})
                 );
             }
         }
@@ -497,4 +537,13 @@ fn packed_decode_preparation_v1_matches_per_participant_across_core_replay_and_g
 #[ignore = "requires CUDA NativeAdaptive V1/V2, actual Core Sequence admission and packed prepare/gate providers"]
 fn packed_decode_preparation_mixed_v1_v2_matches_per_participant_across_fresh_requests() {
     verify(&[60, 60, 1084, 1084]);
+}
+
+#[test]
+#[cfg(feature = "cuda-indexed-causal-attention")]
+#[ignore = "requires CUDA indexed NativeAdaptive, actual Core Sequence admission and replay"]
+fn indexed_decode_attention_matches_contiguous_across_core_replay_boundary_and_fresh_requests() {
+    // The 508 rows cross V1/V2 at wave4; the 57 rows grow physical pages on
+    // wave7, after the new program is captured and its fresh recipe published.
+    verify_modes(&[508, 57, 1084, 57, 508, 1084], true);
 }

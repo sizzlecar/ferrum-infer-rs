@@ -348,11 +348,18 @@ jobs:
             $package = Join-Path $set "packages/$operator"
             $plan = Join-Path $work "$operator.plan.json"
             $spec = Join-Path $work "$operator.package.json"
+            $operatorSource = $source
             $stage = 'lock-source'
             try {
-              & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $source --out $plan
+              if ($operator -eq 'vllm-paged-attention-v2') {
+                $stage = 'materialize-source'
+                $operatorSource = Join-Path $work 'indexed-source'
+                & $builder materialize-source --spec 'native-operators/cuda/source-overlays/vllm-paged-attention-indexed.json' --base-source-root $source --override-source-root $env:GITHUB_WORKSPACE --out $operatorSource
+              }
+              $stage = 'lock-source'
+              & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $operatorSource --out $plan
               $stage = 'source-build'
-              & $builder source-build --plan $plan --source-root $source --out $build --compute-capability sm_89 --builder-sha $builderSha --nvcc "$env:CUDA_PATH/bin/nvcc.exe" --cuda-toolkit-root $env:CUDA_PATH --ccbin $env:NVCC_CCBIN --ar $env:FERRUM_MSVC_LIB --nvcc-threads 4 --object-cache "$env:WINDOWS_OBJECT_CACHE"
+              & $builder source-build --plan $plan --source-root $operatorSource --out $build --compute-capability sm_89 --builder-sha $builderSha --nvcc "$env:CUDA_PATH/bin/nvcc.exe" --cuda-toolkit-root $env:CUDA_PATH --ccbin $env:NVCC_CCBIN --ar $env:FERRUM_MSVC_LIB --nvcc-threads 4 --object-cache "$env:WINDOWS_OBJECT_CACHE"
               $buildReceipt = Get-Content "$build/source-build.receipt.json" -Raw | ConvertFrom-Json
               $hits = @($buildReceipt.cache_hit_translation_units).Count
               $compiled = @($buildReceipt.compiled_translation_units).Count
@@ -362,7 +369,7 @@ jobs:
               $stage = 'materialize-package-spec'
               & $builder materialize-package-spec --definition "native-operators/cuda/package-definitions/$operator.json" --g03-catalog $catalog --out $spec
               $stage = 'package'
-              & $builder package --spec $spec --source-root $source --license-root $env:GITHUB_WORKSPACE --source-build-receipt "$build/source-build.receipt.json" --source-build-plan $plan --g03-catalog $catalog --abi-contract 'native-operators/abi/ferrum-native-abi-v2.json' --cc $env:CC --ar $env:FERRUM_MSVC_LIB --out $package
+              & $builder package --spec $spec --source-root $operatorSource --license-root $env:GITHUB_WORKSPACE --source-build-receipt "$build/source-build.receipt.json" --source-build-plan $plan --g03-catalog $catalog --abi-contract 'native-operators/abi/ferrum-native-abi-v2.json' --cc $env:CC --ar $env:FERRUM_MSVC_LIB --out $package
               $stage = 'package receipt'
               $receipt = Join-Path $package 'package.receipt.json'
               $receiptArgs += @('--receipt', $receipt, '--receipt-sha256', (Get-FileHash $receipt -Algorithm SHA256).Hash.ToLowerInvariant())

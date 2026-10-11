@@ -582,6 +582,10 @@ fn required_cuda_native_build_units() -> Vec<CudaNativeBuildUnit> {
             "CARGO_FEATURE_VLLM_PAGED_ATTN_V2",
             CudaNativeBuildUnit::VllmPagedAttentionV2,
         ),
+        (
+            "CARGO_FEATURE_CUDA_INDEXED_CAUSAL_ATTENTION",
+            CudaNativeBuildUnit::VllmIndexedPagedAttentionV2,
+        ),
     ]
     .into_iter()
     .filter_map(|(feature, unit)| env::var_os(feature).is_some().then_some(unit))
@@ -780,6 +784,7 @@ fn emit_native_artifact_build_unit(unit: CudaNativeBuildUnit) {
         CudaNativeBuildUnit::VllmMarlin => "vllm_marlin",
         CudaNativeBuildUnit::VllmMoeMarlin => "vllm_moe_marlin",
         CudaNativeBuildUnit::VllmPagedAttentionV2 => "vllm_paged_attn",
+        CudaNativeBuildUnit::VllmIndexedPagedAttentionV2 => "vllm_indexed_paged_attn",
         CudaNativeBuildUnit::UpstreamLinear => "upstream_linear",
         CudaNativeBuildUnit::UpstreamExtraLinear => "upstream_extra_linear",
         CudaNativeBuildUnit::UpstreamQ6F32Linear => "upstream_q6_f32_linear",

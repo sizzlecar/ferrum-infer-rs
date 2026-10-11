@@ -86,6 +86,25 @@ impl CausalDecodePreparationModeArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CausalDecodeAttentionGroupingArg {
+    Contiguous,
+    Indexed,
+}
+
+impl CausalDecodeAttentionGroupingArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Contiguous => {
+                ferrum_types::CausalDecodeAttentionGrouping::Contiguous.as_runtime_value()
+            }
+            Self::Indexed => {
+                ferrum_types::CausalDecodeAttentionGrouping::Indexed.as_runtime_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
@@ -157,6 +176,13 @@ mod tests {
             match self.command {
                 TestCommand::Run(command) => command.causal_decode_preparation_mode,
                 TestCommand::Serve(command) => command.causal_decode_preparation_mode,
+            }
+        }
+
+        fn causal_decode_attention_grouping(self) -> Option<CausalDecodeAttentionGroupingArg> {
+            match self.command {
+                TestCommand::Run(command) => command.causal_decode_attention_grouping,
+                TestCommand::Serve(command) => command.causal_decode_attention_grouping,
             }
         }
 
@@ -247,6 +273,40 @@ mod tests {
                 command,
                 "test-model",
                 "--causal-decode-preparation-mode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .causal_decode_attention_grouping(),
+                None
+            );
+            for (value, expected) in [
+                ("contiguous", CausalDecodeAttentionGroupingArg::Contiguous),
+                ("indexed", CausalDecodeAttentionGroupingArg::Indexed),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--causal-decode-attention-grouping",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.causal_decode_attention_grouping(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--causal-decode-attention-grouping",
                 "automatic",
             ])
             .is_err());

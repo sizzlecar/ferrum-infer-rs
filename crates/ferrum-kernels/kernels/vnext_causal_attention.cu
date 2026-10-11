@@ -46,6 +46,38 @@ extern "C" __global__ void vnext_causal_gather_decode_lengths(
   }
 }
 
+// Preserve each row's addressed V1/V2 algorithm while joining non-adjacent
+// rows. The admitted replay topology supplies the number of short rows; every
+// replay reads the fresh binding controls and emits stable original row indices
+// (V1 first, then V2). No query, output, or KV allocation is moved. The 512-token
+// boundary is the addressed native operator's fixed partition-size ABI.
+extern "C" __global__ void vnext_causal_gather_decode_lengths_indexed(
+    const int* __restrict__ binding_base,
+    const unsigned long long binding_slot_bytes,
+    int* __restrict__ sequence_lengths,
+    int* __restrict__ row_indices,
+    const int participants,
+    const int v1_count) {
+  const int participant = blockIdx.x * blockDim.x + threadIdx.x;
+  if (participant >= participants || v1_count < 0 || v1_count > participants) {
+    return;
+  }
+  const int length =
+      vnext_participant_control(binding_base, binding_slot_bytes, participant)[3];
+  sequence_lengths[participant] = length;
+  const bool short_row = length <= 512;
+  int ordinal = short_row ? 0 : v1_count;
+  for (int previous = 0; previous < participant; ++previous) {
+    const int previous_length =
+        vnext_participant_control(binding_base, binding_slot_bytes, previous)[3];
+    ordinal += (previous_length <= 512) == short_row;
+  }
+  const int group_end = short_row ? v1_count : participants;
+  if (length > 0 && ordinal >= 0 && ordinal < group_end) {
+    row_indices[ordinal] = participant;
+  }
+}
+
 // Packed query rows are contiguous even when their owning sequences have
 // different active-token counts. Resolve a packed row with a bounded binary
 // search over the stable binding slots so grid.x can be the packed token axis;

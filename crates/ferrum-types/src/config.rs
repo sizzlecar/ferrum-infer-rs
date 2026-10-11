@@ -163,6 +163,48 @@ pub const SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY: &str =
 /// Snapshot identity for an explicit CLI/config option, never an environment switch.
 pub const CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECODE_PREPARATION_MODE";
 
+/// Snapshot identity for explicit attention grouping, never an environment switch.
+pub const CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY: &str =
+    "FERRUM_CAUSAL_DECODE_ATTENTION_GROUPING";
+
+/// Grouping of already selected native V1/V2 causal decode rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalDecodeAttentionGrouping {
+    #[default]
+    Contiguous,
+    Indexed,
+}
+
+impl CausalDecodeAttentionGrouping {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Contiguous => "contiguous",
+            Self::Indexed => "indexed",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "contiguous" => Ok(Self::Contiguous),
+            "indexed" => Ok(Self::Indexed),
+            _ => Err(format!("expected contiguous or indexed; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select causal decode attention grouping through CLI or config, not environment"
+                    .into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Preparation of rows in an eligible native batched causal decode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -372,6 +414,9 @@ pub struct RuntimeKnobs {
     /// Packed preparation applies only to eligible native batched causal decode.
     #[serde(default)]
     pub causal_decode_preparation_mode: CausalDecodePreparationMode,
+    /// Indexed grouping requires packed preparation with native CUDA attention.
+    #[serde(default)]
+    pub causal_decode_attention_grouping: CausalDecodeAttentionGrouping,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -539,6 +584,16 @@ impl EngineConfig {
             self.runtime.causal_decode_preparation_mode =
                 CausalDecodePreparationMode::parse_config_entry(entry).map_err(|reason| {
                     format!("{CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY}: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY)
+        {
+            self.runtime.causal_decode_attention_grouping =
+                CausalDecodeAttentionGrouping::parse_config_entry(entry).map_err(|reason| {
+                    format!("{CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY}: {reason}")
                 })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
@@ -1672,6 +1727,50 @@ mod tests {
     }
 
     #[test]
+    fn causal_decode_attention_grouping_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Contiguous
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("causal_decode_attention_grouping");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Contiguous
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                CausalDecodeAttentionGrouping::Indexed,
+                CausalDecodeAttentionGrouping::Contiguous,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.causal_decode_attention_grouping, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.causal_decode_attention_grouping, mode);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+
+    #[test]
     fn segment_owner_mode_environment_cannot_activate_or_override_typed_config() {
         let key = SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
         let mut config = EngineConfig::default();
@@ -1717,6 +1816,33 @@ mod tests {
         assert_eq!(
             config.runtime.causal_decode_preparation_mode,
             CausalDecodePreparationMode::Packed
+        );
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_environment_cannot_activate_or_override_typed_config() {
+        let key = CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key, "indexed"
+            )]))
+            .unwrap_err()
+            .contains("not environment"));
+        assert_eq!(
+            config.runtime.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Contiguous
+        );
+        config.runtime.causal_decode_attention_grouping = CausalDecodeAttentionGrouping::Indexed;
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "contiguous"
+            )]))
+            .is_err());
+        assert_eq!(
+            config.runtime.causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Indexed
         );
     }
 

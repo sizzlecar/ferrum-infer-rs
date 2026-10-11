@@ -143,46 +143,6 @@ impl Arm {
     }
 }
 
-fn build_launches(
-    shape: CausalAttentionShape,
-    binding: BindingLayout,
-    layout: ScratchLayout,
-    lengths: &[u64],
-) -> Vec<CausalAttentionLaunch> {
-    lengths
-        .iter()
-        .enumerate()
-        .map(|(index, &length)| {
-            let path = CausalAttentionKernelPath::select(
-                AttentionExecutionPolicy::NativeAdaptive,
-                shape,
-                1,
-                length,
-            )
-            .unwrap();
-            let offset = |base, width| layout.token_offset(base, index as u64, width).unwrap();
-            CausalAttentionLaunch {
-                input_region: 0,
-                output_region: 1,
-                binding_offset: binding.binding_offset(index).unwrap(),
-                packed_token_start: index as u64,
-                packed_query_raw: offset(layout.query_raw, shape.query_projection_features),
-                packed_key_raw: offset(layout.key_raw, shape.kv_features),
-                packed_value_raw: offset(layout.value_raw, shape.kv_features),
-                packed_query: offset(layout.query, shape.query_features),
-                packed_context: offset(layout.context, shape.query_features),
-                tokens: 1,
-                tokens_i32: 1,
-                sequence_tokens: length,
-                sequence_tokens_i32: length as i32,
-                table_entries_i32: shape.table_entries(length).unwrap() as i32,
-                replay_topology: CausalAttentionReplayTopology::new(shape, path, length).unwrap(),
-                path,
-            }
-        })
-        .collect()
-}
-
 fn scratch_words(
     shape: CausalAttentionShape,
     layout: ScratchLayout,
@@ -296,6 +256,17 @@ fn check_pages(
 #[test]
 #[ignore = "requires actual CUDA and the pinned addressed-vLLM operator set"]
 fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests() {
+    compare_batches(false);
+}
+
+#[test]
+#[cfg(feature = "cuda-indexed-causal-attention")]
+#[ignore = "requires actual CUDA and the pinned indexed addressed-vLLM operator set"]
+fn indexed_groups_match_contiguous_across_growth_reordering_and_path_transition() {
+    compare_batches(true);
+}
+
+fn compare_batches(indexed: bool) {
     let runtime = CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
             0,
@@ -346,7 +317,18 @@ fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests()
         assert!(launches
             .iter()
             .any(|x| x.path == CausalAttentionKernelPath::VllmAddressedDecodeV2));
-        let batches = [false, true].map(|packed| {
+        let batch_modes = if indexed {
+            [
+                (true, CausalDecodeAttentionGrouping::Contiguous),
+                (true, CausalDecodeAttentionGrouping::Indexed),
+            ]
+        } else {
+            [
+                (false, CausalDecodeAttentionGrouping::Contiguous),
+                (true, CausalDecodeAttentionGrouping::Contiguous),
+            ]
+        };
+        let batches = batch_modes.map(|(packed, grouping)| {
             BatchDecode::for_launches(
                 &launches,
                 true,
@@ -355,11 +337,17 @@ fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests()
                 layout,
                 packed,
                 true, // Independently owned, nonoverlapping fixture KV ranges.
+                grouping,
             )
             .unwrap()
             .unwrap()
         });
-        assert!(batches[0].packed_work().is_none());
+        assert_eq!(batches[0].packed_work().is_some(), indexed);
+        if indexed {
+            assert!(batches[0].groups.len() > 2);
+            assert_eq!(batches[1].groups.len(), 2);
+            assert!(batches[1].row_map.is_some());
+        }
         assert!(batches[1].packed_work().unwrap().prepare.is_some());
         assert_eq!(
             batches[1].packed_work().unwrap().gate_tokens(),
@@ -406,38 +394,21 @@ fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests()
         }
         // Capture the complete production prepare -> gather -> selected V1/V2
         // groups -> optional gate path for each arm. Only payloads change later.
-        let graphs = arms
-            .iter()
-            .zip(&batches)
-            .map(|(arm, batch)| {
-                stream
-                    .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                    .unwrap();
-                batch
-                    .enqueue(
-                        &stream,
-                        &provider.functions,
-                        &launches,
-                        arm.binding_pointer(&stream),
-                        binding_layout,
-                        cuda_shape,
-                        layout,
-                        arm.scratch_pointer(&stream),
-                        query_norm.pointer(&stream),
-                        key_norm.pointer(&stream),
-                        output_gate,
-                    )
-                    .unwrap();
-                stream
-                    .end_capture(
-                        CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-                    )
-                    .unwrap()
-                    .expect("nonempty full batch decode graph")
-            })
-            .collect::<Vec<_>>();
+        let mut graphs = capture_batches(
+            &stream,
+            &provider.functions,
+            &arms,
+            &batches,
+            &launches,
+            binding_layout,
+            cuda_shape,
+            layout,
+            &query_norm,
+            &key_norm,
+            output_gate,
+        );
         let mut previous_query = None;
-        for wave in 0..4 {
+        for wave in 0..if indexed { 6 } else { 4 } {
             if wave == 2 {
                 // Fresh requests really own new physical allocations. The old
                 // owners remain alive and must not change on the new replays.
@@ -459,12 +430,61 @@ fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests()
             }
             let lengths = initial_lengths
                 .iter()
-                .map(|length| length + (wave % 2) as u64)
+                .map(|length| {
+                    if indexed && wave >= 4 && *length <= 512 {
+                        512 + (wave - 4) as u64
+                    } else {
+                        length + (wave % 2) as u64
+                    }
+                })
                 .collect::<Vec<_>>();
             let current = build_launches(shape, binding_layout, layout, &lengths);
-            for (before, now) in launches.iter().zip(&current) {
-                assert_eq!(before.path, now.path);
-                assert_eq!(before.replay_topology, now.replay_topology);
+            if indexed && wave == 5 {
+                let updated = batch_modes.map(|(packed, grouping)| {
+                    BatchDecode::for_launches(
+                        &current,
+                        true,
+                        binding_layout,
+                        shape,
+                        layout,
+                        packed,
+                        true,
+                        grouping,
+                    )
+                    .unwrap()
+                    .unwrap()
+                });
+                let key = |batch: &BatchDecode| {
+                    batch
+                        .bind_replay(CudaCommandReplayKeyBuilder::new("fixture", "causal"))
+                        .finish()
+                        .bind_runtime_payload("causal", std::iter::empty(), &[])
+                };
+                assert_ne!(key(&batches[1]), key(&updated[1]));
+                assert_eq!(updated[1].v1_count, 0);
+                assert_eq!(updated[1].groups.len(), 1);
+                // A length crossing 512 changes the host topology/map and
+                // captures a new graph. Existing replay must not choose math.
+                stream.synchronize().unwrap();
+                graphs.clear();
+                graphs = capture_batches(
+                    &stream,
+                    &provider.functions,
+                    &arms,
+                    &updated,
+                    &current,
+                    binding_layout,
+                    cuda_shape,
+                    layout,
+                    &query_norm,
+                    &key_norm,
+                    output_gate,
+                );
+            } else {
+                for (before, now) in launches.iter().zip(&current) {
+                    assert_eq!(before.path, now.path);
+                    assert_eq!(before.replay_topology, now.replay_topology);
+                }
             }
             let input = scratch_words(shape, layout, &requests, wave);
             let expected_bindings = arms
@@ -488,11 +508,54 @@ fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests()
                 .iter()
                 .map(|arm| stream.clone_dtoh(&arm.scratch).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(
-                bits(&actual[0]),
-                bits(&actual[1]),
-                "whole scratch differs, including prepared query/context and partition output"
-            );
+            if !indexed {
+                assert_eq!(
+                    bits(&actual[0]),
+                    bits(&actual[1]),
+                    "whole scratch differs, including prepared query/context and partition output"
+                );
+            } else {
+                for (base, width) in [
+                    (layout.query, shape.query_features),
+                    (layout.context, shape.query_features),
+                ] {
+                    let begin = GUARD_WORDS + base as usize / 2;
+                    let end = begin + participants * width as usize;
+                    assert_eq!(
+                        bits(&actual[0][begin..end]),
+                        bits(&actual[1][begin..end]),
+                        "indexed grouping changed original-row query/context bits"
+                    );
+                }
+                // V2 temporary rows are group-local and intentionally differ.
+                // Check actual dense lengths/map plus the untouched padding.
+                let partition = layout.vllm.unwrap();
+                let read_i32 = |words: &[f16], base: u64| {
+                    (0..participants)
+                        .map(|i| {
+                            let j = GUARD_WORDS + base as usize / 2 + i * 2;
+                            (u32::from(words[j].to_bits())
+                                | (u32::from(words[j + 1].to_bits()) << 16))
+                                as i32
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    read_i32(&actual[1], partition.sequence_lengths),
+                    lengths.iter().map(|&x| x as i32).collect::<Vec<_>>()
+                );
+                let expected_map =
+                    indexed_row_map(&current.iter().map(|x| x.path).collect::<Vec<_>>()).unwrap();
+                assert_eq!(read_i32(&actual[1], partition.row_indices), expected_map);
+                let padding = GUARD_WORDS + (partition.row_indices as usize + participants * 4) / 2;
+                for words in &actual {
+                    assert_eq!(
+                        bits(&words[padding..words.len() - GUARD_WORDS]),
+                        bits(&input[padding..input.len() - GUARD_WORDS]),
+                        "gather escaped admitted length/map arrays"
+                    );
+                }
+            }
             for (arm, binding) in arms.iter().zip(&expected_bindings) {
                 assert_eq!(
                     stream.clone_dtoh(&arm.binding).unwrap(),
@@ -500,25 +563,27 @@ fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests()
                     "binding/control/slot guards modified"
                 );
             }
-            let words = &actual[0];
-            assert_eq!(&words[..GUARD_WORDS], &input[..GUARD_WORDS]);
-            assert_eq!(
-                &words[words.len() - GUARD_WORDS..],
-                &input[input.len() - GUARD_WORDS..]
-            );
-            for (base, width) in [
-                (layout.query_raw, shape.query_projection_features),
-                (layout.key_raw, shape.kv_features),
-                (layout.value_raw, shape.kv_features),
-            ] {
-                let begin = GUARD_WORDS + base as usize / 2;
-                let end = begin + participants * width as usize;
+            for words in &actual {
+                assert_eq!(&words[..GUARD_WORDS], &input[..GUARD_WORDS]);
                 assert_eq!(
-                    bits(&words[begin..end]),
-                    bits(&input[begin..end]),
-                    "projection inputs modified"
+                    &words[words.len() - GUARD_WORDS..],
+                    &input[input.len() - GUARD_WORDS..]
                 );
+                for (base, width) in [
+                    (layout.query_raw, shape.query_projection_features),
+                    (layout.key_raw, shape.kv_features),
+                    (layout.value_raw, shape.kv_features),
+                ] {
+                    let begin = GUARD_WORDS + base as usize / 2;
+                    let end = begin + participants * width as usize;
+                    assert_eq!(
+                        bits(&words[begin..end]),
+                        bits(&input[begin..end]),
+                        "projection inputs modified"
+                    );
+                }
             }
+            let words = &actual[0];
             let query_begin = GUARD_WORDS + layout.query as usize / 2;
             let query =
                 &words[query_begin..query_begin + participants * shape.query_features as usize];
@@ -538,6 +603,51 @@ fn packed_prepare_gate_matches_loop_across_current_bindings_pages_and_requests()
         // Graphs die before all pointed-to allocations. No driver-fault or
         // failed-drain lifetime guarantee is asserted by this success oracle.
         drop(graphs);
-        println!("packed_prepare_gate_oracle head_dim={head_dim} participants={participants} output_gate={output_gate} physical_page_tokens={page_tokens} complete_query_context_kv_bits_equal=true current_binding_growth_and_new_request_allocations=true shared_allocation_disjoint_page_ranges=true");
+        println!("packed_prepare_gate_oracle indexed_grouping={indexed} head_dim={head_dim} participants={participants} output_gate={output_gate} physical_page_tokens={page_tokens} complete_query_context_kv_bits_equal=true current_binding_growth_and_new_request_allocations=true shared_allocation_disjoint_page_ranges=true");
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_batches(
+    stream: &Arc<CudaStream>,
+    functions: &CausalAttentionFunctions,
+    arms: &[Arm; 2],
+    batches: &[BatchDecode; 2],
+    launches: &[CausalAttentionLaunch],
+    binding_layout: BindingLayout,
+    cuda_shape: CudaCausalAttentionShape,
+    layout: ScratchLayout,
+    query_norm: &Guarded<f16>,
+    key_norm: &Guarded<f16>,
+    output_gate: bool,
+) -> Vec<cudarc::driver::CudaGraph> {
+    arms.iter()
+        .zip(batches)
+        .map(|(arm, batch)| {
+            stream
+                .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .unwrap();
+            batch
+                .enqueue(
+                    &stream,
+                    functions,
+                    launches,
+                    arm.binding_pointer(&stream),
+                    binding_layout,
+                    cuda_shape,
+                    layout,
+                    arm.scratch_pointer(&stream),
+                    query_norm.pointer(&stream),
+                    key_norm.pointer(&stream),
+                    output_gate,
+                )
+                .unwrap();
+            stream
+                .end_capture(
+                    CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                )
+                .unwrap()
+                .expect("nonempty full batch decode graph")
+        })
+        .collect::<Vec<_>>()
 }

@@ -1211,7 +1211,24 @@ fn validate_causal_decode_preparation_mode(
     config: &ComponentConfig,
     plan_runtime: bool,
 ) -> Result<()> {
-    use ferrum_types::{AttentionExecutionPolicy, CausalDecodePreparationMode};
+    use ferrum_types::{
+        AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
+    };
+    if config
+        .engine_config
+        .runtime
+        .causal_decode_attention_grouping
+        == CausalDecodeAttentionGrouping::Indexed
+        && (config.engine_config.runtime.causal_decode_preparation_mode
+            != CausalDecodePreparationMode::Packed
+            || !matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || !cfg!(feature = "cuda-indexed-causal-attention"))
+    {
+        return Err(FerrumError::unsupported(
+            "indexed causal decode attention grouping requires packed preparation on a CUDA plan runtime with compiled indexed native attention",
+        ));
+    }
     if config.engine_config.runtime.causal_decode_preparation_mode
         == CausalDecodePreparationMode::PerParticipant
     {
@@ -1346,7 +1363,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_causal_decode_preparation_mode(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_causal_decode_attention_grouping(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1357,6 +1374,7 @@ fn create_registered_vnext_executor(
                         ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
                         config.engine_config.runtime.segment_binding_owner_view_mode,
                         config.engine_config.runtime.causal_decode_preparation_mode,
+                        config.engine_config.runtime.causal_decode_attention_grouping,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -2212,6 +2230,144 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("packed causal decode preparation"));
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_checks_direct_config_before_default_early_return() {
+        use ferrum_types::{CausalDecodeAttentionGrouping, CausalDecodePreparationMode};
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        assert_eq!(
+            config
+                .engine_config
+                .runtime
+                .causal_decode_attention_grouping,
+            CausalDecodeAttentionGrouping::Contiguous
+        );
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config
+                    .engine_config
+                    .runtime
+                    .causal_decode_attention_grouping = CausalDecodeAttentionGrouping::Contiguous;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                config
+                    .engine_config
+                    .runtime
+                    .causal_decode_attention_grouping = CausalDecodeAttentionGrouping::Indexed;
+                assert!(
+                    validate_causal_decode_preparation_mode(&config, plan_runtime)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(
+                            "indexed causal decode attention grouping requires packed preparation"
+                        )
+                );
+            }
+        }
+        config.engine_config.runtime.causal_decode_preparation_mode =
+            CausalDecodePreparationMode::Packed;
+        config.device = Device::CPU;
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        config.device = Device::CUDA(0);
+        assert!(validate_causal_decode_preparation_mode(&config, false).is_err());
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_requires_native_fp16_but_keeps_other_strategies_independent(
+    ) {
+        use ferrum_types::{
+            AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
+            InvocationPreparationStrategy, KvCacheDtype, ProgramBindingUploadStrategy,
+            SegmentBindingOwnerViewMode,
+        };
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        config.device = Device::CUDA(0);
+        config
+            .engine_config
+            .runtime
+            .causal_decode_attention_grouping = CausalDecodeAttentionGrouping::Indexed;
+        config.engine_config.runtime.causal_decode_preparation_mode =
+            CausalDecodePreparationMode::Packed;
+        config.engine_config.runtime.attention_execution_policy =
+            AttentionExecutionPolicy::Portable;
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        config.engine_config.runtime.attention_execution_policy = AttentionExecutionPolicy::Auto;
+        config.engine_config.kv_cache.dtype = KvCacheDtype::Int8;
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        config.engine_config.runtime.attention_execution_policy =
+            AttentionExecutionPolicy::NativeAdaptive;
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        config.engine_config.kv_cache.dtype = KvCacheDtype::Fp16;
+        #[cfg(feature = "cuda")]
+        let supported = ferrum_kernels::backend::cuda::vnext_ops::cuda_vnext_capabilities()
+            .unwrap()
+            .iter()
+            .any(|capability| {
+                capability.as_str()
+                    == ferrum_interfaces::vnext::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+            })
+            && cfg!(feature = "cuda-indexed-causal-attention");
+        #[cfg(not(feature = "cuda"))]
+        let supported = false;
+        for policy in [
+            AttentionExecutionPolicy::Auto,
+            AttentionExecutionPolicy::NativeAdaptive,
+        ] {
+            config.engine_config.runtime.attention_execution_policy = policy;
+            for (preparation, upload, owners) in [
+                (
+                    InvocationPreparationStrategy::Full,
+                    ProgramBindingUploadStrategy::Sparse,
+                    SegmentBindingOwnerViewMode::Legacy,
+                ),
+                (
+                    InvocationPreparationStrategy::DecodeSegmentProgram,
+                    ProgramBindingUploadStrategy::CompactScatter,
+                    SegmentBindingOwnerViewMode::Indexed,
+                ),
+            ] {
+                config.engine_config.runtime.invocation_preparation_strategy = preparation;
+                config.engine_config.runtime.program_binding_upload_strategy = upload;
+                config.engine_config.runtime.segment_binding_owner_view_mode = owners;
+                assert_eq!(
+                    validate_causal_decode_preparation_mode(&config, true).is_ok(),
+                    supported
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_rejects_unsupported_factories_before_loading() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.causal_decode_attention_grouping =
+            ferrum_types::CausalDecodeAttentionGrouping::Indexed;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("indexed causal decode attention grouping"));
+        config.device = Device::CUDA(0);
+        assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("indexed causal decode attention grouping"));
+        config.engine_config.runtime.causal_decode_preparation_mode =
+            ferrum_types::CausalDecodePreparationMode::Packed;
+        assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("indexed causal decode attention grouping"));
     }
 
     #[test]

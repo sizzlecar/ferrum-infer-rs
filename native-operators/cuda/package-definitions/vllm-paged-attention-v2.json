@@ -12,9 +12,13 @@
       "provider_id": "provider.cuda.causal_paged_attention.f16",
       "entrypoints": [
         "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed",
+        "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed_indexed_v1",
         "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed",
+        "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed_indexed_v1",
         "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed",
-        "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed"
+        "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed_indexed_v1",
+        "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed",
+        "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed_indexed_v1"
       ]
     }
   ],
@@ -24,9 +28,13 @@
     "ferrum_vllm_paged_attention_v2_f16_h128_b16",
     "ferrum_vllm_paged_attention_v2_f16_h256_b16",
     "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed",
+    "ferrum_vnext_vllm_paged_attention_v1_f16_h128_b16_addressed_indexed_v1",
     "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed",
+    "ferrum_vnext_vllm_paged_attention_v1_f16_h256_b16_addressed_indexed_v1",
     "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed",
-    "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed"
+    "ferrum_vnext_vllm_paged_attention_v2_f16_h128_b16_addressed_indexed_v1",
+    "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed",
+    "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_addressed_indexed_v1"
   ],
   "license_files": [
     {

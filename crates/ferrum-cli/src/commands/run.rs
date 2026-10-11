@@ -891,6 +891,10 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
 
+    /// Causal decode grouping (default: contiguous). Indexed requires packed native CUDA attention.
+    #[arg(long, value_enum)]
+    pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -2748,6 +2752,12 @@ fn run_startup_cli_runtime_entries(
         cmd.causal_decode_preparation_mode
             .map(crate::commands::CausalDecodePreparationModeArg::as_runtime_value),
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+        cmd.causal_decode_attention_grouping
+            .map(crate::commands::CausalDecodeAttentionGroupingArg::as_runtime_value),
+    );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
         "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
@@ -3053,6 +3063,69 @@ mod tests {
     }
 
     #[test]
+    fn causal_decode_attention_grouping_run_precedence_preserves_upload_policy() {
+        use crate::commands::CausalDecodeAttentionGroupingArg as Arg;
+        use ferrum_types::{
+            CausalDecodeAttentionGrouping as Mode,
+            CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Contiguous, None),
+            (
+                Some(Mode::Indexed),
+                None,
+                Mode::Indexed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Indexed),
+                Some(Arg::Contiguous),
+                Mode::Contiguous,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Contiguous),
+                Some(Arg::Indexed),
+                Mode::Indexed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                causal_decode_attention_grouping: config_mode,
+                causal_decode_preparation_mode: Some(
+                    ferrum_types::CausalDecodePreparationMode::Packed,
+                ),
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.causal_decode_attention_grouping = cli_mode;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.causal_decode_attention_grouping, expected);
+            assert_eq!(
+                engine.runtime.causal_decode_preparation_mode,
+                ferrum_types::CausalDecodePreparationMode::Packed
+            );
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
     fn invocation_preparation_run_override_reaches_engine_config() {
         use crate::commands::InvocationPreparationStrategyArg;
         use ferrum_types::InvocationPreparationStrategy;
@@ -3139,6 +3212,7 @@ mod tests {
             program_binding_upload_strategy: None,
             segment_binding_owner_view_mode: None,
             causal_decode_preparation_mode: None,
+            causal_decode_attention_grouping: None,
             scheduler_slo: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,

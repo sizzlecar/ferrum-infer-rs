@@ -117,6 +117,33 @@ impl Fixture {
         attention_policy: ferrum_types::AttentionExecutionPolicy,
         preparation_mode: ferrum_types::CausalDecodePreparationMode,
     ) -> Self {
+        Self::for_family_with_decode_attention_grouping(
+            kind,
+            reusable,
+            participants,
+            definition,
+            upload_strategy,
+            oracle,
+            owner_mode,
+            attention_policy,
+            preparation_mode,
+            ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_family_with_decode_attention_grouping(
+        kind: AttentionKind,
+        reusable: bool,
+        participants: u32,
+        definition: Family,
+        upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
+        oracle: SegmentBindingOracleMode,
+        owner_mode: SegmentBindingOwnerViewMode,
+        attention_policy: ferrum_types::AttentionExecutionPolicy,
+        preparation_mode: ferrum_types::CausalDecodePreparationMode,
+        attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    ) -> Self {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let attention_arithmetic = definition.attention_arithmetic();
@@ -129,7 +156,7 @@ impl Fixture {
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
         let (runtime, registry, materializers, catalog) =
-            CudaVNextComposition::create_with_causal_decode_preparation_mode(
+            CudaVNextComposition::create_with_causal_decode_attention_grouping(
                 0,
                 id(format!("device.cuda.upstream-marker.{kind:?}")),
                 attention_policy,
@@ -137,6 +164,7 @@ impl Fixture {
                 oracle,
                 owner_mode,
                 preparation_mode,
+                attention_grouping,
             )
             .unwrap()
             .into_parts();

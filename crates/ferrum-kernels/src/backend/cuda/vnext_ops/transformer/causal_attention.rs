@@ -22,7 +22,7 @@ use ferrum_interfaces::vnext::{
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
 };
 use ferrum_types::{
-    AttentionExecutionPolicy, ProgramBindingUploadStrategy,
+    AttentionExecutionPolicy, CausalDecodeAttentionGrouping, ProgramBindingUploadStrategy,
     CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
 };
 use sha2::{Digest, Sha256};
@@ -144,6 +144,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     attention_policy: AttentionExecutionPolicy,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     packed_decode_prepare_gate: bool,
+    decode_attention_grouping: CausalDecodeAttentionGrouping,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     q8act: bool,
@@ -214,6 +215,7 @@ struct CausalAttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     gather_decode_lengths: CudaFunction,
+    gather_decode_lengths_indexed: CudaFunction,
     attention: CudaFunction,
     grouped_attention: CudaFunction,
     varlen_addressed: CudaFunction,
@@ -443,9 +445,12 @@ impl CudaCausalPagedAttentionProvider {
         let source = include_str!("causal_attention.rs");
         let packed_decode_prepare_gate = runtime.packed_decode_prepare_gate_enabled();
         let packed_decode_mode = [u8::from(packed_decode_prepare_gate)];
+        let decode_attention_grouping = runtime.causal_decode_attention_grouping();
+        let grouping_identity = decode_attention_grouping.as_runtime_value().as_bytes();
         let mut provider_sources = vec![
             source.as_bytes(),
             packed_decode_mode.as_slice(),
+            grouping_identity,
             include_bytes!("q8act_attention.rs"),
             include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
@@ -496,6 +501,7 @@ impl CudaCausalPagedAttentionProvider {
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
             packed_decode_mode.as_slice(),
+            grouping_identity,
             include_bytes!("q8act_attention.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             estimator_id.as_bytes(),
@@ -731,6 +737,11 @@ impl CudaCausalPagedAttentionProvider {
                 "vnext_causal_gather_decode_lengths",
                 "causal attention decode length gather",
             )?,
+            gather_decode_lengths_indexed: load_function(
+                &attention_module,
+                "vnext_causal_gather_decode_lengths_indexed",
+                "causal attention indexed decode length gather",
+            )?,
             attention: load_function(
                 &attention_module,
                 if semantics.int8_kv() {
@@ -778,6 +789,7 @@ impl CudaCausalPagedAttentionProvider {
             attention_policy,
             program_binding_upload_strategy: runtime.program_binding_upload_strategy(),
             packed_decode_prepare_gate,
+            decode_attention_grouping,
             semantics,
             precision,
             q8act,
@@ -1005,6 +1017,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.attention_policy,
             self.program_binding_upload_strategy,
             self.packed_decode_prepare_gate,
+            self.decode_attention_grouping,
             self.semantics,
             self.precision,
             self.descriptor.operation_id().as_str(),
@@ -1045,6 +1058,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.attention_policy,
             self.program_binding_upload_strategy,
             self.packed_decode_prepare_gate,
+            self.decode_attention_grouping,
             self.semantics,
             self.precision,
             self.descriptor.operation_id().as_str(),
@@ -1099,6 +1113,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 self.attention_policy,
                 self.program_binding_upload_strategy,
                 self.packed_decode_prepare_gate,
+                self.decode_attention_grouping,
                 self.semantics,
                 self.precision,
                 self.descriptor.operation_id().as_str(),
@@ -2016,6 +2031,7 @@ struct VllmScratchLayout {
     max_logits: u64,
     temporary_output: u64,
     sequence_lengths: u64,
+    row_indices: u64,
     participants: u64,
 }
 
@@ -2099,11 +2115,32 @@ impl ScratchLayout {
                     .ok_or("causal attention batch lengths overflow")?,
                 1,
             )?;
+            // The admitted length reservation contains 16 bytes per owner.
+            // Two disjoint dense i32 arrays use eight: current lengths, then
+            // the stable original-row permutation regenerated each submission.
+            let row_indices = sequence_lengths
+                .checked_add(
+                    participants
+                        .checked_mul(4)
+                        .ok_or("row-map size overflows")?,
+                )
+                .ok_or("row-map offset overflows")?;
+            if row_indices
+                .checked_add(
+                    participants
+                        .checked_mul(4)
+                        .ok_or("row-map size overflows")?,
+                )
+                .is_none_or(|end| end > offset)
+            {
+                return Err("causal row map escapes admitted length reservation".into());
+            }
             Some(VllmScratchLayout {
                 exp_sums,
                 max_logits,
                 temporary_output,
                 sequence_lengths,
+                row_indices,
                 participants,
             })
         };
@@ -2353,6 +2390,7 @@ fn encode_attention(
     attention_policy: AttentionExecutionPolicy,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     packed_decode_prepare_gate: bool,
+    decode_attention_grouping: CausalDecodeAttentionGrouping,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     operation_id: &str,
@@ -2883,14 +2921,19 @@ fn encode_attention(
         layout,
         packed_decode_prepare_gate,
         independent_sequence_kv,
+        decode_attention_grouping,
     )?;
-    let compute_dispatch_count = physical_dispatch_count(
-        launches.iter().map(|launch| launch.path),
-        shape.output_gate,
-        shape.post_attention_norm,
-        packed_enabled,
-        batch_decode.as_ref().and_then(|batch| batch.packed_work()),
-    );
+    let compute_dispatch_count = if let Some(batch) = &batch_decode {
+        batch.dispatch_count(&launches, shape.output_gate, shape.post_attention_norm)
+    } else {
+        physical_dispatch_count(
+            launches.iter().map(|launch| launch.path),
+            shape.output_gate,
+            shape.post_attention_norm,
+            packed_enabled,
+            None,
+        )
+    };
     let projection_extra = if packed_enabled {
         native_projection_extra_dispatches(&shared, total_tokens)?
     } else {
@@ -2991,6 +3034,7 @@ fn encode_attention(
                 .u64(layout.vllm.map_or(0, |vllm| vllm.max_logits))
                 .u64(layout.vllm.map_or(0, |vllm| vllm.temporary_output))
                 .u64(layout.vllm.map_or(0, |vllm| vllm.sequence_lengths))
+                .u64(layout.vllm.map_or(0, |vllm| vllm.row_indices))
                 .u64(layout.vllm.map_or(0, |vllm| vllm.participants))
                 .u64(binding_layout.required_bytes)
                 .u64(binding_layout.slot_bytes)
@@ -3000,6 +3044,9 @@ fn encode_attention(
                 batch_decode.as_ref().and_then(|batch| batch.packed_work()),
                 shape.output_gate,
             );
+            if let Some(batch) = &batch_decode {
+                replay_key = batch.bind_replay(replay_key);
+            }
             for launch in &launches {
                 let replay_envelope = launch.replay_topology.envelope();
                 replay_key = replay_key

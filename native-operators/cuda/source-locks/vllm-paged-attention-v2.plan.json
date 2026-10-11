@@ -2,9 +2,9 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_paged_attention_v2",
   "source_package": {
-    "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
-    "sha256": "de439dd07a2c34efc0a9f7c74b67291d347d28cdf2dd342084c031cfd93ec253"
+    "kind": "ferrum-native-source-overlay",
+    "revision": "ferrum-vllm-addressed-indexed-v1+sha256.3dca5c7432c174ed9b2e905c67fd4314de8e0ad04319788366cf66465841a4d5",
+    "sha256": "e39129527e1dfe879703d25d9cea650c414cf0db3dba05c7f6d2c9e5e2d470eb"
   },
   "upstream_sources": [
     {
@@ -16,7 +16,7 @@
   "translation_units": [
     {
       "path": "kernels/vllm_attn/launcher.cu",
-      "sha256": "19cdd5472b11b7a950a38f71ec00191acfdff93bc8dc967ca863288870911ca6"
+      "sha256": "68af197aa4c477dbf53b09e43d4d74fc4bd887b05c4a3c4d1f737cb5ca78789e"
     }
   ],
   "headers": [
@@ -30,7 +30,7 @@
     },
     {
       "path": "kernels/vllm_attn/attention_kernels.cuh",
-      "sha256": "4a961f33700f62a2250157dd41f8db66e5a31c00c0076d82eca02eb16640c97e"
+      "sha256": "228342b821814b225c21e8c8c3cc14eae39988d08b90bbc26fa532b03cdadf1d"
     },
     {
       "path": "kernels/vllm_attn/attention_utils.cuh",
@@ -79,7 +79,7 @@
         },
         {
           "path": "kernels/vllm_attn/attention_kernels.cuh",
-          "sha256": "4a961f33700f62a2250157dd41f8db66e5a31c00c0076d82eca02eb16640c97e"
+          "sha256": "228342b821814b225c21e8c8c3cc14eae39988d08b90bbc26fa532b03cdadf1d"
         },
         {
           "path": "kernels/vllm_attn/attention_utils.cuh",
@@ -114,7 +114,7 @@
           "sha256": "cb3bb3d40f972dd2649d42536c26c767f68dfb5c09ba9d4856299a888af12f17"
         }
       ],
-      "closure_sha256": "c69b65bb947965044559c731174eb1a233381fc028121fdb21e1deaf24c8d469"
+      "closure_sha256": "0b60fcddc3f9fa09d2167bf2c71056dc9c221d341ec7fd3bc3991d550d99fba5"
     }
   ],
   "include_dirs": [

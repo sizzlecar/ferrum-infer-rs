@@ -144,6 +144,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
 
+    /// Causal decode grouping (default: contiguous). Indexed requires packed native CUDA attention.
+    #[arg(long, value_enum)]
+    pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -431,6 +435,7 @@ async fn execute_with_compatibility(
         program_binding_upload_strategy,
         segment_binding_owner_view_mode,
         causal_decode_preparation_mode,
+        causal_decode_attention_grouping,
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
@@ -896,6 +901,10 @@ async fn execute_with_compatibility(
     push_causal_decode_preparation_mode_cli_entry(
         &mut startup_cli_runtime_entries,
         causal_decode_preparation_mode,
+    );
+    push_causal_decode_attention_grouping_cli_entry(
+        &mut startup_cli_runtime_entries,
+        causal_decode_attention_grouping,
     );
     startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
@@ -1647,6 +1656,17 @@ fn push_causal_decode_preparation_mode_cli_entry(
     );
 }
 
+fn push_causal_decode_attention_grouping_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    mode: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+        mode.map(crate::commands::CausalDecodeAttentionGroupingArg::as_runtime_value),
+    );
+}
+
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
     kv_capacity: Option<usize>,
@@ -2389,6 +2409,7 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
     CompiledKernelFeatures {
         cuda: cfg!(feature = "cuda"),
         vllm_paged_attn: cfg!(feature = "vllm-paged-attn-v2"),
+        cuda_indexed_causal_attention: cfg!(feature = "cuda-indexed-causal-attention"),
         vllm_moe_marlin: cfg!(feature = "vllm-moe-marlin"),
         cuda_graph: cfg!(feature = "cuda"),
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
@@ -2682,6 +2703,69 @@ mod tests {
             let mut engine = ferrum_types::EngineConfig::default();
             engine.apply_runtime_config_snapshot(&snapshot).unwrap();
             assert_eq!(engine.runtime.causal_decode_preparation_mode, expected);
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_attention_grouping_serve_precedence_preserves_upload_policy() {
+        use crate::commands::CausalDecodeAttentionGroupingArg as Arg;
+        use ferrum_types::{
+            CausalDecodeAttentionGrouping as Mode,
+            CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Contiguous, None),
+            (
+                Some(Mode::Indexed),
+                None,
+                Mode::Indexed,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::Indexed),
+                Some(Arg::Contiguous),
+                Mode::Contiguous,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Contiguous),
+                Some(Arg::Indexed),
+                Mode::Indexed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                causal_decode_attention_grouping: config_mode,
+                causal_decode_preparation_mode: Some(
+                    ferrum_types::CausalDecodePreparationMode::Packed,
+                ),
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_causal_decode_attention_grouping_cli_entry(&mut cli_entries, cli_mode);
+            let snapshot = merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.causal_decode_attention_grouping, expected);
+            assert_eq!(
+                engine.runtime.causal_decode_preparation_mode,
+                ferrum_types::CausalDecodePreparationMode::Packed
+            );
             assert_eq!(
                 engine.runtime.program_binding_upload_strategy,
                 ferrum_types::ProgramBindingUploadStrategy::CompactScatter
