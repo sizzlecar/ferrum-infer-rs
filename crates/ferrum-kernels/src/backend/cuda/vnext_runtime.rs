@@ -4567,6 +4567,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 .as_deref()
                 .expect("reusable execution capture retained node attribution");
             if let Err(error) = stream.executable_cache.register_program(
+                compute_path_requirement,
                 capture,
                 &executable_candidates,
                 &command_phases,

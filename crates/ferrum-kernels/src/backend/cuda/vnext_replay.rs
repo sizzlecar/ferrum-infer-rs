@@ -17,13 +17,14 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
 use ferrum_interfaces::vnext::{
-    DeviceCommandPhase, DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
-    DeviceReusableExecutionCapture, DeviceReusableExecutionEntryIdentity,
-    DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
-    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
-    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
-    DeviceReusableExecutionSegment, DeviceSubmissionTimingSink, DeviceTimingMode, ElementType,
+    DeviceCommandPhase, DeviceComputePathRequirement, DeviceReplayedLogicalCommandAttribution,
+    DeviceReusableAddressScope, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionEntryIdentity, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionPreparationState, DeviceReusableExecutionProgram,
+    DeviceReusableExecutionProgramGap, DeviceReusableExecutionProgramGapReason,
+    DeviceReusableExecutionProgramId, DeviceReusableExecutionSegment, DeviceSubmissionTimingSink,
+    DeviceTimingMode, ElementType,
 };
 use sha2::{Digest, Sha256};
 
@@ -1415,6 +1416,7 @@ impl CudaExecutableCache {
 
     pub(crate) fn register_program<S: DeviceSubmissionTimingSink>(
         &mut self,
+        compute_path: DeviceComputePathRequirement,
         capture: &DeviceReusableExecutionCapture,
         candidates: &[CudaExecutableCandidate],
         command_phases: &[DeviceCommandPhase],
@@ -1423,6 +1425,14 @@ impl CudaExecutableCache {
         preparation: &CudaExecutablePreparation,
         timing_sink: &S,
     ) -> Result<(), CudaReplayError> {
+        // Only Adaptive discovers candidates for this submission. A forced
+        // eager or direct replay submission supplies no candidates; that is
+        // not evidence that an existing resident segment was evicted. Leave
+        // its descriptor and recipe identity unchanged until an actual cache
+        // update or explicit eviction takes place.
+        if compute_path != DeviceComputePathRequirement::Adaptive {
+            return Ok(());
+        }
         if !self.preparation.capture_is_open() {
             return Ok(());
         }
