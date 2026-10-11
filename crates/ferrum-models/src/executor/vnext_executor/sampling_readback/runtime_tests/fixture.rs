@@ -365,6 +365,10 @@ impl<R: DeviceRuntime> Fixture<R> {
         engine.batching.max_num_batched_tokens = MAX_TOKENS;
         engine.runtime.max_model_len = Some(MAX_TOKENS);
         engine.runtime.sampling_readback_mode = mode;
+        if matches!(&info.device, Device::CUDA(_)) {
+            // This attention-free fixture installs the portable CUDA composition.
+            engine.runtime.attention_execution_policy = AttentionExecutionPolicy::Portable;
+        }
         engine.backend.enable_reusable_execution = false;
         let executor = VNextModelExecutor::from_runtime_composition(
             &prepared,
