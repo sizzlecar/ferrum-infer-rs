@@ -27,6 +27,8 @@ use super::{
 
 mod readback_collection;
 pub use readback_collection::*;
+mod readback_selection;
+pub use readback_selection::*;
 mod segment_binding_publication;
 use segment_binding_publication::SegmentBindingRecipeCache;
 pub use segment_binding_publication::{ReadySegmentBindingPublication, SegmentBindingPublication};
@@ -2163,6 +2165,76 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         })
     }
 
+    pub(crate) fn wait_bound_with_readback_selection(
+        &self,
+        slot_id: CompletionSlotId,
+        request: CompletionReadbackSelectionRequest,
+    ) -> Result<CompletionReadbackSelectionObservation, VNextError> {
+        self.validate_bound_readback_selection(slot_id, &request)?;
+        let observation = self.observe_bound_with(
+            slot_id,
+            true,
+            |resources, lane, batch_identity, disposition, timing_mode| {
+                attempt_completion_readback_selection(
+                    resources,
+                    lane,
+                    batch_identity,
+                    disposition,
+                    timing_mode,
+                    request,
+                )
+            },
+        )?;
+        Ok(match observation {
+            BoundCompletionObservation::Pending => CompletionReadbackBatchObservation::Pending,
+            BoundCompletionObservation::Terminal {
+                completion,
+                terminal,
+            } => CompletionReadbackBatchObservation::Terminal(CompletionReadbackBatchReceipt::new(
+                completion, terminal,
+            )),
+            BoundCompletionObservation::Indeterminate(failures) => {
+                CompletionReadbackBatchObservation::Indeterminate(failures)
+            }
+            BoundCompletionObservation::SubmissionIndeterminate => {
+                CompletionReadbackBatchObservation::SubmissionIndeterminate
+            }
+            BoundCompletionObservation::ObservationPanicked => {
+                CompletionReadbackBatchObservation::ObservationPanicked
+            }
+            BoundCompletionObservation::Quarantined(receipt) => {
+                CompletionReadbackBatchObservation::Quarantined(receipt)
+            }
+        })
+    }
+
+    fn validate_bound_readback_selection(
+        &self,
+        slot_id: CompletionSlotId,
+        request: &CompletionReadbackSelectionRequest,
+    ) -> Result<(), VNextError> {
+        let record = self.lookup(slot_id)?;
+        let guard = record
+            .lock()
+            .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
+        match &*guard {
+            CompletionRecord::InFlight { batch_identity, .. }
+            | CompletionRecord::SubmissionIndeterminate { batch_identity, .. } => {
+                request.validate_for(batch_identity)
+            }
+            CompletionRecord::Reserved => Err(invalid_completion(
+                "completion slot has not reached submission",
+            )),
+            CompletionRecord::Quarantined { .. } => Ok(()),
+            CompletionRecord::StateTransfer(_) => Err(invalid_completion(
+                "native transfers do not expose model readback",
+            )),
+            CompletionRecord::Reaped => {
+                Err(invalid_completion("completion slot is already reaped"))
+            }
+        }
+    }
+
     fn validate_bound_readback_batch(
         &self,
         slot_id: CompletionSlotId,
@@ -3411,6 +3483,30 @@ fn attempt_completion_readback_collection<R: DeviceRuntime>(
         .collect()
 }
 
+fn attempt_completion_readback_selection<R: DeviceRuntime>(
+    resources: &CompletionResourceLease<R>,
+    lane: &Arc<ExecutionLane<R>>,
+    batch_identity: &BatchOperationIdentity,
+    completion_disposition: &OperationCompletionDisposition,
+    timing_mode: DeviceTimingMode,
+    request: CompletionReadbackSelectionRequest,
+) -> Vec<CompletionReadbackDisposition> {
+    request
+        .into_requests()
+        .into_iter()
+        .map(|request| {
+            attempt_completion_readback(
+                resources,
+                lane,
+                batch_identity,
+                completion_disposition,
+                timing_mode,
+                request,
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 #[must_use = "nonterminal completion readback observations retain invocation ownership"]
 pub enum CompletionReadbackObservation {
@@ -3566,6 +3662,16 @@ impl<R: DeviceRuntime> CompletionHandle<R> {
             .upgrade()
             .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?
             .wait_bound_with_readback_collection(self.slot_id(), request)
+    }
+
+    pub fn wait_with_readback_selection(
+        &self,
+        request: CompletionReadbackSelectionRequest,
+    ) -> Result<CompletionReadbackSelectionObservation, VNextError> {
+        self.reaper
+            .upgrade()
+            .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?
+            .wait_bound_with_readback_selection(self.slot_id(), request)
     }
 }
 

@@ -337,3 +337,53 @@ fn cpu_masked_argmax_preserves_logits_and_applies_penalty_once() {
         .is_err());
     }
 }
+
+#[test]
+fn cpu_masked_argmax_matches_finite_total_order_and_preserves_signed_zero_logits() {
+    use super::elementwise::masked_argmax;
+    let cases = [
+        (vec![-0.0, 0.0, 0.0], vec![1, 1, 1], 1),
+        (vec![0.0, -0.0], vec![1, 1], 0),
+        (vec![-0.0, 0.0], vec![1, 0], 0),
+        (vec![-2.0, -2.0, -3.0], vec![1, 1, 1], 0),
+        (vec![-2.0, -1.0, -1.0], vec![1, 1, 1], 1),
+        (
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            vec![1, 1, 1],
+            u32::MAX,
+        ),
+        (vec![-0.0, 0.0], vec![0, 0], u32::MAX),
+    ];
+    for dtype in [CpuFloat::F16, CpuFloat::F32] {
+        for (row, mask, expected) in &cases {
+            let logits = encoded(row, dtype);
+            let original = logits.clone();
+            // A positive repetition penalty preserves the sign of each zero.
+            let ids = (0..row.len() as u32)
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let offsets = [0, row.len() as u32]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            for penalty in [1.0, 1.75, 0.75] {
+                let mut workspace = vec![0; row.len()];
+                assert_eq!(
+                    masked_argmax(
+                        &logits,
+                        dtype,
+                        mask,
+                        &ids,
+                        &offsets,
+                        penalty,
+                        &mut workspace
+                    )
+                    .unwrap(),
+                    *expected,
+                    "dtype={dtype:?} row={row:?} penalty={penalty}"
+                );
+                assert_eq!(logits, original, "semantic logits changed");
+            }
+        }
+    }
+}

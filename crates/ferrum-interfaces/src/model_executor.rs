@@ -203,6 +203,10 @@ impl LogitsReturnPolicy {
 pub enum ExecutorSamplingOutput {
     FullLogits(Vec<f32>),
     GreedyToken(TokenId),
+    /// An authorized greedy selection found no finite logit among eligible
+    /// tokens. This is a request-local sampling failure, not a token ID or a
+    /// malformed execution-wave output.
+    NoSelectableFiniteLogit,
 }
 
 impl ExecutorSamplingOutput {
@@ -241,6 +245,11 @@ impl ExecutorSamplingOutput {
                     "plan runtime returned a greedy token for a full-logits request",
                 ));
             }
+            Self::NoSelectableFiniteLogit if policy.requires_full_logits() => {
+                return Err(FerrumError::backend(
+                    "plan runtime returned a greedy sampling failure for a full-logits request",
+                ));
+            }
             Self::GreedyToken(token)
                 if usize::try_from(token.get())
                     .ok()
@@ -261,6 +270,9 @@ impl ExecutorSamplingOutput {
             Self::FullLogits(logits) => Ok(logits),
             Self::GreedyToken(_) => Err(FerrumError::backend(
                 "plan-runtime prefill unexpectedly returned a selected token",
+            )),
+            Self::NoSelectableFiniteLogit => Err(FerrumError::backend(
+                "plan-runtime prefill unexpectedly returned a greedy sampling failure",
             )),
         }
     }
@@ -304,6 +316,20 @@ mod executor_sampling_output_tests {
         };
         let output = ExecutorSamplingOutput::full_logits(vec![0.0; 4]).unwrap();
         assert!(output.validate_for_policy(&policy, 4).is_ok());
+    }
+
+    #[test]
+    fn no_selectable_finite_logit_requires_greedy_authorization() {
+        let policy = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: None,
+        };
+        let output = ExecutorSamplingOutput::NoSelectableFiniteLogit;
+        assert!(output.validate_for_policy(&policy, 4).is_ok());
+        assert!(output
+            .validate_for_policy(&LogitsReturnPolicy::FullLogits, 4)
+            .is_err());
+        assert!(output.into_full_logits().is_err());
     }
 }
 

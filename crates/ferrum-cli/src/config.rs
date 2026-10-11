@@ -249,6 +249,9 @@ pub struct RuntimeCliConfig {
     /// Host invocation preparation policy for native plan runtimes.
     #[serde(default)]
     pub invocation_preparation_strategy: Option<ferrum_types::InvocationPreparationStrategy>,
+    /// Product sampling readback granularity for native plan runtimes.
+    #[serde(default)]
+    pub sampling_readback_mode: Option<ferrum_types::SamplingReadbackMode>,
     /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: Option<ferrum_types::ProgramBindingUploadStrategy>,
@@ -493,6 +496,12 @@ impl RuntimeCliConfig {
             "FERRUM_INVOCATION_PREPARATION_STRATEGY",
             self.invocation_preparation_strategy
                 .map(ferrum_types::InvocationPreparationStrategy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_SAMPLING_READBACK_MODE",
+            self.sampling_readback_mode
+                .map(ferrum_types::SamplingReadbackMode::as_runtime_value),
         );
         push_string_entry(
             &mut entries,
@@ -1204,6 +1213,29 @@ mod tests {
             "[runtime]\ncausal_decode_attention_grouping = \"automatic\"\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn sampling_readback_config_file_preserves_absence_and_validates_values() {
+        let absent: CliConfig = toml::from_str("[runtime]\n").unwrap();
+        assert_eq!(absent.runtime.sampling_readback_mode, None);
+        for value in ["uniform", "participant"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\nsampling_readback_mode = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|e| e.key == "FERRUM_SAMPLING_READBACK_MODE")
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(
+            toml::from_str::<CliConfig>("[runtime]\nsampling_readback_mode = \"automatic\"\n")
+                .is_err()
+        );
     }
 
     #[test]

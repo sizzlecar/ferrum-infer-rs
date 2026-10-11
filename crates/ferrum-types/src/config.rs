@@ -121,6 +121,33 @@ impl InvocationPreparationStrategy {
     }
 }
 
+/// Product sampling readback granularity. Participant selection applies only
+/// to eligible pure decode rows; other waves retain the uniform policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SamplingReadbackMode {
+    #[default]
+    Uniform,
+    Participant,
+}
+
+impl SamplingReadbackMode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Participant => "participant",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "uniform" => Ok(Self::Uniform),
+            "participant" => Ok(Self::Participant),
+            _ => Err(format!("expected uniform or participant; got {raw:?}")),
+        }
+    }
+}
+
 /// Upload policy for CUDA program bindings. Uniform live prefixes pad rows
 /// only to the largest live payload in the same node and current batch.
 /// Compact scatter uploads one packed packet and scatters its live bytes on
@@ -405,6 +432,9 @@ pub struct RuntimeKnobs {
     /// Host invocation preparation policy; full preparation is the default.
     #[serde(default)]
     pub invocation_preparation_strategy: InvocationPreparationStrategy,
+    /// Sampling readback granularity; uniform preserves the existing wave policy.
+    #[serde(default)]
+    pub sampling_readback_mode: SamplingReadbackMode,
     /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: ProgramBindingUploadStrategy,
@@ -557,6 +587,10 @@ impl EngineConfig {
                 InvocationPreparationStrategy::parse_runtime_value(value).map_err(|reason| {
                     format!("FERRUM_INVOCATION_PREPARATION_STRATEGY: {reason}")
                 })?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SAMPLING_READBACK_MODE") {
+            self.runtime.sampling_readback_mode = SamplingReadbackMode::parse_runtime_value(value)
+                .map_err(|reason| format!("FERRUM_SAMPLING_READBACK_MODE: {reason}"))?;
         }
         if let Some(value) =
             runtime_config_value(snapshot, "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
@@ -1540,6 +1574,45 @@ impl Default for BatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_readback_defaults_to_uniform_and_validates_typed_overrides() {
+        let mut engine = EngineConfig::default();
+        let mut legacy = serde_json::to_value(&engine.runtime).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("sampling_readback_mode");
+        let restored: RuntimeKnobs = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.sampling_readback_mode,
+            SamplingReadbackMode::Uniform
+        );
+        for mode in [
+            SamplingReadbackMode::Participant,
+            SamplingReadbackMode::Uniform,
+        ] {
+            engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    "FERRUM_SAMPLING_READBACK_MODE",
+                    mode.as_runtime_value(),
+                )]))
+                .unwrap();
+            assert_eq!(engine.runtime.sampling_readback_mode, mode);
+            engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                .unwrap();
+            assert_eq!(engine.runtime.sampling_readback_mode, mode);
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+        }
+        assert!(engine
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_SAMPLING_READBACK_MODE",
+                "automatic"
+            ),]))
+            .unwrap_err()
+            .contains("FERRUM_SAMPLING_READBACK_MODE"));
+    }
 
     #[test]
     fn invocation_preparation_defaults_to_full_and_rejects_unknown_overrides() {

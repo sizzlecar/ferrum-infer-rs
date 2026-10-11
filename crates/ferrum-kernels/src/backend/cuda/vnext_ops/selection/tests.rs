@@ -40,18 +40,63 @@ fn reference(case: &Case, precision: ArgmaxPrecision, penalty: f32) -> u32 {
             }
         }
     }
-    // Iterate in vocabulary order so an equal finite value retains the
-    // smallest permitted token, without sharing the kernel's reduction tree.
-    let mut selected = None;
-    for (id, &value) in row.iter().enumerate() {
-        if case.valid[id] != 0
-            && value.is_finite()
-            && selected.is_none_or(|(_, previous)| value > previous)
-        {
-            selected = Some((id as u32, value));
+    // Independent host-sampler ordering, without sharing the GPU reduction tree.
+    row.iter()
+        .enumerate()
+        .filter(|(id, value)| case.valid[*id] != 0 && value.is_finite())
+        .max_by(|(left_id, left), (right_id, right)| {
+            left.total_cmp(right).then_with(|| right_id.cmp(left_id))
+        })
+        .map_or(u32::MAX, |(id, _)| id as u32)
+}
+
+fn signed_zero_case(n: usize, negative: usize, positive: usize, mask_positive: bool) -> Case {
+    let mut logits = vec![-2.0; n];
+    logits[negative] = -0.0;
+    logits[positive] = 0.0;
+    let mut valid = vec![1; n];
+    if mask_positive {
+        valid[positive] = 0;
+    }
+    Case {
+        logits,
+        valid,
+        repetition: vec![negative as u32, positive as u32],
+        offsets: [0, 2],
+    }
+}
+
+#[test]
+fn selection_host_reference_distinguishes_signed_zero_and_rejects_nonfinite_values() {
+    for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
+        for penalty in [1.0, 1.75, 0.75] {
+            assert_eq!(
+                reference(&signed_zero_case(2, 0, 1, false), precision, penalty),
+                1
+            );
+            assert_eq!(
+                reference(&signed_zero_case(2, 1, 0, false), precision, penalty),
+                0
+            );
+            assert_eq!(
+                reference(&signed_zero_case(2, 0, 1, true), precision, penalty),
+                0
+            );
+            assert_eq!(
+                reference(
+                    &Case {
+                        logits: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+                        valid: vec![1; 3],
+                        repetition: vec![],
+                        offsets: [0, 0]
+                    },
+                    precision,
+                    penalty
+                ),
+                u32::MAX
+            );
         }
     }
-    selected.map_or(u32::MAX, |(id, _)| id)
 }
 
 #[test]
@@ -68,6 +113,18 @@ fn masked_selection_matches_scalar_semantics_and_preserves_logits_on_cuda() {
     let mut tail_mask = vec![1; 513];
     tail_mask[254] = 0;
     let cases = [
+        signed_zero_case(2, 0, 1, false),
+        signed_zero_case(2, 1, 0, false),
+        signed_zero_case(2, 0, 1, true),
+        signed_zero_case(513, 31, 32, false),
+        signed_zero_case(513, 0, 256, false),
+        signed_zero_case(513, 255, 256, false),
+        Case {
+            logits: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            valid: vec![1; 3],
+            repetition: vec![0],
+            offsets: [0, 0],
+        },
         Case {
             logits: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 2.0, 2.0, 1.0],
             valid: vec![1; 6],
