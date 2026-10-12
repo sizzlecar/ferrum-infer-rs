@@ -6,6 +6,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
+use ferrum_interfaces::{DecodeCycleOutcome, DecodeCycleStage, DecodeCycleWaveContext};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -108,13 +109,23 @@ impl BindingScatter {
         transfers: &[CudaProgramBindingTransfer],
         arena_bytes: u64,
     ) -> Result<Option<PreparedScatter>> {
+        self.prepare_with_cycle(allocation_stream, transfers, arena_bytes, None)
+    }
+
+    pub(super) fn prepare_with_cycle(
+        &self,
+        allocation_stream: &Arc<CudaStream>,
+        transfers: &[CudaProgramBindingTransfer],
+        arena_bytes: u64,
+        cycle: Option<&DecodeCycleWaveContext>,
+    ) -> Result<Option<PreparedScatter>> {
         let Some(packet) =
             Packet::prepare(transfers, arena_bytes, self.budget.limits.packet_bytes)?
         else {
             return Ok(None);
         };
         let Some(owner) =
-            self.prepare_encoded(allocation_stream, packet.bytes.len(), packet.count)?
+            self.prepare_encoded(allocation_stream, packet.bytes.len(), packet.count, cycle)?
         else {
             return Ok(None);
         };
@@ -131,6 +142,7 @@ impl BindingScatter {
         allocation_stream: &Arc<CudaStream>,
         bytes: usize,
         count: u32,
+        cycle: Option<&DecodeCycleWaveContext>,
     ) -> Result<Option<ScatterOwner>> {
         if count == 0
             || (count as usize)
@@ -146,7 +158,23 @@ impl BindingScatter {
         };
         // No H2D or destination writes occur during preparation. Allocation
         // failure can still safely choose the original sparse-copy prelude.
-        let device = match unsafe { allocation_stream.alloc::<u8>(bytes) } {
+        if let Some(cycle) = cycle {
+            cycle.mark(DecodeCycleStage::ScatterAllocationStart);
+        }
+        let allocation = unsafe { allocation_stream.alloc::<u8>(bytes) };
+        if let Some(cycle) = cycle {
+            let outcome = match &allocation {
+                Ok(_) => DecodeCycleOutcome::Success,
+                Err(error)
+                    if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY =>
+                {
+                    DecodeCycleOutcome::Unavailable
+                }
+                Err(_) => DecodeCycleOutcome::Failed,
+            };
+            cycle.mark_with_outcome(DecodeCycleStage::ScatterAllocationEnd, outcome);
+        }
+        let device = match allocation {
             Ok(device) => device,
             Err(error) if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY => {
                 return Ok(None);
@@ -167,7 +195,21 @@ impl BindingScatter {
         };
         // Event tracking is disabled by this runtime. Establish allocation
         // readiness explicitly before another stream can use its raw address.
-        if let Err(error) = allocation_stream.synchronize() {
+        if let Some(cycle) = cycle {
+            cycle.mark(DecodeCycleStage::ScatterReadinessWaitStart);
+        }
+        let readiness = allocation_stream.synchronize();
+        if let Some(cycle) = cycle {
+            cycle.mark_with_outcome(
+                DecodeCycleStage::ScatterReadinessWaitEnd,
+                if readiness.is_ok() {
+                    DecodeCycleOutcome::Success
+                } else {
+                    DecodeCycleOutcome::Failed
+                },
+            );
+        }
+        if let Err(error) = readiness {
             // Unknown allocation completion is not a healthy fallback. Keep
             // both its allocation and budget charged instead of freeing it.
             std::mem::forget(owner);

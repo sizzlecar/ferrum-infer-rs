@@ -43,7 +43,7 @@ use ferrum_interfaces::vnext::{
     DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
-use ferrum_interfaces::DecodeCycleStage;
+use ferrum_interfaces::{DecodeCycleStage, DecodeCycleWaveContext};
 use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
@@ -982,7 +982,7 @@ impl CudaBindingProgramSink {
                 "compiled packet omitted or duplicated a live write",
             ));
         }
-        let owner = scatter.prepare_encoded(allocation_stream, packet.len(), count)?;
+        let owner = scatter.prepare_encoded(allocation_stream, packet.len(), count, None)?;
         let compact = owner.is_some();
         upload_plan.compact_scatter_preludes = u64::from(compact);
         upload_plan.compact_scatter_sparse_fallback_preludes = u64::from(!compact);
@@ -1783,6 +1783,7 @@ impl CudaDeviceCommand {
         mut commands: Vec<Self>,
         upload_counters: Arc<ProgramBindingUploadCounters>,
         scatter: Option<(&binding_scatter::BindingScatter, &Arc<CudaStream>)>,
+        cycle: Option<&DecodeCycleWaveContext>,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         if commands.is_empty() {
             return Ok(commands);
@@ -2035,9 +2036,17 @@ impl CudaDeviceCommand {
         // Every original authority, layout, exact-allocation and range check
         // above also applies to scatter. Opaque commands never reach this path.
         let compact = match scatter {
-            Some((scatter, allocation_stream)) => {
-                scatter.prepare(allocation_stream, &transfers, layout_physical_size_bytes)?
-            }
+            Some((scatter, allocation_stream)) => match cycle {
+                Some(cycle) => scatter.prepare_with_cycle(
+                    allocation_stream,
+                    &transfers,
+                    layout_physical_size_bytes,
+                    Some(cycle),
+                )?,
+                None => {
+                    scatter.prepare(allocation_stream, &transfers, layout_physical_size_bytes)?
+                }
+            },
             None => None,
         };
         if let Some(binding_scatter::PreparedScatter { bytes, owner }) = compact {
@@ -4836,12 +4845,21 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         commands: Vec<Self::Command>,
     ) -> Result<Vec<Self::Command>, Self::Error> {
+        self.coalesce_program_bindings_with_cycle(commands, None)
+    }
+
+    fn coalesce_program_bindings_with_cycle(
+        &self,
+        commands: Vec<Self::Command>,
+        cycle: Option<&DecodeCycleWaveContext>,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
         CudaDeviceCommand::coalesced_program_bindings(
             commands,
             Arc::clone(&self.program_binding_upload_counters),
             self.binding_scatter
                 .as_ref()
                 .map(|scatter| (scatter, &self.allocation_stream)),
+            cycle,
         )
     }
 

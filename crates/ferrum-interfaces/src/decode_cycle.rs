@@ -368,6 +368,12 @@ pub enum DecodeCycleStage {
     WavePrepared,
     EncodeStart,
     EncodeEnd,
+    ProgramBindingCoalesceStart,
+    ProgramBindingCoalesceEnd,
+    ScatterAllocationStart,
+    ScatterAllocationEnd,
+    ScatterReadinessWaitStart,
+    ScatterReadinessWaitEnd,
     CommandEnqueueStart,
     CommandEnqueueEnd,
     /// Host API boundary of the first compute graph; not first kernel/GPU start.

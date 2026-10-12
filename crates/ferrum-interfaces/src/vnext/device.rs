@@ -3855,6 +3855,16 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         Ok(commands)
     }
 
+    /// Coarse diagnostic observation of the same binding coalescing operation.
+    /// Unsupported backends preserve their existing behavior without clocks.
+    fn coalesce_program_bindings_with_cycle(
+        &self,
+        commands: Vec<Self::Command>,
+        _cycle: Option<&crate::DecodeCycleWaveContext>,
+    ) -> Result<Vec<Self::Command>, Self::Error> {
+        self.coalesce_program_bindings(commands)
+    }
+
     /// Cumulative typed binding-prelude upload observations for this runtime.
     /// Successful copies mean the host CUDA API returned success, not that a
     /// GPU fence completed. Unsupported backends retain the default `None`.

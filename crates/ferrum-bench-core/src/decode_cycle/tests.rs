@@ -745,3 +745,221 @@ fn profile_parser_validates_the_envelope_and_independent_coverage() {
     assert!(analyze_profile_jsonl(&jsonl[..jsonl.len() - 1], Some(2)).is_err());
     assert!(analyze_profile_jsonl("", Some(2)).is_err());
 }
+
+const NEXT_HOST_SUBPHASES: [(&str, &str, u64); 3] = [
+    (
+        "next_program_binding_coalesce",
+        "program_binding_coalesce_end",
+        4,
+    ),
+    ("next_scatter_allocation", "scatter_allocation_end", 2),
+    (
+        "next_scatter_readiness_wait",
+        "scatter_readiness_wait_end",
+        1,
+    ),
+];
+
+fn append_host_submission_subphases(capture: &mut DecodeCycleCapture, wave_id: u64, offset: u64) {
+    let wave = wave(wave_id);
+    for (at, stage, end) in [
+        (15, "program_binding_coalesce_start", false),
+        (19, "program_binding_coalesce_end", true),
+        (16, "scatter_allocation_start", false),
+        (18, "scatter_allocation_end", true),
+        (18, "scatter_readiness_wait_start", false),
+        (19, "scatter_readiness_wait_end", true),
+    ] {
+        let mut event = event(offset + at, stage, wave_scope(&wave));
+        if end {
+            event.outcome = Some("success".to_owned());
+        }
+        capture.events.push(event);
+    }
+    sync_counts(capture);
+}
+
+#[test]
+fn next_host_subphases_are_optional_nested_observations_of_the_next_wave() {
+    let split_metrics = [
+        ("next_encode_before_binding_coalesce", 0_u64),
+        ("next_post_binding_coalesce_to_enqueue", 1_u64),
+    ];
+    let baseline = analyze_capture(&capture(), Some(2));
+    assert_eq!(
+        baseline.cohorts[0].classification,
+        "complete_decode_to_decode"
+    );
+    for (metric, _, _) in NEXT_HOST_SUBPHASES {
+        let absent = &baseline.chain_metrics[metric];
+        assert_eq!(absent.count, 0);
+        assert_eq!(absent.median_ns, None);
+        assert_eq!(absent.p99_ns, None);
+    }
+    for (name, _) in split_metrics {
+        let absent = &baseline.chain_metrics[name];
+        assert_eq!(absent.count, 0);
+        assert_eq!(absent.median_ns, None);
+        assert_eq!(absent.p99_ns, None);
+    }
+
+    let mut nested = capture();
+    append_host_submission_subphases(&mut nested, 2, 450);
+    let observed = analyze_capture(&nested, Some(2));
+    assert_eq!(
+        observed.cohorts[0].classification,
+        "complete_decode_to_decode"
+    );
+    for (name, _, duration) in NEXT_HOST_SUBPHASES {
+        let metric = &observed.chain_metrics[name];
+        assert_eq!(metric.count, 1);
+        assert_eq!(metric.median_ns, Some(duration as f64));
+        assert_eq!(metric.p99_ns, Some(duration as f64));
+        assert_eq!(metric.union_ns, duration);
+    }
+    for (name, duration) in split_metrics {
+        let metric = &observed.chain_metrics[name];
+        assert_eq!(metric.count, 1);
+        assert_eq!(metric.median_ns, Some(duration as f64));
+        assert_eq!(metric.p99_ns, Some(duration as f64));
+        assert_eq!(metric.union_ns, duration);
+    }
+    let whole = "terminal_readback_end->next_host_graph_launch";
+    assert_eq!(
+        serde_json::to_value(&observed.chain_metrics[whole]).unwrap(),
+        serde_json::to_value(&baseline.chain_metrics[whole]).unwrap()
+    );
+    assert_eq!(
+        observed.observed_interval_union_ns,
+        baseline.observed_interval_union_ns
+    );
+
+    let mut source_only = capture();
+    append_host_submission_subphases(&mut source_only, 1, 0);
+    let source_only = analyze_capture(&source_only, Some(2));
+    assert_eq!(
+        source_only.cohorts[0].classification,
+        "complete_decode_to_decode"
+    );
+    for (name, _, _) in NEXT_HOST_SUBPHASES {
+        assert_eq!(source_only.chain_metrics[name].count, 0);
+        assert_eq!(source_only.chain_metrics[name].median_ns, None);
+    }
+    for (name, _) in split_metrics {
+        assert_eq!(source_only.chain_metrics[name].count, 0);
+        assert_eq!(source_only.chain_metrics[name].median_ns, None);
+    }
+
+    let mut coalesce_only = capture();
+    append_host_submission_subphases(&mut coalesce_only, 2, 450);
+    coalesce_only
+        .events
+        .retain(|event| !event.stage.starts_with("scatter_"));
+    sync_counts(&mut coalesce_only);
+    let coalesce_only = analyze_capture(&coalesce_only, Some(2));
+    assert_eq!(
+        coalesce_only.cohorts[0].classification,
+        "complete_decode_to_decode"
+    );
+    assert_eq!(
+        coalesce_only.chain_metrics["next_program_binding_coalesce"].count,
+        1
+    );
+    for name in ["next_scatter_allocation", "next_scatter_readiness_wait"] {
+        assert_eq!(coalesce_only.chain_metrics[name].count, 0);
+        assert_eq!(coalesce_only.chain_metrics[name].median_ns, None);
+    }
+    for (name, duration) in split_metrics {
+        let metric = &coalesce_only.chain_metrics[name];
+        assert_eq!(metric.count, 1);
+        assert_eq!(metric.median_ns, Some(duration as f64));
+        assert_eq!(metric.p99_ns, Some(duration as f64));
+        assert_eq!(metric.union_ns, duration);
+    }
+}
+
+#[test]
+fn next_host_subphase_ends_require_complete_success_evidence() {
+    for (_, stage, _) in NEXT_HOST_SUBPHASES {
+        for fault in ["missing", "failed", "unknown"] {
+            let mut capture = capture();
+            append_host_submission_subphases(&mut capture, 2, 450);
+            if fault == "missing" {
+                capture.events.retain(|event| event.stage != stage);
+                sync_counts(&mut capture);
+            } else {
+                let end = capture
+                    .events
+                    .iter_mut()
+                    .find(|event| event.stage == stage)
+                    .expect("observed subphase end");
+                end.outcome = (fault == "failed").then(|| "failed".to_owned());
+            }
+            let analysis = analyze_capture(&capture, Some(2));
+            assert_eq!(
+                analysis.cohorts[0].classification,
+                if fault == "failed" {
+                    "failed_window"
+                } else {
+                    "incomplete_edges"
+                },
+                "{fault} {stage}"
+            );
+            assert_no_chain_samples(&analysis);
+        }
+    }
+}
+
+#[test]
+fn scatter_subphases_preserve_the_observed_parent_and_readiness_dependencies() {
+    for fault in [
+        "child_outside_coalesce",
+        "readiness_before_allocation_end",
+        "missing_coalesce",
+        "missing_readiness",
+        "missing_allocation",
+    ] {
+        let mut capture = capture();
+        append_host_submission_subphases(&mut capture, 2, 450);
+        match fault {
+            "child_outside_coalesce" => {
+                // Each pair remains inside encode465..enqueue470; the
+                // readiness end469 exceeds the coalesce parent end468.
+                capture
+                    .events
+                    .iter_mut()
+                    .find(|event| event.stage == "program_binding_coalesce_end")
+                    .unwrap()
+                    .at
+                    .nanos = 468;
+            }
+            "readiness_before_allocation_end" => {
+                capture
+                    .events
+                    .iter_mut()
+                    .find(|event| event.stage == "scatter_readiness_wait_start")
+                    .unwrap()
+                    .at
+                    .nanos = 467;
+            }
+            _ => {
+                let prefix = match fault {
+                    "missing_coalesce" => "program_binding_coalesce_",
+                    "missing_readiness" => "scatter_readiness_wait_",
+                    "missing_allocation" => "scatter_allocation_",
+                    _ => unreachable!("declared fixture fault"),
+                };
+                capture
+                    .events
+                    .retain(|event| !event.stage.starts_with(prefix));
+            }
+        }
+        sync_counts(&mut capture);
+        let analysis = analyze_capture(&capture, Some(2));
+        assert_eq!(
+            analysis.cohorts[0].classification, "incomplete_edges",
+            "{fault}"
+        );
+        assert_no_chain_samples(&analysis);
+    }
+}

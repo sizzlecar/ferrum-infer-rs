@@ -1,6 +1,8 @@
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::Arc};
 
+use crate::{DecodeCycleOutcome, DecodeCycleStage};
+
 use super::super::{
     classify_device_error, AllocationKind, AllocationLifetime, BackingInitializationEncodeError,
     BufferUsage, CompletionHandle, CompletionReaper, CompletionReservation,
@@ -2327,13 +2329,27 @@ impl OperationDispatch {
             )));
         }
         let uncoalesced_program_binding_count = program_bindings.len();
-        let coalesced_program_bindings = runtime
-            .coalesce_program_bindings(program_bindings)
-            .map_err(|error| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(format!(
-                    "device runtime could not coalesce program bindings: {error}"
-                )))
-            })?;
+        let cycle = timing_sink.decode_cycle_context();
+        if let Some(cycle) = cycle {
+            cycle.mark(DecodeCycleStage::ProgramBindingCoalesceStart);
+        }
+        let coalesced_program_bindings =
+            runtime.coalesce_program_bindings_with_cycle(program_bindings, cycle);
+        if let Some(cycle) = cycle {
+            cycle.mark_with_outcome(
+                DecodeCycleStage::ProgramBindingCoalesceEnd,
+                if coalesced_program_bindings.is_ok() {
+                    DecodeCycleOutcome::Success
+                } else {
+                    DecodeCycleOutcome::Failed
+                },
+            );
+        }
+        let coalesced_program_bindings = coalesced_program_bindings.map_err(|error| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(format!(
+                "device runtime could not coalesce program bindings: {error}"
+            )))
+        })?;
         if (uncoalesced_program_binding_count == 0) != coalesced_program_bindings.is_empty()
             || coalesced_program_bindings.len() > uncoalesced_program_binding_count
         {

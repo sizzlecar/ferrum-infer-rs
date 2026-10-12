@@ -10,6 +10,9 @@ const CURRENT_OUTCOME_STAGES: &[&str] = &[
     "stream_send_end",
     "request_complete_end",
     "compute_graph_launch_end",
+    "program_binding_coalesce_end",
+    "scatter_allocation_end",
+    "scatter_readiness_wait_end",
     "failure_observed",
 ];
 

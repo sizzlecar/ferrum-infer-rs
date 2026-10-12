@@ -1,6 +1,7 @@
 use super::*;
 
 type Stages<'a> = BTreeMap<&'a str, Vec<u64>>;
+type SubphaseEvents<'a> = BTreeMap<CycleWaveKey, BTreeMap<&'a str, Vec<&'a CycleEvent>>>;
 
 const OWN: &[&str] = &[
     "terminal_readback_end",
@@ -46,6 +47,27 @@ const CHAIN: &[&str] = &[
     "next_command_enqueue_start",
     "next_compute_graph_launch_start",
 ];
+const NEXT_SUBPHASES: &[(&str, &str, &str)] = &[
+    (
+        "program_binding_coalesce_start",
+        "program_binding_coalesce_end",
+        "next_program_binding_coalesce",
+    ),
+    (
+        "scatter_allocation_start",
+        "scatter_allocation_end",
+        "next_scatter_allocation",
+    ),
+    (
+        "scatter_readiness_wait_start",
+        "scatter_readiness_wait_end",
+        "next_scatter_readiness_wait",
+    ),
+];
+const NEXT_COALESCE_RESIDUALS: &[&str] = &[
+    "next_encode_before_binding_coalesce",
+    "next_post_binding_coalesce_to_enqueue",
+];
 
 fn unique(stages: Option<&Stages<'_>>, name: &str) -> Option<u64> {
     let values = stages?.get(name)?;
@@ -65,6 +87,91 @@ fn call_key(wave: &Wave<'_>) -> Option<CallKey> {
     calls.all(|call| call == Some(first)).then_some(first)
 }
 
+fn next_subphases(
+    events: &SubphaseEvents<'_>,
+    next: Option<CycleWaveKey>,
+    boundaries: &mut BTreeMap<String, Option<u64>>,
+    missing: &mut Vec<String>,
+) -> Vec<(&'static str, Interval)> {
+    let Some(stages) = next.and_then(|next| events.get(&next)) else {
+        return Vec::new();
+    };
+    let mut intervals = Vec::new();
+    for &(start, end, name) in NEXT_SUBPHASES {
+        let starts = stages.get(start).map(Vec::as_slice).unwrap_or(&[]);
+        let ends = stages.get(end).map(Vec::as_slice).unwrap_or(&[]);
+        // These probes are optional. An old capture or a backend without the
+        // probe has absent samples, not zero-duration observations.
+        if starts.is_empty() && ends.is_empty() {
+            continue;
+        }
+        boundaries.insert(
+            format!("next_{start}"),
+            match starts {
+                [event] => Some(event.at.nanos),
+                _ => None,
+            },
+        );
+        boundaries.insert(
+            format!("next_{end}"),
+            match ends {
+                [event] => Some(event.at.nanos),
+                _ => None,
+            },
+        );
+        let ([start], [end]) = (starts, ends) else {
+            missing.push(format!("{name}.unique_pair"));
+            continue;
+        };
+        if start.scope != end.scope {
+            missing.push(format!("{name}.scope_mismatch"));
+            continue;
+        }
+        if end.outcome.as_deref() != Some("success") {
+            missing.push(format!("{name}.successful_end"));
+            continue;
+        }
+        if end.at.nanos < start.at.nanos
+            || boundaries["next_encode_start"].is_none_or(|at| start.at.nanos < at)
+            || boundaries["next_command_enqueue_start"].is_none_or(|at| end.at.nanos > at)
+        {
+            missing.push(format!("{name}.outside_encode_to_enqueue"));
+            continue;
+        }
+        intervals.push((name, (start.at.nanos, end.at.nanos)));
+    }
+    let observed = |name| {
+        intervals
+            .iter()
+            .find_map(|&(candidate, interval)| (candidate == name).then_some(interval))
+    };
+    let coalesce = observed("next_program_binding_coalesce");
+    let allocation = observed("next_scatter_allocation");
+    let readiness = observed("next_scatter_readiness_wait");
+    // In the regular compact-scatter path a successful allocation is always
+    // followed by its readiness wait, inside the same coalescing call. No
+    // allocation attempt (for example a budget fallback) remains legitimate.
+    if allocation.is_some() || readiness.is_some() {
+        match (coalesce, allocation, readiness) {
+            (Some(coalesce), Some(allocation), Some(readiness))
+                if coalesce.0 <= allocation.0
+                    && allocation.1 <= readiness.0
+                    && readiness.1 <= coalesce.1 => {}
+            _ => missing.push("next_scatter.allocation_readiness_nesting".to_owned()),
+        }
+    }
+    if let Some((start, end)) = coalesce {
+        if let (Some(encode), Some(enqueue)) = (
+            boundaries["next_encode_start"],
+            boundaries["next_command_enqueue_start"],
+        ) {
+            intervals.push((NEXT_COALESCE_RESIDUALS[0], (encode, start)));
+            intervals.push((NEXT_COALESCE_RESIDUALS[1], (end, enqueue)));
+        }
+    }
+    intervals
+}
+
 pub(super) fn collect(
     events: &[&CycleEvent],
     waves: &BTreeMap<CycleWaveKey, Wave<'_>>,
@@ -75,6 +182,22 @@ pub(super) fn collect(
 ) -> (Vec<DecodeCycleCohort>, BTreeMap<String, IntervalMetric>) {
     let mut cohorts = Vec::new();
     let mut intervals = BTreeMap::<String, Vec<Interval>>::new();
+    let mut subphase_events = SubphaseEvents::new();
+    for &event in events {
+        if NEXT_SUBPHASES
+            .iter()
+            .any(|&(start, end, _)| event.stage == start || event.stage == end)
+        {
+            if let Some(key) = event.scope.wave_key() {
+                subphase_events
+                    .entry(key)
+                    .or_default()
+                    .entry(&event.stage)
+                    .or_default()
+                    .push(event);
+            }
+        }
+    }
     let graph_starts = events
         .iter()
         .filter_map(|event| {
@@ -181,6 +304,7 @@ pub(super) fn collect(
             );
         }
         let failed = coverage.failed(key) || next.is_some_and(|key| coverage.failed(key));
+        let subphases = next_subphases(&subphase_events, next, &mut boundaries, &mut missing);
         let classification = if failed {
             "failed_window"
         } else if next.is_none() && anchor.is_some() {
@@ -199,6 +323,9 @@ pub(super) fn collect(
             "incomplete_edges"
         };
         if classification == "complete_decode_to_decode" {
+            for (name, interval) in subphases {
+                intervals.entry(name.to_owned()).or_default().push(interval);
+            }
             for pair in CHAIN.windows(2) {
                 if let (Some(start), Some(end)) = (boundaries[pair[0]], boundaries[pair[1]]) {
                     intervals
@@ -246,5 +373,17 @@ pub(super) fn collect(
         name.to_owned(),
         super::analysis::metric(intervals.get(name).map(Vec::as_slice).unwrap_or(&[])),
     );
+    for &(_, _, name) in NEXT_SUBPHASES {
+        metrics.insert(
+            name.to_owned(),
+            super::analysis::metric(intervals.get(name).map(Vec::as_slice).unwrap_or(&[])),
+        );
+    }
+    for &name in NEXT_COALESCE_RESIDUALS {
+        metrics.insert(
+            name.to_owned(),
+            super::analysis::metric(intervals.get(name).map(Vec::as_slice).unwrap_or(&[])),
+        );
+    }
     (cohorts, metrics)
 }
