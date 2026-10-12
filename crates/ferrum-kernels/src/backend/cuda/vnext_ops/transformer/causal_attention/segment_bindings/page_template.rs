@@ -317,7 +317,7 @@ mod tests {
                 } else {
                     (entries as usize).div_ceil(2)
                 };
-                let controls = [entries, 0, 1, entries * 16, 7, 0];
+                let controls: [i32; 6] = [entries, 0, 1, entries * 16, 7, 0];
                 let mut actual = Vec::new();
                 for control in controls {
                     actual.extend_from_slice(&control.to_ne_bytes());
