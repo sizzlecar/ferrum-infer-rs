@@ -340,14 +340,49 @@ impl<T> ObservationCell<T> {
     }
 }
 
+enum AttemptSelection<'a> {
+    Late(&'a ReusableExecutionSelection),
+    // These are observer expectations only, never execution authority.
+    #[cfg(test)]
+    Declared {
+        program_id: Option<DeviceReusableExecutionProgramId>,
+        catalog_miss: Option<VNextReusableExecutionCatalogMissReason>,
+    },
+}
+
+impl AttemptSelection<'_> {
+    fn program_id(&self) -> Option<&DeviceReusableExecutionProgramId> {
+        match self {
+            Self::Late(selection) => selection.get().and_then(|facts| facts.program_id()),
+            #[cfg(test)]
+            Self::Declared { program_id, .. } => program_id.as_ref(),
+        }
+    }
+
+    fn catalog_miss(&self) -> Option<VNextReusableExecutionCatalogMissReason> {
+        match self {
+            Self::Late(selection) => selection.get().and_then(|facts| facts.miss_reason()),
+            #[cfg(test)]
+            Self::Declared { catalog_miss, .. } => *catalog_miss,
+        }
+    }
+
+    fn lane_epoch(&self, initial: u64) -> u64 {
+        match self {
+            Self::Late(selection) => selection.get().map_or(initial, |facts| facts.lane_epoch()),
+            #[cfg(test)]
+            Self::Declared { .. } => initial,
+        }
+    }
+}
+
 /// Callbacks only borrow identity and copy fixed-size data. No locks, clocks,
 /// allocation, or serialization occur on the backend submission thread.
 pub(super) struct AttemptObservation<'a, T> {
     timing: &'a T,
-    program_id: Option<DeviceReusableExecutionProgramId>,
+    selection: AttemptSelection<'a>,
     lane_epoch: u64,
     catalog_epoch: Option<u64>,
-    catalog_miss: Option<VNextReusableExecutionCatalogMissReason>,
     provider_ns: ObservationCell<u64>,
     enqueue_ns: ObservationCell<u64>,
     preparation: ObservationCell<BackendPreparation>,
@@ -357,19 +392,52 @@ pub(super) struct AttemptObservation<'a, T> {
 }
 
 impl<'a, T> AttemptObservation<'a, T> {
-    pub(super) fn new(
+    pub(super) fn new_with_selection(
+        timing: &'a T,
+        selection: &'a ReusableExecutionSelection,
+        lane_epoch: u64,
+        catalog_epoch: Option<u64>,
+    ) -> Self {
+        Self::with_selection(
+            timing,
+            AttemptSelection::Late(selection),
+            lane_epoch,
+            catalog_epoch,
+        )
+    }
+
+    /// Declared observer expectations exercise identity diagnostics without
+    /// constructing or publishing any reusable execution selection facts.
+    #[cfg(test)]
+    fn new(
         timing: &'a T,
         program_id: Option<DeviceReusableExecutionProgramId>,
         lane_epoch: u64,
         catalog_epoch: Option<u64>,
         catalog_miss: Option<VNextReusableExecutionCatalogMissReason>,
     ) -> Self {
-        Self {
+        Self::with_selection(
             timing,
-            program_id,
+            AttemptSelection::Declared {
+                program_id,
+                catalog_miss,
+            },
             lane_epoch,
             catalog_epoch,
-            catalog_miss,
+        )
+    }
+
+    fn with_selection(
+        timing: &'a T,
+        selection: AttemptSelection<'a>,
+        lane_epoch: u64,
+        catalog_epoch: Option<u64>,
+    ) -> Self {
+        Self {
+            timing,
+            selection,
+            lane_epoch,
+            catalog_epoch,
             provider_ns: ObservationCell::new(),
             enqueue_ns: ObservationCell::new(),
             preparation: ObservationCell::new(),
@@ -394,10 +462,10 @@ impl<'a, T> AttemptObservation<'a, T> {
     ) -> AttemptRecord {
         AttemptRecord {
             ordinal,
-            program_id: self.program_id,
-            lane_epoch: self.lane_epoch,
+            program_id: self.selection.program_id().cloned(),
+            lane_epoch: self.selection.lane_epoch(self.lane_epoch),
             catalog_epoch: self.catalog_epoch,
-            catalog_miss: self.catalog_miss,
+            catalog_miss: self.selection.catalog_miss(),
             disposition: disposition(stats, outcome),
             incomplete_declarations: stats.segment_incomplete_declarations != 0,
             core_preparation: stats,
@@ -442,7 +510,7 @@ impl<T: DeviceSubmissionTimingSink> DeviceSubmissionTimingSink for AttemptObserv
             self.set(
                 &self.preparation,
                 BackendPreparation {
-                    identity: identity_match(self.program_id.as_ref(), program_id),
+                    identity: identity_match(self.selection.program_id(), program_id),
                     capture_allowed_at_entry: capture_allowed,
                     segments: observation,
                 },
@@ -465,7 +533,7 @@ impl<T: DeviceSubmissionTimingSink> DeviceSubmissionTimingSink for AttemptObserv
             self.set(
                 &self.gaps,
                 ProgramGaps {
-                    identity: identity_match(self.program_id.as_ref(), Some(program_id)),
+                    identity: identity_match(self.selection.program_id(), Some(program_id)),
                     node_counts_by_reason,
                 },
             );

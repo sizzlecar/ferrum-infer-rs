@@ -84,7 +84,10 @@ pub use determinism_artifact::{
     SubmissionWaveDeterminismArtifactPhysicalCommand,
     SubmissionWaveDeterminismArtifactReplayedSegment, SubmissionWaveDeterminismArtifactWitness,
 };
-pub use dispatch::OperationDispatch;
+pub use dispatch::{
+    OperationDispatch, ReusableExecutionCatalogMissReason, ReusableExecutionProgramCatalog,
+    ReusableExecutionSelection, ReusableExecutionSelectionFacts, ReusableExecutionSelectionPolicy,
+};
 pub use dispatch_contract::{
     BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatchError,
     ProfiledSubmissionHandle, SubmissionExecutionPolicy, SubmissionScratchInitialization,

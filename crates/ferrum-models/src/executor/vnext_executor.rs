@@ -1282,21 +1282,7 @@ struct VNextReusableExecutionCatalog {
 
 const MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum VNextReusableExecutionCatalogMissReason {
-    ProgramIdentityUnavailable,
-    CatalogEmpty,
-    ProgramAbsent,
-    ProgramNonResident,
-    EpochMismatch,
-}
-
-impl VNextReusableExecutionCatalogMissReason {
-    const fn is_epoch_mismatch(self) -> bool {
-        matches!(self, Self::EpochMismatch)
-    }
-}
+type VNextReusableExecutionCatalogMissReason = ReusableExecutionCatalogMissReason;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct VNextReusableExecutionCatalogMissKey {
@@ -7589,117 +7575,32 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             let device_timing_mode = self.device_timing_mode();
             let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
-            let mut reusable_catalog_miss = None;
             let catalog_snapshot = self.reusable_execution_catalog.read().clone();
             let catalog = catalog_snapshot.as_deref();
-            let mut diagnostic_program_id = None;
-            let reusable_program = if !reusable_program_identity_required(
+            let selection = ReusableExecutionSelection::default();
+            let selection_policy = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
                 catalog.is_some(),
                 device_timing_mode.direct_reusable_execution_allowed(),
                 reusable_direct_attempted,
             ) {
-                None
+                ReusableExecutionSelectionPolicy::Disabled
+            } else if catalog.is_some() {
+                ReusableExecutionSelectionPolicy::LookupCatalog
             } else {
-                let program_id = match OperationDispatch::reusable_execution_program_id_for_wave(
-                    self.providers.providers(),
-                    &self.resolved_plan,
-                    &wave,
-                    &self.lane,
-                ) {
-                    Ok(program_id) => program_id,
-                    Err(error) => {
-                        return DispatchOutcome::QuiescentFailure(error.to_string());
-                    }
-                };
-                match program_id {
-                    Some(program_id) => {
-                        if cold_wave.is_some() {
-                            diagnostic_program_id = Some(program_id.clone());
-                        }
-                        if catalog.is_none() {
-                            self.record_startup_reusable_program(participants, kind, &program_id);
-                        }
-                        match catalog {
-                            Some(catalog)
-                                if catalog.lane_epoch != self.lane.reusable_execution_epoch() =>
-                            {
-                                reusable_catalog_miss =
-                                    Some(VNextReusableExecutionCatalogMissKey::from_program_id(
-                                        &program_id,
-                                        VNextReusableExecutionCatalogMissReason::EpochMismatch,
-                                    ));
-                                None
-                            }
-                            Some(catalog) if catalog.programs.is_empty() => {
-                                reusable_catalog_miss =
-                                    Some(VNextReusableExecutionCatalogMissKey::from_program_id(
-                                        &program_id,
-                                        VNextReusableExecutionCatalogMissReason::CatalogEmpty,
-                                    ));
-                                None
-                            }
-                            Some(catalog) => match catalog.programs.get(&program_id) {
-                                Some(program) if program.has_resident_segments() => Some(program),
-                                Some(_) => {
-                                    reusable_catalog_miss = Some(
-                                        VNextReusableExecutionCatalogMissKey::from_program_id(
-                                            &program_id,
-                                            VNextReusableExecutionCatalogMissReason::ProgramNonResident,
-                                        ),
-                                    );
-                                    None
-                                }
-                                None => {
-                                    reusable_catalog_miss = Some(
-                                        VNextReusableExecutionCatalogMissKey::from_program_id(
-                                            &program_id,
-                                            VNextReusableExecutionCatalogMissReason::ProgramAbsent,
-                                        ),
-                                    );
-                                    None
-                                }
-                            },
-                            None => None,
-                        }
-                    }
-                    None if catalog.is_some() => {
-                        reusable_catalog_miss = Some(
-                            VNextReusableExecutionCatalogMissKey::without_program_identity(
-                                wave.claimed_backing().work_shape(),
-                                VNextReusableExecutionCatalogMissReason::ProgramIdentityUnavailable,
-                            ),
-                        );
-                        None
-                    }
-                    None => None,
-                }
+                ReusableExecutionSelectionPolicy::ObserveOnly
             };
-            reusable_direct_attempted |= reusable_program.is_some();
-            if reusable_program.is_none() && self.on_demand_reusable_execution_enabled() {
-                self.reusable_execution_catalog_refresh_needed
-                    .store(true, Ordering::Release);
-            }
-            let reusable_program_stats = reusable_program.map(|program| {
-                (
-                    program.segments().len() as u64,
-                    program
-                        .segments()
-                        .iter()
-                        .map(|segment| {
-                            u64::from(segment.end_node_index() - segment.start_node_index())
-                        })
-                        .sum::<u64>(),
-                    program.per_wave_binding_node_indices().len() as u64,
-                )
-            });
+            let unavailable_identity_miss =
+                VNextReusableExecutionCatalogMissKey::without_program_identity(
+                    wave.claimed_backing().work_shape(),
+                    VNextReusableExecutionCatalogMissReason::ProgramIdentityUnavailable,
+                );
             let observation = timing_enabled.then(|| {
-                reusable_cold_path::AttemptObservation::new(
+                reusable_cold_path::AttemptObservation::new_with_selection(
                     &timing_sink,
-                    diagnostic_program_id,
+                    &selection,
                     self.lane.reusable_execution_epoch(),
                     catalog.map(|catalog| catalog.lane_epoch),
-                    reusable_catalog_miss.map(|miss| miss.reason),
                 )
             });
             let mut provider_elapsed = None;
@@ -7713,46 +7614,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .provider_encode_submit
                     .start_if(timing_enabled);
                 let phase_timer = phase_timing.provider_encode_submit.start_if(timing_enabled);
-                let submission = if let Some(reusable_program) = reusable_program {
-                    if let Some(timing_sink) = observation.as_ref() {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
-                            self.providers.providers(),
-                            &self.resolved_plan,
-                            &identity,
-                            active_bindings(),
-                            device_timing_mode,
-                            &uploads,
-                            reusable_program,
-                            execution_policy,
-                            self.invocation_preparation_strategy,
-                            timing_sink,
-                            &self.metrics.invocation_preparation,
-                            wave,
-                            &self.lane,
-                            &self.reaper,
-                        )
-                        .map(ProfiledSubmissionHandle::into_parts)
-                    } else {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
-                            self.providers.providers(),
-                            &self.resolved_plan,
-                            &identity,
-                            active_bindings(),
-                            device_timing_mode,
-                            &uploads,
-                            reusable_program,
-                            execution_policy,
-                            self.invocation_preparation_strategy,
-                            &coarse_timing,
-                            &self.metrics.invocation_preparation,
-                            wave,
-                            &self.lane,
-                            &self.reaper,
-                        )
-                        .map(|profiled| (profiled.into_parts().0, None))
-                    }
-                } else if let Some(timing_sink) = observation.as_ref() {
-                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
+                let catalog_view = catalog.map(|catalog| {
+                    ReusableExecutionProgramCatalog::new(catalog.lane_epoch, &catalog.programs)
+                });
+                let submission = if let Some(timing_sink) = observation.as_ref() {
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_catalog_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
@@ -7761,6 +7627,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &uploads,
                         execution_policy,
                         self.invocation_preparation_strategy,
+                        catalog_view,
+                        selection_policy,
+                        &selection,
                         timing_sink,
                         &self.metrics.invocation_preparation,
                         wave,
@@ -7769,7 +7638,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )
                     .map(ProfiledSubmissionHandle::into_parts)
                 } else {
-                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_catalog_and_preparation(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
@@ -7778,6 +7647,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &uploads,
                         execution_policy,
                         self.invocation_preparation_strategy,
+                        catalog_view,
+                        selection_policy,
+                        &selection,
                         &coarse_timing,
                         &self.metrics.invocation_preparation,
                         wave,
@@ -7792,6 +7664,29 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
                 submission
             };
+            let selected = selection.get();
+            let reusable_program_stats = selected.and_then(|facts| facts.direct_program_stats());
+            reusable_direct_attempted |= reusable_program_stats.is_some();
+            if reusable_program_stats.is_none() && self.on_demand_reusable_execution_enabled() {
+                self.reusable_execution_catalog_refresh_needed
+                    .store(true, Ordering::Release);
+            }
+            if catalog.is_none() {
+                if let Some(program_id) = selected.and_then(|facts| facts.program_id()) {
+                    self.record_startup_reusable_program(participants, kind, program_id);
+                }
+            }
+            let reusable_catalog_miss = selected.and_then(|facts| {
+                facts.miss_reason().map(|reason| {
+                    facts
+                        .program_id()
+                        .map_or(unavailable_identity_miss, |program_id| {
+                            VNextReusableExecutionCatalogMissKey::from_program_id(
+                                program_id, reason,
+                            )
+                        })
+                })
+            });
             if let (Some(cold_wave), Some(observation)) = (cold_wave.as_mut(), observation) {
                 let outcome = match &submission {
                     Ok(_) => reusable_cold_path::Outcome::Submitted,

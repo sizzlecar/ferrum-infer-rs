@@ -1,5 +1,8 @@
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, OnceLock},
+};
 
 use crate::{DecodeCycleOutcome, DecodeCycleStage};
 
@@ -210,6 +213,160 @@ fn validate_determinism_replay_coverage(
 struct ReusableExecutionWaveAuthority {
     program_id: DeviceReusableExecutionProgramId,
     eager_boundary_node_indices: Vec<u32>,
+}
+
+/// Immutable caller snapshot; live residency is still checked at submission.
+#[derive(Clone, Copy)]
+pub struct ReusableExecutionProgramCatalog<'a> {
+    lane_epoch: u64,
+    programs: &'a BTreeMap<DeviceReusableExecutionProgramId, DeviceReusableExecutionProgram>,
+}
+
+impl<'a> ReusableExecutionProgramCatalog<'a> {
+    pub const fn new(
+        lane_epoch: u64,
+        programs: &'a BTreeMap<DeviceReusableExecutionProgramId, DeviceReusableExecutionProgram>,
+    ) -> Self {
+        Self {
+            lane_epoch,
+            programs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReusableExecutionSelectionPolicy {
+    Disabled,
+    ObserveOnly,
+    LookupCatalog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableExecutionCatalogMissReason {
+    ProgramIdentityUnavailable,
+    CatalogEmpty,
+    ProgramAbsent,
+    ProgramNonResident,
+    EpochMismatch,
+}
+
+impl ReusableExecutionCatalogMissReason {
+    pub const fn is_epoch_mismatch(self) -> bool {
+        matches!(self, Self::EpochMismatch)
+    }
+}
+
+/// Facts from the late, actual topology lookup, published before encoding.
+pub struct ReusableExecutionSelectionFacts {
+    lane_epoch: u64,
+    program_id: Option<DeviceReusableExecutionProgramId>,
+    miss_reason: Option<ReusableExecutionCatalogMissReason>,
+    direct_program_stats: Option<(u64, u64, u64)>,
+}
+
+impl ReusableExecutionSelectionFacts {
+    pub const fn lane_epoch(&self) -> u64 {
+        self.lane_epoch
+    }
+    pub fn program_id(&self) -> Option<&DeviceReusableExecutionProgramId> {
+        self.program_id.as_ref()
+    }
+    pub const fn miss_reason(&self) -> Option<ReusableExecutionCatalogMissReason> {
+        self.miss_reason
+    }
+    pub const fn direct_program_stats(&self) -> Option<(u64, u64, u64)> {
+        self.direct_program_stats
+    }
+}
+
+/// One attempt's output, also available to same-attempt timing callbacks.
+/// An empty slot means selection was not reached; it is not a catalog miss.
+#[derive(Default)]
+pub struct ReusableExecutionSelection {
+    facts: OnceLock<ReusableExecutionSelectionFacts>,
+}
+
+impl ReusableExecutionSelection {
+    pub fn get(&self) -> Option<&ReusableExecutionSelectionFacts> {
+        self.facts.get()
+    }
+}
+
+struct CatalogSelection<'a> {
+    catalog: Option<ReusableExecutionProgramCatalog<'a>>,
+    policy: ReusableExecutionSelectionPolicy,
+    output: &'a ReusableExecutionSelection,
+}
+
+impl<'a> CatalogSelection<'a> {
+    fn select<R: DeviceRuntime>(
+        &self,
+        authority: Option<&ReusableExecutionWaveAuthority>,
+        lane: &ExecutionLane<R>,
+    ) -> Result<Option<&'a DeviceReusableExecutionProgram>, VNextError> {
+        let lane_epoch = lane.reusable_execution_epoch();
+        let program_id = authority.map(|authority| &authority.program_id);
+        let mut miss_reason = None;
+        let selected = if self.policy != ReusableExecutionSelectionPolicy::LookupCatalog {
+            None
+        } else if let Some(catalog) = self.catalog {
+            match program_id {
+                None => {
+                    miss_reason =
+                        Some(ReusableExecutionCatalogMissReason::ProgramIdentityUnavailable);
+                    None
+                }
+                Some(_) if catalog.lane_epoch != lane_epoch => {
+                    miss_reason = Some(ReusableExecutionCatalogMissReason::EpochMismatch);
+                    None
+                }
+                Some(_) if catalog.programs.is_empty() => {
+                    miss_reason = Some(ReusableExecutionCatalogMissReason::CatalogEmpty);
+                    None
+                }
+                Some(id) => match catalog.programs.get(id) {
+                    Some(program) if program.has_resident_segments() => Some(program),
+                    Some(_) => {
+                        miss_reason = Some(ReusableExecutionCatalogMissReason::ProgramNonResident);
+                        None
+                    }
+                    None => {
+                        miss_reason = Some(ReusableExecutionCatalogMissReason::ProgramAbsent);
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
+        let facts = ReusableExecutionSelectionFacts {
+            lane_epoch,
+            program_id: (self.policy != ReusableExecutionSelectionPolicy::Disabled)
+                .then(|| program_id.cloned())
+                .flatten(),
+            miss_reason,
+            direct_program_stats: selected.map(|program| {
+                (
+                    program.segments().len() as u64,
+                    program
+                        .segments()
+                        .iter()
+                        .map(|segment| {
+                            u64::from(segment.end_node_index() - segment.start_node_index())
+                        })
+                        .sum(),
+                    program.per_wave_binding_node_indices().len() as u64,
+                )
+            }),
+        };
+        self.output.facts.set(facts).map_err(|_| {
+            invalid_operation(
+                "reusable catalog selection output was already used by another attempt",
+            )
+        })?;
+        Ok(selected)
+    }
 }
 
 pub struct OperationDispatch;
@@ -1424,6 +1581,109 @@ impl OperationDispatch {
         )
     }
 
+    /// Selects a caller catalog entry from the one late live topology derivation.
+    /// Explicit-program entrypoints keep their independent stale-program checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_inputs_and_catalog<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        catalog: Option<ReusableExecutionProgramCatalog<'_>>,
+        policy: ReusableExecutionSelectionPolicy,
+        selection: &ReusableExecutionSelection,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        if selection.get().is_some() {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "reusable catalog selection output must be fresh for this attempt",
+            )));
+        }
+        Self::encode_and_submit_wave_with_inputs_selected_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            None,
+            Some(CatalogSelection {
+                catalog,
+                policy,
+                output: selection,
+            }),
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_inputs_and_catalog_and_preparation<'binding, R, I, S, P>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        strategy: ferrum_types::InvocationPreparationStrategy,
+        catalog: Option<ReusableExecutionProgramCatalog<'_>>,
+        policy: ReusableExecutionSelectionPolicy,
+        selection: &ReusableExecutionSelection,
+        timing_sink: &S,
+        preparation_sink: &P,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+        P: super::InvocationPreparationSink,
+    {
+        let _observation = super::preparation::PreparationObservation {
+            identity: batch_identity,
+            sink: preparation_sink,
+        };
+        if batch_identity.preparation_strategy() != strategy {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "identity preparation strategy differs from the fresh wave binding",
+            )));
+        }
+        Self::encode_and_submit_wave_with_inputs_and_catalog(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            catalog,
+            policy,
+            selection,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_and_submit_wave_with_inputs_timed<'binding, R, I, S>(
         providers: &[BoundOperationProvider<'_, R>],
@@ -1435,6 +1695,46 @@ impl OperationDispatch {
         execution_policy: SubmissionExecutionPolicy,
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
         reusable_program: Option<&DeviceReusableExecutionProgram>,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_wave_with_inputs_selected_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            determinism_restore,
+            reusable_program,
+            None,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_and_submit_wave_with_inputs_selected_timed<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        catalog_selection: Option<CatalogSelection<'_>>,
         timing_sink: &S,
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -1534,6 +1834,13 @@ impl OperationDispatch {
         let reusable_execution_authority =
             Self::reusable_execution_wave_authority(providers, resolved, &wave, lane)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
+        let reusable_program = if let Some(selection) = &catalog_selection {
+            selection
+                .select(reusable_execution_authority.as_ref(), lane)
+                .map_err(SubmissionWaveDispatchError::Contract)?
+        } else {
+            reusable_program
+        };
         let mut effective_compute_path = execution_policy.compute_path();
         let mut declared_eager_compute_node_indices = Vec::new();
         if let Some(reusable_program) = reusable_program {

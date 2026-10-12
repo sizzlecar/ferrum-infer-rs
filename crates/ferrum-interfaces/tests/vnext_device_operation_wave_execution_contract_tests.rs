@@ -1561,3 +1561,382 @@ fn stale_reusable_topology_is_rejected_before_dispatch_or_encoding() {
     drop(lane);
     teardown(fixture, sequence, session, batch, step);
 }
+
+#[test]
+fn late_catalog_selection_observes_current_provider_topology_before_dispatch() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let earlier_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .unwrap();
+    let node_count = u32::try_from(providers.len()).unwrap();
+    let earlier_program = test_reusable_program(
+        earlier_id.clone(),
+        node_count,
+        vec![],
+        vec![DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap()],
+        (0..node_count).collect(),
+        vec![],
+    );
+
+    // The provider object, descriptor and prepared wave remain identical;
+    // its live topology now requires an eager first node and a resident tail.
+    *fixture.provider_behavior.lock().unwrap() =
+        ProviderBehavior::ProgramBindingFirstNodeEagerBoundary;
+    let current_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .unwrap();
+    assert_ne!(earlier_id, current_id);
+    let current_program = test_reusable_program(
+        current_id.clone(),
+        node_count,
+        vec![0],
+        vec![DeviceReusableExecutionSegment::new(0, 1, node_count, node_count - 1).unwrap()],
+        (1..node_count).collect(),
+        vec![],
+    );
+    let catalog = BTreeMap::from([
+        (earlier_id, earlier_program),
+        (current_id.clone(), current_program),
+    ]);
+    fixture
+        .provider_trace
+        .lock()
+        .unwrap()
+        .reusable_topology_calls = 0;
+    let selection = ReusableExecutionSelection::default();
+    let timing = RecordingSubmissionTimingSink::default();
+    let handle = OperationDispatch::encode_and_submit_wave_with_inputs_and_catalog(
+        &providers,
+        &fixture.resolved,
+        &identity,
+        active.iter(),
+        DeviceTimingMode::Off,
+        &[],
+        SubmissionExecutionPolicy::adaptive(),
+        Some(ReusableExecutionProgramCatalog::new(
+            lane.reusable_execution_epoch(),
+            &catalog,
+        )),
+        ReusableExecutionSelectionPolicy::LookupCatalog,
+        &selection,
+        &timing,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap()
+    .into_parts()
+    .0;
+    let facts = selection.get().expect("late selection reached dispatch");
+    assert_eq!(facts.program_id(), Some(&current_id));
+    assert_eq!(facts.miss_reason(), None);
+    assert_eq!(
+        facts.direct_program_stats(),
+        Some((1, u64::from(node_count - 1), u64::from(node_count - 1)))
+    );
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(
+            trace.submitted_commands,
+            vec![vec![
+                TestCommand::CoalescedProgramBinding,
+                TestCommand::Provider,
+                TestCommand::ReusableExecution,
+            ]]
+        );
+    }
+    {
+        let trace = fixture.provider_trace.lock().unwrap();
+        assert_eq!(trace.reusable_topology_calls, providers.len() as u64);
+        assert_eq!(trace.encode_calls, 1);
+        assert_eq!(
+            trace.reusable_binding_encode_calls,
+            u64::from(node_count - 1)
+        );
+    }
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    drop(handle);
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(reaper.retained_count(), 0);
+    drop(catalog);
+    drop(providers);
+    drop(active);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn late_catalog_misses_preserve_eager_execution_and_exact_selection_facts() {
+    for reason in [
+        ReusableExecutionCatalogMissReason::EpochMismatch,
+        ReusableExecutionCatalogMissReason::CatalogEmpty,
+        ReusableExecutionCatalogMissReason::ProgramAbsent,
+        ReusableExecutionCatalogMissReason::ProgramNonResident,
+    ] {
+        let (fixture, sequence, session, batch, step) = setup_with_fixture(
+            fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+        );
+        let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let active = wave_active_bindings(&wave, &session);
+        let lane = Arc::clone(step.execution_lane());
+        let reaper = CompletionReaper::new();
+        let providers = fixture
+            .plan
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+            .collect::<Vec<_>>();
+        let identity = OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap();
+        let current_id = OperationDispatch::reusable_execution_program_id_for_wave(
+            &providers,
+            &fixture.resolved,
+            &wave,
+            &lane,
+        )
+        .unwrap()
+        .unwrap();
+        let node_count = u32::try_from(providers.len()).unwrap();
+        let mut epoch = lane.reusable_execution_epoch();
+        let mut catalog = BTreeMap::new();
+        if reason != ReusableExecutionCatalogMissReason::CatalogEmpty {
+            let catalog_id = if reason == ReusableExecutionCatalogMissReason::ProgramAbsent {
+                current_id.clone().with_topology_fingerprint(
+                    DeviceReusableExecutionTopologyFingerprint::from_sha256([0xee; 32]),
+                )
+            } else {
+                current_id.clone()
+            };
+            let program = if reason == ReusableExecutionCatalogMissReason::ProgramNonResident {
+                test_reusable_program(
+                    catalog_id.clone(),
+                    node_count,
+                    vec![],
+                    vec![],
+                    vec![],
+                    (0..node_count)
+                        .map(|node| {
+                            DeviceReusableExecutionProgramGap::new(
+                                node,
+                                DeviceReusableExecutionProgramGapReason::CapacityDeferred,
+                            )
+                        })
+                        .collect(),
+                )
+            } else {
+                test_reusable_program(
+                    catalog_id.clone(),
+                    node_count,
+                    vec![],
+                    vec![
+                        DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap(),
+                    ],
+                    (0..node_count).collect(),
+                    vec![],
+                )
+            };
+            catalog.insert(catalog_id, program);
+        }
+        if reason == ReusableExecutionCatalogMissReason::EpochMismatch {
+            epoch = epoch.checked_add(1).unwrap();
+        }
+        let selection = ReusableExecutionSelection::default();
+        let timing = RecordingSubmissionTimingSink::default();
+        let handle = OperationDispatch::encode_and_submit_wave_with_inputs_and_catalog(
+            &providers,
+            &fixture.resolved,
+            &identity,
+            active.iter(),
+            DeviceTimingMode::Off,
+            &[],
+            SubmissionExecutionPolicy::adaptive(),
+            Some(ReusableExecutionProgramCatalog::new(epoch, &catalog)),
+            ReusableExecutionSelectionPolicy::LookupCatalog,
+            &selection,
+            &timing,
+            wave,
+            &lane,
+            &reaper,
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+        let facts = selection
+            .get()
+            .expect("catalog miss still publishes selection facts");
+        assert_eq!(facts.program_id(), Some(&current_id));
+        assert_eq!(facts.miss_reason(), Some(reason));
+        assert_eq!(facts.direct_program_stats(), None);
+        {
+            let trace = fixture.runtime_trace.lock().unwrap();
+            assert_eq!(
+                trace.submitted_commands,
+                vec![vec![
+                    TestCommand::CoalescedProgramBinding,
+                    TestCommand::Provider,
+                    TestCommand::Provider,
+                ]]
+            );
+        }
+        assert_eq!(
+            fixture.provider_trace.lock().unwrap().encode_calls,
+            providers.len() as u64
+        );
+        assert!(matches!(
+            handle.wait().unwrap(),
+            CompletionObservation::Terminal(_)
+        ));
+        drop(handle);
+        assert_eq!(lane.in_flight_count(), 0);
+        assert_eq!(reaper.retained_count(), 0);
+        drop(catalog);
+        drop(providers);
+        drop(active);
+        drop(reaper);
+        drop(lane);
+        teardown(fixture, sequence, session, batch, step);
+    }
+}
+
+#[test]
+fn observe_only_and_disabled_catalog_policies_do_not_select_resident_compute() {
+    for policy in [
+        ReusableExecutionSelectionPolicy::ObserveOnly,
+        ReusableExecutionSelectionPolicy::Disabled,
+    ] {
+        let (fixture, sequence, session, batch, step) = setup_with_fixture(
+            fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+        );
+        let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let active = wave_active_bindings(&wave, &session);
+        let lane = Arc::clone(step.execution_lane());
+        let reaper = CompletionReaper::new();
+        let providers = fixture
+            .plan
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+            .collect::<Vec<_>>();
+        let identity = OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap();
+        let current_id = OperationDispatch::reusable_execution_program_id_for_wave(
+            &providers,
+            &fixture.resolved,
+            &wave,
+            &lane,
+        )
+        .unwrap()
+        .unwrap();
+        let node_count = u32::try_from(providers.len()).unwrap();
+        let program = test_reusable_program(
+            current_id.clone(),
+            node_count,
+            vec![],
+            vec![DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap()],
+            (0..node_count).collect(),
+            vec![],
+        );
+        let catalog = BTreeMap::from([(current_id.clone(), program)]);
+        let selection = ReusableExecutionSelection::default();
+        let timing = RecordingSubmissionTimingSink::default();
+        let handle = OperationDispatch::encode_and_submit_wave_with_inputs_and_catalog(
+            &providers,
+            &fixture.resolved,
+            &identity,
+            active.iter(),
+            DeviceTimingMode::Off,
+            &[],
+            SubmissionExecutionPolicy::adaptive(),
+            Some(ReusableExecutionProgramCatalog::new(
+                lane.reusable_execution_epoch(),
+                &catalog,
+            )),
+            policy,
+            &selection,
+            &timing,
+            wave,
+            &lane,
+            &reaper,
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+        let facts = selection
+            .get()
+            .expect("selection policy publishes its facts");
+        assert_eq!(
+            facts.program_id(),
+            (policy == ReusableExecutionSelectionPolicy::ObserveOnly).then_some(&current_id)
+        );
+        assert_eq!(facts.miss_reason(), None);
+        assert_eq!(facts.direct_program_stats(), None);
+        {
+            let trace = fixture.runtime_trace.lock().unwrap();
+            assert_eq!(
+                trace.submitted_commands,
+                vec![vec![
+                    TestCommand::CoalescedProgramBinding,
+                    TestCommand::Provider,
+                    TestCommand::Provider,
+                ]]
+            );
+        }
+        assert!(matches!(
+            handle.wait().unwrap(),
+            CompletionObservation::Terminal(_)
+        ));
+        drop(handle);
+        drop(catalog);
+        drop(providers);
+        drop(active);
+        drop(reaper);
+        drop(lane);
+        teardown(fixture, sequence, session, batch, step);
+    }
+}
