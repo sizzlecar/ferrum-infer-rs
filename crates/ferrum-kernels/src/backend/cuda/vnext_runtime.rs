@@ -1607,7 +1607,7 @@ impl CudaDeviceCommand {
         ranges: Vec<CudaSegmentRange>,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         for range in &ranges {
-            if owners.region(range)?.runtime_instance != destination.runtime_instance {
+            if owners.runtime_instance_for(range)? != destination.runtime_instance {
                 return Err(CudaDeviceRuntimeError::contract(
                     "segment owner belongs to another CUDA runtime",
                 ));

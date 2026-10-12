@@ -122,6 +122,20 @@ pub(crate) struct CudaSegmentRange {
 }
 
 impl CudaSegmentRange {
+    fn validate_capacity(self, capacity: u64) -> Result<(), CudaDeviceRuntimeError> {
+        if self.length_bytes == 0
+            || self
+                .byte_offset
+                .checked_add(self.length_bytes)
+                .is_none_or(|end| end > capacity)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "segment range is empty or outside its retained allocation",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn subrange(self, offset: u64, bytes: u64) -> Result<Self, CudaDeviceRuntimeError> {
         let byte_offset =
             checked_subregion_address(self.byte_offset, self.length_bytes, offset, bytes)?;
@@ -151,6 +165,42 @@ impl CudaSegmentOwnerTable {
             .map_or(0, |previous| self.ends[previous]);
         self.blocks.get(block)?;
         Some((block, index - base))
+    }
+
+    /// Validate against the actual retained owner without deriving an address.
+    /// The range was issued from this patch's checked parent/current window.
+    pub(crate) fn runtime_instance_for(
+        &self,
+        range: &CudaSegmentRange,
+    ) -> Result<u64, CudaDeviceRuntimeError> {
+        match self.blocks.get(range.owner_block) {
+            Some(CudaSegmentOwnerBlock::Sequence(block)) => {
+                let source = block.owner(range.owner_local).ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("shared segment range owner is absent")
+                })?;
+                let (buffer, _) = source.buffer_and_retention();
+                range.validate_capacity(
+                    buffer
+                        .descriptor
+                        .size_bytes
+                        .min(buffer.allocation.requested_bytes),
+                )?;
+                Ok(buffer.runtime_instance)
+            }
+            Some(CudaSegmentOwnerBlock::Fresh(owners)) => {
+                let owner = owners
+                    .get(range.owner_local)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract("segment range owner is absent")
+                    })?;
+                range.validate_capacity(owner.allocation.requested_bytes)?;
+                Ok(owner.runtime_instance)
+            }
+            None => Err(CudaDeviceRuntimeError::contract(
+                "segment range owner block is absent",
+            )),
+        }
     }
 
     pub(crate) fn region(
@@ -433,8 +483,15 @@ mod tests {
             length_bytes: 1,
         };
         assert!(table.region(&absent).is_err());
+        assert!(table.runtime_instance_for(&absent).is_err());
         assert!(table
             .region(&CudaSegmentRange {
+                owner_block: 3,
+                ..absent
+            })
+            .is_err());
+        assert!(table
+            .runtime_instance_for(&CudaSegmentRange {
                 owner_block: 3,
                 ..absent
             })
@@ -450,6 +507,15 @@ mod tests {
             length_bytes: 96,
         };
         let tail = parent.subrange(64, 32).unwrap();
+        assert!(parent.validate_capacity(4192).is_ok());
+        assert!(tail.validate_capacity(4192).is_ok());
+        assert!(parent.validate_capacity(4191).is_err());
+        assert!(CudaSegmentRange {
+            length_bytes: 0,
+            ..parent
+        }
+        .validate_capacity(4192)
+        .is_err());
         assert_eq!(
             (
                 tail.owner_block,
@@ -469,5 +535,6 @@ mod tests {
             ..parent
         };
         assert!(overflowing.subrange(0, 1).is_err());
+        assert!(overflowing.validate_capacity(u64::MAX).is_err());
     }
 }
