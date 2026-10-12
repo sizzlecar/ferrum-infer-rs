@@ -545,7 +545,7 @@ pub(crate) struct SegmentBindings<B> {
 
 enum BindingBlock<B> {
     Fresh(Vec<LogicalBackingSegmentBinding<B>>),
-    Sequence(Arc<super::sequence_physical_rows::ValidatedSequencePhysicalRow<B>>),
+    Sequence(super::SharedSequenceBindingOwnerBlock<B>),
 }
 
 impl<B> SegmentBindings<B> {
@@ -688,7 +688,7 @@ impl<'a, B> Iterator for SegmentMetadataIter<'a, B> {
 pub struct SegmentBackingBatch<B> {
     resources: Vec<SegmentBackingResource>,
     bindings: SegmentBindings<B>,
-    windows: Vec<Range<usize>>,
+    windows: Vec<PreparedWindow>,
     regions: Vec<WindowRegion>,
 }
 
@@ -702,9 +702,10 @@ impl<B> SegmentBackingBatch<B> {
     pub fn window(&self, index: usize) -> Option<SegmentBackingWindowView<'_, B>> {
         self.windows
             .get(index)
-            .map(|range| SegmentBackingWindowView {
+            .map(|window| SegmentBackingWindowView {
                 batch: self,
-                regions: &self.regions[range.clone()],
+                window,
+                regions: &self.regions[window.regions.clone()],
             })
     }
     /// The operation layer uses each actual buffer once for its explicit
@@ -720,14 +721,58 @@ impl<B> SegmentBackingBatch<B> {
             entry: 0,
         }
     }
+    pub(crate) fn owner_block_count(&self) -> usize {
+        self.bindings.blocks.len()
+    }
+    pub(crate) fn owner_blocks(
+        &self,
+    ) -> impl ExactSizeIterator<Item = crate::vnext::SegmentBindingOwnerBlock<'_, B>> {
+        self.bindings.blocks.iter().map(|block| match block {
+            BindingBlock::Fresh(bindings) => crate::vnext::SegmentBindingOwnerBlock::Borrowed(
+                bindings
+                    .iter()
+                    .map(|binding| crate::vnext::SegmentBindingOwnerView {
+                        buffer: binding.buffer(),
+                        retention: binding.retention_ref(),
+                    })
+                    .collect(),
+            ),
+            BindingBlock::Sequence(block) => {
+                crate::vnext::SegmentBindingOwnerBlock::SharedSequence(block.clone())
+            }
+        })
+    }
+}
+
+struct PreparedWindow {
+    regions: Range<usize>,
+    binding_block: usize,
+    start: u64,
+    length: u64,
+    element_type: ElementType,
 }
 
 pub struct SegmentBackingWindowView<'a, B> {
     batch: &'a SegmentBackingBatch<B>,
+    window: &'a PreparedWindow,
     regions: &'a [WindowRegion],
 }
 
 impl<'a, B> SegmentBackingWindowView<'a, B> {
+    pub(crate) fn shared_sequence_window(
+        &self,
+        owner_block_base: usize,
+    ) -> Option<super::CurrentSequenceBindingWindow<'a, B>> {
+        match self.batch.bindings.blocks.get(self.window.binding_block)? {
+            BindingBlock::Sequence(block) => Some(block.current_window(
+                owner_block_base + self.window.binding_block,
+                self.window.start,
+                self.window.length,
+                self.window.element_type,
+            )),
+            BindingBlock::Fresh(_) => None,
+        }
+    }
     pub(crate) fn region_count(&self) -> usize {
         self.regions.len()
     }
@@ -767,6 +812,12 @@ pub struct SegmentPhysicalRegion<'a, B> {
 impl<'a, B> SegmentPhysicalRegion<'a, B> {
     pub(crate) const fn binding_index(&self) -> usize {
         self.region.binding_index
+    }
+    pub(crate) const fn binding_block(&self) -> usize {
+        self.region.binding_block
+    }
+    pub(crate) const fn binding_local(&self) -> usize {
+        self.region.binding_local
     }
 
     pub(crate) fn borrowed_buffer_and_physical_range(
@@ -1119,7 +1170,9 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                             )
                         };
                         publish.push((source, Arc::clone(&row)));
-                        result.bindings.push(BindingBlock::Sequence(row))?
+                        result.bindings.push(BindingBlock::Sequence(
+                            super::SharedSequenceBindingOwnerBlock::new(row),
+                        ))?
                     } else {
                         result
                             .bindings
@@ -1234,7 +1287,13 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                         "segment physical backing does not cover its window",
                     ));
                 }
-                result.windows.push(start..result.regions.len());
+                result.windows.push(PreparedWindow {
+                    regions: start..result.regions.len(),
+                    binding_block: resource.binding_block,
+                    start: window.offset_bytes,
+                    length: window.length_bytes,
+                    element_type: window.element_type,
+                });
             }
             Ok(true)
         })();

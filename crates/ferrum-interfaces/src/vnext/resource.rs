@@ -75,6 +75,11 @@ pub(crate) use segment_permit::{
     SegmentPlanResourceView, SegmentWindowResource, SegmentWindowRule,
 };
 pub(crate) use sequence_physical_rows::SequencePhysicalRowSource;
+pub use sequence_physical_rows::{
+    ApprovedSequenceBindingPart, CurrentSequenceBindingWindow, SegmentBindingPageAddressLayout,
+    SegmentBindingPageTemplate, SegmentBindingPageTemplateKey, SegmentBindingTemplatePage,
+    SharedSequenceBindingOwnerBlock,
+};
 mod dynamic_pool_maintenance;
 mod pool_resident_reclaim;
 pub use dynamic_pool_maintenance::*;

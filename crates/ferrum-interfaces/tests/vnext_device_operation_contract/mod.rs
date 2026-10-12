@@ -1786,8 +1786,10 @@ impl DeviceRuntime for TestRuntime {
                             match part.owner_index() {
                                 Some(index) => {
                                     assert_eq!(mode, SegmentBindingOwnerViewMode::Indexed);
-                                    let (owner_buffer, owner_retention) =
-                                        owners[index.get()].buffer_and_retention();
+                                    let (owner_buffer, owner_retention) = owners
+                                        .get(index.get())
+                                        .expect("current segment owner")
+                                        .buffer_and_retention();
                                     assert!(std::ptr::eq(buffer, owner_buffer));
                                     assert!(retention.same_owners(owner_retention));
                                 }

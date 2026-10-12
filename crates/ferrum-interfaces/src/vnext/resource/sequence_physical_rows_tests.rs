@@ -1,6 +1,11 @@
 //! Real sequence admission and the legacy full-permit oracle.
 use super::*;
 use crate::vnext::operation::DisabledSubmissionWaveDispatchTimingSink;
+use crate::vnext::{
+    ApprovedSequenceBindingPart, SegmentBindingOwnerBlock, SegmentBindingOwnerSources,
+    SegmentBindingPageAddressLayout, SegmentBindingPageTemplate, SegmentBindingPageTemplateKey,
+    SegmentBindingTemplatePage,
+};
 
 fn sequence_row_harness(
     demand: TestDemand,
@@ -137,6 +142,242 @@ fn paired_batch(
     let candidate = cached_batch(pools, snapshot, resource, expected, &windows).unwrap();
     assert_same_batch(&legacy, &candidate, windows.len());
     candidate
+}
+
+// These deterministic host addresses exercise only Core's scalar geometry.
+// The CUDA cold path separately checks actual native address derivation.
+fn scalar_template(
+    part: &ApprovedSequenceBindingPart<'_, TestBuffer>,
+    key: SegmentBindingPageTemplateKey,
+) -> SegmentBindingPageTemplate {
+    let mut pages = Vec::new();
+    let mut addresses = Vec::new();
+    for local_owner in 0..part.owner_count() {
+        let range = part.physical_range(local_owner).unwrap();
+        let mut offset = range.start;
+        while offset < range.end {
+            let address = 0x1000 + pages.len() as u64 * 0x100;
+            pages.push(SegmentBindingTemplatePage {
+                local_owner,
+                physical_offset_bytes: offset,
+                length_bytes: key.physical_page_bytes,
+                address,
+            });
+            match key.address_layout {
+                SegmentBindingPageAddressLayout::Flat => addresses.push(address),
+                SegmentBindingPageAddressLayout::Blocked {
+                    combined_block_bytes,
+                    blocks_per_page,
+                } => {
+                    addresses.extend(
+                        (0..blocks_per_page).map(|block| address + block * combined_block_bytes),
+                    );
+                }
+            }
+            offset += key.physical_page_bytes;
+        }
+    }
+    SegmentBindingPageTemplate {
+        key,
+        pages,
+        addresses,
+        physical_bytes: part.physical_bytes(),
+    }
+}
+
+#[test]
+fn sequence_physical_rows_page_memo_is_scalar_sealed_and_shared_with_exact_owners() {
+    let (harness, sequence) = sequence_row_harness(TestDemand::Tokens, "physical-row-memo", 64);
+    let initial = sequence.backing_snapshot().unwrap();
+    let resource = initial.backing_slices()[0].resource_id().clone();
+    let pools = &harness.root.dynamic_pools;
+    let first = paired_batch(pools, &initial, &resource, 64);
+    let approved = first.window(0).unwrap().shared_sequence_window(2).unwrap();
+    let part = approved.parts().next().unwrap();
+    let key = SegmentBindingPageTemplateKey {
+        physical_page_bytes: 16,
+        element_type: expectation(&initial, &resource, 64).element_type,
+        address_layout: SegmentBindingPageAddressLayout::Blocked {
+            combined_block_bytes: 8,
+            blocks_per_page: 2,
+        },
+        runtime_instance: 1,
+        provider_fingerprint: [3; 32],
+        numerical_profile: [5; 32],
+    };
+    let mutations: [fn(&mut SegmentBindingPageTemplate); 10] = [
+        |template: &mut SegmentBindingPageTemplate| {
+            template.pages[0].local_owner += 1;
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.pages[0].physical_offset_bytes += 16;
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.pages[0].length_bytes -= 1;
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.addresses[1] += 1;
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.physical_bytes -= 16;
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.pages.pop();
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.key.physical_page_bytes = 0;
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.key.element_type = if template.key.element_type == ElementType::F32 {
+                ElementType::U8
+            } else {
+                ElementType::F32
+            };
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.pages[0].address = u64::MAX;
+        },
+        |template: &mut SegmentBindingPageTemplate| {
+            template.key.address_layout = SegmentBindingPageAddressLayout::Blocked {
+                combined_block_bytes: u64::MAX,
+                blocks_per_page: 2,
+            };
+        },
+    ];
+    for mutate in mutations {
+        let mut invalid = scalar_template(&part, key);
+        mutate(&mut invalid);
+        assert!(!part.publish_page_template(Arc::new(invalid)));
+        assert!(part.page_template(&key).is_none());
+    }
+    let template = Arc::new(scalar_template(&part, key));
+    assert!(part.publish_page_template(Arc::clone(&template)));
+    assert!(part.same_page_template(&template));
+    assert!(part.matches_page_template(&template));
+    assert!(!part.matches_page_template(&scalar_template(&part, key)));
+    assert!(!part.publish_page_template(Arc::new(scalar_template(&part, key))));
+    assert!(Arc::ptr_eq(&part.page_template(&key).unwrap(), &template));
+    for changed in [
+        SegmentBindingPageTemplateKey {
+            runtime_instance: 2,
+            ..key
+        },
+        SegmentBindingPageTemplateKey {
+            provider_fingerprint: [4; 32],
+            ..key
+        },
+        SegmentBindingPageTemplateKey {
+            numerical_profile: [6; 32],
+            ..key
+        },
+        SegmentBindingPageTemplateKey {
+            address_layout: SegmentBindingPageAddressLayout::Flat,
+            ..key
+        },
+        SegmentBindingPageTemplateKey {
+            physical_page_bytes: 32,
+            ..key
+        },
+    ] {
+        assert!(part.page_template(&changed).is_none());
+    }
+    let lease = &initial.backing_slices()[0].segment_lease;
+    let probe = Arc::downgrade(lease);
+    let counts = (
+        Arc::strong_count(lease),
+        Arc::strong_count(&first.bindings()[0].chunk),
+    );
+    let mut sources = SegmentBindingOwnerSources::new();
+    sources
+        .push(SegmentBindingOwnerBlock::Borrowed(vec![approved
+            .shared_block()
+            .owner(0)
+            .unwrap()]))
+        .unwrap();
+    sources
+        .push(SegmentBindingOwnerBlock::Borrowed(Vec::new()))
+        .unwrap();
+    sources
+        .push(SegmentBindingOwnerBlock::SharedSequence(
+            approved.shared_block().clone(),
+        ))
+        .unwrap();
+    assert_eq!(sources.block_count(), 3);
+    assert_eq!(sources.resolve(0).unwrap().block(), 0);
+    assert_eq!(
+        (
+            sources.resolve(1).unwrap().block(),
+            sources.resolve(1).unwrap().local()
+        ),
+        (2, 0)
+    );
+    let copied = sources.clone();
+    let (_, retained) = copied.get(1).unwrap().buffer_and_retention();
+    assert!(retained.same_owners(first.bindings()[0].retention_ref()));
+    assert_eq!(
+        (
+            Arc::strong_count(lease),
+            Arc::strong_count(&first.bindings()[0].chunk)
+        ),
+        counts
+    );
+    drop(copied);
+    drop(sources);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 64)
+        .unwrap();
+    let session = sequence.open_session().unwrap();
+    let extended = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("real append must add a physical tail"),
+    };
+    let next = paired_batch(pools, &extended, &resource, 128);
+    let current = next.window(0).unwrap().shared_sequence_window(0).unwrap();
+    let mut parts = current.parts();
+    let prefix = parts.next().unwrap();
+    let tail = parts.next().unwrap();
+    assert!(prefix.same_page_template(&template));
+    assert!(tail.page_template(&key).is_none());
+    assert!(!tail.matches_page_template(&template));
+    assert!(!prefix
+        .shared_block()
+        .same_owner_block(approved.shared_block()));
+    assert!(prefix
+        .owner(0)
+        .unwrap()
+        .buffer_and_retention()
+        .1
+        .same_owners(
+            approved
+                .shared_block()
+                .owner(0)
+                .unwrap()
+                .buffer_and_retention()
+                .1,
+        ));
+    session.request_cancel().unwrap();
+    session.try_abort().unwrap();
+    drop(parts);
+    drop(next);
+    drop(first);
+    drop(extended);
+    drop(initial);
+    drop(session);
+    drop(sequence);
+    assert!(
+        probe.upgrade().is_none(),
+        "retained scalar template must not pin a lease"
+    );
+    assert_eq!(template.pages.len(), 4);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -336,6 +577,49 @@ fn sequence_physical_rows_preserve_prefix_across_real_and_empty_extensions() {
         let next = paired_batch(pools, &extended, &resource, bytes);
         assert!(std::ptr::eq(&first.bindings()[0], &next.bindings()[0]));
         assert_eq!(next.bindings().len(), if added_extent { 2 } else { 1 });
+        if added_extent {
+            let expected = expectation(&extended, &resource, 128);
+            let windows = [(0, 32), (80, 32), (48, 32), (16, 96)].map(|(offset, length)| {
+                SegmentBackingWindow {
+                    offset_bytes: offset,
+                    length_bytes: length,
+                    ..window(expected)
+                }
+            });
+            let legacy = pools
+                .segment_backing_batch(
+                    &[extended.backing_slices_for(&resource)],
+                    &[expected],
+                    &windows,
+                )
+                .unwrap();
+            let selected = cached_batch(pools, &extended, &resource, expected, &windows).unwrap();
+            assert_same_batch(&legacy, &selected, windows.len());
+            let parts = |index| {
+                selected
+                    .window(index)
+                    .unwrap()
+                    .shared_sequence_window(2)
+                    .unwrap()
+                    .parts()
+                    .map(|part| {
+                        (
+                            part.owner_block(),
+                            part.owner_base(),
+                            part.logical_start_in_part(),
+                            part.length_bytes(),
+                            part.logical_offset_in_window(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // Legal windows may leave an entire physical part before or after
+            // the selected interval; neither excluded part may be evaluated.
+            assert_eq!(parts(0), vec![(2, 0, 0, 32, 0)]);
+            assert_eq!(parts(1), vec![(2, 1, 16, 32, 0)]);
+            assert_eq!(parts(2), vec![(2, 0, 48, 16, 0), (2, 1, 0, 16, 16)]);
+            assert_eq!(parts(3), vec![(2, 0, 16, 48, 0), (2, 1, 0, 48, 48)]);
+        }
         let current = match session
             .try_ensure_backing_covers(
                 SequenceResourceExtensionRequest::new(
@@ -425,6 +709,7 @@ fn sequence_physical_rows_recheck_live_chunks_poison_and_window_bounds() {
         .chunks
         .insert(ordinal, replacement);
     let fresh = paired_batch(pools, &snapshot, &resource, 64);
+    assert!(fresh.window(0).unwrap().shared_sequence_window(0).is_none());
     assert!(!Arc::ptr_eq(
         &first.bindings()[0].chunk,
         &fresh.bindings()[0].chunk

@@ -493,29 +493,31 @@ where
         SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
     );
     let owner_view_mode = runtime.segment_binding_owner_view_mode();
-    let mut owners = Vec::new();
+    let mut owners = SegmentBindingOwnerSources::new();
+    let mut owner_block_base = 0;
     if owner_view_mode == SegmentBindingOwnerViewMode::Indexed {
-        let owner_count = plan_views
-            .len()
-            .checked_add(backing.as_ref().map_or(0, |batch| batch.bindings().len()))
-            .ok_or_else(|| invalid_operation("segment owner table length overflows"))?;
-        owners
-            .try_reserve_exact(owner_count)
-            .map_err(|_| invalid_operation("segment owner view allocation failed"))?;
-        owners.extend(plan_views.iter().map(|plan| SegmentBindingOwnerView {
-            buffer: plan.leased.buffer(),
-            retention: &plan.retention,
-        }));
-        if let Some(backing) = &backing {
-            owners.extend(
-                backing
-                    .bindings()
+        owners.reserve(
+            usize::from(!plan_views.is_empty())
+                + backing
+                    .as_ref()
+                    .map_or(0, |batch| batch.owner_block_count()),
+        )?;
+        if !plan_views.is_empty() {
+            owners.push(SegmentBindingOwnerBlock::Borrowed(
+                plan_views
                     .iter()
-                    .map(|binding| SegmentBindingOwnerView {
-                        buffer: binding.buffer(),
-                        retention: binding.retention_ref(),
-                    }),
-            );
+                    .map(|plan| SegmentBindingOwnerView {
+                        buffer: plan.leased.buffer(),
+                        retention: &plan.retention,
+                    })
+                    .collect(),
+            ))?;
+        }
+        owner_block_base = owners.block_count();
+        if let Some(backing) = &backing {
+            for block in backing.owner_blocks() {
+                owners.push(block)?;
+            }
         }
     }
     let mut scopes = Vec::with_capacity(recipe.nodes.len());
@@ -604,6 +606,7 @@ where
                                 SegmentBindingPhysicalSource::Dynamic {
                                     window: current,
                                     owner_base: plan_views.len(),
+                                    owner_block_base: Some(owner_block_base),
                                 }
                             }
                         }

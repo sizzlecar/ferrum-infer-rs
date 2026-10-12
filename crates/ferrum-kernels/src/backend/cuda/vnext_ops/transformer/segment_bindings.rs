@@ -100,7 +100,9 @@ pub(crate) fn encode_program(
             "compiled CUDA binding node count differs from its fresh frame",
         ));
     }
-    let mut owners = CudaSegmentOwnerBuilder::new(frame.owners().to_vec());
+    let mut owners = CudaSegmentOwnerBuilder::new(
+        ferrum_interfaces::vnext::SegmentBindingOwnerSources::from_legacy(frame.owners().to_vec()),
+    )?;
     let mut sink = crate::backend::cuda::vnext_runtime::CudaBindingProgramSink::new();
     let mut encoded = Vec::with_capacity(program.nodes.len());
     for (ordinal, (node_index, recipe)) in program.nodes.iter().enumerate() {
@@ -370,7 +372,7 @@ pub(crate) fn encode(
     }
     let mut pending_nodes = Vec::with_capacity(patch.nodes().len());
     let (owner_views, nodes) = patch.into_parts();
-    let mut owners = CudaSegmentOwnerBuilder::new(owner_views);
+    let mut owners = CudaSegmentOwnerBuilder::new(owner_views)?;
     for mut node in nodes {
         let recipe = node
             .declaration()

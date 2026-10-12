@@ -178,6 +178,168 @@ impl<'a, B> SegmentBindingOwnerView<'a, B> {
     }
 }
 
+/// Current patch coordinates, never an ownership identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentBindingOwnerLocation {
+    block: usize,
+    local: usize,
+}
+impl SegmentBindingOwnerLocation {
+    pub const fn block(self) -> usize {
+        self.block
+    }
+    pub const fn local(self) -> usize {
+        self.local
+    }
+    pub(crate) const fn new(block: usize, local: usize) -> Self {
+        Self { block, local }
+    }
+}
+
+pub enum SegmentBindingOwnerBlock<'a, B> {
+    Borrowed(Vec<SegmentBindingOwnerView<'a, B>>),
+    SharedSequence(crate::vnext::SharedSequenceBindingOwnerBlock<B>),
+}
+impl<B> Clone for SegmentBindingOwnerBlock<'_, B> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Borrowed(views) => Self::Borrowed(views.clone()),
+            Self::SharedSequence(block) => Self::SharedSequence(block.clone()),
+        }
+    }
+}
+impl<B> SegmentBindingOwnerBlock<'_, B> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(views) => views.len(),
+            Self::SharedSequence(block) => block.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn owner(&self, local: usize) -> Option<SegmentBindingOwnerView<'_, B>> {
+        match self {
+            Self::Borrowed(views) => views.get(local).copied(),
+            Self::SharedSequence(block) => block.owner(local),
+        }
+    }
+}
+
+/// Stores only one retained handle per shared Sequence block. Legacy
+/// iteration is borrowed; it never materializes a flat owner-view vector.
+pub struct SegmentBindingOwnerSources<'a, B> {
+    blocks: Vec<SegmentBindingOwnerBlock<'a, B>>,
+    ends: Vec<usize>,
+    count: usize,
+}
+impl<B> Clone for SegmentBindingOwnerSources<'_, B> {
+    fn clone(&self) -> Self {
+        Self {
+            blocks: self.blocks.clone(),
+            ends: self.ends.clone(),
+            count: self.count,
+        }
+    }
+}
+impl<'a, B> SegmentBindingOwnerSources<'a, B> {
+    pub(crate) fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            ends: Vec::new(),
+            count: 0,
+        }
+    }
+    pub fn from_legacy(views: Vec<SegmentBindingOwnerView<'a, B>>) -> Self {
+        let count = views.len();
+        if count == 0 {
+            return Self::new();
+        }
+        Self {
+            blocks: vec![SegmentBindingOwnerBlock::Borrowed(views)],
+            ends: vec![count],
+            count,
+        }
+    }
+    pub(crate) fn reserve(&mut self, blocks: usize) -> Result<(), VNextError> {
+        self.blocks
+            .try_reserve_exact(blocks)
+            .map_err(|_| invalid_operation("segment owner block allocation failed"))?;
+        self.ends
+            .try_reserve_exact(blocks)
+            .map_err(|_| invalid_operation("segment owner index allocation failed"))
+    }
+    pub(crate) fn push(
+        &mut self,
+        block: SegmentBindingOwnerBlock<'a, B>,
+    ) -> Result<(), VNextError> {
+        self.count = self
+            .count
+            .checked_add(block.len())
+            .ok_or_else(|| invalid_operation("segment owner table length overflows"))?;
+        self.blocks.push(block);
+        self.ends.push(self.count);
+        Ok(())
+    }
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+    pub fn resolve(&self, global: usize) -> Option<SegmentBindingOwnerLocation> {
+        let block = self.ends.partition_point(|end| *end <= global);
+        let end = *self.ends.get(block)?;
+        let start = block
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous]);
+        (global < end).then_some(SegmentBindingOwnerLocation::new(block, global - start))
+    }
+    pub fn get(&self, global: usize) -> Option<SegmentBindingOwnerView<'_, B>> {
+        let location = self.resolve(global)?;
+        self.blocks.get(location.block)?.owner(location.local)
+    }
+    pub fn into_blocks(self) -> Vec<SegmentBindingOwnerBlock<'a, B>> {
+        self.blocks
+    }
+    pub fn iter(&self) -> SegmentBindingOwnerIterator<'_, 'a, B> {
+        SegmentBindingOwnerIterator {
+            sources: self,
+            block: 0,
+            local: 0,
+            remaining: self.count,
+        }
+    }
+}
+pub struct SegmentBindingOwnerIterator<'s, 'a, B> {
+    sources: &'s SegmentBindingOwnerSources<'a, B>,
+    block: usize,
+    local: usize,
+    remaining: usize,
+}
+impl<'s, B> Iterator for SegmentBindingOwnerIterator<'s, '_, B> {
+    type Item = SegmentBindingOwnerView<'s, B>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let block = self.sources.blocks.get(self.block)?;
+            if let Some(view) = block.owner(self.local) {
+                self.local += 1;
+                self.remaining -= 1;
+                return Some(view);
+            }
+            self.block += 1;
+            self.local = 0;
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+impl<B> ExactSizeIterator for SegmentBindingOwnerIterator<'_, '_, B> {}
+
 /// Borrowed command channels for the same-wave diagnostic. No authority can be
 /// moved, minted, or submitted through this view.
 pub struct SegmentBindingOracleCommands<'a, C> {
@@ -230,6 +392,7 @@ pub(crate) enum SegmentBindingPhysicalSource<'a, B> {
     Dynamic {
         window: SegmentBackingWindowView<'a, B>,
         owner_base: usize,
+        owner_block_base: Option<usize>,
     },
 }
 
@@ -241,6 +404,7 @@ pub struct SegmentBindingPhysicalRegionView<'a, B> {
     logical_offset_bytes: u64,
     retention: &'a DeviceBufferRetention,
     owner_index: Option<SegmentBindingOwnerIndex>,
+    owner_location: Option<SegmentBindingOwnerLocation>,
 }
 
 impl<'a, B> SegmentBindingPhysicalRegionView<'a, B> {
@@ -260,6 +424,9 @@ impl<'a, B> SegmentBindingPhysicalRegionView<'a, B> {
 
     pub const fn owner_index(&self) -> Option<SegmentBindingOwnerIndex> {
         self.owner_index
+    }
+    pub const fn owner_location(&self) -> Option<SegmentBindingOwnerLocation> {
+        self.owner_location
     }
 
     pub const fn logical_offset_bytes(&self) -> u64 {
@@ -293,6 +460,7 @@ impl<'a, B> Iterator for SegmentBindingPhysicalRegions<'a, B> {
                     logical_offset_bytes: region.logical_offset_bytes,
                     retention: &region.retention,
                     owner_index: None,
+                    owner_location: None,
                 }
             }
             SegmentBindingPhysicalSource::Plan {
@@ -306,8 +474,13 @@ impl<'a, B> Iterator for SegmentBindingPhysicalRegions<'a, B> {
                 logical_offset_bytes: 0,
                 retention: *retention,
                 owner_index: Some(*owner_index),
+                owner_location: Some(SegmentBindingOwnerLocation::new(0, owner_index.get())),
             },
-            SegmentBindingPhysicalSource::Dynamic { window, owner_base } => {
+            SegmentBindingPhysicalSource::Dynamic {
+                window,
+                owner_base,
+                owner_block_base,
+            } => {
                 let region = window.physical_region(self.next)?;
                 let (buffer, physical_range, retention) =
                     region.borrowed_buffer_and_physical_range();
@@ -320,6 +493,12 @@ impl<'a, B> Iterator for SegmentBindingPhysicalRegions<'a, B> {
                     // projection was built; binding indices belong to it.
                     owner_index: Some(SegmentBindingOwnerIndex(
                         owner_base + region.binding_index(),
+                    )),
+                    owner_location: Some(SegmentBindingOwnerLocation::new(
+                        owner_block_base.map_or(0, |base| base + region.binding_block()),
+                        owner_block_base.map_or(owner_base + region.binding_index(), |_| {
+                            region.binding_local()
+                        }),
                     )),
                 }
             }
@@ -338,6 +517,18 @@ impl<B> ExactSizeIterator for SegmentBindingPhysicalRegions<'_, B> {}
 impl<B> std::iter::FusedIterator for SegmentBindingPhysicalRegions<'_, B> {}
 
 impl<B> PreparedSegmentBindingRegion<'_, B> {
+    pub fn shared_sequence_window(
+        &self,
+    ) -> Option<crate::vnext::CurrentSequenceBindingWindow<'_, B>> {
+        match &self.source {
+            SegmentBindingPhysicalSource::Dynamic {
+                window,
+                owner_block_base,
+                ..
+            } => owner_block_base.and_then(|base| window.shared_sequence_window(base)),
+            _ => None,
+        }
+    }
     pub fn descriptor(&self) -> &BufferDescriptor {
         &self.descriptor
     }
@@ -419,7 +610,7 @@ impl<B> PreparedSegmentBindingNode<'_, B> {
 
 pub struct PreparedSegmentBindingPatch<'a, B> {
     pub(crate) owner_view_mode: SegmentBindingOwnerViewMode,
-    pub(crate) owners: Vec<SegmentBindingOwnerView<'a, B>>,
+    pub(crate) owners: SegmentBindingOwnerSources<'a, B>,
     pub(crate) nodes: Vec<PreparedSegmentBindingNode<'a, B>>,
 }
 
@@ -428,14 +619,14 @@ impl<'a, B> PreparedSegmentBindingPatch<'a, B> {
         self.owner_view_mode
     }
 
-    pub fn owners(&self) -> &[SegmentBindingOwnerView<'a, B>] {
+    pub fn owners(&self) -> &SegmentBindingOwnerSources<'a, B> {
         &self.owners
     }
 
     pub fn into_parts(
         self,
     ) -> (
-        Vec<SegmentBindingOwnerView<'a, B>>,
+        SegmentBindingOwnerSources<'a, B>,
         Vec<PreparedSegmentBindingNode<'a, B>>,
     ) {
         (self.owners, self.nodes)
@@ -664,6 +855,7 @@ impl<'f, 'w, B> PreparedSegmentBindingNodeView<'f, 'w, B> {
                     SegmentBindingPhysicalSource::Dynamic {
                         window,
                         owner_base: self.frame.plan_views.len(),
+                        owner_block_base: None,
                     },
                 )
             }

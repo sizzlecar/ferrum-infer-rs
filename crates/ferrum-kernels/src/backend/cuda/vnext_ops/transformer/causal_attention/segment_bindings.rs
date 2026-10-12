@@ -3,15 +3,57 @@
 use super::super::segment_bindings::{self as segment, DynamicRecipe, ValidationRecipe};
 use super::*;
 use ferrum_interfaces::vnext::{
-    PreparedSegmentBindingNode, SegmentBindingDeclaration, SegmentBindingRegionExtent,
-    SegmentBindingRegionRequest, SegmentBindingRegionSelector,
+    PreparedSegmentBindingNode, SegmentBindingDeclaration, SegmentBindingPageTemplateKey,
+    SegmentBindingRegionExtent, SegmentBindingRegionRequest, SegmentBindingRegionSelector,
 };
+use sha2::{Digest, Sha256};
+
+mod page_template;
+
+#[derive(Clone, Copy)]
+struct PageTemplateNamespace {
+    provider: [u8; 32],
+    numerical: [u8; 32],
+}
+
+fn page_template_namespace(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<PageTemplateNamespace, String> {
+    let node = invocation
+        .batch_identity()
+        .nodes()
+        .iter()
+        .find(|node| {
+            node.node_id() == invocation.node_id() && node.provider_id() == invocation.provider_id()
+        })
+        .ok_or("segment causal declaration has no exact provider identity")?;
+    let provider = Sha256::digest(node.provider_implementation_fingerprint().as_bytes()).into();
+    let mut numerical = Sha256::new();
+    numerical.update(b"ferrum.cuda.causal.page-template.numerics.v1\0");
+    match invocation
+        .participants()
+        .first()
+        .and_then(|participant| participant.projection_numerics())
+    {
+        Some(declared) => {
+            numerical.update(b"prepared-projection-numerics\0");
+            numerical.update(declared.fingerprint().as_bytes());
+        }
+        // This is an explicit declaration state, not an invented profile.
+        None => numerical.update(b"declared-no-projection-numerics"),
+    }
+    Ok(PageTemplateNamespace {
+        provider,
+        numerical: numerical.finalize().into(),
+    })
+}
 
 #[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) struct CausalRecipe {
     shape: CausalAttentionShape,
     participants: usize,
     upload_strategy: ProgramBindingUploadStrategy,
+    page_template_namespace: PageTemplateNamespace,
 }
 
 impl CausalRecipe {
@@ -68,6 +110,7 @@ pub(super) fn declare(
             shape,
             participants: invocation.participants().len(),
             upload_strategy,
+            page_template_namespace: page_template_namespace(invocation)?,
         }),
         regions,
         validations,
@@ -322,6 +365,195 @@ fn indexed_pages(
     Ok(pages)
 }
 
+enum IndexedPageAddresses {
+    Current(Vec<u64>),
+    Templates(Vec<page_template::AddressPart>),
+}
+
+struct IndexedPages {
+    ranges: Vec<crate::backend::cuda::vnext_runtime::CudaSegmentRange>,
+    addresses: IndexedPageAddresses,
+}
+
+impl IndexedPages {
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    fn empty() -> Self {
+        Self {
+            ranges: Vec::new(),
+            addresses: IndexedPageAddresses::Current(Vec::new()),
+        }
+    }
+
+    fn append_addresses(
+        &self,
+        layout: CausalKvLayout,
+        entries: i32,
+        payload: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        match &self.addresses {
+            IndexedPageAddresses::Current(addresses) => visit_binding_addresses(
+                layout,
+                entries,
+                self.ranges.len(),
+                |index| {
+                    addresses
+                        .get(index)
+                        .copied()
+                        .ok_or("segment causal page index is absent".into())
+                },
+                |address| payload.extend_from_slice(&address.to_ne_bytes()),
+            ),
+            IndexedPageAddresses::Templates(parts) => {
+                page_template::append_addresses(layout, entries, self.ranges.len(), parts, payload)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_indexed_pages(
+    node: &PreparedSegmentBindingNode<'_, CudaDeviceBuffer>,
+    participant: usize,
+    declaration: usize,
+    expected: u64,
+    element: ElementType,
+    layout: CausalKvLayout,
+    namespace: PageTemplateNamespace,
+    runtime_instance: u64,
+    owners: &mut crate::backend::cuda::vnext_runtime::CudaSegmentOwnerBuilder<'_>,
+) -> Result<IndexedPages, String> {
+    let fallback =
+        |owners: &mut crate::backend::cuda::vnext_runtime::CudaSegmentOwnerBuilder<'_>| {
+            let ranges = indexed_pages(node, participant, declaration, expected, element, owners)?;
+            let addresses = ranges
+                .iter()
+                .map(|range| {
+                    owners
+                        .region(range)
+                        .map(|view| view.device_ptr())
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, String>(IndexedPages {
+                ranges,
+                addresses: IndexedPageAddresses::Current(addresses),
+            })
+        };
+    let view = node
+        .region(participant, declaration)
+        .map_err(|error| error.to_string())?;
+    if view.storage_kind() != OperationBufferStorageKind::DynamicPaged
+        || view.descriptor().element_type != element
+        || view.descriptor().size_bytes != expected
+        || expected == 0
+        || expected % VNEXT_KV_PAGE_BYTES != 0
+    {
+        return Err("segment causal state differs from its admitted paged view".into());
+    }
+    let Some(window) = view.shared_sequence_window() else {
+        return fallback(owners);
+    };
+    if window.length_bytes() != expected || window.element_type() != element {
+        return Err("segment causal template window differs from its fresh view".into());
+    }
+    let capacity = usize::try_from(expected / VNEXT_KV_PAGE_BYTES)
+        .map_err(|_| "segment causal page count exceeds usize")?;
+    let key = SegmentBindingPageTemplateKey {
+        physical_page_bytes: VNEXT_KV_PAGE_BYTES,
+        element_type: element,
+        address_layout: page_template::address_layout(layout),
+        runtime_instance,
+        provider_fingerprint: namespace.provider,
+        numerical_profile: namespace.numerical,
+    };
+    let mut ranges = Vec::with_capacity(capacity);
+    let mut address_parts = Vec::new();
+    let mut logical = 0u64;
+    for part in window.parts() {
+        if part.logical_offset_in_window() != logical || part.length_bytes() == 0 {
+            return Err("segment causal pages lost block geometry".into());
+        }
+        if part.logical_start_in_part() % VNEXT_KV_PAGE_BYTES != 0
+            || part.length_bytes() % VNEXT_KV_PAGE_BYTES != 0
+        {
+            return fallback(owners);
+        }
+        let template = match part.page_template(&key) {
+            Some(template) => template,
+            None => {
+                let mut cold = Vec::with_capacity(part.owner_count());
+                for local in 0..part.owner_count() {
+                    let owner = part
+                        .owner(local)
+                        .ok_or("segment causal template owner is absent")?;
+                    let physical_range = part
+                        .physical_range(local)
+                        .ok_or("segment causal template physical owner is absent")?;
+                    let (buffer, retention) = owner.buffer_and_retention();
+                    // Derive host scalars from the actual retained CUDA buffer.
+                    // This does not grant the full part as a current window;
+                    // only the witness below produces executable page ranges.
+                    let native = buffer
+                        .borrowed_region(physical_range.clone(), retention)
+                        .map_err(|error| error.to_string())?;
+                    if native.runtime_instance() != runtime_instance
+                        || native.element_type() != element
+                    {
+                        return Err("segment causal template has a foreign native owner".into());
+                    }
+                    cold.push(page_template::ColdOwner {
+                        local_owner: local,
+                        physical_range,
+                        address: native.device_ptr(),
+                    });
+                }
+                let Some(template) = page_template::build(key, cold)? else {
+                    return fallback(owners);
+                };
+                if template.physical_bytes != part.physical_bytes() {
+                    return fallback(owners);
+                }
+                // A different namespace may already occupy the one memo cell.
+                // Losing publication is never a new inference failure.
+                let _ = part.publish_page_template(std::sync::Arc::new(template));
+                let Some(template) = part.page_template(&key) else {
+                    return fallback(owners);
+                };
+                template
+            }
+        };
+        let selected =
+            page_template::select(&template, part.logical_start_in_part(), part.length_bytes())?;
+        let witness = owners
+            .retain_shared_part(&part, template.as_ref())
+            .map_err(|error| error.to_string())?;
+        for page in selected.pages {
+            ranges.push(
+                witness
+                    .range_for_template_page(page)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        address_parts.push(page_template::AddressPart {
+            template,
+            addresses: selected.addresses,
+        });
+        logical = logical
+            .checked_add(part.length_bytes())
+            .ok_or("segment causal logical coverage overflows")?;
+    }
+    if logical != expected || ranges.len() != capacity || ranges.is_empty() {
+        return Err("segment causal pages do not cover current state".into());
+    }
+    Ok(IndexedPages {
+        ranges,
+        addresses: IndexedPageAddresses::Templates(address_parts),
+    })
+}
+
 pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
     node: &PreparedSegmentBindingNode<'_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
@@ -333,6 +565,7 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
     }
     let layout = BindingLayout::new(shape, recipe.participants)?;
     let destination = segment::shared_borrowed_region(node, 1)?;
+    let runtime_instance = destination.borrowed().runtime_instance();
     let kv_layout = shape.kv_layout()?;
     let maximum_pages = shape.maximum_pages()?;
     let maximum_entries = shape.table_entries(shape.maximum_context_tokens)?;
@@ -351,7 +584,7 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
         {
             return Err("segment causal token range exceeds admitted context".into());
         }
-        let state_pages = indexed_pages(
+        let state_pages = prepared_indexed_pages(
             node,
             participant,
             0,
@@ -360,19 +593,25 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
                 token_range.full_input_tokens(),
             )?,
             shape.kv_element_type(),
+            kv_layout,
+            recipe.page_template_namespace,
+            runtime_instance,
             owners,
         )?;
         let scale_pages = if shape.int8_kv {
-            indexed_pages(
+            prepared_indexed_pages(
                 node,
                 participant,
                 2,
                 shape.scale_state_bytes(source.end)?,
                 ElementType::F32,
+                CausalKvLayout::TokenMajorPages,
+                recipe.page_template_namespace,
+                runtime_instance,
                 owners,
             )?
         } else {
-            Vec::new()
+            IndexedPages::empty()
         };
         let page_count = u64::try_from(state_pages.len())
             .map_err(|_| "segment causal page count exceeds u64")?;
@@ -404,30 +643,13 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
         for value in controls {
             payload.extend_from_slice(&value.to_ne_bytes());
         }
-        visit_binding_addresses(
-            kv_layout,
-            table_entries,
-            state_pages.len(),
-            |index| {
-                let range = state_pages
-                    .get(index)
-                    .ok_or("segment causal page index is absent")?;
-                owners
-                    .region(range)
-                    .map(|view| view.device_ptr())
-                    .map_err(|e| e.to_string())
-            },
-            |address| payload.extend_from_slice(&address.to_ne_bytes()),
+        state_pages.append_addresses(kv_layout, table_entries, &mut payload)?;
+        scale_pages.append_addresses(
+            CausalKvLayout::TokenMajorPages,
+            i32::try_from(scale_pages.len())
+                .map_err(|_| "segment causal scale count exceeds i32")?,
+            &mut payload,
         )?;
-        for range in &scale_pages {
-            payload.extend_from_slice(
-                &owners
-                    .region(range)
-                    .map_err(|e| e.to_string())?
-                    .device_ptr()
-                    .to_ne_bytes(),
-            );
-        }
         writes.push(
             super::super::CudaProgramBindingWrite::new(
                 layout.binding_offset(participant)?,
@@ -435,8 +657,8 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
             )
             .map_err(|e| e.to_string())?,
         );
-        ranges.extend(state_pages);
-        ranges.extend(scale_pages);
+        ranges.extend(state_pages.ranges);
+        ranges.extend(scale_pages.ranges);
     }
     prepare_causal_program_binding_writes(recipe.upload_strategy, &mut writes, layout.slot_bytes)?;
     let numerical_status = if shape.int8_kv {
