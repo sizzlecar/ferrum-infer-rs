@@ -65,14 +65,16 @@ mod dynamic_pool_set;
 pub use dynamic_pool_set::DynamicPoolGrowthBatchReceipt;
 use dynamic_pool_set::DynamicPoolSet;
 mod segment_permit;
+mod sequence_physical_rows;
 pub use segment_permit::{
     SegmentBackingBatch, SegmentBackingExpectation, SegmentBackingRequest, SegmentBackingResource,
     SegmentBackingWindow, SegmentBackingWindowView, SegmentLogicalSizeRule, SegmentPhysicalRegion,
 };
 pub(crate) use segment_permit::{
-    SegmentBackingWindowInput, SegmentPlanResourceRequest, SegmentPlanResourceView,
-    SegmentWindowResource, SegmentWindowRule,
+    SegmentBackingSource, SegmentBackingWindowInput, SegmentPlanResourceRequest,
+    SegmentPlanResourceView, SegmentWindowResource, SegmentWindowRule,
 };
+pub(crate) use sequence_physical_rows::SequencePhysicalRowSource;
 mod dynamic_pool_maintenance;
 mod pool_resident_reclaim;
 pub use dynamic_pool_maintenance::*;

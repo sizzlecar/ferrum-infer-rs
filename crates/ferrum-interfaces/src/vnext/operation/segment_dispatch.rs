@@ -468,8 +468,8 @@ where
         }
     }
     if let Some(backing) = &backing {
-        for binding in backing.bindings() {
-            if !validate_buffer(runtime, binding.buffer(), binding.descriptor(), &mut seen)? {
+        for (buffer, descriptor) in backing.metadata_buffers() {
+            if !validate_buffer(runtime, buffer, descriptor, &mut seen)? {
                 identity.record_segment_miss_reason(
                     SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
                 );
@@ -966,8 +966,8 @@ where
         }
     }
     if let Some(backing) = &backing {
-        for binding in backing.bindings() {
-            if !validate_buffer(runtime, binding.buffer(), binding.descriptor(), &mut seen)? {
+        for (buffer, descriptor) in backing.metadata_buffers() {
+            if !validate_buffer(runtime, buffer, descriptor, &mut seen)? {
                 identity.record_segment_miss_reason(
                     SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
                 );

@@ -2667,7 +2667,7 @@ where
         Ok(())
     }
 
-    fn validate_authority_identity_and_bounds(
+    pub(super) fn validate_authority_identity_and_bounds(
         pool: &DynamicBackingPool<R>,
         authority: &LogicalBackingSliceAuthority,
     ) -> Result<(), VNextError> {

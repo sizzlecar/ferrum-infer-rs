@@ -2041,9 +2041,9 @@ where
                 ));
             }
         }
-        let mut groups = Vec::new();
+        let mut sources = Vec::new();
         let mut expected = Vec::new();
-        groups
+        sources
             .try_reserve_exact(requests.len())
             .map_err(|_| invalid_resource("segment authority allocation failed"))?;
         expected
@@ -2054,13 +2054,14 @@ where
                 .get(request.participant_index)
                 .ok_or_else(|| invalid_resource("segment participant index is out of bounds"))?;
             let resource_id = &request.resource_id;
-            let authorities = match request.lifetime {
+            let source = match request.lifetime {
                 AllocationLifetime::Request => participant
                     .request
                     .backing_slices()
                     .iter()
                     .find(|authority| authority.resource_id() == resource_id)
-                    .map(std::slice::from_ref),
+                    .map(std::slice::from_ref)
+                    .map(super::SegmentBackingSource::Authorities),
                 AllocationLifetime::Sequence => {
                     let snapshot =
                         self.step
@@ -2068,31 +2069,42 @@ where
                                 participant.sequence_authority(),
                                 participant.request_authority(),
                             ))?;
-                    let authorities = snapshot.backing_slices_for(resource_id);
-                    (!authorities.is_empty()).then_some(authorities)
+                    // Only the exact snapshot captured by this prepared Step
+                    // can supply a producer-owned physical row. The row does
+                    // not replace this wave's authority or logical bounds.
+                    snapshot
+                        .segment_physical_row(resource_id)
+                        .map(super::SegmentBackingSource::Sequence)
                 }
                 AllocationLifetime::Step => self
                     .step
                     .backing_slices()
                     .iter()
                     .find(|authority| authority.resource_id() == resource_id)
-                    .map(std::slice::from_ref),
+                    .map(std::slice::from_ref)
+                    .map(super::SegmentBackingSource::Authorities),
                 AllocationLifetime::Invocation => self
                     .claimed_backing
                     .backing_slices()
                     .iter()
                     .find(|authority| authority.resource_id() == resource_id)
-                    .map(std::slice::from_ref),
+                    .map(std::slice::from_ref)
+                    .map(super::SegmentBackingSource::Authorities),
                 AllocationLifetime::Plan => None,
             }
             .ok_or_else(|| {
                 invalid_resource("segment resource has no exact current captured authority")
             })?;
-            groups.push(authorities);
+            sources.push(source);
             expected.push(request.expected);
         }
         drop(snapshot_stage);
-        pools.segment_backing_batch_with_timing(&groups, &expected, windows, timing_sink)
+        pools.segment_backing_batch_with_sources(
+            &sources,
+            &expected,
+            super::SegmentBackingWindowInput::Slice(windows),
+            timing_sink,
+        )
     }
 
     pub(crate) fn backing_view(

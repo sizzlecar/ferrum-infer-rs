@@ -6630,3 +6630,5 @@ fn paged_internal_fault_restores_segments_selected_earlier_in_the_same_call() {
     assert_eq!(index.by_offset[&(1, 0)].length_bytes, 64);
     assert!(index.by_size.contains(&(64, 1, 1, 0)));
 }
+#[path = "sequence_physical_rows_tests.rs"]
+mod sequence_physical_rows_tests;

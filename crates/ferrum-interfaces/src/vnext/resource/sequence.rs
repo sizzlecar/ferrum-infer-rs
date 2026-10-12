@@ -1565,6 +1565,9 @@ pub struct SequenceBackingSnapshot<R>
 where
     R: DeviceRuntime,
 {
+    // Cached physical owners release before the original slices, extension
+    // capacity and parent logical owner. No cache owns a snapshot/session Arc.
+    physical_rows: Arc<super::sequence_physical_rows::SequencePhysicalRows<R::Buffer>>,
     generation: SequenceBackingGeneration,
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     // Extension capacity drops after its physical extents. Arcs let a newer
@@ -1597,6 +1600,9 @@ where
             ));
         }
         Ok(Self {
+            physical_rows: Arc::new(
+                super::sequence_physical_rows::SequencePhysicalRows::initial(&backing_slices),
+            ),
             generation: SequenceBackingGeneration::INITIAL,
             backing_slices,
             extension_capacity: Vec::new(),
@@ -1640,6 +1646,7 @@ where
                 "sequence backing extension slices must be canonical and unique",
             ));
         }
+        let physical_append = !extension.backing_slices.is_empty();
         let mut backing_slices = prior
             .backing_slices
             .iter()
@@ -1658,6 +1665,17 @@ where
             extension_capacity.push(Arc::new(capacity));
         }
         Ok(Self {
+            physical_rows: if physical_append {
+                Arc::new(
+                    super::sequence_physical_rows::SequencePhysicalRows::appended(
+                        &prior.physical_rows,
+                        &prior.backing_slices,
+                        &backing_slices,
+                    ),
+                )
+            } else {
+                Arc::clone(&prior.physical_rows)
+            },
             generation,
             backing_slices,
             extension_capacity,
@@ -1672,6 +1690,13 @@ where
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
         &self.backing_slices
+    }
+
+    pub(crate) fn segment_physical_row(
+        &self,
+        resource: &ResourceId,
+    ) -> Option<super::SequencePhysicalRowSource<'_, R::Buffer>> {
+        self.physical_rows.source(&self.backing_slices, resource)
     }
 
     pub const fn committed_tokens(&self) -> u64 {
