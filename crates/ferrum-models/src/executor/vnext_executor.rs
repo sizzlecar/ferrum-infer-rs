@@ -7713,6 +7713,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     catalog.map(|catalog| catalog.lane_epoch),
                     reusable_catalog_miss.map(|miss| miss.reason),
                 )
+                .with_owner_snapshots(self.device_timing_mode() == DeviceTimingMode::Completion)
             });
             let mut provider_elapsed = None;
             let submission = {

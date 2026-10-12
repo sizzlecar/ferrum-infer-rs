@@ -116,6 +116,7 @@ struct AttemptRecord {
     incomplete_declarations: bool,
     core_preparation: InvocationPreparationStats,
     segment_backing_materialization: Option<SegmentBackingMaterializationObservation>,
+    owner_continuity: Option<segment_materialization::OwnerContinuityRecord>,
     outcome: Outcome,
     provider_encode_submit_ns: Option<u64>,
     provider_node_encode_ns: Option<u64>,
@@ -142,6 +143,7 @@ pub(super) struct Ledger {
     overflow: AtomicU64,
     unfinalized: AtomicU64,
     records: Mutex<Vec<WaveRecord>>,
+    owner_continuity: OnceLock<Mutex<segment_materialization::OwnerContinuityTracker>>,
 }
 
 impl Default for Ledger {
@@ -158,6 +160,7 @@ impl Ledger {
             overflow: AtomicU64::new(0),
             unfinalized: AtomicU64::new(0),
             records: Mutex::new(Vec::new()),
+            owner_continuity: OnceLock::new(),
         }
     }
 
@@ -177,6 +180,7 @@ impl Ledger {
             .ok()?;
         if ordinal >= self.maximum_waves as u64 {
             self.overflow.fetch_add(1, Ordering::Relaxed);
+            self.break_owner_chain("ledger_overflow");
             return None;
         }
         Some(WaveObservation {
@@ -190,6 +194,8 @@ impl Ledger {
             attempts: Vec::with_capacity(MAXIMUM_ATTEMPTS),
             attempt_overflow: 0,
             finished: false,
+            pending_owner_attempt: None,
+            pending_owner_snapshot: None,
         })
     }
 
@@ -199,6 +205,9 @@ impl Ledger {
         self.next_wave.store(0, Ordering::Relaxed);
         self.overflow.store(0, Ordering::Relaxed);
         self.unfinalized.store(0, Ordering::Relaxed);
+        if let Some(tracker) = self.owner_continuity.get() {
+            tracker.lock().reset();
+        }
     }
 
     pub(super) fn snapshot(&self) -> serde_json::Value {
@@ -209,6 +218,7 @@ impl Ledger {
             "waves_started": self.next_wave.load(Ordering::Relaxed),
             "overflow_waves": self.overflow.load(Ordering::Relaxed),
             "unfinalized_waves": self.unfinalized.load(Ordering::Relaxed),
+            "owner_continuity": self.owner_continuity.get().map(|tracker| tracker.lock().snapshot()),
             "gap_reason_order": GAP_REASONS.map(|reason| reason.as_str()),
             "records": &*self.records.lock(),
             "scope": [
@@ -221,9 +231,49 @@ impl Ledger {
                 "capture_allowed_at_entry is the backend quiescence decision, not proof of later completion",
                 "first-wave prefix only; overflow and unfinalized waves cannot be used as complete cold-path history",
                 "unwinding preserves original RAII metrics but does not finalize joint rows; snapshots during execution are not atomic",
-                "attempt observation work is inside host_encode_submit; outer ledger reservation and final serialization are outside that interval; no additional clock is read"
+                "snapshot capture and callback movement are inside original Core preparation/dispatch timings but independently unmeasured; attempt scalar recording reads no extra clocks; finalized continuity comparison reads clocks after the supplied host_encode_submit interval and reports comparison_wall_ns including those clock costs; serialization is outside that interval"
             ]
         })
+    }
+
+    fn break_owner_chain(&self, reason: &'static str) {
+        if let Some(tracker) = self.owner_continuity.get() {
+            tracker.lock().break_chain(reason);
+        }
+    }
+
+    fn record_owner_attempt(
+        &self,
+        wave_ordinal: u64,
+        record: &AttemptRecord,
+        submitted_wave: bool,
+        snapshot: Option<SegmentBackingOwnerSnapshot>,
+    ) -> segment_materialization::OwnerContinuityRecord {
+        let context = segment_materialization::OwnerAttemptContext {
+            wave_ordinal,
+            attempt_ordinal: record.ordinal,
+            program_id: record.program_id.as_ref(),
+            lane_epoch: record.lane_epoch,
+            catalog_epoch: record.catalog_epoch,
+            submitted: submitted_wave && record.outcome == Outcome::Submitted,
+            hit: record.disposition == Disposition::Hit,
+            catalog_miss: record.catalog_miss.is_some(),
+            incomplete_declarations: record.incomplete_declarations,
+            repeated_callback: record.repeated_callback,
+            backend_identity_mismatch: record
+                .backend_preparation
+                .is_some_and(|value| value.identity == BackendIdentity::Mismatch)
+                || record
+                    .program_gaps
+                    .is_some_and(|value| value.identity == BackendIdentity::Mismatch),
+            backend_identity_available: record
+                .backend_preparation
+                .is_some_and(|value| value.identity == BackendIdentity::Exact),
+        };
+        self.owner_continuity
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .observe(context, snapshot)
     }
 }
 
@@ -234,10 +284,12 @@ pub(super) struct WaveObservation<'a> {
     attempts: Vec<AttemptRecord>,
     attempt_overflow: usize,
     finished: bool,
+    pending_owner_attempt: Option<usize>,
+    pending_owner_snapshot: Option<SegmentBackingOwnerSnapshot>,
 }
 
 impl WaveObservation<'_> {
-    pub(super) fn record_attempt<T>(
+    pub(super) fn record_attempt<T: DeviceSubmissionTimingSink>(
         &mut self,
         observation: AttemptObservation<'_, T>,
         stats: InvocationPreparationStats,
@@ -246,17 +298,64 @@ impl WaveObservation<'_> {
     ) {
         if self.attempts.len() >= MAXIMUM_ATTEMPTS {
             self.attempt_overflow += 1;
+            self.pending_owner_snapshot = None;
+            self.pending_owner_attempt = None;
+            self.ledger.break_owner_chain("attempt_overflow");
             return;
         }
-        self.attempts.push(observation.finish(
+        if let Some(previous) = self.pending_owner_attempt.take() {
+            self.attempts[previous].owner_continuity =
+                Some(segment_materialization::OwnerContinuityRecord::superseded());
+            self.pending_owner_snapshot = None;
+            self.ledger.break_owner_chain("superseded_attempt");
+        }
+        let track_owners = T::ENABLED && observation.owner_snapshots_enabled;
+        let (mut record, snapshot) = observation.finish_with_snapshot(
             self.attempts.len(),
             stats,
             outcome,
             provider_encode_submit,
-        ));
+        );
+        if track_owners {
+            if outcome == Outcome::Submitted {
+                // Qualification includes the final wave outcome. A later
+                // unwind/error must not add a successful continuity pair.
+                record.owner_continuity =
+                    Some(segment_materialization::OwnerContinuityRecord::pending());
+                self.pending_owner_attempt = Some(self.attempts.len());
+                self.pending_owner_snapshot = snapshot;
+            } else {
+                record.owner_continuity =
+                    Some(
+                        self.ledger
+                            .record_owner_attempt(self.ordinal, &record, false, snapshot),
+                    );
+            }
+        } else {
+            self.ledger.break_owner_chain("owner_capture_disabled");
+        }
+        self.attempts.push(record);
     }
 
     pub(super) fn finish(mut self, host_elapsed: Option<Duration>, outcome: Outcome) {
+        if let Some(index) = self.pending_owner_attempt.take() {
+            let observation = self.ledger.record_owner_attempt(
+                self.ordinal,
+                &self.attempts[index],
+                outcome == Outcome::Submitted,
+                self.pending_owner_snapshot.take(),
+            );
+            self.attempts[index].owner_continuity = Some(observation);
+        }
+        if self.attempts.is_empty() {
+            self.ledger.break_owner_chain("missing_attempt");
+        }
+        if outcome != Outcome::Submitted {
+            self.ledger.break_owner_chain("wave_not_submitted");
+        }
+        if self.attempt_overflow != 0 {
+            self.ledger.break_owner_chain("attempt_overflow");
+        }
         let record = WaveRecord {
             ordinal: self.ordinal,
             phase: self.phase,
@@ -274,6 +373,7 @@ impl Drop for WaveObservation<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.ledger.unfinalized.fetch_add(1, Ordering::Relaxed);
+            self.ledger.break_owner_chain("unfinalized_wave");
         }
     }
 }
@@ -341,8 +441,9 @@ impl<T> ObservationCell<T> {
     }
 }
 
-/// Callbacks only borrow identity and copy fixed-size data. No locks, clocks,
-/// allocation, or serialization occur on the backend submission thread.
+/// Scalar callbacks copy fixed-size data; the owner callback moves one opaque
+/// weak snapshot. The observer adds no locks, clocks or serialization to those
+/// callbacks. Continuity comparison runs only at completed wave finalization.
 pub(super) struct AttemptObservation<'a, T> {
     timing: &'a T,
     program_id: Option<DeviceReusableExecutionProgramId>,
@@ -351,6 +452,8 @@ pub(super) struct AttemptObservation<'a, T> {
     catalog_miss: Option<VNextReusableExecutionCatalogMissReason>,
     provider_ns: ObservationCell<u64>,
     materialization: ObservationCell<SegmentBackingMaterializationObservation>,
+    owner_snapshot: ObservationCell<SegmentBackingOwnerSnapshot>,
+    owner_snapshots_enabled: bool,
     enqueue_ns: ObservationCell<u64>,
     preparation: ObservationCell<BackendPreparation>,
     gaps: ObservationCell<ProgramGaps>,
@@ -374,12 +477,19 @@ impl<'a, T> AttemptObservation<'a, T> {
             catalog_miss,
             provider_ns: ObservationCell::new(),
             materialization: ObservationCell::new(),
+            owner_snapshot: ObservationCell::new(),
+            owner_snapshots_enabled: false,
             enqueue_ns: ObservationCell::new(),
             preparation: ObservationCell::new(),
             gaps: ObservationCell::new(),
             submission: ObservationCell::new(),
             repeated_callback: AtomicBool::new(false),
         }
+    }
+
+    pub(super) fn with_owner_snapshots(mut self, enabled: bool) -> Self {
+        self.owner_snapshots_enabled = enabled;
+        self
     }
 
     fn set<U>(&self, cell: &ObservationCell<U>, value: U) {
@@ -395,7 +505,19 @@ impl<'a, T> AttemptObservation<'a, T> {
         outcome: Outcome,
         provider_encode_submit: Option<Duration>,
     ) -> AttemptRecord {
-        AttemptRecord {
+        self.finish_with_snapshot(ordinal, stats, outcome, provider_encode_submit)
+            .0
+    }
+
+    fn finish_with_snapshot(
+        self,
+        ordinal: usize,
+        stats: InvocationPreparationStats,
+        outcome: Outcome,
+        provider_encode_submit: Option<Duration>,
+    ) -> (AttemptRecord, Option<SegmentBackingOwnerSnapshot>) {
+        let snapshot = self.owner_snapshot.into_inner();
+        let record = AttemptRecord {
             ordinal,
             program_id: self.program_id,
             lane_epoch: self.lane_epoch,
@@ -405,6 +527,7 @@ impl<'a, T> AttemptObservation<'a, T> {
             incomplete_declarations: stats.segment_incomplete_declarations != 0,
             core_preparation: stats,
             segment_backing_materialization: self.materialization.into_inner(),
+            owner_continuity: None,
             outcome,
             provider_encode_submit_ns: provider_encode_submit.map(duration_ns),
             provider_node_encode_ns: self.provider_ns.into_inner(),
@@ -413,7 +536,8 @@ impl<'a, T> AttemptObservation<'a, T> {
             program_gaps: self.gaps.into_inner(),
             backend_submission_observation: self.submission.into_inner(),
             repeated_callback: self.repeated_callback.load(Ordering::Relaxed),
-        }
+        };
+        (record, snapshot)
     }
 }
 
@@ -480,6 +604,16 @@ impl<T: DeviceSubmissionTimingSink> DeviceSubmissionTimingSink for AttemptObserv
 impl<T: SubmissionWaveDispatchTimingSink> SubmissionWaveDispatchTimingSink
     for AttemptObservation<'_, T>
 {
+    fn segment_backing_owner_snapshots_enabled(&self) -> bool {
+        T::ENABLED && self.owner_snapshots_enabled
+    }
+
+    fn record_segment_backing_owner_snapshot(&self, snapshot: SegmentBackingOwnerSnapshot) {
+        if T::ENABLED && self.owner_snapshots_enabled {
+            self.set(&self.owner_snapshot, snapshot);
+        }
+    }
+
     fn record_segment_backing_materialization(
         &self,
         observation: SegmentBackingMaterializationObservation,

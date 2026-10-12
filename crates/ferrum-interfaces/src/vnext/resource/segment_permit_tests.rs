@@ -94,6 +94,228 @@ fn windows(expected: &[SegmentBackingExpectation]) -> Vec<SegmentBackingWindow> 
         .collect()
 }
 
+struct OwnerSnapshotTiming(Mutex<Vec<SegmentBackingOwnerSnapshot>>);
+
+impl DeviceSubmissionTimingSink for OwnerSnapshotTiming {
+    const ENABLED: bool = true;
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {}
+}
+impl SubmissionWaveDispatchTimingSink for OwnerSnapshotTiming {
+    fn record(&self, _: SubmissionWaveDispatchStage, _: std::time::Duration) {}
+    fn segment_backing_owner_snapshots_enabled(&self) -> bool {
+        true
+    }
+    fn record_segment_backing_owner_snapshot(&self, snapshot: SegmentBackingOwnerSnapshot) {
+        self.0.lock().unwrap().push(snapshot);
+    }
+}
+
+fn owner_snapshot(
+    pools: &DynamicPoolSet<TestRuntime>,
+    groups: &[&[LogicalBackingSliceAuthority]],
+) -> SegmentBackingOwnerSnapshot {
+    let expected = expectations(groups);
+    let sink = OwnerSnapshotTiming(Mutex::new(Vec::new()));
+    let batch = pools
+        .segment_backing_batch_with_timing(groups, &expected, &windows(&expected), &sink)
+        .unwrap();
+    drop(batch);
+    sink.0.into_inner().unwrap().pop().unwrap()
+}
+
+#[test]
+fn owner_snapshot_compares_reordered_resources_and_does_not_pin_physical_owners() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let lease = Arc::downgrade(&authorities[0].segment_lease);
+    let chunk = {
+        let pool = &pools.pools[&harness.pool_ids[0]];
+        let state = pool.state.lock().unwrap();
+        Arc::downgrade(&state.chunks[&authorities[0].evidence.segments[0].chunk_ordinal()].backing)
+    };
+    let original = owner_snapshot(
+        pools,
+        &[
+            std::slice::from_ref(&authorities[0]),
+            std::slice::from_ref(&authorities[1]),
+        ],
+    );
+    let reordered = owner_snapshot(
+        pools,
+        &[
+            std::slice::from_ref(&authorities[1]),
+            std::slice::from_ref(&authorities[0]),
+        ],
+    );
+    let counts = reordered.compare(&original)[1];
+    assert_eq!(counts.current_owners, 2);
+    assert_eq!(counts.shared_owners, 2);
+    assert!(counts.owner_set_equal && counts.range_set_equal && counts.logical_window_set_equal);
+    drop(authorities);
+    assert!(
+        lease.upgrade().is_none(),
+        "a weak diagnostic must release real lease occupancy"
+    );
+    close_dynamic_test_root(harness.root);
+    assert!(
+        chunk.upgrade().is_none(),
+        "device backing drops while snapshots remain alive"
+    );
+    assert_eq!(reordered.compare(&original)[1].shared_owners, 2);
+    let debug = format!("{original:?}");
+    assert!(debug.contains("owners"));
+    assert!(!debug.contains("0x"));
+}
+
+#[test]
+fn owner_snapshot_separates_logical_windows_ranges_and_new_leases() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        2,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pools = &harness.root.dynamic_pools;
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let mut authority = claim_size(pools, pool, 64);
+    let full = owner_snapshot(pools, &[std::slice::from_ref(&authority)]);
+    authority.evidence.logical_size_bytes = 32;
+    let logical = owner_snapshot(pools, &[std::slice::from_ref(&authority)]);
+    let changed = logical.compare(&full)[1];
+    assert!(changed.owner_set_equal && changed.range_set_equal);
+    assert_eq!(changed.shared_owners_with_changed_logical_windows, 1);
+    let allocation = Arc::get_mut(&mut authority.evidence.allocation).unwrap();
+    let segment = &allocation.segments[0];
+    allocation.segments =
+        vec![
+            BackingSegment::new(segment.chunk().clone(), segment.offset_bytes() + 16, 32).unwrap(),
+        ];
+    allocation.physical_offset_bytes += 16;
+    allocation.capacity_size_bytes = 32;
+    let range = owner_snapshot(pools, &[std::slice::from_ref(&authority)]);
+    let changed = range.compare(&logical)[1];
+    assert!(changed.owner_set_equal && changed.logical_window_set_equal);
+    assert_eq!(changed.shared_owners_with_changed_ranges, 1);
+    let scoped = authority.retained_for_lane(crate::vnext::ExecutionLaneId::mint().unwrap());
+    let lane_snapshot = owner_snapshot(pools, &[std::slice::from_ref(&scoped)]);
+    assert_eq!(lane_snapshot.compare(&range)[1].shared_owners, 0);
+    let independent = claim_size(pools, pool, 64);
+    let other = owner_snapshot(pools, &[std::slice::from_ref(&independent)]);
+    let changed = other.compare(&range)[1];
+    assert_eq!(changed.shared_owners, 0);
+    assert_eq!((changed.added_owners, changed.removed_owners), (1, 1));
+    let extended = owner_snapshot(
+        pools,
+        &[
+            std::slice::from_ref(&authority),
+            std::slice::from_ref(&independent),
+        ],
+    );
+    let changed = extended.compare(&range)[1];
+    assert_eq!(
+        (
+            changed.current_owners,
+            changed.shared_owners,
+            changed.added_owners
+        ),
+        (2, 1, 1)
+    );
+    assert!(
+        !changed.owner_set_equal,
+        "new tails must not hide an unchanged owner prefix"
+    );
+    let failed_sink = OwnerSnapshotTiming(Mutex::new(Vec::new()));
+    let groups = [std::slice::from_ref(&authority)];
+    let expected = expectations(&groups);
+    let mut invalid = windows(&expected);
+    invalid[0].length_bytes += 1;
+    assert!(pools
+        .segment_backing_batch_with_timing(&groups, &expected, &invalid, &failed_sink)
+        .is_err());
+    assert!(
+        failed_sink.0.lock().unwrap().is_empty(),
+        "partial permits cannot publish complete snapshots"
+    );
+    let lease_weaks = Arc::weak_count(&authority.segment_lease);
+    let groups = [std::slice::from_ref(&authority)];
+    let expected = expectations(&groups);
+    let batch = pools
+        .segment_backing_batch(&groups, &expected, &windows(&expected))
+        .unwrap();
+    assert_eq!(
+        Arc::weak_count(&authority.segment_lease),
+        lease_weaks,
+        "Off must not mint weak diagnostics"
+    );
+    drop(batch);
+    drop(scoped);
+    drop(independent);
+    drop(authority);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn owner_snapshot_distinguishes_current_chunk_arc_even_when_declared_identity_matches() {
+    let (harness, authorities) = two_pools();
+    let (donor, donor_authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let donor_pool = &donor.root.dynamic_pools.pools[&donor.pool_ids[0]];
+    let ordinal = authorities[0].evidence.segments[0].chunk_ordinal();
+    let groups = [std::slice::from_ref(&authorities[0])];
+    let original_snapshot = owner_snapshot(pools, &groups);
+    let original = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    let mut replacement = donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .remove(&ordinal)
+        .unwrap();
+    let donor_identity = replacement.backing.identity.clone();
+    let donor_descriptor = replacement.backing.descriptor.clone();
+    let current = Arc::get_mut(&mut replacement.backing).unwrap();
+    current.identity = original.backing.identity.clone();
+    current.descriptor = original.backing.descriptor.clone();
+    pool.state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    let replacement_snapshot = owner_snapshot(pools, &groups);
+    assert_eq!(
+        replacement_snapshot.compare(&original_snapshot)[1].shared_owners,
+        0
+    );
+    // Dropping weak diagnostic metadata restores the existing get_mut contract.
+    drop(replacement_snapshot);
+    drop(original_snapshot);
+    let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    let current = Arc::get_mut(&mut replacement.backing).unwrap();
+    current.identity = donor_identity;
+    current.descriptor = donor_descriptor;
+    donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    pool.state.lock().unwrap().chunks.insert(ordinal, original);
+    drop(authorities);
+    drop(donor_authorities);
+    close_dynamic_test_root(harness.root);
+    close_dynamic_test_root(donor.root);
+}
+
 #[test]
 fn segment_owner_identity_distinguishes_real_leases_and_retains_only_when_cloned() {
     // Two declared resources make the real initial chunk 128 bytes. Merely

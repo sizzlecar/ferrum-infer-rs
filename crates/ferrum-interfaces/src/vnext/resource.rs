@@ -66,7 +66,8 @@ pub use dynamic_pool_set::DynamicPoolGrowthBatchReceipt;
 use dynamic_pool_set::DynamicPoolSet;
 mod segment_permit;
 pub use segment_permit::{
-    SegmentBackingBatch, SegmentBackingExpectation, SegmentBackingRequest, SegmentBackingResource,
+    SegmentBackingBatch, SegmentBackingExpectation, SegmentBackingOwnerContinuity,
+    SegmentBackingOwnerSnapshot, SegmentBackingRequest, SegmentBackingResource,
     SegmentBackingWindow, SegmentBackingWindowView, SegmentLogicalSizeRule, SegmentPhysicalRegion,
 };
 pub(crate) use segment_permit::{

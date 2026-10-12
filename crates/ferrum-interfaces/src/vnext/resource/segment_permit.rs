@@ -20,6 +20,8 @@ use crate::vnext::{
 
 mod materialization;
 use materialization::MaterializationDiagnostics;
+mod owner_snapshot;
+pub use owner_snapshot::{SegmentBackingOwnerContinuity, SegmentBackingOwnerSnapshot};
 
 /// Durations only while pool guards exist. Declare this before retained results
 /// and guards: ordinary errors flush after both have dropped, while unwinding
@@ -992,6 +994,13 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         // after partial result cleanup on Err, and never during unwinding.
         timings.materialization = materialization.finish::<S>(unique_groups.len(), checked.is_ok());
         checked?;
+        if S::ENABLED && timing_sink.segment_backing_owner_snapshots_enabled() {
+            if let Some(snapshot) =
+                SegmentBackingOwnerSnapshot::capture::<R, S>(self, groups, &result, windows)
+            {
+                timing_sink.record_segment_backing_owner_snapshot(snapshot);
+            }
+        }
         Ok(result)
     }
 }

@@ -1,10 +1,364 @@
 //! Real ledger/sink contracts. CPU lanes supply owned identities; these tests
 //! do not simulate CUDA capture, dispatch completion, or measured performance.
+use super::super::segment_materialization::{
+    OwnerAttemptContext, OwnerContinuityTracker, OwnerSnapshotEvidence,
+};
 use super::*;
 use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
 use ferrum_kernels::backend::cpu::vnext_runtime::CpuDeviceRuntime;
 use serde_json::{json, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+// Models test only qualification/adjacency/aggregation. Real opaque snapshot
+// lease/current-chunk identity and logical ResourceView sets are exercised by
+// ferrum-interfaces' actual owned-permit tests, without a public forge API.
+struct TestOwner {
+    owner: Weak<()>,
+    lifetime: AllocationLifetime,
+    range: Range<u64>,
+    logical: u64,
+}
+struct TestSnapshot(Vec<TestOwner>);
+
+impl OwnerSnapshotEvidence for TestSnapshot {
+    fn owner_count(&self) -> usize {
+        self.0.len()
+    }
+    fn compare_owners(&self, previous: &Self) -> [SegmentBackingOwnerContinuity; 5] {
+        [
+            AllocationLifetime::Plan,
+            AllocationLifetime::Request,
+            AllocationLifetime::Sequence,
+            AllocationLifetime::Step,
+            AllocationLifetime::Invocation,
+        ]
+        .map(|lifetime| {
+            let current = self
+                .0
+                .iter()
+                .filter(|entry| entry.lifetime == lifetime)
+                .collect::<Vec<_>>();
+            let prior = previous
+                .0
+                .iter()
+                .filter(|entry| entry.lifetime == lifetime)
+                .collect::<Vec<_>>();
+            let same = |a: &&TestOwner, b: &&TestOwner| Weak::ptr_eq(&a.owner, &b.owner);
+            let shared = current
+                .iter()
+                .filter(|a| prior.iter().any(|b| same(a, b)))
+                .count() as u64;
+            let ranges = current
+                .iter()
+                .filter(|a| prior.iter().any(|b| same(a, b) && a.range == b.range))
+                .count() as u64;
+            let logical = current
+                .iter()
+                .filter(|a| prior.iter().any(|b| same(a, b) && a.logical == b.logical))
+                .count() as u64;
+            let current = current.len() as u64;
+            let prior = prior.len() as u64;
+            SegmentBackingOwnerContinuity {
+                lifetime,
+                previous_owners: prior,
+                current_owners: current,
+                shared_owners: shared,
+                added_owners: current - shared,
+                removed_owners: prior - shared,
+                owner_set_equal: shared == current && shared == prior,
+                previous_ranges: prior,
+                current_ranges: current,
+                shared_ranges: ranges,
+                range_set_equal: ranges == current && ranges == prior,
+                shared_owners_with_changed_ranges: shared - ranges,
+                previous_logical_windows: prior,
+                current_logical_windows: current,
+                shared_logical_windows: logical,
+                logical_window_set_equal: logical == current && logical == prior,
+                shared_owners_with_changed_logical_windows: shared - logical,
+            }
+        })
+    }
+}
+
+fn owner_snapshot(
+    owner: &Arc<()>,
+    lifetime: AllocationLifetime,
+    end: u64,
+    logical: u64,
+) -> TestSnapshot {
+    TestSnapshot(vec![TestOwner {
+        owner: Arc::downgrade(owner),
+        lifetime,
+        range: 0..end,
+        logical,
+    }])
+}
+
+fn owner_context(program: &DeviceReusableExecutionProgramId, wave: u64) -> OwnerAttemptContext<'_> {
+    OwnerAttemptContext {
+        wave_ordinal: wave,
+        attempt_ordinal: 0,
+        program_id: Some(program),
+        lane_epoch: 3,
+        catalog_epoch: Some(3),
+        submitted: true,
+        hit: true,
+        catalog_miss: false,
+        incomplete_declarations: false,
+        repeated_callback: false,
+        backend_identity_mismatch: false,
+        backend_identity_available: true,
+    }
+}
+
+#[test]
+fn owner_continuity_keeps_same_owner_range_and_logical_changes_distinct_and_empty_plan_unavailable()
+{
+    let fixture = IdentityFixture::new();
+    let program = fixture.program(1, 'b', 1);
+    let owner = Arc::new(());
+    let mut tracker = OwnerContinuityTracker::<TestSnapshot>::default();
+    let first = tracker.observe(
+        owner_context(&program, 0),
+        Some(owner_snapshot(&owner, AllocationLifetime::Step, 64, 48)),
+    );
+    assert_eq!(serde_json::to_value(first).unwrap()["status"], "baseline");
+    let next = tracker.observe(
+        owner_context(&program, 1),
+        Some(owner_snapshot(&owner, AllocationLifetime::Step, 128, 96)),
+    );
+    let value = serde_json::to_value(next).unwrap();
+    assert_eq!(value["status"], "compared");
+    assert_eq!(value["comparison"][0]["comparison_available"], false);
+    assert!(value["comparison"][0]["counts"].is_null());
+    let step = &value["comparison"][3]["counts"];
+    assert_eq!(step["shared_owners"], 1);
+    assert_eq!(step["owner_set_equal"], true);
+    assert_eq!(step["range_set_equal"], false);
+    assert_eq!(step["logical_window_set_equal"], false);
+    assert_eq!(step["shared_owners_with_changed_ranges"], 1);
+    assert_eq!(step["shared_owners_with_changed_logical_windows"], 1);
+    let value = tracker.snapshot();
+    assert_eq!(value["per_lifetime"][0]["compared_pairs"], 0);
+    assert_eq!(value["per_lifetime"][0]["owner_set_equal_pairs"], 0);
+    assert_eq!(value["per_lifetime"][3]["owner_set_equal_pairs"], 1);
+    assert_eq!(value["per_lifetime"][3]["range_changed_pairs"], 1);
+    assert!(value["comparison_wall_ns"].is_number());
+    assert!(value["snapshot_capture_wall_ns"].is_null());
+    assert_eq!(
+        Arc::strong_count(&owner),
+        1,
+        "tracker retained a strong owner"
+    );
+}
+
+#[test]
+fn owner_continuity_failure_miss_missing_duplicate_and_incomplete_break_adjacent_pairs() {
+    let fixture = IdentityFixture::new();
+    let program = fixture.program(1, 'b', 1);
+    let owner = Arc::new(());
+    for kind in [
+        "error",
+        "miss",
+        "catalog",
+        "missing",
+        "duplicate",
+        "incomplete",
+        "backend",
+        "program",
+    ] {
+        let mut tracker = OwnerContinuityTracker::<TestSnapshot>::default();
+        tracker.observe(
+            owner_context(&program, 0),
+            Some(owner_snapshot(&owner, AllocationLifetime::Sequence, 64, 64)),
+        );
+        let mut context = owner_context(&program, 1);
+        match kind {
+            "error" => context.submitted = false,
+            "miss" => context.hit = false,
+            "catalog" => context.catalog_miss = true,
+            "duplicate" => context.repeated_callback = true,
+            "incomplete" => context.incomplete_declarations = true,
+            "backend" => context.backend_identity_mismatch = true,
+            "program" => context.program_id = None,
+            "missing" => (),
+            _ => unreachable!(),
+        }
+        let snapshot = (kind != "missing")
+            .then(|| owner_snapshot(&owner, AllocationLifetime::Sequence, 64, 64));
+        tracker.observe(context, snapshot);
+        let next = tracker.observe(
+            owner_context(&program, 2),
+            Some(owner_snapshot(&owner, AllocationLifetime::Sequence, 64, 64)),
+        );
+        assert_eq!(
+            serde_json::to_value(next).unwrap()["status"],
+            "baseline",
+            "{kind} was skipped"
+        );
+        assert_eq!(tracker.snapshot()["compared_pairs"], 0);
+    }
+}
+
+#[test]
+fn owner_continuity_full_program_slot_lane_catalog_and_observation_order_are_boundaries() {
+    let fixture = IdentityFixture::new();
+    let program = fixture.program(1, 'b', 1);
+    let other_slot = fixture.program(2, 'b', 1);
+    let owner = Arc::new(());
+    for kind in ["slot", "lane", "catalog", "gap", "older", "duplicate_wave"] {
+        let mut tracker = OwnerContinuityTracker::<TestSnapshot>::default();
+        tracker.observe(
+            owner_context(&program, 1),
+            Some(owner_snapshot(
+                &owner,
+                AllocationLifetime::Invocation,
+                64,
+                64,
+            )),
+        );
+        let mut context = owner_context(&program, 2);
+        match kind {
+            "slot" => context.program_id = Some(&other_slot),
+            "lane" => context.lane_epoch += 1,
+            "catalog" => context.catalog_epoch = Some(4),
+            "gap" => context.wave_ordinal = 3,
+            "older" => context.wave_ordinal = 0,
+            "duplicate_wave" => context.wave_ordinal = 1,
+            _ => unreachable!(),
+        }
+        let value = serde_json::to_value(tracker.observe(
+            context,
+            Some(owner_snapshot(
+                &owner,
+                AllocationLifetime::Invocation,
+                64,
+                64,
+            )),
+        ))
+        .unwrap();
+        assert!(
+            value["comparison"].is_null(),
+            "{kind} compared non-adjacent owners"
+        );
+        assert_eq!(tracker.snapshot()["compared_pairs"], 0);
+        if kind == "slot" {
+            assert_eq!(tracker.snapshot()["program_discontinuities"], 1);
+        }
+    }
+}
+
+#[test]
+fn owner_continuity_missing_backend_receipt_is_core_context_comparison_only() {
+    let fixture = IdentityFixture::new();
+    let program = fixture.program(1, 'b', 1);
+    let owner = Arc::new(());
+    let mut tracker = OwnerContinuityTracker::<TestSnapshot>::default();
+    let mut first = owner_context(&program, 0);
+    first.backend_identity_available = false;
+    tracker.observe(
+        first,
+        Some(owner_snapshot(&owner, AllocationLifetime::Sequence, 64, 64)),
+    );
+    let next = tracker.observe(
+        owner_context(&program, 1),
+        Some(owner_snapshot(&owner, AllocationLifetime::Sequence, 64, 64)),
+    );
+    let value = serde_json::to_value(next).unwrap();
+    assert_eq!(value["status"], "compared");
+    assert_eq!(value["backend_observations_available"], false);
+    assert_eq!(
+        tracker.snapshot()["comparisons_without_backend_observation"],
+        1
+    );
+    assert!(tracker.snapshot()["identity_scope"]
+        .as_str()
+        .unwrap()
+        .contains("not_actual_GPU_graph_cache_hit"));
+}
+
+#[test]
+fn owner_continuity_retry_starts_new_baseline_and_lifetime_change_is_not_reuse() {
+    let fixture = IdentityFixture::new();
+    let program = fixture.program(1, 'b', 1);
+    let owner = Arc::new(());
+    let mut tracker = OwnerContinuityTracker::<TestSnapshot>::default();
+    tracker.observe(
+        owner_context(&program, 0),
+        Some(owner_snapshot(&owner, AllocationLifetime::Step, 64, 64)),
+    );
+    let mut retry = owner_context(&program, 1);
+    retry.attempt_ordinal = 1;
+    let value = serde_json::to_value(tracker.observe(
+        retry,
+        Some(owner_snapshot(&owner, AllocationLifetime::Step, 64, 64)),
+    ))
+    .unwrap();
+    assert_eq!(value["status"], "retry_baseline");
+    assert!(value["comparison"].is_null());
+    let value = serde_json::to_value(tracker.observe(
+        owner_context(&program, 2),
+        Some(owner_snapshot(
+            &owner,
+            AllocationLifetime::Invocation,
+            64,
+            64,
+        )),
+    ))
+    .unwrap();
+    assert_eq!(value["comparison"][3]["counts"]["removed_owners"], 1);
+    assert_eq!(value["comparison"][4]["counts"]["added_owners"], 1);
+    assert_eq!(tracker.snapshot()["entire_owner_set_equal_pairs"], 0);
+    tracker.reset();
+    assert_eq!(tracker.snapshot()["attempts"], 0);
+    assert_eq!(tracker.snapshot()["previous_snapshot_present"], false);
+    assert!(tracker.snapshot()["comparison_wall_ns"].is_null());
+}
+
+#[test]
+fn owner_continuity_disabled_collection_allocates_no_tracker_and_unfinalized_wave_breaks_history() {
+    let ledger = Ledger::default();
+    assert!(ledger
+        .begin(false, VNextExecutionWaveKind::Decode)
+        .is_none());
+    assert!(ledger.owner_continuity.get().is_none());
+    let sink = CaptureSink::default();
+    let fixture = IdentityFixture::new();
+    let program = fixture.program(1, 'b', 1);
+    let mut wave = ledger.begin(true, VNextExecutionWaveKind::Decode).unwrap();
+    wave.record_attempt(
+        AttemptObservation::new(&sink, Some(program), 3, Some(3), None).with_owner_snapshots(true),
+        InvocationPreparationStats {
+            segment_hits: 1,
+            ..Default::default()
+        },
+        Outcome::Submitted,
+        None,
+    );
+    assert!(
+        ledger.owner_continuity.get().is_none(),
+        "pending success was counted before wave qualification"
+    );
+    // No opaque snapshot was produced by this CPU state-machine test. Missing
+    // data remains unavailable after successful finalization, never stable.
+    wave.finish(None, Outcome::Submitted);
+    assert_eq!(ledger.snapshot()["owner_continuity"]["compared_pairs"], 0);
+    assert_eq!(
+        ledger.snapshot()["owner_continuity"]["unavailable_snapshots"],
+        1
+    );
+    let wave = ledger.begin(true, VNextExecutionWaveKind::Prefill).unwrap();
+    drop(wave);
+    assert_eq!(
+        ledger.snapshot()["owner_continuity"]["boundaries"]["unfinalized_wave"],
+        1
+    );
+    assert_eq!(
+        ledger.snapshot()["owner_continuity"]["previous_snapshot_present"],
+        false
+    );
+}
 
 struct IdentityFixture {
     composition: CpuVNextComposition,

@@ -296,9 +296,24 @@ impl SegmentBackingMaterializationObservation {
 pub trait SubmissionWaveDispatchTimingSink: DeviceSubmissionTimingSink {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration);
 
+    /// Explicit diagnostic opt-in, separate from host/device timing. Generic
+    /// timing observers must not create cross-step weak identity snapshots.
+    fn segment_backing_owner_snapshots_enabled(&self) -> bool {
+        false
+    }
+
     fn record_segment_backing_materialization(
         &self,
         _observation: SegmentBackingMaterializationObservation,
+    ) {
+    }
+
+    /// Opaque weak identities from one fully validated permit, after pool
+    /// unlock. Metadata cannot retain a physical owner or authorize later use.
+    /// Missing observations are unavailable, never evidence of zero owners.
+    fn record_segment_backing_owner_snapshot(
+        &self,
+        _snapshot: super::super::SegmentBackingOwnerSnapshot,
     ) {
     }
 }
