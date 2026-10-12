@@ -1822,6 +1822,16 @@ impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
         self.pools
             .segment_backing_batch_with_window_input(groups, expected, windows, timing)
     }
+
+    pub(crate) fn prepare_rows<S: crate::vnext::SubmissionWaveDispatchTimingSink>(
+        &self,
+        rows: &[super::SegmentBackingRow<'_>],
+        windows: super::SegmentBackingWindowInput<'_>,
+        timing: &S,
+    ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError> {
+        self.pools
+            .segment_backing_batch_with_rows(rows, windows, timing)
+    }
 }
 
 impl<R> PreparedStepSubmissionWave<R>

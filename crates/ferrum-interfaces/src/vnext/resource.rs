@@ -70,8 +70,8 @@ pub use segment_permit::{
     SegmentBackingWindow, SegmentBackingWindowView, SegmentLogicalSizeRule, SegmentPhysicalRegion,
 };
 pub(crate) use segment_permit::{
-    SegmentBackingWindowInput, SegmentPlanResourceRequest, SegmentPlanResourceView,
-    SegmentWindowResource, SegmentWindowRule,
+    SegmentBackingRow, SegmentBackingWindowInput, SegmentPlanResourceRequest,
+    SegmentPlanResourceView, SegmentWindowResource, SegmentWindowRule,
 };
 mod dynamic_pool_maintenance;
 mod pool_resident_reclaim;

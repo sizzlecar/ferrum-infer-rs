@@ -31,8 +31,8 @@ impl SubmissionWaveDispatchTimingSink for SegmentTiming {
 }
 
 const SEGMENT_PHASES: [SubmissionWaveDispatchStage; 10] = [
-    SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
     SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+    SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
     SubmissionWaveDispatchStage::SegmentBackingDedupReserveAndPoolResolution,
     SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
     SubmissionWaveDispatchStage::SegmentBackingLockedValidation,
@@ -313,7 +313,10 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         )
     };
     assert!(run().unwrap().is_none());
-    assert_eq!(timing.take(), SEGMENT_PHASES[..1]);
+    assert_eq!(
+        timing.take(),
+        [SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows]
+    );
     assert!(!oracle(&fixture, &wave, &identity, &active, &recipe).is_empty());
     fixture
         .runtime_trace
@@ -336,7 +339,10 @@ fn segment_hot_missing_capability_falls_back_but_foreign_capability_or_getter_dr
         .unwrap()
         .segment_foreign_runtime_metadata = true;
     assert!(run().is_err());
-    assert_eq!(timing.take(), SEGMENT_PHASES[..1]);
+    assert_eq!(
+        timing.take(),
+        [SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows]
+    );
     fixture
         .runtime_trace
         .lock()

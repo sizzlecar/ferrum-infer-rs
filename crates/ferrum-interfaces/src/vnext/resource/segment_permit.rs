@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 
 use crate::vnext::{SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink};
 
+mod rows;
+pub(crate) use rows::SegmentBackingRow;
+
 /// Durations only while pool guards exist. Declare this before retained results
 /// and guards: ordinary errors flush after both have dropped, while unwinding
 /// follows the existing dispatch timers' rule of not calling observers.
@@ -527,6 +530,9 @@ pub struct SegmentBackingBatch<B> {
     bindings: Vec<LogicalBackingSegmentBinding<B>>,
     windows: Vec<Range<usize>>,
     regions: Vec<WindowRegion>,
+    // Representative indices never own, replace or merge an allocation/lease.
+    // General callers retain their existing complete metadata iteration.
+    metadata_binding_indices: Option<Vec<usize>>,
 }
 
 impl<B> SegmentBackingBatch<B> {
@@ -548,6 +554,99 @@ impl<B> SegmentBackingBatch<B> {
     /// immutable-metadata capability. This never calls a runtime under a lock.
     pub(crate) fn bindings(&self) -> &[LogicalBackingSegmentBinding<B>] {
         &self.bindings
+    }
+
+    /// Fresh row permits already resolve each current chunk in their guarded
+    /// directory. Its first binding is enough for immutable buffer metadata;
+    /// every original binding still owns its exact lease, chunk and lane.
+    pub(crate) fn metadata_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &LogicalBackingSegmentBinding<B>> {
+        let length = self
+            .metadata_binding_indices
+            .as_ref()
+            .map_or(self.bindings.len(), Vec::len);
+        (0..length).map(move |index| {
+            let binding_index = self
+                .metadata_binding_indices
+                .as_ref()
+                .map_or(index, |indices| indices[index]);
+            &self.bindings[binding_index]
+        })
+    }
+
+    fn build_windows(&mut self, windows: SegmentBackingWindowInput<'_>) -> Result<(), VNextError> {
+        for window in windows.iter() {
+            let window = window?;
+            let resource = self
+                .resources
+                .get(window.resource_index)
+                .ok_or_else(|| invalid_resource("segment window references an unknown resource"))?;
+            let end = window
+                .offset_bytes
+                .checked_add(window.length_bytes)
+                .ok_or_else(|| invalid_resource("segment window range overflows u64"))?;
+            if window.length_bytes == 0
+                || end > resource.view_size_bytes
+                || window.element_type != resource.element_type
+                || window.alignment_bytes == 0
+                || !window.alignment_bytes.is_power_of_two()
+                || resource.alignment_bytes < window.alignment_bytes
+                || !window.offset_bytes.is_multiple_of(window.alignment_bytes)
+            {
+                return Err(invalid_resource(
+                    "segment window is outside its typed current-wave view",
+                ));
+            }
+            let start = self.regions.len();
+            let mut logical_origin = 0u64;
+            let mut covered = 0u64;
+            for binding_index in resource.bindings.clone() {
+                let binding = &self.bindings[binding_index];
+                let segment_end = logical_origin
+                    .checked_add(binding.segment.length_bytes())
+                    .ok_or_else(|| invalid_resource("segment logical range overflows u64"))?;
+                let begin = logical_origin.max(window.offset_bytes);
+                let finish = segment_end.min(end);
+                if begin < finish {
+                    let physical = binding
+                        .segment
+                        .offset_bytes()
+                        .checked_add(begin - logical_origin)
+                        .ok_or_else(|| invalid_resource("segment physical offset overflows u64"))?;
+                    let length = finish - begin;
+                    if !physical.is_multiple_of(window.alignment_bytes)
+                        || physical
+                            .checked_add(length)
+                            .is_none_or(|limit| limit > binding.descriptor().size_bytes)
+                    {
+                        return Err(invalid_resource(
+                            "segment physical window exceeds its actual allocation",
+                        ));
+                    }
+                    covered = covered
+                        .checked_add(length)
+                        .ok_or_else(|| invalid_resource("segment covered bytes overflow"))?;
+                    self.regions.push(WindowRegion {
+                        binding_index,
+                        logical_offset_bytes: begin - window.offset_bytes,
+                        physical_offset_bytes: physical,
+                        length_bytes: length,
+                    });
+                }
+                logical_origin = segment_end;
+                if logical_origin >= end {
+                    break;
+                }
+            }
+            if covered != window.length_bytes {
+                return Err(invalid_resource(
+                    "segment physical backing does not cover its window",
+                ));
+            }
+            self.windows.push(start..self.regions.len());
+        }
+        Ok(())
     }
 }
 
@@ -671,6 +770,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
             bindings: Vec::new(),
             windows: Vec::new(),
             regions: Vec::new(),
+            metadata_binding_indices: None,
         };
         let mut ids = BTreeSet::new();
         let mut unique = BTreeMap::new();
@@ -866,77 +966,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                 });
             }
             timings.next();
-            for window in windows.iter() {
-                let window = window?;
-                let resource = result.resources.get(window.resource_index).ok_or_else(|| {
-                    invalid_resource("segment window references an unknown resource")
-                })?;
-                let end = window
-                    .offset_bytes
-                    .checked_add(window.length_bytes)
-                    .ok_or_else(|| invalid_resource("segment window range overflows u64"))?;
-                if window.length_bytes == 0
-                    || end > resource.view_size_bytes
-                    || window.element_type != resource.element_type
-                    || window.alignment_bytes == 0
-                    || !window.alignment_bytes.is_power_of_two()
-                    || resource.alignment_bytes < window.alignment_bytes
-                    || !window.offset_bytes.is_multiple_of(window.alignment_bytes)
-                {
-                    return Err(invalid_resource(
-                        "segment window is outside its typed current-wave view",
-                    ));
-                }
-                let start = result.regions.len();
-                let mut logical_origin = 0u64;
-                let mut covered = 0u64;
-                for binding_index in resource.bindings.clone() {
-                    let binding = &result.bindings[binding_index];
-                    let segment_end = logical_origin
-                        .checked_add(binding.segment.length_bytes())
-                        .ok_or_else(|| invalid_resource("segment logical range overflows u64"))?;
-                    let begin = logical_origin.max(window.offset_bytes);
-                    let finish = segment_end.min(end);
-                    if begin < finish {
-                        let physical = binding
-                            .segment
-                            .offset_bytes()
-                            .checked_add(begin - logical_origin)
-                            .ok_or_else(|| {
-                                invalid_resource("segment physical offset overflows u64")
-                            })?;
-                        let length = finish - begin;
-                        if !physical.is_multiple_of(window.alignment_bytes)
-                            || physical
-                                .checked_add(length)
-                                .is_none_or(|limit| limit > binding.descriptor().size_bytes)
-                        {
-                            return Err(invalid_resource(
-                                "segment physical window exceeds its actual allocation",
-                            ));
-                        }
-                        covered = covered
-                            .checked_add(length)
-                            .ok_or_else(|| invalid_resource("segment covered bytes overflow"))?;
-                        result.regions.push(WindowRegion {
-                            binding_index,
-                            logical_offset_bytes: begin - window.offset_bytes,
-                            physical_offset_bytes: physical,
-                            length_bytes: length,
-                        });
-                    }
-                    logical_origin = segment_end;
-                    if logical_origin >= end {
-                        break;
-                    }
-                }
-                if covered != window.length_bytes {
-                    return Err(invalid_resource(
-                        "segment physical backing does not cover its window",
-                    ));
-                }
-                result.windows.push(start..result.regions.len());
-            }
+            result.build_windows(windows)?;
             Ok(())
         })();
         // Read the last locked interval without invoking the observer. It is

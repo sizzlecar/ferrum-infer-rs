@@ -1,5 +1,7 @@
 //! Actual multi-pool admission, replacement and whole-segment failure boundaries.
 use super::*;
+use crate::vnext::operation::DisabledSubmissionWaveDispatchTimingSink;
+use crate::vnext::resource::{SegmentBackingRow, SegmentBackingWindowInput};
 use crate::vnext::{
     DeviceSubmissionStage, DeviceSubmissionTimingSink, SubmissionWaveDispatchStage,
     SubmissionWaveDispatchTimingSink,
@@ -83,6 +85,377 @@ fn windows(expected: &[SegmentBackingExpectation]) -> Vec<SegmentBackingWindow> 
             alignment_bytes: e.alignment_bytes,
         })
         .collect()
+}
+
+fn fresh_batch<R: DeviceRuntime>(
+    pools: &DynamicPoolSet<R>,
+    groups: &[&[LogicalBackingSliceAuthority]],
+    expected: &[SegmentBackingExpectation],
+    windows: &[SegmentBackingWindow],
+) -> Result<SegmentBackingBatch<R::Buffer>, VNextError> {
+    assert_eq!(groups.len(), expected.len());
+    let rows = groups
+        .iter()
+        .zip(expected)
+        .map(|(authorities, expected)| SegmentBackingRow {
+            authorities,
+            expected: *expected,
+        })
+        .collect::<Vec<_>>();
+    pools.segment_backing_batch_with_rows(
+        &rows,
+        SegmentBackingWindowInput::Slice(windows),
+        &DisabledSubmissionWaveDispatchTimingSink,
+    )
+}
+
+fn assert_batch_equivalence<B>(
+    old: &SegmentBackingBatch<B>,
+    new: &SegmentBackingBatch<B>,
+    window_count: usize,
+) {
+    assert_eq!(old.resources().len(), new.resources().len());
+    for (old, new) in old.resources().iter().zip(new.resources()) {
+        assert_eq!(old.logical_size_bytes(), new.logical_size_bytes());
+        assert_eq!(old.capacity_size_bytes(), new.capacity_size_bytes());
+        assert_eq!(old.view_size_bytes(), new.view_size_bytes());
+        assert_eq!(old.alignment_bytes(), new.alignment_bytes());
+        assert_eq!(old.usage(), new.usage());
+        assert_eq!(old.element_type(), new.element_type());
+        assert_eq!(old.storage_profile(), new.storage_profile());
+    }
+    assert_eq!(old.bindings().len(), new.bindings().len());
+    for (old, new) in old.bindings().iter().zip(new.bindings()) {
+        assert_eq!(old.segment(), new.segment());
+        assert!(Arc::ptr_eq(&old.chunk, &new.chunk));
+        assert_eq!(old.descriptor(), new.descriptor());
+        assert!(old.retention_ref().same_owners(new.retention_ref()));
+    }
+    for index in 0..window_count {
+        let old = old.window(index).unwrap();
+        let new = new.window(index).unwrap();
+        assert_eq!(old.region_count(), new.region_count());
+        for (old, new) in old.physical_regions().zip(new.physical_regions()) {
+            assert_eq!(old.logical_offset_bytes(), new.logical_offset_bytes());
+            assert_eq!(old.length_bytes(), new.length_bytes());
+            assert_eq!(old.descriptor(), new.descriptor());
+            let (old_buffer, old_range, old_owner) = old.borrowed_buffer_and_physical_range();
+            let (new_buffer, new_range, new_owner) = new.borrowed_buffer_and_physical_range();
+            assert!(std::ptr::eq(old_buffer, new_buffer));
+            assert_eq!(old_range, new_range);
+            assert!(old_owner.same_owners(new_owner));
+        }
+    }
+    assert!(new.window(window_count).is_none());
+    let old_buffers = old
+        .bindings()
+        .iter()
+        .map(|binding| binding.buffer() as *const B)
+        .collect::<std::collections::BTreeSet<_>>();
+    let representatives = new
+        .metadata_bindings()
+        .map(|binding| binding.buffer() as *const B)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(old_buffers, representatives);
+    assert_eq!(new.metadata_bindings().len(), representatives.len());
+}
+
+#[test]
+fn fresh_rows_match_legacy_for_duplicate_authorities_and_independent_view_bounds() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let groups = [
+        std::slice::from_ref(&authorities[1]),
+        std::slice::from_ref(&authorities[0]),
+        std::slice::from_ref(&authorities[1]),
+        std::slice::from_ref(&authorities[1]),
+    ];
+    let mut expected = expectations(&groups);
+    expected[2].logical_size_rule = SegmentLogicalSizeRule::AtLeast;
+    expected[2].logical_bytes = 32;
+    expected[3].logical_size_rule = SegmentLogicalSizeRule::AtLeast;
+    expected[3].logical_bytes = 16;
+    let mut requested = windows(&expected);
+    requested[2].offset_bytes = 16;
+    requested[2].length_bytes = 16;
+    requested.push(SegmentBackingWindow {
+        resource_index: 2,
+        offset_bytes: 16,
+        length_bytes: 16,
+        element_type: expected[2].element_type,
+        alignment_bytes: expected[2].alignment_bytes,
+    });
+    let old = pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .unwrap();
+    let new = fresh_batch(pools, &groups, &expected, &requested).unwrap();
+    assert_batch_equivalence(&old, &new, requested.len());
+    drop(old);
+    drop(new);
+
+    // Sharing an authority cannot let this row borrow another row's full view.
+    requested.last_mut().unwrap().length_bytes = 17;
+    assert!(pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .is_err());
+    assert!(fresh_batch(pools, &groups, &expected, &requested).is_err());
+    requested.last_mut().unwrap().length_bytes = 16;
+    expected[2].logical_size_rule = SegmentLogicalSizeRule::Exact;
+    assert!(pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .is_err());
+    assert!(fresh_batch(pools, &groups, &expected, &requested).is_err());
+    for pool in pools.pools.values() {
+        assert!(pool.state.try_lock().is_ok());
+    }
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn fresh_rows_keep_each_real_lease_and_lane_while_representing_shared_buffer_metadata() {
+    // The two resources declare an actually resident 128-byte initial chunk.
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        2,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pools = &harness.root.dynamic_pools;
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let original = claim_size(pools, pool, 64);
+    let mut independent = claim_size(pools, pool, 64);
+    let lane = original.retained_for_lane(crate::vnext::ExecutionLaneId::mint().unwrap());
+    let other_lane = original.retained_for_lane(crate::vnext::ExecutionLaneId::mint().unwrap());
+    let groups = [&original, &independent, &lane, &other_lane, &original].map(std::slice::from_ref);
+    let expected = expectations(&groups);
+    let requested = windows(&expected);
+    let old = pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .unwrap();
+    let new = fresh_batch(pools, &groups, &expected, &requested).unwrap();
+    assert_batch_equivalence(&old, &new, requested.len());
+    let first_binding = &new.bindings()[0];
+    let second_binding = &new.bindings()[1];
+    assert!(std::ptr::eq(
+        first_binding.buffer(),
+        second_binding.buffer()
+    ));
+    assert!(!first_binding
+        .retention_ref()
+        .same_owners(second_binding.retention_ref()));
+    assert!(!new.bindings()[2]
+        .retention_ref()
+        .same_owners(new.bindings()[3].retention_ref()));
+    drop(old);
+    drop(new);
+    drop(other_lane);
+    drop(lane);
+    // Keep the later real claim's immutable projection and lease in agreement,
+    // but require a chunk generation that the current shared buffer lacks.
+    // Validating the first range cannot authorize this later range implicitly.
+    let segment = independent.evidence.segments[0].clone();
+    let stale = BackingSegment::from_chunk(
+        segment.pool_id(),
+        segment.chunk_ordinal(),
+        segment.chunk_generation() + 1,
+        segment.offset_bytes(),
+        segment.length_bytes(),
+    )
+    .unwrap();
+    Arc::get_mut(&mut independent.evidence.allocation)
+        .unwrap()
+        .segments[0] = stale.clone();
+    Arc::get_mut(&mut independent.segment_lease)
+        .unwrap()
+        .segments[0] = stale;
+    let groups = [&original, &independent].map(std::slice::from_ref);
+    let expected = expectations(&groups);
+    let requested = windows(&expected);
+    assert!(pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .is_err());
+    assert!(fresh_batch(pools, &groups, &expected, &requested).is_err());
+    assert!(pool.state.try_lock().is_ok());
+    Arc::get_mut(&mut independent.evidence.allocation)
+        .unwrap()
+        .segments[0] = segment.clone();
+    Arc::get_mut(&mut independent.segment_lease)
+        .unwrap()
+        .segments[0] = segment;
+    drop(independent);
+    drop(original);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn fresh_rows_reject_late_authority_and_current_chunk_changes_without_retention_leaks() {
+    let (harness, mut authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let first_pool = &pools.pools[&harness.pool_ids[0]];
+    let second_pool = &pools.pools[&harness.pool_ids[1]];
+    let first_ordinal = authorities[0].evidence.segments[0].chunk_ordinal();
+    let first_chunk = Arc::clone(&first_pool.state.lock().unwrap().chunks[&first_ordinal].backing);
+    let first_chunk_owners = Arc::strong_count(&first_chunk);
+    let first_lease_owners = Arc::strong_count(&authorities[0].segment_lease);
+    let reject = |authorities: &[LogicalBackingSliceAuthority]| {
+        let groups = authorities
+            .iter()
+            .map(std::slice::from_ref)
+            .collect::<Vec<_>>();
+        let expected = expectations(&groups);
+        let requested = windows(&expected);
+        assert!(pools
+            .segment_backing_batch(&groups, &expected, &requested)
+            .is_err());
+        assert!(fresh_batch(pools, &groups, &expected, &requested).is_err());
+        for pool in pools.pools.values() {
+            assert!(pool.state.try_lock().is_ok());
+        }
+        assert_eq!(Arc::strong_count(&first_chunk), first_chunk_owners);
+        assert_eq!(
+            Arc::strong_count(&authorities[0].segment_lease),
+            first_lease_owners
+        );
+    };
+
+    let generation = authorities[1].evidence.segment_generation;
+    Arc::get_mut(&mut authorities[1].evidence.allocation)
+        .unwrap()
+        .segment_generation = generation + 1;
+    reject(&authorities);
+    {
+        // A bad earlier requirement cannot hide the later authority failure.
+        let groups = authorities
+            .iter()
+            .map(std::slice::from_ref)
+            .collect::<Vec<_>>();
+        let mut expected = expectations(&groups);
+        expected[0].logical_bytes /= 2;
+        let requested = windows(&expected);
+        let legacy = pools
+            .segment_backing_batch(&groups, &expected, &requested)
+            .err()
+            .expect("the stale authority must reject the whole permit");
+        let fresh = fresh_batch(pools, &groups, &expected, &requested)
+            .err()
+            .expect("the fresh row permit must also reject");
+        match (legacy, fresh) {
+            (
+                VNextError::InvalidExecutionPlan { reason: legacy },
+                VNextError::InvalidExecutionPlan { reason: fresh },
+            ) => assert_eq!(legacy, fresh),
+            errors => panic!("authority error attribution differs: {errors:?}"),
+        }
+    }
+    Arc::get_mut(&mut authorities[1].evidence.allocation)
+        .unwrap()
+        .segment_generation = generation;
+
+    let resource_id = authorities[1].evidence.resource_id.clone();
+    Arc::get_mut(&mut authorities[1].evidence.allocation)
+        .unwrap()
+        .resource_id = ResourceId::new("resource.foreign-claim-member").unwrap();
+    reject(&authorities);
+    Arc::get_mut(&mut authorities[1].evidence.allocation)
+        .unwrap()
+        .resource_id = resource_id;
+
+    let segment = authorities[1].evidence.segments[0].clone();
+    Arc::get_mut(&mut authorities[1].evidence.allocation)
+        .unwrap()
+        .segments[0] = BackingSegment::from_chunk(
+        segment.pool_id(),
+        segment.chunk_ordinal(),
+        segment.chunk_generation(),
+        segment.offset_bytes() + 8,
+        segment.length_bytes() - 8,
+    )
+    .unwrap();
+    reject(&authorities);
+    Arc::get_mut(&mut authorities[1].evidence.allocation)
+        .unwrap()
+        .segments[0] = segment;
+
+    let ordinal = authorities[1].evidence.segments[0].chunk_ordinal();
+    let identity = {
+        let mut state = second_pool.state.lock().unwrap();
+        let backing = Arc::get_mut(&mut state.chunks.get_mut(&ordinal).unwrap().backing).unwrap();
+        let identity = backing.identity.clone();
+        backing.identity = BackingChunkIdentity::from_parts(
+            identity.pool_id().clone(),
+            identity.ordinal(),
+            identity.generation() + 1,
+        )
+        .unwrap();
+        identity
+    };
+    reject(&authorities);
+    {
+        let mut state = second_pool.state.lock().unwrap();
+        Arc::get_mut(&mut state.chunks.get_mut(&ordinal).unwrap().backing)
+            .unwrap()
+            .identity = identity;
+    }
+    let descriptor_size = {
+        let mut state = second_pool.state.lock().unwrap();
+        let backing = Arc::get_mut(&mut state.chunks.get_mut(&ordinal).unwrap().backing).unwrap();
+        let size = backing.descriptor.size_bytes;
+        backing.descriptor.size_bytes = 32;
+        size
+    };
+    reject(&authorities);
+    {
+        let mut state = second_pool.state.lock().unwrap();
+        Arc::get_mut(&mut state.chunks.get_mut(&ordinal).unwrap().backing)
+            .unwrap()
+            .descriptor
+            .size_bytes = descriptor_size;
+    }
+    second_pool.state.lock().unwrap().poisoned = true;
+    reject(&authorities);
+    second_pool.state.lock().unwrap().poisoned = false;
+
+    let groups = authorities
+        .iter()
+        .map(std::slice::from_ref)
+        .collect::<Vec<_>>();
+    let expected = expectations(&groups);
+    let mut requested = windows(&expected);
+    requested[1].offset_bytes = u64::MAX;
+    assert!(pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .is_err());
+    assert!(fresh_batch(pools, &groups, &expected, &requested).is_err());
+    for pool in pools.pools.values() {
+        assert!(pool.state.try_lock().is_ok());
+    }
+    assert_eq!(Arc::strong_count(&first_chunk), first_chunk_owners);
+    assert_eq!(
+        Arc::strong_count(&authorities[0].segment_lease),
+        first_lease_owners
+    );
+
+    requested = windows(&expected);
+    let old = pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .unwrap();
+    let new = fresh_batch(pools, &groups, &expected, &requested).unwrap();
+    assert_batch_equivalence(&old, &new, requested.len());
+    drop(old);
+    drop(new);
+    drop(first_chunk);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -492,9 +865,11 @@ fn segment_permit_returns_current_arc_and_retains_it_after_unlock() {
         .insert(ordinal, replacement);
     let groups = [std::slice::from_ref(&authorities[0])];
     let expected = expectations(&groups);
-    let batch = pools
+    let legacy = pools
         .segment_backing_batch(&groups, &expected, &windows(&expected))
         .unwrap();
+    let batch = fresh_batch(pools, &groups, &expected, &windows(&expected)).unwrap();
+    assert_batch_equivalence(&legacy, &batch, expected.len());
     assert!(Arc::ptr_eq(
         &batch.bindings()[0].chunk,
         &replacement_probe.upgrade().unwrap()
@@ -519,7 +894,9 @@ fn segment_permit_returns_current_arc_and_retains_it_after_unlock() {
     assert!(pools
         .segment_backing_batch(&groups, &expected, &windows(&expected))
         .is_err());
+    assert!(fresh_batch(pools, &groups, &expected, &windows(&expected)).is_err());
     pool.state.lock().unwrap().poisoned = false;
+    drop(legacy);
     drop(batch);
     drop(replacement_probe);
     let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();

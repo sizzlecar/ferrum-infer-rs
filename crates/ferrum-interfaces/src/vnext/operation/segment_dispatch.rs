@@ -6,12 +6,15 @@ use std::sync::Arc;
 use super::buffer_view::sequence_execution_shape;
 use super::dispatch_contract::SubmissionWaveDispatchStageTimer;
 use super::foundation::invalid_operation;
-use super::invocation::{validate_segment_wave_authority, OperationInvocationResources};
+use super::invocation::validate_segment_wave_authority;
 use super::preparation::SegmentPreparationMissReason;
 use super::retained_dependency::{issue_segment_plan_dependency, SegmentPlanDependencyInput};
 use super::segment_binding::SegmentBindingPhysicalSource;
 use super::segment_compile::{CompiledSegmentBindingRecipe, CompiledSegmentResourceSource};
-use crate::vnext::resource::{SegmentPlanResourceRequest, SegmentPlanResourceView};
+use crate::vnext::resource::{
+    SegmentBackingRow, SegmentBackingWindowInput, SegmentPlanResourceRequest,
+    SegmentPlanResourceView,
+};
 use crate::vnext::*;
 
 pub(super) struct SegmentEncodedNode<C> {
@@ -169,10 +172,6 @@ where
         ));
     }
     let participant_count = first.participant_count() as usize;
-    let current = OperationInvocationResources::Wave {
-        wave,
-        node_index: 0,
-    };
     let memory = resolved.execution_plan().payload().memory();
     let plan_requests = recipe
         .plan_slots
@@ -189,7 +188,12 @@ where
         })
         .collect::<Result<Vec<_>, VNextError>>()?;
     let plan_views = wave.prepare_segment_plan_views(&plan_requests)?;
-    let mut requests: Vec<SegmentBackingRequest> = Vec::new();
+    let snapshot_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup,
+    );
+    let context = wave.segment_backing_context()?;
+    let mut requests: Vec<SegmentBackingRow<'_>> = Vec::new();
     let mut fresh = Vec::with_capacity(recipe.resources.len());
     for resource in &recipe.resources {
         let mut participants = Vec::with_capacity(participant_count);
@@ -235,8 +239,6 @@ where
                                     wave.step_resources().work_shape().immediate_shape(),
                                 )?,
                             AllocationLifetime::Sequence => {
-                                let backing =
-                                    current.participant_backing_snapshot(participant_index)?;
                                 let tokens = first
                                     .work_shape()
                                     .participant_token_ranges()
@@ -248,16 +250,13 @@ where
                                     })?;
                                 descriptor.evaluate_request_bytes_for_shape(
                                     sequence_execution_shape(
-                                        backing.committed_shape(),
+                                        context.sequence_shape(participant_index)?,
                                         tokens.source_token_range().end,
                                     )?,
                                 )?
                             }
                             AllocationLifetime::Request => descriptor.evaluate_fit_request_bytes(
-                                current
-                                    .participant(participant_index)?
-                                    .request_resources()
-                                    .work_shape(),
+                                context.request_shape(participant_index)?,
                             )?,
                             AllocationLifetime::Plan => {
                                 return Err(invalid_operation(
@@ -270,10 +269,12 @@ where
                         first_request
                     } else {
                         let index = requests.len();
-                        requests.push(SegmentBackingRequest {
-                            participant_index,
-                            resource_id: resource.resource_id.clone(),
-                            lifetime,
+                        requests.push(SegmentBackingRow {
+                            authorities: context.resolve(
+                                participant_index,
+                                &resource.resource_id,
+                                lifetime,
+                            )?,
                             expected: SegmentBackingExpectation {
                                 logical_bytes: expected_bytes,
                                 logical_size_rule: if lifetime == AllocationLifetime::Sequence {
@@ -333,6 +334,7 @@ where
         }
         fresh.push(participants);
     }
+    drop(snapshot_stage);
     // Validate full physical coverage, including captured resources not patched
     // by the backend. Declared subwindows are consumed under the same permit.
     let mut windows = requests
@@ -380,7 +382,9 @@ where
                         };
                         (
                             BufferDescriptor {
-                                resource_id: request.resource_id.clone(),
+                                resource_id: recipe.resources[region.resource_index]
+                                    .resource_id
+                                    .clone(),
                                 size_bytes: bytes,
                                 alignment_bytes: request.expected.alignment_bytes,
                                 usage: request.expected.usage,
@@ -442,7 +446,11 @@ where
     let backing = if requests.is_empty() {
         None
     } else {
-        Some(wave.prepare_segment_backings_with_timing(&requests, &windows, timing_sink)?)
+        Some(context.prepare_rows(
+            &requests,
+            SegmentBackingWindowInput::Slice(&windows),
+            timing_sink,
+        )?)
     };
     let metadata_stage = SubmissionWaveDispatchStageTimer::start(
         timing_sink,
@@ -468,7 +476,7 @@ where
         }
     }
     if let Some(backing) = &backing {
-        for binding in backing.bindings() {
+        for binding in backing.metadata_bindings() {
             if !validate_buffer(runtime, binding.buffer(), binding.descriptor(), &mut seen)? {
                 identity.record_segment_miss_reason(
                     SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
@@ -966,7 +974,7 @@ where
         }
     }
     if let Some(backing) = &backing {
-        for binding in backing.bindings() {
+        for binding in backing.metadata_bindings() {
             if !validate_buffer(runtime, binding.buffer(), binding.descriptor(), &mut seen)? {
                 identity.record_segment_miss_reason(
                     SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
