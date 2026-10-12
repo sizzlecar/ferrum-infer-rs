@@ -567,6 +567,12 @@ mod gpu;
 #[cfg(feature = "vllm-paged-attn-v2")]
 mod packed_prepare_gate_gpu;
 
+#[cfg(all(
+    feature = "vllm-paged-attn-v2",
+    feature = "cuda-indexed-causal-attention"
+))]
+mod indexed_gqa_decode_probe_gpu;
+
 #[cfg(feature = "vllm-paged-attn-v2")]
 fn build_launches(
     shape: CausalAttentionShape,

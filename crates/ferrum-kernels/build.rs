@@ -86,6 +86,7 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/gated_delta_rule.cu",
     "kernels/linear_attention.cu",
     "kernels/vnext_causal_attention.cu",
+    "kernels/indexed_gqa_decode_probe.cu",
     gguf::KERNEL,
     "kernels/mxfp4_marlin_prepare.cu",
     "kernels/gpt_oss_attention.cu",
@@ -1439,7 +1440,10 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         // the cache identity and the actual compiler invocation.
         let precise_math = matches!(
             *kernel,
-            gguf::KERNEL | "kernels/residual_add.cu" | "kernels/argmax_rows.cu"
+            gguf::KERNEL
+                | "kernels/residual_add.cu"
+                | "kernels/argmax_rows.cu"
+                | "kernels/indexed_gqa_decode_probe.cu"
         );
         if precise_math {
             flags.retain(|flag| flag != "--use_fast_math");
