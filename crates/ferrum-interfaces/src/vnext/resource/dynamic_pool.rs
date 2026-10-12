@@ -6,7 +6,7 @@ use super::{
     DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicResourceShape,
     DynamicStorageAllocator, DynamicStorageProfile, ElementType, ExecutionLaneId, FreeExtentIndex,
     InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
-    Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError,
+    Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError, Weak,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolProvisioningPolicy,
@@ -1690,10 +1690,18 @@ where
                 released: false,
             });
             slices.extend(extent.projections.into_iter().map(|evidence| {
+                // The physical allocation and this owned lease are immutable.
+                // Certify their projection at publication, not when a later
+                // wave borrows or resizes the logical view. An unsupported
+                // relation retains the original full validation path.
+                let projection_proof = ExactLeaseProjectionProof::new(&evidence, &segment_lease)
+                    .ok()
+                    .map(Arc::new);
                 LogicalBackingSliceAuthority {
                     evidence,
                     segment_lease: Arc::clone(&segment_lease),
                     reusable_lane: None,
+                    projection_proof,
                 }
             }));
         }
@@ -2132,6 +2140,50 @@ pub struct LogicalBackingSliceAuthority {
     pub(in crate::vnext::resource) evidence: LogicalBackingSliceEvidence,
     pub(in crate::vnext::resource) segment_lease: Arc<BackingSegmentLease>,
     pub(super) reusable_lane: Option<ExecutionLaneId>,
+    pub(super) projection_proof: Option<Arc<ExactLeaseProjectionProof>>,
+}
+
+/// Proves only the immutable lease-to-allocation projection. Allocation Arc
+/// ownership seals its layout; the Weak lease identity pins its control block
+/// against address reuse and unique mutation without adding an external lease
+/// pin. The consuming authority still owns the actual lease. Equal values or
+/// fingerprints cannot retarget this proof. Logical size, lane scope, pool
+/// state, and current chunk owners are always checked by the consuming path.
+pub(super) struct ExactLeaseProjectionProof {
+    allocation: Arc<LogicalBackingSliceAllocationEvidence>,
+    segment_lease: Weak<BackingSegmentLease>,
+}
+
+impl ExactLeaseProjectionProof {
+    fn new(
+        evidence: &LogicalBackingSliceEvidence,
+        segment_lease: &Arc<BackingSegmentLease>,
+    ) -> Result<Self, VNextError> {
+        if segment_lease.owner_instance_id != evidence.pool_instance_id
+            || segment_lease.segment_generation != evidence.segment_generation
+            || segment_lease.size_bytes != evidence.physical_size_bytes
+            || segment_lease.claim_identity != evidence.physical_claim_identity
+            || !super::backing_segment_range_matches(
+                &segment_lease.segments,
+                evidence.physical_offset_bytes,
+                evidence.capacity_size_bytes,
+                &evidence.segments,
+            )?
+        {
+            return Err(invalid_resource(
+                "logical backing projection cannot be certified for its exact owned lease",
+            ));
+        }
+        Ok(Self {
+            allocation: Arc::clone(&evidence.allocation),
+            segment_lease: Arc::downgrade(segment_lease),
+        })
+    }
+
+    pub(super) fn matches(&self, authority: &LogicalBackingSliceAuthority) -> bool {
+        Arc::ptr_eq(&self.allocation, &authority.evidence.allocation)
+            && self.segment_lease.as_ptr() == Arc::as_ptr(&authority.segment_lease)
+    }
 }
 
 impl LogicalBackingSliceAuthority {
@@ -2144,6 +2196,7 @@ impl LogicalBackingSliceAuthority {
             evidence: self.evidence.clone(),
             segment_lease: Arc::clone(&self.segment_lease),
             reusable_lane: self.reusable_lane,
+            projection_proof: self.projection_proof.clone(),
         }
     }
 
@@ -2152,6 +2205,7 @@ impl LogicalBackingSliceAuthority {
             evidence: self.evidence.clone(),
             segment_lease: Arc::clone(&self.segment_lease),
             reusable_lane: Some(lane_id),
+            projection_proof: self.projection_proof.clone(),
         }
     }
 

@@ -324,8 +324,12 @@ fn retained_materialization_rechecks_current_chunk_generation_bounds_and_identit
 }
 
 #[test]
-fn first_materialization_still_checks_claim_membership_and_physical_projection() {
+fn legacy_first_materialization_still_checks_claim_membership_and_physical_projection() {
     let (harness, mut authority) = paged_window_fixture();
+    // Keep exercising the complete unproved validator. Certified authorities
+    // have separate allocation/lease/proof substitution tests; their proof
+    // deliberately prevents unique mutation of either immutable layout.
+    authority.projection_proof = None;
     let pools = &harness.root.dynamic_pools;
     let original_claim = authority.evidence.physical_claim_identity.clone();
     let different_claim = PhysicalBackingClaimIdentity::new(
@@ -367,4 +371,42 @@ fn first_materialization_still_checks_claim_membership_and_physical_projection()
         .segments[1] = original_segment;
     let backing = pools.view(&authority).unwrap();
     pools.revalidate_view(&authority, &backing).unwrap();
+}
+
+#[test]
+fn certified_materialization_rejects_replaced_later_page_and_allocation_ranges() {
+    let (harness, authority) = paged_window_fixture();
+    let pools = &harness.root.dynamic_pools;
+    assert!(authority.projection_proof.is_some());
+    for edit in [
+        (|allocation: &mut LogicalBackingSliceAllocationEvidence| {
+            let original = &allocation.segments[1];
+            allocation.segments[1] = BackingSegment::from_chunk(
+                original.pool_id(),
+                original.chunk_ordinal(),
+                original.chunk_generation(),
+                original.offset_bytes() + 1,
+                original.length_bytes() - 1,
+            )
+            .unwrap();
+        }) as fn(&mut LogicalBackingSliceAllocationEvidence),
+        |allocation| allocation.physical_offset_bytes += 1,
+        |allocation| allocation.capacity_size_bytes -= 1,
+    ] {
+        let mut allocation = super::segment_permit_tests::copy_allocation(&authority.evidence);
+        edit(&mut allocation);
+        let mut forged = authority.retained();
+        forged.evidence.allocation = Arc::new(allocation);
+        assert!(forged.projection_proof.is_some());
+        assert!(pools.view(&forged).is_err());
+        // The whole physical validator also rejects these geometries when an
+        // authority has no certificate. This preserves the old error boundary.
+        forged.projection_proof = None;
+        assert!(pools.view(&forged).is_err());
+    }
+    let backing = pools.view(&authority).unwrap();
+    pools.revalidate_view(&authority, &backing).unwrap();
+    drop(backing);
+    drop(authority);
+    close_dynamic_test_root(harness.root);
 }

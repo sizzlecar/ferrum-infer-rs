@@ -85,6 +85,185 @@ fn windows(expected: &[SegmentBackingExpectation]) -> Vec<SegmentBackingWindow> 
         .collect()
 }
 
+/// A forged immutable allocation must be a different Arc, rather than mutating
+/// the allocation that a published proof deliberately keeps immutable.
+pub(super) fn copy_allocation(
+    evidence: &LogicalBackingSliceEvidence,
+) -> LogicalBackingSliceAllocationEvidence {
+    LogicalBackingSliceAllocationEvidence {
+        domain_id: evidence.domain_id,
+        pool_id: evidence.pool_id.clone(),
+        resource_id: evidence.resource_id.clone(),
+        pool_instance_id: evidence.pool_instance_id,
+        physical_claim_identity: evidence.physical_claim_identity.clone(),
+        reusable_execution_bucket_id: evidence.reusable_execution_bucket_id.clone(),
+        segment_generation: evidence.segment_generation,
+        segments: evidence.segments.clone(),
+        physical_offset_bytes: evidence.physical_offset_bytes,
+        capacity_size_bytes: evidence.capacity_size_bytes,
+        physical_size_bytes: evidence.physical_size_bytes,
+        alignment_bytes: evidence.alignment_bytes,
+        usage: evidence.usage,
+        element_type: evidence.element_type,
+        storage_profile: evidence.storage_profile,
+        initialization: evidence.initialization,
+        fingerprint: evidence.fingerprint.clone(),
+    }
+}
+
+#[test]
+fn published_projection_proof_preserves_fresh_logical_sizes_and_lane_retention() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let original = &authorities[0];
+    let proof = original.projection_proof.as_ref().unwrap();
+    let lease_pins = Arc::strong_count(&original.segment_lease);
+    let cloned_proof = Arc::clone(proof);
+    assert_eq!(Arc::strong_count(&original.segment_lease), lease_pins);
+    drop(cloned_proof);
+    let lane = crate::vnext::ExecutionLaneId::mint().unwrap();
+    let mut current = original.retained_for_lane(lane);
+    assert!(Arc::ptr_eq(
+        current.projection_proof.as_ref().unwrap(),
+        proof,
+    ));
+    assert!(Arc::ptr_eq(
+        current.retained().projection_proof.as_ref().unwrap(),
+        proof,
+    ));
+    for logical_bytes in [32, 64] {
+        current.evidence.logical_size_bytes = logical_bytes;
+        let groups = [std::slice::from_ref(&current)];
+        let expected = expectations(&groups);
+        let requested = windows(&expected);
+        let batch = pools
+            .segment_backing_batch(&groups, &expected, &requested)
+            .unwrap();
+        let physical = batch.window(0).unwrap().physical_region(0).unwrap();
+        assert_eq!(physical.length_bytes(), logical_bytes);
+        assert_eq!(
+            physical
+                .borrowed_buffer_and_physical_range()
+                .2
+                .reusable_address_scope(),
+            Some(crate::vnext::DeviceReusableAddressScope::ExecutionLane(
+                lane
+            )),
+        );
+    }
+    for logical_bytes in [0, current.capacity_size_bytes() + 1] {
+        current.evidence.logical_size_bytes = logical_bytes;
+        let groups = [std::slice::from_ref(&current)];
+        let expected = expectations(&groups);
+        assert!(pools
+            .segment_backing_batch(&groups, &expected, &windows(&expected))
+            .is_err());
+    }
+    current.evidence.logical_size_bytes = 32;
+    let groups = [std::slice::from_ref(&current)];
+    let expected = expectations(&groups);
+    let mut requested = windows(&expected);
+    requested[0].length_bytes = 33;
+    assert!(pools
+        .segment_backing_batch(&groups, &expected, &requested)
+        .is_err());
+    drop(current);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn certified_segment_projection_rejects_other_allocation_lease_and_proof_owners() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let original = &authorities[0];
+    assert!(original.projection_proof.is_some());
+    let reject = |authority: &LogicalBackingSliceAuthority| {
+        let groups = [std::slice::from_ref(authority)];
+        let expected = expectations(&groups);
+        let error = match pools.segment_backing_batch(&groups, &expected, &windows(&expected)) {
+            Ok(_) => panic!("foreign projection proof was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("projection proof"));
+        for pool in pools.pools.values() {
+            assert!(pool.state.try_lock().is_ok());
+        }
+    };
+    let mut replaced = original.retained();
+    // Equal bytes and metadata do not prove the identity of an allocation.
+    replaced.evidence.allocation = Arc::new(copy_allocation(&original.evidence));
+    reject(&replaced);
+    replaced.evidence = original.evidence.clone();
+    replaced.projection_proof = authorities[1].projection_proof.clone();
+    reject(&replaced);
+    replaced.projection_proof = original.projection_proof.clone();
+
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 64)
+        .unwrap();
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let mut second = claim_size(pools, pool, 64);
+    // Keep a real independent lease and its correct release ranges. Alter only
+    // its generation temporarily to isolate exact lease identity from the
+    // fresh scalar generation check, then restore before releasing the claim.
+    second.projection_proof = None;
+    let generation = second.segment_lease.segment_generation;
+    Arc::get_mut(&mut second.segment_lease)
+        .unwrap()
+        .segment_generation = original.segment_lease.segment_generation;
+    replaced.segment_lease = Arc::clone(&second.segment_lease);
+    reject(&replaced);
+    drop(replaced);
+    Arc::get_mut(&mut second.segment_lease)
+        .unwrap()
+        .segment_generation = generation;
+    drop(second);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn uncertifiable_publication_keeps_full_projection_validation() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 64)
+        .unwrap();
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let request = evaluated_request(pool, 64);
+    let BackingPrepareDecision::Prepared(mut prepared) =
+        pools.prepare_claim(std::slice::from_ref(&request)).unwrap()
+    else {
+        panic!("resident test pool must prepare its exact physical claim")
+    };
+    let allocation = Arc::get_mut(&mut prepared.extents[0].projections[0].allocation).unwrap();
+    let segment = &allocation.segments[0];
+    allocation.segments[0] = BackingSegment::from_chunk(
+        segment.pool_id(),
+        segment.chunk_ordinal(),
+        segment.chunk_generation(),
+        segment.offset_bytes() + 1,
+        segment.length_bytes() - 1,
+    )
+    .unwrap();
+    let unproved = prepared.commit();
+    assert!(unproved[0].projection_proof.is_none());
+    let groups = [unproved.as_slice()];
+    let expected = expectations(&groups);
+    assert!(pools
+        .segment_backing_batch(&groups, &expected, &windows(&expected))
+        .is_err());
+    assert!(pools.view(&unproved[0]).is_err());
+    drop(unproved);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
+}
+
 #[test]
 fn segment_owner_identity_distinguishes_real_leases_and_retains_only_when_cloned() {
     // Two declared resources make the real initial chunk 128 bytes. Merely

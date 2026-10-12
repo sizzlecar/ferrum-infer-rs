@@ -2654,15 +2654,29 @@ where
                 "logical backing authority belongs to another dynamic pool instance",
             ));
         }
-        if !backing_segment_range_matches(
-            &authority.segment_lease.segments,
-            authority.evidence.physical_offset_bytes,
-            authority.evidence.capacity_size_bytes,
-            &authority.evidence.segments,
-        )? {
-            return Err(invalid_resource(
-                "logical backing projection differs from its shared physical extent",
-            ));
+        match &authority.projection_proof {
+            Some(proof) if !proof.matches(authority) => {
+                return Err(invalid_resource(
+                    "logical backing projection proof belongs to another allocation or lease",
+                ));
+            }
+            Some(_) => {
+                // Publication already checked this exact immutable allocation
+                // against this exact owned lease. The fresh identity/bounds
+                // checks above and current chunk checks below are unchanged.
+            }
+            None => {
+                if !backing_segment_range_matches(
+                    &authority.segment_lease.segments,
+                    authority.evidence.physical_offset_bytes,
+                    authority.evidence.capacity_size_bytes,
+                    &authority.evidence.segments,
+                )? {
+                    return Err(invalid_resource(
+                        "logical backing projection differs from its shared physical extent",
+                    ));
+                }
+            }
         }
         Ok(())
     }
