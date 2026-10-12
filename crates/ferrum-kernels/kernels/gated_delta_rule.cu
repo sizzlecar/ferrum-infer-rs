@@ -1307,6 +1307,46 @@ extern "C" __global__ void vnext_gated_delta_varlen_tiled16_interleaved_f32_indi
       scale);
 }
 
+// Same F32 arithmetic and tile geometry as the existing key128 branch, but
+// this entry never references the generic fallback's shared reduction arrays.
+// State ownership and both pointer slots remain the caller's current binding
+// contract; recurrent state uses the existing odd slot in place.
+extern "C" __global__ void vnext_gated_delta_varlen_key128_interleaved_f32_indirect(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const unsigned long long* __restrict__ state_bindings,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  if (key_dim != 128 || value_dim != 128 || blockDim.x != 256 ||
+      blockDim.y != 1 || blockDim.z != 1 || key_heads <= 0 ||
+      value_heads <= 0 || value_heads % key_heads != 0) {
+    return;
+  }
+  const int value_head = blockIdx.y;
+  const int seq = blockIdx.z;
+  if (value_head >= value_heads || seq >= batch) return;
+
+  const int token_start = static_cast<int>(cu_seqlens[seq]);
+  const int token_end = static_cast<int>(cu_seqlens[seq + 1]);
+  if (token_start < 0 || token_end <= token_start || token_end > total_tokens) {
+    return;
+  }
+  float* state = reinterpret_cast<float*>(state_bindings[seq * 2 + 1]);
+  recurrent_gated_delta_rule_varlen_warp128_f32<true>(
+      query, key, value, g, beta, state, state, out,
+      token_start, token_end, key_heads, value_heads, value_dim, scale);
+}
+
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_state_f16(
     const float* __restrict__ query,
     const float* __restrict__ key,

@@ -83,6 +83,8 @@ const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f3
 const DELTA_INTERLEAVED_FUNCTION: &str = "vnext_gated_delta_varlen_interleaved_f32_indirect";
 const DELTA_TILED_INTERLEAVED_FUNCTION: &str =
     "vnext_gated_delta_varlen_tiled16_interleaved_f32_indirect";
+const DELTA_KEY128_INTERLEAVED_FUNCTION: &str =
+    "vnext_gated_delta_varlen_key128_interleaved_f32_indirect";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 #[cfg(feature = "vllm-marlin")]
@@ -117,6 +119,7 @@ struct AttentionFunctions {
     delta_tiled: CudaFunction,
     delta_interleaved: CudaFunction,
     delta_tiled_interleaved: CudaFunction,
+    delta_key128_interleaved: CudaFunction,
     gated_norm: CudaFunction,
     f32_to_f16: CudaFunction,
     residual_add: CudaFunction,
@@ -435,6 +438,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 &delta_module,
                 DELTA_TILED_INTERLEAVED_FUNCTION,
                 "attention tiled interleaved delta",
+            )?,
+            delta_key128_interleaved: load_function(
+                &delta_module,
+                DELTA_KEY128_INTERLEAVED_FUNCTION,
+                "attention key128 delta",
             )?,
             gated_norm: load_function(&linear_module, GATED_NORM_FUNCTION, "attention gated norm")?,
             f32_to_f16: load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?,
@@ -3265,7 +3273,11 @@ fn launch_delta(
         (true, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta_tiled,
         (false, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => &functions.delta_interleaved,
         (true, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
-            &functions.delta_tiled_interleaved
+            if shape.key_head_dim == 128 && shape.value_head_dim == 128 {
+                &functions.delta_key128_interleaved
+            } else {
+                &functions.delta_tiled_interleaved
+            }
         }
     };
     let pointers = [
@@ -4243,6 +4255,10 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 mod projection_stitch_tests;
 #[cfg(test)]
 mod recurrent_tests;
+
+#[cfg(test)]
+#[path = "attention/gdn_key128_occupancy_gpu_tests.rs"]
+mod gdn_key128_occupancy_gpu_tests;
 
 #[cfg(test)]
 mod tests {
