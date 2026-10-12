@@ -1,13 +1,14 @@
 //! Actual multi-pool admission, replacement and whole-segment failure boundaries.
 use super::*;
 use crate::vnext::{
-    DeviceSubmissionStage, DeviceSubmissionTimingSink, SubmissionWaveDispatchStage,
-    SubmissionWaveDispatchTimingSink,
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, SegmentBackingMaterializationObservation,
+    SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink,
 };
 
 struct PermitTiming<F> {
     before_record: F,
     stages: Mutex<Vec<SubmissionWaveDispatchStage>>,
+    materialization: Mutex<Vec<SegmentBackingMaterializationObservation>>,
 }
 
 impl<F: Fn() + Send + Sync> DeviceSubmissionTimingSink for PermitTiming<F> {
@@ -19,6 +20,14 @@ impl<F: Fn() + Send + Sync> DeviceSubmissionTimingSink for PermitTiming<F> {
 }
 
 impl<F: Fn() + Send + Sync> SubmissionWaveDispatchTimingSink for PermitTiming<F> {
+    fn record_segment_backing_materialization(
+        &self,
+        observation: SegmentBackingMaterializationObservation,
+    ) {
+        (self.before_record)();
+        self.materialization.lock().unwrap().push(observation);
+    }
+
     fn record(&self, stage: SubmissionWaveDispatchStage, _: std::time::Duration) {
         (self.before_record)();
         self.stages.lock().unwrap().push(stage);
@@ -198,11 +207,19 @@ fn segment_permit_timing_flushes_after_two_pool_unlock_and_preserves_views() {
             }
         },
         stages: Mutex::new(Vec::new()),
+        materialization: Mutex::new(Vec::new()),
     };
     let queries = harness.runtime.descriptor_queries.load(Ordering::Acquire);
     let batch = pools
         .segment_backing_batch_with_timing(&groups, &expected, &requested, &sink)
         .unwrap();
+    let observation = sink.materialization.lock().unwrap()[0];
+    assert!(observation.complete);
+    assert_eq!(observation.unique_authority_groups, 2);
+    assert_eq!(observation.segment_bindings, 2);
+    assert_eq!(observation.unique_lease_chunk_scope_owners, 2);
+    assert_eq!(observation.sampled_bindings, 1);
+    assert!(observation.sampled_materialization_ns.is_some());
     for (index, group) in groups.iter().enumerate() {
         let original = pools.view(&group[0]).unwrap();
         let region = batch
@@ -268,11 +285,15 @@ fn segment_permit_timing_error_flush_releases_partial_retention_and_marks_entere
             );
         },
         stages: Mutex::new(Vec::new()),
+        materialization: Mutex::new(Vec::new()),
     };
     second.state.lock().unwrap().poisoned = true;
     assert!(pools
         .segment_backing_batch_with_timing(&groups, &expected, &requested, &sink)
         .is_err());
+    let observation = sink.materialization.lock().unwrap()[0];
+    assert!(!observation.complete);
+    assert_eq!(observation.segment_bindings, 1);
     let stages = std::mem::take(&mut *sink.stages.lock().unwrap());
     assert_eq!(
         stages.last(),
@@ -293,6 +314,7 @@ fn segment_permit_timing_error_flush_releases_partial_retention_and_marks_entere
 
     // A poisoned second mutex aborts collect after acquiring the first mutex.
     // The partial guard vector must be destroyed before any observer callback.
+    let observations_before_poison = sink.materialization.lock().unwrap().len();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guard = second.state.lock().unwrap();
         panic!("poison the second real pool mutex");
@@ -309,9 +331,125 @@ fn segment_permit_timing_error_flush_releases_partial_retention_and_marks_entere
             SubmissionWaveDispatchStage::SegmentBackingLockAcquisition,
         ]
     );
+    assert_eq!(
+        sink.materialization.lock().unwrap().len(),
+        observations_before_poison,
+        "a failed lock acquisition must leave materialization unavailable"
+    );
     second.state.clear_poison();
     drop(sink);
     drop(chunk);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
+}
+
+pub(super) fn assert_shared_step_materialization<R: DeviceRuntime>(
+    pools: &DynamicPoolSet<R>,
+    authorities: &[LogicalBackingSliceAuthority],
+) {
+    let groups = authorities
+        .iter()
+        .map(std::slice::from_ref)
+        .collect::<Vec<_>>();
+    let expected = expectations(&groups);
+    let sink = PermitTiming {
+        before_record: || {
+            for pool in pools.pools.values() {
+                assert!(pool.state.try_lock().is_ok());
+            }
+        },
+        stages: Mutex::new(Vec::new()),
+        materialization: Mutex::new(Vec::new()),
+    };
+    let batch = pools
+        .segment_backing_batch_with_timing(&groups, &expected, &windows(&expected), &sink)
+        .unwrap();
+    let observation = sink.materialization.lock().unwrap()[0];
+    assert!(observation.complete);
+    assert_eq!(observation.unique_authority_groups, 2);
+    assert_eq!(observation.segment_bindings, 2);
+    assert_eq!(observation.unique_lease_chunk_scope_owners, 1);
+    assert_eq!(observation.owner_tuple_group_pairs, 2);
+    assert_eq!(observation.unique_owner_segment_ranges, 1);
+    assert!(batch.bindings()[0]
+        .retention_ref()
+        .same_owners(batch.bindings()[1].retention_ref()));
+}
+
+#[test]
+fn materialization_counts_exact_leases_and_lane_scopes_on_same_current_buffer() {
+    // Two declared resources make 128 bytes actually resident, allowing two
+    // independent 64-byte leases to use the same current backing buffer.
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        2,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pools = &harness.root.dynamic_pools;
+    let authorities = vec![claim_size(pools, &pools.pools[&harness.pool_ids[0]], 64)];
+    let original = &authorities[0];
+    let cloned = original.retained();
+    let first_lane = crate::vnext::ExecutionLaneId::mint().unwrap();
+    let second_lane = crate::vnext::ExecutionLaneId::mint().unwrap();
+    let lane_one = original.retained_for_lane(first_lane);
+    let lane_one_clone = lane_one.retained();
+    let lane_two = original.retained_for_lane(second_lane);
+    let independent = claim_size(pools, &pools.pools[&harness.pool_ids[0]], 64);
+    let groups = [
+        original,
+        &cloned,
+        &lane_one,
+        &lane_one_clone,
+        &lane_two,
+        &independent,
+    ]
+    .map(std::slice::from_ref);
+    let expected = expectations(&groups);
+    let sink = PermitTiming {
+        before_record: || {
+            for pool in pools.pools.values() {
+                assert!(pool.state.try_lock().is_ok());
+            }
+        },
+        stages: Mutex::new(Vec::new()),
+        materialization: Mutex::new(Vec::new()),
+    };
+    let batch = pools
+        .segment_backing_batch_with_timing(&groups, &expected, &windows(&expected), &sink)
+        .unwrap();
+    let observation = sink.materialization.lock().unwrap()[0];
+    assert_eq!(observation.unique_authority_groups, 6);
+    assert_eq!(observation.segment_bindings, 6);
+    assert_eq!(observation.unique_lease_chunk_scope_owners, 4);
+    assert_eq!(observation.owner_tuple_group_pairs, 6);
+    assert_eq!(observation.unique_owner_segment_ranges, 4);
+    assert!(std::ptr::eq(
+        batch.bindings()[0].buffer(),
+        batch.bindings()[5].buffer()
+    ));
+    assert!(!batch.bindings()[0]
+        .retention_ref()
+        .same_owners(batch.bindings()[5].retention_ref()));
+    assert!(batch.bindings()[2]
+        .retention_ref()
+        .same_owners(batch.bindings()[3].retention_ref()));
+    drop(batch);
+    drop(sink);
+    drop(independent);
+    drop(lane_two);
+    drop(lane_one_clone);
+    drop(lane_one);
+    drop(cloned);
     drop(authorities);
     close_dynamic_test_root(harness.root);
 }
@@ -492,9 +630,20 @@ fn segment_permit_returns_current_arc_and_retains_it_after_unlock() {
         .insert(ordinal, replacement);
     let groups = [std::slice::from_ref(&authorities[0])];
     let expected = expectations(&groups);
+    let sink = PermitTiming {
+        before_record: || {
+            assert!(pool.state.try_lock().is_ok());
+        },
+        stages: Mutex::new(Vec::new()),
+        materialization: Mutex::new(Vec::new()),
+    };
     let batch = pools
-        .segment_backing_batch(&groups, &expected, &windows(&expected))
+        .segment_backing_batch_with_timing(&groups, &expected, &windows(&expected), &sink)
         .unwrap();
+    assert_eq!(
+        sink.materialization.lock().unwrap()[0].unique_lease_chunk_scope_owners,
+        1
+    );
     assert!(Arc::ptr_eq(
         &batch.bindings()[0].chunk,
         &replacement_probe.upgrade().unwrap()
@@ -533,6 +682,7 @@ fn segment_permit_returns_current_arc_and_retains_it_after_unlock() {
         .chunks
         .insert(ordinal, replacement);
     pool.state.lock().unwrap().chunks.insert(ordinal, original);
+    drop(sink);
     drop(old_view);
     drop(authorities);
     drop(donor_authorities);

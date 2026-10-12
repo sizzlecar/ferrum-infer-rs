@@ -115,6 +115,7 @@ struct AttemptRecord {
     disposition: Disposition,
     incomplete_declarations: bool,
     core_preparation: InvocationPreparationStats,
+    segment_backing_materialization: Option<SegmentBackingMaterializationObservation>,
     outcome: Outcome,
     provider_encode_submit_ns: Option<u64>,
     provider_node_encode_ns: Option<u64>,
@@ -349,6 +350,7 @@ pub(super) struct AttemptObservation<'a, T> {
     catalog_epoch: Option<u64>,
     catalog_miss: Option<VNextReusableExecutionCatalogMissReason>,
     provider_ns: ObservationCell<u64>,
+    materialization: ObservationCell<SegmentBackingMaterializationObservation>,
     enqueue_ns: ObservationCell<u64>,
     preparation: ObservationCell<BackendPreparation>,
     gaps: ObservationCell<ProgramGaps>,
@@ -371,6 +373,7 @@ impl<'a, T> AttemptObservation<'a, T> {
             catalog_epoch,
             catalog_miss,
             provider_ns: ObservationCell::new(),
+            materialization: ObservationCell::new(),
             enqueue_ns: ObservationCell::new(),
             preparation: ObservationCell::new(),
             gaps: ObservationCell::new(),
@@ -401,6 +404,7 @@ impl<'a, T> AttemptObservation<'a, T> {
             disposition: disposition(stats, outcome),
             incomplete_declarations: stats.segment_incomplete_declarations != 0,
             core_preparation: stats,
+            segment_backing_materialization: self.materialization.into_inner(),
             outcome,
             provider_encode_submit_ns: provider_encode_submit.map(duration_ns),
             provider_node_encode_ns: self.provider_ns.into_inner(),
@@ -476,6 +480,17 @@ impl<T: DeviceSubmissionTimingSink> DeviceSubmissionTimingSink for AttemptObserv
 impl<T: SubmissionWaveDispatchTimingSink> SubmissionWaveDispatchTimingSink
     for AttemptObservation<'_, T>
 {
+    fn record_segment_backing_materialization(
+        &self,
+        observation: SegmentBackingMaterializationObservation,
+    ) {
+        if T::ENABLED {
+            self.timing
+                .record_segment_backing_materialization(observation);
+            self.set(&self.materialization, observation);
+        }
+    }
+
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         self.timing.record(stage, elapsed);
         if T::ENABLED && stage == SubmissionWaveDispatchStage::ProviderNodeEncode {

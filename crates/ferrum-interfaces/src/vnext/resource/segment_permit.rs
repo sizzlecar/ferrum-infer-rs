@@ -13,7 +13,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use crate::vnext::{SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink};
+use crate::vnext::{
+    SegmentBackingMaterializationObservation, SubmissionWaveDispatchStage,
+    SubmissionWaveDispatchTimingSink,
+};
+
+mod materialization;
+use materialization::MaterializationDiagnostics;
 
 /// Durations only while pool guards exist. Declare this before retained results
 /// and guards: ordinary errors flush after both have dropped, while unwinding
@@ -23,6 +29,7 @@ struct SegmentBackingTimings<'a, S: SubmissionWaveDispatchTimingSink> {
     elapsed: [Option<Duration>; 4],
     active: usize,
     started: Option<Instant>,
+    materialization: Option<SegmentBackingMaterializationObservation>,
 }
 
 impl<'a, S: SubmissionWaveDispatchTimingSink> SegmentBackingTimings<'a, S> {
@@ -40,6 +47,7 @@ impl<'a, S: SubmissionWaveDispatchTimingSink> SegmentBackingTimings<'a, S> {
             elapsed: [None; 4],
             active: 0,
             started: S::ENABLED.then(Instant::now),
+            materialization: None,
         }
     }
 
@@ -70,6 +78,10 @@ impl<S: SubmissionWaveDispatchTimingSink> Drop for SegmentBackingTimings<'_, S> 
                     self.sink.record(stage, elapsed);
                 }
             }
+            if let Some(observation) = self.materialization.take() {
+                self.sink
+                    .record_segment_backing_materialization(observation);
+            }
         }
     }
 }
@@ -91,6 +103,17 @@ mod timing_tests {
     }
 
     impl<const ENABLED: bool> SubmissionWaveDispatchTimingSink for Sink<ENABLED> {
+        fn record_segment_backing_materialization(
+            &self,
+            _: SegmentBackingMaterializationObservation,
+        ) {
+            assert!(
+                ENABLED,
+                "disabled materialization observer cannot be called"
+            );
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
         fn record(&self, _: SubmissionWaveDispatchStage, _: Duration) {
             assert!(ENABLED, "disabled sink cannot be called");
             self.0.fetch_add(1, Ordering::Relaxed);
@@ -113,6 +136,18 @@ mod timing_tests {
         assert!(std::panic::catch_unwind(|| {
             let mut timing = SegmentBackingTimings::new(&enabled);
             timing.next();
+            timing.materialization = Some(SegmentBackingMaterializationObservation {
+                complete: false,
+                unique_authority_groups: 0,
+                segment_bindings: 0,
+                unique_lease_chunk_scope_owners: 0,
+                owner_tuple_group_pairs: 0,
+                unique_owner_segment_ranges: 0,
+                sampling_stride: SegmentBackingMaterializationObservation::SAMPLING_STRIDE,
+                sampled_bindings: 0,
+                sampled_materialization_ns: None,
+                diagnostic_counting_ns: 0,
+            });
             panic!("diagnostic observers must not flush during unwinding");
         })
         .is_err());
@@ -743,6 +778,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                     .ok_or_else(|| invalid_resource("segment authority has no dynamic pool"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut materialization = MaterializationDiagnostics::new::<S>(segment_count);
         timings.next();
         let guards = pools
             .iter()
@@ -754,7 +790,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
             .collect::<Result<Vec<_>, _>>()?;
         timings.next();
         let checked = (|| {
-            for group in &unique_groups {
+            for (group_index, group) in unique_groups.iter().enumerate() {
                 let first = &group[0];
                 let pool_index = pools
                     .binary_search_by(|(id, _)| id.cmp(&first.evidence.pool_id))
@@ -815,6 +851,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                                 "logical backing references a stale or out-of-bounds chunk region",
                             ));
                         }
+                        let sampled = materialization.begin_sample::<S>(result.bindings.len());
                         let retention = match authority.reusable_lane {
                             Some(lane) => DeviceBufferRetention::lane_pair(
                                 lane,
@@ -831,6 +868,13 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                             chunk: Arc::clone(&chunk.backing),
                             retention,
                         });
+                        materialization.finish_sample(sampled);
+                        materialization.record::<S, _>(
+                            group_index,
+                            authority,
+                            &chunk.backing,
+                            segment,
+                        );
                     }
                 }
                 summaries.push((logical, capacity, start..result.bindings.len()));
@@ -943,6 +987,10 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         // flushed only after guard release, on both success and ordinary Err.
         timings.finish();
         drop(guards);
+        // Strong lease/current-chunk owners still reside in result.bindings
+        // while private keys are counted. The receipt is flushed by timings
+        // after partial result cleanup on Err, and never during unwinding.
+        timings.materialization = materialization.finish::<S>(unique_groups.len(), checked.is_ok());
         checked?;
         Ok(result)
     }
