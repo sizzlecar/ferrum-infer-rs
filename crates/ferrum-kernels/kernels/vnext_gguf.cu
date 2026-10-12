@@ -247,6 +247,21 @@ NATIVE_Q8_0_LINEAR(f16, 1)
 NATIVE_Q8_0_LINEAR(tiled_f16, 8)
 #undef NATIVE_Q8_0_LINEAR
 
+// Diagnostic-only pair launch. Each CTA selects one original matrix and calls
+// the unchanged T1 body, preserving its K order and warp reduction exactly.
+// Launch (max(ceil(outputs0/4), ceil(outputs1/4)), rows, 2) with 128 threads.
+// The caller retains both weights/input/output and validates disjoint output
+// windows; this raw kernel does not establish allocation or owner authority.
+extern "C" __global__ void vnext_gguf_linear_q8_0_pair_f16(
+    const half* x, const byte* w0, const byte* w1, half* y,
+    unsigned rows, unsigned inputs, unsigned outputs0, unsigned outputs1,
+    unsigned stride, unsigned offset0, unsigned offset1) {
+    if (inputs % 32 != 0 || blockIdx.z >= 2) return;
+    const bool second = blockIdx.z == 1;
+    native_q8_0_linear<1>(x, second ? w1 : w0, y, rows, inputs,
+        second ? outputs1 : outputs0, stride, second ? offset1 : offset0);
+}
+
 // Fix a 256-value block's format and byte stride without changing reconstructed
 // F32 coefficients, each lane's K order, or the final warp reduction. Byte-safe
 // coefficient loads preserve odd-offset views. F32 operands remain F32: the
