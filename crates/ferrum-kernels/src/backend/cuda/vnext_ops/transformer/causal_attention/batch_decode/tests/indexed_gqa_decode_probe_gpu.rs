@@ -25,6 +25,8 @@ const PARTITIONS: usize = 16;
 const BLOCK_HALF: usize = 2 * KV_HEADS * DIM * 16;
 const GUARDS: usize = 8;
 const LAYERS: usize = 16;
+// Human-readable experimental schedule identity, not a correctness condition.
+const PROBE_VARIANT: &str = "qk_group8_r2";
 const LENGTH_CASES: [usize; 8] = [16, 17, 511, 512, 513, 1024, 1025, 2048];
 // Declared before running either arm. All output elements are checked, using
 // absolute tolerance near zero and relative tolerance elsewhere.
@@ -792,7 +794,12 @@ fn indexed_gqa_full_output_oracle_and_complete_bundle_gate() {
                 ended.synchronize().unwrap();
                 let gpu_ms = f64::from(started.elapsed_ms(&ended).unwrap()) / 64.0;
                 let host_ms = wall.elapsed().as_secs_f64() * 1000.0 / 64.0;
-                eprintln!("indexed_gqa_bundle owners={owners} layers={LAYERS} arm={} repeat={repeat} iterations=64 gpu_ms={gpu_ms:.9} host_ms={host_ms:.9} includes=gather,attention_partitions,reduce,output_gate,control_query_cast precision_candidate=F32Q_F16KV_F32out precision_control=F16Q_F16KV_F16context_F32gate",
+                let includes = if candidate_arm {
+                    "indexed_gather,partial128,reduce_f32,output_gate_f32"
+                } else {
+                    "indexed_gather,query_cast_f32_to_f16,indexed_v1,indexed_v2,native_v2_reduce,output_gate_f16_to_f32"
+                };
+                eprintln!("indexed_gqa_bundle kernel_variant={PROBE_VARIANT} owners={owners} layers={LAYERS} arm={} repeat={repeat} iterations=64 gpu_ms={gpu_ms:.9} host_ms={host_ms:.9} includes={includes} precision_candidate=F32Q_F16KV_F32out precision_control=F16Q_F16KV_F16context_F32gate",
                     if candidate_arm { "candidate" } else { "control" });
                 if candidate_arm {
                     candidate_ms.push(gpu_ms);
@@ -825,7 +832,7 @@ fn indexed_gqa_full_output_oracle_and_complete_bundle_gate() {
         candidate_ms.sort_by(f64::total_cmp);
         let faster = candidate_ms[1] < control_ms[1];
         let budget = owners != 32 || candidate_ms[1] <= 1.05;
-        eprintln!("indexed_gqa_native_gate owners={owners} layers={LAYERS} control_median_ms={:.9} candidate_median_ms={:.9} faster={faster} m32_budget_ms=1.05 budget_pass={budget} whole_model_tps_claim=false", control_ms[1], candidate_ms[1]);
+        eprintln!("indexed_gqa_native_gate kernel_variant={PROBE_VARIANT} owners={owners} layers={LAYERS} control_median_ms={:.9} candidate_median_ms={:.9} faster={faster} m32_budget_ms=1.05 budget_pass={budget} whole_model_tps_claim=false", control_ms[1], candidate_ms[1]);
         gate_results.push((owners, faster, budget));
     }
     // A measured timing outcome is a benchmark fact, not a unit-test contract.
@@ -833,5 +840,5 @@ fn indexed_gqa_full_output_oracle_and_complete_bundle_gate() {
     let gate_failed = gate_results
         .iter()
         .any(|(_, faster, budget)| !*faster || !*budget);
-    eprintln!("indexed_gqa_native_result gate_failed={gate_failed} observations={gate_results:?} whole_model_tps_claim=false");
+    eprintln!("indexed_gqa_native_result kernel_variant={PROBE_VARIANT} gate_failed={gate_failed} observations={gate_results:?} whole_model_tps_claim=false");
 }

@@ -114,11 +114,18 @@ extern "C" __global__ void indexed_gqa_decode_f32_query_f16_kv_h256_gqa6_partial
     const int query_head = kv_head * QUERY_GROUP + warp;
     const float* q = query + static_cast<size_t>(original_row) * query_stride +
         static_cast<size_t>(query_head) * HEAD;
-    float q_registers[HEAD / 32];
+    const int dot_lane = lane % 8;
+    const int token_group = lane / 8;
+    // Four 8-thread groups compute four tokens concurrently for this head.
+    // Each group retains the same query, partition and physical K/V owner.
+    float q_registers[HEAD / 8];
     float numerator[HEAD / 32];
     #pragma unroll
+    for (int item = 0; item < HEAD / 8; ++item) {
+        q_registers[item] = q[dot_lane + item * 8];
+    }
+    #pragma unroll
     for (int item = 0; item < HEAD / 32; ++item) {
-        q_registers[item] = q[lane + item * 32];
         numerator[item] = 0.0f;
     }
     float running_max = -FLT_MAX;
@@ -162,14 +169,33 @@ extern "C" __global__ void indexed_gqa_decode_f32_query_f16_kv_h256_gqa6_partial
         }
         __syncthreads();
         #pragma unroll
-        for (int token = 0; token < BLOCK_TOKENS; ++token) {
-            float dot = 0.0f;
+        for (int round = 0; round < BLOCK_TOKENS / 4; ++round) {
+            const int token = round * 4 + token_group;
+            // Independent chains keep the 32 features per thread from
+            // becoming one long FMA dependency before the group reduction.
+            float dot0 = 0.0f;
+            float dot1 = 0.0f;
+            float dot2 = 0.0f;
+            float dot3 = 0.0f;
             #pragma unroll
             for (int item = 0; item < HEAD / 32; ++item) {
-                dot = fmaf(q_registers[item], tile_key[token][lane + item * 32], dot);
+                dot0 = fmaf(q_registers[item],
+                    tile_key[token][dot_lane + item * 8], dot0);
+                dot1 = fmaf(q_registers[item + 8],
+                    tile_key[token][dot_lane + (item + 8) * 8], dot1);
+                dot2 = fmaf(q_registers[item + 16],
+                    tile_key[token][dot_lane + (item + 16) * 8], dot2);
+                dot3 = fmaf(q_registers[item + 24],
+                    tile_key[token][dot_lane + (item + 24) * 8], dot3);
             }
-            dot = warp_sum(dot);
-            if (lane == 0) {
+            float dot = (dot0 + dot1) + (dot2 + dot3);
+            #pragma unroll
+            for (int delta = 4; delta > 0; delta >>= 1) {
+                // All 32 lanes participate; width8 isolates the four token
+                // groups while preserving the full active-warp mask.
+                dot += __shfl_xor_sync(0xffffffffu, dot, delta, 8);
+            }
+            if (dot_lane == 0) {
                 logits[warp][token] = token < live_tokens ? dot * scale : -FLT_MAX;
             }
         }
