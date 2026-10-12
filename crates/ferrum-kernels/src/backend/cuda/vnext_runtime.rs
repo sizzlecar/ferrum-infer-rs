@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -28,20 +29,20 @@ use ferrum_interfaces::vnext::{
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
-    DeviceNativeWorkAttribution, DeviceProgramBindingUploadSnapshot,
-    DeviceReplayedLogicalCommandAttribution, DeviceReplayedSegmentAttribution,
-    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
-    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
-    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionTrim, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
-    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
-    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
-    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, RetainedHostMemoryRegion,
-    StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, VNextError,
-    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
-    HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceNativeWorkAttribution, DeviceProgramBindingUploadSnapshot, DeviceReadbackBatchOutcome,
+    DeviceReadbackPiece, DeviceReadbackPieceOutput, DeviceReplayedLogicalCommandAttribution,
+    DeviceReplayedSegmentAttribution, DeviceReusableAddressScope, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionInvocation, DeviceReusableExecutionObservation,
+    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGapReason,
+    DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
+    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ProgramBindingNodeBinding, RetainedHostMemoryRegion, StaticWeightTransformPlan,
+    StaticWeightTransformRequest, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
+    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
 
@@ -60,6 +61,15 @@ pub(crate) use segment_owners::{CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, 
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+thread_local! {
+    // Only the affected native Rust test observes the actual CUDA call sites.
+    // These counters do not exist in a product binary.
+    static BATCH_READBACK_TEST_CALLS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
 
 struct CudaSubmissionStageTimer<'sink, S>
 where
@@ -191,6 +201,23 @@ pub struct CudaDeviceBuffer {
     descriptor: BufferDescriptor,
     runtime_instance: u64,
     allocation: Arc<CudaAllocation>,
+}
+
+/// Validated scalar copy geometry. Ownership stays in the borrowed input and
+/// the enclosing completion; this plan is never retained across a readback.
+#[derive(Clone, Copy)]
+struct CudaReadbackPiecePlan {
+    source_end: u64,
+    device_ptr: u64,
+    output_bytes: usize,
+    output_start: usize,
+    output_end: usize,
+}
+
+impl CudaReadbackPiecePlan {
+    fn is_complete_output(&self) -> bool {
+        self.output_start == 0 && self.output_end == self.output_bytes
+    }
 }
 
 impl fmt::Debug for CudaDeviceBuffer {
@@ -3315,6 +3342,59 @@ impl CudaDeviceRuntime {
         Ok(())
     }
 
+    fn readback_piece_plan(
+        &self,
+        piece: &DeviceReadbackPiece<'_, CudaDeviceBuffer>,
+    ) -> Result<CudaReadbackPiecePlan, CudaDeviceRuntimeError> {
+        let source = piece.source();
+        let region = piece.region();
+        let output_layout = piece.output_layout();
+        self.validate_buffer(source)?;
+        if output_layout.element_type() != source.descriptor.element_type {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA readback layout differs from source element type",
+            ));
+        }
+        let output_bytes = output_layout
+            .byte_len()
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        let source_end = checked_end(
+            region.source_offset_bytes(),
+            region.length_bytes(),
+            source
+                .descriptor
+                .size_bytes
+                .min(source.allocation.requested_bytes),
+            "CUDA readback source",
+        )?;
+        if source_end == region.source_offset_bytes() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA readback source is empty",
+            ));
+        }
+        let output_end = checked_end(
+            region.destination_offset_bytes(),
+            region.length_bytes(),
+            output_bytes,
+            "CUDA readback output",
+        )?;
+        let device_ptr = source
+            .allocation
+            .aligned_ptr
+            .checked_add(region.source_offset_bytes())
+            .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA buffer pointer overflow"))?;
+        Ok(CudaReadbackPiecePlan {
+            source_end,
+            device_ptr,
+            output_bytes: checked_usize(output_bytes, "CUDA readback output")?,
+            output_start: checked_usize(
+                region.destination_offset_bytes(),
+                "CUDA readback output offset",
+            )?,
+            output_end: checked_usize(output_end, "CUDA readback output end")?,
+        })
+    }
+
     fn validate_stream(&self, stream: &CudaDeviceStream) -> Result<(), CudaDeviceRuntimeError> {
         if stream.runtime_instance != self.runtime_instance {
             return Err(CudaDeviceRuntimeError::contract(
@@ -5681,6 +5761,138 @@ impl DeviceRuntime for CudaDeviceRuntime {
         Ok(output)
     }
 
+    fn readback_batch(
+        &self,
+        stream: &mut Self::Stream,
+        pieces: &[DeviceReadbackPiece<'_, Self::Buffer>],
+    ) -> DeviceReadbackBatchOutcome<Self::Error> {
+        let mut completed = Vec::new();
+        let result = catch_unwind(AssertUnwindSafe(
+            || -> Result<(), CudaDeviceRuntimeError> {
+                self.validate_stream(stream)?;
+                if pieces.is_empty() {
+                    return Ok(());
+                }
+                // Validate the first input before waiting, just as the single-copy
+                // API does. The caller holds one lane guard throughout this call.
+                let mut first = self.readback_piece_plan(&pieces[0])?;
+                // Waiting the original fence is not a substitute for synchronizing
+                // the stream tail. Later lane work may have preceded this guard.
+                #[cfg(test)]
+                BATCH_READBACK_TEST_CALLS.with(|calls| {
+                    let (sync, copy) = calls.get();
+                    calls.set((sync + 1, copy));
+                });
+                self.synchronize(stream)?;
+                let mut input = 0usize;
+                while input < pieces.len() {
+                    let mut run_end = input + 1;
+                    let mut total_bytes = first.output_bytes;
+                    let mut source_end = first.source_end;
+                    let mut plans = vec![first];
+                    if plans[0].is_complete_output() {
+                        while let Some(next) = pieces.get(run_end) {
+                            if !std::ptr::eq(pieces[input].source(), next.source())
+                                || next.output_layout().element_type()
+                                    != pieces[input].output_layout().element_type()
+                                || next.region().source_offset_bytes() != source_end
+                            {
+                                break;
+                            }
+                            // A bad later input must not erase the successful
+                            // prefix. Finish this valid run before reporting it.
+                            let Ok(plan) = self.readback_piece_plan(next) else {
+                                break;
+                            };
+                            if !plan.is_complete_output() {
+                                break;
+                            }
+                            total_bytes =
+                                total_bytes.checked_add(plan.output_bytes).ok_or_else(|| {
+                                    CudaDeviceRuntimeError::contract(
+                                        "CUDA batch readback output overflows",
+                                    )
+                                })?;
+                            source_end = plan.source_end;
+                            plans.push(plan);
+                            run_end += 1;
+                        }
+                    }
+                    let mut output = Vec::new();
+                    output.try_reserve_exact(total_bytes).map_err(|_| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA batch readback host allocation failed",
+                        )
+                    })?;
+                    output.resize(total_bytes, 0u8);
+                    let target = if plans.len() == 1 {
+                        plans[0].output_start..plans[0].output_end
+                    } else {
+                        0..total_bytes
+                    };
+                    // Every merged input is a separately validated full output;
+                    // equal raw addresses never merge distinct buffer facades.
+                    #[cfg(test)]
+                    BATCH_READBACK_TEST_CALLS.with(|calls| {
+                        let (sync, copy) = calls.get();
+                        calls.set((sync, copy + 1));
+                    });
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtoh_sync(
+                            &mut output[target],
+                            plans[0].device_ptr,
+                        )
+                    }
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("batch host readback", error)
+                    })?;
+                    if plans.len() == 1 {
+                        completed.push(DeviceReadbackPieceOutput {
+                            input_index: input,
+                            bytes: output,
+                        });
+                    } else {
+                        let mut offset = 0usize;
+                        for (local, plan) in plans.into_iter().enumerate() {
+                            let end = offset + plan.output_bytes;
+                            let mut bytes = Vec::new();
+                            bytes.try_reserve_exact(plan.output_bytes).map_err(|_| {
+                                CudaDeviceRuntimeError::contract(
+                                    "CUDA batch readback split allocation failed",
+                                )
+                            })?;
+                            bytes.extend_from_slice(&output[offset..end]);
+                            completed.push(DeviceReadbackPieceOutput {
+                                input_index: input + local,
+                                bytes,
+                            });
+                            offset = end;
+                        }
+                    }
+                    input = run_end;
+                    if let Some(piece) = pieces.get(input) {
+                        first = self.readback_piece_plan(piece)?;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(())
+            },
+        ));
+        match result {
+            Ok(Ok(())) => DeviceReadbackBatchOutcome::Complete(completed),
+            Ok(Err(error)) => DeviceReadbackBatchOutcome::Failed {
+                failed_input: completed.len(),
+                completed,
+                error,
+            },
+            Err(_) => DeviceReadbackBatchOutcome::Panicked {
+                failed_input: completed.len(),
+                completed,
+            },
+        }
+    }
+
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {
         let (code, retryable) = match error {
             CudaDeviceRuntimeError::Blas { source, .. }
@@ -5728,6 +5940,249 @@ mod tests {
     #[cfg(feature = "vllm-marlin")]
     use cudarc::driver::DevicePtrMut;
     use ferrum_interfaces::vnext::DeviceCommandPhase;
+
+    #[test]
+    #[ignore = "requires an exclusive actual CUDA device"]
+    fn completion_batch_readback_matches_scalar_logits_and_exact_error_prefix() {
+        use ferrum_interfaces::vnext::{BufferUsage, ResourceId};
+
+        fn buffer(
+            runtime: &CudaDeviceRuntime,
+            stream: &CudaDeviceStream,
+            id: &str,
+            element_type: ElementType,
+            bytes: &[u8],
+        ) -> CudaDeviceBuffer {
+            let base = stream.stream.alloc_zeros::<u8>(bytes.len()).unwrap();
+            let (pointer, guard) = base.device_ptr(&stream.stream);
+            drop(guard);
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.stream.cu_stream())
+            }
+            .unwrap();
+            // The test input owns pageable host bytes only until this returns.
+            stream.stream.synchronize().unwrap();
+            CudaDeviceBuffer {
+                descriptor: BufferDescriptor {
+                    resource_id: ResourceId::new(id).unwrap(),
+                    size_bytes: bytes.len() as u64,
+                    alignment_bytes: 4,
+                    usage: BufferUsage::Activations,
+                    element_type,
+                },
+                runtime_instance: runtime.runtime_instance,
+                allocation: Arc::new(CudaAllocation {
+                    _base: base,
+                    aligned_ptr: pointer,
+                    requested_bytes: bytes.len() as u64,
+                }),
+            }
+        }
+
+        fn complete(
+            runtime: &CudaDeviceRuntime,
+            stream: &mut CudaDeviceStream,
+            pieces: &[DeviceReadbackPiece<'_, CudaDeviceBuffer>],
+            expected_calls: (usize, usize),
+        ) -> Vec<DeviceReadbackPieceOutput> {
+            let expected = pieces
+                .iter()
+                .map(|piece| {
+                    runtime
+                        .readback(
+                            stream,
+                            piece.source(),
+                            piece.region(),
+                            piece.output_layout(),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            BATCH_READBACK_TEST_CALLS.with(|calls| calls.set((0, 0)));
+            let outcome = runtime.readback_batch(stream, pieces);
+            let DeviceReadbackBatchOutcome::Complete(outputs) = outcome else {
+                panic!("actual CUDA batch must return every valid input");
+            };
+            assert_eq!(outputs.len(), expected.len());
+            for (index, (output, bytes)) in outputs.iter().zip(expected).enumerate() {
+                assert_eq!(output.input_index, index);
+                assert_eq!(output.bytes, bytes);
+            }
+            let calls = BATCH_READBACK_TEST_CALLS.with(std::cell::Cell::get);
+            assert_eq!(
+                calls, expected_calls,
+                "copies follow actual buffer/range geometry"
+            );
+            eprintln!(
+                "actual CUDA batch inputs={} stream_syncs={} synchronous_d2h_runs={}",
+                pieces.len(),
+                calls.0,
+                calls.1
+            );
+            outputs
+        }
+
+        let runtime = CudaDeviceRuntime::new(
+            crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config(
+                0,
+                DeviceId::new("device.test.completion-batch-readback").unwrap(),
+                AttentionExecutionPolicy::Portable,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut stream = runtime.create_stream().unwrap();
+        let scalar_bytes = [17u32, 23, 41, 59]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let scalar = buffer(
+            &runtime,
+            &stream,
+            "resource.test.scalar",
+            ElementType::U32,
+            &scalar_bytes,
+        );
+        let scalar_layout = HostTransferLayout::new(ElementType::U32, 1).unwrap();
+        let scalars = (0..4)
+            .map(|index| {
+                DeviceReadbackPiece::new(
+                    &scalar,
+                    CopyRegion::new(index * 4, 0, 4).unwrap(),
+                    scalar_layout,
+                )
+            })
+            .collect::<Vec<_>>();
+        let outputs = complete(&runtime, &mut stream, &scalars, (1, 1));
+        assert_eq!(
+            outputs
+                .iter()
+                .flat_map(|output| output.bytes.iter().copied())
+                .collect::<Vec<_>>(),
+            scalar_bytes
+        );
+
+        let logits_bytes = [0.25f32, -1.0, 7.5, 0.0, 2.0, -3.25]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let logits = buffer(
+            &runtime,
+            &stream,
+            "resource.test.logits",
+            ElementType::F32,
+            &logits_bytes,
+        );
+        let row_layout = HostTransferLayout::new(ElementType::F32, 3).unwrap();
+        let rows = [0, 12].map(|offset| {
+            DeviceReadbackPiece::new(&logits, CopyRegion::new(offset, 0, 12).unwrap(), row_layout)
+        });
+        complete(&runtime, &mut stream, &rows, (1, 1));
+        let mixed_buffers = [
+            DeviceReadbackPiece::new(&scalar, CopyRegion::new(8, 0, 4).unwrap(), scalar_layout),
+            DeviceReadbackPiece::new(&logits, CopyRegion::new(12, 0, 12).unwrap(), row_layout),
+        ];
+        complete(&runtime, &mut stream, &mixed_buffers, (1, 2));
+
+        // Same allocation/address is insufficient to merge distinct facades.
+        let alias = CudaDeviceBuffer {
+            descriptor: scalar.descriptor.clone(),
+            runtime_instance: scalar.runtime_instance,
+            allocation: Arc::clone(&scalar.allocation),
+        };
+        let separate = [
+            DeviceReadbackPiece::new(&scalar, CopyRegion::new(0, 0, 4).unwrap(), scalar_layout),
+            DeviceReadbackPiece::new(&alias, CopyRegion::new(4, 0, 4).unwrap(), scalar_layout),
+        ];
+        complete(&runtime, &mut stream, &separate, (1, 2));
+        let gapped = [0, 8].map(|offset| {
+            DeviceReadbackPiece::new(
+                &scalar,
+                CopyRegion::new(offset, 0, 4).unwrap(),
+                scalar_layout,
+            )
+        });
+        complete(&runtime, &mut stream, &gapped, (1, 2));
+
+        let partial = [DeviceReadbackPiece::new(
+            &scalar,
+            CopyRegion::new(4, 4, 4).unwrap(),
+            HostTransferLayout::new(ElementType::U32, 3).unwrap(),
+        )];
+        let output = complete(&runtime, &mut stream, &partial, (1, 1));
+        assert_eq!(&output[0].bytes[..4], &[0; 4]);
+        assert_eq!(&output[0].bytes[4..8], &scalar_bytes[4..8]);
+        assert_eq!(&output[0].bytes[8..], &[0; 4]);
+
+        let invalid = [
+            DeviceReadbackPiece::new(&scalar, CopyRegion::new(0, 0, 4).unwrap(), scalar_layout),
+            DeviceReadbackPiece::new(&scalar, CopyRegion::new(4, 0, 4).unwrap(), scalar_layout),
+            DeviceReadbackPiece::new(&scalar, CopyRegion::new(16, 0, 4).unwrap(), scalar_layout),
+            DeviceReadbackPiece::new(&scalar, CopyRegion::new(8, 0, 4).unwrap(), scalar_layout),
+        ];
+        BATCH_READBACK_TEST_CALLS.with(|calls| calls.set((0, 0)));
+        let DeviceReadbackBatchOutcome::Failed {
+            completed,
+            failed_input,
+            ..
+        } = runtime.readback_batch(&mut stream, &invalid)
+        else {
+            panic!("out-of-bounds input must stop before later requests");
+        };
+        assert_eq!(failed_input, 2);
+        assert_eq!(completed.len(), 2);
+        for (index, output) in completed.iter().enumerate() {
+            assert_eq!(output.input_index, index);
+            assert_eq!(output.bytes, scalar_bytes[index * 4..(index + 1) * 4]);
+        }
+        assert_eq!(BATCH_READBACK_TEST_CALLS.with(std::cell::Cell::get), (1, 1));
+        for piece in [
+            DeviceReadbackPiece::new(
+                &scalar,
+                CopyRegion::new(0, 0, 4).unwrap(),
+                HostTransferLayout::new(ElementType::F32, 1).unwrap(),
+            ),
+            DeviceReadbackPiece::new(&scalar, CopyRegion::new(0, 4, 4).unwrap(), scalar_layout),
+        ] {
+            BATCH_READBACK_TEST_CALLS.with(|calls| calls.set((0, 0)));
+            let DeviceReadbackBatchOutcome::Failed {
+                completed,
+                failed_input,
+                ..
+            } = runtime.readback_batch(&mut stream, &[piece])
+            else {
+                panic!("invalid typed/host range must fail before any copy");
+            };
+            assert_eq!(failed_input, 0);
+            assert!(completed.is_empty());
+            assert_eq!(BATCH_READBACK_TEST_CALLS.with(std::cell::Cell::get), (0, 0));
+        }
+        let mut oversized_descriptor = alias.descriptor.clone();
+        oversized_descriptor.size_bytes += 4;
+        let oversized = CudaDeviceBuffer {
+            descriptor: oversized_descriptor,
+            runtime_instance: scalar.runtime_instance,
+            allocation: Arc::clone(&scalar.allocation),
+        };
+        BATCH_READBACK_TEST_CALLS.with(|calls| calls.set((0, 0)));
+        let outside_allocation = [DeviceReadbackPiece::new(
+            &oversized,
+            CopyRegion::new(16, 0, 4).unwrap(),
+            scalar_layout,
+        )];
+        let DeviceReadbackBatchOutcome::Failed {
+            completed,
+            failed_input,
+            ..
+        } = runtime.readback_batch(&mut stream, &outside_allocation)
+        else {
+            panic!("descriptor capacity cannot extend the actual allocation");
+        };
+        assert_eq!(failed_input, 0);
+        assert!(completed.is_empty());
+        assert_eq!(BATCH_READBACK_TEST_CALLS.with(std::cell::Cell::get), (0, 0));
+        complete(&runtime, &mut stream, &scalars[..1], (1, 1));
+    }
 
     #[test]
     #[ignore = "requires an actual CUDA device"]

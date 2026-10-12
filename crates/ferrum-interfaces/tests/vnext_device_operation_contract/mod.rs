@@ -1447,6 +1447,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) readback_lengths: Vec<u64>,
     pub(crate) readback_fill_pattern: Vec<u8>,
     pub(crate) readback_fill_index: usize,
+    pub(crate) readback_fault: Option<(u64, TestReadbackFault)>,
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
     pub(crate) tamper_buffer_descriptor: bool,
@@ -1466,6 +1467,13 @@ pub(crate) struct RuntimeTrace {
     pub(crate) static_weight_import_seal_calls: u64,
     pub(crate) imported_component_count: usize,
     pub(crate) imported_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TestReadbackFault {
+    DeviceError,
+    Panic,
+    WrongByteLength,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2371,6 +2379,20 @@ impl DeviceRuntime for TestRuntime {
         let mut trace = self.trace.lock().unwrap();
         trace.readback_calls += 1;
         trace.readback_lengths.push(region.length_bytes());
+        let fault = trace
+            .readback_fault
+            .filter(|(call, _)| *call == trace.readback_calls)
+            .map(|(_, fault)| fault);
+        match fault {
+            Some(TestReadbackFault::DeviceError) => {
+                return Err(TestRuntimeError("readback-failure"))
+            }
+            Some(TestReadbackFault::Panic) => {
+                drop(trace);
+                panic!("injected readback panic");
+            }
+            _ => {}
+        }
         let fill_byte = if trace.readback_fill_pattern.is_empty() {
             0
         } else {
@@ -2378,7 +2400,15 @@ impl DeviceRuntime for TestRuntime {
             trace.readback_fill_index += 1;
             trace.readback_fill_pattern[index]
         };
-        Ok(vec![fill_byte; output_layout.byte_len().unwrap() as usize])
+        let bytes = output_layout.byte_len().unwrap() as usize;
+        Ok(vec![
+            fill_byte;
+            if matches!(fault, Some(TestReadbackFault::WrongByteLength)) {
+                bytes.saturating_sub(1)
+            } else {
+                bytes
+            }
+        ])
     }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {

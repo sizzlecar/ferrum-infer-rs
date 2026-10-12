@@ -3601,11 +3601,62 @@ impl<'request, 'source, B> StaticWeightTransformRequest<'request, 'source, B> {
     }
 }
 
+/// One borrowed, Core-approved physical copy. The enclosing completion owns
+/// every source until the synchronous batch operation returns.
+pub struct DeviceReadbackPiece<'a, B> {
+    source: &'a B,
+    region: CopyRegion,
+    output_layout: HostTransferLayout,
+}
+
+impl<'a, B> DeviceReadbackPiece<'a, B> {
+    pub const fn new(source: &'a B, region: CopyRegion, output_layout: HostTransferLayout) -> Self {
+        Self {
+            source,
+            region,
+            output_layout,
+        }
+    }
+    pub const fn source(&self) -> &'a B {
+        self.source
+    }
+    pub const fn region(&self) -> CopyRegion {
+        self.region
+    }
+    pub const fn output_layout(&self) -> HostTransferLayout {
+        self.output_layout
+    }
+}
+
+pub struct DeviceReadbackPieceOutput {
+    pub input_index: usize,
+    pub bytes: Vec<u8>,
+}
+
+/// Outputs must be the exact ordered prefix of the inputs. A failed or
+/// panicked batch stops before later inputs; every attempted host copy must
+/// be quiescent before it returns. Core checks ordinals and byte lengths.
+pub enum DeviceReadbackBatchOutcome<E> {
+    Complete(Vec<DeviceReadbackPieceOutput>),
+    Failed {
+        completed: Vec<DeviceReadbackPieceOutput>,
+        failed_input: usize,
+        error: E,
+    },
+    Panicked {
+        completed: Vec<DeviceReadbackPieceOutput>,
+        failed_input: usize,
+    },
+    ContractFailed {
+        completed: Vec<DeviceReadbackPieceOutput>,
+        failed_input: usize,
+        reason: String,
+    },
+}
+
 /// Stable primitive boundary implemented by a concrete device runtime.
-///
-/// Associated buffer, stream, command, and error types preserve compile-time
-/// type safety. Every operation is required; unsupported work cannot inherit a
-/// success-returning default implementation.
+/// Associated types preserve compile-time device, command and error identity.
+/// The batch-readback default delegates to the required scalar primitive.
 pub trait DeviceRuntime: Send + Sync + 'static {
     type Buffer: Send + Sync + 'static;
     type Stream: Send + 'static;
@@ -3915,6 +3966,52 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         region: CopyRegion,
         output_layout: HostTransferLayout,
     ) -> Result<Vec<u8>, Self::Error>;
+
+    /// A backend may combine copies within this synchronous lane transaction.
+    /// A completed submission fence does not prove the entire stream idle:
+    /// overrides must retain their required current-stream synchronization.
+    fn readback_batch(
+        &self,
+        stream: &mut Self::Stream,
+        pieces: &[DeviceReadbackPiece<'_, Self::Buffer>],
+    ) -> DeviceReadbackBatchOutcome<Self::Error> {
+        let mut completed = Vec::with_capacity(pieces.len());
+        for (input_index, piece) in pieces.iter().enumerate() {
+            match catch_unwind(AssertUnwindSafe(|| {
+                self.readback(
+                    stream,
+                    piece.source(),
+                    piece.region(),
+                    piece.output_layout(),
+                )
+            })) {
+                Ok(Ok(bytes)) => {
+                    if let Err(error) = piece.output_layout().validate_bytes(bytes.len()) {
+                        return DeviceReadbackBatchOutcome::ContractFailed {
+                            completed,
+                            failed_input: input_index,
+                            reason: error.to_string(),
+                        };
+                    }
+                    completed.push(DeviceReadbackPieceOutput { input_index, bytes });
+                }
+                Ok(Err(error)) => {
+                    return DeviceReadbackBatchOutcome::Failed {
+                        completed,
+                        failed_input: input_index,
+                        error,
+                    }
+                }
+                Err(_) => {
+                    return DeviceReadbackBatchOutcome::Panicked {
+                        completed,
+                        failed_input: input_index,
+                    }
+                }
+            }
+        }
+        DeviceReadbackBatchOutcome::Complete(completed)
+    }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError>;
 }

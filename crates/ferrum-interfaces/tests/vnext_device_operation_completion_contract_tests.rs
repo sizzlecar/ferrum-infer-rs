@@ -194,6 +194,148 @@ fn retire_step_after_deferred_cleanup(
     }
 }
 
+fn batch_readback_collection(windows: &[(u64, u64)]) -> CompletionReadbackCollectionRequest {
+    CompletionReadbackCollectionRequest::new(
+        windows
+            .iter()
+            .map(|&(offset, elements)| {
+                CompletionReadbackBatchRequest::new(vec![CompletionReadbackRequest::new(
+                    id("node.main"),
+                    0,
+                    id("resource.intermediate"),
+                    offset,
+                    HostTransferLayout::new(ElementType::F32, elements).unwrap(),
+                )
+                .unwrap()])
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn terminal_batch_readback(
+    handle: &CompletionHandle<TestRuntime>,
+    windows: &[(u64, u64)],
+) -> CompletionReadbackBatchReceipt {
+    match handle
+        .wait_with_readback_collection(batch_readback_collection(windows))
+        .unwrap()
+    {
+        CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
+        other => panic!("batch readback failed to reach terminal: {other:?}"),
+    }
+}
+
+#[test]
+fn completion_batch_readback_preserves_order_and_skips_individually_invalid_ranges() {
+    let harness = CompletionHarness::new();
+    harness.runtime_trace.lock().unwrap().readback_fill_pattern = vec![0x11, 0x22];
+    let handle = harness.dispatch().unwrap();
+    let receipt = terminal_batch_readback(&handle, &[(0, 1), (4, 5), (8, 1)]);
+    let dispositions = receipt.dispositions();
+    assert!(
+        matches!(&dispositions[0], CompletionReadbackDisposition::Succeeded(output) if output.bytes()==[0x11;4])
+    );
+    assert!(matches!(
+        &dispositions[1],
+        CompletionReadbackDisposition::ContractFailedButQuiescent { .. }
+    ));
+    assert!(
+        matches!(&dispositions[2], CompletionReadbackDisposition::Succeeded(output) if output.bytes()==[0x22;4])
+    );
+    assert_eq!(harness.runtime_trace.lock().unwrap().readback_calls, 2);
+    assert_eq!(harness.runtime_trace.lock().unwrap().wait_fence_calls, 1);
+    assert!(harness.lane.is_reusable());
+    assert_eq!(harness.reaper.retained_count(), 0);
+    drop(receipt);
+    drop(handle);
+    harness.finish(&mut 0);
+}
+
+#[test]
+fn completion_batch_readback_device_error_and_panic_keep_prefix_and_stop_later_copies() {
+    for fault in [TestReadbackFault::DeviceError, TestReadbackFault::Panic] {
+        let harness = CompletionHarness::new();
+        harness.runtime_trace.lock().unwrap().readback_fault = Some((2, fault));
+        let handle = harness.dispatch().unwrap();
+        let receipt = terminal_batch_readback(&handle, &[(0, 1), (4, 1), (8, 1)]);
+        assert!(
+            matches!(&receipt.dispositions()[0], CompletionReadbackDisposition::Succeeded(output) if output.bytes()==[0;4])
+        );
+        assert!(match (&receipt.dispositions()[1], fault) {
+            (
+                CompletionReadbackDisposition::FailedButQuiescent { .. },
+                TestReadbackFault::DeviceError,
+            ) => true,
+            (
+                CompletionReadbackDisposition::ContractFailedButQuiescent { .. },
+                TestReadbackFault::Panic,
+            ) => true,
+            _ => false,
+        });
+        assert!(matches!(
+            &receipt.dispositions()[2],
+            CompletionReadbackDisposition::ContractFailedButQuiescent { .. }
+        ));
+        assert_eq!(harness.runtime_trace.lock().unwrap().readback_calls, 2);
+        assert!(!harness.lane.is_reusable());
+        assert_eq!(harness.reaper.retained_count(), 0);
+        assert_eq!(harness.lane.in_flight_count(), 0);
+        drop(receipt);
+        drop(handle);
+        harness.finish(&mut 0);
+    }
+}
+
+#[test]
+fn completion_batch_readback_wrong_bytes_fail_closed_before_later_copy() {
+    for fail_at in [1, 2] {
+        let harness = CompletionHarness::new();
+        harness.runtime_trace.lock().unwrap().readback_fault =
+            Some((fail_at, TestReadbackFault::WrongByteLength));
+        let handle = harness.dispatch().unwrap();
+        let receipt = terminal_batch_readback(&handle, &[(0, 1), (4, 1), (8, 1)]);
+        if fail_at == 2 {
+            assert!(
+                matches!(&receipt.dispositions()[0], CompletionReadbackDisposition::Succeeded(output) if output.bytes()==[0;4])
+            );
+        }
+        assert!(receipt.dispositions()[(fail_at - 1) as usize..]
+            .iter()
+            .all(|output| matches!(
+                output,
+                CompletionReadbackDisposition::ContractFailedButQuiescent { .. }
+            )));
+        assert_eq!(
+            harness.runtime_trace.lock().unwrap().readback_calls,
+            fail_at
+        );
+        assert!(!harness.lane.is_reusable());
+        assert_eq!(harness.reaper.retained_count(), 0);
+        drop(receipt);
+        drop(handle);
+        harness.finish(&mut 0);
+    }
+}
+
+#[test]
+fn completion_batch_readback_all_invalid_ranges_perform_no_device_copy() {
+    let harness = CompletionHarness::new();
+    let handle = harness.dispatch().unwrap();
+    let receipt = terminal_batch_readback(&handle, &[(0, 5), (4, 5)]);
+    assert!(receipt.dispositions().iter().all(|output| matches!(
+        output,
+        CompletionReadbackDisposition::ContractFailedButQuiescent { .. }
+    )));
+    assert_eq!(harness.runtime_trace.lock().unwrap().readback_calls, 0);
+    assert_eq!(harness.runtime_trace.lock().unwrap().wait_fence_calls, 1);
+    assert!(harness.lane.is_reusable());
+    drop(receipt);
+    drop(handle);
+    harness.finish(&mut 0);
+}
+
 #[test]
 fn reusable_catalog_snapshot_defers_in_flight_work_and_recovers_after_completion() {
     let harness = CompletionHarness::new();

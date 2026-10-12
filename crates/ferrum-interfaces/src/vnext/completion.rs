@@ -27,6 +27,7 @@ use super::{
 
 mod readback_collection;
 pub use readback_collection::*;
+mod batch_readback;
 mod segment_binding_publication;
 use segment_binding_publication::SegmentBindingRecipeCache;
 pub use segment_binding_publication::{ReadySegmentBindingPublication, SegmentBindingPublication};
@@ -1079,10 +1080,18 @@ impl CompletionFenceTiming {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionReadbackTimingScope {
+    Request,
+    Batch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CompletionReadbackTiming {
     host_elapsed_ns: u64,
     calls: u32,
     bytes: u64,
+    scope: CompletionReadbackTimingScope,
 }
 
 impl CompletionReadbackTiming {
@@ -1091,6 +1100,7 @@ impl CompletionReadbackTiming {
             host_elapsed_ns,
             calls,
             bytes,
+            scope: CompletionReadbackTimingScope::Request,
         }
     }
 
@@ -1104,6 +1114,21 @@ impl CompletionReadbackTiming {
 
     pub const fn bytes(self) -> u64 {
         self.bytes
+    }
+
+    /// Batch timing is carried once, by the first successful request. Calls
+    /// counts Runtime API invocations; it does not count native copy commands.
+    pub const fn scope(self) -> CompletionReadbackTimingScope {
+        self.scope
+    }
+
+    const fn batch(host_elapsed_ns: u64, calls: u32, bytes: u64) -> Self {
+        Self {
+            host_elapsed_ns,
+            calls,
+            bytes,
+            scope: CompletionReadbackTimingScope::Batch,
+        }
     }
 }
 
@@ -3371,20 +3396,14 @@ fn attempt_completion_readbacks<R: DeviceRuntime>(
     timing_mode: DeviceTimingMode,
     request: CompletionReadbackBatchRequest,
 ) -> Vec<CompletionReadbackDisposition> {
-    request
-        .into_requests()
-        .into_iter()
-        .map(|request| {
-            attempt_completion_readback(
-                resources,
-                lane,
-                batch_identity,
-                completion_disposition,
-                timing_mode,
-                request,
-            )
-        })
-        .collect()
+    batch_readback::attempt(
+        resources,
+        lane,
+        batch_identity,
+        completion_disposition,
+        timing_mode,
+        request.into_requests(),
+    )
 }
 
 fn attempt_completion_readback_collection<R: DeviceRuntime>(
@@ -3395,20 +3414,14 @@ fn attempt_completion_readback_collection<R: DeviceRuntime>(
     timing_mode: DeviceTimingMode,
     request: CompletionReadbackCollectionRequest,
 ) -> Vec<CompletionReadbackDisposition> {
-    request
-        .into_requests()
-        .into_iter()
-        .map(|request| {
-            attempt_completion_readback(
-                resources,
-                lane,
-                batch_identity,
-                completion_disposition,
-                timing_mode,
-                request,
-            )
-        })
-        .collect()
+    batch_readback::attempt(
+        resources,
+        lane,
+        batch_identity,
+        completion_disposition,
+        timing_mode,
+        request.into_requests(),
+    )
 }
 
 #[derive(Debug)]
