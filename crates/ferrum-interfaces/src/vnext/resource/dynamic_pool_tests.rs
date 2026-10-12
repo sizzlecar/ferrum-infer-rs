@@ -5754,6 +5754,10 @@ fn step_slot_projects_two_logical_activations_from_one_physical_extent() {
     assert_eq!(step.backing_slices().len(), 2);
     assert_eq!(step.claimed_backing().physical_claim_count(), 1);
     assert!(step.claimed_backing().has_shared_physical_claims());
+    segment_permit_tests::assert_shared_step_materialization(
+        &harness.root.dynamic_pools,
+        step.backing_slices(),
+    );
     let first = step.backing_slices()[0].evidence();
     let second = step.backing_slices()[1].evidence();
     assert_eq!(

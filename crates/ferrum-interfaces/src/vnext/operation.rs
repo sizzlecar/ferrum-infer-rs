@@ -87,9 +87,9 @@ pub use determinism_artifact::{
 pub use dispatch::OperationDispatch;
 pub use dispatch_contract::{
     BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatchError,
-    ProfiledSubmissionHandle, SubmissionExecutionPolicy, SubmissionScratchInitialization,
-    SubmissionWaveDispatchError, SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink,
-    SubmissionWaveInputUpload,
+    ProfiledSubmissionHandle, SegmentBackingMaterializationObservation, SubmissionExecutionPolicy,
+    SubmissionScratchInitialization, SubmissionWaveDispatchError, SubmissionWaveDispatchStage,
+    SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
 };
 pub(crate) use dispatch_contract::{
     DisabledSubmissionWaveDispatchTimingSink, SubmissionWaveDispatchStageTimer,

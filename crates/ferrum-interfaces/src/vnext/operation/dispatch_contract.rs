@@ -261,15 +261,46 @@ pub enum SubmissionWaveDispatchStage {
     LaneReserveSubmitAndArm,
 }
 
-/// Diagnostic-only timing sink for the prepared-wave dispatch hot path.
-///
-/// The sink receives only a stage and completed host duration; it receives no
-/// command, resource, or correctness authority. `ENABLED = false` is the
-/// compile-time off path: no clock is read and `record` is never called.
-/// Enabled implementations run on the submission thread and must not block,
-/// allocate, or panic.
+/// Same-observation counts of real retained core bindings. No address or
+/// correctness authority escapes through this diagnostic receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SegmentBackingMaterializationObservation {
+    /// The core permit passed every check. This does not imply a segment hit,
+    /// backend acceptance, submission, or device completion.
+    pub complete: bool,
+    pub unique_authority_groups: u64,
+    pub segment_bindings: u64,
+    pub unique_lease_chunk_scope_owners: u64,
+    pub owner_tuple_group_pairs: u64,
+    pub unique_owner_segment_ranges: u64,
+    pub sampling_stride: u32,
+    pub sampled_bindings: u64,
+    /// Raw sampled retention/segment-clone/binding-push intervals, including
+    /// clock overhead, excluding authority validation and chunk lookup. This
+    /// is neither total materialization time nor a removable CPU budget.
+    pub sampled_materialization_ns: Option<u64>,
+    /// Sorting/counting after pool unlock; included in the outer host interval.
+    /// Excludes reserve, entry collection, sampling clocks and sink callbacks,
+    /// so this is only a subset of the diagnostic overhead.
+    pub diagnostic_counting_ns: u64,
+}
+
+impl SegmentBackingMaterializationObservation {
+    pub const SAMPLING_STRIDE: u32 = 64;
+}
+
+/// Diagnostic-only observations for the prepared-wave dispatch hot path.
+/// Disabled generic callers read no clock, allocate no diagnostic storage and
+/// invoke no observer. Enabled observers receive scalar data after pool unlock
+/// and must not block, allocate, or panic.
 pub trait SubmissionWaveDispatchTimingSink: DeviceSubmissionTimingSink {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration);
+
+    fn record_segment_backing_materialization(
+        &self,
+        _observation: SegmentBackingMaterializationObservation,
+    ) {
+    }
 }
 
 pub(crate) struct DisabledSubmissionWaveDispatchTimingSink;

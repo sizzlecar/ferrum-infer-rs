@@ -71,6 +71,7 @@ mod program_binding_upload;
 mod request;
 mod reusable_catalog;
 mod reusable_cold_path;
+mod segment_materialization;
 mod state_memory;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -2130,6 +2131,7 @@ struct VNextWaveTimingMetrics {
     segment_backing_dedup_reserve_pool_resolution: AtomicDurationMetrics,
     segment_backing_lock_acquisition: AtomicDurationMetrics,
     segment_backing_locked_validation: AtomicDurationMetrics,
+    segment_backing_materialization: segment_materialization::MaterializationMetrics,
     segment_backing_window_intersections: AtomicDurationMetrics,
     segment_backing_immutable_metadata_validation: AtomicDurationMetrics,
     segment_node_dependencies_regions: AtomicDurationMetrics,
@@ -2312,6 +2314,7 @@ impl VNextWaveTimingMetrics {
             "dedup_reserve_and_pool_resolution": self.segment_backing_dedup_reserve_pool_resolution.snapshot(),
             "lock_acquisition": self.segment_backing_lock_acquisition.snapshot(),
             "locked_validation": self.segment_backing_locked_validation.snapshot(),
+            "materialization": self.segment_backing_materialization.snapshot(),
             "window_intersections": self.segment_backing_window_intersections.snapshot(),
             "immutable_metadata_validation": self.segment_backing_immutable_metadata_validation.snapshot(),
         })
@@ -2361,6 +2364,7 @@ impl VNextWaveTimingMetrics {
             metrics.reset();
         }
         self.resource_step_admission_breakdown.reset();
+        self.segment_backing_materialization.reset();
         self.reusable_execution.reset();
     }
 }
@@ -2484,6 +2488,13 @@ impl DeviceSubmissionTimingSink for VNextWaveTimingMetrics {
 }
 
 impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
+    fn record_segment_backing_materialization(
+        &self,
+        observation: SegmentBackingMaterializationObservation,
+    ) {
+        self.segment_backing_materialization.record(observation);
+    }
+
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         match stage {
             SubmissionWaveDispatchStage::ContractValidateAndReserve => {
@@ -2575,6 +2586,16 @@ impl DeviceSubmissionTimingSink for VNextWaveTimingSink<'_> {
 }
 
 impl SubmissionWaveDispatchTimingSink for VNextWaveTimingSink<'_> {
+    fn record_segment_backing_materialization(
+        &self,
+        observation: SegmentBackingMaterializationObservation,
+    ) {
+        self.aggregate
+            .record_segment_backing_materialization(observation);
+        self.phase
+            .record_segment_backing_materialization(observation);
+    }
+
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         SubmissionWaveDispatchTimingSink::record(self.aggregate, stage, elapsed);
         SubmissionWaveDispatchTimingSink::record(self.phase, stage, elapsed);

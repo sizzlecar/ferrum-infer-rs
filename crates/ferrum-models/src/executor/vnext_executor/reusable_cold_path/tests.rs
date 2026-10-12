@@ -53,6 +53,7 @@ impl IdentityFixture {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
+    Materialization(SegmentBackingMaterializationObservation),
     Host(SubmissionWaveDispatchStage, Duration),
     Device(DeviceSubmissionStage, Duration),
     Submission(DeviceReusableExecutionObservation),
@@ -106,9 +107,73 @@ impl DeviceSubmissionTimingSink for CaptureSink {
 }
 
 impl SubmissionWaveDispatchTimingSink for CaptureSink {
+    fn record_segment_backing_materialization(
+        &self,
+        observation: SegmentBackingMaterializationObservation,
+    ) {
+        self.0.lock().push(Event::Materialization(observation));
+    }
+
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         self.0.lock().push(Event::Host(stage, elapsed));
     }
+}
+
+#[test]
+fn reusable_cold_path_materialization_forwards_same_attempt_and_keeps_missing_null() {
+    let sink = CaptureSink::default();
+    let ledger = Ledger::default();
+    let observation = SegmentBackingMaterializationObservation {
+        complete: false,
+        unique_authority_groups: 2,
+        segment_bindings: 1,
+        unique_lease_chunk_scope_owners: 1,
+        owner_tuple_group_pairs: 1,
+        unique_owner_segment_ranges: 1,
+        sampling_stride: SegmentBackingMaterializationObservation::SAMPLING_STRIDE,
+        sampled_bindings: 1,
+        sampled_materialization_ns: Some(7),
+        diagnostic_counting_ns: 3,
+    };
+    let mut wave = ledger.begin(true, VNextExecutionWaveKind::Decode).unwrap();
+    let observer = AttemptObservation::new(&sink, None, 1, None, None);
+    observer.record_segment_backing_materialization(observation);
+    wave.record_attempt(observer, Default::default(), Outcome::ContractError, None);
+    let observer = AttemptObservation::new(&sink, None, 1, None, None);
+    wave.record_attempt(observer, Default::default(), Outcome::Submitted, None);
+    wave.finish(None, Outcome::Submitted);
+    let value = ledger.snapshot();
+    assert_eq!(
+        value["records"][0]["attempts"][0]["segment_backing_materialization"],
+        serde_json::to_value(observation).unwrap()
+    );
+    assert!(value["records"][0]["attempts"][1]["segment_backing_materialization"].is_null());
+    assert_eq!(*sink.0.lock(), vec![Event::Materialization(observation)]);
+
+    struct Off;
+    impl DeviceSubmissionTimingSink for Off {
+        const ENABLED: bool = false;
+        fn record_device_submission(&self, _: DeviceSubmissionStage, _: Duration) {
+            panic!("disabled observer called");
+        }
+    }
+    impl SubmissionWaveDispatchTimingSink for Off {
+        fn record(&self, _: SubmissionWaveDispatchStage, _: Duration) {
+            panic!("disabled observer called");
+        }
+        fn record_segment_backing_materialization(
+            &self,
+            _: SegmentBackingMaterializationObservation,
+        ) {
+            panic!("disabled materialization observer called");
+        }
+    }
+    let observer = AttemptObservation::new(&Off, None, 1, None, None);
+    observer.record_segment_backing_materialization(observation);
+    assert!(observer
+        .finish(0, Default::default(), Outcome::Submitted, None)
+        .segment_backing_materialization
+        .is_none());
 }
 
 fn no_resident() -> InvocationPreparationStats {
