@@ -73,6 +73,8 @@ pub(super) fn strided_bytes(
 enum Family {
     #[cfg(any(feature = "cuda-upstream-linear", test))]
     Original,
+    #[cfg(any(feature = "cuda-upstream-linear", test))]
+    Q8,
     #[cfg(any(feature = "cuda-upstream-extra-linear", test))]
     Extra,
 }
@@ -81,6 +83,8 @@ impl Family {
         match self {
             #[cfg(any(feature = "cuda-upstream-linear", test))]
             Self::Original => UPSTREAM_LINEAR_OPERATOR,
+            #[cfg(any(feature = "cuda-upstream-linear", test))]
+            Self::Q8 => UPSTREAM_LINEAR_OPERATOR,
             #[cfg(any(feature = "cuda-upstream-extra-linear", test))]
             Self::Extra => UPSTREAM_EXTRA_LINEAR_OPERATOR,
         }
@@ -105,6 +109,11 @@ impl PreparedUpstreamLinear {
         device: Device,
     ) -> Result<Self, Error> {
         let request = UpstreamLinearRequestV1::new(format, layout, rows, inputs, outputs, device)?;
+        if format == Format::Q8_0
+            && (algorithm != Algorithm::Mmq || arithmetic != Arithmetic::MarkerV2)
+        {
+            return Err(Error::UnsupportedGeometry);
+        }
         #[cfg(not(feature = "cuda-upstream-linear"))]
         {
             let _ = (algorithm, arithmetic, request);
@@ -113,10 +122,21 @@ impl PreparedUpstreamLinear {
         #[cfg(feature = "cuda-upstream-linear")]
         {
             let mut raw = UpstreamLinearPlanV1::default();
-            let call = match algorithm {
-                Algorithm::Mmq if rows > 32 => ffi::ferrum_upstream_mmq_prefill_plan_v1,
-                Algorithm::Mmq => ffi::ferrum_upstream_mmq_plan_v1,
-                Algorithm::Mmvq => ffi::ferrum_upstream_mmvq_plan_v1,
+            let (family, call) = match (format, algorithm) {
+                (Format::Q8_0, Algorithm::Mmq) => {
+                    (Family::Q8, q8_ffi::ferrum_upstream_q8_mmq_plan_v1 as PlanFn)
+                }
+                (_, Algorithm::Mmq) if rows > 32 => (
+                    Family::Original,
+                    ffi::ferrum_upstream_mmq_prefill_plan_v1 as PlanFn,
+                ),
+                (_, Algorithm::Mmq) => {
+                    (Family::Original, ffi::ferrum_upstream_mmq_plan_v1 as PlanFn)
+                }
+                (_, Algorithm::Mmvq) => (
+                    Family::Original,
+                    ffi::ferrum_upstream_mmvq_plan_v1 as PlanFn,
+                ),
             };
             // Native preparation checks the current device and configures MMQ
             // dynamic shared memory once, outside any CUDA graph capture.
@@ -125,7 +145,7 @@ impl PreparedUpstreamLinear {
             Ok(Self {
                 raw,
                 arithmetic,
-                family: Family::Original,
+                family,
             })
         }
     }
@@ -231,6 +251,11 @@ impl PreparedUpstreamLinear {
         distinct(&[weights, flag])?;
         #[cfg(feature = "cuda-upstream-linear")]
         {
+            if self.family == Family::Q8 {
+                return Error::from_status(unsafe {
+                    q8_ffi::ferrum_upstream_q8_mmq_check_weights_v2(&self.raw, w, f, stream)
+                });
+            }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
             Error::from_status(unsafe { (api.check_weights)(&self.raw, w, f, stream) })
         }
@@ -260,6 +285,13 @@ impl PreparedUpstreamLinear {
         distinct(&[input, converted, packed, row_poison])?;
         #[cfg(feature = "cuda-upstream-linear")]
         {
+            if self.family == Family::Q8 {
+                return Error::from_status(unsafe {
+                    q8_ffi::ferrum_upstream_q8_mmq_pack_v2(
+                        &self.raw, x, stride, c, q, poison, stream,
+                    )
+                });
+            }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
             Error::from_status(unsafe {
                 match self.arithmetic {
@@ -297,6 +329,11 @@ impl PreparedUpstreamLinear {
         distinct(&[weights, packed, output, fixup])?;
         #[cfg(feature = "cuda-upstream-linear")]
         {
+            if self.family == Family::Q8 {
+                return Error::from_status(unsafe {
+                    q8_ffi::ferrum_upstream_q8_mmq_dot_v1(&self.raw, w, q, o, f, stream)
+                });
+            }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
             Error::from_status(unsafe { (api.dot)(&self.raw, w, q, o, f, stream) })
         }
@@ -334,6 +371,11 @@ impl PreparedUpstreamLinear {
         distinct(&[input, output, row_poison, weight_poison])?;
         #[cfg(feature = "cuda-upstream-linear")]
         {
+            if self.family == Family::Q8 {
+                return Error::from_status(unsafe {
+                    q8_ffi::ferrum_upstream_q8_mmq_cast_v2(&self.raw, i, o, stride, rp, wp, stream)
+                });
+            }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
             Error::from_status(unsafe {
                 match self.arithmetic {
@@ -347,6 +389,56 @@ impl PreparedUpstreamLinear {
             let _ = (i, o, rp, wp, stream);
             Err(Error::Unavailable)
         }
+    }
+}
+
+#[cfg(feature = "cuda-upstream-linear")]
+type PlanFn =
+    unsafe extern "C" fn(*const UpstreamLinearRequestV1, *mut UpstreamLinearPlanV1) -> i32;
+
+// Q8 uses one independent prefix in the existing artifact. No old-format
+// symbol, V1 arithmetic export, or MMVQ entry can be substituted for it.
+#[cfg(feature = "cuda-upstream-linear")]
+mod q8_ffi {
+    use super::*;
+
+    unsafe extern "C" {
+        pub(super) fn ferrum_upstream_q8_mmq_plan_v1(
+            request: *const UpstreamLinearRequestV1,
+            plan: *mut UpstreamLinearPlanV1,
+        ) -> i32;
+        pub(super) fn ferrum_upstream_q8_mmq_pack_v2(
+            plan: *const UpstreamLinearPlanV1,
+            input: *const c_void,
+            stride: u32,
+            converted: *mut c_void,
+            packed: *mut c_void,
+            row_flags: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub(super) fn ferrum_upstream_q8_mmq_dot_v1(
+            plan: *const UpstreamLinearPlanV1,
+            weights: *const c_void,
+            packed: *const c_void,
+            output: *mut c_void,
+            fixup: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub(super) fn ferrum_upstream_q8_mmq_check_weights_v2(
+            plan: *const UpstreamLinearPlanV1,
+            weights: *const c_void,
+            weight_flag: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub(super) fn ferrum_upstream_q8_mmq_cast_v2(
+            plan: *const UpstreamLinearPlanV1,
+            input: *const c_void,
+            output: *mut c_void,
+            stride: u32,
+            row_flags: *const c_void,
+            weight_flag: *const c_void,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -414,7 +506,7 @@ mod tests {
     }
     #[test]
     fn prepared_operator_identity_keeps_the_two_artifact_families_distinct() {
-        for family in [Family::Original, Family::Extra] {
+        for family in [Family::Original, Family::Q8, Family::Extra] {
             let plan = PreparedUpstreamLinear {
                 raw: Default::default(),
                 arithmetic: Arithmetic::MarkerV2,
@@ -423,6 +515,88 @@ mod tests {
             assert_eq!(plan.operator(), family.operator());
         }
         assert_ne!(Family::Original.operator(), Family::Extra.operator());
+        assert_eq!(Family::Q8.operator(), Family::Original.operator());
+    }
+    #[test]
+    fn q8_constructor_rejects_unsupported_domain_before_native_dispatch() {
+        let device = Device {
+            architecture: 800,
+            multiprocessors: 1,
+            maximum_dynamic_shared_bytes: 65536,
+        };
+        for (algorithm, arithmetic, layout, rows) in [
+            (Algorithm::Mmvq, Arithmetic::MarkerV2, Layout::Columns, 8),
+            (Algorithm::Mmq, Arithmetic::V1, Layout::Columns, 8),
+            (Algorithm::Mmq, Arithmetic::MarkerV2, Layout::Channels, 8),
+            (Algorithm::Mmq, Arithmetic::MarkerV2, Layout::Columns, 1),
+            (Algorithm::Mmq, Arithmetic::MarkerV2, Layout::Columns, 33),
+        ] {
+            assert!(matches!(
+                PreparedUpstreamLinear::new(
+                    algorithm,
+                    arithmetic,
+                    Format::Q8_0,
+                    layout,
+                    rows,
+                    5120,
+                    48,
+                    device,
+                ),
+                Err(Error::UnsupportedGeometry)
+            ));
+        }
+    }
+    #[test]
+    fn q8_projection_subspan_extent_keeps_real_output_stride() {
+        for rows in [8, 32] {
+            let required = strided_bytes(rows, 48, 16480, 2).unwrap();
+            let base = 1 << 20;
+            for offset in [16384, 16432] {
+                let output = DeviceSpan {
+                    address: base + offset * 2,
+                    bytes: required,
+                };
+                assert!(output.checked(required, 2).is_ok());
+                assert!(DeviceSpan {
+                    bytes: required - 2,
+                    ..output
+                }
+                .checked(required, 2)
+                .is_err());
+                // Scratch in a row gap is still within the checked output
+                // envelope and cannot be substituted for disjoint storage.
+                assert!(distinct(&[
+                    output,
+                    DeviceSpan {
+                        address: output.address + 96,
+                        bytes: 16
+                    },
+                ])
+                .is_err());
+            }
+        }
+        assert_eq!(strided_bytes(8, 48, 47, 2), Err(Error::Span));
+    }
+    #[cfg(not(feature = "cuda-upstream-linear"))]
+    #[test]
+    fn q8_missing_artifact_is_explicit_without_original_symbol_fallback() {
+        assert!(matches!(
+            PreparedUpstreamLinear::new(
+                Algorithm::Mmq,
+                Arithmetic::MarkerV2,
+                Format::Q8_0,
+                Layout::Columns,
+                8,
+                5120,
+                48,
+                Device {
+                    architecture: 800,
+                    multiprocessors: 1,
+                    maximum_dynamic_shared_bytes: 65536,
+                },
+            ),
+            Err(Error::Unavailable)
+        ));
     }
     #[cfg(not(feature = "cuda-upstream-extra-linear"))]
     #[test]

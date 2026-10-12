@@ -398,7 +398,12 @@
     "ferrum_upstream_mmvq_dot_v1",
     "ferrum_upstream_mmvq_pack_v1",
     "ferrum_upstream_mmvq_pack_v2",
-    "ferrum_upstream_mmvq_plan_v1"
+    "ferrum_upstream_mmvq_plan_v1",
+    "ferrum_upstream_q8_mmq_cast_v2",
+    "ferrum_upstream_q8_mmq_check_weights_v2",
+    "ferrum_upstream_q8_mmq_dot_v1",
+    "ferrum_upstream_q8_mmq_pack_v2",
+    "ferrum_upstream_q8_mmq_plan_v1"
   ],
   "license_files": [
     {

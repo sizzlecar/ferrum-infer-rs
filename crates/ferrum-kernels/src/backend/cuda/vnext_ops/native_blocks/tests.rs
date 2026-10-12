@@ -13,6 +13,8 @@ mod format_specialization;
 mod iq4xs_register;
 mod q4k;
 mod q8_0;
+#[cfg(feature = "cuda-upstream-linear")]
+mod q8_zero_mmq;
 mod q8dot;
 
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {

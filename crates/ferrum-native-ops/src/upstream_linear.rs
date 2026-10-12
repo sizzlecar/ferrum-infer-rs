@@ -15,9 +15,30 @@ pub enum UpstreamLinearAlgorithm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum UpstreamLinearFormat {
+    /// Independent MMQ MarkerV2 pilot; the original three-format exports
+    /// continue to reject this wire format.
+    #[allow(non_camel_case_types)]
+    Q8_0 = 8,
     Q4K = 12,
     Q5K = 13,
     Iq4Xs = 23,
+}
+impl UpstreamLinearFormat {
+    pub const fn block_elements(self) -> u32 {
+        match self {
+            Self::Q8_0 => 32,
+            Self::Q4K | Self::Q5K | Self::Iq4Xs => 256,
+        }
+    }
+
+    pub const fn block_bytes(self) -> u32 {
+        match self {
+            Self::Q8_0 => 34,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Iq4Xs => 136,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -84,7 +105,7 @@ impl UpstreamLinearRequestV1 {
         if self.abi != UPSTREAM_LINEAR_ABI
             || self.size as usize != size_of::<Self>()
             || self.reserved != 0
-            || !matches!(self.format, 12 | 13 | 23)
+            || !matches!(self.format, 8 | 12 | 13 | 23)
             || self.layout > 1
             || self.rows == 0
             || self.rows > 2048
@@ -96,6 +117,12 @@ impl UpstreamLinearRequestV1 {
             || self.shared_limit == 0
         {
             return Err(UpstreamLinearError::InvalidArgument);
+        }
+        if self.format == UpstreamLinearFormat::Q8_0 as u32
+            && (!(2..=32).contains(&self.rows)
+                || self.layout != UpstreamLinearLayout::Columns as u32)
+        {
+            return Err(UpstreamLinearError::UnsupportedGeometry);
         }
         Ok(())
     }
@@ -174,6 +201,11 @@ impl UpstreamLinearPlanV1 {
         algorithm: UpstreamLinearAlgorithm,
     ) -> Result<(), UpstreamLinearError> {
         request.validate()?;
+        if request.format == UpstreamLinearFormat::Q8_0 as u32
+            && algorithm != UpstreamLinearAlgorithm::Mmq
+        {
+            return Err(UpstreamLinearError::UnsupportedGeometry);
+        }
         if self.request != *request
             || self.abi != UPSTREAM_LINEAR_ABI
             || self.size as usize != size_of::<Self>()
@@ -187,7 +219,7 @@ impl UpstreamLinearPlanV1 {
         }
         let expected_pack = match algorithm {
             UpstreamLinearAlgorithm::Mmq => {
-                if request.format == 23 {
+                if matches!(request.format, 8 | 23) {
                     1
                 } else {
                     2
@@ -197,6 +229,44 @@ impl UpstreamLinearPlanV1 {
         };
         if self.pack_abi != expected_pack {
             return Err(UpstreamLinearError::AbiMismatch);
+        }
+        if request.format == UpstreamLinearFormat::Q8_0 as u32 {
+            let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(UpstreamLinearError::Extent);
+            let rows = u64::from(request.rows);
+            let outputs = u64::from(request.outputs);
+            let padded_inputs = u64::from(self.padded_inputs);
+            let weight_bytes = mul(mul(outputs, u64::from(request.inputs / 32))?, 34)?;
+            let converted_bytes = mul(mul(rows, padded_inputs)?, 4)?;
+            // D4 has four independent FP32 scales and 128 signed Q8 values.
+            let packed_bytes = mul(mul(rows, padded_inputs / 128)?, 144)?
+                .checked_add(mul(u64::from(self.guard_blocks), 144)?)
+                .ok_or(UpstreamLinearError::Extent)?;
+            let output_bytes = mul(mul(rows, outputs)?, 4)?;
+            let fixup_bytes = if self.fixup == 0 {
+                0
+            } else {
+                mul(
+                    mul(
+                        mul(u64::from(self.blocks), u64::from(self.j))?,
+                        u64::from(self.i),
+                    )?,
+                    4,
+                )?
+            };
+            if self.padded_outputs != request.outputs
+                || self.weight_bytes != weight_bytes
+                || self.converted_bytes != converted_bytes
+                || self.packed_bytes != packed_bytes
+                || self.output_bytes != output_bytes
+                || self.fixup_bytes != fixup_bytes
+                || self.ncols != 0
+                || self.channels != 0
+                || self.nwarps != 0
+                || self.rows_per_block != 0
+                || self.small_k != 0
+            {
+                return Err(UpstreamLinearError::AbiMismatch);
+            }
         }
         Ok(())
     }
@@ -270,6 +340,150 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    fn q8_plan(rows: u32) -> UpstreamLinearPlanV1 {
+        let request = UpstreamLinearRequestV1::new(
+            UpstreamLinearFormat::Q8_0,
+            UpstreamLinearLayout::Columns,
+            rows,
+            5120,
+            48,
+            UpstreamLinearDevice {
+                architecture: 800,
+                multiprocessors: 1,
+                maximum_dynamic_shared_bytes: 65536,
+            },
+        )
+        .unwrap();
+        UpstreamLinearPlanV1 {
+            request,
+            abi: UPSTREAM_LINEAR_ABI,
+            size: size_of::<UpstreamLinearPlanV1>() as u32,
+            algorithm: UpstreamLinearAlgorithm::Mmq as u32,
+            pack_abi: 1,
+            padded_inputs: 5120,
+            padded_outputs: 48,
+            guard_blocks: 1,
+            weight_bytes: 261120,
+            converted_bytes: u64::from(rows) * 5120 * 4,
+            packed_bytes: u64::from(rows) * 40 * 144 + 144,
+            output_bytes: u64::from(rows) * 48 * 4,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn q8_request_rejects_unsupported_rows_layout_and_mmq_quantum() {
+        let base = q8_plan(8).request;
+        assert_eq!(base.format, 8);
+        assert_eq!(UpstreamLinearFormat::Q8_0.block_elements(), 32);
+        assert_eq!(UpstreamLinearFormat::Q8_0.block_bytes(), 34);
+        for bad in [
+            UpstreamLinearRequestV1 { rows: 1, ..base },
+            UpstreamLinearRequestV1 { rows: 33, ..base },
+            UpstreamLinearRequestV1 {
+                layout: UpstreamLinearLayout::Channels as u32,
+                ..base
+            },
+        ] {
+            assert_eq!(
+                bad.validate(),
+                Err(UpstreamLinearError::UnsupportedGeometry)
+            );
+        }
+        // A complete Q8_0 weight block is insufficient for MMQ's K256 tile.
+        assert_eq!(
+            UpstreamLinearRequestV1 {
+                inputs: 5152,
+                ..base
+            }
+            .validate(),
+            Err(UpstreamLinearError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn q8_plan_rejects_wrong_pack_weight_block_and_scratch_extents() {
+        for rows in [8, 32] {
+            let plan = q8_plan(rows);
+            plan.validate_identity(&plan.request, UpstreamLinearAlgorithm::Mmq)
+                .unwrap();
+            for bad in [
+                UpstreamLinearPlanV1 {
+                    pack_abi: 2,
+                    ..plan
+                },
+                UpstreamLinearPlanV1 {
+                    weight_bytes: 48 * 20 * 144,
+                    ..plan
+                },
+                UpstreamLinearPlanV1 {
+                    padded_outputs: 128,
+                    ..plan
+                },
+                UpstreamLinearPlanV1 {
+                    packed_bytes: plan.packed_bytes - 144,
+                    ..plan
+                },
+                UpstreamLinearPlanV1 {
+                    converted_bytes: plan.converted_bytes - 4,
+                    ..plan
+                },
+                UpstreamLinearPlanV1 {
+                    fixup_bytes: 4,
+                    ..plan
+                },
+            ] {
+                assert_eq!(
+                    bad.validate_identity(&plan.request, UpstreamLinearAlgorithm::Mmq),
+                    Err(UpstreamLinearError::AbiMismatch)
+                );
+            }
+            let fixup = UpstreamLinearPlanV1 {
+                blocks: 2,
+                j: 32,
+                i: 128,
+                fixup: 1,
+                fixup_bytes: 32768,
+                ..plan
+            };
+            fixup
+                .validate_identity(&fixup.request, UpstreamLinearAlgorithm::Mmq)
+                .unwrap();
+            assert_eq!(
+                UpstreamLinearPlanV1 {
+                    fixup_bytes: 32764,
+                    ..fixup
+                }
+                .validate_identity(&fixup.request, UpstreamLinearAlgorithm::Mmq),
+                Err(UpstreamLinearError::AbiMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn q8_plan_rejects_mmvq_and_overflowing_weight_extent() {
+        let plan = q8_plan(8);
+        assert_eq!(
+            plan.validate_identity(&plan.request, UpstreamLinearAlgorithm::Mmvq),
+            Err(UpstreamLinearError::UnsupportedGeometry)
+        );
+        let request = UpstreamLinearRequestV1 {
+            inputs: 0xffff_fe00,
+            outputs: u32::MAX,
+            ..plan.request
+        };
+        request.validate().unwrap();
+        assert_eq!(
+            UpstreamLinearPlanV1 {
+                request,
+                padded_inputs: request.inputs,
+                padded_outputs: request.outputs,
+                ..plan
+            }
+            .validate_identity(&request, UpstreamLinearAlgorithm::Mmq),
+            Err(UpstreamLinearError::Extent)
+        );
     }
     #[test]
     fn abi_rejects_unknown_reserved_and_partial_quant_blocks() {
