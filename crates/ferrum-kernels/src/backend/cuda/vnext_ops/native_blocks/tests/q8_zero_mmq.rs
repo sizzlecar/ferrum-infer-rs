@@ -856,3 +856,317 @@ fn q8_zero_mmq_48_layer_two_leaf_inclusive_paired_on_cuda() {
         );
     }
 }
+
+// A distinct finite-domain pilot: cold-concatenate adjacent B/A weight rows,
+// then perform one complete N96 pipeline per layer. It deliberately retains
+// the original two N48 strict projections as its comparison baseline.
+struct MergedCase<'a> {
+    base: &'a Case,
+    native: PreparedUpstreamLinear,
+    weights: Vec<Weight>,
+    converted: Buffer,
+    packed: Buffer,
+    raw: Buffer,
+    fixup: Buffer,
+    rows: Buffer,
+    native_preparation_wall_ns: f64,
+    cold_concat_and_upload_wall_ns: f64,
+}
+impl<'a> MergedCase<'a> {
+    fn new(s: &Arc<CudaStream>, base: &'a Case) -> Self {
+        assert_eq!(base.offsets[1], base.offsets[0] + base.n);
+        let start = std::time::Instant::now();
+        let native = PreparedUpstreamLinear::new(
+            Algorithm::Mmq,
+            Arithmetic::MarkerV2,
+            Format::Q8_0,
+            Layout::Columns,
+            base.m as u32,
+            base.k as u32,
+            (2 * base.n) as u32,
+            device(s.context()),
+        )
+        .unwrap();
+        let native_preparation_wall_ns = start.elapsed().as_secs_f64() * 1e9;
+        let p = *native.geometry();
+        assert_eq!(p.weight_bytes, 2 * base.native.geometry().weight_bytes);
+        let concat = std::time::Instant::now();
+        let weights = base
+            .weights
+            .chunks_exact(2)
+            .map(|pair| {
+                let bytes = [pair[0].bytes.as_slice(), pair[1].bytes.as_slice()].concat();
+                assert_eq!(bytes.len(), p.weight_bytes as usize);
+                let mut gpu = Buffer::new(s, bytes.len());
+                gpu.write(s, &bytes);
+                Weight {
+                    bytes,
+                    gpu,
+                    flag: Buffer::new(s, 4),
+                }
+            })
+            .collect();
+        s.synchronize().unwrap();
+        let cold_concat_and_upload_wall_ns = concat.elapsed().as_secs_f64() * 1e9;
+        Self {
+            base,
+            native,
+            weights,
+            native_preparation_wall_ns,
+            cold_concat_and_upload_wall_ns,
+            converted: Buffer::new(s, p.converted_bytes as usize),
+            packed: Buffer::new(s, p.packed_bytes as usize),
+            raw: Buffer::new(s, p.output_bytes as usize),
+            fixup: Buffer::new(s, p.fixup_bytes as usize),
+            rows: Buffer::new(s, base.m * 4),
+        }
+    }
+    fn scan(&self, s: &Arc<CudaStream>) {
+        for w in &self.weights {
+            unsafe {
+                self.native
+                    .check_weights(w.gpu.span(s), w.flag.span(s), s.cu_stream().cast())
+            }
+            .unwrap();
+        }
+    }
+    fn inclusive(&self, s: &Arc<CudaStream>, layer: usize) {
+        let w = &self.weights[layer];
+        // SAFETY: exact concatenated row order, disjoint scratch, fixed live
+        // input/output and retained matrix-specific flag on the same stream.
+        unsafe {
+            self.native
+                .pack(
+                    self.base.input.span(s),
+                    self.base.k as u32,
+                    self.converted.span(s),
+                    self.packed.span(s),
+                    self.rows.span(s),
+                    s.cu_stream().cast(),
+                )
+                .unwrap();
+            self.native
+                .dot(
+                    w.gpu.span(s),
+                    self.packed.span(s),
+                    self.raw.span(s),
+                    self.fixup.span(s),
+                    s.cu_stream().cast(),
+                )
+                .unwrap();
+            self.native
+                .cast(
+                    self.raw.span(s),
+                    self.base.output.span_at(s, self.base.offsets[0] * 2),
+                    self.base.stride as u32,
+                    self.rows.span(s),
+                    w.flag.span(s),
+                    s.cu_stream().cast(),
+                )
+                .unwrap();
+        }
+    }
+    fn guards_and_oracle(&self, s: &Arc<CudaStream>) -> serde_json::Value {
+        s.synchronize().unwrap();
+        self.base.guards(s);
+        for b in [
+            &self.converted,
+            &self.packed,
+            &self.raw,
+            &self.fixup,
+            &self.rows,
+        ] {
+            b.guards(s);
+        }
+        for (layer, w) in self.weights.iter().enumerate() {
+            w.gpu.guards(s);
+            w.flag.guards(s);
+            assert_eq!(w.gpu.read(s), w.bytes);
+            assert_eq!(
+                &w.bytes[..self.base.weights[2 * layer].bytes.len()],
+                self.base.weights[2 * layer].bytes
+            );
+            assert_eq!(
+                &w.bytes[self.base.weights[2 * layer].bytes.len()..],
+                self.base.weights[2 * layer + 1].bytes
+            );
+            assert_eq!(
+                u32::from_le_bytes(w.flag.read(s).try_into().unwrap()),
+                0,
+                "merged pilot finite weight domain"
+            );
+        }
+        assert!(self.rows.read(s).iter().all(|v| *v == 0));
+        let packed = self.packed.read(s);
+        let padded = self.native.geometry().padded_inputs as usize;
+        assert!(packed[self.base.m * padded * 9 / 8..]
+            .iter()
+            .all(|v| *v == 0));
+        let converted = floats(&self.converted.read(s));
+        for row in 0..self.base.m {
+            for i in 0..padded {
+                let expected = if i < self.base.k {
+                    self.base.x[row * self.base.k + i].to_f32()
+                } else {
+                    0.0
+                };
+                assert_eq!(converted[row * padded + i].to_bits(), expected.to_bits());
+            }
+        }
+        for row in 0..self.base.m {
+            for g in 0..padded / 32 {
+                let group = (g * 32 < self.base.k).then(|| {
+                    &self.base.x[row * self.base.k + g * 32..row * self.base.k + (g + 1) * 32]
+                });
+                let amax = group.map_or(0.0, |x| {
+                    x.iter().map(|v| v.to_f32().abs()).fold(0.0_f32, f32::max)
+                });
+                for i in 0..32 {
+                    let (q, d) = self.base.activation(&packed, row, g * 32 + i);
+                    if amax == 0.0 {
+                        assert_eq!(q, 0);
+                        assert_eq!(d.to_bits(), 0);
+                    } else {
+                        assert!(
+                            d.is_finite()
+                                && (d - amax / 127.0).abs() <= amax / 127.0 * 8.0 * f32::EPSILON
+                        );
+                        assert_ne!(q, i8::MIN);
+                        assert!(
+                            (f64::from(group.unwrap()[i].to_f32()) - f64::from(q) * f64::from(d))
+                                .abs()
+                                <= f64::from(d) * 0.501
+                                    + f64::from(amax) * 8.0 * f64::from(f32::EPSILON)
+                        );
+                    }
+                }
+            }
+        }
+        let y = halves(&self.base.output.read(s));
+        let w = &self.weights.last().unwrap().bytes;
+        let mut max_quant_error = 0.0_f64;
+        let mut max_original_error = 0.0_f64;
+        for row in 0..self.base.m {
+            for column in 0..self.base.stride {
+                if !(self.base.offsets[0]..self.base.offsets[0] + 2 * self.base.n).contains(&column)
+                {
+                    assert_eq!(y[row * self.base.stride + column], 0x3535);
+                    continue;
+                }
+                let col = column - self.base.offsets[0];
+                let mut target = 0.0;
+                let mut original = 0.0;
+                let mut magnitude = 0.0;
+                for i in 0..self.base.k {
+                    let (q, d) = self.base.activation(&packed, row, i);
+                    assert!(d.is_finite() && q != i8::MIN);
+                    let weight = weight_value(w, self.base.k, col, i);
+                    let x = f64::from(q) * f64::from(d);
+                    target += weight * x;
+                    magnitude += (weight * x).abs();
+                    original += weight * f64::from(self.base.x[row * self.base.k + i].to_f32());
+                }
+                let actual = f64::from(f16::from_bits(y[row * self.base.stride + column]).to_f32());
+                let operations = (2 * self.base.k + 64) as f64;
+                let epsilon = f64::from(f32::EPSILON);
+                let gamma = operations * epsilon / (1.0 - operations * epsilon);
+                let bound = gamma * magnitude + target.abs() / 2048.0 + 2.0_f64.powi(-24);
+                assert!(
+                    actual.is_finite() && (actual - target).abs() <= bound,
+                    "merged actual D4 F64 [{row},{column}] {actual} != {target}, bound{bound}"
+                );
+                max_quant_error = max_quant_error.max((target - original).abs());
+                max_original_error = max_original_error.max((actual - original).abs());
+            }
+        }
+        serde_json::json!({"checked_outputs":self.base.m*2*self.base.n,"oracle":"independent_concatenated_q8_weight_actual_merged_d4_f64",
+            "max_input_quantization_output_error":max_quant_error,"max_published_error_vs_original_input_f64":max_original_error,
+            "domain":"finite activations and finite scales with representable F16 output","merged_invalid_weight_semantics_equivalence":"not claimed"})
+    }
+}
+
+#[test]
+#[ignore = "finite-domain merged Q8_0 pilot versus original two-leaf strict; exclusive CUDA"]
+fn q8_zero_mmq_48_layer_merged_two_leaf_inclusive_paired_on_cuda() {
+    let (_, s, kernels) = context();
+    const LAYERS: usize = 48;
+    for m in [8, 32] {
+        let mut c = Case::new(&s, m, 5120, 48, LAYERS);
+        c.scan(&s);
+        c.reset(&s);
+        let merged = MergedCase::new(&s, &c);
+        let (scan_wall, scan_gpu) = measure(&s, || merged.scan(&s));
+        for layer in 0..LAYERS {
+            merged.inclusive(&s, layer);
+            c.strict(&s, &kernels, 2 * layer);
+            c.strict(&s, &kernels, 2 * layer + 1);
+        }
+        let last = [2 * LAYERS - 2, 2 * LAYERS - 1];
+        let oracle = merged.guards_and_oracle(&s);
+        let strict_oracle = c.oracle(&s, &last, true);
+        let difference = c.strict_difference(&s, &last);
+        let initial = c.output.read(&s);
+        let strict_initial = c.strict_output.read(&s);
+        let strict = Captured::new(&s, || {
+            for i in 0..2 * LAYERS {
+                c.strict(&s, &kernels, i);
+            }
+        });
+        let candidate = Captured::new(&s, || {
+            for layer in 0..LAYERS {
+                merged.inclusive(&s, layer);
+            }
+        });
+        for _ in 0..2 {
+            strict.launch();
+            candidate.launch();
+        }
+        s.synchronize().unwrap();
+        for pair in 0..8 {
+            for position in 0..2 {
+                let use_candidate = (pair + position) % 2 == 1;
+                let (wall, gpu) = measure(&s, || {
+                    if use_candidate {
+                        candidate.launch();
+                    } else {
+                        strict.launch();
+                    }
+                });
+                let actual = if use_candidate {
+                    c.output.read(&s)
+                } else {
+                    c.strict_output.read(&s)
+                };
+                assert_eq!(
+                    &actual,
+                    if use_candidate {
+                        &initial
+                    } else {
+                        &strict_initial
+                    },
+                    "merged replay changed route output"
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({"kind":"q8_zero_mmq_merged_inclusive_paired","synthetic":true,"m":m,"k":5120,
+                "candidate_n":96,"baseline_n_per_leaf":48,"layers":LAYERS,"candidate_projections":LAYERS,"baseline_projections":2*LAYERS,
+                "pair":pair,"position":position,"route":if use_candidate {"merged_n96_complete_d4_mmq_publish"} else {"original_96_n48_strict_q8_f16_dispatch"},
+                "mode":"graph_replay","graph_nodes":if use_candidate {candidate.nodes} else {strict.nodes},"wall_ns":wall,"gpu_ns":gpu,
+                "wall_ns_per_original_leaf_pair":wall/LAYERS as f64,"gpu_ns_per_original_leaf_pair":gpu/LAYERS as f64,
+                "output_stride":16480,"output_offset":16384,"inclusive_pipeline":use_candidate,"row_flag_reset_included":use_candidate,
+                "convert_pad_pack_dot_fixup_publish_included":use_candidate,"cold_concat_included":false,"static_weight_scan_included":false,
+                "performance_assertion":null,"semantic_quality":"not evaluated","nonfinite_equivalence":"not claimed"})
+                );
+            }
+        }
+        let final_oracle = merged.guards_and_oracle(&s);
+        println!(
+            "{}",
+            serde_json::json!({"kind":"q8_zero_mmq_merged_paired_summary","m":m,"j":merged.native.geometry().j,"fixup":merged.native.geometry().fixup,
+            "native_plan_preparation_wall_ns":merged.native_preparation_wall_ns,"cold_concat_and_upload_wall_ns":merged.cold_concat_and_upload_wall_ns,
+            "cold_weight_scan_wall_ns":scan_wall,"cold_weight_scan_gpu_ns":scan_gpu,"merged_resident_weight_bytes":merged.weights.iter().map(|w|w.bytes.len()).sum::<usize>(),
+            "baseline_resident_weight_bytes":c.weights.iter().map(|w|w.bytes.len()).sum::<usize>(),"combined_resident_duplicate_weight_bytes":2*c.weights.iter().map(|w|w.bytes.len()).sum::<usize>(),
+            "oracle":oracle,"strict_oracle":strict_oracle,"final_oracle":final_oracle,"strict_difference":difference,"same_route_repeat_bits":true})
+        );
+    }
+}
