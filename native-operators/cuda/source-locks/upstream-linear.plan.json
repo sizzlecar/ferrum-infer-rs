@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.upstream_linear",
   "source_package": {
     "kind": "ferrum-native-upstream-linear",
-    "revision": "marker-v2-tail-safe-r1+q8-mmq-pilot-r1+d81235049384534c167caea52b85a694f6103d14",
-    "sha256": "f26dfe3925e0c70f1ecf7cbc7375a26f63aedd68612b64e56853f5d3df62d7a5"
+    "revision": "marker-v2-tail-safe-r1+q8-mmq-pilot-r2+d81235049384534c167caea52b85a694f6103d14",
+    "sha256": "f18fbf6cf89559e49db3aa5b79632e3e46870f0923ccd4860d4fb0df6ace4d5a"
   },
   "upstream_sources": [
     {
@@ -28,7 +28,7 @@
     },
     {
       "path": "kernels/q8-mmq.cu",
-      "sha256": "603ca0dc5124ca52503deb0079fb97e19f1455ec51de0051c376d4c0f73114ff"
+      "sha256": "a32465d77bf511a5e1c3110aa77d77b3fd32d1eb2b5aa6793d92585e2191cbb1"
     }
   ],
   "headers": [
@@ -536,7 +536,7 @@
           "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
         }
       ],
-      "closure_sha256": "fb18d1a6663529e3f6f4baab7f49a1a2e094b83c0cc6b6427c878b79d3f257b7"
+      "closure_sha256": "2e597981426c59f84151ff12f6b0ee0624a2473aff814c4bb01732f83aeda350"
     }
   ],
   "include_dirs": [

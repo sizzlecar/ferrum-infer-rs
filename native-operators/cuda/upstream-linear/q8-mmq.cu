@@ -194,7 +194,7 @@ static int ferrum_test_mmq_plan(uint32_t format, uint32_t rows, uint32_t inputs,
     const uint64_t tiles_y = (uint64_t(outputs) + config.I - 1)/config.I;
     const uint64_t tiles_x = (uint64_t(rows) + config.J - 1)/config.J;
     const uint64_t total_tiles = tiles_x*tiles_y;
-    if (total_tiles*(inputs/256) >= (1u << 30)) return -3;
+    if (total_tiles*(inputs/32) >= (1u << 30)) return -3;
     const uint64_t waves = (total_tiles + nsm - 1)/nsm;
     const uint64_t efficiency = 100*total_tiles/(nsm*waves);
     const uint64_t blocks = config.stream_k ? (efficiency >= 90 ? total_tiles : nsm) : total_tiles;
@@ -231,9 +231,10 @@ static int test_mmq_dispatch(const TestMmqPlan & p, const void * weights, const 
             cudaFuncAttributeMaxDynamicSharedMemorySize, p.shared_bytes);
     }
     const auto one = init_fastdiv_values(1);
-    const auto blocks_per_k = init_fastdiv_values(p.inputs/256);
+    const auto blocks_per_k = init_fastdiv_values(p.inputs/32);
     const auto ntx = init_fastdiv_values((p.rows + J - 1)/J);
-    // Q8_0 weight rows have K/32 blocks; MMQ K scheduling still iterates 256.
+    // Both MMQ scheduling and weight strides use Q8_0's 32-value blocks.
+    // The kernel advances by ITER_K/qk blocks per internal tile iteration.
     const int weight_stride = p.inputs/32;
     const int packed_channel_stride = p.rows*p.padded_inputs*sizeof(block_q8_1_mmq)/(128*sizeof(int));
     const bool stream_k = p.stream_k != 0;
