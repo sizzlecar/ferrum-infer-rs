@@ -247,7 +247,7 @@ NATIVE_Q8_0_LINEAR(f16, 1)
 NATIVE_Q8_0_LINEAR(tiled_f16, 8)
 #undef NATIVE_Q8_0_LINEAR
 
-// Diagnostic-only pair launch. Each CTA selects one original matrix and calls
+// Pair launch. Each CTA selects one original matrix and calls
 // the unchanged T1 body, preserving its K order and warp reduction exactly.
 // Launch (max(ceil(outputs0/4), ceil(outputs1/4)), rows, 2) with 128 threads.
 // The caller retains both weights/input/output and validates disjoint output

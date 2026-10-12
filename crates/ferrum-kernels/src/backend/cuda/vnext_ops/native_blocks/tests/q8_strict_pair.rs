@@ -553,3 +553,116 @@ fn q8_strict_pair_48_layer_inclusive_paired_on_cuda() {
         );
     }
 }
+
+fn launch_product_pair(
+    c: &Case,
+    s: &Arc<CudaStream>,
+    kernels: &CudaNativeBlockKernels,
+    parts: &[weights::MatrixPart; 2],
+) {
+    assert!(
+        kernels
+            .try_linear_q8_0_pair_f16(
+                s,
+                c.input.pointer(s, 0),
+                [
+                    c.weights[0].gpu.pointer(s, WEIGHT_PREFIX),
+                    c.weights[1].gpu.pointer(s, WEIGHT_PREFIX)
+                ],
+                c.pair_output.pointer(s, 0),
+                [&parts[0], &parts[1]],
+                c.m as u32,
+                c.stride as u32,
+            )
+            .unwrap(),
+        "actual strict pair geometry must select the product adapter"
+    );
+}
+
+#[test]
+#[ignore = "typed strict Q8 pair adapter and fresh captured inputs require actual CUDA"]
+fn q8_strict_pair_product_adapter_preserves_bits_and_fresh_captured_inputs_on_cuda() {
+    use ferrum_interfaces::vnext::WeightId;
+    let (_, s, kernels) = context();
+    for m in [8, 32] {
+        let mut c = Case::new(&s, m, 5120, [48, 48], 1);
+        let parts = std::array::from_fn(|leaf| weights::MatrixPart {
+            component_id: WeightId::new(if leaf == 0 {
+                "fixture.strict-pair.left"
+            } else {
+                "fixture.strict-pair.right"
+            })
+            .unwrap(),
+            format: weights::MatrixFormat::Block(GgufBlockFormat::Q8_0),
+            rows: c.n[leaf] as u32,
+            columns: c.k as u32,
+            output_offset: c.offsets[leaf] as u32,
+            transform: None,
+            signs_region: None,
+        });
+        c.old(&s, &kernels, 0);
+        c.old(&s, &kernels, 1);
+        launch_product_pair(&c, &s, &kernels, &parts);
+        c.equal(&s);
+        c.guards(&s);
+        let oracle = c.oracle(&s, 0);
+        let old = Captured::new(&s, || {
+            c.old(&s, &kernels, 0);
+            c.old(&s, &kernels, 1);
+        });
+        let product = Captured::new(&s, || launch_product_pair(&c, &s, &kernels, &parts));
+        let ordinary = c.x.clone();
+        let good = c
+            .weights
+            .iter()
+            .map(|w| w.bytes.clone())
+            .collect::<Vec<_>>();
+        for pattern in 0..9 {
+            c.x = ordinary.clone();
+            for (w, bytes) in c.weights.iter_mut().zip(&good) {
+                w.bytes = bytes.clone();
+            }
+            match pattern {
+                1 => {
+                    for (i, x) in c.x.iter_mut().enumerate() {
+                        *x = f16::from_f32((((i / c.k) * 5 + i * 23) % 97) as f32 / 64.0 - 0.75);
+                    }
+                }
+                2 => c.x[(m - 1) * c.k] = f16::NAN,
+                3 => c.x[(m - 1) * c.k] = f16::INFINITY,
+                4 => c.x[(m - 1) * c.k] = f16::NEG_INFINITY,
+                5 => c.weights[0].bytes[WEIGHT_PREFIX..WEIGHT_PREFIX + 2]
+                    .copy_from_slice(&0x7e00_u16.to_le_bytes()),
+                6 => c.weights[1].bytes[WEIGHT_PREFIX..WEIGHT_PREFIX + 2]
+                    .copy_from_slice(&0x7c00_u16.to_le_bytes()),
+                7 => c.weights[0].bytes[WEIGHT_PREFIX..WEIGHT_PREFIX + 2]
+                    .copy_from_slice(&0xfc00_u16.to_le_bytes()),
+                _ => {} // ordinary and finite recovery on the same device views
+            }
+            c.upload(&s);
+            c.reset(&s);
+            c.old(&s, &kernels, 0);
+            c.old(&s, &kernels, 1);
+            launch_product_pair(&c, &s, &kernels, &parts);
+            c.equal(&s);
+            let reference = c.old_output.full(&s);
+            old.launch();
+            product.launch();
+            c.equal(&s);
+            assert_eq!(
+                reference,
+                c.pair_output.full(&s),
+                "typed adapter captured fresh-input bits"
+            );
+            c.guards(&s);
+        }
+        println!(
+            "{}",
+            serde_json::json!({"kind":"q8_strict_pair_product_adapter_correctness",
+            "m":m,"k":c.k,"n":c.n,"output_stride":c.stride,"output_offsets":c.offsets,
+            "oracle":oracle,"selected":true,"full_allocation_bit_equality":true,
+            "fresh_input_on_same_captured_device_views":true,"independent_nonfinite_weight_leaves":true,
+            "odd_weight_byte_views":true,"activation_quantization":false})
+        );
+    }
+}

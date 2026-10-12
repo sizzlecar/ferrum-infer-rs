@@ -29,6 +29,62 @@ fn q8_0_f16_row_tile(rows: u32, inputs: u32, outputs: u32, multiprocessors: u32)
     }
 }
 
+fn q8_0_pair_f16_eligible(
+    parts: [&weights::MatrixPart; 2],
+    rows: u32,
+    output_stride: u32,
+    multiprocessors: u32,
+) -> Result<bool, CudaDeviceRuntimeError> {
+    let q8 = weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q8_0);
+    if parts
+        .iter()
+        .any(|part| part.format != q8 || part.transform.is_some() || part.signs_region.is_some())
+        || parts[0].columns != parts[1].columns
+    {
+        return Ok(false);
+    }
+    if rows == 0
+        || parts[0].columns == 0
+        || parts[0].columns % 32 != 0
+        || parts.iter().any(|part| part.rows == 0)
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA native linear pair launch extent is invalid",
+        ));
+    }
+    // Larger row batches use the existing chunked single-leaf path. Keep the
+    // caller's signed shape domain too; unsupported extents never launch here.
+    if rows > u16::MAX as u32
+        || parts[0].columns > i32::MAX as u32
+        || output_stride > i32::MAX as u32
+    {
+        return Ok(false);
+    }
+    // Select each original leaf independently. Combining their output widths
+    // must not change a former T1 leaf into a different arithmetic schedule.
+    if parts
+        .iter()
+        .any(|part| q8_0_f16_row_tile(rows, part.columns, part.rows, multiprocessors) != 1)
+    {
+        return Ok(false);
+    }
+    let [Some(end0), Some(end1)] = parts.map(|part| part.output_offset.checked_add(part.rows))
+    else {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA native linear pair output extent overflows",
+        ));
+    };
+    if end0 > output_stride
+        || end1 > output_stride
+        || !(end0 <= parts[1].output_offset || end1 <= parts[0].output_offset)
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA native linear pair output windows are invalid",
+        ));
+    }
+    Ok(true)
+}
+
 #[derive(Clone)]
 pub(super) struct CudaNativeBlockKernels {
     multiprocessors: u32,
@@ -41,7 +97,6 @@ pub(super) struct CudaNativeBlockKernels {
     linear_q4k_f16: CudaFunction,
     linear_q4k_tiled_f16: CudaFunction,
     linear_q8_0_f16: CudaFunction,
-    #[cfg(test)]
     linear_q8_0_pair_f16: CudaFunction,
     #[cfg(test)]
     linear_q8_0_tiled_f16: CudaFunction,
@@ -67,6 +122,52 @@ pub(super) struct CudaNativeBlockKernels {
 }
 
 impl CudaNativeBlockKernels {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_linear_q8_0_pair_f16(
+        &self,
+        stream: &CudaStream,
+        input: u64,
+        weights: [u64; 2],
+        output: u64,
+        parts: [&weights::MatrixPart; 2],
+        rows: u32,
+        output_stride: u32,
+    ) -> Result<bool, CudaDeviceRuntimeError> {
+        if !q8_0_pair_f16_eligible(parts, rows, output_stride, self.multiprocessors)? {
+            return Ok(false);
+        }
+        let parameters = [
+            rows,
+            parts[0].columns,
+            parts[0].rows,
+            parts[1].rows,
+            output_stride,
+            parts[0].output_offset,
+            parts[1].output_offset,
+        ];
+        let mut launch = stream.launch_builder(&self.linear_q8_0_pair_f16);
+        launch
+            .arg(&input)
+            .arg(&weights[0])
+            .arg(&weights[1])
+            .arg(&output);
+        for parameter in &parameters {
+            launch.arg(parameter);
+        }
+        // SAFETY: The caller retains the independently validated original
+        // weight/input/output regions. Checked disjoint windows remain in the
+        // existing stride; each z plane uses exactly one original T1 leaf.
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (parts[0].rows.max(parts[1].rows).div_ceil(4), rows, 2),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| true)
+        .map_err(|error| CudaDeviceRuntimeError::driver("native Q8_0 pair linear launch", error))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn transformed_linear(
         &self,
@@ -191,7 +292,6 @@ impl CudaNativeBlockKernels {
             linear_q4k_f16: load("vnext_gguf_linear_q4k_f16")?,
             linear_q4k_tiled_f16: load("vnext_gguf_linear_q4k_tiled_f16")?,
             linear_q8_0_f16: load("vnext_gguf_linear_q8_0_f16")?,
-            #[cfg(test)]
             linear_q8_0_pair_f16: load("vnext_gguf_linear_q8_0_pair_f16")?,
             #[cfg(test)]
             linear_q8_0_tiled_f16: load("vnext_gguf_linear_q8_0_tiled_f16")?,

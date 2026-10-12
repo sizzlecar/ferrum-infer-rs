@@ -456,7 +456,31 @@ impl<'a> PreparedAttentionProjections<'a> {
             address: region.device_ptr(),
             bytes: region.length_bytes(),
         };
-        for leaf in &projection.leaves {
+        let strict_untransformed = |leaf: &Leaf| {
+            leaf.stage.native.is_none()
+                && leaf.validation.is_none()
+                && leaf.signs.is_none()
+                && leaf.part.transform.is_none()
+        };
+        let mut leaf_index = 0;
+        while let Some(leaf) = projection.leaves.get(leaf_index) {
+            if let Some(next) = projection.leaves.get(leaf_index + 1) {
+                if strict_untransformed(leaf)
+                    && strict_untransformed(next)
+                    && native.try_linear_q8_0_pair_f16(
+                        stream,
+                        input,
+                        [leaf.weight.device_ptr(), next.weight.device_ptr()],
+                        output,
+                        [&leaf.part, &next.part],
+                        rows,
+                        stride,
+                    )?
+                {
+                    leaf_index += 2;
+                    continue;
+                }
+            }
             if let Some(validation) = &leaf.validation {
                 // Captured State owns this Arc and its retained flag/weight leases.
                 unsafe {
@@ -491,6 +515,7 @@ impl<'a> PreparedAttentionProjections<'a> {
                     transform,
                 )?;
             }
+            leaf_index += 1;
         }
         Ok(())
     }

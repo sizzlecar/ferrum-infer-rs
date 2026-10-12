@@ -67,6 +67,76 @@ fn q8_0_row_tile_respects_input_and_sm_grid_boundaries() {
     );
 }
 
+fn pair_part(inputs: u32, outputs: u32, offset: u32) -> weights::MatrixPart {
+    weights::MatrixPart {
+        component_id: ferrum_interfaces::vnext::WeightId::new("component.pair-fixture").unwrap(),
+        format: weights::MatrixFormat::Block(GgufBlockFormat::Q8_0),
+        rows: outputs,
+        columns: inputs,
+        output_offset: offset,
+        transform: None,
+        signs_region: None,
+    }
+}
+
+#[test]
+fn q8_0_pair_preserves_each_leaf_tile_policy_and_disjoint_windows() {
+    let a = pair_part(1024, 32, 3);
+    let b = pair_part(1024, 32, 40);
+    // Each original grid selects T1, even though the combined N would select
+    // T8 at this boundary. Noncontiguous and reversed output windows are legal.
+    assert_eq!(q8_0_f16_row_tile(8, 1024, 64, 4), LINEAR_ROW_TILE);
+    assert!(q8_0_pair_f16_eligible([&a, &b], 8, 80, 4).unwrap());
+    assert!(q8_0_pair_f16_eligible([&b, &a], 8, 80, 4).unwrap());
+    let wider = pair_part(1024, 64, 40);
+    assert!(!q8_0_pair_f16_eligible([&a, &wider], 8, 104, 4).unwrap());
+    let low_k = pair_part(992, 32, 3);
+    let low_k_b = pair_part(992, 32, 40);
+    assert!(!q8_0_pair_f16_eligible([&low_k, &low_k_b], 8, 80, 4).unwrap());
+    assert!(q8_0_pair_f16_eligible([&low_k, &low_k_b], 1, 80, 4).unwrap());
+    let mismatch = pair_part(1056, 32, 40);
+    assert!(!q8_0_pair_f16_eligible([&a, &mismatch], 1, 80, 4).unwrap());
+    let mut signs = b.clone();
+    signs.signs_region = Some(0);
+    assert!(!q8_0_pair_f16_eligible([&a, &signs], 1, 80, 4).unwrap());
+    let mut transformed = b.clone();
+    transformed.transform = Some(ferrum_interfaces::vnext::HadamardTransformSpec {
+        block_size: std::num::NonZeroU32::new(32).unwrap(),
+        signs: ferrum_interfaces::vnext::HadamardSigns::Identity,
+        application: ferrum_interfaces::vnext::HadamardApplication::BeforeMatmul {
+            input_permutation: None,
+        },
+    });
+    assert!(!q8_0_pair_f16_eligible([&a, &transformed], 1, 80, 4).unwrap());
+    let mut other_format = b.clone();
+    other_format.format = weights::MatrixFormat::Block(GgufBlockFormat::Q4K);
+    assert!(!q8_0_pair_f16_eligible([&a, &other_format], 1, 80, 4).unwrap());
+}
+
+#[test]
+fn q8_0_pair_rejects_applicable_capacity_and_output_alias_errors() {
+    let a = pair_part(1024, 17, 3);
+    let b = pair_part(1024, 7, 29);
+    assert!(q8_0_pair_f16_eligible([&a, &b], 1, 36, 4).unwrap());
+    assert!(q8_0_pair_f16_eligible([&a, &b], 0, 36, 4).is_err());
+    assert!(!q8_0_pair_f16_eligible([&a, &b], 65536, 36, 4).unwrap());
+    assert!(!q8_0_pair_f16_eligible([&a, &b], i32::MAX as u32 + 1, 36, 4).unwrap());
+    assert!(q8_0_pair_f16_eligible([&a, &b], 1, 35, 4).is_err());
+    let overlap = pair_part(1024, 7, 19);
+    assert!(q8_0_pair_f16_eligible([&a, &overlap], 1, 36, 4).is_err());
+    let overflow = pair_part(1024, 7, u32::MAX - 3);
+    assert!(q8_0_pair_f16_eligible([&a, &overflow], 1, 36, 4).is_err());
+    let empty = pair_part(1024, 0, 29);
+    assert!(q8_0_pair_f16_eligible([&a, &empty], 1, 36, 4).is_err());
+    let malformed_a = pair_part(1025, 17, 3);
+    let malformed_b = pair_part(1025, 7, 29);
+    assert!(q8_0_pair_f16_eligible([&malformed_a, &malformed_b], 1, 36, 4).is_err());
+    assert!(!q8_0_pair_f16_eligible([&a, &b], 1, u32::MAX, 4).unwrap());
+    let high_k_a = pair_part(i32::MAX as u32 + 1, 17, 3);
+    let high_k_b = pair_part(i32::MAX as u32 + 1, 7, 29);
+    assert!(!q8_0_pair_f16_eligible([&high_k_a, &high_k_b], 1, 36, 4).unwrap());
+}
+
 #[test]
 #[ignore = "requires an actual CUDA device"]
 fn q8_0_specialization_preserves_generic_bits_and_f64_oracle_on_cuda() {
