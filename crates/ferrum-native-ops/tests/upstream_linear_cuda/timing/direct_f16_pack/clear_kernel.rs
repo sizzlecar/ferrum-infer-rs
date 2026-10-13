@@ -1,10 +1,19 @@
 //! Same-node-count control: only row flag memset becomes a standalone kernel.
-//! Production and the original direct-F16 comparison remain unchanged.
+//! Independent control symbols; measurements make no serving-performance claim.
 use super::*;
 use std::collections::HashMap;
 
 unsafe extern "C" {
     fn ferrum_test_upstream_mmq_pack_f16_direct_kernel_zero_v1(
+        plan: *const UpstreamLinearPlanV1,
+        input: *const c_void,
+        stride: u32,
+        converted: *mut c_void,
+        packed: *mut c_void,
+        flags: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn ferrum_test_upstream_mmvq_pack_f32_intermediate_kernel_zero_v1(
         plan: *const UpstreamLinearPlanV1,
         input: *const c_void,
         stride: u32,
@@ -143,29 +152,73 @@ fn assert_direct_equivalent(fixture: &Fixture, host: &[u16], finite: bool) -> Ve
 }
 
 #[test]
-#[ignore = "exclusive CUDA same-node-count row flag clear control; no product change"]
+#[ignore = "exclusive CUDA independent row flag clear control; no serving claim"]
 fn direct_f16_row_flag_clear_kernel_preserves_bits_and_pairs() {
+    row_flag_clear_kernel_case(
+        Shape {
+            algorithm: UpstreamLinearAlgorithm::Mmq,
+            format: UpstreamLinearFormat::Iq4Xs,
+            m: 8,
+            k: 5120,
+            n: 17408,
+        },
+        [
+            ferrum_test_upstream_mmq_pack_f16_direct_v1,
+            ferrum_test_upstream_mmq_pack_f16_direct_kernel_zero_v1,
+        ],
+        true,
+    );
+}
+
+#[test]
+#[ignore = "exclusive CUDA Q4 SharedM8 flags-only control; original F32 conversion retained"]
+fn mmvq_q4_shared_m8_row_flag_clear_kernel_preserves_bits_and_pairs() {
+    mmvq_row_flag_clear_kernel_case(UpstreamLinearFormat::Q4K, 5120, 10240);
+}
+
+#[test]
+#[ignore = "exclusive CUDA Q5 SharedM8 flags-only control; original F32 conversion retained"]
+fn mmvq_q5_shared_m8_row_flag_clear_kernel_preserves_bits_and_pairs() {
+    mmvq_row_flag_clear_kernel_case(UpstreamLinearFormat::Q5K, 6144, 5120);
+}
+
+fn mmvq_row_flag_clear_kernel_case(format: UpstreamLinearFormat, k: usize, n: usize) {
+    row_flag_clear_kernel_case(
+        Shape {
+            algorithm: UpstreamLinearAlgorithm::Mmvq,
+            format,
+            m: 8,
+            k,
+            n,
+        },
+        [
+            ffi::ferrum_upstream_mmvq_pack_v2,
+            ferrum_test_upstream_mmvq_pack_f32_intermediate_kernel_zero_v1,
+        ],
+        false,
+    );
+}
+
+fn row_flag_clear_kernel_case(shape: Shape, packs: [Pack; 2], direct: bool) {
     let _ = caps();
     let mut l2 = 0;
     unsafe {
         ok(cudaDeviceGetAttribute(&mut l2, 38, 0));
     }
     assert!(l2 > 0);
-    let shape = Shape {
-        algorithm: UpstreamLinearAlgorithm::Mmq,
-        format: UpstreamLinearFormat::Iq4Xs,
-        m: 8,
-        k: 5120,
-        n: 17408,
-    };
     let fixture = Fixture::new(shape, 3 * l2 as usize);
     let stream = Stream::new();
     fixture.scan(&stream);
-    let packs: [Pack; 2] = [
-        ferrum_test_upstream_mmq_pack_f16_direct_v1,
-        ferrum_test_upstream_mmq_pack_f16_direct_kernel_zero_v1,
-    ];
     let enqueue = |arm, index| fixture.enqueue_with_pack(&stream, arm, index, packs[arm]);
+    let assert_equivalent = |host: &[u16], finite| {
+        if direct {
+            assert_direct_equivalent(&fixture, host, finite)
+        } else {
+            // Both MMVQ arms retain the real F16->F32 conversion, including
+            // padding. The existing checker proves full converted-byte equality.
+            fixture.assert_equal_with_converted(host, finite, false)
+        }
+    };
     let host = fixture.write_input(0, false);
     for arm in 0..2 {
         for index in 0..fixture.count {
@@ -173,7 +226,7 @@ fn direct_f16_row_flag_clear_kernel_preserves_bits_and_pairs() {
         }
     }
     stream.sync();
-    let stable = assert_direct_equivalent(&fixture, &host, true);
+    let stable = assert_equivalent(&host, true);
     let laps = 320_usize.div_ceil(fixture.count);
     let projections = laps * fixture.count;
     let graphs = [0, 1].map(|arm| {
@@ -208,34 +261,40 @@ fn direct_f16_row_flag_clear_kernel_preserves_bits_and_pairs() {
         graph.launch(&stream);
     }
     stream.sync();
-    assert_direct_equivalent(&fixture, &edge_host, false);
+    assert_equivalent(&edge_host, false);
     let host = fixture.write_input(0, false);
     for (graph, _) in &graphs {
         graph.launch(&stream);
     }
     stream.sync();
-    assert_eq!(assert_direct_equivalent(&fixture, &host, true), stable);
+    assert_eq!(assert_equivalent(&host, true), stable);
     const WARM: usize = 2;
     const PAIRS: usize = 8;
     let samples = paired_graph_samples(&stream, [&graphs[0].0, &graphs[1].0], WARM, PAIRS);
     stream.sync();
-    assert_eq!(assert_direct_equivalent(&fixture, &host, true), stable);
+    assert_eq!(assert_equivalent(&host, true), stable);
     let fresh = fixture.write_input(1, false);
     for (graph, _) in &graphs {
         graph.launch(&stream);
     }
     stream.sync();
-    assert_ne!(assert_direct_equivalent(&fixture, &fresh, true), stable);
+    assert_ne!(assert_equivalent(&fresh, true), stable);
     for (launches, pair, order, arm, wall, cpu, block_wall_ns, gpu_ns) in samples {
         let mut record = serde_json::json!({
-            "experiment":"direct_f16_row_flag_clear_kernel_control",
-            "algorithm":"Mmq","format":"Iq4Xs","M":8,"K":shape.k,"N":shape.n,
-            "matrix_count":fixture.count,"weight_bytes":fixture.host_weights.len(),
-            "working_set_bytes":fixture.count*fixture.host_weights.len(),"device_l2_bytes":l2,
-            "same_physical_weights_between_arms":true,"input_stride":fixture.input_stride,
-            "input_view_offset_bytes":2,"output_stride":shape.n+5,"output_view_offset_elements":1,
-            "laps":laps,"projections_per_graph":projections,
-            "correctness":"full packed/guard/flags/F32/fixup/F16/padding/canaries/fresh replay, special values then finite reset; both converted buffers untouched"});
+        "experiment":if direct {"direct_f16_row_flag_clear_kernel_control"} else {"mmvq_row_flag_clear_kernel_control"},
+        "algorithm":format!("{:?}",shape.algorithm),"format":format!("{:?}",shape.format),
+        "M":shape.m,"K":shape.k,"N":shape.n,
+        "dot":if direct {"unchanged_mmq"} else {"current_shared_m8"},
+        "matrix_count":fixture.count,"weight_bytes":fixture.host_weights.len(),
+        "working_set_bytes":fixture.count*fixture.host_weights.len(),"device_l2_bytes":l2,
+        "same_physical_weights_between_arms":true,"input_stride":fixture.input_stride,
+        "input_view_offset_bytes":2,"output_stride":shape.n+5,"output_view_offset_elements":1,
+        "laps":laps,"projections_per_graph":projections,
+        "correctness":if direct {
+            "full packed/guard/flags/F32/fixup/F16/padding/canaries/fresh replay, special values then finite reset; both converted buffers untouched"
+        } else {
+            "full packed/flags/F32/fixup/F16/padding/canaries/fresh replay, special values then finite reset; both converted buffers written and full-byte equal"
+        }});
         record["graph"] = serde_json::json!({
             "baseline":baseline.describe(),"candidate":candidate.describe(),
             "same_node_count_and_dependency_chain":true,"memset_to_kernel_replacements":replacements,
@@ -243,11 +302,18 @@ fn direct_f16_row_flag_clear_kernel_preserves_bits_and_pairs() {
             "graph_launches_per_block":launches,"projections_per_block":launches*projections,
             "warm_pairs":WARM,"pairs":PAIRS});
         record["sample"] = serde_json::json!({
-            "pair":pair,"order":order,"arm":if arm==0 {"direct_f16_memset"} else {"direct_f16_clear_kernel"},
+            "pair":pair,"order":order,"arm":match (direct,arm) {
+                (true,0)=>"direct_f16_memset",(true,_)=>"direct_f16_clear_kernel",
+                (false,0)=>"f32_intermediate_memset",(false,_)=>"f32_intermediate_clear_kernel"
+            },
             "gpu_ns":gpu_ns,"block_wall_ns":block_wall_ns,
             "graph_launch_wall_ns":&wall[..launches],"graph_launch_thread_cpu_ns":&cpu[..launches]});
         record["scope"] = serde_json::json!({
-            "only_change":"same direct F16 pack; row flag cudaMemsetAsync becomes standalone clear kernel",
+            "only_change":if direct {
+                "same direct F16 pack; row flag cudaMemsetAsync becomes standalone clear kernel"
+            } else {
+                "same original F16->F32 conversion, quantizer and SharedM8 dot/cast; only row flag cudaMemsetAsync becomes standalone clear kernel"
+            },
             "timing":"raw runtime cudaGraphLaunch with adjacent CPU-clock reads; optional Linux thread CPU; status check outside clocks; GPU events and full block through final fence",
             "excluded":"pre-block idle fence/allocation/upload/cold scan/capture/topology queries/assertions/readback",
             "limits":"runtime API proxy, not product driver API; event span not sum of kernels; CPU may include busy-spin; no model throughput claim"});

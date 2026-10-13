@@ -1058,14 +1058,36 @@ extern "C" int ferrum_upstream_mmvq_cast_v1(const FerrumUpstreamLinearPlanV1 * p
     });
 }
 
-extern "C" int ferrum_upstream_mmvq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+// Test-only node-type control. Preserve the converted-input quantizer and its
+// marker atomics; the separate predecessor clears exactly the row flags span.
+static __global__ void test_mmvq_zero_row_flags(uint32_t * flags, uint32_t rows) {
+    const uint64_t row = uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (row < rows) {
+        flags[row] = 0;
+    }
+}
+#endif
+
+template <bool KernelZero = false>
+static int upstream_mmvq_pack_f32_intermediate(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
     return ferrum_upstream_boundary([&]() -> int {
         TestMmvqPlan n{}; if(!upstream_mmvq_valid(p,n)) return -1;
         if(!input||!converted||!packed||!flags||stride<n.inputs||uint64_t(stride)*n.rows>INT_MAX||
             uintptr_t(input)%2||uintptr_t(converted)%16||uintptr_t(packed)%4||uintptr_t(flags)%4) return -5;
         const auto stream=static_cast<cudaStream_t>(s);
-        auto status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
+        cudaError_t status;
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+        if constexpr (KernelZero) {
+            test_mmvq_zero_row_flags<<<(uint64_t(n.rows)+127)/128,128,0,stream>>>(
+                static_cast<uint32_t *>(flags),n.rows);
+            status=cudaGetLastError();
+        } else
+#endif
+        {
+            status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
+        }
         if(status!=cudaSuccess) return status;
         test_mmvq_convert<<<(n.rows*n.padded_inputs+255)/256,256,0,stream>>>(
             static_cast<const half *>(input),static_cast<float *>(converted),n.rows,n.inputs,stride,n.padded_inputs);
@@ -1078,7 +1100,15 @@ extern "C" int ferrum_upstream_mmvq_pack_v2(const FerrumUpstreamLinearPlanV1 * p
         return cudaGetLastError();
     });
 }
+extern "C" int ferrum_upstream_mmvq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return upstream_mmvq_pack_f32_intermediate(p,input,stride,converted,packed,flags,s);
+}
 #if defined(FERRUM_TEST_DIRECT_F16_PACK)
+extern "C" int ferrum_test_upstream_mmvq_pack_f32_intermediate_kernel_zero_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return upstream_mmvq_pack_f32_intermediate<true>(p,input,stride,converted,packed,flags,s);
+}
 // Keep the original pack ABI/checks, but leave converted entirely untouched.
 extern "C" int ferrum_test_upstream_mmvq_pack_f16_direct_v1(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {

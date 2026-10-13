@@ -471,17 +471,14 @@ static int upstream_mmq_pack_f32_intermediate(const FerrumUpstreamLinearPlanV1 *
         return cudaGetLastError();
     });
 }
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
-// Node-type control only: one kernel replaces one memset over the exact flags
-// span. This remains a separate predecessor of the quantizer because several
-// quantizer CTAs can atomicOr the same row marker.
-static __global__ void test_mmq_zero_row_flags(uint32_t * flags, uint32_t rows) {
+// Keep clearing as a separate predecessor of the quantizer: several quantizer
+// CTAs can atomicOr the same row marker. Only the exact flags span is written.
+static __global__ void mmq_zero_row_flags(uint32_t * flags, uint32_t rows) {
     const uint64_t row = uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (row < rows) {
         flags[row] = 0;
     }
 }
-#endif
 
 // Same boundary checks and ABI as pack_v2. converted remains caller-owned but
 // is deliberately neither read nor written by the direct-input implementation.
@@ -494,14 +491,11 @@ static int upstream_mmq_pack_f16_direct(const FerrumUpstreamLinearPlanV1 * p,
             uintptr_t(input)%2||uintptr_t(converted)%16||uintptr_t(packed)%16||uintptr_t(flags)%4) return -5;
         const auto stream=static_cast<cudaStream_t>(s);
         cudaError_t status;
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
         if constexpr (KernelZero) {
-            test_mmq_zero_row_flags<<<(uint64_t(n.rows)+127)/128,128,0,stream>>>(
+            mmq_zero_row_flags<<<(uint64_t(n.rows)+127)/128,128,0,stream>>>(
                 static_cast<uint32_t *>(flags),n.rows);
             status=cudaGetLastError();
-        } else
-#endif
-        {
+        } else {
             status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
         }
         if(status!=cudaSuccess) return status;
@@ -525,20 +519,29 @@ extern "C" int ferrum_upstream_mmq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
     // the separately admitted prefill implementation and its scratch writes.
     // Both helpers perform the complete existing plan/span/alignment checks.
     if (p && p->request.rows <= 32) {
-        return upstream_mmq_pack_f16_direct(p,input,stride,converted,packed,flags,s);
+        return upstream_mmq_pack_f16_direct<true>(p,input,stride,converted,packed,flags,s);
     }
     return upstream_mmq_pack_f32_intermediate(p,input,stride,converted,packed,flags,s);
 }
 
-// Versioned, callable capability: this archive's pack_v2 uses one direct pack
-// kernel and one row-flags memset for valid physical rows 1..32, with no
-// conversion kernel or separate guard memset. The ABI and scratch extents are
-// unchanged. Older archives without this export retain their original counts.
+// Retained callable v1 uses one direct pack kernel and one row-flags memset for
+// valid physical rows 1..32. Archives with only this capability also used that
+// implementation for pack_v2; newer capabilities take precedence in metadata.
 extern "C" int ferrum_upstream_mmq_pack_f16_small_v1(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
     if (!p || !p->request.rows) return -1;
     if (p->request.rows > 32) return -2;
     return upstream_mmq_pack_f16_direct(p,input,stride,converted,packed,flags,s);
+}
+
+// Versioned, callable v2 and this archive's small-row pack_v2 use two kernels
+// and no memset: row-flags clear followed by direct F16 pack with guard clear.
+// ABI, scratch extents, alignment requirements and numerical behavior match v1.
+extern "C" int ferrum_upstream_mmq_pack_f16_small_v2(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    if (!p || !p->request.rows) return -1;
+    if (p->request.rows > 32) return -2;
+    return upstream_mmq_pack_f16_direct<true>(p,input,stride,converted,packed,flags,s);
 }
 
 #if defined(FERRUM_TEST_DIRECT_F16_PACK)

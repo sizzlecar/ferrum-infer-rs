@@ -413,6 +413,7 @@
     "ferrum_upstream_mmq_check_weights_v2",
     "ferrum_upstream_mmq_dot_v1",
     "ferrum_upstream_mmq_pack_f16_small_v1",
+    "ferrum_upstream_mmq_pack_f16_small_v2",
     "ferrum_upstream_mmq_pack_v1",
     "ferrum_upstream_mmq_pack_v2",
     "ferrum_upstream_mmq_plan_v1",
