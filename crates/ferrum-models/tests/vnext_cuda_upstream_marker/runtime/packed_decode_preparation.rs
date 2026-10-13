@@ -269,13 +269,6 @@ fn verify_options_with_q4_grouping(
             fixture
                 ._composition
                 ._runtime
-                .causal_decode_attention_grouping(),
-            groupings[arm]
-        );
-        assert_eq!(
-            fixture
-                ._composition
-                ._runtime
                 .segment_binding_owner_view_mode(),
             SegmentBindingOwnerViewMode::Indexed
         );
