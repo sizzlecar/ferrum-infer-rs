@@ -2109,6 +2109,46 @@ impl VNextStepAdmissionTimingMetrics {
 }
 
 #[derive(Default)]
+struct VNextEnqueueCallMetrics {
+    wall: AtomicDurationMetrics,
+    thread_cpu: AtomicDurationMetrics,
+    thread_cpu_paired_wall: AtomicDurationMetrics,
+    thread_cpu_unavailable_samples: AtomicU64,
+}
+
+impl VNextEnqueueCallMetrics {
+    fn record(&self, wall: Duration, thread_cpu: Option<Duration>) {
+        self.wall.record(wall);
+        if let Some(cpu) = thread_cpu {
+            self.thread_cpu.record(cpu);
+            self.thread_cpu_paired_wall.record(wall);
+        } else {
+            self.thread_cpu_unavailable_samples
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let thread_cpu = self.thread_cpu.snapshot();
+        let has_cpu_samples = thread_cpu["samples"].as_u64().is_some_and(|n| n > 0);
+        serde_json::json!({
+            "wall": self.wall.snapshot(),
+            "thread_cpu": has_cpu_samples.then_some(thread_cpu),
+            "thread_cpu_paired_wall": has_cpu_samples.then(|| self.thread_cpu_paired_wall.snapshot()),
+            "thread_cpu_unavailable_samples": self.thread_cpu_unavailable_samples.load(Ordering::Relaxed),
+        })
+    }
+
+    fn reset(&self) {
+        self.wall.reset();
+        self.thread_cpu.reset();
+        self.thread_cpu_paired_wall.reset();
+        self.thread_cpu_unavailable_samples
+            .store(0, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
 struct VNextWaveTimingMetrics {
     resource_prepare_attempt: AtomicDurationMetrics,
     resource_step_request_prepare: AtomicDurationMetrics,
@@ -2144,6 +2184,9 @@ struct VNextWaveTimingMetrics {
     device_submit_validate_prepare: AtomicDurationMetrics,
     device_submit_begin_timing: AtomicDurationMetrics,
     device_submit_enqueue_commands: AtomicDurationMetrics,
+    device_enqueue_graph_launch: VNextEnqueueCallMetrics,
+    device_enqueue_eager_command: VNextEnqueueCallMetrics,
+    device_enqueue_deferred_snapshot_readback: VNextEnqueueCallMetrics,
     device_submit_record_fence_account: AtomicDurationMetrics,
     reusable_execution: VNextReusableExecutionMetrics,
     completion_arm: AtomicDurationMetrics,
@@ -2261,6 +2304,7 @@ impl VNextWaveTimingMetrics {
                             "validate_and_prepare": self.device_submit_validate_prepare.snapshot(),
                             "begin_timing": self.device_submit_begin_timing.snapshot(),
                             "enqueue_commands": self.device_submit_enqueue_commands.snapshot(),
+                            "enqueue_commands_breakdown": self.enqueue_commands_breakdown(),
                             "record_fence_and_account": self.device_submit_record_fence_account.snapshot(),
                             "reusable_execution": self.reusable_execution.snapshot(),
                         },
@@ -2288,9 +2332,22 @@ impl VNextWaveTimingMetrics {
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
                 "device_runtime_submit breakdown isolates backend validation/preparation, timing start, ordered command enqueue, and fence/accounting for runtimes that implement typed attribution",
+                "enqueue_commands children are nested per-call host intervals, not additional wave time; optional thread_cpu and its paired wall use only calls with valid CPU samples; unavailable includes clocks not collected; these clocks are not additive, and their difference cannot identify driver waits or GPU idle; snapshots are not atomic",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
             ],
+        })
+    }
+
+    fn enqueue_commands_breakdown(&self) -> serde_json::Value {
+        serde_json::json!({
+            "collection": "profile_attached_only",
+            "scope": "per_call_nested_in_enqueue_commands",
+            "wall_clock": "host_monotonic",
+            "thread_cpu_clock": "calling_thread_cpu_time_when_available",
+            "graph_launch": self.device_enqueue_graph_launch.snapshot(),
+            "eager_command": self.device_enqueue_eager_command.snapshot(),
+            "deferred_snapshot_readback": self.device_enqueue_deferred_snapshot_readback.snapshot(),
         })
     }
 
@@ -2361,6 +2418,9 @@ impl VNextWaveTimingMetrics {
             metrics.reset();
         }
         self.resource_step_admission_breakdown.reset();
+        self.device_enqueue_graph_launch.reset();
+        self.device_enqueue_eager_command.reset();
+        self.device_enqueue_deferred_snapshot_readback.reset();
         self.reusable_execution.reset();
     }
 }
@@ -2463,6 +2523,22 @@ impl VNextReusableExecutionMetrics {
 impl DeviceSubmissionTimingSink for VNextWaveTimingMetrics {
     const ENABLED: bool = true;
 
+    fn record_device_enqueue(
+        &self,
+        stage: DeviceEnqueueStage,
+        wall: Duration,
+        thread_cpu: Option<Duration>,
+    ) {
+        match stage {
+            DeviceEnqueueStage::GraphLaunch => &self.device_enqueue_graph_launch,
+            DeviceEnqueueStage::EagerCommand => &self.device_enqueue_eager_command,
+            DeviceEnqueueStage::DeferredSnapshotReadback => {
+                &self.device_enqueue_deferred_snapshot_readback
+            }
+        }
+        .record(wall, thread_cpu);
+    }
+
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration) {
         match stage {
             DeviceSubmissionStage::ValidateAndPrepare => {
@@ -2562,6 +2638,17 @@ struct VNextWaveTimingSink<'metrics> {
 
 impl DeviceSubmissionTimingSink for VNextWaveTimingSink<'_> {
     const ENABLED: bool = true;
+
+    fn record_device_enqueue(
+        &self,
+        stage: DeviceEnqueueStage,
+        wall: Duration,
+        thread_cpu: Option<Duration>,
+    ) {
+        self.aggregate
+            .record_device_enqueue(stage, wall, thread_cpu);
+        self.phase.record_device_enqueue(stage, wall, thread_cpu);
+    }
 
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration) {
         self.aggregate.record_device_submission(stage, elapsed);
@@ -11496,6 +11583,94 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry.as_str().unwrap().contains("not kernel")));
+    }
+
+    #[test]
+    fn wave_timing_enqueue_calls_preserve_cpu_availability_phase_and_reset() {
+        use ferrum_interfaces::vnext::{DeviceEnqueueStage, DeviceSubmissionStage};
+
+        let aggregate = VNextWaveTimingMetrics::default();
+        let decode = VNextWaveTimingMetrics::default();
+        let prefill = VNextWaveTimingMetrics::default();
+        let sink = VNextWaveTimingSink {
+            aggregate: &aggregate,
+            phase: &decode,
+        };
+        sink.record_device_submission(
+            DeviceSubmissionStage::EnqueueCommands,
+            Duration::from_nanos(900),
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::GraphLaunch,
+            Duration::from_nanos(100),
+            Some(Duration::from_nanos(40)),
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::GraphLaunch,
+            Duration::from_nanos(300),
+            None,
+        );
+        // An available zero CPU interval is a sample, distinct from unavailable.
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::GraphLaunch,
+            Duration::ZERO,
+            Some(Duration::ZERO),
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::EagerCommand,
+            Duration::from_nanos(70),
+            None,
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::DeferredSnapshotReadback,
+            Duration::from_nanos(80),
+            None,
+        );
+
+        for metrics in [&aggregate, &decode] {
+            let snapshot = metrics.snapshot();
+            let submit = &snapshot["host_encode_submit_breakdown"]
+                ["provider_encode_submit_breakdown"]["lane_reserve_submit_arm_breakdown"]
+                ["device_runtime_submit_breakdown"];
+            let children = &submit["enqueue_commands_breakdown"];
+            assert_eq!(children["scope"], "per_call_nested_in_enqueue_commands");
+            let graph = &children["graph_launch"];
+            assert_eq!(graph["wall"]["samples"], 3);
+            assert_eq!(graph["wall"]["total_ns"], 400);
+            assert_eq!(graph["thread_cpu"]["samples"], 2);
+            assert_eq!(graph["thread_cpu"]["total_ns"], 40);
+            assert_eq!(graph["thread_cpu_paired_wall"]["samples"], 2);
+            assert_eq!(graph["thread_cpu_paired_wall"]["total_ns"], 100);
+            assert_eq!(graph["thread_cpu_unavailable_samples"], 1);
+            for (field, wall_ns) in [("eager_command", 70), ("deferred_snapshot_readback", 80)] {
+                assert_eq!(children[field]["wall"]["samples"], 1);
+                assert_eq!(children[field]["wall"]["total_ns"], wall_ns);
+                assert!(children[field]["thread_cpu"].is_null());
+                assert!(children[field]["thread_cpu_paired_wall"].is_null());
+                assert_eq!(children[field]["thread_cpu_unavailable_samples"], 1);
+            }
+            // Nested calls neither synthesize a wave nor add to its parent.
+            assert_eq!(submit["enqueue_commands"]["samples"], 1);
+            assert_eq!(submit["enqueue_commands"]["total_ns"], 900);
+            assert_eq!(snapshot["submitted_wave_total"]["samples"], 0);
+            metrics.reset();
+            assert_eq!(
+                metrics.enqueue_commands_breakdown(),
+                prefill.enqueue_commands_breakdown()
+            );
+        }
+        let untouched = prefill.enqueue_commands_breakdown();
+        for field in [
+            "graph_launch",
+            "eager_command",
+            "deferred_snapshot_readback",
+        ] {
+            assert_eq!(untouched[field]["wall"]["samples"], 0);
+            assert_eq!(untouched[field]["wall"]["total_ns"], 0);
+            assert!(untouched[field]["thread_cpu"].is_null());
+            assert!(untouched[field]["thread_cpu_paired_wall"].is_null());
+            assert_eq!(untouched[field]["thread_cpu_unavailable_samples"], 0);
+        }
     }
 
     #[test]

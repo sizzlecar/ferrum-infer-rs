@@ -55,6 +55,7 @@ impl IdentityFixture {
 enum Event {
     Host(SubmissionWaveDispatchStage, Duration),
     Device(DeviceSubmissionStage, Duration),
+    Enqueue(DeviceEnqueueStage, Duration, Option<Duration>),
     Submission(DeviceReusableExecutionObservation),
     Preparation(
         Option<DeviceReusableExecutionProgramId>,
@@ -72,6 +73,15 @@ struct CaptureSink(Mutex<Vec<Event>>);
 
 impl DeviceSubmissionTimingSink for CaptureSink {
     const ENABLED: bool = true;
+
+    fn record_device_enqueue(
+        &self,
+        stage: DeviceEnqueueStage,
+        wall: Duration,
+        thread_cpu: Option<Duration>,
+    ) {
+        self.0.lock().push(Event::Enqueue(stage, wall, thread_cpu));
+    }
 
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration) {
         self.0.lock().push(Event::Device(stage, elapsed));
@@ -401,6 +411,26 @@ fn reusable_cold_path_callbacks_forward_unchanged_and_repeats_remain_visible() {
         sink.record_device_submission(
             DeviceSubmissionStage::EnqueueCommands,
             Duration::from_nanos(5),
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::GraphLaunch,
+            Duration::from_nanos(7),
+            Some(Duration::from_nanos(3)),
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::GraphLaunch,
+            Duration::from_nanos(11),
+            None,
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::EagerCommand,
+            Duration::from_nanos(13),
+            None,
+        );
+        sink.record_device_enqueue(
+            DeviceEnqueueStage::DeferredSnapshotReadback,
+            Duration::from_nanos(17),
+            None,
         );
         let mut warm = DeviceReusableExecutionObservation::default();
         warm.observe_warmup_required_segment();

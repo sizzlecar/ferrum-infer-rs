@@ -26,9 +26,9 @@ use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
     DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
-    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
-    DeviceNativeWorkAttribution, DeviceProgramBindingUploadSnapshot,
+    DeviceEnqueueStage, DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind,
+    DeviceExecutionPath, DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId,
+    DeviceNativeOperationId, DeviceNativeWorkAttribution, DeviceProgramBindingUploadSnapshot,
     DeviceReplayedLogicalCommandAttribution, DeviceReplayedSegmentAttribution,
     DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
@@ -47,6 +47,7 @@ use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 use super::vnext_tool_correlation;
+use crate::backend::enqueue_timing;
 use crate::backend::program_binding_upload::ProgramBindingUploadCounters;
 
 mod binding_scatter;
@@ -5316,6 +5317,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     invocation,
                     timing_mode,
                     logical_attribution,
+                    timing_sink,
                 );
                 let end = command_spans.as_ref().and_then(|_| {
                     stream
@@ -5427,10 +5429,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             ))
                             .ok()
                     });
-                    let launched =
-                        stream
-                            .executable_cache
-                            .launch(&stream.stream, candidate, timing_mode);
+                    let launched = stream.executable_cache.launch(
+                        &stream.stream,
+                        candidate,
+                        timing_mode,
+                        timing_sink,
+                    );
                     let end = command_spans.as_ref().and_then(|_| {
                         stream
                             .stream
@@ -5451,10 +5455,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     }
                 }
                 Some(candidate) if !physical_span_attribution => {
-                    match stream
-                        .executable_cache
-                        .launch(&stream.stream, candidate, timing_mode)
-                    {
+                    match stream.executable_cache.launch(
+                        &stream.stream,
+                        candidate,
+                        timing_mode,
+                        timing_sink,
+                    ) {
                         Ok(Some(_)) => Some(Ok((candidate.end(), None, None, None))),
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
@@ -5518,7 +5524,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
                     .ok()
             });
-            let work = match commands[index].enqueue(&stream.stream, &stream.blas) {
+            let work = match enqueue_timing::measure(
+                timing_sink,
+                DeviceEnqueueStage::EagerCommand,
+                false,
+                || commands[index].enqueue(&stream.stream, &stream.blas),
+            ) {
                 Ok(work) => work,
                 Err(error) => {
                     stream.state.fail();
@@ -5561,11 +5572,18 @@ impl DeviceRuntime for CudaDeviceRuntime {
         // Snapshot non-aliasing typed binding statuses after all eager or
         // replayed computation and before the fence. The prelude commands own
         // both their source regions and pinned host destinations until terminal.
-        let numerical_snapshot = commands
-            .iter()
-            .flat_map(|command| &command.completion_checks)
-            .filter(|check| check.deferred)
-            .try_for_each(|check| check.enqueue(&stream.stream));
+        let numerical_snapshot = enqueue_timing::measure(
+            timing_sink,
+            DeviceEnqueueStage::DeferredSnapshotReadback,
+            false,
+            || {
+                commands
+                    .iter()
+                    .flat_map(|command| &command.completion_checks)
+                    .filter(|check| check.deferred)
+                    .try_for_each(|check| check.enqueue(&stream.stream))
+            },
+        );
         if let Err(error) = numerical_snapshot {
             stream.state.fail();
             self.quarantine(stream, commands);
