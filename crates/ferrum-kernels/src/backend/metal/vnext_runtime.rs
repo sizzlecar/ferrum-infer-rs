@@ -3284,289 +3284,304 @@ mod tests {
 
     #[test]
     fn shared_counter_cpu_resolve_uses_original_completed_samples() {
-        let runtime = runtime();
-        if !matches!(
-            runtime.timestamp_counter_support(),
-            MetalTimestampCounterSupport::Supported(_)
-        ) {
-            return;
-        }
-        let destination = runtime
-            .allocate_request(&buffer_request("resource/cpu-counter-resolve"))
-            .unwrap();
-        let command = runtime.encode_zero(&destination, 0, 8).unwrap();
-        let mut stream = runtime.create_stream().unwrap();
-        let fence = runtime
-            .submit_commands(
-                &mut stream,
-                compute_entries(vec![command]),
-                DeviceTimingMode::Kernel,
-                &DisabledDeviceSubmissionTimingSink,
+        let _counter_guard = super::counter_capacity_tests::counter_test_guard();
+        metal::objc::rc::autoreleasepool(|| {
+            let runtime = runtime();
+            if !matches!(
+                runtime.timestamp_counter_support(),
+                MetalTimestampCounterSupport::Supported(_)
+            ) {
+                return;
+            }
+            let destination = runtime
+                .allocate_request(&buffer_request("resource/cpu-counter-resolve"))
+                .unwrap();
+            let command = runtime.encode_zero(&destination, 0, 8).unwrap();
+            let mut stream = runtime.create_stream().unwrap();
+            let fence = runtime
+                .submit_commands(
+                    &mut stream,
+                    compute_entries(vec![command]),
+                    DeviceTimingMode::Kernel,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .unwrap();
+            // Wait for the same command, without invoking its production resolve.
+            // Capture the end anchors once; CPU resolution does not sample again.
+            fence.command_buffer.wait_until_completed();
+            assert_eq!(
+                fence.command_buffer.status(),
+                MTLCommandBufferStatus::Completed
+            );
+            let MetalFenceCommandTiming::Captured { capture, .. } = &fence.command_timing else {
+                panic!("timestamp support must produce a capture")
+            };
+            let mut cpu_end = 0;
+            let mut gpu_end = 0;
+            capture.device.sample_timestamps(&mut cpu_end, &mut gpu_end);
+            let page = &capture.pages[0];
+            let missing = vec![0; page.used_samples as usize];
+            // Exercise the official CPU API on real GPU-produced samples even on
+            // devices whose GPU resolve does not exhibit the reported zero result.
+            let recovered = counter_readback::resolve_missing_samples(
+                &missing,
+                capture.gpu_anchor_start,
+                gpu_end,
+                || counter_readback::resolve_cpu_page(page),
             )
             .unwrap();
-        // Wait for the same command, without invoking its production resolve.
-        // Capture the end anchors once; CPU resolution does not sample again.
-        fence.command_buffer.wait_until_completed();
-        assert_eq!(
-            fence.command_buffer.status(),
-            MTLCommandBufferStatus::Completed
-        );
-        let MetalFenceCommandTiming::Captured { capture, .. } = &fence.command_timing else {
-            panic!("timestamp support must produce a capture")
-        };
-        let mut cpu_end = 0;
-        let mut gpu_end = 0;
-        capture.device.sample_timestamps(&mut cpu_end, &mut gpu_end);
-        let page = &capture.pages[0];
-        let missing = vec![0; page.used_samples as usize];
-        // Exercise the official CPU API on real GPU-produced samples even on
-        // devices whose GPU resolve does not exhibit the reported zero result.
-        let recovered = counter_readback::resolve_missing_samples(
-            &missing,
-            capture.gpu_anchor_start,
-            gpu_end,
-            || counter_readback::resolve_cpu_page(page),
-        )
-        .unwrap();
-        assert_eq!(recovered.len(), 2);
-        assert!(recovered[0] >= capture.gpu_anchor_start);
-        assert!(recovered[1] > recovered[0] && recovered[1] <= gpu_end);
-        assert!(cpu_end > capture.cpu_anchor_start);
-        // The real terminal path also resolves only once and returns one
-        // immutable result on subsequent observations.
-        let terminal = runtime.wait_fence(&fence).unwrap();
-        assert!(terminal.terminal().is_succeeded());
-        let again = runtime.wait_fence(&fence).unwrap();
-        assert_eq!(terminal.submission_timing(), again.submission_timing());
+            assert_eq!(recovered.len(), 2);
+            assert!(recovered[0] >= capture.gpu_anchor_start);
+            assert!(recovered[1] > recovered[0] && recovered[1] <= gpu_end);
+            assert!(cpu_end > capture.cpu_anchor_start);
+            // The real terminal path also resolves only once and returns one
+            // immutable result on subsequent observations.
+            let terminal = runtime.wait_fence(&fence).unwrap();
+            assert!(terminal.terminal().is_succeeded());
+            let again = runtime.wait_fence(&fence).unwrap();
+            assert_eq!(terminal.submission_timing(), again.submission_timing());
+        });
     }
 
     #[test]
     fn kernel_profile_attributes_node_bound_native_work() {
-        let runtime = runtime();
-        let destination = runtime
-            .allocate_request(&buffer_request("resource/kernel-profile-destination"))
-            .expect("destination allocation");
-        let command = runtime
-            .encode_zero(&destination, 0, 8)
-            .expect("zero command")
-            .bind_core_logical_work(
-                DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 2, 8)
-                    .expect("logical work"),
-            )
-            .expect("core logical work");
-        let mut stream = runtime.create_stream().expect("stream");
+        let _counter_guard = super::counter_capacity_tests::counter_test_guard();
+        metal::objc::rc::autoreleasepool(|| {
+            let runtime = runtime();
+            let destination = runtime
+                .allocate_request(&buffer_request("resource/kernel-profile-destination"))
+                .expect("destination allocation");
+            let command = runtime
+                .encode_zero(&destination, 0, 8)
+                .expect("zero command")
+                .bind_core_logical_work(
+                    DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 2, 8)
+                        .expect("logical work"),
+                )
+                .expect("core logical work");
+            let mut stream = runtime.create_stream().expect("stream");
 
-        let fence = runtime
-            .submit_commands(
-                &mut stream,
-                vec![(DeviceCommandPhase::Compute, Some(0), command)],
-                DeviceTimingMode::Kernel,
-                &DisabledDeviceSubmissionTimingSink,
-            )
-            .expect("kernel-profiled submission");
-        let attribution = runtime
-            .submission_attribution(&fence)
-            .expect("kernel profile must retain native work attribution");
-        let [command] = attribution.commands() else {
-            panic!("expected exactly one native command attribution")
-        };
-        assert_eq!(command.command_index(), 0);
-        assert_eq!(command.node_index(), Some(0));
-        assert_eq!(command.command_phase(), DeviceCommandPhase::Compute);
-        assert_eq!(
-            command.native_op_id(),
-            DEVICE_ZERO_NATIVE_OPERATION_ID.as_str()
-        );
-        assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);
-        assert_eq!(command.batching_form(), DeviceBatchingForm::Packed);
-        assert_eq!(command.participant_count(), 2);
-        assert_eq!(command.token_count(), 8);
-        assert_eq!(command.compute_dispatch_count(), 0);
-        assert_eq!(command.transfer_command_count(), 1);
+            let fence = runtime
+                .submit_commands(
+                    &mut stream,
+                    vec![(DeviceCommandPhase::Compute, Some(0), command)],
+                    DeviceTimingMode::Kernel,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .expect("kernel-profiled submission");
+            let attribution = runtime
+                .submission_attribution(&fence)
+                .expect("kernel profile must retain native work attribution");
+            let [command] = attribution.commands() else {
+                panic!("expected exactly one native command attribution")
+            };
+            assert_eq!(command.command_index(), 0);
+            assert_eq!(command.node_index(), Some(0));
+            assert_eq!(command.command_phase(), DeviceCommandPhase::Compute);
+            assert_eq!(
+                command.native_op_id(),
+                DEVICE_ZERO_NATIVE_OPERATION_ID.as_str()
+            );
+            assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);
+            assert_eq!(command.batching_form(), DeviceBatchingForm::Packed);
+            assert_eq!(command.participant_count(), 2);
+            assert_eq!(command.token_count(), 8);
+            assert_eq!(command.compute_dispatch_count(), 0);
+            assert_eq!(command.transfer_command_count(), 1);
 
-        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
-        assert!(terminal.terminal().is_succeeded());
-        assert!(matches!(
-            terminal.execution_timing(),
-            DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
-        ));
-        let timing = match terminal.submission_timing() {
-            DeviceTimingMeasurement::Measured(timing) => timing,
-            DeviceTimingMeasurement::Unavailable(
-                DeviceTimingUnavailableReason::BackendUnsupported,
-            ) => return,
-            other => panic!("Metal kernel profile command timing failed: {other:?}"),
-        };
-        let [timing] = timing.spans() else {
-            panic!("expected exactly one command timing row")
-        };
-        assert_eq!(timing.start_command_index(), command.command_index());
-        assert_eq!(timing.end_command_index(), command.command_index() + 1);
-        let intervals = timing.measurement().intervals().unwrap();
-        assert_eq!(intervals.len(), 1);
-        assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
-        assert!(timing.measurement().elapsed_ns().unwrap() > 0);
+            let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+            assert!(terminal.terminal().is_succeeded());
+            assert!(matches!(
+                terminal.execution_timing(),
+                DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
+            ));
+            let timing = match terminal.submission_timing() {
+                DeviceTimingMeasurement::Measured(timing) => timing,
+                DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendUnsupported,
+                ) => return,
+                other => panic!("Metal kernel profile command timing failed: {other:?}"),
+            };
+            let [timing] = timing.spans() else {
+                panic!("expected exactly one command timing row")
+            };
+            assert_eq!(timing.start_command_index(), command.command_index());
+            assert_eq!(timing.end_command_index(), command.command_index() + 1);
+            let intervals = timing.measurement().intervals().unwrap();
+            assert_eq!(intervals.len(), 1);
+            assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
+            assert!(timing.measurement().elapsed_ns().unwrap() > 0);
+        });
     }
 
     #[test]
     fn kernel_profile_keeps_gpu_timings_around_host_only_command() {
-        let runtime = runtime();
-        let destination = runtime
-            .allocate_request(&buffer_request("resource/kernel-profile-host-hole"))
-            .expect("destination allocation");
-        let first = runtime
-            .encode_zero(&destination, 0, 8)
-            .expect("first zero command");
-        let host_only = MetalDeviceCommand::operation(
-            "test.host_binding",
-            vec![destination.region(0..8).expect("destination region")],
-            |_encoder, _regions| Ok(()),
-        )
-        .expect("host-only command");
-        let last = runtime
-            .encode_zero(&destination, 0, 8)
-            .expect("last zero command");
-        let mut stream = runtime.create_stream().expect("stream");
-
-        let fence = runtime
-            .submit_commands(
-                &mut stream,
-                compute_entries(vec![first, host_only, last]),
-                DeviceTimingMode::Kernel,
-                &DisabledDeviceSubmissionTimingSink,
+        let _counter_guard = super::counter_capacity_tests::counter_test_guard();
+        metal::objc::rc::autoreleasepool(|| {
+            let runtime = runtime();
+            let destination = runtime
+                .allocate_request(&buffer_request("resource/kernel-profile-host-hole"))
+                .expect("destination allocation");
+            let first = runtime
+                .encode_zero(&destination, 0, 8)
+                .expect("first zero command");
+            let host_only = MetalDeviceCommand::operation(
+                "test.host_binding",
+                vec![destination.region(0..8).expect("destination region")],
+                |_encoder, _regions| Ok(()),
             )
-            .expect("kernel-profiled submission");
-        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
-        assert!(terminal.terminal().is_succeeded());
-        let timing = match terminal.submission_timing() {
-            DeviceTimingMeasurement::Measured(timing) => timing,
-            DeviceTimingMeasurement::Unavailable(
-                DeviceTimingUnavailableReason::BackendUnsupported,
-            ) => return,
-            other => panic!("Metal kernel profile command timing failed: {other:?}"),
-        };
+            .expect("host-only command");
+            let last = runtime
+                .encode_zero(&destination, 0, 8)
+                .expect("last zero command");
+            let mut stream = runtime.create_stream().expect("stream");
 
-        assert_eq!(timing.command_count(), 3);
-        let [first, host_only, last] = timing.spans() else {
-            panic!("expected three command timing rows")
-        };
-        for measured in [first, last] {
-            let intervals = measured.measurement().intervals().unwrap();
-            assert_eq!(intervals.len(), 1);
-            assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
-            assert!(measured.measurement().elapsed_ns().unwrap() > 0);
-        }
-        assert_eq!(
-            host_only.measurement().unavailable_reason(),
-            Some(DeviceTimingUnavailableReason::BackendMeasurementFailed)
-        );
+            let fence = runtime
+                .submit_commands(
+                    &mut stream,
+                    compute_entries(vec![first, host_only, last]),
+                    DeviceTimingMode::Kernel,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .expect("kernel-profiled submission");
+            let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+            assert!(terminal.terminal().is_succeeded());
+            let timing = match terminal.submission_timing() {
+                DeviceTimingMeasurement::Measured(timing) => timing,
+                DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendUnsupported,
+                ) => return,
+                other => panic!("Metal kernel profile command timing failed: {other:?}"),
+            };
+
+            assert_eq!(timing.command_count(), 3);
+            let [first, host_only, last] = timing.spans() else {
+                panic!("expected three command timing rows")
+            };
+            for measured in [first, last] {
+                let intervals = measured.measurement().intervals().unwrap();
+                assert_eq!(intervals.len(), 1);
+                assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
+                assert!(measured.measurement().elapsed_ns().unwrap() > 0);
+            }
+            assert_eq!(
+                host_only.measurement().unavailable_reason(),
+                Some(DeviceTimingUnavailableReason::BackendMeasurementFailed)
+            );
+        });
     }
 
     #[test]
     fn replay_profile_reports_physical_timing_without_native_attribution() {
-        let runtime = runtime();
-        let destination = runtime
-            .allocate_request(&buffer_request("resource/replay-profile-destination"))
-            .expect("destination allocation");
-        let command = runtime
-            .encode_zero(&destination, 0, 8)
-            .expect("zero command");
-        let mut stream = runtime.create_stream().expect("stream");
+        let _counter_guard = super::counter_capacity_tests::counter_test_guard();
+        metal::objc::rc::autoreleasepool(|| {
+            let runtime = runtime();
+            let destination = runtime
+                .allocate_request(&buffer_request("resource/replay-profile-destination"))
+                .expect("destination allocation");
+            let command = runtime
+                .encode_zero(&destination, 0, 8)
+                .expect("zero command");
+            let mut stream = runtime.create_stream().expect("stream");
 
-        let fence = runtime
-            .submit_commands(
-                &mut stream,
-                compute_entries(vec![command]),
-                DeviceTimingMode::Replay,
-                &DisabledDeviceSubmissionTimingSink,
-            )
-            .expect("replay-profiled submission");
-        assert!(runtime.submission_attribution(&fence).is_none());
+            let fence = runtime
+                .submit_commands(
+                    &mut stream,
+                    compute_entries(vec![command]),
+                    DeviceTimingMode::Replay,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .expect("replay-profiled submission");
+            assert!(runtime.submission_attribution(&fence).is_none());
 
-        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
-        assert!(terminal.terminal().is_succeeded());
-        assert!(matches!(
-            terminal.execution_timing(),
-            DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
-        ));
-        let timing = match terminal.submission_timing() {
-            DeviceTimingMeasurement::Measured(timing) => timing,
-            DeviceTimingMeasurement::Unavailable(
-                DeviceTimingUnavailableReason::BackendUnsupported,
-            ) => return,
-            other => panic!("Metal replay profile command timing failed: {other:?}"),
-        };
-        assert_eq!(timing.command_count(), 1);
-        assert_eq!(timing.spans().len(), 1);
+            let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+            assert!(terminal.terminal().is_succeeded());
+            assert!(matches!(
+                terminal.execution_timing(),
+                DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
+            ));
+            let timing = match terminal.submission_timing() {
+                DeviceTimingMeasurement::Measured(timing) => timing,
+                DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendUnsupported,
+                ) => return,
+                other => panic!("Metal replay profile command timing failed: {other:?}"),
+            };
+            assert_eq!(timing.command_count(), 1);
+            assert_eq!(timing.spans().len(), 1);
+        });
     }
 
     #[test]
     fn kernel_profile_counts_each_command_inside_one_blit_encoder() {
-        let runtime = runtime();
-        let destination = runtime
-            .allocate_request(&buffer_request("resource/kernel-profile-batched-transfer"))
-            .expect("destination allocation");
-        let region = destination.region(0..8).expect("destination region");
-        let command = MetalDeviceCommand::operation(
-            "batched.device.zero",
-            vec![region],
-            |encoder, regions| {
-                encoder.with_blit_commands(3, |blit| {
-                    for _ in 0..3 {
-                        blit.fill_buffer(
-                            regions[0].buffer(),
-                            NSRange::new(regions[0].offset_bytes(), regions[0].length_bytes()),
-                            0,
-                        );
-                    }
-                });
-                Ok(())
-            },
-        )
-        .expect("batched transfer command")
-        .with_work_shape(DeviceBatchingForm::Packed, 3, 3)
-        .expect("work shape");
-        let mut stream = runtime.create_stream().expect("stream");
-
-        let fence = runtime
-            .submit_commands(
-                &mut stream,
-                vec![(DeviceCommandPhase::Compute, Some(0), command)],
-                DeviceTimingMode::Kernel,
-                &DisabledDeviceSubmissionTimingSink,
+        let _counter_guard = super::counter_capacity_tests::counter_test_guard();
+        metal::objc::rc::autoreleasepool(|| {
+            let runtime = runtime();
+            let destination = runtime
+                .allocate_request(&buffer_request("resource/kernel-profile-batched-transfer"))
+                .expect("destination allocation");
+            let region = destination.region(0..8).expect("destination region");
+            let command = MetalDeviceCommand::operation(
+                "batched.device.zero",
+                vec![region],
+                |encoder, regions| {
+                    encoder.with_blit_commands(3, |blit| {
+                        for _ in 0..3 {
+                            blit.fill_buffer(
+                                regions[0].buffer(),
+                                NSRange::new(regions[0].offset_bytes(), regions[0].length_bytes()),
+                                0,
+                            );
+                        }
+                    });
+                    Ok(())
+                },
             )
-            .expect("kernel-profiled submission");
-        let attribution = runtime
-            .submission_attribution(&fence)
-            .expect("kernel profile must retain native work attribution");
-        let [command] = attribution.commands() else {
-            panic!("expected exactly one native command attribution")
-        };
-        assert_eq!(command.compute_dispatch_count(), 0);
-        assert_eq!(command.transfer_command_count(), 3);
+            .expect("batched transfer command")
+            .with_work_shape(DeviceBatchingForm::Packed, 3, 3)
+            .expect("work shape");
+            let mut stream = runtime.create_stream().expect("stream");
 
-        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
-        assert!(terminal.terminal().is_succeeded());
-        let timing = match terminal.submission_timing() {
-            DeviceTimingMeasurement::Measured(timing) => timing,
-            DeviceTimingMeasurement::Unavailable(
-                DeviceTimingUnavailableReason::BackendUnsupported,
-            ) => return,
-            other => panic!("Metal kernel profile command timing failed: {other:?}"),
-        };
-        let [timing] = timing.spans() else {
-            panic!("expected exactly one command timing row")
-        };
-        assert_eq!(timing.start_command_index(), command.command_index());
-        assert_eq!(timing.end_command_index(), command.command_index() + 1);
-        let intervals = timing.measurement().intervals().unwrap();
-        assert_eq!(
-            intervals.len(),
-            1,
-            "three transfer operations in one blit encoder are one physical interval"
-        );
-        assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
-        assert!(timing.measurement().elapsed_ns().unwrap() > 0);
+            let fence = runtime
+                .submit_commands(
+                    &mut stream,
+                    vec![(DeviceCommandPhase::Compute, Some(0), command)],
+                    DeviceTimingMode::Kernel,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .expect("kernel-profiled submission");
+            let attribution = runtime
+                .submission_attribution(&fence)
+                .expect("kernel profile must retain native work attribution");
+            let [command] = attribution.commands() else {
+                panic!("expected exactly one native command attribution")
+            };
+            assert_eq!(command.compute_dispatch_count(), 0);
+            assert_eq!(command.transfer_command_count(), 3);
+
+            let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+            assert!(terminal.terminal().is_succeeded());
+            let timing = match terminal.submission_timing() {
+                DeviceTimingMeasurement::Measured(timing) => timing,
+                DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendUnsupported,
+                ) => return,
+                other => panic!("Metal kernel profile command timing failed: {other:?}"),
+            };
+            let [timing] = timing.spans() else {
+                panic!("expected exactly one command timing row")
+            };
+            assert_eq!(timing.start_command_index(), command.command_index());
+            assert_eq!(timing.end_command_index(), command.command_index() + 1);
+            let intervals = timing.measurement().intervals().unwrap();
+            assert_eq!(
+                intervals.len(),
+                1,
+                "three transfer operations in one blit encoder are one physical interval"
+            );
+            assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
+            assert!(timing.measurement().elapsed_ns().unwrap() > 0);
+        });
     }
 
     #[test]

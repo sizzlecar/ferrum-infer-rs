@@ -283,12 +283,14 @@ fn counter_lifetime_probe(scope: PoolScope, workload: ProbeWorkload) {
 #[test]
 #[ignore = "model-free GPU lifecycle diagnostic; coordinate an idle GPU and run this test alone"]
 fn counter_capture_whole_run_pool_diagnostic() {
+    let _counter_guard = super::counter_capacity_tests::counter_test_guard();
     counter_lifetime_probe(PoolScope::WholeRun, COUNTER_LIFETIME_WORKLOAD);
 }
 
 #[test]
 #[ignore = "model-free GPU lifecycle diagnostic; coordinate an idle GPU and run this test alone"]
 fn counter_capture_per_submission_pool_diagnostic() {
+    let _counter_guard = super::counter_capacity_tests::counter_test_guard();
     counter_lifetime_probe(PoolScope::EachSubmission, COUNTER_LIFETIME_WORKLOAD);
 }
 
@@ -397,6 +399,7 @@ fn verify_fence_outlives_submit_pool(timing_mode: DeviceTimingMode) {
 
 #[test]
 fn profiled_fence_and_buffers_survive_submit_pool_drain() {
+    let _counter_guard = super::counter_capacity_tests::counter_test_guard();
     verify_fence_outlives_submit_pool(DeviceTimingMode::Kernel);
 }
 
