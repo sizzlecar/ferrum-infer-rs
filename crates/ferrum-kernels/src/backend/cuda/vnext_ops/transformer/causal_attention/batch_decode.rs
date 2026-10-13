@@ -718,7 +718,11 @@ impl PreparedBatchDecode {
         independent_sequence_kv: bool,
         grouping: CausalDecodeAttentionGrouping,
     ) -> Result<Option<Self>, String> {
-        if grouping == CausalDecodeAttentionGrouping::FixedCapacity {
+        if matches!(
+            grouping,
+            CausalDecodeAttentionGrouping::FixedCapacity
+                | CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        ) {
             #[cfg(feature = "cuda-indexed-causal-attention")]
             return fixed::FixedBatchDecode::for_launches(
                 launches,

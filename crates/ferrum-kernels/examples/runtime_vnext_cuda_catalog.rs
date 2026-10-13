@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::cuda_validated_native_operator_catalog_input_with_mmvq_weight_decode;
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_validated_native_operator_catalog_input_with_execution_context_limit;
 use ferrum_types::{
     AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
     NativeOperatorBackend, Q4MmvqWeightDecode, Q5MmvqWeightDecode,
@@ -13,9 +13,9 @@ use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if !matches!(arguments.len(), 6 | 7 | 8 | 9 | 10) {
+    if !matches!(arguments.len(), 6 | 7 | 8 | 9 | 10 | 11) {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> <compiled-native-operators-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode] [q5-mmvq-weight-decode]",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> <compiled-native-operators-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode] [q5-mmvq-weight-decode] [execution-context-limit]",
             arguments.first().map(String::as_str).unwrap_or("runtime_vnext_cuda_catalog")
         )
         .into());
@@ -45,7 +45,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|value| Q5MmvqWeightDecode::parse_runtime_value(value))
         .transpose()?
         .unwrap_or_default();
-    let catalog_input = cuda_validated_native_operator_catalog_input_with_mmvq_weight_decode(
+    let execution_context_limit = arguments
+        .get(10)
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
+    let catalog_input = cuda_validated_native_operator_catalog_input_with_execution_context_limit(
         ordinal,
         DeviceId::new(format!("cuda:{ordinal}"))?,
         policy,
@@ -53,6 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         causal_decode_attention_grouping,
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
+        execution_context_limit,
     )?;
     let capability_catalog = catalog_input.capability_catalog();
     let provider_catalog =

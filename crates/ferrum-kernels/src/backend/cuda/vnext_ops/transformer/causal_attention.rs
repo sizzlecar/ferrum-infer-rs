@@ -146,6 +146,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     packed_decode_prepare_gate: bool,
     decode_attention_grouping: CausalDecodeAttentionGrouping,
+    execution_context_limit: Option<usize>,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     q8act: bool,
@@ -450,6 +451,18 @@ impl CudaCausalPagedAttentionProvider {
         let packed_decode_mode = [u8::from(packed_decode_prepare_gate)];
         let decode_attention_grouping = runtime.causal_decode_attention_grouping();
         let grouping_identity = decode_attention_grouping.as_runtime_value().as_bytes();
+        let execution_context_limit =
+            if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
+                runtime.execution_context_limit()
+            } else {
+                None
+            };
+        if execution_context_limit == Some(0) {
+            return Err(CudaDeviceRuntimeError::contract(
+                "fixed execution capacity requires a positive execution context limit",
+            ));
+        }
+        let execution_context_identity = execution_context_identity(execution_context_limit);
         let mut provider_sources = vec![
             source.as_bytes(),
             packed_decode_mode.as_slice(),
@@ -497,6 +510,9 @@ impl CudaCausalPagedAttentionProvider {
         provider_sources.push(include_bytes!("causal_attention/batch_decode/fixed.rs"));
         provider_sources.push(semantics.fingerprint_tag());
         provider_sources.push(include_bytes!("../../../program_binding_rows.rs"));
+        if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
+            provider_sources.push(&execution_context_identity);
+        }
 
         if upstream {
             provider_sources.extend(super::q8act_attention::upstream::fingerprint_sources());
@@ -515,7 +531,7 @@ impl CudaCausalPagedAttentionProvider {
             );
         }
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
-        let estimator_fingerprint = implementation_fingerprint(&[
+        let mut estimator_sources: Vec<&[u8]> = vec![
             source.as_bytes(),
             packed_decode_mode.as_slice(),
             grouping_identity,
@@ -529,7 +545,11 @@ impl CudaCausalPagedAttentionProvider {
             include_bytes!("causal_attention/precision.rs"),
             include_bytes!("causal_attention/batch_decode.rs"),
             semantics.fingerprint_tag(),
-        ]);
+        ];
+        if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
+            estimator_sources.push(&execution_context_identity);
+        }
+        let estimator_fingerprint = implementation_fingerprint(&estimator_sources);
         let mut provider_capabilities = BTreeSet::from([capability]);
         let mut accepted_weight_formats =
             BTreeSet::from([
@@ -817,6 +837,7 @@ impl CudaCausalPagedAttentionProvider {
             program_binding_upload_strategy: runtime.program_binding_upload_strategy(),
             packed_decode_prepare_gate,
             decode_attention_grouping,
+            execution_context_limit,
             semantics,
             precision,
             q8act,
@@ -882,8 +903,13 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             &request,
             self.descriptor.operation_id().as_str(),
         )?;
-        let shape = CausalAttentionShape::from_attributes_for(request.attributes(), self.semantics)
-            .map_err(invalid_plan)?;
+        let shape = CausalAttentionShape::from_attributes_for_execution(
+            request.attributes(),
+            self.semantics,
+            self.decode_attention_grouping,
+            self.execution_context_limit,
+        )
+        .map_err(invalid_plan)?;
         let q8act = self
             .q8act
             .then(|| {
@@ -1034,6 +1060,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.attention_policy,
             self.semantics,
             self.decode_attention_grouping,
+            self.execution_context_limit,
         )
         .map_err(invalid_plan)
     }
@@ -1050,6 +1077,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.program_binding_upload_strategy,
             self.packed_decode_prepare_gate,
             self.decode_attention_grouping,
+            self.execution_context_limit,
             self.semantics,
             self.precision,
             self.descriptor.operation_id().as_str(),
@@ -1091,6 +1119,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.program_binding_upload_strategy,
             self.packed_decode_prepare_gate,
             self.decode_attention_grouping,
+            self.execution_context_limit,
             self.semantics,
             self.precision,
             self.descriptor.operation_id().as_str(),
@@ -1146,6 +1175,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 self.program_binding_upload_strategy,
                 self.packed_decode_prepare_gate,
                 self.decode_attention_grouping,
+                self.execution_context_limit,
                 self.semantics,
                 self.precision,
                 self.descriptor.operation_id().as_str(),
@@ -1167,6 +1197,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         encode_reusable_attention_bindings(
             invocation,
             self.semantics,
+            self.decode_attention_grouping,
+            self.execution_context_limit,
             self.program_binding_upload_strategy,
             self.descriptor.operation_id().as_str(),
         )
@@ -1423,20 +1455,38 @@ impl CausalAttentionReplayTopology {
     }
 }
 
+fn execution_context_identity(limit: Option<usize>) -> [u8; 9] {
+    let mut identity = [0_u8; 9];
+    if let Some(limit) = limit {
+        identity[0] = 1;
+        identity[1..].copy_from_slice(&(limit as u64).to_le_bytes());
+    }
+    identity
+}
+
 fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
     attention_policy: AttentionExecutionPolicy,
     semantics: CausalAttentionSemantics,
     grouping: CausalDecodeAttentionGrouping,
+    execution_context_limit: Option<usize>,
 ) -> Result<ReusableExecutionTopology, String> {
-    let shape = CausalAttentionShape::from_attributes_for(request.attributes(), semantics)?;
+    let shape = CausalAttentionShape::from_attributes_for_execution(
+        request.attributes(),
+        semantics,
+        grouping,
+        execution_context_limit,
+    )?;
     let ranges = request.work_shape().participant_token_ranges();
     if ranges.is_empty() {
         return Err("CUDA causal topology has no participant token ranges".to_owned());
     }
 
-    if grouping == CausalDecodeAttentionGrouping::FixedCapacity
-        && cfg!(feature = "cuda-indexed-causal-attention")
+    if matches!(
+        grouping,
+        CausalDecodeAttentionGrouping::FixedCapacity
+            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
+    ) && cfg!(feature = "cuda-indexed-causal-attention")
         && ranges.len() > 1
         && !shape.int8_kv
         && request
@@ -1607,6 +1657,36 @@ where
 }
 
 impl CausalAttentionShape {
+    fn from_attributes_for_execution(
+        attributes: &BTreeMap<AttributeId, SemanticValue>,
+        semantics: CausalAttentionSemantics,
+        grouping: CausalDecodeAttentionGrouping,
+        execution_context_limit: Option<usize>,
+    ) -> Result<Self, String> {
+        // Validate model semantics first: a sliding window may exceed the
+        // configured execution ceiling without changing attention semantics.
+        Self::from_attributes_for(attributes, semantics)?
+            .with_execution_context_limit(grouping, execution_context_limit)
+    }
+
+    fn with_execution_context_limit(
+        mut self,
+        grouping: CausalDecodeAttentionGrouping,
+        execution_context_limit: Option<usize>,
+    ) -> Result<Self, String> {
+        if grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
+            if let Some(limit) = execution_context_limit {
+                if limit == 0 {
+                    return Err("execution context limit must be positive".to_owned());
+                }
+                let limit = u64::try_from(limit)
+                    .map_err(|_| "execution context limit exceeds u64".to_owned())?;
+                self.maximum_context_tokens = self.maximum_context_tokens.min(limit);
+            }
+        }
+        Ok(self)
+    }
+
     fn from_attributes(attributes: &BTreeMap<AttributeId, SemanticValue>) -> Result<Self, String> {
         Self::from_attributes_for(attributes, CausalAttentionSemantics::Standard)
     }
@@ -2514,6 +2594,7 @@ fn encode_attention(
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     packed_decode_prepare_gate: bool,
     decode_attention_grouping: CausalDecodeAttentionGrouping,
+    execution_context_limit: Option<usize>,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
     operation_id: &str,
@@ -2550,7 +2631,12 @@ fn encode_attention(
         q8act
     };
     let mut q8act = q8act;
-    let shape = CausalAttentionShape::from_attributes_for(first.attributes(), semantics)?;
+    let shape = CausalAttentionShape::from_attributes_for_execution(
+        first.attributes(),
+        semantics,
+        decode_attention_grouping,
+        execution_context_limit,
+    )?;
     let projection = CausalProjection::from_values(
         first.bindings(),
         #[cfg(feature = "vllm-marlin")]
@@ -2558,7 +2644,12 @@ fn encode_attention(
     )?;
     validate_signature(first, shape, semantics, precision)?;
     for participant in &invocation.participants()[1..] {
-        if CausalAttentionShape::from_attributes_for(participant.attributes(), semantics)? != shape
+        if CausalAttentionShape::from_attributes_for_execution(
+            participant.attributes(),
+            semantics,
+            decode_attention_grouping,
+            execution_context_limit,
+        )? != shape
         {
             return Err("CUDA causal attention participant attributes disagree".to_owned());
         }
@@ -3423,6 +3514,8 @@ fn prepare_causal_program_binding_writes(
 fn encode_reusable_attention_bindings(
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     semantics: CausalAttentionSemantics,
+    grouping: CausalDecodeAttentionGrouping,
+    execution_context_limit: Option<usize>,
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     operation_id: &str,
 ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, String> {
@@ -3432,9 +3525,11 @@ fn encode_reusable_attention_bindings(
     let program_binding = invocation.program_binding().cloned().ok_or_else(|| {
         "CUDA causal direct execution requires a compiled program binding".to_owned()
     })?;
-    let shape = CausalAttentionShape::from_attributes_for(
+    let shape = CausalAttentionShape::from_attributes_for_execution(
         invocation.participants()[0].attributes(),
         semantics,
+        grouping,
+        execution_context_limit,
     )?;
     let total_tokens = invocation.work_shape().immediate_tokens();
     let participant_count = u32::try_from(invocation.participants().len())
@@ -6027,6 +6122,159 @@ mod tests {
         assert!(shape
             .physical_state_bytes_for_source_frontier(129, 128)
             .is_err());
+    }
+
+    #[test]
+    fn fixed_execution_capacity_shape_uses_stable_limit_and_preserves_model_semantics() {
+        let model = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
+        let bounded = model
+            .with_execution_context_limit(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                Some(2_048),
+            )
+            .unwrap();
+        assert_eq!(
+            bounded.maximum_context_tokens,
+            model.maximum_context_tokens.min(2_048)
+        );
+        assert_eq!(bounded.rope_theta, model.rope_theta);
+        for grouping in [
+            CausalDecodeAttentionGrouping::Contiguous,
+            CausalDecodeAttentionGrouping::Indexed,
+            CausalDecodeAttentionGrouping::FixedCapacity,
+        ] {
+            assert_eq!(
+                model
+                    .with_execution_context_limit(grouping, Some(0))
+                    .unwrap(),
+                model
+            );
+            assert_eq!(
+                model
+                    .with_execution_context_limit(grouping, Some(512))
+                    .unwrap(),
+                model
+            );
+        }
+        assert_eq!(
+            model
+                .with_execution_context_limit(
+                    CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                    None,
+                )
+                .unwrap(),
+            model
+        );
+        assert_eq!(
+            model
+                .with_execution_context_limit(
+                    CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                    Some(usize::MAX),
+                )
+                .unwrap(),
+            model
+        );
+        assert!(model
+            .with_execution_context_limit(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                Some(0),
+            )
+            .is_err());
+        let local = CausalAttentionShape::from_attributes_for_execution(
+            &gemma4_attributes(false),
+            CausalAttentionSemantics::Gemma4,
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            Some(512),
+        )
+        .unwrap();
+        assert_eq!(local.maximum_context_tokens, 512);
+        assert_eq!(local.sliding_window_tokens, 1_024);
+        let mut malformed = gemma4_attributes(false);
+        malformed.insert(
+            AttributeId::new("maximum_context_tokens").unwrap(),
+            SemanticValue::Unsigned(512),
+        );
+        assert!(CausalAttentionShape::from_attributes_for_execution(
+            &malformed,
+            CausalAttentionSemantics::Gemma4,
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+            Some(256),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fixed_execution_capacity_layout_and_topology_share_the_execution_ceiling() {
+        let model = goal_shape(24, 4, 256, 262_144);
+        let bounded = model
+            .with_execution_context_limit(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                Some(2_048),
+            )
+            .unwrap();
+        let long = model
+            .with_execution_context_limit(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                Some(4_096),
+            )
+            .unwrap();
+        let binding = BindingLayout::new(bounded, 32).unwrap();
+        assert!(binding.required_bytes < BindingLayout::new(model, 32).unwrap().required_bytes);
+        assert_eq!(
+            bounded.maximum_pages().unwrap(),
+            bounded.physical_state_bytes(2_048).unwrap() / VNEXT_KV_PAGE_BYTES
+        );
+        assert!(CausalAttentionReplayEnvelope::new(
+            bounded,
+            CausalAttentionKernelPath::VllmAddressedDecodeV2,
+            2_049,
+        )
+        .is_err());
+        assert!(CausalAttentionReplayEnvelope::new(
+            long,
+            CausalAttentionKernelPath::VllmAddressedDecodeV2,
+            2_049,
+        )
+        .is_ok());
+        assert!(bounded.vllm_scratch_bytes().unwrap() < long.vllm_scratch_bytes().unwrap());
+        #[cfg(feature = "vllm-paged-attn-v2")]
+        {
+            let topology = |shape, sequence| {
+                reusable_fixed_attention_topology_from_rows(
+                    AttentionExecutionPolicy::NativeAdaptive,
+                    shape,
+                    &[CausalAttentionTopologyRow {
+                        active_tokens: 1,
+                        sequence_tokens: sequence,
+                    }; 32],
+                )
+                .unwrap()
+                .unwrap()
+            };
+            let first = topology(bounded, 511);
+            for frontier in [512, 513, 2_047, 2_048] {
+                assert_eq!(first, topology(bounded, frontier));
+            }
+            assert_ne!(first, topology(long, 513));
+            assert!(reusable_fixed_attention_topology_from_rows(
+                AttentionExecutionPolicy::NativeAdaptive,
+                bounded,
+                &[CausalAttentionTopologyRow {
+                    active_tokens: 1,
+                    sequence_tokens: 2_049
+                }; 32],
+            )
+            .is_err());
+            assert!(topology(long, 4_096) != first);
+        }
+        assert_ne!(
+            execution_context_identity(Some(2_048)),
+            execution_context_identity(Some(4_096))
+        );
+        assert_ne!(
+            execution_context_identity(None),
+            execution_context_identity(Some(2_048))
+        );
     }
 
     #[test]

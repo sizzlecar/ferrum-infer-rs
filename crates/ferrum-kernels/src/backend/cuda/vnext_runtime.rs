@@ -3030,6 +3030,7 @@ pub struct CudaDeviceRuntime {
     segment_binding_indexed_encodes: AtomicU64,
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    execution_context_limit: Option<usize>,
     q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
     q4_shared_weight_decode_encodes: Arc<AtomicU64>,
@@ -3239,6 +3240,7 @@ impl CudaDeviceRuntime {
             packed_decode_prepare_gate: false,
             causal_decode_attention_grouping:
                 ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
+            execution_context_limit: None,
             q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             q4_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
@@ -3304,6 +3306,16 @@ impl CudaDeviceRuntime {
         &self,
     ) -> ferrum_types::CausalDecodeAttentionGrouping {
         self.causal_decode_attention_grouping
+    }
+
+    /// Stable execution ceiling selected before providers and replay identities are built.
+    pub fn with_execution_context_limit(mut self, limit: Option<usize>) -> Self {
+        self.execution_context_limit = limit;
+        self
+    }
+
+    pub fn execution_context_limit(&self) -> Option<usize> {
+        self.execution_context_limit
     }
 
     pub fn with_q4_mmvq_weight_decode(mut self, mode: ferrum_types::Q4MmvqWeightDecode) -> Self {

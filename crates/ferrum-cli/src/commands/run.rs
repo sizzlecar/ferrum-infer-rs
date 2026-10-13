@@ -891,7 +891,8 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub causal_decode_preparation_mode: Option<crate::commands::CausalDecodePreparationModeArg>,
 
-    /// Causal decode grouping (default: contiguous). Indexed requires packed native CUDA attention.
+    /// Causal decode grouping (default: contiguous). Other modes require packed native CUDA attention.
+    /// Fixed-execution-capacity also uses the declared --max-model-len bound.
     #[arg(long, value_enum)]
     pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
@@ -3091,6 +3092,24 @@ mod tests {
         for (config_mode, cli_mode, expected, source) in [
             (None, None, Mode::Contiguous, None),
             (
+                Some(Mode::FixedExecutionCapacity),
+                None,
+                Mode::FixedExecutionCapacity,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::FixedExecutionCapacity),
+                Some(Arg::FixedCapacity),
+                Mode::FixedCapacity,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::FixedCapacity),
+                Some(Arg::FixedExecutionCapacity),
+                Mode::FixedExecutionCapacity,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
                 Some(Mode::Indexed),
                 None,
                 Mode::Indexed,
@@ -3111,6 +3130,7 @@ mod tests {
         ] {
             let config_entries = crate::config::RuntimeCliConfig {
                 causal_decode_attention_grouping: config_mode,
+                max_model_len: Some(2048),
                 causal_decode_preparation_mode: Some(
                     ferrum_types::CausalDecodePreparationMode::Packed,
                 ),
@@ -3130,6 +3150,7 @@ mod tests {
             let mut engine = ferrum_types::EngineConfig::default();
             engine.apply_runtime_config_snapshot(&snapshot).unwrap();
             assert_eq!(engine.runtime.causal_decode_attention_grouping, expected);
+            assert_eq!(engine.runtime.max_model_len, Some(2048));
             assert_eq!(
                 engine.runtime.causal_decode_preparation_mode,
                 ferrum_types::CausalDecodePreparationMode::Packed

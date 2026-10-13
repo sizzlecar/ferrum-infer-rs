@@ -343,6 +343,23 @@ fn check_current_pages(
 #[test]
 #[ignore = "requires CUDA and pinned indexed addressed-vLLM operators"]
 fn fixed_capacity_captured_replay_matches_current_indexed_bits_and_guards_on_cuda() {
+    captured_capacity_replay(&[
+        (128, 8, false, 2048, None),
+        (256, 32, true, 2048, None),
+        (128, 8, false, 512, None),
+    ]);
+}
+
+#[test]
+#[ignore = "requires CUDA and pinned indexed addressed-vLLM operators"]
+fn fixed_execution_capacity_captured_replay_matches_indexed_bits_and_guards_on_cuda() {
+    captured_capacity_replay(&[
+        (256, 32, true, 262_144, Some(2_048)),
+        (128, 8, false, 32_768, Some(4_096)),
+    ]);
+}
+
+fn captured_capacity_replay(cases: &[(u64, usize, bool, u64, Option<usize>)]) {
     let runtime = CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
             0,
@@ -356,15 +373,17 @@ fn fixed_capacity_captured_replay_matches_current_indexed_bits_and_guards_on_cud
         CudaCausalPagedAttentionProvider::new(&runtime, AttentionExecutionPolicy::NativeAdaptive)
             .unwrap();
     let stream = runtime.context().new_stream().unwrap();
-    for (head_dim, participants, output_gate, maximum_context) in [
-        (128, 8, false, 2048),
-        (256, 32, true, 2048),
-        (128, 8, false, 512),
-    ] {
+    for &(head_dim, participants, output_gate, maximum_context, execution_limit) in cases {
         let mut shape = shape(head_dim);
         shape.maximum_context_tokens = maximum_context;
         shape.output_gate = output_gate;
         shape.query_projection_features = shape.query_features * if output_gate { 2 } else { 1 };
+        shape = shape
+            .with_execution_context_limit(
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                execution_limit,
+            )
+            .unwrap();
         let binding = BindingLayout::new(shape, participants).unwrap();
         let layout = ScratchLayout::for_participants(
             shape,
@@ -427,6 +446,9 @@ fn fixed_capacity_captured_replay_matches_current_indexed_bits_and_guards_on_cud
                     1 => 512 + (row % 2) as u64,
                     2 => 1023 + (row % 2) as u64,
                     3 => shape.maximum_context_tokens - (row % 2) as u64,
+                    4 if execution_limit.is_some() => {
+                        [511, 512, 513, 2047, 2048, 2049, 4095, 4096][row % 8]
+                    }
                     4 => [511, 512, 513, 1023, 1024, 1025, 2047, 2048][row % 8],
                     _ => 257 + row as u64,
                 })
@@ -487,7 +509,7 @@ fn fixed_capacity_captured_replay_matches_current_indexed_bits_and_guards_on_cud
             drop(reference_graph);
         }
         drop(fixed_graph);
-        println!("fixed_capacity_complete_replay head_dim={head_dim} M={participants} maximum_context={maximum_context} fixed_captures=1 v1_only_capacity={} current_requests_pages_and_maximum_context=true full_query_context_kv_bits=true masks_complete=true", maximum_context <= 512);
+        println!("fixed_capacity_complete_replay head_dim={head_dim} M={participants} model_maximum_context={maximum_context} effective_maximum_context={} execution_limit={execution_limit:?} fixed_captures=1 v1_only_capacity={} current_requests_pages_and_maximum_context=true full_query_context_kv_bits=true masks_complete=true", shape.maximum_context_tokens, shape.maximum_context_tokens <= 512);
     }
 }
 

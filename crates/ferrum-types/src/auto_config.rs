@@ -2840,6 +2840,7 @@ impl FerrumConfigBuilder {
             grouping,
             crate::CausalDecodeAttentionGrouping::Indexed
                 | crate::CausalDecodeAttentionGrouping::FixedCapacity
+                | crate::CausalDecodeAttentionGrouping::FixedExecutionCapacity
         ) {
             let preparation = self
                 .entry(crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY)
@@ -2871,7 +2872,12 @@ impl FerrumConfigBuilder {
             grouping.as_runtime_value(),
             source,
             source_key,
-            ["contiguous", "indexed", "fixed-capacity"],
+            [
+                "contiguous",
+                "indexed",
+                "fixed-capacity",
+                "fixed-execution-capacity",
+            ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5949,6 +5955,11 @@ mod tests {
             (Some("indexed"), RuntimeConfigSource::Cli),
             (Some("fixed-capacity"), RuntimeConfigSource::ConfigFile),
             (Some("fixed-capacity"), RuntimeConfigSource::Cli),
+            (
+                Some("fixed-execution-capacity"),
+                RuntimeConfigSource::ConfigFile,
+            ),
+            (Some("fixed-execution-capacity"), RuntimeConfigSource::Cli),
         ] {
             for (preparation, upload, owner) in [
                 ("full", "sparse", "legacy"),
@@ -6066,7 +6077,7 @@ mod tests {
     #[test]
     fn causal_decode_attention_grouping_rejects_env_and_unsupported_execution() {
         let key = crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
-        for grouping in ["indexed", "fixed-capacity"] {
+        for grouping in ["indexed", "fixed-capacity", "fixed-execution-capacity"] {
             for (backend, authority, compiled, policy, kv, preparation, source) in [
                 (
                     "cuda",
@@ -6200,7 +6211,12 @@ mod tests {
         assert!(!decoded.cuda_indexed_causal_attention);
 
         for compiled in [false, true] {
-            for grouping in ["contiguous", "indexed", "fixed-capacity"] {
+            for grouping in [
+                "contiguous",
+                "indexed",
+                "fixed-capacity",
+                "fixed-execution-capacity",
+            ] {
                 let entries = snapshot_with_sources(&[
                     (key, grouping, RuntimeConfigSource::Cli),
                     (

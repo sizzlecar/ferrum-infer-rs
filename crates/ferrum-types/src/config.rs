@@ -256,6 +256,8 @@ pub enum CausalDecodeAttentionGrouping {
     Indexed,
     /// Preserve decode command capacities while current device lengths select V1/V2 rows.
     FixedCapacity,
+    /// Bound fixed native scratch by the declared execution context limit.
+    FixedExecutionCapacity,
 }
 
 impl CausalDecodeAttentionGrouping {
@@ -264,6 +266,7 @@ impl CausalDecodeAttentionGrouping {
             Self::Contiguous => "contiguous",
             Self::Indexed => "indexed",
             Self::FixedCapacity => "fixed-capacity",
+            Self::FixedExecutionCapacity => "fixed-execution-capacity",
         }
     }
 
@@ -272,8 +275,9 @@ impl CausalDecodeAttentionGrouping {
             "contiguous" => Ok(Self::Contiguous),
             "indexed" => Ok(Self::Indexed),
             "fixed-capacity" => Ok(Self::FixedCapacity),
+            "fixed-execution-capacity" => Ok(Self::FixedExecutionCapacity),
             _ => Err(format!(
-                "expected contiguous, indexed or fixed-capacity; got {raw:?}"
+                "expected contiguous, indexed, fixed-capacity or fixed-execution-capacity; got {raw:?}"
             )),
         }
     }
@@ -1856,6 +1860,7 @@ mod tests {
             for mode in [
                 CausalDecodeAttentionGrouping::Indexed,
                 CausalDecodeAttentionGrouping::FixedCapacity,
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
                 CausalDecodeAttentionGrouping::Contiguous,
             ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
@@ -1941,6 +1946,7 @@ mod tests {
         for grouping in [
             CausalDecodeAttentionGrouping::Indexed,
             CausalDecodeAttentionGrouping::FixedCapacity,
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut config = EngineConfig::default();
             assert!(config

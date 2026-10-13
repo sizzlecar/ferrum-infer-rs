@@ -1203,7 +1203,12 @@ mod tests {
 
     #[test]
     fn causal_decode_attention_grouping_config_file_parses_explicit_mode() {
-        for value in ["contiguous", "indexed"] {
+        for value in [
+            "contiguous",
+            "indexed",
+            "fixed-capacity",
+            "fixed-execution-capacity",
+        ] {
             let config: CliConfig = toml::from_str(&format!(
                 "[runtime]\ncausal_decode_attention_grouping = \"{value}\"\n"
             ))

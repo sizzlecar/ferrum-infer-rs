@@ -1213,6 +1213,7 @@ fn validate_causal_decode_preparation_mode(
 ) -> Result<()> {
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
+    causal_decode_execution_context_limit(config)?;
     use ferrum_types::{
         AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
     };
@@ -1221,7 +1222,9 @@ fn validate_causal_decode_preparation_mode(
             .engine_config
             .runtime
             .causal_decode_attention_grouping,
-        CausalDecodeAttentionGrouping::Indexed | CausalDecodeAttentionGrouping::FixedCapacity
+        CausalDecodeAttentionGrouping::Indexed
+            | CausalDecodeAttentionGrouping::FixedCapacity
+            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
     ) && (config.engine_config.runtime.causal_decode_preparation_mode
         != CausalDecodePreparationMode::Packed
         || !matches!(config.device, Device::CUDA(_))
@@ -1267,6 +1270,25 @@ fn validate_causal_decode_preparation_mode(
         ));
     }
     Ok(())
+}
+
+// Composition precedes automatic startup fitting. Forward the declared hard
+// upper bound; a later fit may shrink it further. The backend also clamps it
+// to the model shape and uses it only for FixedExecutionCapacity.
+fn causal_decode_execution_context_limit(config: &ComponentConfig) -> Result<Option<usize>> {
+    let limit = config.engine_config.runtime.max_model_len;
+    if config
+        .engine_config
+        .runtime
+        .causal_decode_attention_grouping
+        == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        && limit == Some(0)
+    {
+        return Err(FerrumError::config(
+            "fixed-execution-capacity requires a positive maximum model length when configured",
+        ));
+    }
+    Ok(limit)
 }
 
 fn validate_q4_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
@@ -1394,7 +1416,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_mmvq_weight_decode(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_execution_context_limit(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1408,6 +1430,7 @@ fn create_registered_vnext_executor(
                         config.engine_config.runtime.causal_decode_attention_grouping,
                         config.engine_config.runtime.q4_mmvq_weight_decode,
                         config.engine_config.runtime.q5_mmvq_weight_decode,
+                        causal_decode_execution_context_limit(config)?,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -2266,11 +2289,46 @@ mod tests {
     }
 
     #[test]
+    fn causal_decode_attention_grouping_execution_context_limit_preserves_bound_and_rejects_zero() {
+        use ferrum_types::CausalDecodeAttentionGrouping;
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        config
+            .engine_config
+            .runtime
+            .causal_decode_attention_grouping =
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity;
+        for limit in [None, Some(1), Some(512), Some(2048), Some(usize::MAX)] {
+            config.engine_config.runtime.max_model_len = limit;
+            assert_eq!(
+                causal_decode_execution_context_limit(&config).unwrap(),
+                limit
+            );
+        }
+        config.engine_config.runtime.max_model_len = Some(0);
+        assert!(causal_decode_execution_context_limit(&config).is_err());
+        assert!(validate_causal_decode_preparation_mode(&config, true)
+            .unwrap_err()
+            .to_string()
+            .contains("positive maximum model length"));
+        // The original grouping keeps its previous interpretation; only the
+        // new mode authorizes a context-bound native scratch plan.
+        config
+            .engine_config
+            .runtime
+            .causal_decode_attention_grouping = CausalDecodeAttentionGrouping::FixedCapacity;
+        assert_eq!(
+            causal_decode_execution_context_limit(&config).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn causal_decode_attention_grouping_checks_direct_config_before_default_early_return() {
         use ferrum_types::{CausalDecodeAttentionGrouping, CausalDecodePreparationMode};
         for grouping in [
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             assert_eq!(
@@ -2328,6 +2386,7 @@ mod tests {
         for grouping in [
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             config.device = Device::CUDA(0);
@@ -2393,6 +2452,7 @@ mod tests {
         for grouping in [
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut engine = EngineConfig::default();
             engine.runtime.causal_decode_attention_grouping = grouping;

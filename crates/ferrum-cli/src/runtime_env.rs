@@ -186,17 +186,19 @@ mod tests {
     fn causal_decode_attention_grouping_provenance_is_never_materialized_as_environment() {
         let key = ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
         let original = std::env::var_os(key);
-        for source in [
-            RuntimeConfigSource::Default,
-            RuntimeConfigSource::ConfigFile,
-            RuntimeConfigSource::Cli,
-        ] {
-            let current = snapshot(&[(key, "indexed", source)]);
-            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
-            assert!(materialize_runtime_env_effective(&current).is_empty());
-            assert_eq!(std::env::var_os(key), original);
-            assert_eq!(runtime_snapshot_value(&current, key), Some("indexed"));
-            assert_eq!(current.entries[0].source, source);
+        for mode in ["indexed", "fixed-capacity", "fixed-execution-capacity"] {
+            for source in [
+                RuntimeConfigSource::Default,
+                RuntimeConfigSource::ConfigFile,
+                RuntimeConfigSource::Cli,
+            ] {
+                let current = snapshot(&[(key, mode, source)]);
+                assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+                assert!(materialize_runtime_env_effective(&current).is_empty());
+                assert_eq!(std::env::var_os(key), original);
+                assert_eq!(runtime_snapshot_value(&current, key), Some(mode));
+                assert_eq!(current.entries[0].source, source);
+            }
         }
     }
 
