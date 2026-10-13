@@ -4,6 +4,10 @@ use super::*;
 use ferrum_interfaces::vnext::{DynamicStorageAllocator, DynamicStorageView, ResourceId};
 use metal::objc::rc::autoreleasepool;
 
+// Each test exercises the full counter-page capacity. Keep their fixture
+// lifetimes and autorelease-pool drains from competing for driver resources.
+static COUNTER_CAPACITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct CounterCapacityFixture {
     runtime: MetalDeviceRuntime,
     stream: MetalDeviceStream,
@@ -169,6 +173,9 @@ fn payload_byte(index: usize) -> u8 {
 
 #[test]
 fn counter_capture_page_and_capacity_boundaries_preserve_intervals() {
+    let _counter_capacity_guard = COUNTER_CAPACITY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     autoreleasepool(|| {
         let Some(mut fixture) = CounterCapacityFixture::new() else {
             return;
@@ -187,6 +194,9 @@ fn counter_capture_page_and_capacity_boundaries_preserve_intervals() {
 
 #[test]
 fn counter_capture_overflow_preserves_work_and_next_submission_recovers() {
+    let _counter_capacity_guard = COUNTER_CAPACITY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     autoreleasepool(|| {
         let Some(mut fixture) = CounterCapacityFixture::new() else {
             return;
