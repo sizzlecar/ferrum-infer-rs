@@ -84,7 +84,7 @@ pub use determinism_artifact::{
     SubmissionWaveDeterminismArtifactPhysicalCommand,
     SubmissionWaveDeterminismArtifactReplayedSegment, SubmissionWaveDeterminismArtifactWitness,
 };
-pub use dispatch::OperationDispatch;
+pub use dispatch::{OperationDispatch, PreparedSubmissionWaveTopology};
 pub use dispatch_contract::{
     BoundDeviceSubmissionAttribution, DispatchRetryAuthority, OperationDispatchError,
     ProfiledSubmissionHandle, SubmissionExecutionPolicy, SubmissionScratchInitialization,
@@ -114,7 +114,7 @@ pub use registry::{
     OperationPlanningRegistry, OperationProvider, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
     ReusableBindingResources, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
-    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress,
+    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, ReusableTopologyStability,
 };
 pub use resolved_value::{
     ProviderStorageBindingRequirement, ResolvedStorageComponent, ResolvedValueBinding,

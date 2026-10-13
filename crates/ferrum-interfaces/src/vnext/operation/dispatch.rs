@@ -210,6 +210,91 @@ struct ReusableExecutionWaveAuthority {
     eager_boundary_node_indices: Vec<u32>,
 }
 
+/// One topology observation tied to the exact owned submission wave and its
+/// immutable provider/plan selection. This is neither a resident recipe nor a
+/// cross-wave authority cache. Dropping it drops the unsubmitted wave; retry
+/// authority returns a bare wave which must be prepared again.
+#[must_use = "a topology-prepared wave must be submitted or dropped"]
+pub struct PreparedSubmissionWaveTopology<'a, 'provider, R: DeviceRuntime> {
+    wave: PreparedStepSubmissionWave<R>,
+    authority: Option<ReusableExecutionWaveAuthority>,
+    same_wave_stable: bool,
+    providers: &'a [BoundOperationProvider<'provider, R>],
+    resolved: &'a dyn ExecutablePlanView,
+    lane: &'a Arc<ExecutionLane<R>>,
+}
+
+impl<R: DeviceRuntime> PreparedSubmissionWaveTopology<'_, '_, R> {
+    pub fn program_id(&self) -> Option<&DeviceReusableExecutionProgramId> {
+        self.authority
+            .as_ref()
+            .map(|authority| &authority.program_id)
+    }
+
+    pub fn work_shape(&self) -> &super::super::BatchWorkShape {
+        self.wave.claimed_backing().work_shape()
+    }
+
+    /// Consumes the original wave. Callers cannot substitute another wave,
+    /// provider selection, plan or lane after looking up the resident program.
+    /// Current batch/participant and backing/lease validation still runs in the
+    /// normal submission transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_with_inputs_and_preparation<'binding, I, S, P>(
+        self,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        execution_policy: SubmissionExecutionPolicy,
+        strategy: ferrum_types::InvocationPreparationStrategy,
+        timing_sink: &S,
+        preparation_sink: &P,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+        P: super::InvocationPreparationSink,
+    {
+        let _observation = super::preparation::PreparationObservation {
+            identity: batch_identity,
+            sink: preparation_sink,
+        };
+        if batch_identity.preparation_strategy() != strategy {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "identity preparation strategy differs from the fresh wave binding",
+            )));
+        }
+        OperationDispatch::encode_and_submit_wave_with_topology(
+            self.providers,
+            self.resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            reusable_program,
+            timing_sink,
+            self.wave,
+            self.lane,
+            reaper,
+            if self.same_wave_stable {
+                SubmissionWaveTopology::Prepared(self.authority)
+            } else {
+                SubmissionWaveTopology::Fresh
+            },
+        )
+    }
+}
+
+enum SubmissionWaveTopology {
+    Fresh,
+    Prepared(Option<ReusableExecutionWaveAuthority>),
+}
+
 pub struct OperationDispatch;
 
 impl OperationDispatch {
@@ -628,6 +713,48 @@ impl OperationDispatch {
             Self::reusable_execution_wave_authority(providers, resolved, wave, lane)?
                 .map(|authority| authority.program_id),
         )
+    }
+
+    /// Resolves topology once for catalog lookup and consumption of this same
+    /// wave. The result retains the exact inputs rather than accepting a
+    /// caller-supplied fingerprint as submission authority.
+    pub fn prepare_submission_wave_topology<'a, 'provider, R: DeviceRuntime>(
+        providers: &'a [BoundOperationProvider<'provider, R>],
+        resolved: &'a dyn ExecutablePlanView,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &'a Arc<ExecutionLane<R>>,
+    ) -> Result<PreparedSubmissionWaveTopology<'a, 'provider, R>, VNextError> {
+        let authority = Self::reusable_execution_wave_authority(providers, resolved, &wave, lane)?;
+        let same_wave_stable = providers.iter().all(|provider| {
+            provider.provider().reusable_topology_stability()
+                == super::ReusableTopologyStability::SameWaveStable
+        });
+        Ok(PreparedSubmissionWaveTopology {
+            wave,
+            authority,
+            same_wave_stable,
+            providers,
+            resolved,
+            lane,
+        })
+    }
+
+    /// Keeps the original one-observation submission path when no catalog
+    /// lookup needs a program identity. No provider callback runs here.
+    pub fn defer_submission_wave_topology<'a, 'provider, R: DeviceRuntime>(
+        providers: &'a [BoundOperationProvider<'provider, R>],
+        resolved: &'a dyn ExecutablePlanView,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &'a Arc<ExecutionLane<R>>,
+    ) -> PreparedSubmissionWaveTopology<'a, 'provider, R> {
+        PreparedSubmissionWaveTopology {
+            wave,
+            authority: None,
+            same_wave_stable: false,
+            providers,
+            resolved,
+            lane,
+        }
     }
 
     fn reusable_execution_wave_authority<R>(
@@ -1434,9 +1561,49 @@ impl OperationDispatch {
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
         reusable_program: Option<&DeviceReusableExecutionProgram>,
         timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_wave_with_topology(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            determinism_restore,
+            reusable_program,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+            SubmissionWaveTopology::Fresh,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_and_submit_wave_with_topology<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        timing_sink: &S,
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
+        topology: SubmissionWaveTopology,
     ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
@@ -1529,9 +1696,13 @@ impl OperationDispatch {
                 )));
             }
         }
-        let reusable_execution_authority =
-            Self::reusable_execution_wave_authority(providers, resolved, &wave, lane)
-                .map_err(SubmissionWaveDispatchError::Contract)?;
+        let reusable_execution_authority = match topology {
+            SubmissionWaveTopology::Fresh => {
+                Self::reusable_execution_wave_authority(providers, resolved, &wave, lane)
+                    .map_err(SubmissionWaveDispatchError::Contract)?
+            }
+            SubmissionWaveTopology::Prepared(authority) => authority,
+        };
         let mut effective_compute_path = execution_policy.compute_path();
         let mut declared_eager_compute_node_indices = Vec::new();
         if let Some(reusable_program) = reusable_program {

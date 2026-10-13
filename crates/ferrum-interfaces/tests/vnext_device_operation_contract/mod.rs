@@ -694,6 +694,7 @@ impl ProviderBehavior {
 
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
+    pub(crate) topology_stability: ReusableTopologyStability,
     pub(crate) reusable_binding_resources: ReusableBindingResources,
     pub(crate) reusable_views: Vec<(NodeId, BTreeSet<ResourceId>, BTreeSet<ProgramValueId>)>,
     pub(crate) reusable_topology_calls: u64,
@@ -780,6 +781,10 @@ impl OperationResourceEstimator for TestProvider {
 }
 
 impl OperationProvider<TestRuntime> for TestProvider {
+    fn reusable_topology_stability(&self) -> ReusableTopologyStability {
+        self.trace.lock().unwrap().topology_stability
+    }
+
     fn reusable_binding_resources(&self) -> ReusableBindingResources {
         self.trace.lock().unwrap().reusable_binding_resources
     }
