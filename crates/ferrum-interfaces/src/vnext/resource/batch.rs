@@ -11,7 +11,7 @@ use super::{
     SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
     SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
     StepCompletedBoundaryProof, StepCompletedBoundarySlot, StepParticipantFrameAssignment,
-    TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
+    StepPlanDependencyRetention, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
 };
 use crate::vnext::DeviceReusableExecutionProgramId;
 use crate::vnext::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
@@ -34,8 +34,7 @@ where
     pub(super) batch_step_id: BatchStepId,
     pub(super) completed_boundary: Mutex<StepCompletedBoundarySlot>,
     pub(super) finalized: bool,
-    pub(super) retained_plan_dependencies:
-        Mutex<Vec<crate::vnext::RetainedPlanDependencyAuthority>>,
+    pub(super) retained_plan_dependencies: Mutex<StepPlanDependencyRetention>,
 }
 
 /// Canonical non-empty set selected by the scheduler for one continuous

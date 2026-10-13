@@ -55,6 +55,8 @@ mod lane_stable_identity;
 pub use lane_stable_identity::*;
 mod program_binding;
 pub use program_binding::*;
+mod plan_dependency_retention;
+pub(in crate::vnext) use plan_dependency_retention::StepPlanDependencyRetention;
 mod dynamic_pool;
 pub use dynamic_pool::*;
 mod maintenance_boundary;

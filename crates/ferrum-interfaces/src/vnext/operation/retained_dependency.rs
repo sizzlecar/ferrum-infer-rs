@@ -14,6 +14,10 @@ use crate::vnext::{
     VNextError, WeightId,
 };
 
+#[cfg(test)]
+#[path = "../resource/plan_dependency_retention_tests.rs"]
+mod retention_index_tests;
+
 /// Exact subranges authorized by a live invocation. Source offsets are relative
 /// to the selected physical weight component; destination offsets are relative
 /// to this node's persistent allocation, including its admitted padding.

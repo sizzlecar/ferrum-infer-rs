@@ -146,11 +146,7 @@ where
             .retained_plan_dependencies
             .lock()
             .map_err(|_| invalid_resource("Plan dependency retention lock poisoned"))?;
-        for lease in leases {
-            if !retained.iter().any(|old| old.identity == lease.identity) {
-                retained.push(lease);
-            }
-        }
+        retained.retain(leases);
         Ok(())
     }
 
@@ -212,7 +208,9 @@ where
             reusable_execution_bucket,
             batch_step_id,
             completed_boundary: super::Mutex::new(super::StepCompletedBoundarySlot::default()),
-            retained_plan_dependencies: super::Mutex::new(Vec::new()),
+            retained_plan_dependencies: super::Mutex::new(
+                super::StepPlanDependencyRetention::default(),
+            ),
             finalized: false,
         })
     }
