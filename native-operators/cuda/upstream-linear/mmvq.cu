@@ -1058,16 +1058,14 @@ extern "C" int ferrum_upstream_mmvq_cast_v1(const FerrumUpstreamLinearPlanV1 * p
     });
 }
 
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
-// Test-only node-type control. Preserve the converted-input quantizer and its
-// marker atomics; the separate predecessor clears exactly the row flags span.
-static __global__ void test_mmvq_zero_row_flags(uint32_t * flags, uint32_t rows) {
+// Preserve the converted-input quantizer and its marker atomics; the separate
+// predecessor clears exactly the row flags span before any quantizer CTA runs.
+static __global__ void mmvq_zero_row_flags(uint32_t * flags, uint32_t rows) {
     const uint64_t row = uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (row < rows) {
         flags[row] = 0;
     }
 }
-#endif
 
 template <bool KernelZero = false>
 static int upstream_mmvq_pack_f32_intermediate(const FerrumUpstreamLinearPlanV1 * p,
@@ -1078,14 +1076,11 @@ static int upstream_mmvq_pack_f32_intermediate(const FerrumUpstreamLinearPlanV1 
             uintptr_t(input)%2||uintptr_t(converted)%16||uintptr_t(packed)%4||uintptr_t(flags)%4) return -5;
         const auto stream=static_cast<cudaStream_t>(s);
         cudaError_t status;
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
         if constexpr (KernelZero) {
-            test_mmvq_zero_row_flags<<<(uint64_t(n.rows)+127)/128,128,0,stream>>>(
+            mmvq_zero_row_flags<<<(uint64_t(n.rows)+127)/128,128,0,stream>>>(
                 static_cast<uint32_t *>(flags),n.rows);
             status=cudaGetLastError();
-        } else
-#endif
-        {
+        } else {
             status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
         }
         if(status!=cudaSuccess) return status;
@@ -1102,9 +1097,26 @@ static int upstream_mmvq_pack_f32_intermediate(const FerrumUpstreamLinearPlanV1 
 }
 extern "C" int ferrum_upstream_mmvq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    if (p && p->request.rows <= 32) {
+        return upstream_mmvq_pack_f32_intermediate<true>(p,input,stride,converted,packed,flags,s);
+    }
     return upstream_mmvq_pack_f32_intermediate(p,input,stride,converted,packed,flags,s);
 }
+// Callable archive capability: valid small-row pack_v2 consists of separate
+// row-flags clear, F16->F32 conversion and quantizer kernels, with no memset.
+// The original scratch extents and accumulation/MarkerV2 behavior are retained.
+extern "C" int ferrum_upstream_mmvq_pack_kernel_clear_small_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    if (!p || !p->request.rows) return -1;
+    if (p->request.rows > 32) return -2;
+    return upstream_mmvq_pack_f32_intermediate<true>(p,input,stride,converted,packed,flags,s);
+}
 #if defined(FERRUM_TEST_DIRECT_F16_PACK)
+// Independent old path: product promotion must not change a paired baseline.
+extern "C" int ferrum_test_upstream_mmvq_pack_f32_intermediate_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return upstream_mmvq_pack_f32_intermediate(p,input,stride,converted,packed,flags,s);
+}
 extern "C" int ferrum_test_upstream_mmvq_pack_f32_intermediate_kernel_zero_v1(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
     return upstream_mmvq_pack_f32_intermediate<true>(p,input,stride,converted,packed,flags,s);

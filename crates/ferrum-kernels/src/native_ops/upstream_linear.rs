@@ -108,12 +108,32 @@ impl SmallMmqPack {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmallMmvqPack {
+    F32Memset,
+    F32KernelClear,
+}
+impl SmallMmvqPack {
+    #[cfg(any(feature = "cuda-upstream-linear", test))]
+    fn from_exports<'a>(exports: impl IntoIterator<Item = &'a str>) -> Self {
+        if exports
+            .into_iter()
+            .any(|export| export == "ferrum_upstream_mmvq_pack_kernel_clear_small_v1")
+        {
+            Self::F32KernelClear
+        } else {
+            Self::F32Memset
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedUpstreamLinear {
     raw: UpstreamLinearPlanV1,
     arithmetic: Arithmetic,
     family: Family,
     small_mmq_pack: SmallMmqPack,
+    small_mmvq_pack: SmallMmvqPack,
     q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
 }
@@ -151,6 +171,7 @@ impl PreparedUpstreamLinear {
                 arithmetic,
                 family: Family::Original,
                 small_mmq_pack: compiled_small_mmq_pack(),
+                small_mmvq_pack: compiled_small_mmvq_pack(),
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             })
@@ -189,6 +210,7 @@ impl PreparedUpstreamLinear {
                 arithmetic,
                 family: Family::Extra,
                 small_mmq_pack: SmallMmqPack::LegacyF32,
+                small_mmvq_pack: SmallMmvqPack::F32Memset,
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             })
@@ -226,6 +248,7 @@ impl PreparedUpstreamLinear {
                 arithmetic: Arithmetic::MarkerV2,
                 family: Family::Extra,
                 small_mmq_pack: SmallMmqPack::LegacyF32,
+                small_mmvq_pack: SmallMmvqPack::F32Memset,
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             })
@@ -257,6 +280,16 @@ impl PreparedUpstreamLinear {
                 SmallMmqPack::DirectF16KernelClear => return (2, 0),
                 SmallMmqPack::LegacyF32 => {}
             }
+        }
+        #[cfg(any(feature = "cuda-upstream-linear", test))]
+        if self.family == Family::Original
+            && self.arithmetic == Arithmetic::MarkerV2
+            && self.raw.algorithm == Algorithm::Mmvq as u32
+            && (1..=32).contains(&self.raw.request.rows)
+            && self.small_mmvq_pack == SmallMmvqPack::F32KernelClear
+        {
+            // Row clear, the retained F16-to-F32 conversion, and quantization.
+            return (3, 0);
         }
         (2, 1 + u64::from(self.raw.guard_blocks != 0))
     }
@@ -522,6 +555,20 @@ fn compiled_small_mmq_pack() -> SmallMmqPack {
 }
 
 #[cfg(feature = "cuda-upstream-linear")]
+fn compiled_small_mmvq_pack() -> SmallMmvqPack {
+    crate::native_ops::compiled_native_operator_artifacts()
+        .iter()
+        .find(|artifact| {
+            artifact.operator == UPSTREAM_LINEAR_OPERATOR
+                && artifact.backend == ferrum_types::NativeOperatorBackend::Cuda
+                && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                && artifact.operator_abi_version == "1"
+        })
+        .map(|artifact| SmallMmvqPack::from_exports(artifact.exports.iter().map(String::as_str)))
+        .unwrap_or(SmallMmvqPack::F32Memset)
+}
+
+#[cfg(feature = "cuda-upstream-linear")]
 mod dispatch;
 
 #[cfg(feature = "cuda-upstream-extra-linear")]
@@ -540,6 +587,60 @@ mod shared_weight_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn small_mmvq_pack_capability_requires_its_independent_export() {
+        use SmallMmvqPack::{F32KernelClear, F32Memset};
+        let capability = "ferrum_upstream_mmvq_pack_kernel_clear_small_v1";
+        for (exports, expected) in [
+            (vec![], F32Memset),
+            (vec!["ferrum_upstream_mmvq_pack_v2"], F32Memset),
+            (vec!["ferrum_upstream_mmq_pack_f16_small_v2"], F32Memset),
+            (vec![capability], F32KernelClear),
+            (
+                vec!["ferrum_upstream_mmq_pack_f16_small_v2", capability],
+                F32KernelClear,
+            ),
+        ] {
+            assert_eq!(SmallMmvqPack::from_exports(exports), expected);
+        }
+    }
+    #[test]
+    fn small_mmvq_pack_work_counts_preserve_f32_and_archive_family_row_boundaries() {
+        use Algorithm::{Mmq, Mmvq};
+        use Arithmetic::{MarkerV2, V1};
+        use Family::{Extra, Original};
+        use SmallMmvqPack::{F32KernelClear, F32Memset};
+        for (family, arithmetic, algorithm, rows, capability, guard, expected) in [
+            (Original, MarkerV2, Mmvq, 1, F32KernelClear, 0, (3, 0)),
+            (Original, MarkerV2, Mmvq, 3, F32KernelClear, 0, (3, 0)),
+            (Original, MarkerV2, Mmvq, 8, F32KernelClear, 0, (3, 0)),
+            (Original, MarkerV2, Mmvq, 32, F32KernelClear, 0, (3, 0)),
+            (Original, MarkerV2, Mmvq, 0, F32KernelClear, 0, (2, 1)),
+            (Original, MarkerV2, Mmvq, 33, F32KernelClear, 0, (2, 1)),
+            (Original, MarkerV2, Mmvq, 32, F32Memset, 0, (2, 1)),
+            (Original, MarkerV2, Mmvq, 32, F32Memset, 8, (2, 2)),
+            (Extra, MarkerV2, Mmvq, 8, F32KernelClear, 0, (2, 1)),
+            (Original, V1, Mmvq, 8, F32KernelClear, 0, (2, 0)),
+            (Original, MarkerV2, Mmq, 32, F32KernelClear, 8, (1, 1)),
+            (Original, MarkerV2, Mmq, 33, F32KernelClear, 8, (2, 2)),
+        ] {
+            let mut raw = UpstreamLinearPlanV1::default();
+            raw.algorithm = algorithm as u32;
+            raw.request.rows = rows;
+            raw.guard_blocks = guard;
+            let prepared = PreparedUpstreamLinear {
+                raw,
+                arithmetic,
+                family,
+                small_mmq_pack: SmallMmqPack::DirectF16Memset,
+                small_mmvq_pack: capability,
+                q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
+                q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
+            };
+            assert_eq!(prepared.pack_work_counts(), expected,
+                "{family:?}/{arithmetic:?}/{algorithm:?}/M{rows}/capability{capability:?}/guard{guard}");
+        }
+    }
     #[test]
     fn small_mmq_pack_capability_prefers_versioned_kernel_clear_without_requiring_it() {
         use SmallMmqPack::{DirectF16KernelClear, DirectF16Memset, LegacyF32};
@@ -608,6 +709,7 @@ mod tests {
                 arithmetic,
                 family,
                 small_mmq_pack: capability,
+                small_mmvq_pack: SmallMmvqPack::F32Memset,
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             };
@@ -632,6 +734,7 @@ mod tests {
             arithmetic: Arithmetic::MarkerV2,
             family: Family::Original,
             small_mmq_pack: SmallMmqPack::LegacyF32,
+            small_mmvq_pack: SmallMmvqPack::F32Memset,
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
         };
@@ -679,6 +782,7 @@ mod tests {
             arithmetic: Arithmetic::MarkerV2,
             family: Family::Original,
             small_mmq_pack: SmallMmqPack::LegacyF32,
+            small_mmvq_pack: SmallMmvqPack::F32Memset,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
         };
@@ -771,6 +875,7 @@ mod tests {
                 arithmetic: Arithmetic::MarkerV2,
                 family,
                 small_mmq_pack: SmallMmqPack::LegacyF32,
+                small_mmvq_pack: SmallMmvqPack::F32Memset,
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             };

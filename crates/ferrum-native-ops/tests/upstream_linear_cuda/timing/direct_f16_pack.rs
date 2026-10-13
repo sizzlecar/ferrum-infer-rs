@@ -16,6 +16,15 @@ type Pack = unsafe extern "C" fn(
 ) -> i32;
 
 unsafe extern "C" {
+    fn ferrum_test_upstream_mmvq_pack_f32_intermediate_v1(
+        plan: *const UpstreamLinearPlanV1,
+        input: *const c_void,
+        stride: u32,
+        converted: *mut c_void,
+        packed: *mut c_void,
+        flags: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn ferrum_test_upstream_mmq_pack_f32_intermediate_v1(
         plan: *const UpstreamLinearPlanV1,
         input: *const c_void,
@@ -72,7 +81,7 @@ struct Shape {
 
 impl Shape {
     fn layout(self) -> UpstreamLinearLayout {
-        if self.algorithm == UpstreamLinearAlgorithm::Mmvq && self.m == 32 {
+        if self.algorithm == UpstreamLinearAlgorithm::Mmvq && !matches!(self.m, 1 | 4 | 8) {
             UpstreamLinearLayout::Channels
         } else {
             UpstreamLinearLayout::Columns
@@ -235,7 +244,9 @@ impl Fixture {
         let pack: Pack = match (self.shape.algorithm, arm) {
             (UpstreamLinearAlgorithm::Mmq, 0) => ferrum_test_upstream_mmq_pack_f32_intermediate_v1,
             (UpstreamLinearAlgorithm::Mmq, _) => ferrum_test_upstream_mmq_pack_f16_direct_v1,
-            (UpstreamLinearAlgorithm::Mmvq, 0) => ffi::ferrum_upstream_mmvq_pack_v2,
+            (UpstreamLinearAlgorithm::Mmvq, 0) => {
+                ferrum_test_upstream_mmvq_pack_f32_intermediate_v1
+            }
             (UpstreamLinearAlgorithm::Mmvq, _) => ferrum_test_upstream_mmvq_pack_f16_direct_v1,
         };
         self.enqueue_with_pack(stream, arm, index, pack);
@@ -328,7 +339,7 @@ impl Fixture {
             assert_ne!(
                 converted,
                 vec![0x35; b.converted.bytes],
-                "large-row product pack did not execute its legacy conversion"
+                "F32-intermediate pack did not execute its conversion"
             );
         }
         a.converted.guards();
@@ -487,6 +498,91 @@ fn product_mmq_pack_v2_preserves_bits_across_small_and_prefill_boundaries() {
                 "checked":"full packed/guard/F32/fixup/F16/flags/padding/canaries, fresh capture, markers then finite reset"})
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "exclusive CUDA public MMVQ pack-v2 small-row boundary correctness"]
+fn product_mmvq_pack_v2_preserves_bits_across_small_row_boundaries() {
+    let stream = Stream::new();
+    for format in [UpstreamLinearFormat::Q4K, UpstreamLinearFormat::Q5K] {
+        for m in [1, 3, 32] {
+            let shape = Shape {
+                algorithm: UpstreamLinearAlgorithm::Mmvq,
+                format,
+                m,
+                k: 768,
+                n: 64,
+            };
+            let fixture = Fixture::new(shape, 0);
+            fixture.scan(&stream);
+            let enqueue = |arm| {
+                fixture.enqueue_with_pack(
+                    &stream,
+                    arm,
+                    0,
+                    if arm == 0 {
+                        ferrum_test_upstream_mmvq_pack_f32_intermediate_v1
+                    } else {
+                        ffi::ferrum_upstream_mmvq_pack_v2
+                    },
+                );
+            };
+            let initial_input = fixture.write_input(0, false);
+            for arm in 0..2 {
+                enqueue(arm);
+            }
+            stream.sync();
+            let initial = fixture.assert_equal_with_converted(&initial_input, true, false);
+            let graphs = [0, 1].map(|arm| Graph::capture(&stream, || enqueue(arm)));
+            let edge_input = fixture.write_input(0, true);
+            for graph in &graphs {
+                graph.launch(&stream);
+            }
+            stream.sync();
+            fixture.assert_equal_with_converted(&edge_input, false, false);
+            let fresh_input = fixture.write_input(1, false);
+            for graph in &graphs {
+                graph.launch(&stream);
+            }
+            stream.sync();
+            let fresh = fixture.assert_equal_with_converted(&fresh_input, true, false);
+            assert_ne!(initial, fresh, "public MMVQ pack ignored changed input");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "experiment":"product_mmvq_pack_v2_boundary_correctness",
+                    "format":format!("{format:?}"),"M":m,"K":shape.k,"N":shape.n,
+                    "layout":format!("{:?}",shape.layout()),
+                    "actual_product_symbol":"ferrum_upstream_mmvq_pack_v2",
+                    "baseline_symbol":"ferrum_test_upstream_mmvq_pack_f32_intermediate_v1",
+                    "expected_path":"row-flags clear kernel; original F32 conversion and quantizer retained",
+                    "checked":"full converted/packed/F32/fixup/F16/flags/padding/canaries; special values and fresh replay reset"
+                })
+            );
+        }
+        // MMVQ has no admitted >32-row plan in either layout. Do not invent a
+        // legacy-prefill route solely to exercise the pack's defensive fallback.
+        let request = UpstreamLinearRequestV1::new(
+            format,
+            UpstreamLinearLayout::Channels,
+            33,
+            768,
+            64,
+            caps(),
+        )
+        .unwrap();
+        let mut rejected = UpstreamLinearPlanV1::default();
+        let status = unsafe { ffi::ferrum_upstream_mmvq_plan_v1(&request, &mut rejected) };
+        assert_ne!(status, 0, "MMVQ must reject unsupported M33 geometry");
+        println!(
+            "{}",
+            serde_json::json!({
+                "experiment":"product_mmvq_plan_boundary_rejection",
+                "format":format!("{format:?}"),"M":33,"layout":"Channels",
+                "actual_product_symbol":"ferrum_upstream_mmvq_plan_v1","native_status":status
+            })
+        );
     }
 }
 

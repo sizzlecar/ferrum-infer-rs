@@ -192,7 +192,7 @@ fn mmvq_row_flag_clear_kernel_case(format: UpstreamLinearFormat, k: usize, n: us
             n,
         },
         [
-            ffi::ferrum_upstream_mmvq_pack_v2,
+            ferrum_test_upstream_mmvq_pack_f32_intermediate_v1,
             ferrum_test_upstream_mmvq_pack_f32_intermediate_kernel_zero_v1,
         ],
         false,
