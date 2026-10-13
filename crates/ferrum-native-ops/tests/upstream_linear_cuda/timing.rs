@@ -4,6 +4,19 @@
 use super::*;
 use std::time::Instant;
 
+#[cfg(feature = "cuda-upstream-linear-prefetch-tests")]
+#[path = "timing/mmq_prefetch.rs"]
+mod mmq_prefetch;
+
+type MmqDot = unsafe extern "C" fn(
+    *const UpstreamLinearPlanV1,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+
 unsafe extern "C" {
     fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
     fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
@@ -63,11 +76,14 @@ impl Drop for Event {
 struct Route {
     algorithm: UpstreamLinearAlgorithm,
     plan: UpstreamLinearPlanV1,
+    mmq_dot: Option<MmqDot>,
     converted: Buffer,
     packed: Buffer,
     output: Buffer,
     fixup: Buffer,
     result: Buffer,
+    result_stride: u32,
+    result_offset: u32,
     rows: Buffer,
     flags: Buffer,
 }
@@ -87,11 +103,14 @@ impl Route {
         );
         Self {
             algorithm,
+            mmq_dot: None,
             converted: Buffer::new(p.converted_bytes as usize),
             packed: Buffer::new(p.packed_bytes as usize),
             output: Buffer::new(p.output_bytes as usize),
             fixup: Buffer::new(p.fixup_bytes.max(4) as usize),
             result: Buffer::new(m as usize * n as usize * 2),
+            result_stride: n,
+            result_offset: 0,
             rows: Buffer::new(m as usize * 4),
             flags: Buffer::new(count * 4),
             plan: p,
@@ -130,7 +149,7 @@ impl Route {
                         self.rows.ptr,
                         stream.0,
                     ));
-                    ok(ffi::ferrum_upstream_mmq_dot_v1(
+                    ok(self.mmq_dot.unwrap_or(ffi::ferrum_upstream_mmq_dot_v1)(
                         p,
                         weight,
                         self.packed.ptr,
@@ -141,8 +160,8 @@ impl Route {
                     ok(ffi::ferrum_upstream_mmq_cast_v2(
                         p,
                         self.output.ptr,
-                        self.result.ptr,
-                        p.request.outputs,
+                        self.result.ptr.add(self.result_offset as usize * 2),
+                        self.result_stride,
                         self.rows.ptr,
                         flag,
                         stream.0,
@@ -169,8 +188,8 @@ impl Route {
                     ok(ffi::ferrum_upstream_mmvq_cast_v2(
                         p,
                         self.output.ptr,
-                        self.result.ptr,
-                        p.request.outputs,
+                        self.result.ptr.add(self.result_offset as usize * 2),
+                        self.result_stride,
                         self.rows.ptr,
                         flag,
                         stream.0,
@@ -189,11 +208,21 @@ impl Route {
         assert_eq!(self.rows.read::<u32>(m), vec![0; m]);
         assert_eq!(self.flags.read::<u32>(count), vec![0; count]);
         let values = self.output.read::<f32>(m * n);
-        let bits = self.result.read::<u16>(m * n);
-        for (value, &bits) in values.iter().zip(&bits) {
-            assert!(value.is_finite());
-            assert!(f16::from_bits(bits).is_finite());
-            assert_eq!(bits, oracle::final_cast_bits(*value, false, false));
+        let stride = self.result_stride as usize;
+        let offset = self.result_offset as usize;
+        let bits = self.result.read::<u16>(m * stride);
+        for row in 0..m {
+            for col in 0..stride {
+                let bits = bits[row * stride + col];
+                if (offset..offset + n).contains(&col) {
+                    let value = values[row * n + col - offset];
+                    assert!(value.is_finite());
+                    assert!(f16::from_bits(bits).is_finite());
+                    assert_eq!(bits, oracle::final_cast_bits(value, false, false));
+                } else {
+                    assert_eq!(bits, 0x3535, "untouched strided projection output");
+                }
+            }
         }
         let packed = self.packed.read::<u8>(p.packed_bytes as usize);
         let wb = match format {

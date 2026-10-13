@@ -457,3 +457,5 @@ extern "C" int ferrum_upstream_mmq_cast_v2(const FerrumUpstreamLinearPlanV1 * p,
         return cudaGetLastError();
     });
 }
+
+#include "mmq-next-k-prefetch.cuh"
