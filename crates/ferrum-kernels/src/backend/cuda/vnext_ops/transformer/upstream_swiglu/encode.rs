@@ -264,8 +264,9 @@ pub(super) fn encode(
         for leaf in gate_leaves.iter().chain(&down_leaves) {
             if let Some(native) = &leaf.stage.native {
                 let p = native.geometry();
-                dispatches = add(dispatches, 4 + u64::from(p.fixup != 0))?;
-                transfers = add(transfers, 1 + u64::from(p.guard_blocks != 0))?;
+                let (pack_kernels, pack_transfers) = native.pack_work_counts();
+                dispatches = add(dispatches, pack_kernels + 2 + u64::from(p.fixup != 0))?;
+                transfers = add(transfers, pack_transfers)?;
             } else {
                 dispatches = add(dispatches, 1 + u64::from(leaf.part.transform.is_some()))?;
             }

@@ -384,15 +384,13 @@ impl<'a> PreparedAttentionProjections<'a> {
                         flag,
                     )
                     .map_err(|e| e.to_string())?;
-                // Replace one strict leaf launch by convert+pack+dot+cast(+fixup).
+                // Replace one strict leaf by the linked pack + dot + cast.
+                let (pack_kernels, pack_transfers) = native.pack_work_counts();
                 extra_dispatches = add(
                     extra_dispatches,
-                    3 + u64::from(native.geometry().fixup != 0),
+                    pack_kernels + 1 + u64::from(native.geometry().fixup != 0),
                 )?;
-                transfers = add(
-                    transfers,
-                    1 + u64::from(native.geometry().guard_blocks != 0),
-                )?;
+                transfers = add(transfers, pack_transfers)?;
                 Some(validation)
             } else if let Some(destination) = q8_destination {
                 destination.validate(part, k)?;

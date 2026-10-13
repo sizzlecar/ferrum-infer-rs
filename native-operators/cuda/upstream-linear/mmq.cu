@@ -58,13 +58,11 @@ static __global__ void test_mmq_cast(const float * output, half * result,
 static __device__ __forceinline__ float4 mmq_pack_load4(const float * x, int64_t index) {
     return reinterpret_cast<const float4 *>(x)[index/4];
 }
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
 static __device__ __forceinline__ float4 mmq_pack_load4(const half * x, int64_t index) {
     // Only two-byte input alignment is promised, including odd row strides.
     return make_float4(__half2float(x[index]), __half2float(x[index+1]),
         __half2float(x[index+2]), __half2float(x[index+3]));
 }
-#endif
 
 // Pinned V1 pack math: quantize.cu:456-555; explicit MarkerV2 branches below.
 // Both input loaders use this exact math and marker order. In particular,
@@ -194,7 +192,6 @@ static __global__ void quantize_mmq_q8_1(
         x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, row_flags);
 }
 
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1_f16_direct(
         const half * __restrict__ input, void * __restrict__ packed,
@@ -213,7 +210,6 @@ static __global__ void quantize_mmq_q8_1_f16_direct(
         for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) guard[i] = 0;
     }
 }
-#endif
 // End pinned pack with versioned marker extension.
 
 static bool test_mmq_format(uint32_t format) {
@@ -445,7 +441,7 @@ extern "C" int ferrum_upstream_mmq_cast_v1(const FerrumUpstreamLinearPlanV1 * p,
     });
 }
 
-extern "C" int ferrum_upstream_mmq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
+static int upstream_mmq_pack_f32_intermediate(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
     return ferrum_upstream_boundary([&]() -> int {
         TestMmqPlan n{}; if(!upstream_mmq_valid(p,n)) return -1;
@@ -475,10 +471,9 @@ extern "C" int ferrum_upstream_mmq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
         return cudaGetLastError();
     });
 }
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
 // Same boundary checks and ABI as pack_v2. converted remains caller-owned but
-// is deliberately neither read nor written by this independent test route.
-extern "C" int ferrum_test_upstream_mmq_pack_f16_direct_v1(const FerrumUpstreamLinearPlanV1 * p,
+// is deliberately neither read nor written by the direct-input implementation.
+static int upstream_mmq_pack_f16_direct(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
     return ferrum_upstream_boundary([&]() -> int {
         TestMmqPlan n{}; if(!upstream_mmq_valid(p,n)) return -1;
@@ -499,6 +494,40 @@ extern "C" int ferrum_test_upstream_mmq_pack_f16_direct_v1(const FerrumUpstreamL
         }
         return cudaGetLastError();
     });
+}
+
+extern "C" int ferrum_upstream_mmq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    // Decode stays within the original M<=32 MMQ domain. Larger rows retain
+    // the separately admitted prefill implementation and its scratch writes.
+    // Both helpers perform the complete existing plan/span/alignment checks.
+    if (p && p->request.rows <= 32) {
+        return upstream_mmq_pack_f16_direct(p,input,stride,converted,packed,flags,s);
+    }
+    return upstream_mmq_pack_f32_intermediate(p,input,stride,converted,packed,flags,s);
+}
+
+// Versioned, callable capability: this archive's pack_v2 uses one direct pack
+// kernel and one row-flags memset for valid physical rows 1..32, with no
+// conversion kernel or separate guard memset. The ABI and scratch extents are
+// unchanged. Older archives without this export retain their original counts.
+extern "C" int ferrum_upstream_mmq_pack_f16_small_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    if (!p || !p->request.rows) return -1;
+    if (p->request.rows > 32) return -2;
+    return upstream_mmq_pack_f16_direct(p,input,stride,converted,packed,flags,s);
+}
+
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+// Explicit independent references remain available after pack_v2 promotion;
+// the paired test must not silently compare the product route with itself.
+extern "C" int ferrum_test_upstream_mmq_pack_f32_intermediate_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return upstream_mmq_pack_f32_intermediate(p,input,stride,converted,packed,flags,s);
+}
+extern "C" int ferrum_test_upstream_mmq_pack_f16_direct_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return upstream_mmq_pack_f16_direct(p,input,stride,converted,packed,flags,s);
 }
 #endif
 extern "C" int ferrum_upstream_mmq_check_weights_v2(const FerrumUpstreamLinearPlanV1 * p,

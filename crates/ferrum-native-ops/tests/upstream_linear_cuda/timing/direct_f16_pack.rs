@@ -13,6 +13,15 @@ type Pack = unsafe extern "C" fn(
 ) -> i32;
 
 unsafe extern "C" {
+    fn ferrum_test_upstream_mmq_pack_f32_intermediate_v1(
+        plan: *const UpstreamLinearPlanV1,
+        input: *const c_void,
+        stride: u32,
+        converted: *mut c_void,
+        packed: *mut c_void,
+        flags: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn ferrum_test_upstream_mmq_pack_f16_direct_v1(
         plan: *const UpstreamLinearPlanV1,
         input: *const c_void,
@@ -220,14 +229,18 @@ impl Fixture {
     }
 
     fn enqueue(&self, stream: &Stream, arm: usize, index: usize) {
-        let route = &self.routes[arm];
-        let p = &route.plan;
         let pack: Pack = match (self.shape.algorithm, arm) {
-            (UpstreamLinearAlgorithm::Mmq, 0) => ffi::ferrum_upstream_mmq_pack_v2,
+            (UpstreamLinearAlgorithm::Mmq, 0) => ferrum_test_upstream_mmq_pack_f32_intermediate_v1,
             (UpstreamLinearAlgorithm::Mmq, _) => ferrum_test_upstream_mmq_pack_f16_direct_v1,
             (UpstreamLinearAlgorithm::Mmvq, 0) => ffi::ferrum_upstream_mmvq_pack_v2,
             (UpstreamLinearAlgorithm::Mmvq, _) => ferrum_test_upstream_mmvq_pack_f16_direct_v1,
         };
+        self.enqueue_with_pack(stream, arm, index, pack);
+    }
+
+    fn enqueue_with_pack(&self, stream: &Stream, arm: usize, index: usize, pack: Pack) {
+        let route = &self.routes[arm];
+        let p = &route.plan;
         unsafe {
             ok(pack(
                 p,
@@ -273,6 +286,15 @@ impl Fixture {
     }
 
     fn assert_equal(&self, host_input: &[u16], finite: bool) -> Vec<u16> {
+        self.assert_equal_with_converted(host_input, finite, true)
+    }
+
+    fn assert_equal_with_converted(
+        &self,
+        host_input: &[u16],
+        finite: bool,
+        direct: bool,
+    ) -> Vec<u16> {
         let [a, b] = &self.routes;
         for (name, left, right) in [
             ("packed including guard", &a.packed, &b.packed),
@@ -291,11 +313,21 @@ impl Fixture {
             left.guards();
             right.guards();
         }
-        assert_eq!(
-            b.converted.read::<u8>(b.converted.bytes),
-            vec![0x35; b.converted.bytes],
-            "direct pack wrote the legacy converted buffer"
-        );
+        let converted = b.converted.read::<u8>(b.converted.bytes);
+        if direct {
+            assert_eq!(
+                converted,
+                vec![0x35; b.converted.bytes],
+                "direct pack wrote the legacy converted buffer"
+            );
+        } else {
+            assert_eq!(converted, a.converted.read::<u8>(a.converted.bytes));
+            assert_ne!(
+                converted,
+                vec![0x35; b.converted.bytes],
+                "large-row product pack did not execute its legacy conversion"
+            );
+        }
         a.converted.guards();
         b.converted.guards();
         assert_eq!(self.input.read::<u16>(host_input.len()), host_input);
@@ -384,6 +416,74 @@ fn direct_f16_pack_preserves_complete_projection_bits_and_boundaries() {
             "M":shape.m,"K":shape.k,"N":shape.n,"layout":format!("{:?}",shape.layout()),
             "checked":"all packed/guard/row flags/F32/fixup/F16 bytes, converted untouched, canaries, odd stride/view offsets, signed zero/subnormals/NaN/Inf/overflow, fresh capture and marker reset"})
         );
+    }
+}
+
+#[test]
+#[ignore = "exclusive CUDA product MMQ pack-v2 small/large row boundary correctness"]
+fn product_mmq_pack_v2_preserves_bits_across_small_and_prefill_boundaries() {
+    let stream = Stream::new();
+    for format in [
+        UpstreamLinearFormat::Iq4Xs,
+        UpstreamLinearFormat::Q4K,
+        UpstreamLinearFormat::Q5K,
+    ] {
+        for m in [1, 3, 32, 33, 75] {
+            let shape = Shape {
+                algorithm: UpstreamLinearAlgorithm::Mmq,
+                format,
+                m,
+                k: 768,
+                n: 64,
+            };
+            let fixture = Fixture::new(shape, 0);
+            fixture.scan(&stream);
+            let enqueue = |arm| {
+                fixture.enqueue_with_pack(
+                    &stream,
+                    arm,
+                    0,
+                    if arm == 0 {
+                        ferrum_test_upstream_mmq_pack_f32_intermediate_v1
+                    } else {
+                        ffi::ferrum_upstream_mmq_pack_v2
+                    },
+                );
+            };
+            let initial_input = fixture.write_input(0, false);
+            for arm in 0..2 {
+                enqueue(arm);
+            }
+            stream.sync();
+            let initial = fixture.assert_equal_with_converted(&initial_input, true, m <= 32);
+            let graphs = [0, 1].map(|arm| Graph::capture(&stream, || enqueue(arm)));
+            let edge_input = fixture.write_input(0, true);
+            for graph in &graphs {
+                graph.launch(&stream);
+            }
+            stream.sync();
+            fixture.assert_equal_with_converted(&edge_input, false, m <= 32);
+            let fresh_input = fixture.write_input(1, false);
+            for graph in &graphs {
+                graph.launch(&stream);
+            }
+            stream.sync();
+            let fresh = fixture.assert_equal_with_converted(&fresh_input, true, m <= 32);
+            assert_ne!(
+                initial, fresh,
+                "product captured pack ignored changed input"
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                "experiment":"product_mmq_pack_v2_boundary_correctness",
+                "format":format!("{format:?}"),"M":m,"K":shape.k,"N":shape.n,
+                "actual_product_symbol":"ferrum_upstream_mmq_pack_v2",
+                "baseline_symbol":"ferrum_test_upstream_mmq_pack_f32_intermediate_v1",
+                "expected_path":if m<=32 {"direct_f16; converted untouched"} else {"legacy_f32; converted bytes equal baseline"},
+                "checked":"full packed/guard/F32/fixup/F16/flags/padding/canaries, fresh capture, markers then finite reset"})
+            );
+        }
     }
 }
 

@@ -92,6 +92,7 @@ pub struct PreparedUpstreamLinear {
     raw: UpstreamLinearPlanV1,
     arithmetic: Arithmetic,
     family: Family,
+    small_mmq_f16_pack_available: bool,
     q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
 }
@@ -128,6 +129,7 @@ impl PreparedUpstreamLinear {
                 raw,
                 arithmetic,
                 family: Family::Original,
+                small_mmq_f16_pack_available: compiled_small_mmq_f16_pack(),
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             })
@@ -165,6 +167,7 @@ impl PreparedUpstreamLinear {
                 raw,
                 arithmetic,
                 family: Family::Extra,
+                small_mmq_f16_pack_available: false,
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             })
@@ -201,6 +204,7 @@ impl PreparedUpstreamLinear {
                 raw,
                 arithmetic: Arithmetic::MarkerV2,
                 family: Family::Extra,
+                small_mmq_f16_pack_available: false,
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             })
@@ -211,6 +215,26 @@ impl PreparedUpstreamLinear {
     }
     pub fn arithmetic(&self) -> Arithmetic {
         self.arithmetic
+    }
+    /// Input-pack kernel and transfer counts for retained projection accounting.
+    /// The linked archive capability is captured during cold preparation. Older
+    /// archives and every other route retain their existing work accounting.
+    pub fn pack_work_counts(&self) -> (u64, u64) {
+        if self.arithmetic == Arithmetic::V1 {
+            return (2, 0);
+        }
+        #[cfg(any(feature = "cuda-upstream-linear", test))]
+        let direct = self.small_mmq_f16_pack_available
+            && self.family == Family::Original
+            && self.arithmetic == Arithmetic::MarkerV2
+            && self.raw.algorithm == Algorithm::Mmq as u32
+            && (1..=32).contains(&self.raw.request.rows);
+        #[cfg(not(any(feature = "cuda-upstream-linear", test)))]
+        let direct = false;
+        (
+            if direct { 1 } else { 2 },
+            1 + u64::from(!direct && self.raw.guard_blocks != 0),
+        )
     }
     /// The dot implementation is selected once after the existing numerical
     /// route has supplied the exact native plan. Pack, cast and validation
@@ -460,6 +484,22 @@ impl PreparedUpstreamLinear {
 }
 
 #[cfg(feature = "cuda-upstream-linear")]
+fn compiled_small_mmq_f16_pack() -> bool {
+    crate::native_ops::compiled_native_operator_artifacts()
+        .iter()
+        .any(|artifact| {
+            artifact.operator == UPSTREAM_LINEAR_OPERATOR
+                && artifact.backend == ferrum_types::NativeOperatorBackend::Cuda
+                && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                && artifact.operator_abi_version == "1"
+                && artifact
+                    .exports
+                    .iter()
+                    .any(|symbol| symbol == "ferrum_upstream_mmq_pack_f16_small_v1")
+        })
+}
+
+#[cfg(feature = "cuda-upstream-linear")]
 mod dispatch;
 
 #[cfg(feature = "cuda-upstream-extra-linear")]
@@ -479,6 +519,45 @@ mod shared_weight_tests;
 mod tests {
     use super::*;
     #[test]
+    fn small_mmq_direct_pack_work_counts_preserve_archive_family_and_row_boundaries() {
+        use Algorithm::{Mmq, Mmvq};
+        use Arithmetic::{MarkerV2, V1};
+        use Family::{Extra, Original};
+        // Expected values are actual pack kernels and cudaMemset transfers,
+        // excluding the unchanged dot/fixup/cast and cold static weight scan.
+        for (family, arithmetic, algorithm, rows, capability, guard, expected) in [
+            (Original, MarkerV2, Mmq, 1, true, 8, (1, 1)),
+            (Original, MarkerV2, Mmq, 3, true, 8, (1, 1)),
+            (Original, MarkerV2, Mmq, 32, true, 8, (1, 1)),
+            (Original, MarkerV2, Mmq, 32, true, 0, (1, 1)),
+            (Original, MarkerV2, Mmq, 32, false, 8, (2, 2)),
+            (Original, MarkerV2, Mmq, 32, false, 0, (2, 1)),
+            (Original, MarkerV2, Mmq, 33, true, 8, (2, 2)),
+            (Original, MarkerV2, Mmq, 75, true, 8, (2, 2)),
+            (Original, MarkerV2, Mmq, 0, true, 8, (2, 2)),
+            (Extra, MarkerV2, Mmq, 32, true, 8, (2, 2)),
+            (Original, V1, Mmq, 32, true, 8, (2, 0)),
+            (Original, V1, Mmvq, 32, false, 0, (2, 0)),
+            (Original, MarkerV2, Mmvq, 32, true, 0, (2, 1)),
+        ] {
+            let mut raw = UpstreamLinearPlanV1::default();
+            raw.algorithm = algorithm as u32;
+            raw.request.rows = rows;
+            raw.guard_blocks = guard;
+            let prepared = PreparedUpstreamLinear {
+                raw,
+                arithmetic,
+                family,
+                small_mmq_f16_pack_available: capability,
+                q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
+                q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
+            };
+            assert_eq!(prepared.pack_work_counts(), expected,
+                "{family:?}/{arithmetic:?}/{algorithm:?}/M{rows}/capability{capability}/guard{guard}");
+        }
+    }
+
+    #[test]
     fn shared_q4_weight_decode_requires_the_complete_prepared_mmvq_geometry() {
         let mut raw = UpstreamLinearPlanV1::default();
         raw.algorithm = Algorithm::Mmvq as u32;
@@ -493,6 +572,7 @@ mod tests {
             raw,
             arithmetic: Arithmetic::MarkerV2,
             family: Family::Original,
+            small_mmq_f16_pack_available: false,
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
         };
@@ -539,6 +619,7 @@ mod tests {
             raw,
             arithmetic: Arithmetic::MarkerV2,
             family: Family::Original,
+            small_mmq_f16_pack_available: false,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
         };
@@ -630,6 +711,7 @@ mod tests {
                 raw: Default::default(),
                 arithmetic: Arithmetic::MarkerV2,
                 family,
+                small_mmq_f16_pack_available: false,
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             };
