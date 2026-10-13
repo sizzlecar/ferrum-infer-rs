@@ -1425,6 +1425,8 @@ pub(crate) struct RuntimeTrace {
     pub(crate) segment_program_encode_calls: usize,
     pub(crate) segment_program_fault: SegmentProgramFault,
     pub(crate) segment_entry: Option<DeviceReusableExecutionEntryIdentity>,
+    pub(crate) segment_catalog: Vec<DeviceReusableExecutionProgram>,
+    pub(crate) segment_catalog_replaces_entry: bool,
     pub(crate) segment_entry_error: bool,
     pub(crate) segment_entry_panic: bool,
     pub(crate) segment_trim_released: usize,
@@ -1972,6 +1974,17 @@ impl DeviceRuntime for TestRuntime {
             },
             program_binding_nodes,
         }))
+    }
+
+    fn reusable_execution_catalog(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Result<Vec<DeviceReusableExecutionProgram>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        if trace.segment_catalog_replaces_entry {
+            trace.segment_entry = Some(DeviceReusableExecutionEntryIdentity::new());
+        }
+        Ok(trace.segment_catalog.clone())
     }
 
     fn reusable_execution_entry_identity(

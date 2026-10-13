@@ -1707,6 +1707,16 @@ impl OperationDispatch {
                 .iter()
                 .enumerate()
                 .all(|(index, node)| node.plan_node_index() == index);
+        // A first capture has no resident entry at dispatch time. Collect only
+        // immutable hints; successful completion and exact retirement will
+        // inspect the actual newly resident program before publication.
+        let collect_capture_declarations = use_segment
+            && reusable_program.is_none()
+            && reusable_execution_authority.is_some()
+            && timing_mode.direct_reusable_execution_allowed()
+            && execution_policy.compute_path() == DeviceComputePathRequirement::Adaptive;
+        let capture_candidate_epoch =
+            collect_capture_declarations.then(|| lane.reusable_execution_epoch());
         let mut segment_recipe = if use_segment {
             reusable_program
                 .map(|program| lane.lookup_segment_binding_recipe(program.program_id()))
@@ -2175,7 +2185,7 @@ impl OperationDispatch {
                     let mut recipe = super::segment_compile::CompiledSegmentBindingRecipe::compile(
                         resolved,
                         reusable_program.program_id().clone(),
-                        segment_declarations,
+                        std::mem::take(&mut segment_declarations),
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
                     if use_compiled_segment {
@@ -2221,8 +2231,18 @@ impl OperationDispatch {
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
                 let dependency_scope = invocation.retained_dependency_scope.clone();
-                let mut operation = match provider.provider().encode_selected(invocation) {
-                    Ok(operation) => operation,
+                let encoded = if collect_capture_declarations {
+                    provider
+                        .provider()
+                        .encode_selected_with_segment_declaration(invocation)
+                } else {
+                    provider
+                        .provider()
+                        .encode_selected(invocation)
+                        .map(|operation| (operation, None))
+                };
+                let (mut operation, declaration) = match encoded {
+                    Ok(encoded) => encoded,
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())
                             && failure.phase() == expected_phase =>
@@ -2271,6 +2291,22 @@ impl OperationDispatch {
                     || program_binding_count > 0
                     || operation.dynamic_binding_count() > 0
                     || operation.result_binding_count() > 0;
+                if has_per_wave_bindings
+                    && reusable_execution_authority
+                        .as_ref()
+                        .is_some_and(|authority| {
+                            u32::try_from(node_index).is_ok_and(|index| {
+                                authority
+                                    .eager_boundary_node_indices
+                                    .binary_search(&index)
+                                    .is_err()
+                            })
+                        })
+                {
+                    if let Some(declaration) = declaration {
+                        segment_declarations.push((node_index, declaration));
+                    }
+                }
                 encoded_provider_command_count = encoded_provider_command_count
                     .checked_add(operation_command_count)
                     .ok_or_else(|| {
@@ -2366,21 +2402,57 @@ impl OperationDispatch {
         }
         if reusable_program.is_none() {
             if let Some(authority) = reusable_execution_authority {
-                commands
-                    .set_reusable_execution_capture(
-                        DeviceReusableExecutionCapture::new(
-                            authority.program_id,
-                            u32::try_from(providers.len()).map_err(|_| {
-                                SubmissionWaveDispatchError::Contract(invalid_operation(
-                                    "reusable execution capture node count exceeds u32",
-                                ))
-                            })?,
-                            authority.eager_boundary_node_indices,
-                            reusable_execution_binding_nodes,
+                let capture = DeviceReusableExecutionCapture::new(
+                    authority.program_id,
+                    u32::try_from(providers.len()).map_err(|_| {
+                        SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "reusable execution capture node count exceeds u32",
+                        ))
+                    })?,
+                    authority.eager_boundary_node_indices,
+                    reusable_execution_binding_nodes,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .with_retained_plan_dependencies(retained_dependencies);
+                if collect_capture_declarations
+                    && !segment_declarations.is_empty()
+                    && capture
+                        .per_wave_binding_node_indices()
+                        .iter()
+                        .copied()
+                        .filter(|index| {
+                            capture
+                                .eager_boundary_node_indices()
+                                .binary_search(index)
+                                .is_err()
+                        })
+                        .map(|index| index as usize)
+                        .eq(segment_declarations.iter().map(|(index, _)| *index))
+                {
+                    // A hint failure must not fail a valid eager submission.
+                    // The first warmup also pays this cold compilation; it
+                    // publishes nothing until a resident entry exists.
+                    if let Ok(mut recipe) =
+                        super::segment_compile::CompiledSegmentBindingRecipe::compile(
+                            resolved,
+                            capture.program_id().clone(),
+                            segment_declarations,
                         )
-                        .map_err(SubmissionWaveDispatchError::Contract)?
-                        .with_retained_plan_dependencies(retained_dependencies),
-                    )
+                    {
+                        if !use_compiled_segment || recipe.compile_backend(runtime).is_ok() {
+                            completion
+                                .set_captured_segment_binding_candidate(
+                                    Arc::new(recipe),
+                                    capture.clone(),
+                                    capture_candidate_epoch
+                                        .expect("capture declaration collection has an epoch"),
+                                )
+                                .map_err(SubmissionWaveDispatchError::Contract)?;
+                        }
+                    }
+                }
+                commands
+                    .set_reusable_execution_capture(capture)
                     .map_err(SubmissionWaveDispatchError::Contract)?;
             }
         }

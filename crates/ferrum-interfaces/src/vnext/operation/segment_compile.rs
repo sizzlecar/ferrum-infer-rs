@@ -17,9 +17,10 @@ use super::{
     SegmentBindingRegionSelector, TensorAccess,
 };
 use crate::vnext::{
-    AllocationLifetime, BufferDescriptor, BufferUsage, DeviceReusableExecutionProgramId,
-    ElementType, ExecutablePlanView, MemoryPlan, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ResourceId, VNextError,
+    AllocationLifetime, BufferDescriptor, BufferUsage, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId, ElementType,
+    ExecutablePlanView, MemoryPlan, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ResourceId, VNextError,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +95,43 @@ pub(crate) struct CompiledSegmentBindingRecipe {
 }
 
 impl CompiledSegmentBindingRecipe {
+    /// A cold declaration bundle is a hint until a fresh backend catalog
+    /// classifies the exact submitted topology. Partial or different coverage
+    /// keeps the ordinary cold path; declarations never mint residency.
+    pub(crate) fn matches_captured_program(
+        &self,
+        capture: &DeviceReusableExecutionCapture,
+        program: &DeviceReusableExecutionProgram,
+    ) -> bool {
+        self.program_id == *capture.program_id()
+            && program.program_id() == capture.program_id()
+            && program.node_count() == capture.node_count()
+            && program.eager_boundary_node_indices() == capture.eager_boundary_node_indices()
+            && program.retained_plan_dependencies() == capture.retained_plan_dependencies()
+            && program.has_resident_segments()
+            && program.segments().iter().all(|segment| {
+                segment.end_node_index() <= capture.node_count()
+                    && segment.logical_command_count()
+                        == segment.end_node_index() - segment.start_node_index()
+            })
+            && capture
+                .per_wave_binding_node_indices()
+                .iter()
+                .copied()
+                .filter(|index| {
+                    program
+                        .segments()
+                        .iter()
+                        .any(|segment| segment.contains_node(*index))
+                })
+                .eq(program.per_wave_binding_node_indices().iter().copied())
+            && program
+                .per_wave_binding_node_indices()
+                .iter()
+                .map(|index| *index as usize)
+                .eq(self.nodes.iter().map(|node| node.node_index))
+    }
+
     pub(crate) fn compile_backend<R: crate::vnext::DeviceRuntime>(
         &mut self,
         runtime: &R,

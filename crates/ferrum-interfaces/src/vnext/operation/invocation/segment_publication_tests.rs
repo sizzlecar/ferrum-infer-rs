@@ -403,3 +403,6 @@ fn segment_publication_pending_does_not_keep_lane_or_step_alive() {
     assert!(lane.upgrade().is_none());
     assert!(!ready.publish(&retirement).unwrap());
 }
+
+#[path = "capture_wave_publication_tests.rs"]
+mod capture_wave_publication_tests;

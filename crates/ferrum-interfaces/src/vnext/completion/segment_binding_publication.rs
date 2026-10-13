@@ -3,9 +3,9 @@
 use super::*;
 use crate::vnext::operation::segment_compile::CompiledSegmentBindingRecipe;
 use crate::vnext::{
-    BatchInvocationId, BatchStepId, DeviceReusableExecutionEntryIdentity,
-    DeviceReusableExecutionProgramId, StepParticipantFrameAssignment,
-    StepParticipantRetirementDisposition, StepRetirementReceipt,
+    BatchInvocationId, BatchStepId, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionEntryIdentity, DeviceReusableExecutionProgramId,
+    StepParticipantFrameAssignment, StepParticipantRetirementDisposition, StepRetirementReceipt,
 };
 
 struct CachedSegmentBindingRecipe {
@@ -20,11 +20,19 @@ pub(super) struct SegmentBindingRecipeCache {
     current: Mutex<Option<CachedSegmentBindingRecipe>>,
 }
 
+enum SegmentBindingPublicationEntry {
+    Resident(DeviceReusableExecutionEntryIdentity),
+    // This immutable capture seal carries neither a resident entry nor live
+    // ownership. Only successful completion and exact committed retirement
+    // allow a fresh, quiescent backend catalog to resolve it.
+    AwaitCapturedEntry(DeviceReusableExecutionCapture),
+}
+
 #[must_use = "publication requires the exact successful completion and normal retirement"]
 pub struct SegmentBindingPublication<R: DeviceRuntime> {
     lane: Weak<ExecutionLane<R>>,
     recipe: Arc<CompiledSegmentBindingRecipe>,
-    entry: DeviceReusableExecutionEntryIdentity,
+    entry: SegmentBindingPublicationEntry,
     epoch: u64,
     slot_id: CompletionSlotId,
     submission_fingerprint: String,
@@ -105,6 +113,37 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         entry: DeviceReusableExecutionEntryIdentity,
         epoch: u64,
     ) -> Result<(), VNextError> {
+        self.stage_segment_binding_candidate(
+            recipe,
+            SegmentBindingPublicationEntry::Resident(entry),
+            epoch,
+        )
+    }
+
+    pub(crate) fn set_captured_segment_binding_candidate(
+        &mut self,
+        recipe: Arc<CompiledSegmentBindingRecipe>,
+        capture: DeviceReusableExecutionCapture,
+        epoch: u64,
+    ) -> Result<(), VNextError> {
+        if recipe.program_id != *capture.program_id() {
+            return Err(invalid_completion(
+                "segment candidate differs from its capture seal",
+            ));
+        }
+        self.stage_segment_binding_candidate(
+            recipe,
+            SegmentBindingPublicationEntry::AwaitCapturedEntry(capture),
+            epoch,
+        )
+    }
+
+    fn stage_segment_binding_candidate(
+        &mut self,
+        recipe: Arc<CompiledSegmentBindingRecipe>,
+        entry: SegmentBindingPublicationEntry,
+        epoch: u64,
+    ) -> Result<(), VNextError> {
         if self.segment_binding_candidate.is_some() || self.submission_may_have_happened {
             return Err(invalid_completion(
                 "segment candidate may be staged once before submission",
@@ -123,7 +162,15 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .receipt
             .as_ref()
             .ok_or_else(|| invalid_completion("segment reservation has no receipt"))?;
-        if epoch != lane.reusable_execution_epoch() || wave.execution_lane_id() != lane.id {
+        if epoch != lane.reusable_execution_epoch() {
+            if matches!(entry, SegmentBindingPublicationEntry::AwaitCapturedEntry(_)) {
+                return Ok(());
+            }
+            return Err(invalid_completion(
+                "segment candidate lane epoch changed before staging",
+            ));
+        }
+        if wave.execution_lane_id() != lane.id {
             return Err(invalid_completion(
                 "segment candidate lane epoch changed before staging",
             ));
@@ -242,7 +289,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
     fn publish_segment_binding_recipe(
         &self,
         recipe: Arc<CompiledSegmentBindingRecipe>,
-        expected_entry: DeviceReusableExecutionEntryIdentity,
+        publication_entry: SegmentBindingPublicationEntry,
         epoch: u64,
     ) -> Result<bool, VNextError> {
         if self.fail_closed.load(Ordering::Acquire) || epoch != self.reusable_execution_epoch() {
@@ -259,9 +306,72 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             return Ok(false);
         }
         let current_entry = self.checked_segment_binding_entry(&state, &recipe.program_id)?;
-        if !current_entry.is_some_and(|entry| entry.same_entry(&expected_entry)) {
+        let Some(current_entry) = current_entry else {
             return Ok(false);
-        }
+        };
+        let expected_entry = match publication_entry {
+            SegmentBindingPublicationEntry::Resident(expected) => {
+                if !current_entry.same_entry(&expected) {
+                    return Ok(false);
+                }
+                expected
+            }
+            SegmentBindingPublicationEntry::AwaitCapturedEntry(capture) => {
+                let inspected = catch_unwind(AssertUnwindSafe(|| {
+                    if !self.current_descriptor_matches_snapshot()
+                        || self.runtime.stream_state(&state.stream) != StreamState::Ready
+                    {
+                        return Err(invalid_completion(
+                            "capture publication requires a stable lane",
+                        ));
+                    }
+                    let catalog = self
+                        .runtime
+                        .reusable_execution_catalog(&state.stream)
+                        .map_err(|error| {
+                            invalid_completion(format!(
+                                "capture publication catalog inspection failed: {error}"
+                            ))
+                        })?;
+                    if !self.current_descriptor_matches_snapshot()
+                        || self.runtime.stream_state(&state.stream) != StreamState::Ready
+                    {
+                        return Err(invalid_completion(
+                            "capture publication inspection changed lane state",
+                        ));
+                    }
+                    let mut programs = catalog
+                        .iter()
+                        .filter(|program| program.program_id() == capture.program_id());
+                    Ok(programs
+                        .next()
+                        .is_some_and(|program| recipe.matches_captured_program(&capture, program))
+                        && programs.next().is_none())
+                }));
+                let matches = inspected.unwrap_or_else(|_| {
+                    Err(invalid_completion(
+                        "runtime panicked while inspecting capture publication",
+                    ))
+                });
+                let matches = match matches {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        self.fail_closed.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                };
+                if !matches || epoch != self.reusable_execution_epoch() {
+                    return Ok(false);
+                }
+                // The catalog inspection may not replace the entry it just
+                // described. Both observations occur under this same guard.
+                let confirmed = self.checked_segment_binding_entry(&state, &recipe.program_id)?;
+                if !confirmed.is_some_and(|entry| entry.same_entry(&current_entry)) {
+                    return Ok(false);
+                }
+                current_entry
+            }
+        };
         let cache = self
             .segment_binding_recipe
             .get_or_init(SegmentBindingRecipeCache::default);
