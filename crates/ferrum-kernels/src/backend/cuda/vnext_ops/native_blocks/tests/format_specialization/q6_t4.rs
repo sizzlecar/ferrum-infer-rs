@@ -1,4 +1,4 @@
-//! Strict Q6 F16 row tiling: identical arithmetic, independent test-only T4.
+//! Strict Q6 F16 row tiling: independent raw T4 pilot and product mixed route.
 
 use super::super::captured::{measure, Captured};
 use super::*;
@@ -38,13 +38,13 @@ fn q6_t4_preserves_strict_bits_and_f64_boundaries() {
             }
             fixture.run(&stream, &kernels.linear_q6k_tiled_f16, 8, 1);
             let expected = fixture.validate(&stream);
-            fixture.run(&stream, &kernels.linear_q6k_test_t4_f16, 4, 1);
+            fixture.run(&stream, &kernels.linear_q6k_t4_f16, 4, 1);
             assert_eq!(
                 fixture.validate(&stream),
                 expected,
                 "Q6 T4 complete bits {rows}x{k}x{n}"
             );
-            // Production remains T8 (or the original scalar M1 route).
+            // Small/unqualified geometries retain T8 (or scalar M1).
             fixture.run_dispatch(&stream, &kernels);
             stream.synchronize().unwrap();
             assert_eq!(
@@ -103,9 +103,83 @@ fn validate_scope(bank: &Bank, stream: &Arc<CudaStream>, scope: usize) {
     }
 }
 
+// Pure routing tests do not create a CUDA context or submit device work.
+#[test]
+fn q6_f16_row_tile_qualified_shapes_require_exact_m_and_dtype() {
+    use ferrum_interfaces::vnext::ElementType::{F16, F32};
+    let format = weights::MatrixFormat::Block(GgufBlockFormat::Q6K);
+    for (k, n) in [(5120, 1024), (6144, 5120)] {
+        assert_eq!(q6_f16_row_tile(format, F16, F16, 8, k, n), 4);
+        for m in [0, 1, 3, 7, 9, 32, 33, u32::MAX] {
+            assert_eq!(
+                q6_f16_row_tile(format, F16, F16, m, k, n),
+                if m > 1 { 8 } else { 1 }
+            );
+        }
+        for (input, output) in [(F32, F32), (F32, F16), (F16, F32)] {
+            assert_eq!(q6_f16_row_tile(format, input, output, 8, k, n), 8);
+            assert_eq!(q6_f16_row_tile(format, input, output, 1, k, n), 1);
+        }
+    }
+}
+
+#[test]
+fn q6_f16_row_tile_other_formats_and_unmeasured_shapes_keep_legacy() {
+    use ferrum_interfaces::vnext::ElementType::F16;
+    let q6 = weights::MatrixFormat::Block(GgufBlockFormat::Q6K);
+    // Include the rejected FFN shapes and the unmeasured cross-product of
+    // qualified K/N values, so a rectangular gate cannot silently replace it.
+    for (k, n) in [
+        (5120, 17408),
+        (17408, 5120),
+        (5120, 5120),
+        (6144, 1024),
+        (4864, 1024),
+        (5120, 1023),
+        (5120, 1025),
+        (6144, 5119),
+        (6144, 5121),
+    ] {
+        assert_eq!(q6_f16_row_tile(q6, F16, F16, 8, k, n), 8);
+    }
+    for format in [
+        weights::MatrixFormat::DenseF16,
+        weights::MatrixFormat::Block(GgufBlockFormat::Q4K),
+        weights::MatrixFormat::Block(GgufBlockFormat::Q5K),
+        weights::MatrixFormat::Block(GgufBlockFormat::Iq4Xs),
+        weights::MatrixFormat::Block(GgufBlockFormat::Q8_0),
+    ] {
+        for (k, n) in [(5120, 1024), (6144, 5120)] {
+            assert_eq!(q6_f16_row_tile(format, F16, F16, 8, k, n), 8);
+            assert_eq!(q6_f16_row_tile(format, F16, F16, 1, k, n), 1);
+        }
+    }
+}
+
 #[test]
 #[ignore = "paired real-shape Q6 ring; exclusive CUDA; compressed working set exceeds three L2 caches"]
 fn q6_t4_complete_projection_ring_pairs() {
+    // Retain the original all-T4 pilot, including its rejected FFN geometries.
+    paired_projection_ring(false);
+}
+
+#[test]
+#[ignore = "actual mixed product dispatcher paired ring; exclusive CUDA"]
+fn q6_t4_product_dispatch_complete_projection_ring_pairs() {
+    paired_projection_ring(true);
+}
+
+fn paired_projection_ring(product_dispatch: bool) {
+    let scopes = if product_dispatch {
+        1
+    } else {
+        SHAPES.len() + 1
+    };
+    let candidate_name = if product_dispatch {
+        "strict_q6_product_dispatch"
+    } else {
+        "strict_q6_test_t4"
+    };
     let context = CudaContext::new(0).expect("Q6 T4 ring requires CUDA");
     // This thread/stream owns all buffers, fences all host reads and drops
     // uploaded graphs before their buffers. Avoid tracking events in capture.
@@ -155,7 +229,12 @@ fn q6_t4_complete_projection_ring_pairs() {
         for fixture in &mut leaves {
             fixture.run(&stream, &kernels.linear_q6k_tiled_f16, 8, 1);
             let reference = fixture.validate_output(&stream);
-            fixture.run(&stream, &kernels.linear_q6k_test_t4_f16, 4, 1);
+            if product_dispatch {
+                fixture.run_dispatch(&stream, &kernels);
+                stream.synchronize().unwrap();
+            } else {
+                fixture.run(&stream, &kernels.linear_q6k_t4_f16, 4, 1);
+            }
             assert_eq!(
                 fixture.validate_output(&stream),
                 reference,
@@ -163,22 +242,28 @@ fn q6_t4_complete_projection_ring_pairs() {
             );
             expected.push(reference);
         }
-        let graphs = (0..=SHAPES.len())
+        let graphs = (0..scopes)
             .map(|scope| {
                 [0, 1].map(|route| {
                     let graph = Captured::new(&stream, || {
                         for (index, fixture) in leaves.iter_mut().enumerate() {
                             if selected(scope, index) {
-                                fixture.enqueue(
-                                    &stream,
-                                    if route == 0 {
-                                        &kernels.linear_q6k_tiled_f16
-                                    } else {
-                                        &kernels.linear_q6k_test_t4_f16
-                                    },
-                                    if route == 0 { 8 } else { 4 },
-                                    1,
-                                );
+                                if product_dispatch && route == 1 {
+                                    // Exercise actual typed policy, kernel choice and launch
+                                    // grid. No test-local geometry switch substitutes for it.
+                                    fixture.enqueue_dispatch(&stream, &kernels);
+                                } else {
+                                    fixture.enqueue(
+                                        &stream,
+                                        if route == 0 {
+                                            &kernels.linear_q6k_tiled_f16
+                                        } else {
+                                            &kernels.linear_q6k_t4_f16
+                                        },
+                                        if route == 0 { 8 } else { 4 },
+                                        1,
+                                    );
+                                }
                             }
                         }
                     });
@@ -207,7 +292,7 @@ fn q6_t4_complete_projection_ring_pairs() {
             leaves,
             expected,
         };
-        for scope in 0..=SHAPES.len() {
+        for scope in 0..scopes {
             for route in 0..2 {
                 for (index, fixture) in bank.leaves.iter_mut().enumerate() {
                     if selected(scope, index) {
@@ -232,13 +317,21 @@ fn q6_t4_complete_projection_ring_pairs() {
     stream.synchronize().unwrap();
     println!(
         "{}",
-        serde_json::json!({"kind":"q6_t4_ring_plan", "product_status":"test_only",
+        serde_json::json!({"kind":if product_dispatch { "q6_t4_product_ring_plan" } else { "q6_t4_ring_plan" },
+        "product_status":if product_dispatch { "candidate_branch_not_product_qualified" } else { "test_only_raw_t4" },
         "m":8,"shapes":SHAPES,"leaf_shape_order":ORDER,"shape_counts":[12,9,1,1],
         "physical_banks":bank_count,"distinct_physical_weight_leaves":addresses.len(),
         "compressed_bytes_per_ring":ring_bytes,"resident_compressed_bytes":bank_count*ring_bytes,
         "device_l2_bytes":l2,"greater_than_three_l2":true,"pairs_per_scope_per_bank":PAIRS_PER_BANK,
         "graph_nodes":banks[0].graphs.iter().map(|g|[g[0].node_count,g[1].node_count]).collect::<Vec<_>>(),
-        "routes":["strict_q6_t8","strict_q6_test_t4"],"weight_byte_offset":5,"output_offset":2,
+        "routes":["strict_q6_t8",candidate_name],
+        "raw_t4_kernel":"vnext_gguf_linear_q6k_t4_f16; promoted unchanged from test_t4_f16",
+        "candidate_row_tiles_from_policy":ORDER.iter().map(|&shape| {
+            let (k,n)=SHAPES[shape];
+            if product_dispatch { q6_f16_row_tile(weights::MatrixFormat::Block(GgufBlockFormat::Q6K),
+                ferrum_interfaces::vnext::ElementType::F16,ferrum_interfaces::vnext::ElementType::F16,8,k as u32,n as u32) }
+            else {4}
+        }).collect::<Vec<_>>(),"weight_byte_offset":5,"output_offset":2,
         "full_ring_is_actual_23_launches":true,"per_shape_scope":"actual subset graphs, not sums or extrapolated leaf timings",
         "cache_precondition":"before each arm replay every complete T8 bank in fixed cyclic order, then synchronize; outside measured block; not guaranteed cache eviction or model traffic",
         "wall_scope":"start event enqueue, graph launch, end event enqueue and end-event synchronization",
@@ -247,7 +340,7 @@ fn q6_t4_complete_projection_ring_pairs() {
         "f64_scope":"separate small boundary selector only; real shapes compare every GPU output bit",
         "fresh_input_replay":true,"performance_threshold":null})
     );
-    for scope in 0..=SHAPES.len() {
+    for scope in 0..scopes {
         let count = (0..ORDER.len()).filter(|&i| selected(scope, i)).count();
         for round in 0..PAIRS_PER_BANK {
             for bank_index in 0..bank_count {
@@ -269,13 +362,13 @@ fn q6_t4_complete_projection_ring_pairs() {
                     validate_scope(bank, &stream, scope);
                     println!(
                         "{}",
-                        serde_json::json!({"kind":"q6_t4_ring_pair","m":8,
+                        serde_json::json!({"kind":if product_dispatch { "q6_t4_product_ring_pair" } else { "q6_t4_ring_pair" },"m":8,
                         "scope":if scope==0 { "complete_ring" } else { "shape_subset" },
                         "shape":if scope==0 { None } else { Some(SHAPES[scope-1]) },
                         "projections":count,"bank":bank_index,"round":round,"position":position,
                         "pair_order":if round%2==0 { "AB" } else { "BA" },
-                        "route":if route==0 { "strict_q6_t8" } else { "strict_q6_test_t4" },
-                        "row_tile":if route==0 {8} else {4},"graph_nodes":bank.graphs[scope][route].node_count,
+                        "route":if route==0 { "strict_q6_t8" } else { candidate_name },
+                        "row_tile":if route==0 {Some(8)} else if product_dispatch {None} else {Some(4)},"graph_nodes":bank.graphs[scope][route].node_count,
                         "wall_ns":wall_ns,"gpu_ns":gpu_ns,"all_output_bits_equal":true})
                     );
                 }

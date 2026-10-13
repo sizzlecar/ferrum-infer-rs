@@ -274,10 +274,20 @@ impl<T: Scalar> Fixture<T> {
         stream: &Arc<CudaStream>,
         kernels: &CudaNativeBlockKernels,
     ) {
-        use ferrum_interfaces::vnext::WeightId;
         stream
             .memcpy_htod(&self.output_initial, &mut self.output_gpu)
             .unwrap();
+        self.enqueue_dispatch(stream, kernels);
+    }
+
+    // Same production entrypoint without the host reset; safe in a captured
+    // test graph after callers prepare output sentinels outside capture.
+    pub(super) fn enqueue_dispatch(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        kernels: &CudaNativeBlockKernels,
+    ) {
+        use ferrum_interfaces::vnext::WeightId;
         let input = self
             .input_gpu
             .slice(INPUT_PREFIX..INPUT_PREFIX + self.rows * self.inputs);

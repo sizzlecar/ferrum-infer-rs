@@ -30,6 +30,33 @@ fn q8_0_f16_row_tile(rows: u32, inputs: u32, outputs: u32, multiprocessors: u32)
     }
 }
 
+// Only the two measured M8 strict-Q6 geometries select T4. This preserves the
+// strict arithmetic contract and leaves unmeasured shapes/dtypes on the old
+// scalar/T8 route; in particular the two larger FFN geometries retain T8.
+fn q6_f16_row_tile(
+    format: weights::MatrixFormat,
+    input_type: ferrum_interfaces::vnext::ElementType,
+    output_type: ferrum_interfaces::vnext::ElementType,
+    rows: u32,
+    inputs: u32,
+    outputs: u32,
+) -> u32 {
+    use crate::gguf_blocks::GgufBlockFormat;
+    use ferrum_interfaces::vnext::ElementType;
+    if format == weights::MatrixFormat::Block(GgufBlockFormat::Q6K)
+        && input_type == ElementType::F16
+        && output_type == ElementType::F16
+        && rows == 8
+        && matches!((inputs, outputs), (5120, 1024) | (6144, 5120))
+    {
+        4
+    } else if rows > 1 {
+        LINEAR_ROW_TILE
+    } else {
+        1
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CudaNativeBlockKernels {
     multiprocessors: u32,
@@ -59,8 +86,7 @@ pub(super) struct CudaNativeBlockKernels {
     iq4xs_register_decode: CudaFunction,
     linear_q6k_f16: CudaFunction,
     linear_q6k_tiled_f16: CudaFunction,
-    #[cfg(test)]
-    linear_q6k_test_t4_f16: CudaFunction,
+    linear_q6k_t4_f16: CudaFunction,
     linear_q6k_f32: CudaFunction,
     linear_q6k_tiled_f32: CudaFunction,
     hadamard: hadamard::CudaHadamardKernels,
@@ -212,8 +238,7 @@ impl CudaNativeBlockKernels {
             iq4xs_register_decode: load("vnext_gguf_iq4xs_register_decode")?,
             linear_q6k_f16: load("vnext_gguf_linear_q6k_f16")?,
             linear_q6k_tiled_f16: load("vnext_gguf_linear_q6k_tiled_f16")?,
-            #[cfg(test)]
-            linear_q6k_test_t4_f16: load("vnext_gguf_linear_q6k_test_t4_f16")?,
+            linear_q6k_t4_f16: load("vnext_gguf_linear_q6k_t4_f16")?,
             linear_q6k_f32: load("vnext_gguf_linear_q6k_f32")?,
             linear_q6k_tiled_f32: load("vnext_gguf_linear_q6k_tiled_f32")?,
             hadamard: hadamard::CudaHadamardKernels::load(&module)?,
@@ -321,10 +346,15 @@ impl CudaNativeBlockKernels {
         let row_tile = if q8_0 && input_type == ElementType::F16 && output_type == ElementType::F16
         {
             q8_0_f16_row_tile(rows, part.columns, part.rows, self.multiprocessors)
-        } else if rows > 1 {
-            LINEAR_ROW_TILE
         } else {
-            1
+            q6_f16_row_tile(
+                part.format,
+                input_type,
+                output_type,
+                rows,
+                part.columns,
+                part.rows,
+            )
         };
         let kernel = match (input_type, output_type, row_tile > 1) {
             (ElementType::F16, ElementType::F16, false) if q4k => &self.linear_q4k_f16,
@@ -335,6 +365,9 @@ impl CudaNativeBlockKernels {
             (ElementType::F16, ElementType::F16, false) if iq4xs => &self.linear_iq4xs_f16,
             (ElementType::F16, ElementType::F16, true) if iq4xs => &self.linear_iq4xs_tiled_f16,
             (ElementType::F16, ElementType::F16, false) if q6k => &self.linear_q6k_f16,
+            (ElementType::F16, ElementType::F16, true) if q6k && row_tile == 4 => {
+                &self.linear_q6k_t4_f16
+            }
             (ElementType::F16, ElementType::F16, true) if q6k => &self.linear_q6k_tiled_f16,
             (ElementType::F32, ElementType::F32, false) if q6k => &self.linear_q6k_f32,
             (ElementType::F32, ElementType::F32, true) if q6k => &self.linear_q6k_tiled_f32,
