@@ -279,10 +279,6 @@ impl OperationResourceEstimator for CudaRmsNormProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
-    fn reusable_topology_stability(&self) -> ferrum_interfaces::vnext::ReusableTopologyStability {
-        ferrum_interfaces::vnext::ReusableTopologyStability::SameWaveStable
-    }
-
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -1234,10 +1230,6 @@ impl OperationResourceEstimator for CudaResidualAddProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
-    fn reusable_topology_stability(&self) -> ferrum_interfaces::vnext::ReusableTopologyStability {
-        ferrum_interfaces::vnext::ReusableTopologyStability::SameWaveStable
-    }
-
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,

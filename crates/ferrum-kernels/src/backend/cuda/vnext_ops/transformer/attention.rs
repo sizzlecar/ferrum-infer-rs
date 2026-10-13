@@ -617,10 +617,6 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
-    fn reusable_topology_stability(&self) -> ferrum_interfaces::vnext::ReusableTopologyStability {
-        ferrum_interfaces::vnext::ReusableTopologyStability::SameWaveStable
-    }
-
     fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
         if self.precision.upstream() {
             ferrum_interfaces::vnext::ReusableBindingResources::All

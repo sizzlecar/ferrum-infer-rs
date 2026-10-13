@@ -1992,10 +1992,6 @@ impl OperationResourceEstimator for CudaTokenEmbeddingProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
-    fn reusable_topology_stability(&self) -> ferrum_interfaces::vnext::ReusableTopologyStability {
-        ferrum_interfaces::vnext::ReusableTopologyStability::SameWaveStable
-    }
-
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -2106,10 +2102,6 @@ impl OperationResourceEstimator for CudaLastTokenDenseLinearProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
-    fn reusable_topology_stability(&self) -> ferrum_interfaces::vnext::ReusableTopologyStability {
-        ferrum_interfaces::vnext::ReusableTopologyStability::SameWaveStable
-    }
-
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -2233,10 +2225,6 @@ impl OperationResourceEstimator for CudaLastTokenMaskedArgmaxProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider {
-    fn reusable_topology_stability(&self) -> ferrum_interfaces::vnext::ReusableTopologyStability {
-        ferrum_interfaces::vnext::ReusableTopologyStability::SameWaveStable
-    }
-
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,

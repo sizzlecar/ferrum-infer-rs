@@ -7671,37 +7671,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let catalog_snapshot = self.reusable_execution_catalog.read().clone();
             let catalog = catalog_snapshot.as_deref();
             let mut diagnostic_program_id = None;
-            let identity_required = reusable_program_identity_required(
+            let reusable_program = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
                 catalog.is_some(),
                 device_timing_mode.direct_reusable_execution_allowed(),
                 reusable_direct_attempted,
-            );
-            // The topology result owns this exact wave through lookup and
-            // submission. A definitely-not-submitted retry returns a bare wave
-            // and therefore obtains fresh topology on the next attempt.
-            let prepared_topology = if identity_required {
-                match OperationDispatch::prepare_submission_wave_topology(
-                    self.providers.providers(),
-                    &self.resolved_plan,
-                    wave,
-                    &self.lane,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
-                }
-            } else {
-                OperationDispatch::defer_submission_wave_topology(
-                    self.providers.providers(),
-                    &self.resolved_plan,
-                    wave,
-                    &self.lane,
-                )
-            };
-            let reusable_program = if !identity_required {
+            ) {
                 None
             } else {
-                match prepared_topology.program_id().cloned() {
+                let program_id = match OperationDispatch::reusable_execution_program_id_for_wave(
+                    self.providers.providers(),
+                    &self.resolved_plan,
+                    &wave,
+                    &self.lane,
+                ) {
+                    Ok(program_id) => program_id,
+                    Err(error) => {
+                        return DispatchOutcome::QuiescentFailure(error.to_string());
+                    }
+                };
+                match program_id {
                     Some(program_id) => {
                         if cold_wave.is_some() {
                             diagnostic_program_id = Some(program_id.clone());
@@ -7755,7 +7744,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     None if catalog.is_some() => {
                         reusable_catalog_miss = Some(
                             VNextReusableExecutionCatalogMissKey::without_program_identity(
-                                prepared_topology.work_shape(),
+                                wave.claimed_backing().work_shape(),
                                 VNextReusableExecutionCatalogMissReason::ProgramIdentityUnavailable,
                             ),
                         );
@@ -7799,9 +7788,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .provider_encode_submit
                     .start_if(timing_enabled);
                 let phase_timer = phase_timing.provider_encode_submit.start_if(timing_enabled);
-                let submission = if let Some(timing_sink) = observation.as_ref() {
-                    prepared_topology
-                        .encode_and_submit_with_inputs_and_preparation(
+                let submission = if let Some(reusable_program) = reusable_program {
+                    if let Some(timing_sink) = observation.as_ref() {
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
+                            self.providers.providers(),
+                            &self.resolved_plan,
                             &identity,
                             active_bindings(),
                             device_timing_mode,
@@ -7811,12 +7802,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             self.invocation_preparation_strategy,
                             timing_sink,
                             &self.metrics.invocation_preparation,
+                            wave,
+                            &self.lane,
                             &self.reaper,
                         )
                         .map(ProfiledSubmissionHandle::into_parts)
-                } else {
-                    prepared_topology
-                        .encode_and_submit_with_inputs_and_preparation(
+                    } else {
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
+                            self.providers.providers(),
+                            &self.resolved_plan,
                             &identity,
                             active_bindings(),
                             device_timing_mode,
@@ -7826,9 +7820,46 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             self.invocation_preparation_strategy,
                             &invocation_preparation::DisabledTiming,
                             &self.metrics.invocation_preparation,
+                            wave,
+                            &self.lane,
                             &self.reaper,
                         )
                         .map(|profiled| (profiled.into_parts().0, None))
+                    }
+                } else if let Some(timing_sink) = observation.as_ref() {
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
+                        self.providers.providers(),
+                        &self.resolved_plan,
+                        &identity,
+                        active_bindings(),
+                        device_timing_mode,
+                        &uploads,
+                        execution_policy,
+                        self.invocation_preparation_strategy,
+                        timing_sink,
+                        &self.metrics.invocation_preparation,
+                        wave,
+                        &self.lane,
+                        &self.reaper,
+                    )
+                    .map(ProfiledSubmissionHandle::into_parts)
+                } else {
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
+                        self.providers.providers(),
+                        &self.resolved_plan,
+                        &identity,
+                        active_bindings(),
+                        device_timing_mode,
+                        &uploads,
+                        execution_policy,
+                        self.invocation_preparation_strategy,
+                        &invocation_preparation::DisabledTiming,
+                        &self.metrics.invocation_preparation,
+                        wave,
+                        &self.lane,
+                        &self.reaper,
+                    )
+                    .map(|profiled| (profiled.into_parts().0, None))
                 };
                 drop(phase_timer);
                 if cold_wave.is_some() {

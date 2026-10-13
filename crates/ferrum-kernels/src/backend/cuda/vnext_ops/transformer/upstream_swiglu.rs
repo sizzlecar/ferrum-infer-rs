@@ -268,10 +268,6 @@ fn flag_bytes(prepared: &PreparedProjectionNumerics) -> Result<u64, String> {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaUpstreamSwiGluProvider {
-    fn reusable_topology_stability(&self) -> ferrum_interfaces::vnext::ReusableTopologyStability {
-        ferrum_interfaces::vnext::ReusableTopologyStability::SameWaveStable
-    }
-
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,

@@ -588,22 +588,6 @@ pub enum ReusableExecutionTopology {
     EagerBoundary,
 }
 
-/// Whether a provider's topology declaration can be reused while Core retains
-/// the exact immutable inputs and owns the same unsubmitted wave.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ReusableTopologyStability {
-    /// Re-run the provider at submission, including for unknown or mutable
-    /// implementations. This preserves the original public dispatch behavior.
-    #[default]
-    Revalidate,
-    /// An immutable provider capability: topology depends only on immutable
-    /// provider/plan fields and the request's current work/address authority.
-    /// It must not depend on mutable provider state or catalog residency.
-    /// This authorizes reuse only within the same owned wave, never a retry or
-    /// subsequent wave, and does not relax physical backing validation.
-    SameWaveStable,
-}
-
 /// Physical views required when patching an already resident executable.
 /// This does not change the operation's complete semantic bindings or confer
 /// replay authority; dispatch must first validate the exact live program.
@@ -620,10 +604,6 @@ pub enum ReusableBindingResources {
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
-    fn reusable_topology_stability(&self) -> ReusableTopologyStability {
-        ReusableTopologyStability::Revalidate
-    }
-
     /// Opts a binding-only encoder into a smaller physical view projection.
     /// The default preserves the full invocation, including for providers
     /// whose binding encoder delegates to `encode_selected`.
