@@ -1,4 +1,4 @@
-//! Test-only Q4K Columns M8 dot alternative. Both arms retain the same
+//! Test-only Q4K/Q5K Columns M8 dot alternatives. Both arms retain the same
 //! MarkerV2 pack, static weight check, cast and physical working set.
 use super::*;
 
@@ -11,11 +11,23 @@ unsafe extern "C" {
         fixup: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+    fn ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1(
+        plan: *const UpstreamLinearPlanV1,
+        weights: *const c_void,
+        packed: *const c_void,
+        output: *mut c_void,
+        fixup: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 const DOTS: [MmvqDot; 2] = [
     ffi::ferrum_upstream_mmvq_dot_v1,
     ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1,
+];
+const Q5_DOTS: [MmvqDot; 2] = [
+    ffi::ferrum_upstream_mmvq_dot_v1,
+    ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1,
 ];
 const LABELS: [&str; 2] = ["baseline", "shared_weight_decode"];
 const FORMAT: UpstreamLinearFormat = UpstreamLinearFormat::Q4K;
@@ -34,6 +46,7 @@ struct Snapshot {
 /// Nonzero aligned view offsets and odd element strides expose accidental
 /// use of allocation bases, logical N in place of stride, or padded N writes.
 struct Case {
+    format: UpstreamLinearFormat,
     plan: UpstreamLinearPlanV1,
     input_stride: usize,
     output_stride: usize,
@@ -50,10 +63,16 @@ struct Case {
 }
 
 impl Case {
-    fn new(k: usize, n: usize, input_kind: Input, bad_weight: bool) -> Self {
+    fn new(
+        format: UpstreamLinearFormat,
+        k: usize,
+        n: usize,
+        input_kind: Input,
+        bad_weight: bool,
+    ) -> Self {
         let p = plan(
             ALGORITHM,
-            FORMAT,
+            format,
             UpstreamLinearLayout::Columns,
             8,
             k as u32,
@@ -83,16 +102,27 @@ impl Case {
             x[input_stride] = 0xfc00;
             x[7 * input_stride] = 0x7e00;
         }
-        let mut w = weights(FORMAT, k, p.padded_outputs as usize);
-        let row_bytes = k / 256 * 144;
+        let mut w = weights(format, k, p.padded_outputs as usize);
+        let block_bytes = quant_block_bytes(format);
+        let row_bytes = k / 256 * block_bytes;
         for (column, row) in w[..n * row_bytes].chunks_exact_mut(row_bytes).enumerate() {
-            for (block_index, block) in row.chunks_exact_mut(144).enumerate() {
+            for (block_index, block) in row.chunks_exact_mut(block_bytes).enumerate() {
                 block[..2].copy_from_slice(
                     &f16::from_f32(0.0625 + (column % 5) as f32 / 64.0)
                         .to_bits()
                         .to_le_bytes(),
                 );
-                for (i, code) in block[16..].iter_mut().enumerate() {
+                let qs_offset = if matches!(format, UpstreamLinearFormat::Q5K) {
+                    // Exercise both scale encodings and nonconstant fifth bits,
+                    // including qh words with the sign bit set.
+                    for (i, code) in block[4..48].iter_mut().enumerate() {
+                        *code = ((column * 29 + block_index * 31 + i * 53) % 256) as u8;
+                    }
+                    48
+                } else {
+                    16
+                };
+                for (i, code) in block[qs_offset..].iter_mut().enumerate() {
                     *code = ((column * 13 + block_index * 7 + i * 17) % 256) as u8;
                 }
             }
@@ -118,6 +148,7 @@ impl Case {
             ));
         }
         Self {
+            format,
             plan: p,
             input_stride,
             output_stride,
@@ -207,11 +238,13 @@ impl Case {
 
     fn validate(&self, snapshot: &Snapshot) {
         let p = &self.plan;
+        let format = self.format;
+        let block_bytes = quant_block_bytes(format);
         let (k, n) = (p.request.inputs as usize, p.request.outputs as usize);
         let bad_weight = self
             .host_weights
-            .chunks_exact(144)
-            .any(|b| oracle::classify_weight(ALGORITHM, FORMAT, b));
+            .chunks_exact(block_bytes)
+            .any(|b| oracle::classify_weight(ALGORITHM, format, b));
         assert_eq!(snapshot.weight_flag[0] != 0, bad_weight);
         for row in 0..8 {
             let mut row_bad = false;
@@ -223,7 +256,7 @@ impl Case {
                         0
                     }
                 });
-                let (zero, bad) = oracle::marker_classify_pack(ALGORITHM, FORMAT, &values);
+                let (zero, bad) = oracle::marker_classify_pack(ALGORITHM, format, &values);
                 row_bad |= bad;
                 let b = row * (p.padded_inputs as usize / 32) + group;
                 let metadata = &snapshot.packed[b * 36..][..4];
@@ -260,11 +293,11 @@ impl Case {
                                 .to_f32();
                         let sum = f16::from_bits(u16::from_le_bytes(meta[2..].try_into().unwrap()))
                             .to_f32();
-                        let offset = (col * (k / 256) + group / 8) * 144;
+                        let offset = (col * (k / 256) + group / 8) * block_bytes;
                         let (v, mag) = oracle::declared_group(
                             ALGORITHM,
-                            FORMAT,
-                            &self.host_weights[offset..offset + 144],
+                            format,
+                            &self.host_weights[offset..offset + block_bytes],
                             group % 8,
                             &std::array::from_fn(|i| codes[i] as i8),
                             scale,
@@ -290,12 +323,38 @@ impl Case {
     }
 }
 
+fn quant_block_bytes(format: UpstreamLinearFormat) -> usize {
+    match format {
+        UpstreamLinearFormat::Q4K => 144,
+        UpstreamLinearFormat::Q5K => 176,
+        _ => panic!("shared-weight fixture requires Q4K or Q5K"),
+    }
+}
+
 #[test]
 #[ignore = "requires the source-built shared-weight-decode CUDA experiment"]
 fn q4_shared_weight_decode_preserves_marker_bits_and_boundaries() {
+    assert_marker_bits_and_boundaries(FORMAT, DOTS, &[(256, 17), (512, 33), (768, 17), (5120, 17)]);
+}
+
+#[test]
+#[ignore = "requires the source-built Q5 shared-weight-decode CUDA experiment"]
+fn q5_shared_weight_decode_preserves_marker_bits_and_boundaries() {
+    assert_marker_bits_and_boundaries(
+        UpstreamLinearFormat::Q5K,
+        Q5_DOTS,
+        &[(256, 17), (512, 33), (768, 17), (6144, 17), (5120, 17)],
+    );
+}
+
+fn assert_marker_bits_and_boundaries(
+    format: UpstreamLinearFormat,
+    dots: [MmvqDot; 2],
+    shapes: &[(usize, usize)],
+) {
     let _ = caps();
     let stream = Stream::new();
-    for (k, n) in [(256, 17), (512, 33), (768, 17), (5120, 17)] {
+    for &(k, n) in shapes {
         for input in [
             Input::Finite,
             Input::Zero,
@@ -304,24 +363,24 @@ fn q4_shared_weight_decode_preserves_marker_bits_and_boundaries() {
             Input::SumOverflow,
         ] {
             for bad_weight in [false, true] {
-                let case = Case::new(k, n, input, bad_weight);
-                let reference = case.run(&stream, DOTS[0]);
+                let case = Case::new(format, k, n, input, bad_weight);
+                let reference = case.run(&stream, dots[0]);
                 case.validate(&reference);
-                for dot in [DOTS[1], DOTS[1], DOTS[0]] {
+                for dot in [dots[1], dots[1], dots[0]] {
                     let actual = case.run(&stream, dot);
                     case.validate(&actual);
                     assert_eq!(
                         actual, reference,
-                        "full buffers/repeat {k}x{n} {input:?} bad_weight={bad_weight}"
+                        "full buffers/repeat {format:?} {k}x{n} {input:?} bad_weight={bad_weight}"
                     );
                 }
             }
         }
     }
     // Valid-but-ineligible plans and malformed inputs fail before a launch.
-    let case = Case::new(512, 17, Input::Finite, false);
+    let case = Case::new(format, 512, 17, Input::Finite, false);
     let invoke = |p: &UpstreamLinearPlanV1, weights, packed, output, fixup| unsafe {
-        DOTS[1](p, weights, packed, output, fixup, stream.0)
+        dots[1](p, weights, packed, output, fixup, stream.0)
     };
     let w = unsafe { case.weights.ptr.add(4) }.cast_const();
     let q = case.packed.ptr.cast_const();
@@ -331,10 +390,10 @@ fn q4_shared_weight_decode_preserves_marker_bits_and_boundaries() {
     assert_eq!(invoke(&malformed, w, q, o, ptr::null_mut()), -1);
     assert_eq!(invoke(&case.plan, w, q, o, o), -1);
     for p in [
-        plan(ALGORITHM, FORMAT, UpstreamLinearLayout::Columns, 4, 512, 17),
+        plan(ALGORITHM, format, UpstreamLinearLayout::Columns, 4, 512, 17),
         plan(
             ALGORITHM,
-            FORMAT,
+            format,
             UpstreamLinearLayout::Channels,
             8,
             512,
@@ -342,7 +401,11 @@ fn q4_shared_weight_decode_preserves_marker_bits_and_boundaries() {
         ),
         plan(
             ALGORITHM,
-            UpstreamLinearFormat::Q5K,
+            if matches!(format, UpstreamLinearFormat::Q4K) {
+                UpstreamLinearFormat::Q5K
+            } else {
+                UpstreamLinearFormat::Q4K
+            },
             UpstreamLinearLayout::Columns,
             8,
             512,
@@ -358,7 +421,7 @@ fn q4_shared_weight_decode_preserves_marker_bits_and_boundaries() {
         -5
     );
     unsafe {
-        assert_eq!(DOTS[1](ptr::null(), w, q, o, ptr::null_mut(), stream.0), -1);
+        assert_eq!(dots[1](ptr::null(), w, q, o, ptr::null_mut(), stream.0), -1);
         assert_eq!(invoke(&case.plan, w.add(1), q, o, ptr::null_mut()), -5);
         assert_eq!(invoke(&case.plan, w, q.add(1), o, ptr::null_mut()), -5);
         assert_eq!(invoke(&case.plan, w, q, o.add(1), ptr::null_mut()), -5);
@@ -386,6 +449,20 @@ fn q4_shared_weight_decode_preserves_marker_bits_and_boundaries() {
 #[test]
 #[ignore = "exclusive CUDA full-projection paired diagnostic; run correctness first"]
 fn q4_shared_weight_decode_paired_working_sets() {
+    paired_working_set(FORMAT, DOTS, 5120, 10240);
+}
+
+#[test]
+#[ignore = "exclusive CUDA full-projection Q5 paired diagnostic; run correctness first"]
+fn q5_shared_weight_decode_paired_working_sets() {
+    // Saved prepared-leaf metadata: GDN/causal output K6144,N5120 (44 leaves),
+    // and GDN qkv K5120,N10240 (12 leaves). These are physical leaf dimensions.
+    for (k, n) in [(6144, 5120), (5120, 10240)] {
+        paired_working_set(UpstreamLinearFormat::Q5K, Q5_DOTS, k, n);
+    }
+}
+
+fn paired_working_set(format: UpstreamLinearFormat, dots: [MmvqDot; 2], k: usize, n: usize) {
     let _ = caps();
     let mut l2 = 0;
     unsafe {
@@ -394,13 +471,19 @@ fn q4_shared_weight_decode_paired_working_sets() {
     assert!(l2 > 0);
     const WARM: usize = 8;
     const PAIRS: usize = 16;
-    let (m, k, n) = (8, 5120, 10240);
-    let host_weights = weights(FORMAT, k, n);
+    let m = 8;
+    let host_weights = weights(format, k, n);
     let weight_bytes = host_weights.len();
+    let experiment = match format {
+        UpstreamLinearFormat::Q4K => "q4_shared_weight_decode",
+        UpstreamLinearFormat::Q5K => "q5_shared_weight_decode",
+        _ => unreachable!("shared-weight fixture format"),
+    };
+    let format_label = format!("{format:?}");
     println!(
         "{}",
-        serde_json::json!({"experiment":"q4_shared_weight_decode", "kind":"plan",
-        "M":m,"K":k,"N":n,"format":"Q4K","warm_rounds":WARM,"pairs":PAIRS,
+        serde_json::json!({"experiment":experiment, "kind":"plan",
+        "M":m,"K":k,"N":n,"format":format_label,"warm_rounds":WARM,"pairs":PAIRS,
         "order":"alternating AB/BA pairs","modes":["resident","arena_offset_ring"],
         "timed":"same MarkerV2 F16 convert/row checks/pack + selected dot + MarkerV2 cast",
         "excluded":"allocation, input upload, static plan/weight check, graph capture, oracle/readback",
@@ -435,16 +518,16 @@ fn q4_shared_weight_decode_paired_working_sets() {
         );
         let stream = Stream::new();
         let routes =
-            DOTS.map(|_| Route::new(ALGORITHM, FORMAT, m as u32, k as u32, n as u32, count));
+            dots.map(|_| Route::new(ALGORITHM, format, m as u32, k as u32, n as u32, count));
         let mut stable = Vec::new();
         let mut raw = Vec::new();
         for (arm, route) in routes.iter().enumerate() {
             for (index, &address) in addresses.iter().enumerate() {
                 route.scan(&stream, address, index);
-                route.enqueue_with_mmvq_dot(&stream, &input, address, index, DOTS[arm]);
+                route.enqueue_with_mmvq_dot(&stream, &input, address, index, dots[arm]);
             }
             stream.sync();
-            stable.push(route.validate(FORMAT, &host_weights, count));
+            stable.push(route.validate(format, &host_weights, count));
             raw.push(route.output.read::<u32>(m * n));
         }
         assert_eq!(stable[0], stable[1]);
@@ -459,7 +542,7 @@ fn q4_shared_weight_decode_paired_working_sets() {
                 for _ in 0..laps {
                     for (index, &address) in addresses.iter().enumerate() {
                         routes[arm]
-                            .enqueue_with_mmvq_dot(&stream, &input, address, index, DOTS[arm]);
+                            .enqueue_with_mmvq_dot(&stream, &input, address, index, dots[arm]);
                     }
                 }
             })
@@ -496,7 +579,7 @@ fn q4_shared_weight_decode_paired_working_sets() {
         }
         stream.sync();
         for (arm, route) in routes.iter().enumerate() {
-            assert_eq!(route.validate(FORMAT, &host_weights, count), stable[arm]);
+            assert_eq!(route.validate(format, &host_weights, count), stable[arm]);
             assert_eq!(route.output.read::<u32>(m * n), raw[arm]);
         }
         input.guards();
@@ -504,8 +587,8 @@ fn q4_shared_weight_decode_paired_working_sets() {
         for (pair, order, arm, gpu_ns, wall_ns) in samples {
             println!(
                 "{}",
-                serde_json::json!({"experiment":"q4_shared_weight_decode", "kind":"sample",
-                "M":m,"K":k,"N":n,"format":"Q4K","weight_mode":mode,
+                serde_json::json!({"experiment":experiment, "kind":"sample",
+                "M":m,"K":k,"N":n,"format":format_label,"weight_mode":mode,
                 "weight_bytes":weight_bytes,"matrix_count":count,"working_set_bytes":count*weight_bytes,
                 "device_l2_bytes":l2,"matrix_contents":"same deterministic bytes; different ring addresses",
                 "laps":laps,"projections":laps*count,"warm_rounds":WARM,"pairs":PAIRS,
