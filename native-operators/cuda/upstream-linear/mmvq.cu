@@ -741,14 +741,24 @@ static __global__ void mul_mat_vec_q(
 }
 
 
+static __device__ __forceinline__ float mmvq_pack_load(const float * x, int64_t index) {
+    return x[index];
+}
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+static __device__ __forceinline__ float mmvq_pack_load(const half * x, int64_t index) {
+    return __half2float(x[index]);
+}
+#endif
+
 // Exact ordinary row-major Q8_1 pack; differs from MMQ D4/DS4.
-template<bool Marker = false>
-static __global__ void quantize_q8_1(
-        const float * x_ptr, void * vy_ptr,
+// Changing the input loader must not change the reduction or MarkerV2 order.
+template<bool Marker, typename Input>
+static __device__ __forceinline__ void quantize_q8_1_body(
+        const Input * x_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const uint32_t ne1, const uint3 ne2, uint32_t * row_flags=nullptr) {
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2, uint32_t * row_flags) {
     ggml_cuda_pdl_lc();
-    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    const Input * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
     const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -773,7 +783,7 @@ static __global__ void quantize_q8_1(
     const int64_t iqs = i_cont % QK8_1; // quant index
 
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    const float xi = i0 < ne00 ? mmvq_pack_load(x, i03*s03 + i02*s02 + i01*s01 + i00) : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -803,6 +813,24 @@ static __global__ void quantize_q8_1(
         ? __halves2half2(__ushort_as_half(0x7e00),__ushort_as_half(0x7e00))
         : make_half2(d, sum);
 }
+
+template<bool Marker = false>
+static __global__ void quantize_q8_1(
+        const float * x_ptr, void * vy_ptr,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2, uint32_t * row_flags=nullptr) {
+    quantize_q8_1_body<Marker>(x_ptr, vy_ptr, ne00, s01, s02, s03, ne0, ne1, ne2, row_flags);
+}
+
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+static __global__ void quantize_q8_1_f16_direct(
+        const half * input, void * packed, int64_t inputs, int64_t input_stride,
+        int64_t padded_inputs, uint32_t rows, uint3 channels, uint32_t * row_flags) {
+    quantize_q8_1_body<true>(input, packed, inputs, input_stride,
+        int64_t(rows)*input_stride, int64_t(rows)*input_stride,
+        padded_inputs, rows, channels, row_flags);
+}
+#endif
 
 // Private ABI1. layout0=Columns(M columns, one channel), layout1=Channels
 // (one column, M channels sharing W). Both compute the same dense logical GEMM.
@@ -1050,6 +1078,25 @@ extern "C" int ferrum_upstream_mmvq_pack_v2(const FerrumUpstreamLinearPlanV1 * p
         return cudaGetLastError();
     });
 }
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+// Keep the original pack ABI/checks, but leave converted entirely untouched.
+extern "C" int ferrum_test_upstream_mmvq_pack_f16_direct_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmvqPlan n{}; if(!upstream_mmvq_valid(p,n)) return -1;
+        if(!input||!converted||!packed||!flags||stride<n.inputs||uint64_t(stride)*n.rows>INT_MAX||
+            uintptr_t(input)%2||uintptr_t(converted)%16||uintptr_t(packed)%4||uintptr_t(flags)%4) return -5;
+        const auto stream=static_cast<cudaStream_t>(s);
+        auto status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
+        if(status!=cudaSuccess) return status;
+        const dim3 grid((n.padded_inputs+CUDA_QUANTIZE_BLOCK_SIZE-1)/CUDA_QUANTIZE_BLOCK_SIZE,n.rows,1);
+        quantize_q8_1_f16_direct<<<grid,dim3(CUDA_QUANTIZE_BLOCK_SIZE,1,1),0,stream>>>(
+            static_cast<const half *>(input),packed,int64_t(n.inputs),int64_t(stride),
+            int64_t(n.padded_inputs),n.rows,init_fastdiv_values(1),static_cast<uint32_t *>(flags));
+        return cudaGetLastError();
+    });
+}
+#endif
 extern "C" int ferrum_upstream_mmvq_check_weights_v2(const FerrumUpstreamLinearPlanV1 * p,
         const void * weights,void * flag,void * s) noexcept {
     return ferrum_upstream_boundary([&]() -> int {

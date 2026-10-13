@@ -55,12 +55,25 @@ static __global__ void test_mmq_cast(const float * output, half * result,
     }
 }
 
+static __device__ __forceinline__ float4 mmq_pack_load4(const float * x, int64_t index) {
+    return reinterpret_cast<const float4 *>(x)[index/4];
+}
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+static __device__ __forceinline__ float4 mmq_pack_load4(const half * x, int64_t index) {
+    // Only two-byte input alignment is promised, including odd row strides.
+    return make_float4(__half2float(x[index]), __half2float(x[index+1]),
+        __half2float(x[index+2]), __half2float(x[index+3]));
+}
+#endif
+
 // Pinned V1 pack math: quantize.cu:456-555; explicit MarkerV2 branches below.
-template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool Marker = false>
-static __global__ void quantize_mmq_q8_1(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+// Both input loaders use this exact math and marker order. In particular,
+// nonfinite inputs reach amax/sum unchanged; they are not sanitized on load.
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool Marker, typename Input>
+static __device__ __forceinline__ void quantize_mmq_q8_1_body(
+        const Input * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, uint32_t * row_flags=nullptr) {
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, uint32_t * row_flags) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -84,14 +97,13 @@ static __global__ void quantize_mmq_q8_1(
         base_idx = i3*s03 + i2*s02 + i01*s01;
     }
 
-    const float4 * x4 = (const float4 *) x;
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
 
     const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 xi = i0 < ne00 ? mmq_pack_load4(x, base_idx + i00) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -172,6 +184,36 @@ static __global__ void quantize_mmq_q8_1(
     }
     GGML_UNUSED(n_expert_used);
 }
+
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool Marker = false>
+static __global__ void quantize_mmq_q8_1(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, uint32_t * row_flags=nullptr) {
+    quantize_mmq_q8_1_body<ds_layout, scatter, Marker>(
+        x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used, row_flags);
+}
+
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+template <mmq_q8_1_ds_layout ds_layout>
+static __global__ void quantize_mmq_q8_1_f16_direct(
+        const half * __restrict__ input, void * __restrict__ packed,
+        int64_t inputs, int64_t input_stride, int64_t padded_inputs,
+        uint32_t rows, uint32_t guard_blocks, uint32_t * row_flags) {
+    quantize_mmq_q8_1_body<ds_layout, false, true>(input, nullptr, packed,
+        inputs, input_stride, int64_t(rows)*input_stride, int64_t(rows)*input_stride,
+        padded_inputs, rows, 1, 0, row_flags);
+    // Every body write is below logical_bytes. A single CTA owns the disjoint
+    // tail, and the following dot cannot read it until this kernel completes.
+    // Row flags must still be cleared before launch: other CTAs atomicOr them.
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+        const uint64_t logical_bytes = uint64_t(rows)*padded_inputs*9/8;
+        auto * guard = reinterpret_cast<uint32_t *>(static_cast<char *>(packed)+logical_bytes);
+        const uint32_t words = guard_blocks*(144/sizeof(uint32_t));
+        for (uint32_t i = threadIdx.x; i < words; i += blockDim.x) guard[i] = 0;
+    }
+}
+#endif
 // End pinned pack with versioned marker extension.
 
 static bool test_mmq_format(uint32_t format) {
@@ -433,6 +475,32 @@ extern "C" int ferrum_upstream_mmq_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
         return cudaGetLastError();
     });
 }
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+// Same boundary checks and ABI as pack_v2. converted remains caller-owned but
+// is deliberately neither read nor written by this independent test route.
+extern "C" int ferrum_test_upstream_mmq_pack_f16_direct_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmqPlan n{}; if(!upstream_mmq_valid(p,n)) return -1;
+        if(!input||!converted||!packed||!flags||stride<n.inputs||uint64_t(stride)*n.rows>INT_MAX||
+            uintptr_t(input)%2||uintptr_t(converted)%16||uintptr_t(packed)%16||uintptr_t(flags)%4) return -5;
+        const auto stream=static_cast<cudaStream_t>(s);
+        auto status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
+        if(status!=cudaSuccess) return status;
+        const dim3 grid(n.rows,n.padded_inputs/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ),1);
+        if(n.format==GGML_TYPE_IQ4_XS) {
+            quantize_mmq_q8_1_f16_direct<MMQ_Q8_1_DS_LAYOUT_D4><<<grid,CUDA_QUANTIZE_BLOCK_SIZE_MMQ,0,stream>>>(
+                static_cast<const half *>(input),packed,n.inputs,stride,n.padded_inputs,
+                n.rows,p->guard_blocks,static_cast<uint32_t *>(flags));
+        } else {
+            quantize_mmq_q8_1_f16_direct<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid,CUDA_QUANTIZE_BLOCK_SIZE_MMQ,0,stream>>>(
+                static_cast<const half *>(input),packed,n.inputs,stride,n.padded_inputs,
+                n.rows,p->guard_blocks,static_cast<uint32_t *>(flags));
+        }
+        return cudaGetLastError();
+    });
+}
+#endif
 extern "C" int ferrum_upstream_mmq_check_weights_v2(const FerrumUpstreamLinearPlanV1 * p,
         const void * weights,void * flag,void * s) noexcept {
     return ferrum_upstream_boundary([&]() -> int {

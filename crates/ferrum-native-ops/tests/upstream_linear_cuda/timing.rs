@@ -12,6 +12,10 @@ mod shared_weight_decode;
 #[path = "timing/ffn_current_routes.rs"]
 mod ffn_current_routes;
 
+#[cfg(feature = "cuda-upstream-direct-f16-pack-tests")]
+#[path = "timing/direct_f16_pack.rs"]
+mod direct_f16_pack;
+
 type MmvqDot = unsafe extern "C" fn(
     *const UpstreamLinearPlanV1,
     *const c_void,
@@ -113,10 +117,35 @@ impl Route {
         result_stride: u32,
         result_offset: u32,
     ) -> Self {
+        Self::new_with_layout_and_result_window(
+            algorithm,
+            format,
+            UpstreamLinearLayout::Columns,
+            m,
+            k,
+            n,
+            count,
+            result_stride,
+            result_offset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_layout_and_result_window(
+        algorithm: UpstreamLinearAlgorithm,
+        format: UpstreamLinearFormat,
+        layout: UpstreamLinearLayout,
+        m: u32,
+        k: u32,
+        n: u32,
+        count: usize,
+        result_stride: u32,
+        result_offset: u32,
+    ) -> Self {
         assert!(result_offset
             .checked_add(n)
             .is_some_and(|end| end <= result_stride));
-        let p = plan(algorithm, format, UpstreamLinearLayout::Columns, m, k, n);
+        let p = plan(algorithm, format, layout, m, k, n);
         assert_eq!(
             p.padded_outputs, n,
             "benchmark uses complete physical output rows"
