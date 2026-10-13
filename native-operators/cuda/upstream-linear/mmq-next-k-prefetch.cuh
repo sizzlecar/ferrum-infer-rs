@@ -409,7 +409,7 @@ template<ggml_type Type, int J, bool Fallback>
 static int test_mmq_dispatch(const TestMmqPlan & p, const void * weights, const void * packed,
         float * output, float * fixup, cudaStream_t stream, bool setup) {
     if (setup) {
-        return cudaFuncSetAttribute(mul_mat_q<Type, J, Fallback>,
+        return cudaFuncSetAttribute(ferrum_mmq_next_k::mul_mat_q<Type, J, Fallback>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, p.shared_bytes);
     }
     const auto one = init_fastdiv_values(1);
@@ -420,7 +420,7 @@ static int test_mmq_dispatch(const TestMmqPlan & p, const void * weights, const 
     constexpr bool stream_k = ggml_cuda_mmq_get_config_ampere(Type, J, Fallback).stream_k;
     const dim3 block(32, p.nthreads/32, 1);
     const dim3 grid = stream_k ? dim3(p.blocks, 1, 1) : dim3(p.tiles_y, ntx.z, 1);
-    mul_mat_q<Type, J, Fallback><<<grid, block, p.shared_bytes, stream>>>(
+    ferrum_mmq_next_k::mul_mat_q<Type, J, Fallback><<<grid, block, p.shared_bytes, stream>>>(
         static_cast<const char *>(weights), static_cast<const int *>(packed), nullptr, nullptr,
         output, fixup, nullptr, blocks_per_k, p.outputs, p.rows, weight_stride, p.rows, p.outputs,
         one, one, p.outputs*weight_stride, packed_channel_stride, p.rows*p.outputs,
@@ -438,18 +438,18 @@ template<ggml_type Type, bool Fallback>
 static int test_mmq_j(const TestMmqPlan & p, const void * w, const void * q,
         float * out, float * fixup, cudaStream_t stream, bool setup) {
     switch (p.j) {
-        case 8: return test_mmq_dispatch<Type, 8, Fallback>(p,w,q,out,fixup,stream,setup);
-        case 16: return test_mmq_dispatch<Type,16,Fallback>(p,w,q,out,fixup,stream,setup);
-        case 24: return test_mmq_dispatch<Type,24,Fallback>(p,w,q,out,fixup,stream,setup);
-        case 32: return test_mmq_dispatch<Type,32,Fallback>(p,w,q,out,fixup,stream,setup);
+        case 8: return ferrum_mmq_next_k::test_mmq_dispatch<Type, 8, Fallback>(p,w,q,out,fixup,stream,setup);
+        case 16: return ferrum_mmq_next_k::test_mmq_dispatch<Type,16,Fallback>(p,w,q,out,fixup,stream,setup);
+        case 24: return ferrum_mmq_next_k::test_mmq_dispatch<Type,24,Fallback>(p,w,q,out,fixup,stream,setup);
+        case 32: return ferrum_mmq_next_k::test_mmq_dispatch<Type,32,Fallback>(p,w,q,out,fixup,stream,setup);
         default: return -4;
     }
 }
 template<ggml_type Type>
 static int test_mmq_type(const TestMmqPlan & p, const void * w, const void * q,
         float * out, float * fixup, cudaStream_t stream, bool setup) {
-    return p.outputs%128 ? test_mmq_j<Type,true>(p,w,q,out,fixup,stream,setup)
-                        : test_mmq_j<Type,false>(p,w,q,out,fixup,stream,setup);
+    return p.outputs%128 ? ferrum_mmq_next_k::test_mmq_j<Type,true>(p,w,q,out,fixup,stream,setup)
+                        : ferrum_mmq_next_k::test_mmq_j<Type,false>(p,w,q,out,fixup,stream,setup);
 }
 static int ferrum_test_mmq_dot(const TestMmqPlan * p, const void * weights,
         const void * packed, float * output, float * fixup, cudaStream_t stream, int setup) {
@@ -458,9 +458,9 @@ static int ferrum_test_mmq_dot(const TestMmqPlan * p, const void * weights,
             reinterpret_cast<uintptr_t>(weights)%4 || reinterpret_cast<uintptr_t>(packed)%16 ||
             reinterpret_cast<uintptr_t>(output)%4 || reinterpret_cast<uintptr_t>(fixup)%4)) return -5;
     switch (p->format) {
-        case GGML_TYPE_IQ4_XS: return test_mmq_type<GGML_TYPE_IQ4_XS>(*p,weights,packed,output,fixup,stream,setup);
-        case GGML_TYPE_Q4_K: return test_mmq_type<GGML_TYPE_Q4_K>(*p,weights,packed,output,fixup,stream,setup);
-        case GGML_TYPE_Q5_K: return test_mmq_type<GGML_TYPE_Q5_K>(*p,weights,packed,output,fixup,stream,setup);
+        case GGML_TYPE_IQ4_XS: return ferrum_mmq_next_k::test_mmq_type<GGML_TYPE_IQ4_XS>(*p,weights,packed,output,fixup,stream,setup);
+        case GGML_TYPE_Q4_K: return ferrum_mmq_next_k::test_mmq_type<GGML_TYPE_Q4_K>(*p,weights,packed,output,fixup,stream,setup);
+        case GGML_TYPE_Q5_K: return ferrum_mmq_next_k::test_mmq_type<GGML_TYPE_Q5_K>(*p,weights,packed,output,fixup,stream,setup);
         default: return -1;
     }
 }
