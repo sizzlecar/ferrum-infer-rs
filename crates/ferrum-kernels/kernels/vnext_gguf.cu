@@ -350,6 +350,10 @@ NATIVE_FIXED256_LINEAR(half, half, iq4xs_constant, 23, 136, f16, 1, false)
 NATIVE_FIXED256_LINEAR(half, half, iq4xs_constant, 23, 136, tiled_f16, 8, false)
 NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, f16, 1, false)
 NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, tiled_f16, 8, false)
+// Test-only alternative launch geometry. Production dispatch retains T8. The
+// template, F32 coefficient reconstruction, lane K order and reduction are
+// shared verbatim; only the number of independent row accumulators changes.
+NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, test_t4_f16, 4, false)
 NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, f32, 1, false)
 NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, tiled_f32, 8, false)
 #undef NATIVE_FIXED256_LINEAR

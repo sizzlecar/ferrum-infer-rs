@@ -59,6 +59,8 @@ pub(super) struct CudaNativeBlockKernels {
     iq4xs_register_decode: CudaFunction,
     linear_q6k_f16: CudaFunction,
     linear_q6k_tiled_f16: CudaFunction,
+    #[cfg(test)]
+    linear_q6k_test_t4_f16: CudaFunction,
     linear_q6k_f32: CudaFunction,
     linear_q6k_tiled_f32: CudaFunction,
     hadamard: hadamard::CudaHadamardKernels,
@@ -210,6 +212,8 @@ impl CudaNativeBlockKernels {
             iq4xs_register_decode: load("vnext_gguf_iq4xs_register_decode")?,
             linear_q6k_f16: load("vnext_gguf_linear_q6k_f16")?,
             linear_q6k_tiled_f16: load("vnext_gguf_linear_q6k_tiled_f16")?,
+            #[cfg(test)]
+            linear_q6k_test_t4_f16: load("vnext_gguf_linear_q6k_test_t4_f16")?,
             linear_q6k_f32: load("vnext_gguf_linear_q6k_f32")?,
             linear_q6k_tiled_f32: load("vnext_gguf_linear_q6k_tiled_f32")?,
             hadamard: hadamard::CudaHadamardKernels::load(&module)?,
