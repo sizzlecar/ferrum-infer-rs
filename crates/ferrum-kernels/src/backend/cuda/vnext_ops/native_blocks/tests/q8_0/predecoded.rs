@@ -26,7 +26,6 @@ fn read<T: DeviceRepr>(stream: &Arc<CudaStream>, source: &CudaSlice<T>) -> Vec<T
 struct Leaf {
     weights: Vec<u8>,
     encoded: CudaSlice<u8>,
-    decoded: CudaSlice<f32>,
 }
 
 impl Leaf {
@@ -46,18 +45,21 @@ impl Leaf {
         }
         Self {
             encoded: stream.clone_htod(&weights).unwrap(),
-            decoded: stream
-                .clone_htod(&vec![DECODE_CANARY; GUARD + K * N + GUARD])
-                .unwrap(),
             weights,
         }
     }
 
-    fn predecode(&mut self, stream: &Arc<CudaStream>, kernel: &CudaFunction) {
+    fn predecode(
+        &self,
+        stream: &Arc<CudaStream>,
+        kernel: &CudaFunction,
+        decoded: &mut CudaSlice<f32>,
+        offset: usize,
+    ) {
         let source = self
             .encoded
             .slice(WEIGHT_PREFIX..WEIGHT_PREFIX + WEIGHT_BYTES);
-        let mut destination = self.decoded.slice_mut(GUARD..GUARD + K * N);
+        let mut destination = decoded.slice_mut(offset..offset + K * N);
         let (k, n) = (K as u32, N as u32);
         let mut launch = stream.launch_builder(kernel);
         launch.arg(&source).arg(&mut destination).arg(&k).arg(&n);
@@ -73,12 +75,8 @@ impl Leaf {
         .unwrap();
     }
 
-    fn validate_decode(&self, stream: &Arc<CudaStream>) {
-        let actual = read(stream, &self.decoded);
-        assert!(actual[..GUARD]
-            .iter()
-            .chain(&actual[GUARD + K * N..])
-            .all(|value| value.to_bits() == DECODE_CANARY.to_bits()));
+    fn validate_decode(&self, stream: &Arc<CudaStream>, actual: &[f32]) {
+        assert_eq!(actual.len(), K * N);
         for (block, bytes) in self.weights[WEIGHT_PREFIX..WEIGHT_PREFIX + WEIGHT_BYTES]
             .chunks_exact(34)
             .enumerate()
@@ -87,7 +85,7 @@ impl Leaf {
             for lane in 0..32 {
                 let expected = scale * f32::from(bytes[2 + lane] as i8);
                 assert_eq!(
-                    actual[GUARD + block * 32 + lane].to_bits(),
+                    actual[block * 32 + lane].to_bits(),
                     expected.to_bits(),
                     "cold Q8 decode block={block} lane={lane}"
                 );
@@ -102,12 +100,14 @@ struct Layer {
     input_gpu: CudaSlice<f16>,
     output_initial: Vec<f16>,
     output_gpu: CudaSlice<f16>,
+    // Fusion uses one contiguous pair; the older pilots keep two guarded leaves.
+    decoded: Vec<CudaSlice<f32>>,
     leaves: [Leaf; 2],
     rows: usize,
 }
 
 impl Layer {
-    fn new(stream: &Arc<CudaStream>, rows: usize, layer: usize) -> Self {
+    fn new(stream: &Arc<CudaStream>, rows: usize, layer: usize, fusion: bool) -> Self {
         let input = vec![f16::from_bits(CANARY); GUARD + rows * K + GUARD];
         let mut output_initial = vec![f16::from_bits(CANARY); GUARD + rows * STRIDE + GUARD];
         for row in 0..rows {
@@ -119,6 +119,12 @@ impl Layer {
         let mut result = Self {
             input_gpu: stream.clone_htod(&input).unwrap(),
             output_gpu: stream.clone_htod(&output_initial).unwrap(),
+            decoded: (0..if fusion { 1 } else { 2 })
+                .map(|_| {
+                    let elements = GUARD + (if fusion { 2 * K * N } else { K * N }) + GUARD;
+                    stream.clone_htod(&vec![DECODE_CANARY; elements]).unwrap()
+                })
+                .collect(),
             input,
             output_initial,
             leaves: [
@@ -151,14 +157,46 @@ impl Layer {
             .unwrap();
     }
 
+    fn predecode(&mut self, stream: &Arc<CudaStream>, kernel: &CudaFunction) {
+        for (index, leaf) in self.leaves.iter().enumerate() {
+            let (allocation, offset) = if self.decoded.len() == 1 {
+                (0, GUARD + index * K * N)
+            } else {
+                (index, GUARD)
+            };
+            leaf.predecode(stream, kernel, &mut self.decoded[allocation], offset);
+        }
+    }
+
+    fn validate_decode(&self, stream: &Arc<CudaStream>) {
+        for (allocation, decoded) in self.decoded.iter().enumerate() {
+            let actual = read(stream, decoded);
+            let leaves = if self.decoded.len() == 1 { 2 } else { 1 };
+            assert!(actual[..GUARD]
+                .iter()
+                .chain(&actual[GUARD + leaves * K * N..])
+                .all(|value| value.to_bits() == DECODE_CANARY.to_bits()));
+            for local in 0..leaves {
+                let index = if leaves == 2 { local } else { allocation };
+                let start = GUARD + local * K * N;
+                self.leaves[index].validate_decode(stream, &actual[start..start + K * N]);
+            }
+        }
+    }
+
     fn enqueue(&mut self, stream: &Arc<CudaStream>, kernel: &CudaFunction, decoded: bool) {
         let input = self.input_gpu.slice(GUARD..GUARD + self.rows * K);
-        for (leaf, offset) in self.leaves.iter().zip(OFFSETS) {
+        for (index, (leaf, offset)) in self.leaves.iter().zip(OFFSETS).enumerate() {
             let mut output = self.output_gpu.slice_mut(GUARD..GUARD + self.rows * STRIDE);
             let encoded = leaf
                 .encoded
                 .slice(WEIGHT_PREFIX..WEIGHT_PREFIX + WEIGHT_BYTES);
-            let weights_f32 = leaf.decoded.slice(GUARD..GUARD + K * N);
+            let (allocation, start) = if self.decoded.len() == 1 {
+                (0, GUARD + index * K * N)
+            } else {
+                (index, GUARD)
+            };
+            let weights_f32 = self.decoded[allocation].slice(start..start + K * N);
             let params = [
                 self.rows as u32,
                 K as u32,
@@ -194,6 +232,34 @@ impl Layer {
             }
             .unwrap();
         }
+    }
+
+    fn enqueue_fused(&mut self, stream: &Arc<CudaStream>, kernel: &CudaFunction) {
+        let input = self.input_gpu.slice(GUARD..GUARD + self.rows * K);
+        let weights = self.decoded[0].slice(GUARD..GUARD + 2 * K * N);
+        let mut output = self.output_gpu.slice_mut(GUARD..GUARD + self.rows * STRIDE);
+        let params = [
+            self.rows as u32,
+            K as u32,
+            (2 * N) as u32,
+            STRIDE as u32,
+            OFFSETS[0] as u32,
+        ];
+        let mut launch = stream.launch_builder(kernel);
+        launch.arg(&input).arg(&weights).arg(&mut output);
+        for param in &params {
+            launch.arg(param);
+        }
+        // SAFETY: the two column-major N48 matrices are contiguous in the
+        // same retained allocation; the adjacent output windows form N96.
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (((2 * N) as u32).div_ceil(4), self.rows as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .unwrap();
     }
 
     fn read_checked(&self, stream: &Arc<CudaStream>) -> Vec<u16> {
@@ -234,13 +300,19 @@ impl Layer {
 #[test]
 #[ignore = "paired CUDA graph pilot; requires exclusive GPU access"]
 fn q8_0_predecoded_f32_preserves_bits_and_paired_layer_ring_on_cuda() {
-    paired_layer_ring(&[1, 8, 32], 1, 16);
+    paired_layer_ring(&[1, 8, 32], 1, 16, false);
 }
 
 #[test]
 #[ignore = "five physical weight banks; paired CUDA cache-capacity control"]
 fn q8_0_predecoded_f32_m8_five_bank_capacity_control_on_cuda() {
-    paired_layer_ring(&[8], 5, 20);
+    paired_layer_ring(&[8], 5, 20, false);
+}
+
+#[test]
+#[ignore = "five-bank paired N48/N96 CUDA launch-fusion diagnostic"]
+fn q8_0_predecoded_f32_pair_fusion_m8_m32_five_bank_on_cuda() {
+    paired_layer_ring(&[8, 32], 5, 20, true);
 }
 
 struct Bank {
@@ -252,7 +324,7 @@ struct Bank {
     cold_gpu_ns: f64,
 }
 
-fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize) {
+fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize, fusion: bool) {
     const WARM: usize = 8;
     let context = CudaContext::new(0).expect("Q8 predecode pilot requires CUDA");
     // One thread/stream owns every buffer; explicit fences surround host reads
@@ -276,20 +348,16 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize) {
         let mut banks = Vec::with_capacity(bank_count);
         for bank in 0..bank_count {
             let mut layers = (0..LAYERS)
-                .map(|layer| Layer::new(&stream, rows, bank * LAYERS + layer))
+                .map(|layer| Layer::new(&stream, rows, bank * LAYERS + layer, fusion))
                 .collect::<Vec<_>>();
             stream.synchronize().unwrap();
             let (cold_wall_ns, cold_gpu_ns) = measure(&stream, || {
                 for layer in &mut layers {
-                    for leaf in &mut layer.leaves {
-                        leaf.predecode(&stream, &cold);
-                    }
+                    layer.predecode(&stream, &cold);
                 }
             });
             for layer in &layers {
-                for leaf in &layer.leaves {
-                    leaf.validate_decode(&stream);
-                }
+                layer.validate_decode(&stream);
             }
             let mut reference = Vec::new();
             for layer in &mut layers {
@@ -298,19 +366,29 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize) {
                 layer.reset(&stream);
                 layer.enqueue(&stream, &hot, true);
                 assert_eq!(layer.read_checked(&stream), *reference.last().unwrap());
+                if fusion {
+                    layer.reset(&stream);
+                    layer.enqueue_fused(&stream, &hot);
+                    assert_eq!(layer.read_checked(&stream), *reference.last().unwrap());
+                }
             }
-            let graphs = [false, true].map(|decoded| {
+            let graphs = [false, true].map(|candidate| {
                 Captured::new(&stream, || {
                     for layer in &mut layers {
-                        layer.enqueue(
-                            &stream,
-                            if decoded {
-                                &hot
-                            } else {
-                                &kernels.linear_q8_0_f16
-                            },
-                            decoded,
-                        );
+                        if fusion && candidate {
+                            layer.enqueue_fused(&stream, &hot);
+                        } else {
+                            let decoded = fusion || candidate;
+                            layer.enqueue(
+                                &stream,
+                                if decoded {
+                                    &hot
+                                } else {
+                                    &kernels.linear_q8_0_f16
+                                },
+                                decoded,
+                            );
+                        }
                     }
                 })
             });
@@ -359,10 +437,17 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize) {
         println!(
             "{}",
             serde_json::json!({
-                "kind":"q8_f32_predecode_ring_plan", "product_status":"test_only_candidate",
+                "kind":if fusion { "q8_f32_pair_fusion_ring_plan" } else { "q8_f32_predecode_ring_plan" },
+                "product_status":"test_only_candidate",
                 "m":rows, "k":K, "n":N, "layers":LAYERS, "layers_per_bank":LAYERS,
                 "physical_banks":bank_count, "distinct_weight_leaves":bank_count*2*LAYERS,
                 "projection_leaves_per_observation":2*LAYERS,
+                "decoded_allocations_per_layer":if fusion { 1 } else { 2 },
+                "decoded_matrices_per_allocation":if fusion { 2 } else { 1 },
+                "timed_routes":if fusion { ["predecoded_f32_two_n48", "predecoded_f32_one_n96"] }
+                    else { ["strict_q8_f16", "predecoded_f32_f16"] },
+                "compressed_reference_timed":!fusion,
+                "kernel_calls_per_observation":if fusion { [2*LAYERS,LAYERS] } else { [2*LAYERS,2*LAYERS] },
                 "result_stride":STRIDE, "result_offsets":OFFSETS,
                 "additional_resident_f32_bytes":bank_count*2*LAYERS*K*N*4,
                 "retained_q8_bytes":bank_count*2*LAYERS*WEIGHT_BYTES,
@@ -375,6 +460,14 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize) {
                     else { "rotating physical banks; cache-capacity control, not guaranteed eviction or model traffic" },
                 "bank_selection":"pair modulo physical_banks; both paired arms use the same bank",
                 "pair_order":"alternating AB and BA",
+                "other_bank_precondition":if fusion { serde_json::json!({
+                    "before_each_measured_arm":true,
+                    "route":"predecoded_f32_two_n48",
+                    "bank_order":"selected bank plus 1..physical_banks modulo physical_banks",
+                    "graph_replays":bank_count-1,
+                    "f32_weight_bytes":(bank_count-1)*2*LAYERS*K*N*4,
+                    "scope":"other-bank graph launches followed by stream synchronization; excluded from measured GPU and host wall time; cache eviction is not guaranteed"
+                }) } else { serde_json::Value::Null },
                 "graph_nodes":banks[0].graphs.iter().map(|graph| graph.node_count).collect::<Vec<_>>(),
                 "graph_nodes_per_bank":banks.iter().map(|bank| bank.graphs.iter().map(|graph| graph.node_count).collect::<Vec<_>>()).collect::<Vec<_>>(),
                 "warm_rounds":WARM, "warm_rounds_per_bank":WARM, "formal_pairs":pairs, "graph_replays_per_observation":1,
@@ -388,15 +481,26 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize) {
             let bank = pair % bank_count;
             for position in 0..2 {
                 let route = (pair + position) % 2;
+                if fusion {
+                    for offset in 1..bank_count {
+                        banks[(bank + offset) % bank_count].graphs[0].launch();
+                    }
+                    stream.synchronize().unwrap();
+                }
                 let (wall_ns, gpu_ns) = measure(&stream, || banks[bank].graphs[route].launch());
                 println!(
                     "{}",
                     serde_json::json!({
-                        "kind":"q8_f32_predecode_ring_pair", "m":rows, "k":K, "n":N,
+                        "kind":if fusion { "q8_f32_pair_fusion_ring_pair" } else { "q8_f32_predecode_ring_pair" },
+                        "m":rows, "k":K, "n":N,
                         "pair":pair, "position":position, "bank":bank, "physical_banks":bank_count,
                         "pair_order":if pair % 2 == 0 { "AB" } else { "BA" },
-                        "route":if route == 0 { "strict_q8_f16" } else { "predecoded_f32_f16" },
+                        "route":if fusion {
+                            if route == 0 { "predecoded_f32_two_n48" } else { "predecoded_f32_one_n96" }
+                        } else if route == 0 { "strict_q8_f16" } else { "predecoded_f32_f16" },
                         "projection_leaves":2*LAYERS, "graph_replays":1,
+                        "kernel_calls":if fusion && route == 1 { LAYERS } else { 2*LAYERS },
+                        "other_bank_precondition_replays":if fusion { bank_count-1 } else { 0 },
                         "gpu_ns":gpu_ns, "wall_ns":wall_ns,
                         "gpu_ns_per_leaf":gpu_ns/(2*LAYERS) as f64,
                         "performance_threshold":null
@@ -411,9 +515,7 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize) {
                     *expected,
                     "timed replay final bits"
                 );
-                for leaf in &layer.leaves {
-                    leaf.validate_decode(&stream);
-                }
+                layer.validate_decode(&stream);
             }
             // Graphs retain raw addresses; destroy them before fixture allocations.
             drop(bank);
