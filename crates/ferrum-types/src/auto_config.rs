@@ -162,6 +162,8 @@ pub struct CompiledKernelFeatures {
     pub vllm_paged_attn: bool,
     #[serde(default)]
     pub cuda_indexed_causal_attention: bool,
+    #[serde(default)]
+    pub cuda_q4_shared_weight_decode: bool,
     pub vllm_moe_marlin: bool,
     pub cuda_graph: bool,
     pub greedy_argmax: bool,
@@ -180,6 +182,7 @@ impl Default for CompiledKernelFeatures {
             cuda: false,
             vllm_paged_attn: false,
             cuda_indexed_causal_attention: false,
+            cuda_q4_shared_weight_decode: false,
             vllm_moe_marlin: false,
             cuda_graph: false,
             greedy_argmax: false,
@@ -198,6 +201,7 @@ impl CompiledKernelFeatures {
             cuda: true,
             vllm_paged_attn: true,
             cuda_indexed_causal_attention: false,
+            cuda_q4_shared_weight_decode: false,
             vllm_moe_marlin: true,
             cuda_graph: true,
             greedy_argmax: true,
@@ -1209,6 +1213,16 @@ impl FerrumConfigBuilder {
                 RuntimeConfigSource::Default,
             );
         }
+        if self
+            .entry(crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
+                crate::Q4MmvqWeightDecode::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
             if self
                 .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
@@ -1294,6 +1308,7 @@ impl FerrumConfigBuilder {
             plan_attention.as_ref().map(|(_, compiled)| compiled.value),
         )?);
         decisions.push(self.sampling_decision(greedy));
+        decisions.push(self.q4_mmvq_weight_decode_decision()?);
 
         Ok(ResolvedFerrumConfig {
             schema_version: 1,
@@ -2842,6 +2857,46 @@ impl FerrumConfigBuilder {
             source,
             source_key,
             ["contiguous", "indexed", "fixed-capacity"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn q4_mmvq_weight_decode_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::Q4MmvqWeightDecode::parse_config_entry(entry).map_err(|reason| {
+                    AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    }
+                })?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::Q4MmvqWeightDecode::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::Q4MmvqWeightDecode::SharedM8
+            && (!self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || !self.hardware.compiled_features.cuda_q4_shared_weight_decode)
+        {
+            return Err(AutoConfigError::InvalidOverride {
+                key: key.to_owned(),
+                reason: "shared-m8 Q4 weight decode requires the cuda-q4-shared-weight-decode build feature, a CUDA plan runtime, and a selected Q4_K MarkerV2 MMVQ M8 numerical route".to_owned(),
+            });
+        }
+        Ok(self.decision(
+            "q4_mmvq_weight_decode",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["baseline", "shared-m8"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -7033,6 +7088,124 @@ mod tests {
                 assert!(!rejected.value.trim().is_empty());
                 assert!(!rejected.reason.trim().is_empty());
             }
+        }
+    }
+    #[test]
+    fn q4_mmvq_weight_decode_resolves_sources_and_rejects_unsupported_execution() {
+        let key = crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        for backend in ["cpu", "metal", "cuda"] {
+            for authority in [
+                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionResourceAuthority::PlanRuntime,
+            ] {
+                for compiled in [false, true] {
+                    for mode in ["baseline", "shared-m8"] {
+                        let mut hardware = HardwareCapabilities::unknown();
+                        hardware.backend = backend.into();
+                        hardware.compiled_features.cuda = backend == "cuda";
+                        hardware.compiled_features.cuda_q4_shared_weight_decode = compiled;
+                        let builder =
+                            FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
+                                RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
+                            ]))
+                            .with_hardware_capabilities(hardware)
+                            .with_execution_resource_authority(authority);
+                        let result = builder.resolve();
+                        let supported = mode == "baseline"
+                            || (backend == "cuda"
+                                && authority == ExecutionResourceAuthority::PlanRuntime
+                                && compiled);
+                        if supported {
+                            let resolved = result.unwrap();
+                            let mut engine = crate::EngineConfig::default();
+                            engine
+                                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                                .unwrap();
+                            assert_eq!(
+                                engine.runtime.q4_mmvq_weight_decode.as_runtime_value(),
+                                mode
+                            );
+                            let decision = resolved
+                                .decisions
+                                .iter()
+                                .find(|d| d.selection == "q4_mmvq_weight_decode")
+                                .unwrap();
+                            assert_eq!(decision.source, AutoConfigSource::Cli);
+                        } else {
+                            assert!(
+                                matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = "cuda".into();
+            hardware.compiled_features.cuda = true;
+            hardware.compiled_features.cuda_q4_shared_weight_decode = true;
+            let resolved = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "shared-m8", source),
+            ]))
+            .with_hardware_capabilities(hardware)
+            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .resolve()
+            .unwrap();
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap();
+            assert_eq!(entry.source, source);
+        }
+    }
+
+    #[test]
+    fn q4_mmvq_weight_decode_keeps_legacy_default_and_rejects_environment() {
+        let key = crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        let mut old = serde_json::to_value(CompiledKernelFeatures::default()).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("cuda_q4_shared_weight_decode");
+        let decoded: CompiledKernelFeatures = serde_json::from_value(old).unwrap();
+        assert!(!decoded.cuda_q4_shared_weight_decode);
+        let resolved = FerrumConfigBuilder::new(RuntimeConfigSnapshot::default())
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap()
+                .effective_value,
+            "baseline"
+        );
+        for value in ["baseline", "shared-m8", "invalid"] {
+            let result = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, value, RuntimeConfigSource::Env),
+            ]))
+            .resolve();
+            assert!(
+                matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+            );
+            let mut engine = crate::EngineConfig::default();
+            assert!(engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, value, RuntimeConfigSource::Env),
+                ]))
+                .is_err());
+            assert_eq!(
+                engine.runtime.q4_mmvq_weight_decode,
+                crate::Q4MmvqWeightDecode::Baseline
+            );
         }
     }
 }

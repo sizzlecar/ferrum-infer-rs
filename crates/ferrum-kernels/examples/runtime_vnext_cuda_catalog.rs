@@ -4,18 +4,18 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::cuda_validated_native_operator_catalog_input_with_causal_decode_attention_grouping;
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_validated_native_operator_catalog_input_with_q4_mmvq_weight_decode;
 use ferrum_types::{
     AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
-    NativeOperatorBackend,
+    NativeOperatorBackend, Q4MmvqWeightDecode,
 };
 use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if !matches!(arguments.len(), 6 | 7 | 8) {
+    if !matches!(arguments.len(), 6 | 7 | 8 | 9) {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> <compiled-native-operators-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping]",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> <compiled-native-operators-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode]",
             arguments.first().map(String::as_str).unwrap_or("runtime_vnext_cuda_catalog")
         )
         .into());
@@ -35,14 +35,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|value| CausalDecodeAttentionGrouping::parse_runtime_value(value))
         .transpose()?
         .unwrap_or_default();
-    let catalog_input =
-        cuda_validated_native_operator_catalog_input_with_causal_decode_attention_grouping(
-            ordinal,
-            DeviceId::new(format!("cuda:{ordinal}"))?,
-            policy,
-            causal_decode_preparation,
-            causal_decode_attention_grouping,
-        )?;
+    let q4_mmvq_weight_decode = arguments
+        .get(8)
+        .map(|value| Q4MmvqWeightDecode::parse_runtime_value(value))
+        .transpose()?
+        .unwrap_or_default();
+    let catalog_input = cuda_validated_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+        ordinal,
+        DeviceId::new(format!("cuda:{ordinal}"))?,
+        policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+    )?;
     let capability_catalog = catalog_input.capability_catalog();
     let provider_catalog =
         capability_catalog.native_operator_provider_catalog(NativeOperatorBackend::Cuda)?;

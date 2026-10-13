@@ -237,6 +237,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         if precision.upstream() {
             provider_fingerprint_parts
                 .extend(super::q8act_attention::upstream::fingerprint_sources());
+            provider_fingerprint_parts.push(
+                runtime
+                    .q4_mmvq_weight_decode()
+                    .as_runtime_value()
+                    .as_bytes(),
+            );
         }
         let provider_fingerprint = implementation_fingerprint(&provider_fingerprint_parts);
         let estimator_fingerprint = implementation_fingerprint(&[
@@ -400,6 +406,8 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                         runtime.context(),
                         descriptor.provider_implementation_fingerprint(),
                         precision.upstream_profile(),
+                        runtime.q4_mmvq_weight_decode(),
+                        runtime.q4_shared_weight_decode_counter(),
                     )
                 })
                 .transpose()?,

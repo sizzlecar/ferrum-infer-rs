@@ -144,6 +144,35 @@ impl Fixture {
         preparation_mode: ferrum_types::CausalDecodePreparationMode,
         attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     ) -> Self {
+        Self::for_family_with_q4_mmvq_weight_decode(
+            kind,
+            reusable,
+            participants,
+            definition,
+            upload_strategy,
+            oracle,
+            owner_mode,
+            attention_policy,
+            preparation_mode,
+            attention_grouping,
+            ferrum_types::Q4MmvqWeightDecode::Baseline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_family_with_q4_mmvq_weight_decode(
+        kind: AttentionKind,
+        reusable: bool,
+        participants: u32,
+        definition: Family,
+        upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
+        oracle: SegmentBindingOracleMode,
+        owner_mode: SegmentBindingOwnerViewMode,
+        attention_policy: ferrum_types::AttentionExecutionPolicy,
+        preparation_mode: ferrum_types::CausalDecodePreparationMode,
+        attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    ) -> Self {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let attention_arithmetic = definition.attention_arithmetic();
@@ -156,7 +185,7 @@ impl Fixture {
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
         let (runtime, registry, materializers, catalog) =
-            CudaVNextComposition::create_with_causal_decode_attention_grouping(
+            CudaVNextComposition::create_with_q4_mmvq_weight_decode(
                 0,
                 id(format!("device.cuda.upstream-marker.{kind:?}")),
                 attention_policy,
@@ -165,6 +194,7 @@ impl Fixture {
                 owner_mode,
                 preparation_mode,
                 attention_grouping,
+                q4_mmvq_weight_decode,
             )
             .unwrap()
             .into_parts();

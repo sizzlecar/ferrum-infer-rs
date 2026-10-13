@@ -92,6 +92,7 @@ pub struct PreparedUpstreamLinear {
     raw: UpstreamLinearPlanV1,
     arithmetic: Arithmetic,
     family: Family,
+    q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
 }
 impl PreparedUpstreamLinear {
     pub fn new(
@@ -126,6 +127,7 @@ impl PreparedUpstreamLinear {
                 raw,
                 arithmetic,
                 family: Family::Original,
+                q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             })
         }
     }
@@ -161,6 +163,7 @@ impl PreparedUpstreamLinear {
                 raw,
                 arithmetic,
                 family: Family::Extra,
+                q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             })
         }
     }
@@ -195,6 +198,7 @@ impl PreparedUpstreamLinear {
                 raw,
                 arithmetic: Arithmetic::MarkerV2,
                 family: Family::Extra,
+                q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             })
         }
     }
@@ -203,6 +207,49 @@ impl PreparedUpstreamLinear {
     }
     pub fn arithmetic(&self) -> Arithmetic {
         self.arithmetic
+    }
+    /// The dot implementation is selected once after the existing numerical
+    /// route has supplied the exact native plan. Pack, cast and validation
+    /// retain the original MarkerV2 ABI and resource extents.
+    pub fn with_q4_mmvq_weight_decode(
+        mut self,
+        mode: ferrum_types::Q4MmvqWeightDecode,
+    ) -> Result<Self, Error> {
+        if mode == ferrum_types::Q4MmvqWeightDecode::SharedM8 {
+            if !cfg!(feature = "cuda-q4-shared-weight-decode") {
+                return Err(Error::Unavailable);
+            }
+            if !self.q4_shared_weight_decode_eligible() {
+                return Err(Error::UnsupportedGeometry);
+            }
+        }
+        self.q4_weight_decode = mode;
+        Ok(self)
+    }
+    pub fn q4_mmvq_weight_decode(&self) -> ferrum_types::Q4MmvqWeightDecode {
+        self.q4_weight_decode
+    }
+    pub fn q4_shared_weight_decode_eligible(&self) -> bool {
+        #[cfg(any(feature = "cuda-upstream-linear", test))]
+        {
+            let p = &self.raw;
+            self.family == Family::Original
+                && self.arithmetic == Arithmetic::MarkerV2
+                && p.algorithm == Algorithm::Mmvq as u32
+                && p.request.format == Format::Q4K as u32
+                && p.request.layout == Layout::Columns as u32
+                && p.request.rows == 8
+                && p.ncols == 8
+                && p.channels == 1
+                && p.nwarps == 2
+                && p.rows_per_block == 2
+                && p.small_k == 0
+                && p.fixup_bytes == 0
+        }
+        #[cfg(not(any(feature = "cuda-upstream-linear", test)))]
+        {
+            false
+        }
     }
     pub fn row_poison_bytes(&self) -> u64 {
         if self.arithmetic == Arithmetic::MarkerV2 {
@@ -298,7 +345,16 @@ impl PreparedUpstreamLinear {
         #[cfg(feature = "cuda-upstream-linear")]
         {
             let api = dispatch::api(self.family, self.raw.algorithm)?;
-            Error::from_status(unsafe { (api.dot)(&self.raw, w, q, o, f, stream) })
+            let dot = match self.q4_weight_decode {
+                ferrum_types::Q4MmvqWeightDecode::Baseline => api.dot,
+                #[cfg(feature = "cuda-q4-shared-weight-decode")]
+                ferrum_types::Q4MmvqWeightDecode::SharedM8 => {
+                    ffi::ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1
+                }
+                #[cfg(not(feature = "cuda-q4-shared-weight-decode"))]
+                ferrum_types::Q4MmvqWeightDecode::SharedM8 => return Err(Error::Unavailable),
+            };
+            Error::from_status(unsafe { dot(&self.raw, w, q, o, f, stream) })
         }
         #[cfg(not(feature = "cuda-upstream-linear"))]
         {
@@ -352,13 +408,62 @@ impl PreparedUpstreamLinear {
 
 #[cfg(feature = "cuda-upstream-linear")]
 mod dispatch;
+
 #[cfg(feature = "cuda-upstream-extra-linear")]
 mod extra_ffi;
 #[cfg(feature = "cuda-upstream-linear")]
 mod ffi;
+#[cfg(all(test, feature = "cuda-q4-shared-weight-decode"))]
+#[path = "upstream_linear/shared_weight_tests.rs"]
+mod shared_weight_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_q4_weight_decode_requires_the_complete_prepared_mmvq_geometry() {
+        let mut raw = UpstreamLinearPlanV1::default();
+        raw.algorithm = Algorithm::Mmvq as u32;
+        raw.request.format = Format::Q4K as u32;
+        raw.request.layout = Layout::Columns as u32;
+        raw.request.rows = 8;
+        raw.ncols = 8;
+        raw.channels = 1;
+        raw.nwarps = 2;
+        raw.rows_per_block = 2;
+        let plan = PreparedUpstreamLinear {
+            raw,
+            arithmetic: Arithmetic::MarkerV2,
+            family: Family::Original,
+            q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
+        };
+        assert!(plan.q4_shared_weight_decode_eligible());
+        let mutate = |f: fn(&mut PreparedUpstreamLinear)| {
+            let mut changed = plan.clone();
+            f(&mut changed);
+            assert!(!changed.q4_shared_weight_decode_eligible());
+        };
+        mutate(|p| p.family = Family::Extra);
+        mutate(|p| p.arithmetic = Arithmetic::V1);
+        mutate(|p| p.raw.algorithm = Algorithm::Mmq as u32);
+        mutate(|p| p.raw.request.format = Format::Q5K as u32);
+        mutate(|p| p.raw.request.layout = Layout::Channels as u32);
+        mutate(|p| p.raw.request.rows = 4);
+        mutate(|p| p.raw.ncols = 4);
+        mutate(|p| p.raw.channels = 8);
+        mutate(|p| p.raw.nwarps = 4);
+        mutate(|p| p.raw.rows_per_block = 1);
+        mutate(|p| p.raw.small_k = 1);
+        mutate(|p| p.raw.fixup_bytes = 4);
+        assert_eq!(
+            plan.q4_mmvq_weight_decode(),
+            ferrum_types::Q4MmvqWeightDecode::Baseline
+        );
+        #[cfg(not(feature = "cuda-q4-shared-weight-decode"))]
+        assert!(matches!(
+            plan.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8),
+            Err(Error::Unavailable)
+        ));
+    }
     #[test]
     fn span_validation_rejects_overflow_aliasing_and_short_tails() {
         let a = DeviceSpan {
@@ -419,6 +524,7 @@ mod tests {
                 raw: Default::default(),
                 arithmetic: Arithmetic::MarkerV2,
                 family,
+                q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             };
             assert_eq!(plan.operator(), family.operator());
         }

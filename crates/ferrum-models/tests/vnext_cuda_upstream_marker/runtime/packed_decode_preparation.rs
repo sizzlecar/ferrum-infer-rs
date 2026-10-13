@@ -1,12 +1,12 @@
 //! Real Core admission and provider submission. The two independent histories
-//! differ only in causal preparation or grouping; no fixture asserts KV independence
+//! differ only in the selected preparation, grouping, or Q4 weight decode; no fixture asserts KV independence
 //! on the backend's behalf. Kernel attribution is a submission declaration,
 //! not a hardware counter. Ordinary warm/capture/replay remains timing Off.
 use super::*;
 use batch::BatchObservationOptions;
 use ferrum_types::{
     AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
-    InvocationPreparationStrategy, ProgramBindingUploadStrategy,
+    InvocationPreparationStrategy, ProgramBindingUploadStrategy, Q4MmvqWeightDecode,
 };
 use std::cell::RefCell;
 
@@ -154,6 +154,7 @@ fn attention_work(
     fixture: &Fixture,
     participants: usize,
     mixed: bool,
+    grouping: CausalDecodeAttentionGrouping,
 ) -> DeviceNativeWorkAttribution {
     let node_index = fixture
         .compilation
@@ -183,7 +184,9 @@ fn attention_work(
     assert_eq!(work.token_count(), participants as u64);
     assert_eq!(
         work.native_op_id(),
-        if mixed {
+        if grouping == CausalDecodeAttentionGrouping::FixedCapacity {
+            "vnext.causal_attention.fixed_capacity_native_paths"
+        } else if mixed {
             "vnext.causal_attention.mixed_native_paths"
         } else {
             "vnext.causal_attention.vllm_paged_attention_v1_addressed"
@@ -197,9 +200,28 @@ fn verify(leads: &[usize]) {
 }
 
 fn verify_modes(leads: &[usize], indexed_grouping: bool) {
+    verify_options(leads, indexed_grouping, [Q4MmvqWeightDecode::Baseline; 2]);
+}
+
+fn verify_options(leads: &[usize], indexed_grouping: bool, q4_modes: [Q4MmvqWeightDecode; 2]) {
+    verify_options_with_q4_grouping(
+        leads,
+        indexed_grouping,
+        q4_modes,
+        CausalDecodeAttentionGrouping::Indexed,
+    );
+}
+
+fn verify_options_with_q4_grouping(
+    leads: &[usize],
+    indexed_grouping: bool,
+    q4_modes: [Q4MmvqWeightDecode; 2],
+    q4_grouping: CausalDecodeAttentionGrouping,
+) {
     let participants = leads.len();
     let mixed = leads.iter().any(|&lead| lead > 512);
-    let modes = if indexed_grouping {
+    let q4_comparison = q4_modes[0] != q4_modes[1];
+    let modes = if indexed_grouping || q4_comparison {
         [CausalDecodePreparationMode::Packed; 2]
     } else {
         [
@@ -207,16 +229,20 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
             CausalDecodePreparationMode::Packed,
         ]
     };
-    let groupings = [
-        CausalDecodeAttentionGrouping::Contiguous,
-        if indexed_grouping {
-            CausalDecodeAttentionGrouping::Indexed
-        } else {
-            CausalDecodeAttentionGrouping::Contiguous
-        },
-    ];
+    let groupings = if q4_comparison {
+        [q4_grouping; 2]
+    } else {
+        [
+            CausalDecodeAttentionGrouping::Contiguous,
+            if indexed_grouping {
+                CausalDecodeAttentionGrouping::Indexed
+            } else {
+                CausalDecodeAttentionGrouping::Contiguous
+            },
+        ]
+    };
     let fixtures = std::array::from_fn::<_, 2, _>(|arm| {
-        Fixture::for_family_with_decode_attention_grouping(
+        Fixture::for_family_with_q4_mmvq_weight_decode(
             AttentionKind::Causal,
             true,
             participants as u32,
@@ -227,12 +253,24 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
             AttentionExecutionPolicy::NativeAdaptive,
             modes[arm],
             groupings[arm],
+            q4_modes[arm],
         )
     });
-    for fixture in &fixtures {
+    for (arm, fixture) in fixtures.iter().enumerate() {
         assert_eq!(
             fixture._composition._runtime.attention_execution_policy(),
             AttentionExecutionPolicy::NativeAdaptive
+        );
+        assert_eq!(
+            fixture._composition._runtime.q4_mmvq_weight_decode(),
+            q4_modes[arm]
+        );
+        assert_eq!(
+            fixture
+                ._composition
+                ._runtime
+                .causal_decode_attention_grouping(),
+            groupings[arm]
         );
         assert_eq!(
             fixture
@@ -356,8 +394,9 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
         let mut frames = [Vec::new(), Vec::new()];
         let mut hot_hits = [0, 0];
         for wave in 0..DECODE_WAVES {
-            // Only the new Indexed comparison crosses the native 512 boundary.
-            // Warm/capture the changed topology before requiring ReplayOnly.
+            // The contiguous/Indexed comparison changes topology at 512.
+            // The FixedCapacity Q4 pair keeps its captured program across
+            // that boundary; its current lengths select the active nodes.
             let replay_start = if indexed_grouping && wave >= 4 { 6 } else { 3 };
             if indexed_grouping && wave == 4 {
                 before_transition = stable_programs.clone();
@@ -407,6 +446,10 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
                     ._composition
                     ._runtime
                     .segment_binding_oracle_audited_nodes();
+                let q4_before = fixture
+                    ._composition
+                    ._runtime
+                    .q4_shared_weight_decode_encodes();
                 let observation = fixture.execute_participant_ranges_observed(
                     &fixture.lane,
                     &fixture.reaper,
@@ -438,10 +481,38 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
                     ._runtime
                     .segment_binding_oracle_audited_nodes()
                     - audited_before;
+                let q4_encodes = fixture
+                    ._composition
+                    ._runtime
+                    .q4_shared_weight_decode_encodes()
+                    - q4_before;
+                if q4_modes[arm] == Q4MmvqWeightDecode::Baseline || participants != 8 {
+                    assert_eq!(
+                        q4_encodes, 0,
+                        "baseline and ineligible decode widths must keep the original Q4 route"
+                    );
+                } else if wave == 0 {
+                    assert!(
+                        q4_encodes > 0,
+                        "the paired physical-M8 candidate must execute the shared-weight Q4 route"
+                    );
+                }
+                if matches!(path, Path::Replay) {
+                    assert_eq!(
+                        q4_encodes, 0,
+                        "hot replay executes the captured route without a new host dot enqueue"
+                    );
+                }
                 assert_eq!(indexed, stats.segment_hits);
                 assert_eq!(audited, stats.segment_encoded_nodes);
                 if wave == 0 {
-                    work.push(attention_work(&observation, fixture, participants, mixed));
+                    work.push(attention_work(
+                        &observation,
+                        fixture,
+                        participants,
+                        mixed,
+                        groupings[arm],
+                    ));
                 } else {
                     assert!(
                         observation.attribution.is_none(),
@@ -502,6 +573,7 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
                 println!(
                     "{}",
                     serde_json::json!({"kind":"packed_preparation_model_wave", "mode":modes[arm],"grouping":groupings[arm],
+                    "q4_mmvq_weight_decode":q4_modes[arm],"q4_shared_host_encodes":q4_encodes,
                     "generation":generation,"participants":participants,"ranges":ranges,"caller_order":order,
                     "path":format!("{path:?}"),"physical_64k_pages":pages,"program":observation.reusable_program_id,
                     "hits":stats.segment_hits,"indexed_host_encodes":indexed,"oracle_nodes":audited,
@@ -512,7 +584,9 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
             }
             observations[0].assert_same(&observations[1]);
             if wave == 0 {
-                let expected_removed = if indexed_grouping {
+                let expected_removed = if q4_comparison {
+                    0
+                } else if indexed_grouping {
                     // V1,V1,V2,V1,V1,V2: four contiguous groups use six
                     // attention kernels; indexed V1 + V2 main/reduce use three.
                     3
@@ -525,6 +599,7 @@ fn verify_modes(leads: &[usize], indexed_grouping: bool) {
                     "{}",
                     serde_json::json!({"kind":"packed_preparation_model_qualification", "generation":generation,
                     "preparation_modes":modes,"attention_groupings":groupings,
+                    "q4_mmvq_weight_decode_modes":q4_modes,
                     "reference":work[0],"candidate":work[1],"scope":"actual submitted attribution; declared dispatch count, not hardware kernel count"})
                 );
             }
@@ -558,4 +633,164 @@ fn indexed_decode_attention_matches_contiguous_across_core_replay_boundary_and_f
     // The 508 rows cross V1/V2 at wave4; the 57 rows grow physical pages on
     // wave7, after the new program is captured and its fresh recipe published.
     verify_modes(&[508, 57, 1084, 57, 508, 1084], true);
+}
+
+#[test]
+#[cfg(all(
+    feature = "cuda-q4-shared-weight-decode",
+    feature = "cuda-indexed-causal-attention"
+))]
+#[ignore = "requires CUDA shared-weight Q4 and indexed NativeAdaptive, actual Core admission and replay"]
+fn q4_shared_weight_decode_matches_baseline_across_core_m8_replay_and_fresh_requests() {
+    let modes = [Q4MmvqWeightDecode::Baseline, Q4MmvqWeightDecode::SharedM8];
+    // Both arms retain the current Packed/Indexed attention configuration.
+    // Real M8 activates Q4 sharing; M4 exercises the ineligible original path.
+    // Each case mixes native attention widths, grows KV backing, reorders
+    // participants, and reuses graphs with fresh request authorities.
+    verify_options(&[60, 60, 1084, 1084, 60, 60, 1084, 1084], false, modes);
+    verify_options(&[60, 60, 1084, 1084], false, modes);
+}
+
+#[test]
+#[cfg(all(
+    feature = "cuda-q4-shared-weight-decode",
+    feature = "cuda-indexed-causal-attention"
+))]
+#[ignore = "requires CUDA shared-weight Q4 and fixed-capacity NativeAdaptive, actual Core admission and replay"]
+fn q4_shared_weight_decode_matches_baseline_with_fixed_capacity_replay_and_growth() {
+    let modes = [Q4MmvqWeightDecode::Baseline, Q4MmvqWeightDecode::SharedM8];
+    // At wave4 the 508 rows cross V1/V2 without replacing the fixed program.
+    // The 57 rows grow physical KV pages at wave7, after capture, publication
+    // and caller reordering. The M4 case keeps the original Q4 dot selected.
+    for leads in [
+        &[508, 57, 1084, 57, 508, 1084, 57, 1084][..],
+        &[508, 57, 1084, 57][..],
+    ] {
+        verify_options_with_q4_grouping(
+            leads,
+            false,
+            modes,
+            CausalDecodeAttentionGrouping::FixedCapacity,
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "cuda-q4-shared-weight-decode")]
+#[ignore = "requires CUDA shared-weight Q4, actual Core GDN admission and replay"]
+fn q4_shared_weight_decode_gated_delta_matches_baseline_across_core_m8_replay_and_fresh_requests() {
+    let modes = [Q4MmvqWeightDecode::Baseline, Q4MmvqWeightDecode::SharedM8];
+    let fixtures = modes.map(|mode| {
+        Fixture::for_family_with_q4_mmvq_weight_decode(
+            AttentionKind::GatedDelta,
+            true,
+            8,
+            Family::new(AttentionKind::GatedDelta),
+            ProgramBindingUploadStrategy::CompactScatter,
+            SegmentBindingOracleMode::CompareReference,
+            SegmentBindingOwnerViewMode::Indexed,
+            AttentionExecutionPolicy::Portable,
+            CausalDecodePreparationMode::PerParticipant,
+            CausalDecodeAttentionGrouping::Contiguous,
+            mode,
+        )
+    });
+    let mut old_authorities = BTreeSet::new();
+    let mut programs = [None, None];
+    for generation in 0..2 {
+        let tokens: Vec<Arc<[u32]>> = (0..8)
+            .map(|owner| {
+                (0..6)
+                    .map(|position| ((position * 7 + owner * 3 + generation * 11 + 1) % 32) as u32)
+                    .collect()
+            })
+            .collect();
+        let sessions = fixtures.each_ref().map(|fixture| {
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(owner, tokens)| {
+                    let session = fixture.admit(
+                        &format!("shared-q4-gdn-{generation}-{owner}"),
+                        Arc::clone(tokens),
+                    );
+                    assert!(!old_authorities.contains(&session.sequence_authority()));
+                    session
+                })
+                .collect::<Vec<_>>()
+        });
+        for position in 0..6 {
+            let path = if position == 0 {
+                Path::Eager
+            } else if position < 3 {
+                Path::Warm
+            } else {
+                Path::Replay
+            };
+            let order: Vec<_> = if position >= 4 {
+                (0..8).rev().collect()
+            } else {
+                (0..8).collect()
+            };
+            let local_tokens: Vec<_> = order
+                .iter()
+                .map(|&owner| Arc::clone(&tokens[owner]))
+                .collect();
+            let observations = std::array::from_fn::<_, 2, _>(|arm| {
+                let fixture = &fixtures[arm];
+                assert_eq!(
+                    fixture._composition._runtime.q4_mmvq_weight_decode(),
+                    modes[arm]
+                );
+                let group: Vec<_> = order
+                    .iter()
+                    .map(|&owner| Arc::clone(&sessions[arm][owner]))
+                    .collect();
+                let before = fixture
+                    ._composition
+                    ._runtime
+                    .q4_shared_weight_decode_encodes();
+                let observation = fixture.execute_participants(
+                    &group,
+                    &local_tokens,
+                    position..position + 1,
+                    path,
+                );
+                let encodes = fixture
+                    ._composition
+                    ._runtime
+                    .q4_shared_weight_decode_encodes()
+                    - before;
+                if arm == 0 || matches!(path, Path::Replay) {
+                    assert_eq!(
+                        encodes, 0,
+                        "baseline and hot replay do not enqueue a shared dot on the host"
+                    );
+                } else if position == 0 {
+                    assert!(
+                        encodes > 0,
+                        "actual GDN M8 must execute the selected shared-weight Q4 route"
+                    );
+                }
+                if matches!(path, Path::Replay) {
+                    let program = observation.reusable_program_id.as_ref().unwrap();
+                    if let Some(previous) = &programs[arm] {
+                        assert_eq!(
+                            previous, program,
+                            "fresh request authorities must reuse the same native topology"
+                        );
+                    }
+                    programs[arm] = Some(program.clone());
+                }
+                observation
+            });
+            observations[0].assert_same(&observations[1]);
+        }
+        for group in sessions {
+            for session in group {
+                old_authorities.insert(session.sequence_authority());
+                session.try_complete().unwrap();
+            }
+        }
+    }
 }
