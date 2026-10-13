@@ -8,6 +8,10 @@ use std::time::Instant;
 #[path = "timing/shared_weight_decode.rs"]
 mod shared_weight_decode;
 
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/ffn_current_routes.rs"]
+mod ffn_current_routes;
+
 type MmvqDot = unsafe extern "C" fn(
     *const UpstreamLinearPlanV1,
     *const c_void,
@@ -83,6 +87,8 @@ struct Route {
     result: Buffer,
     rows: Buffer,
     flags: Buffer,
+    result_stride: u32,
+    result_offset: u32,
 }
 impl Route {
     fn new(
@@ -93,21 +99,42 @@ impl Route {
         n: u32,
         count: usize,
     ) -> Self {
+        Self::new_with_result_window(algorithm, format, m, k, n, count, n, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_result_window(
+        algorithm: UpstreamLinearAlgorithm,
+        format: UpstreamLinearFormat,
+        m: u32,
+        k: u32,
+        n: u32,
+        count: usize,
+        result_stride: u32,
+        result_offset: u32,
+    ) -> Self {
+        assert!(result_offset
+            .checked_add(n)
+            .is_some_and(|end| end <= result_stride));
         let p = plan(algorithm, format, UpstreamLinearLayout::Columns, m, k, n);
         assert_eq!(
             p.padded_outputs, n,
             "benchmark uses complete physical output rows"
         );
+        let result = Buffer::new(m as usize * result_stride as usize * 2);
+        result.write(&vec![0x3535_u16; m as usize * result_stride as usize]);
         Self {
             algorithm,
             converted: Buffer::new(p.converted_bytes as usize),
             packed: Buffer::new(p.packed_bytes as usize),
             output: Buffer::new(p.output_bytes as usize),
             fixup: Buffer::new(p.fixup_bytes.max(4) as usize),
-            result: Buffer::new(m as usize * n as usize * 2),
+            result,
             rows: Buffer::new(m as usize * 4),
             flags: Buffer::new(count * 4),
             plan: p,
+            result_stride,
+            result_offset,
         }
     }
     fn scan(&self, stream: &Stream, weight: *const c_void, index: usize) {
@@ -170,8 +197,8 @@ impl Route {
                     ok(ffi::ferrum_upstream_mmq_cast_v2(
                         p,
                         self.output.ptr,
-                        self.result.ptr,
-                        p.request.outputs,
+                        self.result.ptr.add(self.result_offset as usize * 2),
+                        self.result_stride,
                         self.rows.ptr,
                         flag,
                         stream.0,
@@ -198,8 +225,8 @@ impl Route {
                     ok(ffi::ferrum_upstream_mmvq_cast_v2(
                         p,
                         self.output.ptr,
-                        self.result.ptr,
-                        p.request.outputs,
+                        self.result.ptr.add(self.result_offset as usize * 2),
+                        self.result_stride,
                         self.rows.ptr,
                         flag,
                         stream.0,
@@ -218,7 +245,19 @@ impl Route {
         assert_eq!(self.rows.read::<u32>(m), vec![0; m]);
         assert_eq!(self.flags.read::<u32>(count), vec![0; count]);
         let values = self.output.read::<f32>(m * n);
-        let bits = self.result.read::<u16>(m * n);
+        let destination = self.result.read::<u16>(m * self.result_stride as usize);
+        let mut bits = Vec::with_capacity(m * n);
+        for row in destination.chunks_exact(self.result_stride as usize) {
+            let start = self.result_offset as usize;
+            bits.extend_from_slice(&row[start..start + n]);
+            assert!(
+                row[..start]
+                    .iter()
+                    .chain(&row[start + n..])
+                    .all(|&bit| bit == 0x3535),
+                "projection overwrote another leaf or output stride padding"
+            );
+        }
         for (value, &bits) in values.iter().zip(&bits) {
             assert!(value.is_finite());
             assert!(f16::from_bits(bits).is_finite());

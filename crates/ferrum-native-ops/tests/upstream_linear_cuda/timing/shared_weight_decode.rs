@@ -33,6 +33,22 @@ const LABELS: [&str; 2] = ["baseline", "shared_weight_decode"];
 const FORMAT: UpstreamLinearFormat = UpstreamLinearFormat::Q4K;
 const ALGORITHM: UpstreamLinearAlgorithm = UpstreamLinearAlgorithm::Mmvq;
 
+pub(super) fn selected_dot(format: UpstreamLinearFormat) -> MmvqDot {
+    match format {
+        UpstreamLinearFormat::Q4K => DOTS[1],
+        UpstreamLinearFormat::Q5K => Q5_DOTS[1],
+        UpstreamLinearFormat::Iq4Xs => ffi::ferrum_upstream_mmvq_dot_v1,
+    }
+}
+
+pub(super) fn validate_selected_markers(format: UpstreamLinearFormat) {
+    assert_marker_bits_and_boundaries(
+        format,
+        [ffi::ferrum_upstream_mmvq_dot_v1, selected_dot(format)],
+        &[(256, 17), (512, 33), (768, 17)],
+    );
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     converted: Vec<u32>,
