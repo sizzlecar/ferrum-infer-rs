@@ -312,7 +312,7 @@ impl ModelFamilyProvider for Family {
             };
             let mut offset = 192;
             for (index, &(outputs, quantized)) in widths.iter().enumerate() {
-                let component_id = id(format!("component.o.q8-pair.{index}"));
+                let component_id: WeightId = id(format!("component.o.q8-pair.{index}"));
                 schema.components.push(WeightComponentSpec {
                     id: component_id.clone(),
                     role: if quantized {
