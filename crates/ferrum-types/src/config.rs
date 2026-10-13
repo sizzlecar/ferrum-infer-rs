@@ -45,37 +45,6 @@ impl Default for SequenceFitPolicy {
     }
 }
 
-/// Runtime snapshot key for the public initial prefill policy.
-pub const PREFILL_FIRST_POLICY_CONFIG_KEY: &str = "FERRUM_SCHED_PREFILL_FIRST_POLICY";
-
-/// When an initial prefill-first cohort may begin decoding.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PrefillFirstPolicy {
-    #[default]
-    ActiveTarget,
-    CompleteAdmitted,
-}
-
-impl PrefillFirstPolicy {
-    pub const fn as_runtime_value(self) -> &'static str {
-        match self {
-            Self::ActiveTarget => "active-target",
-            Self::CompleteAdmitted => "complete-admitted",
-        }
-    }
-
-    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
-        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "active-target" => Ok(Self::ActiveTarget),
-            "complete-admitted" => Ok(Self::CompleteAdmitted),
-            _ => Err(format!(
-                "expected active-target or complete-admitted; got {raw:?}"
-            )),
-        }
-    }
-}
-
 /// Physical execution policy for a PlanRuntime batch containing prefill and decode.
 /// Legacy executors retain their existing execution policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -848,9 +817,6 @@ pub struct SchedulerConfig {
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
     pub prefill_first_until_active: Option<usize>,
-    /// Keep the original active-target rule or finish the bounded admitted cohort.
-    #[serde(default)]
-    pub prefill_first_policy: PrefillFirstPolicy,
     /// Opt in to one bounded wait for another request's exact in-flight prefix.
     /// Expiry releases the optional dependency and resumes cold admission.
     #[serde(default)]
@@ -889,7 +855,6 @@ impl Default for SchedulerConfig {
             enable_sla_enforcement: false,
             prompt_token_estimate: default_prompt_token_estimate(),
             prefill_first_until_active: None,
-            prefill_first_policy: PrefillFirstPolicy::default(),
             prefix_rendezvous_max_wait_ms: None,
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
@@ -930,10 +895,6 @@ impl SchedulerConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_PREFILL_STEP_CHUNK") {
             self.prefill_step_chunk =
                 parse_optional_positive_usize("FERRUM_SCHED_PREFILL_STEP_CHUNK", value)?;
-        }
-        if let Some(value) = runtime_config_value(snapshot, PREFILL_FIRST_POLICY_CONFIG_KEY) {
-            self.prefill_first_policy = PrefillFirstPolicy::parse_runtime_value(value)
-                .map_err(|reason| format!("{PREFILL_FIRST_POLICY_CONFIG_KEY}: {reason}"))?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
             self.active_decode_prefill_chunk =
@@ -2004,36 +1965,6 @@ mod tests {
         assert_eq!(
             SchedulerConfig::default().sequence_fit_policy,
             SequenceFitPolicy::ImmediateOnly
-        );
-    }
-
-    #[test]
-    fn prefill_first_policy_preserves_legacy_default_and_rejects_invalid_values() {
-        let mut legacy = serde_json::to_value(SchedulerConfig::default()).unwrap();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("prefill_first_policy");
-        let mut config: SchedulerConfig = serde_json::from_value(legacy).unwrap();
-        assert_eq!(
-            config.prefill_first_policy,
-            PrefillFirstPolicy::ActiveTarget
-        );
-        for (value, expected) in [
-            ("complete-admitted", PrefillFirstPolicy::CompleteAdmitted),
-            ("active-target", PrefillFirstPolicy::ActiveTarget),
-        ] {
-            let snapshot =
-                RuntimeConfigSnapshot::from_env_vars([(PREFILL_FIRST_POLICY_CONFIG_KEY, value)]);
-            config.apply_runtime_config_snapshot(&snapshot).unwrap();
-            assert_eq!(config.prefill_first_policy, expected);
-            assert_eq!(serde_json::to_value(expected).unwrap(), value);
-        }
-        let invalid =
-            RuntimeConfigSnapshot::from_env_vars([(PREFILL_FIRST_POLICY_CONFIG_KEY, "automatic")]);
-        assert!(config.apply_runtime_config_snapshot(&invalid).is_err());
-        assert!(
-            serde_json::from_value::<PrefillFirstPolicy>(serde_json::json!("automatic")).is_err()
         );
     }
 
