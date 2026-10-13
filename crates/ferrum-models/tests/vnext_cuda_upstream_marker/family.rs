@@ -18,6 +18,7 @@ pub struct Family {
     maximum_tokens: u64,
     g32_baseline: bool,
     small_q8_projection: bool,
+    q8_projection_pair_adjacent: Option<bool>,
 }
 
 impl Family {
@@ -27,6 +28,7 @@ impl Family {
             maximum_tokens: MAX_TOKENS,
             g32_baseline: false,
             small_q8_projection: false,
+            q8_projection_pair_adjacent: None,
             selected: match kind {
                 AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDelta,
                 AttentionKind::Causal => UpstreamMarkerV2Profile::Causal,
@@ -36,7 +38,21 @@ impl Family {
     }
     pub fn with_small_q8_projection(mut self) -> Self {
         self.small_q8_projection = true;
+        self.q8_projection_pair_adjacent = None;
         self
+    }
+    pub fn with_small_q8_projection_pair(mut self, adjacent: bool) -> Self {
+        self.small_q8_projection = false;
+        self.q8_projection_pair_adjacent = Some(adjacent);
+        self
+    }
+    pub fn small_q8_projection_layout(&self) -> Vec<(u64, u64)> {
+        match self.q8_projection_pair_adjacent {
+            Some(true) => vec![(192, 13), (205, 19)],
+            Some(false) => vec![(192, 13), (221, 19)],
+            None if self.small_q8_projection => vec![(192, 32)],
+            None => Vec::new(),
+        }
     }
     pub fn prefill(kind: AttentionKind, maximum_tokens: u64) -> Self {
         assert!(maximum_tokens >= 2048);
@@ -264,6 +280,77 @@ impl ModelFamilyProvider for Family {
                 block_axis: 1,
                 block_padding: PhysicalWeightPadding::Exact,
             });
+        }
+        if let Some(adjacent) = self.q8_projection_pair_adjacent {
+            let tensor = schema
+                .tensors
+                .iter_mut()
+                .find(|t| t.id.as_str() == "weight.o")
+                .unwrap();
+            let PhysicalWeightLayout::Composite { parts } = &mut tensor.physical_layout else {
+                unreachable!()
+            };
+            let removed: BTreeSet<_> = parts
+                .iter()
+                .filter_map(|part| match part.layout.as_ref() {
+                    PhysicalWeightLayout::Dense { component_id } => Some(component_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            parts
+                .retain(|part| !matches!(part.layout.as_ref(), PhysicalWeightLayout::Dense { .. }));
+            schema
+                .components
+                .retain(|component| !removed.contains(&component.id));
+            // The same 64 output columns contain two odd, unequal Q8 leaves.
+            // The fallback inserts a dense output interval between them while
+            // their separately prepared F32 destinations remain contiguous.
+            let widths: &[(u64, bool)] = if adjacent {
+                &[(13, true), (19, true), (32, false)]
+            } else {
+                &[(13, true), (16, false), (19, true), (16, false)]
+            };
+            let mut offset = 192;
+            for (index, &(outputs, quantized)) in widths.iter().enumerate() {
+                let component_id = id(format!("component.o.q8-pair.{index}"));
+                schema.components.push(WeightComponentSpec {
+                    id: component_id.clone(),
+                    role: if quantized {
+                        WeightComponentRole::PackedValues
+                    } else {
+                        WeightComponentRole::Values
+                    },
+                    external_names: vec![format!("o.q8-pair.{index}")],
+                    dimensions: vec![outputs, if quantized { HIDDEN / 32 } else { HIDDEN }],
+                    encoding: if quantized {
+                        WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                            format_id: id("quantization.gguf.q8-0"),
+                            logical_values_per_block: 32,
+                            bytes_per_block: 34,
+                        })
+                    } else {
+                        WeightEncoding::Dense {
+                            element_type: ElementType::F16,
+                        }
+                    },
+                    required: true,
+                });
+                parts.push(CompositeWeightPart {
+                    layout: Box::new(if quantized {
+                        PhysicalWeightLayout::BlockQuantized {
+                            blocks: PhysicalWeightComponentBinding::exact_contiguous(component_id),
+                            block_axis: 1,
+                            block_padding: PhysicalWeightPadding::Exact,
+                        }
+                    } else {
+                        PhysicalWeightLayout::Dense { component_id }
+                    }),
+                    logical_offsets: vec![offset, 0],
+                    extents: vec![outputs, HIDDEN],
+                });
+                offset += outputs;
+            }
+            assert_eq!(offset, HIDDEN);
         }
         Ok(schema)
     }

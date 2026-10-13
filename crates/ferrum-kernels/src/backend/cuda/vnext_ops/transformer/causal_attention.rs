@@ -3117,19 +3117,22 @@ fn encode_attention(
         } else {
             launches.iter().map(|l| l.tokens).collect()
         };
-        rows.into_iter().try_fold((0u64, 0u64), |(d, t), rows| {
-            let (extra, transfers) = q8act
-                .as_ref()
-                .map(|p| p.upstream_work(rows as u32))
-                .transpose()?
-                .unwrap_or_default();
-            Ok::<_, String>((
-                d.checked_add(extra)
-                    .ok_or("causal upstream dispatch overflow")?,
-                t.checked_add(transfers)
-                    .ok_or("causal upstream transfers overflow")?,
-            ))
-        })?
+        rows.into_iter()
+            .try_fold((0u64, 0u64, 0u64), |(d, t, r), rows| {
+                let (extra, transfers, reduction) = q8act
+                    .as_ref()
+                    .map(|p| p.upstream_work(rows as u32))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok::<_, String>((
+                    d.checked_add(extra)
+                        .ok_or("causal upstream dispatch overflow")?,
+                    t.checked_add(transfers)
+                        .ok_or("causal upstream transfers overflow")?,
+                    r.checked_add(reduction)
+                        .ok_or("causal upstream dispatch reduction overflow")?,
+                ))
+            })?
     };
     let compute_operation = launches
         .first()
@@ -3192,9 +3195,11 @@ fn encode_attention(
         .and_then(|count| count.checked_add(pack_dispatches))
         .ok_or_else(|| "causal compute dispatch count overflows".to_owned())?;
 
-    let compute_dispatch_count = compute_dispatch_count
-        .checked_add(upstream_work.0)
-        .ok_or("causal upstream dispatch overflow")?;
+    let compute_dispatch_count = PreparedAttentionProjections::adjust_upstream_dispatch_count(
+        compute_dispatch_count,
+        upstream_work.0,
+        upstream_work.2,
+    )?;
     let q8_replay_bytes = q8act.as_ref().map(|plan| plan.replay_bytes()).transpose()?;
     let replay_key = (!shape.int8_kv || has_compiled_program_slot)
         .then_some(())

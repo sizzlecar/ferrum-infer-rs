@@ -23,6 +23,61 @@ pub(super) struct Destination {
     output_offset: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PairGeometry {
+    pub offset: u64,
+    pub bytes: u64,
+    pub inputs: u32,
+    pub outputs: u32,
+    pub output_offset: u32,
+}
+
+impl PairGeometry {
+    pub fn new(first: Destination, second: Destination, output_stride: u64) -> Option<Self> {
+        let valid = |d: Destination| {
+            d.inputs > 0
+                && d.inputs.is_multiple_of(32)
+                && (1..=MAX_OUTPUTS).contains(&u64::from(d.outputs))
+                && d.offset.is_multiple_of(16)
+                && u64::from(d.inputs)
+                    .checked_mul(u64::from(d.outputs))
+                    .and_then(|v| v.checked_mul(4))
+                    == Some(d.bytes)
+        };
+        if !valid(first)
+            || !valid(second)
+            || first.inputs != second.inputs
+            || first.offset.checked_add(first.bytes) != Some(second.offset)
+            || first.output_offset.checked_add(first.outputs) != Some(second.output_offset)
+        {
+            return None;
+        }
+        let outputs = first
+            .outputs
+            .checked_add(second.outputs)
+            .filter(|&n| n <= 128)?;
+        let output_end = first.output_offset.checked_add(outputs)?;
+        if u64::from(output_end) > output_stride {
+            return None;
+        }
+        let bytes = first.bytes.checked_add(second.bytes)?;
+        first.offset.checked_add(bytes)?;
+        Some(Self {
+            offset: first.offset,
+            bytes,
+            inputs: first.inputs,
+            outputs,
+            output_offset: first.output_offset,
+        })
+    }
+}
+
+pub(super) fn adjusted_dispatches(base: u64, extra: u64, reduction: u64) -> Result<u64, String> {
+    base.checked_add(extra)
+        .and_then(|count| count.checked_sub(reduction))
+        .ok_or_else(|| "upstream attention dispatch count overflows or underflows".into())
+}
+
 impl PersistentLayout {
     pub fn new(
         numerics: &PreparedProjectionNumerics,
@@ -155,5 +210,86 @@ mod tests {
             assert!(Destination::append(&mut bytes, k, n, offset).is_err());
             assert_eq!(bytes, cursor);
         }
+    }
+
+    #[test]
+    fn q8_predecoded_pair_geometry_accepts_unequal_partial_columns_and_complete_views() {
+        for (k, n0, n1, offset) in [(256, 13, 19, 7), (32, 1, 2, 0), (32, 64, 64, 0)] {
+            let mut cursor = 24;
+            let first = Destination::append(&mut cursor, k, n0, offset)
+                .unwrap()
+                .unwrap();
+            let second = Destination::append(&mut cursor, k, n1, offset + n0)
+                .unwrap()
+                .unwrap();
+            let pair = PairGeometry::new(first, second, offset + n0 + n1).unwrap();
+            assert_eq!(pair.offset, first.offset);
+            assert_eq!(pair.bytes, first.bytes + second.bytes);
+            assert_eq!(pair.inputs, k as u32);
+            assert_eq!(pair.outputs, (n0 + n1) as u32);
+            assert_eq!(pair.output_offset, offset as u32);
+        }
+    }
+
+    #[test]
+    fn q8_predecoded_pair_geometry_rejects_gaps_mismatches_and_range_overflows() {
+        let mut cursor = 0;
+        let first = Destination::append(&mut cursor, 256, 13, 7)
+            .unwrap()
+            .unwrap();
+        let second = Destination::append(&mut cursor, 256, 19, 20)
+            .unwrap()
+            .unwrap();
+        for bad in [
+            Destination {
+                inputs: 32,
+                ..second
+            },
+            Destination {
+                outputs: 0,
+                ..second
+            },
+            Destination {
+                outputs: 65,
+                ..second
+            },
+            Destination {
+                output_offset: 19,
+                ..second
+            },
+            Destination {
+                output_offset: 21,
+                ..second
+            },
+            Destination {
+                offset: second.offset + 16,
+                ..second
+            },
+            Destination {
+                bytes: second.bytes - 4,
+                ..second
+            },
+        ] {
+            assert!(PairGeometry::new(first, bad, 39).is_none());
+        }
+        assert!(PairGeometry::new(first, second, 38).is_none());
+        let overflowing = Destination {
+            output_offset: u32::MAX - 12,
+            ..first
+        };
+        assert!(PairGeometry::new(overflowing, second, u64::MAX).is_none());
+        let overflowing = Destination {
+            offset: u64::MAX - 15,
+            ..first
+        };
+        assert!(PairGeometry::new(overflowing, second, 39).is_none());
+    }
+
+    #[test]
+    fn q8_predecoded_pair_dispatch_adjustment_preserves_extra_and_rejects_underflow() {
+        assert_eq!(adjusted_dispatches(7, 4, 1).unwrap(), 10);
+        assert_eq!(adjusted_dispatches(2, 0, 1).unwrap(), 1);
+        assert!(adjusted_dispatches(0, 0, 1).is_err());
+        assert!(adjusted_dispatches(u64::MAX, 1, 0).is_err());
     }
 }

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 mod q8_predecode;
-use q8_predecode::PersistentLayout;
+use q8_predecode::{PairGeometry, PersistentLayout};
 
 pub(in crate::backend::cuda::vnext_ops::transformer) struct Runtime {
     plans: UpstreamPlanFactory,
@@ -166,8 +166,15 @@ struct Projection {
     input: CudaBufferRegion,
     output: CudaBufferRegion,
     leaves: Vec<Leaf>,
+    predecoded_pairs: Vec<PredecodedPair>,
     extra_dispatches: u64,
     transfers: u64,
+}
+#[derive(Clone)]
+struct PredecodedPair {
+    first_leaf: usize,
+    geometry: PairGeometry,
+    destination: CudaBufferRegion,
 }
 #[derive(Clone)]
 struct Leaf {
@@ -433,12 +440,20 @@ impl<'a> PreparedAttentionProjections<'a> {
                 predecoded_f32,
             });
         }
+        let predecoded_pairs = if state.runtime.q8_preparation
+            == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
+        {
+            prepare_predecoded_pairs(&persistent, &state.persistent, first_leaf, &leaves, n)?
+        } else {
+            Vec::new()
+        };
         state.launches.push(Projection {
             role,
             rows,
             input,
             output,
             leaves,
+            predecoded_pairs,
             extra_dispatches,
             transfers,
         });
@@ -476,14 +491,25 @@ impl<'a> PreparedAttentionProjections<'a> {
         }
         Ok(bindings)
     }
-    pub fn upstream_work(&self, rows: u32) -> Result<(u64, u64), String> {
+    pub fn upstream_work(&self, rows: u32) -> Result<(u64, u64, u64), String> {
         self.upstream
             .iter()
             .flat_map(|s| s.launches.iter())
             .filter(|p| p.rows == rows)
-            .try_fold((0, 0), |(d, t), p| {
-                Ok((add(d, p.extra_dispatches)?, add(t, p.transfers)?))
+            .try_fold((0, 0, 0), |(d, t, r), p| {
+                Ok((
+                    add(d, p.extra_dispatches)?,
+                    add(t, p.transfers)?,
+                    add(r, p.predecoded_pairs.len() as u64)?,
+                ))
             })
+    }
+    pub fn adjust_upstream_dispatch_count(
+        base: u64,
+        extra: u64,
+        reduction: u64,
+    ) -> Result<u64, String> {
+        q8_predecode::adjusted_dispatches(base, extra, reduction)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn launch_upstream(
@@ -518,7 +544,30 @@ impl<'a> PreparedAttentionProjections<'a> {
             address: region.device_ptr(),
             bytes: region.length_bytes(),
         };
-        for leaf in &projection.leaves {
+        let mut index = 0;
+        let mut pair_index = 0;
+        while index < projection.leaves.len() {
+            if let Some(pair) = projection
+                .predecoded_pairs
+                .get(pair_index)
+                .filter(|pair| pair.first_leaf == index)
+            {
+                native.linear_q8_0_predecoded_f32_f16(
+                    stream,
+                    &projection.input,
+                    &pair.destination,
+                    &projection.output,
+                    rows,
+                    pair.geometry.inputs,
+                    pair.geometry.outputs,
+                    stride,
+                    pair.geometry.output_offset,
+                )?;
+                index += 2;
+                pair_index += 1;
+                continue;
+            }
+            let leaf = &projection.leaves[index];
             if leaf.predecoded_f32 {
                 let preparation = leaf.validation.as_ref().ok_or_else(|| {
                     CudaDeviceRuntimeError::contract("missing retained Q8 preparation")
@@ -568,9 +617,92 @@ impl<'a> PreparedAttentionProjections<'a> {
                     transform,
                 )?;
             }
+            index += 1;
         }
         Ok(())
     }
+}
+fn prepare_predecoded_pairs(
+    parent: &CudaBufferRegion,
+    layout: &PersistentLayout,
+    first_leaf: u64,
+    leaves: &[Leaf],
+    output_stride: u64,
+) -> Result<Vec<PredecodedPair>, String> {
+    let mut pairs = Vec::new();
+    let mut index = 0;
+    while index + 1 < leaves.len() {
+        let first = &leaves[index];
+        let second = &leaves[index + 1];
+        if !first.predecoded_f32
+            || !second.predecoded_f32
+            || first.stage.native.is_some()
+            || second.stage.native.is_some()
+            || first.signs.is_some()
+            || second.signs.is_some()
+            || first.part.transform.is_some()
+            || second.part.transform.is_some()
+        {
+            index += 1;
+            continue;
+        }
+        let (Some(first_destination), Some(second_destination)) = (
+            layout.destination(first_leaf, index)?,
+            layout.destination(first_leaf, index + 1)?,
+        ) else {
+            index += 1;
+            continue;
+        };
+        first_destination.validate(&first.part, u64::from(first.part.columns))?;
+        second_destination.validate(&second.part, u64::from(second.part.columns))?;
+        let Some(geometry) =
+            PairGeometry::new(first_destination, second_destination, output_stride)
+        else {
+            index += 1;
+            continue;
+        };
+        let (Some(first_preparation), Some(second_preparation)) =
+            (&first.validation, &second.validation)
+        else {
+            index += 1;
+            continue;
+        };
+        // Only the complete Plan-owned parent may authorize the merged range.
+        // Neither narrow leaf view is widened, and both original dependencies
+        // retain their independent source/publication identity.
+        let destination = parent
+            .subregion(geometry.offset, geometry.bytes)
+            .map_err(|e| e.to_string())?;
+        let first_identity = destination
+            .subregion(0, first_destination.bytes)
+            .and_then(|region| region.plan_backing_identity())
+            .map_err(|e| e.to_string())?;
+        let second_identity = destination
+            .subregion(first_destination.bytes, second_destination.bytes)
+            .and_then(|region| region.plan_backing_identity())
+            .map_err(|e| e.to_string())?;
+        if first_identity
+            != first_preparation
+                .destination_region()
+                .plan_backing_identity()
+                .map_err(|e| e.to_string())?
+            || second_identity
+                != second_preparation
+                    .destination_region()
+                    .plan_backing_identity()
+                    .map_err(|e| e.to_string())?
+        {
+            index += 1;
+            continue;
+        }
+        pairs.push(PredecodedPair {
+            first_leaf: index,
+            geometry,
+            destination,
+        });
+        index += 2;
+    }
+    Ok(pairs)
 }
 fn flag_offset(first_leaf: u64, index: u64, algorithm: u32) -> Result<u64, String> {
     let bank = match algorithm {
@@ -642,6 +774,15 @@ impl State {
                 let fingerprint = leaf.stage.replay_fingerprint()?;
                 bytes.extend_from_slice(&(fingerprint.len() as u64).to_le_bytes());
                 bytes.extend_from_slice(fingerprint.as_bytes());
+            }
+            bytes.extend_from_slice(&(projection.predecoded_pairs.len() as u64).to_le_bytes());
+            for pair in &projection.predecoded_pairs {
+                bytes.extend_from_slice(&(pair.first_leaf as u64).to_le_bytes());
+                bytes.extend_from_slice(&pair.geometry.offset.to_le_bytes());
+                bytes.extend_from_slice(&pair.geometry.bytes.to_le_bytes());
+                bytes.extend_from_slice(&pair.geometry.inputs.to_le_bytes());
+                bytes.extend_from_slice(&pair.geometry.outputs.to_le_bytes());
+                bytes.extend_from_slice(&pair.geometry.output_offset.to_le_bytes());
             }
         }
         Ok(())

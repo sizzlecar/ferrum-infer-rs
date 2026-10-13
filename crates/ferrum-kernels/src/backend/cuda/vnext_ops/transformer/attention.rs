@@ -2124,16 +2124,13 @@ fn encode_attention(
             )
             .ok_or("Q8act recurrent dispatch count overflows")?;
 
-        let count = count
-            .checked_add(
-                q8act
-                    .as_ref()
-                    .map(|p| p.upstream_work(launch.tokens as u32))
-                    .transpose()?
-                    .unwrap_or_default()
-                    .0,
-            )
-            .ok_or("attention upstream dispatch overflow")?;
+        let (extra, _, reduction) = q8act
+            .as_ref()
+            .map(|p| p.upstream_work(launch.tokens as u32))
+            .transpose()?
+            .unwrap_or_default();
+        let count =
+            PreparedAttentionProjections::adjust_upstream_dispatch_count(count, extra, reduction)?;
         total
             .checked_add(count)
             .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())

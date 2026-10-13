@@ -272,6 +272,7 @@ impl Fixture {
         execution_context_limit: Option<usize>,
         q8_preparation: ferrum_types::Q8ProjectionWeightPreparation,
     ) -> Self {
+        let q8_fixture_layout = definition.small_q8_projection_layout();
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let attention_arithmetic = definition.attention_arithmetic();
@@ -420,20 +421,32 @@ impl Fixture {
                 .iter()
                 .find(|a| a.resource_id() == resource)
                 .unwrap();
-            let q8_leaves = prepared.projections().iter().flat_map(|p| p.leaves()).filter(|leaf| matches!(leaf.encoding(), WeightEncoding::BlockQuantized(spec) if spec.format_id.as_str() == "quantization.gguf.q8-0")).count();
-            let persistent_bytes = if q8_preparation
-                == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
-                && name == "node.attention"
-            {
-                assert_eq!(
-                    q8_leaves, 1,
-                    "new fixture must contain an actual Q8 physical leaf"
-                );
-                // One N32 x K256 exact F32 leaf, aligned after the existing flags.
-                flag_bytes.div_ceil(16) * 16 + 32 * HIDDEN * 4
+            let q8_leaves: Vec<_> = prepared.projections().iter().flat_map(|projection| {
+                projection.leaves().iter().filter_map(|leaf| {
+                    matches!(leaf.encoding(), WeightEncoding::BlockQuantized(spec) if spec.format_id.as_str() == "quantization.gguf.q8-0")
+                        .then_some((leaf.output_offset(), leaf.output_features(), projection.input_features()))
+                })
+            }).collect();
+            let expected_q8 = if name == "node.attention" {
+                q8_fixture_layout.as_slice()
             } else {
-                flag_bytes
+                &[]
             };
+            assert_eq!(
+                q8_leaves
+                    .iter()
+                    .map(|&(offset, outputs, _)| (offset, outputs))
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                expected_q8
+            );
+            assert!(q8_leaves.iter().all(|&(_, _, inputs)| inputs == HIDDEN));
+            let mut persistent_bytes = flag_bytes;
+            if q8_preparation == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32 {
+                for &(_, outputs) in expected_q8 {
+                    persistent_bytes = persistent_bytes.div_ceil(16) * 16 + outputs * HIDDEN * 4;
+                }
+            }
             assert_eq!(requirement.fixed_bytes(), Some(persistent_bytes));
             assert_eq!(allocation.per_instance_bytes(), persistent_bytes);
             assert_eq!(
@@ -442,7 +455,7 @@ impl Fixture {
                     * requirement.alignment_bytes(),
                 "Plan admission must charge the complete aligned persistent extent"
             );
-            if persistent_bytes == flag_bytes {
+            if persistent_bytes == flag_bytes && q8_leaves.is_empty() {
                 assert_ne!(flag_bytes % requirement.alignment_bytes(), 0);
                 assert!(allocation.size_bytes() > flag_bytes);
             }
@@ -570,6 +583,17 @@ impl Fixture {
 #[test]
 #[ignore = "requires CUDA native MarkerV2, real Plan Q8 preparation and Core replay"]
 fn q8_predecoded_f32_matches_compressed_across_core_m1_m8_replay_and_fresh_requests() {
+    verify_q8_predecoded_preparation(&[1, 8], None);
+}
+
+#[test]
+#[ignore = "requires CUDA native MarkerV2, paired Q8 Plan preparation and Core replay"]
+fn q8_predecoded_f32_pair_matches_compressed_across_core_replay_and_offset_fallback() {
+    verify_q8_predecoded_preparation(&[1, 8, 32], Some(true));
+    verify_q8_predecoded_preparation(&[8], Some(false));
+}
+
+fn verify_q8_predecoded_preparation(participant_counts: &[usize], pair_adjacent: Option<bool>) {
     use ferrum_types::{
         AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
         InvocationPreparationStrategy, ProgramBindingUploadStrategy, Q4MmvqWeightDecode,
@@ -583,13 +607,18 @@ fn q8_predecoded_f32_matches_compressed_across_core_m1_m8_replay_and_fresh_reque
         Q8ProjectionWeightPreparation::Compressed,
         Q8ProjectionWeightPreparation::PredecodedF32,
     ];
-    for participants in [1_usize, 8] {
+    let q8_leaf_count = if pair_adjacent.is_some() { 2 } else { 1 };
+    for &participants in participant_counts {
         let fixtures = policies.map(|policy| {
             Fixture::for_family_with_q8_projection_weight_preparation(
                 AttentionKind::GatedDelta,
                 true,
                 participants as u32,
-                Family::new(AttentionKind::GatedDelta).with_small_q8_projection(),
+                match pair_adjacent {
+                    Some(adjacent) => Family::new(AttentionKind::GatedDelta)
+                        .with_small_q8_projection_pair(adjacent),
+                    None => Family::new(AttentionKind::GatedDelta).with_small_q8_projection(),
+                },
                 ProgramBindingUploadStrategy::CompactScatter,
                 SegmentBindingOracleMode::CompareReference,
                 SegmentBindingOwnerViewMode::Indexed,
@@ -706,13 +735,45 @@ fn q8_predecoded_f32_matches_compressed_across_core_m1_m8_replay_and_fresh_reque
                     });
                     assert_eq!(
                         work[1].1,
-                        work[0].1 + 1,
-                        "one real Q8 Plan publication is consumed by both fresh request generations"
+                        work[0].1 + q8_leaf_count,
+                        "each independent Q8 Plan publication is consumed by both fresh request generations"
                     );
-                    assert_eq!(work[1].0, work[0].0 + u64::from(generation == 0 && position == 0), "Q8 expansion occurs once, then fresh requests reuse the retained preparation");
+                    assert_eq!(
+                        work[1].0,
+                        work[0].0 + q8_leaf_count * u64::from(generation == 0),
+                        "fresh requests reuse each independently retained Q8 preparation"
+                    );
+                    let attention_work =
+                        observations.each_ref().map(|observation| {
+                            let commands: Vec<_> = observation
+                                .attribution
+                                .as_ref()
+                                .unwrap()
+                                .device()
+                                .commands()
+                                .iter()
+                                .filter(|command| {
+                                    command.native_op_id()
+                                        == "vnext_gated_delta_recurrent_attention"
+                                })
+                                .collect();
+                            assert_eq!(
+                                commands.len(),
+                                1,
+                                "real Core attention compute must be observed"
+                            );
+                            assert_eq!(commands[0].participant_count(), participants as u32);
+                            if participants > 1 {
+                                assert_eq!(commands[0].batching_form(), DeviceBatchingForm::Packed,
+                                "M8/M32 qualification must execute a physical packed projection");
+                            }
+                            commands[0].compute_dispatch_count()
+                        });
+                    assert_eq!(attention_work[0].checked_sub(attention_work[1]), Some(u64::from(pair_adjacent == Some(true))),
+                        "adjacent Q8 leaves must actually fuse; separated/single leaves must preserve original launch count");
                     println!(
                         "{}",
-                        serde_json::json!({"kind":"q8_preparation_core_work","participants":participants,"generation":generation,"position":position,"compressed":work[0],"predecoded_f32":work[1],"scope":"actual conditional dependency work; full output/state bits equal"})
+                        serde_json::json!({"kind":"q8_preparation_core_work","participants":participants,"generation":generation,"position":position,"pair_adjacent":pair_adjacent,"q8_leaf_count":q8_leaf_count,"attention_compute_dispatches":attention_work,"compressed":work[0],"predecoded_f32":work[1],"scope":"actual conditional dependency work and declared native compute dispatches; full output/state bits equal"})
                     );
                 }
             }
