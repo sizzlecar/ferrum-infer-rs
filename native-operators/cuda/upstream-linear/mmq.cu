@@ -471,8 +471,21 @@ static int upstream_mmq_pack_f32_intermediate(const FerrumUpstreamLinearPlanV1 *
         return cudaGetLastError();
     });
 }
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+// Node-type control only: one kernel replaces one memset over the exact flags
+// span. This remains a separate predecessor of the quantizer because several
+// quantizer CTAs can atomicOr the same row marker.
+static __global__ void test_mmq_zero_row_flags(uint32_t * flags, uint32_t rows) {
+    const uint64_t row = uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (row < rows) {
+        flags[row] = 0;
+    }
+}
+#endif
+
 // Same boundary checks and ABI as pack_v2. converted remains caller-owned but
 // is deliberately neither read nor written by the direct-input implementation.
+template <bool KernelZero = false>
 static int upstream_mmq_pack_f16_direct(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
     return ferrum_upstream_boundary([&]() -> int {
@@ -480,7 +493,17 @@ static int upstream_mmq_pack_f16_direct(const FerrumUpstreamLinearPlanV1 * p,
         if(!input||!converted||!packed||!flags||stride<n.inputs||uint64_t(stride)*n.rows>INT_MAX||
             uintptr_t(input)%2||uintptr_t(converted)%16||uintptr_t(packed)%16||uintptr_t(flags)%4) return -5;
         const auto stream=static_cast<cudaStream_t>(s);
-        auto status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
+        cudaError_t status;
+#if defined(FERRUM_TEST_DIRECT_F16_PACK)
+        if constexpr (KernelZero) {
+            test_mmq_zero_row_flags<<<(uint64_t(n.rows)+127)/128,128,0,stream>>>(
+                static_cast<uint32_t *>(flags),n.rows);
+            status=cudaGetLastError();
+        } else
+#endif
+        {
+            status=cudaMemsetAsync(flags,0,n.rows*sizeof(uint32_t),stream);
+        }
         if(status!=cudaSuccess) return status;
         const dim3 grid(n.rows,n.padded_inputs/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ),1);
         if(n.format==GGML_TYPE_IQ4_XS) {
@@ -528,6 +551,10 @@ extern "C" int ferrum_test_upstream_mmq_pack_f32_intermediate_v1(const FerrumUps
 extern "C" int ferrum_test_upstream_mmq_pack_f16_direct_v1(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
     return upstream_mmq_pack_f16_direct(p,input,stride,converted,packed,flags,s);
+}
+extern "C" int ferrum_test_upstream_mmq_pack_f16_direct_kernel_zero_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * input,uint32_t stride,void * converted,void * packed,void * flags,void * s) noexcept {
+    return upstream_mmq_pack_f16_direct<true>(p,input,stride,converted,packed,flags,s);
 }
 #endif
 extern "C" int ferrum_upstream_mmq_check_weights_v2(const FerrumUpstreamLinearPlanV1 * p,

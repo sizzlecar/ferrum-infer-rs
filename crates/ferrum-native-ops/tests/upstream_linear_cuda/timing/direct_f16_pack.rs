@@ -2,6 +2,9 @@
 //! static weights, selected dot/fixup, cast, and output window.
 use super::*;
 
+#[path = "direct_f16_pack/clear_kernel.rs"]
+mod clear_kernel;
+
 type Pack = unsafe extern "C" fn(
     *const UpstreamLinearPlanV1,
     *const c_void,
@@ -505,6 +508,75 @@ fn thread_cpu_ns() -> Option<u128> {
     }
 }
 
+type PairedSample = (
+    usize,
+    usize,
+    usize,
+    usize,
+    [u128; 2],
+    [Option<u128>; 2],
+    u128,
+    f64,
+);
+
+fn paired_graph_samples(
+    stream: &Stream,
+    graphs: [&Graph; 2],
+    warm: usize,
+    pairs: usize,
+) -> Vec<PairedSample> {
+    let (start, end) = (Event::new(), Event::new());
+    let mut samples = Vec::with_capacity(2 * pairs * 2);
+    for launches in [1, 2] {
+        for round in 0..warm + pairs {
+            for order in 0..2 {
+                let arm = (round + order) % 2;
+                // Both blocks begin idle. The queued mode has no wait
+                // between its two graph launches and only one final fence.
+                stream.sync();
+                let mut launch_wall = [0_u128; 2];
+                let mut launch_cpu = [None; 2];
+                let block = Instant::now();
+                unsafe {
+                    ok(cudaEventRecord(start.0, stream.0));
+                }
+                for index in 0..launches {
+                    let wall = Instant::now();
+                    let cpu_start = thread_cpu_ns();
+                    let graph = graphs[arm];
+                    let status = unsafe { cudaGraphLaunch(graph.0, stream.0) };
+                    let cpu_end = thread_cpu_ns();
+                    launch_wall[index] = wall.elapsed().as_nanos();
+                    launch_cpu[index] = cpu_start.zip(cpu_end).and_then(|(s, e)| e.checked_sub(s));
+                    ok(status);
+                }
+                unsafe {
+                    ok(cudaEventRecord(end.0, stream.0));
+                    ok(cudaEventSynchronize(end.0));
+                }
+                let block_wall_ns = block.elapsed().as_nanos();
+                let mut gpu_ms = 0.0;
+                unsafe {
+                    ok(cudaEventElapsedTime(&mut gpu_ms, start.0, end.0));
+                }
+                if round >= warm {
+                    samples.push((
+                        launches,
+                        round - warm,
+                        order,
+                        arm,
+                        launch_wall,
+                        launch_cpu,
+                        block_wall_ns,
+                        f64::from(gpu_ms) * 1_000_000.0,
+                    ));
+                }
+            }
+        }
+    }
+    samples
+}
+
 #[test]
 #[ignore = "exclusive CUDA complete-projection long-graph paired diagnostic; run correctness first"]
 fn direct_f16_pack_complete_projection_ring_pairs() {
@@ -540,56 +612,7 @@ fn direct_f16_pack_complete_projection_ring_pairs() {
                 }
             })
         });
-        let (start, end) = (Event::new(), Event::new());
-        let mut samples = Vec::with_capacity(2 * PAIRS * 2);
-        for launches in [1, 2] {
-            for round in 0..WARM + PAIRS {
-                for order in 0..2 {
-                    let arm = (round + order) % 2;
-                    // Both blocks begin idle. The queued mode has no wait
-                    // between its two graph launches and only one final fence.
-                    stream.sync();
-                    let mut launch_wall = [0_u128; 2];
-                    let mut launch_cpu = [None; 2];
-                    let block = Instant::now();
-                    unsafe {
-                        ok(cudaEventRecord(start.0, stream.0));
-                    }
-                    for index in 0..launches {
-                        let wall = Instant::now();
-                        let cpu_start = thread_cpu_ns();
-                        let graph = &graphs[arm].0;
-                        let status = unsafe { cudaGraphLaunch(graph.0, stream.0) };
-                        let cpu_end = thread_cpu_ns();
-                        launch_wall[index] = wall.elapsed().as_nanos();
-                        launch_cpu[index] =
-                            cpu_start.zip(cpu_end).and_then(|(s, e)| e.checked_sub(s));
-                        ok(status);
-                    }
-                    unsafe {
-                        ok(cudaEventRecord(end.0, stream.0));
-                        ok(cudaEventSynchronize(end.0));
-                    }
-                    let block_wall_ns = block.elapsed().as_nanos();
-                    let mut gpu_ms = 0.0;
-                    unsafe {
-                        ok(cudaEventElapsedTime(&mut gpu_ms, start.0, end.0));
-                    }
-                    if round >= WARM {
-                        samples.push((
-                            launches,
-                            round - WARM,
-                            order,
-                            arm,
-                            launch_wall,
-                            launch_cpu,
-                            block_wall_ns,
-                            f64::from(gpu_ms) * 1_000_000.0,
-                        ));
-                    }
-                }
-            }
-        }
+        let samples = paired_graph_samples(&stream, [&graphs[0].0, &graphs[1].0], WARM, PAIRS);
         stream.sync();
         assert_eq!(fixture.assert_equal(&host_input, true), stable);
         let fresh_input = fixture.write_input(1, false);
