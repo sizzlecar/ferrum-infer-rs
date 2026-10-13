@@ -14,6 +14,9 @@ use ferrum_types::{FerrumError, Result};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use serde_json::Value;
 use std::fs::File;
+use std::path::PathBuf;
+
+mod cache;
 
 #[derive(Args, Clone, Debug)]
 pub struct ShareGptArgs {
@@ -42,6 +45,10 @@ pub struct ShareGptArgs {
     /// prefix. Keep this and warmup fixed when comparing different request counts.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub sharegpt_selection_pool_size: Option<u32>,
+    /// Reuse prepared ShareGPT requests after verifying source/tokenizer content
+    /// and selection settings. Omitted by default; does not change warmup.
+    #[arg(long)]
+    pub sharegpt_prepared_cache_dir: Option<PathBuf>,
 }
 
 impl Default for ShareGptArgs {
@@ -55,6 +62,7 @@ impl Default for ShareGptArgs {
             sharegpt_chat_template_reserve_tokens: 0,
             sharegpt_fixed_output_tokens: None,
             sharegpt_selection_pool_size: None,
+            sharegpt_prepared_cache_dir: None,
         }
     }
 }
@@ -91,6 +99,11 @@ pub(super) fn validate(cmd: &BenchServeCommand) -> Result<()> {
         if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
             return Err(FerrumError::model(
                 "--sharegpt-selection-pool-size requires --dataset sharegpt",
+            ));
+        }
+        if cmd.sharegpt.sharegpt_prepared_cache_dir.is_some() {
+            return Err(FerrumError::model(
+                "--sharegpt-prepared-cache-dir requires --dataset sharegpt",
             ));
         }
         return Ok(());
@@ -145,12 +158,20 @@ pub(super) fn prepare(cmd: &BenchServeCommand) -> Result<Option<Vec<PreparedRepe
         cmd.num_prompts
             .checked_add(cmd.warmup_requests)
             .ok_or_else(|| FerrumError::model("ShareGPT sample count overflow"))? as usize;
+    let cache = cache::PreparedCache::for_command(cmd, &tokenizer, count)?;
     let mut prepared = Vec::with_capacity(cmd.n_repeats as usize);
     let mut identity = None;
     for repeat in 0..cmd.n_repeats {
-        let (prompts, evidence) = load(cmd, &tokenizer, repeat, count)?;
-        append_evidence(&mut identity, evidence.clone())?;
-        prepared.push(PreparedRepeat { prompts, evidence });
+        let prepare_repeat = || {
+            let (prompts, evidence) = load(cmd, &tokenizer, repeat, count)?;
+            Ok(PreparedRepeat { prompts, evidence })
+        };
+        let entry = match &cache {
+            Some(cache) => cache.get_or_prepare(repeat, prepare_repeat)?,
+            None => prepare_repeat()?,
+        };
+        append_evidence(&mut identity, entry.evidence.clone())?;
+        prepared.push(entry);
     }
     Ok(Some(prepared))
 }
@@ -163,11 +184,7 @@ pub(super) fn load(
 ) -> Result<(Vec<PromptCase>, ShareGptDatasetEvidence)> {
     validate(cmd)?;
     let pool_size = cmd.sharegpt.pool_size(count)?;
-    let mut unbounded_tokenizer = tok.clone();
-    unbounded_tokenizer
-        .with_truncation(None)
-        .map_err(|e| FerrumError::model(format!("disable ShareGPT tokenizer truncation: {e}")))?;
-    unbounded_tokenizer.with_padding(None);
+    let unbounded_tokenizer = unbounded_tokenizer(tok)?;
     let tok = &unbounded_tokenizer;
     let path = cmd.sharegpt_path.as_ref().expect("validated ShareGPT path");
     let seed = cmd.seed.expect("validated ShareGPT seed");
@@ -371,6 +388,15 @@ fn token_length(tok: &tokenizers::Tokenizer, text: &str) -> Result<u32> {
         .encode(text, false)
         .map_err(|e| FerrumError::model(format!("tokenize ShareGPT text: {e}")))?;
     u32::try_from(encoding.len()).map_err(|_| FerrumError::model("ShareGPT token count overflow"))
+}
+
+fn unbounded_tokenizer(tok: &tokenizers::Tokenizer) -> Result<tokenizers::Tokenizer> {
+    let mut tokenizer = tok.clone();
+    tokenizer
+        .with_truncation(None)
+        .map_err(|e| FerrumError::model(format!("disable ShareGPT tokenizer truncation: {e}")))?;
+    tokenizer.with_padding(None);
+    Ok(tokenizer)
 }
 
 #[cfg(test)]

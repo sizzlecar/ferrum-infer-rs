@@ -3,6 +3,8 @@ use super::*;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+mod prepared_cache;
+
 struct Fixture {
     _directory: tempfile::TempDir,
     tokenizer: tokenizers::Tokenizer,
