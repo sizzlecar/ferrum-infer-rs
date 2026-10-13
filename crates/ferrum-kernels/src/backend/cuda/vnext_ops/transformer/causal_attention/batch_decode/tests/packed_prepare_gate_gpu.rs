@@ -13,6 +13,10 @@ use half::f16;
 
 const GUARD_WORDS: usize = 8;
 
+#[cfg(feature = "cuda-indexed-causal-attention")]
+#[path = "fixed_replay_gpu.rs"]
+mod fixed_replay_gpu;
+
 struct PhysicalPage {
     allocation: Arc<Guarded<f16>>,
     element_offset: usize,

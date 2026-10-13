@@ -543,6 +543,111 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_indexed_batch_raw(
     max_num_blocks_per_seq: i32,
     expected_kernel: VnextAddressedPagedAttentionKernel,
 ) -> Result<VnextAddressedPagedAttentionKernel> {
+    unsafe {
+        dispatch_vnext_addressed_paged_attention_indexed_impl(
+            stream,
+            out,
+            query,
+            block_addresses,
+            sequence_length_device,
+            row_map,
+            sequence_length,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            num_group_rows,
+            num_original_rows,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_num_blocks_per_seq,
+            expected_kernel,
+        )
+    }
+}
+
+/// Test-only fixed-capacity indexed launch with an identity-or-inactive map.
+///
+/// # Safety
+/// The map has exactly one entry per original row; entry i is i or -1. Each
+/// active row's fresh positive length selects expected_kernel and is within
+/// sequence_length. The complementary V1/V2 maps cover every original row once.
+/// A preceding same-stream gather must overwrite all lengths and both maps on
+/// every replay. Addresses, extents, ownership and lifetime requirements of the
+/// indexed ABI still hold, including full M-by-capacity V2 scratch. Inactive
+/// entries are rejected by the native kernel before any original-row access.
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(test, feature = "cuda-indexed-causal-attention"))]
+pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_fixed_masked_batch_raw(
+    stream: &CudaStream,
+    out: u64,
+    query: u64,
+    block_addresses: u64,
+    sequence_length_device: u64,
+    row_map: u64,
+    sequence_length: u64,
+    exp_sums: Option<u64>,
+    max_logits: Option<u64>,
+    temporary_output: Option<u64>,
+    num_group_rows: i32,
+    num_original_rows: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    max_num_blocks_per_seq: i32,
+    expected_kernel: VnextAddressedPagedAttentionKernel,
+) -> Result<VnextAddressedPagedAttentionKernel> {
+    if num_group_rows != num_original_rows {
+        return Err(FerrumError::model(
+            "fixed-capacity causal mask must contain every original row",
+        ));
+    }
+    unsafe {
+        dispatch_vnext_addressed_paged_attention_indexed_impl(
+            stream,
+            out,
+            query,
+            block_addresses,
+            sequence_length_device,
+            row_map,
+            sequence_length,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            num_group_rows,
+            num_original_rows,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_num_blocks_per_seq,
+            expected_kernel,
+        )
+    }
+}
+
+// Both closed callers establish their own device-map contract. This common
+// implementation preserves all scalar bounds and the unchanged native launch.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda-indexed-causal-attention")]
+unsafe fn dispatch_vnext_addressed_paged_attention_indexed_impl(
+    stream: &CudaStream,
+    out: u64,
+    query: u64,
+    block_addresses: u64,
+    sequence_length_device: u64,
+    row_map: u64,
+    sequence_length: u64,
+    exp_sums: Option<u64>,
+    max_logits: Option<u64>,
+    temporary_output: Option<u64>,
+    num_group_rows: i32,
+    num_original_rows: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    max_num_blocks_per_seq: i32,
+    expected_kernel: VnextAddressedPagedAttentionKernel,
+) -> Result<VnextAddressedPagedAttentionKernel> {
     if out == 0
         || query == 0
         || block_addresses == 0

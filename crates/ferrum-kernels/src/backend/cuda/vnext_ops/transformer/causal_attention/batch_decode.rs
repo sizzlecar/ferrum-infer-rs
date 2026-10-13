@@ -696,3 +696,6 @@ pub(super) fn gather_lengths(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "cuda-indexed-causal-attention"))]
+pub(super) mod fixed;
