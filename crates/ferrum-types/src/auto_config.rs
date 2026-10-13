@@ -1237,6 +1237,16 @@ impl FerrumConfigBuilder {
                 RuntimeConfigSource::Default,
             );
         }
+        if self
+            .entry(crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY,
+                crate::Q8ProjectionWeightPreparation::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
             if self
                 .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
@@ -1324,6 +1334,7 @@ impl FerrumConfigBuilder {
         decisions.push(self.sampling_decision(greedy));
         decisions.push(self.q4_mmvq_weight_decode_decision()?);
         decisions.push(self.q5_mmvq_weight_decode_decision()?);
+        decisions.push(self.q8_projection_weight_preparation_decision()?);
 
         Ok(ResolvedFerrumConfig {
             schema_version: 1,
@@ -2957,6 +2968,48 @@ impl FerrumConfigBuilder {
             source,
             source_key,
             ["baseline", "shared-m8"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn q8_projection_weight_preparation_decision(
+        &self,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::Q8ProjectionWeightPreparation::parse_config_entry(entry).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::Q8ProjectionWeightPreparation::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::Q8ProjectionWeightPreparation::PredecodedF32
+            && (!self.is_cuda_backend()
+                || !self.hardware.compiled_features.cuda
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
+        {
+            return Err(AutoConfigError::InvalidOverride {
+                key: key.to_owned(),
+                reason: "predecoded-f32 Q8 projection weights require a CUDA plan runtime and a supported strict Q8 projection numerical route".to_owned(),
+            });
+        }
+        Ok(self.decision(
+            "q8_projection_weight_preparation",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["compressed", "predecoded-f32"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -7309,6 +7362,61 @@ mod tests {
                 .unwrap();
             assert_eq!(entry.source, source);
         }
+    }
+
+    #[test]
+    fn q8_projection_weight_preparation_requires_cuda_plan_runtime() {
+        let key = crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
+        for backend in ["cpu", "cuda"] {
+            for authority in [
+                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionResourceAuthority::PlanRuntime,
+            ] {
+                for compiled in [false, true] {
+                    for mode in ["compressed", "predecoded-f32"] {
+                        let mut hardware = HardwareCapabilities::unknown();
+                        hardware.backend = backend.into();
+                        hardware.compiled_features.cuda = compiled;
+                        let result =
+                            FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
+                                RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
+                            ]))
+                            .with_hardware_capabilities(hardware)
+                            .with_execution_resource_authority(authority)
+                            .resolve();
+                        let supported = mode == "compressed"
+                            || (backend == "cuda"
+                                && compiled
+                                && authority == ExecutionResourceAuthority::PlanRuntime);
+                        if supported {
+                            let resolved = result.unwrap();
+                            let mut engine = crate::EngineConfig::default();
+                            engine
+                                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                                .unwrap();
+                            assert_eq!(
+                                engine
+                                    .runtime
+                                    .q8_projection_weight_preparation
+                                    .as_runtime_value(),
+                                mode
+                            );
+                        } else {
+                            assert!(
+                                matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "predecoded-f32", RuntimeConfigSource::Env),
+            ]))
+            .resolve()
+            .is_err()
+        );
     }
 
     #[test]

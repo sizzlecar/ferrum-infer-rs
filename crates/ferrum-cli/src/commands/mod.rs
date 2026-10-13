@@ -149,6 +149,25 @@ impl Q5MmvqWeightDecodeArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Q8ProjectionWeightPreparationArg {
+    Compressed,
+    PredecodedF32,
+}
+
+impl Q8ProjectionWeightPreparationArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Compressed => {
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed.as_runtime_value()
+            }
+            Self::PredecodedF32 => {
+                ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32.as_runtime_value()
+            }
+        }
+    }
+}
+
 impl SequenceFitPolicyArg {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
@@ -235,6 +254,13 @@ mod tests {
             match self.command {
                 TestCommand::Run(command) => command.q5_mmvq_weight_decode,
                 TestCommand::Serve(command) => command.q5_mmvq_weight_decode,
+            }
+        }
+
+        fn q8_projection_weight_preparation(self) -> Option<Q8ProjectionWeightPreparationArg> {
+            match self.command {
+                TestCommand::Run(command) => command.q8_projection_weight_preparation,
+                TestCommand::Serve(command) => command.q8_projection_weight_preparation,
             }
         }
 
@@ -599,6 +625,42 @@ mod tests {
                 command,
                 "test-model",
                 "--q5-mmvq-weight-decode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn q8_projection_weight_preparation_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .q8_projection_weight_preparation(),
+                None
+            );
+            for (value, expected) in [
+                ("compressed", Q8ProjectionWeightPreparationArg::Compressed),
+                (
+                    "predecoded-f32",
+                    Q8ProjectionWeightPreparationArg::PredecodedF32,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--q8-projection-weight-preparation",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.q8_projection_weight_preparation(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--q8-projection-weight-preparation",
                 "automatic",
             ])
             .is_err());

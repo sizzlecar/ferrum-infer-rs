@@ -515,6 +515,12 @@ impl CudaCausalPagedAttentionProvider {
         }
 
         if upstream {
+            provider_sources.push(
+                runtime
+                    .q8_projection_weight_preparation()
+                    .as_runtime_value()
+                    .as_bytes(),
+            );
             provider_sources.extend(super::q8act_attention::upstream::fingerprint_sources());
             provider_sources.push(
                 runtime
@@ -532,6 +538,10 @@ impl CudaCausalPagedAttentionProvider {
         }
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let mut estimator_sources: Vec<&[u8]> = vec![
+            runtime
+                .q8_projection_weight_preparation()
+                .as_runtime_value()
+                .as_bytes(),
             source.as_bytes(),
             packed_decode_mode.as_slice(),
             grouping_identity,
@@ -753,6 +763,7 @@ impl CudaCausalPagedAttentionProvider {
                         runtime.q5_mmvq_weight_decode(),
                         runtime.q4_shared_weight_decode_counter(),
                         runtime.q5_shared_weight_decode_counter(),
+                        runtime.q8_projection_weight_preparation(),
                     )
                 })
                 .transpose()?,

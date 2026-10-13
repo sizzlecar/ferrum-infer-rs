@@ -237,6 +237,41 @@ impl Fixture {
         q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
         execution_context_limit: Option<usize>,
     ) -> Self {
+        Self::for_family_with_q8_projection_weight_preparation(
+            kind,
+            reusable,
+            participants,
+            definition,
+            upload_strategy,
+            oracle,
+            owner_mode,
+            attention_policy,
+            preparation_mode,
+            attention_grouping,
+            q4_mmvq_weight_decode,
+            q5_mmvq_weight_decode,
+            execution_context_limit,
+            ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_family_with_q8_projection_weight_preparation(
+        kind: AttentionKind,
+        reusable: bool,
+        participants: u32,
+        definition: Family,
+        upload_strategy: ferrum_types::ProgramBindingUploadStrategy,
+        oracle: SegmentBindingOracleMode,
+        owner_mode: SegmentBindingOwnerViewMode,
+        attention_policy: ferrum_types::AttentionExecutionPolicy,
+        preparation_mode: ferrum_types::CausalDecodePreparationMode,
+        attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+        execution_context_limit: Option<usize>,
+        q8_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    ) -> Self {
         let maximum_tokens = definition.maximum_tokens();
         let baseline = definition.is_g32_baseline();
         let attention_arithmetic = definition.attention_arithmetic();
@@ -249,7 +284,7 @@ impl Fixture {
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
         let (runtime, registry, materializers, catalog) =
-            CudaVNextComposition::create_with_execution_context_limit(
+            CudaVNextComposition::create_with_q8_projection_weight_preparation(
                 0,
                 id(format!("device.cuda.upstream-marker.{kind:?}")),
                 attention_policy,
@@ -261,6 +296,7 @@ impl Fixture {
                 q4_mmvq_weight_decode,
                 q5_mmvq_weight_decode,
                 execution_context_limit,
+                q8_preparation,
             )
             .unwrap()
             .into_parts();
@@ -384,10 +420,32 @@ impl Fixture {
                 .iter()
                 .find(|a| a.resource_id() == resource)
                 .unwrap();
-            assert_eq!(requirement.fixed_bytes(), Some(flag_bytes));
-            assert_ne!(flag_bytes % requirement.alignment_bytes(), 0);
-            assert_eq!(allocation.per_instance_bytes(), flag_bytes);
-            assert!(allocation.size_bytes() > flag_bytes);
+            let q8_leaves = prepared.projections().iter().flat_map(|p| p.leaves()).filter(|leaf| matches!(leaf.encoding(), WeightEncoding::BlockQuantized(spec) if spec.format_id.as_str() == "quantization.gguf.q8-0")).count();
+            let persistent_bytes = if q8_preparation
+                == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
+                && name == "node.attention"
+            {
+                assert_eq!(
+                    q8_leaves, 1,
+                    "new fixture must contain an actual Q8 physical leaf"
+                );
+                // One N32 x K256 exact F32 leaf, aligned after the existing flags.
+                flag_bytes.div_ceil(16) * 16 + 32 * HIDDEN * 4
+            } else {
+                flag_bytes
+            };
+            assert_eq!(requirement.fixed_bytes(), Some(persistent_bytes));
+            assert_eq!(allocation.per_instance_bytes(), persistent_bytes);
+            assert_eq!(
+                allocation.size_bytes(),
+                persistent_bytes.div_ceil(requirement.alignment_bytes())
+                    * requirement.alignment_bytes(),
+                "Plan admission must charge the complete aligned persistent extent"
+            );
+            if persistent_bytes == flag_bytes {
+                assert_ne!(flag_bytes % requirement.alignment_bytes(), 0);
+                assert!(allocation.size_bytes() > flag_bytes);
+            }
             assert_eq!(allocation.element_type(), ElementType::U8);
             assert_eq!(allocation.usage(), BufferUsage::Persistent);
             assert_eq!(allocation.lifetime(), AllocationLifetime::Plan);
@@ -505,6 +563,165 @@ impl Fixture {
             checkpoint_timing_mode: DeviceTimingMode::Off,
             reusable_bucket,
             output_type: kind.activation_type(),
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA native MarkerV2, real Plan Q8 preparation and Core replay"]
+fn q8_predecoded_f32_matches_compressed_across_core_m1_m8_replay_and_fresh_requests() {
+    use ferrum_types::{
+        AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
+        InvocationPreparationStrategy, ProgramBindingUploadStrategy, Q4MmvqWeightDecode,
+        Q5MmvqWeightDecode, Q8ProjectionWeightPreparation,
+    };
+    struct NoPreparation;
+    impl InvocationPreparationSink for NoPreparation {
+        fn record_preparation(&self, _: InvocationPreparationStats) {}
+    }
+    let policies = [
+        Q8ProjectionWeightPreparation::Compressed,
+        Q8ProjectionWeightPreparation::PredecodedF32,
+    ];
+    for participants in [1_usize, 8] {
+        let fixtures = policies.map(|policy| {
+            Fixture::for_family_with_q8_projection_weight_preparation(
+                AttentionKind::GatedDelta,
+                true,
+                participants as u32,
+                Family::new(AttentionKind::GatedDelta).with_small_q8_projection(),
+                ProgramBindingUploadStrategy::CompactScatter,
+                SegmentBindingOracleMode::CompareReference,
+                SegmentBindingOwnerViewMode::Indexed,
+                AttentionExecutionPolicy::Portable,
+                CausalDecodePreparationMode::PerParticipant,
+                CausalDecodeAttentionGrouping::Contiguous,
+                Q4MmvqWeightDecode::Baseline,
+                Q5MmvqWeightDecode::Baseline,
+                None,
+                policy,
+            )
+        });
+        let mut programs = [None, None];
+        let mut old_authorities = BTreeSet::new();
+        for generation in 0..2 {
+            let tokens: Vec<Arc<[u32]>> = (0..participants)
+                .map(|owner| {
+                    (0..6)
+                        .map(|position| {
+                            ((position * 7 + owner * 3 + generation * 11 + 1) % 32) as u32
+                        })
+                        .collect()
+                })
+                .collect();
+            let sessions = fixtures.each_ref().map(|fixture| {
+                tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(owner, tokens)| {
+                        let session = fixture.admit(
+                            &format!("q8-predecoded-{participants}-{generation}-{owner}"),
+                            Arc::clone(tokens),
+                        );
+                        assert!(!old_authorities.contains(&session.sequence_authority()));
+                        session
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for position in 0..6 {
+                let path = if position == 0 {
+                    Path::Eager
+                } else if position < 3 {
+                    Path::Warm
+                } else {
+                    Path::Replay
+                };
+                let order: Vec<_> = if position >= 4 {
+                    (0..participants).rev().collect()
+                } else {
+                    (0..participants).collect()
+                };
+                let local_tokens: Vec<_> = order
+                    .iter()
+                    .map(|&owner| Arc::clone(&tokens[owner]))
+                    .collect();
+                let observations = std::array::from_fn::<_, 2, _>(|arm| {
+                    let fixture = &fixtures[arm];
+                    assert_eq!(
+                        fixture
+                            ._composition
+                            ._runtime
+                            .q8_projection_weight_preparation(),
+                        policies[arm]
+                    );
+                    let group: Vec<_> = order
+                        .iter()
+                        .map(|&owner| Arc::clone(&sessions[arm][owner]))
+                        .collect();
+                    let observation = fixture.execute_participant_ranges_observed(
+                        &fixture.lane,
+                        &fixture.reaper,
+                        &group,
+                        &local_tokens,
+                        &vec![position..position + 1; participants],
+                        path,
+                        InvocationPreparationStrategy::default(),
+                        &NoPreparation,
+                        None,
+                        batch::BatchObservationOptions {
+                            timing: if position == 0 {
+                                DeviceTimingMode::Kernel
+                            } else {
+                                DeviceTimingMode::Off
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    if matches!(path, Path::Replay) {
+                        let program = observation.reusable_program_id.as_ref().unwrap();
+                        if let Some(previous) = &programs[arm] {
+                            assert_eq!(previous, program, "fresh authorities and reordered owners reuse the same captured topology");
+                        }
+                        programs[arm] = Some(program.clone());
+                    }
+                    observation
+                });
+                observations[0].assert_same(&observations[1]);
+                if position == 0 {
+                    let work = observations.each_ref().map(|observation| {
+                        observation
+                            .attribution
+                            .as_ref()
+                            .unwrap()
+                            .device()
+                            .commands()
+                            .iter()
+                            .filter(|command| command.dependency_wait_count() > 0)
+                            .fold((0_u64, 0_u64), |(compute, waits), command| {
+                                (
+                                    compute + command.compute_dispatch_count(),
+                                    waits + command.dependency_wait_count(),
+                                )
+                            })
+                    });
+                    assert_eq!(
+                        work[1].1,
+                        work[0].1 + 1,
+                        "one real Q8 Plan publication is consumed by both fresh request generations"
+                    );
+                    assert_eq!(work[1].0, work[0].0 + u64::from(generation == 0 && position == 0), "Q8 expansion occurs once, then fresh requests reuse the retained preparation");
+                    println!(
+                        "{}",
+                        serde_json::json!({"kind":"q8_preparation_core_work","participants":participants,"generation":generation,"position":position,"compressed":work[0],"predecoded_f32":work[1],"scope":"actual conditional dependency work; full output/state bits equal"})
+                    );
+                }
+            }
+            for group in sessions {
+                for session in group {
+                    old_authorities.insert(session.sequence_authority());
+                    session.try_complete().unwrap();
+                }
+            }
         }
     }
 }

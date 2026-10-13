@@ -247,6 +247,50 @@ impl Q5MmvqWeightDecode {
     }
 }
 
+/// Explicit preparation policy snapshot key; never an environment switch.
+pub const Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY: &str =
+    "FERRUM_Q8_PROJECTION_WEIGHT_PREPARATION";
+
+/// Retained representation of eligible strict Q8_0 projection leaves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Q8ProjectionWeightPreparation {
+    #[default]
+    Compressed,
+    PredecodedF32,
+}
+
+impl Q8ProjectionWeightPreparation {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Compressed => "compressed",
+            Self::PredecodedF32 => "predecoded-f32",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "compressed" => Ok(Self::Compressed),
+            "predecoded-f32" => Ok(Self::PredecodedF32),
+            _ => Err(format!(
+                "expected compressed or predecoded-f32; got {raw:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select Q8 projection weight preparation through CLI or config, not environment"
+                    .into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Grouping of already selected native V1/V2 causal decode rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -513,6 +557,9 @@ pub struct RuntimeKnobs {
     /// Shared weight decoding affects only eligible Q5_K MarkerV2 MMVQ M8 leaves.
     #[serde(default)]
     pub q5_mmvq_weight_decode: Q5MmvqWeightDecode,
+    /// Cold preparation of eligible strict Q8_0 projection leaves on CUDA.
+    #[serde(default)]
+    pub q8_projection_weight_preparation: Q8ProjectionWeightPreparation,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -707,6 +754,16 @@ impl EngineConfig {
         {
             self.runtime.q5_mmvq_weight_decode = Q5MmvqWeightDecode::parse_config_entry(entry)
                 .map_err(|reason| format!("{Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY}: {reason}"))?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY)
+        {
+            self.runtime.q8_projection_weight_preparation =
+                Q8ProjectionWeightPreparation::parse_config_entry(entry).map_err(|reason| {
+                    format!("{Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY}: {reason}")
+                })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =
@@ -2497,5 +2554,56 @@ mod tests {
                 RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
             ]))
             .is_err());
+    }
+
+    #[test]
+    fn q8_projection_weight_preparation_defaults_and_explicit_sources() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let mut engine = EngineConfig::default();
+        let key = Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
+        assert_eq!(
+            engine.runtime.q8_projection_weight_preparation,
+            Q8ProjectionWeightPreparation::Compressed
+        );
+        let mut old = serde_json::to_value(&engine.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("q8_projection_weight_preparation");
+        assert_eq!(
+            serde_json::from_value::<RuntimeKnobs>(old)
+                .unwrap()
+                .q8_projection_weight_preparation,
+            Q8ProjectionWeightPreparation::Compressed
+        );
+        engine.runtime.q5_mmvq_weight_decode = Q5MmvqWeightDecode::SharedM8;
+        for source in [RuntimeConfigSource::Cli, RuntimeConfigSource::ConfigFile] {
+            for mode in [
+                Q8ProjectionWeightPreparation::PredecodedF32,
+                Q8ProjectionWeightPreparation::Compressed,
+            ] {
+                engine
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                        RuntimeConfigEntry::new(key, mode.as_runtime_value(), source),
+                    ]))
+                    .unwrap();
+                assert_eq!(engine.runtime.q8_projection_weight_preparation, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                assert_eq!(
+                    engine.runtime.q5_mmvq_weight_decode,
+                    Q5MmvqWeightDecode::SharedM8
+                );
+            }
+        }
+        for (value, source) in [
+            ("predecoded-f32", RuntimeConfigSource::Env),
+            ("compressed", RuntimeConfigSource::Env),
+            ("auto", RuntimeConfigSource::Cli),
+        ] {
+            assert!(engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, value, source),
+                ]))
+                .is_err());
+        }
     }
 }

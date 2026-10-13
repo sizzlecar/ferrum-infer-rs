@@ -19,13 +19,18 @@ use ferrum_interfaces::vnext::{
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+mod q8_predecode;
+use q8_predecode::PersistentLayout;
+
 pub(in crate::backend::cuda::vnext_ops::transformer) struct Runtime {
     plans: UpstreamPlanFactory,
     profile: UpstreamMarkerV2Profile,
     arithmetic: CompositeNumericalArithmetic,
     validation: WeightValidationRegistry,
+    q8_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    q8_kernels: Option<CudaNativeBlockKernels>,
     fingerprint: String,
-    scratch: Mutex<BTreeMap<String, UpstreamScratchEstimate>>,
+    scratch: Mutex<BTreeMap<String, (UpstreamScratchEstimate, Arc<PersistentLayout>)>>,
 }
 impl Runtime {
     pub fn new(
@@ -36,6 +41,7 @@ impl Runtime {
         q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
         shared_weight_decode_encodes: Option<Arc<std::sync::atomic::AtomicU64>>,
         q5_shared_weight_decode_encodes: Option<Arc<std::sync::atomic::AtomicU64>>,
+        q8_preparation: ferrum_types::Q8ProjectionWeightPreparation,
     ) -> Result<Arc<Self>, CudaDeviceRuntimeError> {
         Ok(Arc::new(Self {
             profile,
@@ -50,6 +56,14 @@ impl Runtime {
             )
             .map_err(CudaDeviceRuntimeError::contract)?,
             validation: WeightValidationRegistry::default(),
+            q8_preparation,
+            q8_kernels: if q8_preparation
+                == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
+            {
+                Some(CudaNativeBlockKernels::load(context)?)
+            } else {
+                None
+            },
             fingerprint: fingerprint.to_owned(),
             scratch: Mutex::new(BTreeMap::new()),
         }))
@@ -60,7 +74,9 @@ impl Runtime {
         &self,
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<bool, String> {
-        if !self.profile.hybrid() {
+        if !self.profile.hybrid()
+            || self.q8_preparation == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
+        {
             return Ok(false);
         }
         if invocation.operation().id.as_str() != self.profile.operation_id() {
@@ -101,17 +117,21 @@ impl Runtime {
     fn scratch_bytes(
         &self,
         numerics: &PreparedProjectionNumerics,
-    ) -> Result<UpstreamScratchEstimate, String> {
+    ) -> Result<(UpstreamScratchEstimate, Arc<PersistentLayout>), String> {
         let mut cache = self
             .scratch
             .lock()
             .map_err(|_| "attention upstream scratch cache poisoned")?;
-        if let Some(&bytes) = cache.get(numerics.fingerprint()) {
-            return Ok(bytes);
+        if let Some((bytes, persistent)) = cache.get(numerics.fingerprint()) {
+            return Ok((*bytes, persistent.clone()));
         }
         let bytes = self.plans.maximum_scratch(numerics)?;
-        cache.insert(numerics.fingerprint().to_owned(), bytes);
-        Ok(bytes)
+        let persistent = Arc::new(PersistentLayout::new(numerics, self.q8_preparation)?);
+        cache.insert(
+            numerics.fingerprint().to_owned(),
+            (bytes, persistent.clone()),
+        );
+        Ok((bytes, persistent))
     }
 }
 #[derive(Clone)]
@@ -120,6 +140,7 @@ pub(super) struct State {
     pub fixed_bytes: u64,
     launches: Vec<Projection>,
     preparation: ProjectionPreparation,
+    persistent: Arc<PersistentLayout>,
 }
 impl State {
     pub(super) fn validate_parts(
@@ -155,6 +176,8 @@ struct Leaf {
     signs: Option<CudaBufferRegion>,
     stage: Arc<PreparedUpstreamLeaf>,
     validation: Option<Arc<WeightValidation>>,
+    persistent_offset: u64,
+    predecoded_f32: bool,
 }
 impl<'a> PreparedAttentionProjections<'a> {
     pub fn prepare_upstream(
@@ -194,7 +217,7 @@ impl<'a> PreparedAttentionProjections<'a> {
         runtime: Arc<Runtime>,
         preparation: ProjectionPreparation,
     ) -> Result<Self, String> {
-        let mut estimate = runtime.scratch_bytes(&numerics)?;
+        let (mut estimate, persistent) = runtime.scratch_bytes(&numerics)?;
         if runtime.profile.hybrid() {
             estimate.bytes_per_row = estimate
                 .bytes_per_row
@@ -209,6 +232,7 @@ impl<'a> PreparedAttentionProjections<'a> {
                 fixed_bytes: estimate.fixed_bytes,
                 launches: Vec::new(),
                 preparation,
+                persistent,
             }),
         })
     }
@@ -241,7 +265,11 @@ impl<'a> PreparedAttentionProjections<'a> {
             return Ok(None);
         }
         ProviderWorkspaceRequirement::new(
-            flag_bytes(&self.numerics)?,
+            self.upstream
+                .as_ref()
+                .ok_or("missing upstream state")?
+                .persistent
+                .bytes,
             16,
             ProviderWorkspaceScope::Plan,
             ProviderWorkspaceReusePolicy::Preserve,
@@ -281,7 +309,14 @@ impl<'a> PreparedAttentionProjections<'a> {
         let output = scratch
             .subregion(output_offset, mul(mul(u64::from(rows), n)?, 2)?)
             .map_err(|e| e.to_string())?;
-        let persistent = persistent_region(invocation, flag_bytes(&self.numerics)?)?;
+        let persistent = persistent_region(
+            invocation,
+            self.upstream
+                .as_ref()
+                .ok_or("missing upstream state")?
+                .persistent
+                .bytes,
+        )?;
         let state = self
             .upstream
             .as_mut()
@@ -321,12 +356,16 @@ impl<'a> PreparedAttentionProjections<'a> {
                     .runtime
                     .plans
                     .prepare_for(&self.numerics, &facts, state.preparation)?;
+            let q8_destination = state
+                .persistent
+                .destination(first_leaf, i)?
+                .filter(|_| u64::from(rows) <= super::super::native_matrix::MAX_ROWS);
+            let mut persistent_offset = 0;
+            let mut predecoded_f32 = false;
             let validation = if let Some(native) = &stage.native {
+                persistent_offset = flag_offset(first_leaf, i as u64, native.geometry().algorithm)?;
                 let flag = persistent
-                    .subregion(
-                        flag_offset(first_leaf, i as u64, native.geometry().algorithm)?,
-                        4,
-                    )
+                    .subregion(persistent_offset, 4)
                     .map_err(|e| e.to_string())?;
                 let validation = state
                     .runtime
@@ -348,6 +387,30 @@ impl<'a> PreparedAttentionProjections<'a> {
                     1 + u64::from(native.geometry().guard_blocks != 0),
                 )?;
                 Some(validation)
+            } else if let Some(destination) = q8_destination {
+                destination.validate(part, k)?;
+                persistent_offset = destination.offset;
+                let decoded = persistent
+                    .subregion(destination.offset, destination.bytes)
+                    .map_err(|e| e.to_string())?;
+                let validation = state
+                    .runtime
+                    .validation
+                    .prepare_q8_f32(
+                        destination.inputs,
+                        destination.outputs,
+                        state
+                            .runtime
+                            .q8_kernels
+                            .as_ref()
+                            .ok_or("missing Q8 predecode kernels")?,
+                        &state.runtime.fingerprint,
+                        weight.clone(),
+                        decoded,
+                    )
+                    .map_err(|e| e.to_string())?;
+                predecoded_f32 = true;
+                Some(validation)
             } else {
                 None
             };
@@ -366,6 +429,8 @@ impl<'a> PreparedAttentionProjections<'a> {
                 signs,
                 stage,
                 validation,
+                persistent_offset,
+                predecoded_f32,
             });
         }
         state.launches.push(Projection {
@@ -387,27 +452,13 @@ impl<'a> PreparedAttentionProjections<'a> {
         let mut bindings = Vec::new();
         for projection in self.upstream.iter().flat_map(|s| s.launches.iter()) {
             let retained = self.projection(projection.role)?;
-            let first_leaf = self
-                .numerics
-                .projections()
-                .iter()
-                .take_while(|p| p.role() != projection.role)
-                .map(|p| p.leaves().len() as u64)
-                .sum();
-            for (i, leaf) in projection.leaves.iter().enumerate() {
+            for leaf in &projection.leaves {
                 if let Some(validation) = &leaf.validation {
-                    let algorithm = leaf
-                        .stage
-                        .native
-                        .as_ref()
-                        .ok_or("validation without selected native leaf")?
-                        .geometry()
-                        .algorithm;
                     if let Some(segment) = segment.as_deref_mut() {
                         segment.push(validation.segment_declaration(
                             retained.weight_input_ordinal(),
                             &leaf.part.component_id,
-                            flag_offset(first_leaf, i as u64, algorithm)?,
+                            leaf.persistent_offset,
                         ));
                     }
                     bindings.push(
@@ -416,7 +467,7 @@ impl<'a> PreparedAttentionProjections<'a> {
                                 invocation,
                                 retained.weight_input_ordinal(),
                                 &leaf.part.component_id,
-                                flag_offset(first_leaf, i as u64, algorithm)?,
+                                leaf.persistent_offset,
                             )
                             .map_err(|e| e.to_string())?,
                     );
@@ -468,7 +519,22 @@ impl<'a> PreparedAttentionProjections<'a> {
             bytes: region.length_bytes(),
         };
         for leaf in &projection.leaves {
-            if let Some(validation) = &leaf.validation {
+            if leaf.predecoded_f32 {
+                let preparation = leaf.validation.as_ref().ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("missing retained Q8 preparation")
+                })?;
+                native.linear_q8_0_predecoded_f32_f16(
+                    stream,
+                    &projection.input,
+                    preparation.destination_region(),
+                    &projection.output,
+                    rows,
+                    leaf.part.columns,
+                    leaf.part.rows,
+                    stride,
+                    leaf.part.output_offset,
+                )?;
+            } else if let Some(validation) = &leaf.validation {
                 // Captured State owns this Arc and its retained flag/weight leases.
                 unsafe {
                     leaf.stage.launch(
@@ -537,8 +603,8 @@ fn persistent_region(
                 descriptor.size_bytes, descriptor.element_type
             ));
         }
-        // Admission may round storage up for alignment. Retain only the flag prefix;
-        // trailing allocation padding does not belong to any validation flag.
+        // Retain only the declared flag/predecoded-weight prefix. Allocation
+        // alignment padding does not authorize another preparation destination.
         let parts = view.translate(0, bytes).map_err(|e| e.to_string())?;
         let mut parts = parts.iter();
         let part = parts.next().ok_or("empty validation storage")?;
@@ -571,6 +637,8 @@ impl State {
     pub(super) fn append_replay_bytes(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
         for projection in &self.launches {
             for leaf in &projection.leaves {
+                bytes.push(u8::from(leaf.predecoded_f32));
+                bytes.extend_from_slice(&leaf.persistent_offset.to_le_bytes());
                 let fingerprint = leaf.stage.replay_fingerprint()?;
                 bytes.extend_from_slice(&(fingerprint.len() as u64).to_le_bytes());
                 bytes.extend_from_slice(fingerprint.as_bytes());
@@ -585,9 +653,11 @@ pub(in crate::backend::cuda::vnext_ops::transformer) fn fingerprint_sources() ->
 {
     vec![
         include_bytes!("upstream.rs"),
+        include_bytes!("upstream/q8_predecode.rs"),
         include_bytes!("../../native_blocks/upstream_linear.rs"),
         include_bytes!("../../native_blocks/upstream_linear/preparation.rs"),
         include_bytes!("../../native_blocks/upstream_linear/weight_validation.rs"),
+        include_bytes!("../../native_blocks/q8_predecode.rs"),
         include_bytes!("../../../../../native_ops/upstream_linear.rs"),
         include_bytes!("../../../../../native_ops/upstream_linear/ffi.rs"),
         include_bytes!("../../../../../native_ops/upstream_linear/dispatch.rs"),

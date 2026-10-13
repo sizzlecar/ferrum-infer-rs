@@ -43,6 +43,7 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
         {
             continue;
         }
@@ -62,6 +63,7 @@ pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Ve
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
         {
             continue;
         }
@@ -271,5 +273,29 @@ mod tests {
             assert_eq!(runtime_snapshot_value(&current, key), Some("shared-m8"));
             assert_eq!(current.entries[0].source, source);
         }
+    }
+    #[test]
+    fn q8_projection_weight_preparation_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "predecoded-f32", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(
+                runtime_snapshot_value(&current, key),
+                Some("predecoded-f32")
+            );
+            assert_eq!(current.entries[0].source, source);
+        }
+        let from_environment = snapshot(&[(key, "predecoded-f32", RuntimeConfigSource::Env)]);
+        assert!(ferrum_types::EngineConfig::default()
+            .apply_runtime_config_snapshot(&from_environment)
+            .is_err());
     }
 }

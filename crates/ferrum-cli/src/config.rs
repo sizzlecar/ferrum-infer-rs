@@ -271,6 +271,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub q5_mmvq_weight_decode: Option<ferrum_types::Q5MmvqWeightDecode>,
 
+    /// Preparation of eligible small Q8 projection weights (default: compressed).
+    #[serde(default)]
+    pub q8_projection_weight_preparation: Option<ferrum_types::Q8ProjectionWeightPreparation>,
+
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -535,6 +539,12 @@ impl RuntimeCliConfig {
             ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
             self.q5_mmvq_weight_decode
                 .map(ferrum_types::Q5MmvqWeightDecode::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY,
+            self.q8_projection_weight_preparation
+                .map(ferrum_types::Q8ProjectionWeightPreparation::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1638,5 +1648,27 @@ mod tests {
             toml::from_str::<CliConfig>("[runtime]\nq5_mmvq_weight_decode = \"automatic\"\n")
                 .is_err()
         );
+    }
+    #[test]
+    fn q8_projection_weight_preparation_config_file_parses_explicit_mode() {
+        for value in ["compressed", "predecoded-f32"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\nq8_projection_weight_preparation = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| {
+                    entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
+                })
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nq8_projection_weight_preparation = \"automatic\"\n"
+        )
+        .is_err());
     }
 }

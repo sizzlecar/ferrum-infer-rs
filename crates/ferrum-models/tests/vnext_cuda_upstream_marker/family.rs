@@ -17,6 +17,7 @@ pub struct Family {
     selected: UpstreamMarkerV2Profile,
     maximum_tokens: u64,
     g32_baseline: bool,
+    small_q8_projection: bool,
 }
 
 impl Family {
@@ -25,12 +26,17 @@ impl Family {
             base: attention_family::Family::new(kind),
             maximum_tokens: MAX_TOKENS,
             g32_baseline: false,
+            small_q8_projection: false,
             selected: match kind {
                 AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDelta,
                 AttentionKind::Causal => UpstreamMarkerV2Profile::Causal,
                 _ => panic!("MarkerV2 gate declares GDN and FP16-KV causal"),
             },
         }
+    }
+    pub fn with_small_q8_projection(mut self) -> Self {
+        self.small_q8_projection = true;
+        self
     }
     pub fn prefill(kind: AttentionKind, maximum_tokens: u64) -> Self {
         assert!(maximum_tokens >= 2048);
@@ -219,6 +225,45 @@ impl ModelFamilyProvider for Family {
         } else {
             split_dense_leaf(&mut schema, "o");
             split_dense_leaf(&mut schema, "ffn_down");
+        }
+        if self.small_q8_projection {
+            // Replace one of the split o leaves; the other remains dense.
+            // Logical offsets and output stride therefore exercise a real
+            // mixed projection, rather than a standalone synthetic dot.
+            let tensor = schema
+                .tensors
+                .iter_mut()
+                .find(|t| t.id.as_str() == "weight.o")
+                .unwrap();
+            let PhysicalWeightLayout::Composite { parts } = &mut tensor.physical_layout else {
+                unreachable!()
+            };
+            let part = parts
+                .iter_mut()
+                .find(|p| matches!(p.layout.as_ref(), PhysicalWeightLayout::Dense { .. }))
+                .unwrap();
+            let PhysicalWeightLayout::Dense { component_id } = part.layout.as_ref() else {
+                unreachable!()
+            };
+            let component_id = component_id.clone();
+            let component = schema
+                .components
+                .iter_mut()
+                .find(|c| c.id == component_id)
+                .unwrap();
+            assert_eq!(part.extents, vec![32, HIDDEN]);
+            component.role = WeightComponentRole::PackedValues;
+            component.dimensions = vec![32, HIDDEN / 32];
+            component.encoding = WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                format_id: id("quantization.gguf.q8-0"),
+                logical_values_per_block: 32,
+                bytes_per_block: 34,
+            });
+            part.layout = Box::new(PhysicalWeightLayout::BlockQuantized {
+                blocks: PhysicalWeightComponentBinding::exact_contiguous(component_id),
+                block_axis: 1,
+                block_padding: PhysicalWeightPadding::Exact,
+            });
         }
         Ok(schema)
     }

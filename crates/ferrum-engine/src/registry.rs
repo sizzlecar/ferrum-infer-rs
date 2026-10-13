@@ -1213,6 +1213,7 @@ fn validate_causal_decode_preparation_mode(
 ) -> Result<()> {
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
+    validate_q8_projection_weight_preparation(config, plan_runtime)?;
     causal_decode_execution_context_limit(config)?;
     use ferrum_types::{
         AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
@@ -1318,6 +1319,23 @@ fn validate_q5_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) 
     Ok(())
 }
 
+fn validate_q8_projection_weight_preparation(
+    config: &ComponentConfig,
+    plan_runtime: bool,
+) -> Result<()> {
+    if config
+        .engine_config
+        .runtime
+        .q8_projection_weight_preparation
+        == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
+        && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime || !cfg!(feature = "cuda"))
+    {
+        return Err(FerrumError::unsupported(
+            "predecoded-f32 Q8 projection weights require a CUDA plan runtime and a supported strict Q8 projection numerical route",
+        ));
+    }
+    Ok(())
+}
 fn validate_registered_vnext_backend(
     kind: ferrum_models::vnext::ProductionExecutionKind,
     device: &Device,
@@ -1416,7 +1434,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_execution_context_limit(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_q8_projection_weight_preparation(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1431,6 +1449,7 @@ fn create_registered_vnext_executor(
                         config.engine_config.runtime.q4_mmvq_weight_decode,
                         config.engine_config.runtime.q5_mmvq_weight_decode,
                         causal_decode_execution_context_limit(config)?,
+                        config.engine_config.runtime.q8_projection_weight_preparation,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -3419,6 +3438,33 @@ mod tests {
         {
             config.device = Device::Metal;
             assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        }
+    }
+
+    #[test]
+    fn q8_projection_weight_preparation_checks_direct_config_before_default_return() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config
+                    .engine_config
+                    .runtime
+                    .q8_projection_weight_preparation =
+                    ferrum_types::Q8ProjectionWeightPreparation::Compressed;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                config
+                    .engine_config
+                    .runtime
+                    .q8_projection_weight_preparation =
+                    ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32;
+                assert_eq!(
+                    validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
+                    matches!(config.device, Device::CUDA(_))
+                        && plan_runtime
+                        && cfg!(feature = "cuda")
+                );
+            }
         }
     }
 

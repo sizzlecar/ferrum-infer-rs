@@ -126,7 +126,7 @@ pub struct Weights {
 }
 impl Weights {
     pub fn new(schema: &WeightSchema) -> Self {
-        let is_extra = |c: &WeightComponentSpec| matches!(&c.encoding,WeightEncoding::BlockQuantized(s) if matches!(s.format_id.as_str(),"quantization.gguf.q3-k"|"quantization.gguf.iq3-s"|"quantization.gguf.iq4-nl"));
+        let is_extra = |c: &WeightComponentSpec| matches!(&c.encoding,WeightEncoding::BlockQuantized(s) if matches!(s.format_id.as_str(),"quantization.gguf.q3-k"|"quantization.gguf.iq3-s"|"quantization.gguf.iq4-nl"|"quantization.gguf.q8-0"));
         let mut base_schema = schema.clone();
         base_schema.components.retain(|c| !is_extra(c));
         let base = attention_family::Weights::new(&base_schema);

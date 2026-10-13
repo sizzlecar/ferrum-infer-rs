@@ -155,6 +155,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub q5_mmvq_weight_decode: Option<crate::commands::Q5MmvqWeightDecodeArg>,
 
+    /// Q8 projection weight preparation (default: compressed). Predecoded F32 requires a CUDA plan runtime.
+    #[arg(long, value_enum)]
+    pub q8_projection_weight_preparation: Option<crate::commands::Q8ProjectionWeightPreparationArg>,
+
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -445,6 +449,7 @@ async fn execute_with_compatibility(
         causal_decode_attention_grouping,
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
+        q8_projection_weight_preparation,
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
@@ -917,6 +922,10 @@ async fn execute_with_compatibility(
     );
     push_q4_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q4_mmvq_weight_decode);
     push_q5_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q5_mmvq_weight_decode);
+    push_q8_projection_weight_preparation_cli_entry(
+        &mut startup_cli_runtime_entries,
+        q8_projection_weight_preparation,
+    );
     startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
         profile_detail.as_str(),
@@ -1696,6 +1705,17 @@ fn push_q5_mmvq_weight_decode_cli_entry(
         entries,
         ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
         mode.map(crate::commands::Q5MmvqWeightDecodeArg::as_runtime_value),
+    );
+}
+
+fn push_q8_projection_weight_preparation_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    mode: Option<crate::commands::Q8ProjectionWeightPreparationArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY,
+        mode.map(crate::commands::Q8ProjectionWeightPreparationArg::as_runtime_value),
     );
 }
 
@@ -4388,6 +4408,78 @@ mod tests {
             assert_eq!(
                 engine.runtime.q4_mmvq_weight_decode,
                 ferrum_types::Q4MmvqWeightDecode::SharedM8
+            );
+            assert_eq!(
+                engine.runtime.causal_decode_preparation_mode,
+                ferrum_types::CausalDecodePreparationMode::Packed
+            );
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+    #[test]
+    fn q8_projection_weight_preparation_serve_precedence_preserves_upload_policy() {
+        use crate::commands::Q8ProjectionWeightPreparationArg as Arg;
+        use ferrum_types::{
+            Q8ProjectionWeightPreparation as Mode,
+            Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY as KEY,
+        };
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Compressed, None),
+            (
+                Some(Mode::PredecodedF32),
+                None,
+                Mode::PredecodedF32,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::PredecodedF32),
+                Some(Arg::Compressed),
+                Mode::Compressed,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Compressed),
+                Some(Arg::PredecodedF32),
+                Mode::PredecodedF32,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                q8_projection_weight_preparation: config_mode,
+                q4_mmvq_weight_decode: Some(ferrum_types::Q4MmvqWeightDecode::SharedM8),
+                q5_mmvq_weight_decode: Some(ferrum_types::Q5MmvqWeightDecode::SharedM8),
+                causal_decode_preparation_mode: Some(
+                    ferrum_types::CausalDecodePreparationMode::Packed,
+                ),
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_q8_projection_weight_preparation_cli_entry(&mut cli_entries, cli_mode);
+            let snapshot = merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.q8_projection_weight_preparation, expected);
+            assert_eq!(
+                engine.runtime.q4_mmvq_weight_decode,
+                ferrum_types::Q4MmvqWeightDecode::SharedM8
+            );
+            assert_eq!(
+                engine.runtime.q5_mmvq_weight_decode,
+                ferrum_types::Q5MmvqWeightDecode::SharedM8
             );
             assert_eq!(
                 engine.runtime.causal_decode_preparation_mode,

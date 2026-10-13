@@ -274,6 +274,12 @@ pub(crate) struct CudaPlanBackingIdentity {
 }
 
 impl CudaBufferRegion {
+    pub(crate) const fn runtime_instance(&self) -> u64 {
+        self.runtime_instance
+    }
+    pub(crate) fn context(&self) -> &Arc<CudaContext> {
+        self._allocation._base.context()
+    }
     /// Physical offset in the retained allocation, including nested slices.
     /// This is shape/range evidence only; it does not confer Plan ownership.
     pub(crate) fn backing_byte_offset(&self) -> u64 {
@@ -3033,6 +3039,7 @@ pub struct CudaDeviceRuntime {
     execution_context_limit: Option<usize>,
     q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
     q4_shared_weight_decode_encodes: Arc<AtomicU64>,
     q5_shared_weight_decode_encodes: Arc<AtomicU64>,
     runtime_instance: u64,
@@ -3243,6 +3250,8 @@ impl CudaDeviceRuntime {
             execution_context_limit: None,
             q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
+            q8_projection_weight_preparation:
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed,
             q4_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
             q5_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
             runtime_instance,
@@ -3345,6 +3354,18 @@ impl CudaDeviceRuntime {
     pub fn with_q5_mmvq_weight_decode(mut self, mode: ferrum_types::Q5MmvqWeightDecode) -> Self {
         self.q5_mmvq_weight_decode = mode;
         self
+    }
+
+    pub fn with_q8_projection_weight_preparation(
+        mut self,
+        mode: ferrum_types::Q8ProjectionWeightPreparation,
+    ) -> Self {
+        self.q8_projection_weight_preparation = mode;
+        self
+    }
+
+    pub fn q8_projection_weight_preparation(&self) -> ferrum_types::Q8ProjectionWeightPreparation {
+        self.q8_projection_weight_preparation
     }
 
     /// Selected weight decoding for eligible original Q5_K M8 MMVQ plans.

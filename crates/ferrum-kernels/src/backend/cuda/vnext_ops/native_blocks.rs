@@ -2,13 +2,14 @@
 //! Provider registration and model closure are separate from these primitives.
 use std::sync::Arc;
 
-use super::super::vnext_runtime::CudaDeviceRuntimeError;
+use super::super::vnext_runtime::{CudaBufferRegion, CudaDeviceRuntimeError};
 use cudarc::{
     driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg},
     nvrtc::Ptx,
 };
 
 pub(super) mod hadamard;
+mod q8_predecode;
 pub(super) mod q8act;
 pub(super) mod upstream_linear;
 pub(super) mod weights;
@@ -32,6 +33,7 @@ fn q8_0_f16_row_tile(rows: u32, inputs: u32, outputs: u32, multiprocessors: u32)
 #[derive(Clone)]
 pub(super) struct CudaNativeBlockKernels {
     multiprocessors: u32,
+    q8_predecode_context: Arc<CudaContext>,
     pub linear_f16: CudaFunction,
     pub linear_f32: CudaFunction,
     linear_tiled_f16: CudaFunction,
@@ -41,6 +43,8 @@ pub(super) struct CudaNativeBlockKernels {
     linear_q4k_f16: CudaFunction,
     linear_q4k_tiled_f16: CudaFunction,
     linear_q8_0_f16: CudaFunction,
+    q8_0_predecode_f32: CudaFunction,
+    linear_q8_0_predecoded_f32_f16: CudaFunction,
     #[cfg(test)]
     linear_q8_0_tiled_f16: CudaFunction,
     linear_q5k_f16: CudaFunction,
@@ -180,6 +184,7 @@ impl CudaNativeBlockKernels {
         };
         Ok(Self {
             multiprocessors,
+            q8_predecode_context: context.clone(),
             linear_f16: load("vnext_gguf_linear_f16")?,
             linear_f32: load("vnext_gguf_linear_f32")?,
             linear_tiled_f16: load("vnext_gguf_linear_tiled_f16")?,
@@ -189,6 +194,8 @@ impl CudaNativeBlockKernels {
             linear_q4k_f16: load("vnext_gguf_linear_q4k_f16")?,
             linear_q4k_tiled_f16: load("vnext_gguf_linear_q4k_tiled_f16")?,
             linear_q8_0_f16: load("vnext_gguf_linear_q8_0_f16")?,
+            q8_0_predecode_f32: load("vnext_gguf_q8_0_predecode_f32")?,
+            linear_q8_0_predecoded_f32_f16: load("vnext_gguf_linear_q8_0_predecoded_f32_f16")?,
             #[cfg(test)]
             linear_q8_0_tiled_f16: load("vnext_gguf_linear_q8_0_tiled_f16")?,
             linear_q5k_f16: load("vnext_gguf_linear_q5k_f16")?,

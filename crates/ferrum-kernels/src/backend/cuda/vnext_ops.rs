@@ -1168,6 +1168,7 @@ impl CudaVNextComposition {
         q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
         q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
         execution_context_limit: Option<usize>,
+        q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         if causal_decode_attention_grouping
             == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
@@ -1247,6 +1248,7 @@ impl CudaVNextComposition {
             .with_causal_decode_attention_grouping(causal_decode_attention_grouping)
             .with_q4_mmvq_weight_decode(q4_mmvq_weight_decode)
             .with_q5_mmvq_weight_decode(q5_mmvq_weight_decode)
+            .with_q8_projection_weight_preparation(q8_projection_weight_preparation)
             .with_execution_context_limit(execution_context_limit),
         );
         let registry = cuda_vnext_operation_registry(&runtime)?;
@@ -1484,6 +1486,37 @@ impl CudaVNextComposition {
         q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
         execution_context_limit: Option<usize>,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_q8_projection_weight_preparation(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            causal_decode_preparation,
+            causal_decode_attention_grouping,
+            q4_mmvq_weight_decode,
+            q5_mmvq_weight_decode,
+            execution_context_limit,
+            ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_q8_projection_weight_preparation(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+        causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+        execution_context_limit: Option<usize>,
+        q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let composition = Self::prepare(
             ordinal,
             device_id,
@@ -1497,6 +1530,7 @@ impl CudaVNextComposition {
             q4_mmvq_weight_decode,
             q5_mmvq_weight_decode,
             execution_context_limit,
+            q8_projection_weight_preparation,
         )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
@@ -1676,6 +1710,30 @@ pub fn cuda_validated_native_operator_catalog_input_with_execution_context_limit
     q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
     execution_context_limit: Option<usize>,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_q8_projection_weight_preparation(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+    )
+}
+
+pub fn cuda_validated_native_operator_catalog_input_with_q8_projection_weight_preparation(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1689,6 +1747,7 @@ pub fn cuda_validated_native_operator_catalog_input_with_execution_context_limit
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
         execution_context_limit,
+        q8_projection_weight_preparation,
     )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
@@ -1797,6 +1856,30 @@ pub fn cuda_native_operator_catalog_input_with_execution_context_limit(
     q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
     execution_context_limit: Option<usize>,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_q8_projection_weight_preparation(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+    )
+}
+
+pub fn cuda_native_operator_catalog_input_with_q8_projection_weight_preparation(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1810,6 +1893,7 @@ pub fn cuda_native_operator_catalog_input_with_execution_context_limit(
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
         execution_context_limit,
+        q8_projection_weight_preparation,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }

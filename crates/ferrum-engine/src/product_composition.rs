@@ -101,6 +101,19 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         .map_err(|error| FerrumError::config(error.to_string()))?;
     let mut rejected = Vec::new();
     for profile in candidates {
+        if engine.runtime.q8_projection_weight_preparation
+            == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
+            && !profile.operations.iter().any(|operation| {
+                operation
+                    .composite_arithmetic
+                    .as_ref()
+                    .is_some_and(composite_supports_q8_preparation)
+            })
+        {
+            return Err(FerrumError::unsupported(
+                "predecoded-f32 Q8 projection weights require a selected supported upstream causal or GDN numerical route",
+            ));
+        }
         if engine.runtime.q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM8
             && !profile_has_shared_m8_q4_route(profile)
         {
@@ -290,6 +303,28 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             .collect::<Vec<_>>()
             .join("; ")
     )))
+}
+
+fn composite_supports_q8_preparation(
+    arithmetic: &ferrum_interfaces::vnext::CompositeNumericalArithmetic,
+) -> bool {
+    use ferrum_interfaces::vnext::UpstreamMarkerV2Profile as Profile;
+    // Match declared numerical contracts, not names of models or tensors.
+    // The provider separately decides whether any physical leaf is eligible.
+    [
+        Profile::GatedDelta,
+        Profile::GatedDeltaPrefill,
+        Profile::GatedDeltaExtraPrefill,
+        Profile::GatedDeltaExtraLargePrefill,
+        Profile::GatedDeltaExtraAllRows,
+        Profile::Causal,
+        Profile::CausalPrefill,
+        Profile::CausalExtraPrefill,
+        Profile::CausalExtraLargePrefill,
+        Profile::CausalExtraAllRows,
+    ]
+    .into_iter()
+    .any(|profile| profile.arithmetic() == *arithmetic)
 }
 
 fn profile_has_shared_m8_q4_route(
@@ -748,6 +783,33 @@ const fn decision_source_name(source: ResolutionDecisionSource) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q8_projection_weight_preparation_requires_wired_attention_numerics() {
+        use ferrum_interfaces::vnext::{
+            OperationId, UpstreamMarkerV2Profile as Profile, DENSE_SWIGLU_OPERATION_ID,
+        };
+        for profile in [
+            Profile::GatedDelta,
+            Profile::Causal,
+            Profile::GatedDeltaExtraAllRows,
+            Profile::CausalExtraAllRows,
+        ] {
+            assert!(composite_supports_q8_preparation(&profile.arithmetic()));
+        }
+        for profile in [
+            Profile::SwiGlu,
+            Profile::SwiGluG32MmqPrefill,
+            Profile::SwiGluExtraAllRows,
+            Profile::GatedDeltaG32MmqPrefill,
+            Profile::CausalG32MmqPrefill,
+        ] {
+            assert!(!composite_supports_q8_preparation(&profile.arithmetic()));
+        }
+        let mut unrelated = Profile::GatedDelta.arithmetic();
+        unrelated.strict_base.operation_id = OperationId::new(DENSE_SWIGLU_OPERATION_ID).unwrap();
+        assert!(!composite_supports_q8_preparation(&unrelated));
+    }
 
     #[test]
     fn int8_kv_resolves_attention_without_changing_storage_precision() {

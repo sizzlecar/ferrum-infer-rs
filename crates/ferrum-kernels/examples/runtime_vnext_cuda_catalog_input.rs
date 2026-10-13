@@ -4,18 +4,18 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_execution_context_limit;
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_q8_projection_weight_preparation;
 use ferrum_types::{
     AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
-    Q4MmvqWeightDecode, Q5MmvqWeightDecode,
+    Q4MmvqWeightDecode, Q5MmvqWeightDecode, Q8ProjectionWeightPreparation,
 };
 use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if !matches!(arguments.len(), 5 | 6 | 7 | 8 | 9 | 10) {
+    if !matches!(arguments.len(), 5 | 6 | 7 | 8 | 9 | 10 | 11) {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode] [q5-mmvq-weight-decode] [execution-context-limit]",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode] [q5-mmvq-weight-decode] [execution-context-limit] [q8-projection-weight-preparation]",
             arguments
                 .first()
                 .map(String::as_str)
@@ -51,7 +51,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .get(9)
         .map(|value| value.parse::<usize>())
         .transpose()?;
-    let snapshot = cuda_native_operator_catalog_input_with_execution_context_limit(
+    let q8_projection_weight_preparation = arguments
+        .get(10)
+        .map(|value| Q8ProjectionWeightPreparation::parse_runtime_value(value))
+        .transpose()?
+        .unwrap_or_default();
+    let snapshot = cuda_native_operator_catalog_input_with_q8_projection_weight_preparation(
         ordinal,
         DeviceId::new(format!("cuda:{ordinal}"))?,
         policy,
@@ -60,6 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
         execution_context_limit,
+        q8_projection_weight_preparation,
     )?;
     let capability_fingerprint = snapshot.capability_catalog().fingerprint()?;
     let (provider_catalog, capability_catalog) = snapshot.into_parts();
