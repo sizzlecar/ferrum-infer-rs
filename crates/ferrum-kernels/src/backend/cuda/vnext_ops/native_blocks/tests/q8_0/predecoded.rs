@@ -315,6 +315,14 @@ fn q8_0_predecoded_f32_pair_fusion_m8_m32_five_bank_on_cuda() {
     paired_layer_ring(&[8, 32], 5, 20, true);
 }
 
+#[test]
+#[ignore = "CUDA correctness for paired M2 decode and 75-token prefill"]
+fn q8_0_predecoded_f32_pair_fusion_m2_m75_correctness_on_cuda() {
+    // Reuse full compressed/independent/fused bits, fresh-input replay and
+    // guarded windows. One bank/pair is correctness coverage, not timing evidence.
+    paired_layer_ring(&[2, 75], 1, 1, true);
+}
+
 struct Bank {
     // Field order also destroys graphs before allocations if validation panics.
     graphs: [Captured; 2],

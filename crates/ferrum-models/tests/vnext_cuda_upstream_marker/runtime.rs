@@ -589,7 +589,7 @@ fn q8_predecoded_f32_matches_compressed_across_core_m1_m8_replay_and_fresh_reque
 #[test]
 #[ignore = "requires CUDA native MarkerV2, paired Q8 Plan preparation and Core replay"]
 fn q8_predecoded_f32_pair_matches_compressed_across_core_replay_and_offset_fallback() {
-    verify_q8_predecoded_preparation(&[1, 8, 32], Some(true));
+    verify_q8_predecoded_preparation(&[1, 2, 8, 32], Some(true));
     verify_q8_predecoded_preparation(&[8], Some(false));
 }
 
@@ -765,7 +765,7 @@ fn verify_q8_predecoded_preparation(participant_counts: &[usize], pair_adjacent:
                             assert_eq!(commands[0].participant_count(), participants as u32);
                             if participants > 1 {
                                 assert_eq!(commands[0].batching_form(), DeviceBatchingForm::Packed,
-                                "M8/M32 qualification must execute a physical packed projection");
+                                "multi-participant qualification must execute a physical packed projection");
                             }
                             commands[0].compute_dispatch_count()
                         });
