@@ -139,7 +139,9 @@ impl CudaUpstreamSwiGluProvider {
                     runtime.context(),
                     fingerprint,
                     ferrum_types::Q4MmvqWeightDecode::Baseline,
+                    ferrum_types::Q5MmvqWeightDecode::Baseline,
                     runtime.q4_shared_weight_decode_counter(),
+                    runtime.q5_shared_weight_decode_counter(),
                 )
                 .map_err(CudaDeviceRuntimeError::contract)?,
             ),

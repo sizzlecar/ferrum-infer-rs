@@ -42,6 +42,7 @@ impl Buffer {
 }
 
 #[test]
+#[cfg(feature = "cuda-q4-shared-weight-decode")]
 #[ignore = "requires CUDA and the locked additive Q4 MMVQ shared-weight native export"]
 fn prepared_shared_q4_mmvq_preserves_marker_buffers_and_rejects_ineligible_spans() {
     let context = CudaContext::new(0).unwrap();
@@ -57,20 +58,42 @@ fn prepared_shared_q4_mmvq_preserves_marker_buffers_and_rejects_ineligible_spans
         )),
     };
     for (inputs, outputs) in [(512, 17), (5120, 10240), (6144, 5120)] {
-        verify_prepared_shared_q4_mmvq(&stream, device, inputs, outputs);
+        verify_prepared_shared_mmvq(&stream, device, Format::Q4K, inputs, outputs);
     }
 }
 
-fn verify_prepared_shared_q4_mmvq(
+#[test]
+#[cfg(feature = "cuda-q5-shared-weight-decode")]
+#[ignore = "requires CUDA and the locked additive Q5 MMVQ shared-weight native export"]
+fn prepared_shared_q5_mmvq_preserves_marker_buffers_and_rejects_ineligible_spans() {
+    let context = CudaContext::new(0).unwrap();
+    unsafe { context.disable_event_tracking() };
+    let stream = context.new_stream().unwrap();
+    let attr = |key| u32::try_from(context.attribute(key).unwrap()).unwrap();
+    let device = Device {
+        architecture: attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR) * 100
+            + attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR) * 10,
+        multiprocessors: attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
+        maximum_dynamic_shared_bytes: u64::from(attr(
+            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )),
+    };
+    for (inputs, outputs) in [(512, 17), (5120, 10240), (6144, 5120)] {
+        verify_prepared_shared_mmvq(&stream, device, Format::Q5K, inputs, outputs);
+    }
+}
+
+fn verify_prepared_shared_mmvq(
     stream: &Arc<CudaStream>,
     device: Device,
+    format: Format,
     inputs: u32,
     outputs: u32,
 ) {
     let baseline = PreparedUpstreamLinear::new(
         Algorithm::Mmvq,
         Arithmetic::MarkerV2,
-        Format::Q4K,
+        format,
         Layout::Columns,
         8,
         inputs,
@@ -78,20 +101,31 @@ fn verify_prepared_shared_q4_mmvq(
         device,
     )
     .unwrap();
-    let shared = baseline
-        .clone()
-        .with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8)
-        .unwrap();
+    let select = |plan: PreparedUpstreamLinear| match format {
+        Format::Q4K => plan.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8),
+        Format::Q5K => plan.with_q5_mmvq_weight_decode(ferrum_types::Q5MmvqWeightDecode::SharedM8),
+        _ => unreachable!("shared MMVQ format"),
+    };
+    let shared = select(baseline.clone()).unwrap();
     assert_eq!(shared.geometry(), baseline.geometry());
     assert_eq!(
-        shared.q4_mmvq_weight_decode(),
-        ferrum_types::Q4MmvqWeightDecode::SharedM8
+        shared.q4_mmvq_weight_decode() == ferrum_types::Q4MmvqWeightDecode::SharedM8,
+        format == Format::Q4K
     );
+    assert_eq!(
+        shared.q5_mmvq_weight_decode() == ferrum_types::Q5MmvqWeightDecode::SharedM8,
+        format == Format::Q5K
+    );
+    let other_format = if format == Format::Q4K {
+        Format::Q5K
+    } else {
+        Format::Q4K
+    };
     for (algorithm, format, layout, rows) in [
-        (Algorithm::Mmvq, Format::Q4K, Layout::Columns, 4),
-        (Algorithm::Mmvq, Format::Q5K, Layout::Columns, 8),
-        (Algorithm::Mmvq, Format::Q4K, Layout::Channels, 8),
-        (Algorithm::Mmq, Format::Q4K, Layout::Columns, 8),
+        (Algorithm::Mmvq, format, Layout::Columns, 4),
+        (Algorithm::Mmvq, other_format, Layout::Columns, 8),
+        (Algorithm::Mmvq, format, Layout::Channels, 8),
+        (Algorithm::Mmq, format, Layout::Columns, 8),
     ] {
         let other = PreparedUpstreamLinear::new(
             algorithm,
@@ -104,12 +138,10 @@ fn verify_prepared_shared_q4_mmvq(
             device,
         )
         .unwrap();
-        assert!(matches!(
-            other.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8),
-            Err(Error::UnsupportedGeometry)
-        ));
+        assert!(matches!(select(other), Err(Error::UnsupportedGeometry)));
     }
     let geometry = baseline.geometry();
+    let block_bytes = if format == Format::Q5K { 176 } else { 144 };
     let input_stride = u64::from(inputs) + 3;
     let output_stride = u64::from(outputs) + 3;
     for nonfinite_input in [false, true] {
@@ -129,10 +161,14 @@ fn verify_prepared_shared_q4_mmvq(
             input.write(&stream, &input_bytes);
             let mut ws = vec![0_u8; usize::try_from(geometry.weight_bytes).unwrap()];
             let real_weight_bytes =
-                usize::try_from(u64::from(outputs) * u64::from(inputs / 256) * 144).unwrap();
+                usize::try_from(u64::from(outputs) * u64::from(inputs / 256) * block_bytes)
+                    .unwrap();
             assert!(real_weight_bytes <= ws.len());
             // The native plan owns padded output rows; keep that tail initialized.
-            for (block, data) in ws[..real_weight_bytes].chunks_exact_mut(144).enumerate() {
+            for (block, data) in ws[..real_weight_bytes]
+                .chunks_exact_mut(block_bytes as usize)
+                .enumerate()
+            {
                 data[..2].copy_from_slice(&f16::from_f32(0.001953125).to_bits().to_le_bytes());
                 data[2..4].copy_from_slice(&f16::from_f32(0.0009765625).to_bits().to_le_bytes());
                 data[4..16].fill(3);

@@ -381,8 +381,8 @@ static __device__ __forceinline__ float q4_shared_weight_dot(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE)
-// Standalone experiment only: retain Q5_K's integer-dot and floating-point
+#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE) || defined(FERRUM_Q5_SHARED_WEIGHT_DECODE)
+// Explicit Q5_K mode: retain the original integer-dot and floating-point
 // accumulation order, moving only column-independent weight decode outside j.
 struct Q5SharedWeightDecode {
     int v00, v01, v10, v11;
@@ -471,7 +471,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     static_assert(!shared_weight_decode || ((type == GGML_TYPE_Q4_K
-#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE)
+#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE) || defined(FERRUM_Q5_SHARED_WEIGHT_DECODE)
         || type == GGML_TYPE_Q5_K
 #endif
         ) && ncols_dst == 8 &&
@@ -617,7 +617,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
         }
-#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE)
+#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE) || defined(FERRUM_Q5_SHARED_WEIGHT_DECODE)
         else if constexpr (shared_weight_decode && type == GGML_TYPE_Q5_K) {
             const Q5SharedWeightDecode weights[2] = {
                 q5_shared_weight_decode(vx, kbx_offset + kbx, kqs),
@@ -995,7 +995,7 @@ extern "C" int ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1(
         return cudaGetLastError();
     });
 }
-#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE)
+#if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE) || defined(FERRUM_Q5_SHARED_WEIGHT_DECODE)
 extern "C" int ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1(
         const FerrumUpstreamLinearPlanV1 * p, const void * weights,
         const void * packed, void * output, void * fixup, void * stream) noexcept {

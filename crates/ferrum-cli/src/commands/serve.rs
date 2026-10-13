@@ -150,6 +150,9 @@ pub struct ServeCommand {
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub q4_mmvq_weight_decode: Option<crate::commands::Q4MmvqWeightDecodeArg>,
+    /// Q5_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
+    #[arg(long, value_enum)]
+    pub q5_mmvq_weight_decode: Option<crate::commands::Q5MmvqWeightDecodeArg>,
 
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
@@ -440,6 +443,7 @@ async fn execute_with_compatibility(
         causal_decode_preparation_mode,
         causal_decode_attention_grouping,
         q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
@@ -911,6 +915,7 @@ async fn execute_with_compatibility(
         causal_decode_attention_grouping,
     );
     push_q4_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q4_mmvq_weight_decode);
+    push_q5_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q5_mmvq_weight_decode);
     startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
         profile_detail.as_str(),
@@ -1682,6 +1687,16 @@ fn push_q4_mmvq_weight_decode_cli_entry(
         mode.map(crate::commands::Q4MmvqWeightDecodeArg::as_runtime_value),
     );
 }
+fn push_q5_mmvq_weight_decode_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    mode: Option<crate::commands::Q5MmvqWeightDecodeArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
+        mode.map(crate::commands::Q5MmvqWeightDecodeArg::as_runtime_value),
+    );
+}
 
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
@@ -2427,6 +2442,17 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         vllm_paged_attn: cfg!(feature = "vllm-paged-attn-v2"),
         cuda_indexed_causal_attention: cfg!(feature = "cuda-indexed-causal-attention"),
         cuda_q4_shared_weight_decode: cfg!(feature = "cuda-q4-shared-weight-decode"),
+        cuda_q5_shared_weight_decode: {
+            #[cfg(feature = "cuda")]
+            {
+                cfg!(feature = "cuda-q5-shared-weight-decode")
+                    && ferrum_kernels::backend::cuda::vnext_ops::q5_shared_weight_decode_compiled()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                false
+            }
+        },
         vllm_moe_marlin: cfg!(feature = "vllm-moe-marlin"),
         cuda_graph: cfg!(feature = "cuda"),
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
@@ -4278,6 +4304,70 @@ mod tests {
             let mut engine = ferrum_types::EngineConfig::default();
             engine.apply_runtime_config_snapshot(&snapshot).unwrap();
             assert_eq!(engine.runtime.q4_mmvq_weight_decode, expected);
+            assert_eq!(
+                engine.runtime.causal_decode_preparation_mode,
+                ferrum_types::CausalDecodePreparationMode::Packed
+            );
+            assert_eq!(
+                engine.runtime.program_binding_upload_strategy,
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter
+            );
+            let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
+            assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_serve_precedence_preserves_upload_policy() {
+        use crate::commands::Q5MmvqWeightDecodeArg as Arg;
+        use ferrum_types::{Q5MmvqWeightDecode as Mode, Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY as KEY};
+
+        for (config_mode, cli_mode, expected, source) in [
+            (None, None, Mode::Baseline, None),
+            (
+                Some(Mode::SharedM8),
+                None,
+                Mode::SharedM8,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::SharedM8),
+                Some(Arg::Baseline),
+                Mode::Baseline,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::Baseline),
+                Some(Arg::SharedM8),
+                Mode::SharedM8,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let config_entries = crate::config::RuntimeCliConfig {
+                q5_mmvq_weight_decode: config_mode,
+                q4_mmvq_weight_decode: Some(ferrum_types::Q4MmvqWeightDecode::SharedM8),
+                causal_decode_preparation_mode: Some(
+                    ferrum_types::CausalDecodePreparationMode::Packed,
+                ),
+                program_binding_upload_strategy: Some(
+                    ferrum_types::ProgramBindingUploadStrategy::CompactScatter,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_q5_mmvq_weight_decode_cli_entry(&mut cli_entries, cli_mode);
+            let snapshot = merge_runtime_config_sources(
+                config_entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.q5_mmvq_weight_decode, expected);
+            assert_eq!(
+                engine.runtime.q4_mmvq_weight_decode,
+                ferrum_types::Q4MmvqWeightDecode::SharedM8
+            );
             assert_eq!(
                 engine.runtime.causal_decode_preparation_mode,
                 ferrum_types::CausalDecodePreparationMode::Packed

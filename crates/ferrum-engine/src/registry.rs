@@ -1212,6 +1212,7 @@ fn validate_causal_decode_preparation_mode(
     plan_runtime: bool,
 ) -> Result<()> {
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
+    validate_q5_mmvq_weight_decode(config, plan_runtime)?;
     use ferrum_types::{
         AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
     };
@@ -1277,6 +1278,19 @@ fn validate_q4_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) 
     {
         return Err(FerrumError::unsupported(
             "shared-m8 Q4 weight decode requires a CUDA plan runtime with the cuda-q4-shared-weight-decode build feature and a Q4_K MarkerV2 MMVQ M8 numerical route",
+        ));
+    }
+    Ok(())
+}
+fn validate_q5_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
+    if config.engine_config.runtime.q5_mmvq_weight_decode
+        == ferrum_types::Q5MmvqWeightDecode::SharedM8
+        && (!matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || !cfg!(feature = "cuda-q5-shared-weight-decode"))
+    {
+        return Err(FerrumError::unsupported(
+            "shared-m8 Q5 weight decode requires a CUDA plan runtime with the cuda-q5-shared-weight-decode build feature and a Q5_K MarkerV2 MMVQ M8 numerical route",
         ));
     }
     Ok(())
@@ -1380,7 +1394,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_q4_mmvq_weight_decode(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_mmvq_weight_decode(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1393,6 +1407,7 @@ fn create_registered_vnext_executor(
                         config.engine_config.runtime.causal_decode_preparation_mode,
                         config.engine_config.runtime.causal_decode_attention_grouping,
                         config.engine_config.runtime.q4_mmvq_weight_decode,
+                        config.engine_config.runtime.q5_mmvq_weight_decode,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -3321,6 +3336,31 @@ mod tests {
             assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
         }
     }
+    #[test]
+    fn q5_mmvq_weight_decode_checks_direct_config_before_default_preparation_return() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config.engine_config.runtime.q5_mmvq_weight_decode =
+                    ferrum_types::Q5MmvqWeightDecode::Baseline;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                config.engine_config.runtime.q5_mmvq_weight_decode =
+                    ferrum_types::Q5MmvqWeightDecode::SharedM8;
+                assert_eq!(
+                    validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
+                    matches!(config.device, Device::CUDA(_))
+                        && plan_runtime
+                        && cfg!(feature = "cuda-q5-shared-weight-decode")
+                );
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        }
+    }
 
     #[test]
     fn q4_mmvq_weight_decode_rejects_unsupported_factories_before_loading() {
@@ -3339,5 +3379,23 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("shared-m8 Q4 weight decode"));
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_rejects_unsupported_factories_before_loading() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.q5_mmvq_weight_decode = ferrum_types::Q5MmvqWeightDecode::SharedM8;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("shared-m8 Q5 weight decode"));
+        config.device = Device::CUDA(0);
+        assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("shared-m8 Q5 weight decode"));
     }
 }

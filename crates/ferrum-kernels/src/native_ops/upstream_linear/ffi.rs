@@ -9,6 +9,15 @@ unsafe extern "C" {
         fixup: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+    #[cfg(feature = "cuda-q5-shared-weight-decode")]
+    pub(super) fn ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1(
+        plan: *const UpstreamLinearPlanV1,
+        weights: *const c_void,
+        packed: *const c_void,
+        output: *mut c_void,
+        fixup: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     pub(super) fn ferrum_upstream_mmq_prefill_plan_v1(
         r: *const UpstreamLinearRequestV1,
         p: *mut UpstreamLinearPlanV1,

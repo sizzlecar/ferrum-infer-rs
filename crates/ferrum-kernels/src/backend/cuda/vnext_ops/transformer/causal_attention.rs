@@ -506,6 +506,13 @@ impl CudaCausalPagedAttentionProvider {
                     .as_runtime_value()
                     .as_bytes(),
             );
+
+            provider_sources.push(
+                runtime
+                    .q5_mmvq_weight_decode()
+                    .as_runtime_value()
+                    .as_bytes(),
+            );
         }
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
@@ -723,7 +730,9 @@ impl CudaCausalPagedAttentionProvider {
                         descriptor.provider_implementation_fingerprint(),
                         upstream_profile.expect("upstream selected"),
                         runtime.q4_mmvq_weight_decode(),
+                        runtime.q5_mmvq_weight_decode(),
                         runtime.q4_shared_weight_decode_counter(),
+                        runtime.q5_shared_weight_decode_counter(),
                     )
                 })
                 .transpose()?,

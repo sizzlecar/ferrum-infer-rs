@@ -42,6 +42,7 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
         {
             continue;
         }
@@ -60,6 +61,7 @@ pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Ve
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
         {
             continue;
         }
@@ -237,6 +239,23 @@ mod tests {
     #[test]
     fn q4_mmvq_weight_decode_provenance_is_never_materialized_as_environment() {
         let key = ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "shared-m8", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(runtime_snapshot_value(&current, key), Some("shared-m8"));
+            assert_eq!(current.entries[0].source, source);
+        }
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
         let original = std::env::var_os(key);
         for source in [
             RuntimeConfigSource::Default,

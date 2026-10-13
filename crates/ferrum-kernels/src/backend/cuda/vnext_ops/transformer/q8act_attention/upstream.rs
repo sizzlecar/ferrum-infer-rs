@@ -33,7 +33,9 @@ impl Runtime {
         fingerprint: &str,
         profile: UpstreamMarkerV2Profile,
         q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
         shared_weight_decode_encodes: Option<Arc<std::sync::atomic::AtomicU64>>,
+        q5_shared_weight_decode_encodes: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<Arc<Self>, CudaDeviceRuntimeError> {
         Ok(Arc::new(Self {
             profile,
@@ -42,7 +44,9 @@ impl Runtime {
                 context,
                 fingerprint.to_owned(),
                 q4_weight_decode,
+                q5_weight_decode,
                 shared_weight_decode_encodes,
+                q5_shared_weight_decode_encodes,
             )
             .map_err(CudaDeviceRuntimeError::contract)?,
             validation: WeightValidationRegistry::default(),

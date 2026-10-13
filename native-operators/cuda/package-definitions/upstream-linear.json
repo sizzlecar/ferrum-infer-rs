@@ -26,7 +26,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -48,7 +49,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -70,7 +72,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -92,7 +95,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -113,7 +117,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -135,7 +140,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -282,7 +288,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -304,7 +311,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -326,7 +334,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -348,7 +357,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -369,7 +379,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -391,7 +402,8 @@
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
         "ferrum_upstream_mmvq_plan_v1",
-        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     }
   ],
@@ -411,7 +423,8 @@
     "ferrum_upstream_mmvq_pack_v1",
     "ferrum_upstream_mmvq_pack_v2",
     "ferrum_upstream_mmvq_plan_v1",
-    "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1"
+    "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
   ],
   "license_files": [
     {

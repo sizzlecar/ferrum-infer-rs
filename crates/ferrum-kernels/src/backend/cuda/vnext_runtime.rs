@@ -3031,7 +3031,9 @@ pub struct CudaDeviceRuntime {
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
     q4_shared_weight_decode_encodes: Arc<AtomicU64>,
+    q5_shared_weight_decode_encodes: Arc<AtomicU64>,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -3238,7 +3240,9 @@ impl CudaDeviceRuntime {
             causal_decode_attention_grouping:
                 ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
             q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
+            q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             q4_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
+            q5_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
             runtime_instance,
             context,
             allocation_stream,
@@ -3324,6 +3328,30 @@ impl CudaDeviceRuntime {
         (self.segment_binding_oracle
             == ferrum_interfaces::vnext::SegmentBindingOracleMode::CompareReference)
             .then(|| self.q4_shared_weight_decode_encodes.clone())
+    }
+
+    pub fn with_q5_mmvq_weight_decode(mut self, mode: ferrum_types::Q5MmvqWeightDecode) -> Self {
+        self.q5_mmvq_weight_decode = mode;
+        self
+    }
+
+    /// Selected weight decoding for eligible original Q5_K M8 MMVQ plans.
+    pub fn q5_mmvq_weight_decode(&self) -> ferrum_types::Q5MmvqWeightDecode {
+        self.q5_mmvq_weight_decode
+    }
+
+    /// Successful host enqueues under the explicit CompareReference diagnostic,
+    /// including capture. Disabled product execution does not update this counter.
+    /// Hot graph replay does not call the adapter and does not advance this
+    /// diagnostic counter; this is not a count of hardware kernel executions.
+    pub fn q5_shared_weight_decode_encodes(&self) -> u64 {
+        self.q5_shared_weight_decode_encodes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn q5_shared_weight_decode_counter(&self) -> Option<Arc<AtomicU64>> {
+        (self.segment_binding_oracle
+            == ferrum_interfaces::vnext::SegmentBindingOracleMode::CompareReference)
+            .then(|| self.q5_shared_weight_decode_encodes.clone())
     }
 
     pub(super) fn program_binding_upload_strategy(&self) -> ProgramBindingUploadStrategy {

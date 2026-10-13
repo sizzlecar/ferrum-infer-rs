@@ -129,6 +129,21 @@ impl Q4MmvqWeightDecodeArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Q5MmvqWeightDecodeArg {
+    Baseline,
+    SharedM8,
+}
+
+impl Q5MmvqWeightDecodeArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Baseline => ferrum_types::Q5MmvqWeightDecode::Baseline.as_runtime_value(),
+            Self::SharedM8 => ferrum_types::Q5MmvqWeightDecode::SharedM8.as_runtime_value(),
+        }
+    }
+}
+
 impl SequenceFitPolicyArg {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
@@ -209,6 +224,12 @@ mod tests {
             match self.command {
                 TestCommand::Run(command) => command.q4_mmvq_weight_decode,
                 TestCommand::Serve(command) => command.q4_mmvq_weight_decode,
+            }
+        }
+        fn q5_mmvq_weight_decode(self) -> Option<Q5MmvqWeightDecodeArg> {
+            match self.command {
+                TestCommand::Run(command) => command.q5_mmvq_weight_decode,
+                TestCommand::Serve(command) => command.q5_mmvq_weight_decode,
             }
         }
 
@@ -536,6 +557,39 @@ mod tests {
                 command,
                 "test-model",
                 "--q4-mmvq-weight-decode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .q5_mmvq_weight_decode(),
+                None
+            );
+            for (value, expected) in [
+                ("baseline", Q5MmvqWeightDecodeArg::Baseline),
+                ("shared-m8", Q5MmvqWeightDecodeArg::SharedM8),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--q5-mmvq-weight-decode",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.q5_mmvq_weight_decode(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--q5-mmvq-weight-decode",
                 "automatic",
             ])
             .is_err());
