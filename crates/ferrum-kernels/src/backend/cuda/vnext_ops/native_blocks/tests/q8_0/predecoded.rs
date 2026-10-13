@@ -434,9 +434,7 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize, fusi
             }
         }
         stream.synchronize().unwrap();
-        println!(
-            "{}",
-            serde_json::json!({
+        let mut plan = serde_json::json!({
                 "kind":if fusion { "q8_f32_pair_fusion_ring_plan" } else { "q8_f32_predecode_ring_plan" },
                 "product_status":"test_only_candidate",
                 "m":rows, "k":K, "n":N, "layers":LAYERS, "layers_per_bank":LAYERS,
@@ -454,6 +452,8 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize, fusi
                 "f32_bytes_per_observation":2*LAYERS*K*N*4, "q8_bytes_per_observation":2*LAYERS*WEIGHT_BYTES,
                 "cold_predecode_gpu_ns":banks.iter().map(|bank| bank.cold_gpu_ns).sum::<f64>(),
                 "cold_predecode_wall_ns":banks.iter().map(|bank| bank.cold_wall_ns).sum::<f64>(),
+        });
+        let scope = serde_json::json!({
                 "cold_scope":"device Q8-to-F32 conversions for all resident banks; allocation and upload excluded",
                 "device_l2_bytes":l2,
                 "working_set":if bank_count == 1 { "warm 96-leaf ring; may fit L2; no intervening model traffic" }
@@ -475,8 +475,11 @@ fn paired_layer_ring(row_counts: &[usize], bank_count: usize, pairs: usize, fusi
                 "all_output_bits_equal":true, "shared_window_guards":true, "fresh_input_replay":true,
                 "performance_threshold":null,
                 "excluded_from_hot_timing":["allocation","uploads","cold_predecode","graph_capture","reset","validation"]
-            })
-        );
+        });
+        plan.as_object_mut()
+            .unwrap()
+            .extend(scope.as_object().unwrap().clone());
+        println!("{plan}");
         for pair in 0..pairs {
             let bank = pair % bank_count;
             for position in 0..2 {
