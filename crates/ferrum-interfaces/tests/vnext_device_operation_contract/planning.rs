@@ -317,28 +317,82 @@ pub(super) fn resolved_model_plan_with_zero_state_and_policy(
     catalog: &CapabilityCatalog,
     retain_determinism_outputs: bool,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
+    resolved_model_plan_with_zero_state_policy_and_chain_nodes(
+        registry,
+        state_profile,
+        runtime_policy,
+        catalog,
+        retain_determinism_outputs,
+        None,
+    )
+}
+
+pub(super) fn resolved_model_plan_with_zero_state_policy_and_chain_nodes(
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    state_profile: TestStateProfile,
+    runtime_policy: &ResolvedRuntimePolicy,
+    catalog: &CapabilityCatalog,
+    retain_determinism_outputs: bool,
+    chain_nodes: Option<usize>,
+) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
-    let raw_config = test_raw_config(state_profile);
+    let mut raw_config = test_raw_config(state_profile);
+    if let Some(nodes) = chain_nodes {
+        raw_config["retention_chain_nodes"] = json!(nodes);
+    }
     let family = model_registry
         .registration
         .prepare_fixture(&raw_config)
         .unwrap();
-    let resolutions = vec![
-        node_resolution_with_state_profile(
-            &family,
-            catalog,
-            runtime_policy,
-            registry,
-            state_profile,
-        ),
-        tail_node_resolution_with_state_profile(
-            &family,
-            catalog,
-            runtime_policy,
-            registry,
-            state_profile,
-        ),
-    ];
+    let resolutions = if chain_nodes.is_some() {
+        family
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+            .map(|node| {
+                let input = node.inputs[0].as_str();
+                let output = node.outputs[0].as_str();
+                let input_resource = if input == "value.input" {
+                    "resource.input".to_owned()
+                } else {
+                    format!("resource.{input}")
+                };
+                let output_resource = format!("resource.{output}");
+                node_resolution_for(
+                    &family,
+                    catalog,
+                    runtime_policy,
+                    registry,
+                    node.id.as_str(),
+                    node_values_with_state_profile_for(
+                        input,
+                        &input_resource,
+                        output,
+                        &output_resource,
+                        state_profile,
+                    ),
+                )
+            })
+            .collect()
+    } else {
+        vec![
+            node_resolution_with_state_profile(
+                &family,
+                catalog,
+                runtime_policy,
+                registry,
+                state_profile,
+            ),
+            tail_node_resolution_with_state_profile(
+                &family,
+                catalog,
+                runtime_policy,
+                registry,
+                state_profile,
+            ),
+        ]
+    };
     let completion_retention = if retain_determinism_outputs {
         CompletionRetentionSpec::for_determinism_outputs(&family).unwrap()
     } else {

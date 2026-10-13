@@ -1691,7 +1691,8 @@ impl OperationDispatch {
         let pre_provider_command_count = commands.len();
         let mut encoded_provider_command_count = 0_usize;
         let mut program_bindings = Vec::new();
-        let mut retained_dependencies = Vec::new();
+        let mut retained_dependencies =
+            super::retained_dependency::RetainedPlanDependencyAccumulator::default();
         let mut retained_dependency_commands = Vec::new();
         let mut retained_dependency_leases = Vec::new();
         let mut program_binding_resources = BTreeSet::new();
@@ -1959,14 +1960,14 @@ impl OperationDispatch {
                         );
                         let program_binding_count = bindings.program_binding_count()
                             + usize::from(compiled_binding_nodes.contains(&binding_node_index));
-                        super::retained_dependency::append_dependencies(
-                            &dependency_scope,
-                            bindings.take_retained_plan_dependencies(),
-                            &mut retained_dependencies,
-                            &mut retained_dependency_commands,
-                            &mut retained_dependency_leases,
-                        )
-                        .map_err(SubmissionWaveDispatchError::Contract)?;
+                        retained_dependencies
+                            .append(
+                                &dependency_scope,
+                                bindings.take_retained_plan_dependencies(),
+                                &mut retained_dependency_commands,
+                                &mut retained_dependency_leases,
+                            )
+                            .map_err(SubmissionWaveDispatchError::Contract)?;
                         validate_segment_program_binding_patch(
                             resolved,
                             completion.wave().nodes()[binding_node_index].plan_node_index(),
@@ -2091,14 +2092,14 @@ impl OperationDispatch {
                     SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
                 );
                 let program_binding_count = operation.program_binding_count();
-                super::retained_dependency::append_dependencies(
-                    &dependency_scope,
-                    operation.take_retained_plan_dependencies(),
-                    &mut retained_dependencies,
-                    &mut retained_dependency_commands,
-                    &mut retained_dependency_leases,
-                )
-                .map_err(SubmissionWaveDispatchError::Contract)?;
+                retained_dependencies
+                    .append(
+                        &dependency_scope,
+                        operation.take_retained_plan_dependencies(),
+                        &mut retained_dependency_commands,
+                        &mut retained_dependency_leases,
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
                 validate_program_binding_patch(
                     resolved,
                     node_identity,
@@ -2241,14 +2242,14 @@ impl OperationDispatch {
                 );
                 let program_binding_count = operation.program_binding_count();
                 let retained_dependency_count = operation.retained_plan_dependency_count();
-                super::retained_dependency::append_dependencies(
-                    &dependency_scope,
-                    operation.take_retained_plan_dependencies(),
-                    &mut retained_dependencies,
-                    &mut retained_dependency_commands,
-                    &mut retained_dependency_leases,
-                )
-                .map_err(SubmissionWaveDispatchError::Contract)?;
+                retained_dependencies
+                    .append(
+                        &dependency_scope,
+                        operation.take_retained_plan_dependencies(),
+                        &mut retained_dependency_commands,
+                        &mut retained_dependency_leases,
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
                 validate_program_binding_patch(
                     resolved,
                     node_identity,
@@ -2379,7 +2380,7 @@ impl OperationDispatch {
                             reusable_execution_binding_nodes,
                         )
                         .map_err(SubmissionWaveDispatchError::Contract)?
-                        .with_retained_plan_dependencies(retained_dependencies),
+                        .with_retained_plan_dependencies(retained_dependencies.into_identities()),
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
             }

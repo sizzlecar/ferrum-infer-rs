@@ -1,6 +1,7 @@
 //! Authority for a wave prefix that reads immutable Plan weights and updates
 //! an owned, preserved Plan validation bank. This is deliberately independent
 //! of request-specific program binding slots.
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -372,3 +373,82 @@ pub(super) fn append_dependencies<C>(
     }
     Ok(())
 }
+
+/// One fresh wave's ordered dependency prefix. The index only narrows the
+/// original conflict/equality checks; it grants no ownership or authority.
+#[derive(Default)]
+pub(super) struct RetainedPlanDependencyAccumulator {
+    identities: Vec<RetainedPlanDependencyIdentity>,
+    by_resource: BTreeMap<crate::vnext::ResourceId, Vec<usize>>,
+}
+
+impl RetainedPlanDependencyAccumulator {
+    pub(super) fn as_slice(&self) -> &[RetainedPlanDependencyIdentity] {
+        &self.identities
+    }
+
+    pub(super) fn into_identities(self) -> Vec<RetainedPlanDependencyIdentity> {
+        self.identities
+    }
+
+    fn check_identity(
+        &self,
+        identity: &RetainedPlanDependencyIdentity,
+    ) -> Result<bool, VNextError> {
+        let resource = &identity.destination.descriptor.resource_id;
+        let mut duplicate = false;
+        if let Some(ordinals) = self.by_resource.get(resource) {
+            for &ordinal in ordinals {
+                let previous = &self.identities[ordinal];
+                let left = &previous.destination;
+                let right = &identity.destination;
+                // Generation and node do not partition this conflict
+                // domain: retain the complete original predicate.
+                if left.transaction == right.transaction
+                    && left.descriptor.resource_id == right.descriptor.resource_id
+                    && left.offset < right.offset + right.length
+                    && right.offset < left.offset + left.length
+                    && previous != identity
+                {
+                    return Err(invalid_operation(
+                        "retained dependency validation banks conflict",
+                    ));
+                }
+                duplicate |= previous == identity;
+            }
+        }
+        Ok(duplicate)
+    }
+
+    pub(super) fn append<C>(
+        &mut self,
+        scope: &Arc<()>,
+        dependencies: Vec<EncodedRetainedPlanDependency<C>>,
+        commands: &mut Vec<C>,
+        leases: &mut Vec<RetainedPlanDependencyAuthority>,
+    ) -> Result<(), VNextError> {
+        for dependency in dependencies {
+            if !Arc::ptr_eq(scope, &dependency.authority.scope) {
+                return Err(invalid_operation(
+                    "retained dependency was not issued by this live invocation",
+                ));
+            }
+            let identity = &dependency.authority.identity;
+            let resource = &identity.destination.descriptor.resource_id;
+            if !self.check_identity(identity)? {
+                self.by_resource
+                    .entry(resource.clone())
+                    .or_default()
+                    .push(self.identities.len());
+                self.identities.push(identity.clone());
+                commands.push(dependency.command);
+                leases.push(dependency.authority);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "retained_dependency_accumulator_tests.rs"]
+mod accumulator_tests;
