@@ -9,7 +9,9 @@ use crate::vnext::resource::StepPlanDependencyRetention;
 use std::hint::black_box;
 use std::sync::Mutex;
 use std::time::Instant;
-use vnext_device_operation_contract::{fixture_with_padded_persistent, TestRuntime};
+use vnext_device_operation_contract::{
+    fixture_with_padded_persistent, fixture_with_padded_persistent_nodes, Fixture, TestRuntime,
+};
 use vnext_device_operation_wave_contract::{
     prepare_wave, setup_with_fixture, teardown, wave_active_bindings,
 };
@@ -38,8 +40,14 @@ impl Issue {
 }
 
 fn with_issuer(run: impl FnOnce(&dyn Fn(&[Issue]) -> Vec<RetainedPlanDependencyAuthority>)) {
-    let (fixture, sequence, session, batch, step) =
-        setup_with_fixture(fixture_with_padded_persistent(4096));
+    with_fixture_issuer(fixture_with_padded_persistent(4096), run);
+}
+
+fn with_fixture_issuer(
+    fixture: Fixture,
+    run: impl FnOnce(&dyn Fn(&[Issue]) -> Vec<RetainedPlanDependencyAuthority>),
+) {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(fixture);
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active = wave_active_bindings(&wave, &session);
     let identity = crate::vnext::OperationDispatch::bind_submission_wave_identity(
@@ -334,6 +342,15 @@ fn inclusive_lifecycle(
     calls: usize,
     indexed: bool,
 ) -> usize {
+    inclusive_lifecycle_with_occurrences(templates, calls, 2, indexed)
+}
+
+fn inclusive_lifecycle_with_occurrences(
+    templates: &[Vec<RetainedPlanDependencyAuthority>],
+    calls: usize,
+    occurrences: usize,
+    indexed: bool,
+) -> usize {
     let store = Mutex::new(if indexed {
         RetentionArm::Indexed(StepPlanDependencyRetention::default())
     } else {
@@ -347,10 +364,7 @@ fn inclusive_lifecycle(
             let encoded = group
                 .iter()
                 .flat_map(|authority| {
-                    [
-                        copy_issued(authority).encode(()),
-                        copy_issued(authority).encode(()),
-                    ]
+                    (0..occurrences).map(move |_| copy_issued(authority).encode(()))
                 })
                 .collect();
             append_dependencies(
@@ -425,4 +439,88 @@ fn plan_dependency_retention_cpu_inclusive_paired() {
             }
         }
     });
+}
+
+#[test]
+#[ignore = "genuine admitted multi-node CPU diagnostic; recorded bank fanout is source-inferred, with no performance assertion"]
+fn plan_dependency_retention_cpu_admitted_nodes_paired() {
+    // Recorded prepared_projection_numerics order: attention/FFN at each of
+    // 64 layers. Only staged leaves issue these dependencies. This describes
+    // the recorded configuration plus issuer source, not a runtime counter.
+    const FANOUT: [usize; 128] = [
+        3, 3, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 3, 4, 3, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3, 3,
+        3, 3, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 1, 3, 3, 3, 3, 3,
+        3, 3, 1, 3, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 3,
+        3, 3, 3, 3, 4, 3, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 2, 3,
+        3, 3, 3, 3, 3, 3, 2, 1,
+    ];
+    with_fixture_issuer(
+        fixture_with_padded_persistent_nodes(32, FANOUT.len()),
+        |issue| {
+            let templates = FANOUT
+                .iter()
+                .enumerate()
+                .map(|(node, &banks)| {
+                    let specs = (0..banks)
+                        .map(|bank| Issue::bank(node, bank as u64))
+                        .collect::<Vec<_>>();
+                    let issued = issue(&specs);
+                    assert!(issued
+                        .iter()
+                        .all(|authority| authority.identity.node_id().as_str()
+                            == format!("node.retention.{node}")));
+                    issued
+                })
+                .collect::<Vec<_>>();
+            let expected = FANOUT.iter().sum::<usize>();
+            for (label, calls, occurrences) in [
+                ("ordinary_new_step_one_call_one_occurrence", 1, 1),
+                ("diagnostic_repeated_calls_and_duplicates", 3, 2),
+            ] {
+                assert_eq!(
+                    inclusive_lifecycle_with_occurrences(&templates, calls, occurrences, false),
+                    expected
+                );
+                assert_eq!(
+                    inclusive_lifecycle_with_occurrences(&templates, calls, occurrences, true),
+                    expected
+                );
+                for pair in 0..8 {
+                    let order = if pair % 2 == 0 {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    };
+                    let mut elapsed = [0_u128; 2];
+                    for indexed in order {
+                        let started = Instant::now();
+                        let mut total_retained = 0;
+                        for _ in 0..16 {
+                            total_retained += black_box(inclusive_lifecycle_with_occurrences(
+                                black_box(&templates),
+                                calls,
+                                occurrences,
+                                indexed,
+                            ));
+                        }
+                        elapsed[usize::from(indexed)] = started.elapsed().as_nanos();
+                        assert_eq!(total_retained, expected * 16);
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "kind":"plan_dependency_retention_admitted_nodes_cpu_pair",
+                            "geometry":label,"actual_admitted_nodes":FANOUT.len(),"unique_dependencies":expected,"node_fanout":FANOUT.as_slice(),
+                            "retention_calls":calls,"occurrences_per_dependency_per_call":occurrences,"pair":pair,
+                            "order":if pair % 2 == 0 {"scan,indexed"} else {"indexed,scan"},
+                            "iterations":16,"scan_ns":elapsed[0],"indexed_ns":elapsed[1],
+                            "debug_assertions":cfg!(debug_assertions),
+                            "scope":"genuine CPU Plan nodes and issuer ownership; recorded production fanout inferred from prepared config plus source; includes full unchanged append and retention lifecycle",
+                            "excluded":"initial provisioning/issuance, other Step backing resources and GPU; repeated/duplicate case is a stress diagnostic, not measured production frequency; no throughput claim"
+                        })
+                    );
+                }
+            }
+        },
+    );
 }
