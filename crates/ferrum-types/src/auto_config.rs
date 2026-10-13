@@ -1209,6 +1209,13 @@ impl FerrumConfigBuilder {
                 RuntimeConfigSource::Default,
             );
         }
+        if self.entry(crate::PREFILL_FIRST_POLICY_CONFIG_KEY).is_none() {
+            runtime_config.upsert(
+                crate::PREFILL_FIRST_POLICY_CONFIG_KEY,
+                crate::PrefillFirstPolicy::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if let Some(until) = default_prefill_first_until_active.as_ref() {
             if self
                 .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
@@ -1284,6 +1291,7 @@ impl FerrumConfigBuilder {
             default_active_decode_prefill_chunk,
         )?);
         decisions.push(self.prefill_decode_execution_decision()?);
+        decisions.push(self.prefill_first_policy_decision()?);
         decisions.push(self.invocation_preparation_strategy_decision()?);
         decisions.push(self.program_binding_upload_strategy_decision()?);
         decisions.push(self.segment_binding_owner_view_mode_decision()?);
@@ -2871,6 +2879,36 @@ impl FerrumConfigBuilder {
             source,
             source_key,
             ["split", "mixed"],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn prefill_first_policy_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::PREFILL_FIRST_POLICY_CONFIG_KEY;
+        let (policy, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::PrefillFirstPolicy::parse_runtime_value(&entry.effective_value).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::PrefillFirstPolicy::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        Ok(self.decision(
+            "scheduler_prefill_first_policy",
+            policy.as_runtime_value(),
+            source,
+            source_key,
+            ["active-target", "complete-admitted"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5514,6 +5552,67 @@ mod tests {
             .with_execution_resource_authority(authority)
             .resolve()
             .unwrap()
+    }
+
+    #[test]
+    fn prefill_first_policy_records_default_and_explicit_sources() {
+        let key = crate::PREFILL_FIRST_POLICY_CONFIG_KEY;
+        for (value, runtime_source, source) in [
+            (
+                None,
+                RuntimeConfigSource::Default,
+                AutoConfigSource::Default,
+            ),
+            (
+                Some("complete-admitted"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("active-target"),
+                RuntimeConfigSource::Env,
+                AutoConfigSource::Env,
+            ),
+            (
+                Some("complete-admitted"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+        ] {
+            let runtime = value
+                .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
+                .unwrap_or_default();
+            let resolved =
+                scheduler_resolution("metal", ExecutionResourceAuthority::PlanRuntime, 4, runtime);
+            let expected = value.unwrap_or("active-target");
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, expected);
+            assert_eq!(entry.source, runtime_source);
+            let decision = resolved
+                .decisions
+                .iter()
+                .find(|d| d.selection == "scheduler_prefill_first_policy")
+                .unwrap();
+            assert_eq!(decision.selected, expected);
+            assert_eq!(decision.source, source);
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.scheduler.prefill_first_policy.as_runtime_value(),
+                expected
+            );
+        }
+        assert!(
+            matches!(FerrumConfigBuilder::new(snapshot(&[(key, "automatic")])).resolve(),
+            Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+        );
     }
 
     #[test]

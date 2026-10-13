@@ -160,6 +160,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub scheduler_prefill_first_until_active: Option<usize>,
 
+    /// Initial prefill policy: active-target (default) or complete-admitted.
+    #[arg(long, value_enum)]
+    pub scheduler_prefill_first_policy: Option<crate::commands::PrefillFirstPolicyArg>,
+
     /// Cap per-request scheduler prefill chunks before they enter the engine.
     #[arg(long, value_name = "N")]
     pub scheduler_prefill_step_chunk: Option<usize>,
@@ -439,6 +443,7 @@ async fn execute_with_compatibility(
         scheduler_slo,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
+        scheduler_prefill_first_policy,
         scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
         scheduler_active_decode_prefill_token_budget,
@@ -924,6 +929,10 @@ async fn execute_with_compatibility(
         vnext_diagnostic_fault.map(crate::commands::VNextDiagnosticFaultArg::as_runtime_value),
     );
     push_sequence_fit_policy_cli_entry(&mut startup_cli_runtime_entries, sequence_fit_policy);
+    push_prefill_first_policy_cli_entry(
+        &mut startup_cli_runtime_entries,
+        scheduler_prefill_first_policy,
+    );
     if let Some(enabled) = batched_graph_cli_override(batched_graph, disable_batched_graph) {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
             "FERRUM_BATCHED_GRAPH",
@@ -1891,6 +1900,17 @@ fn push_sequence_fit_policy_cli_entry(
     );
 }
 
+fn push_prefill_first_policy_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    policy: Option<crate::commands::PrefillFirstPolicyArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::PREFILL_FIRST_POLICY_CONFIG_KEY,
+        policy.map(crate::commands::PrefillFirstPolicyArg::as_runtime_value),
+    );
+}
+
 fn push_cli_runtime_usize(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
     if let Some(value) = value {
         entries.push(RuntimeConfigEntry::new(
@@ -2601,6 +2621,60 @@ fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_prefill_first_policy_is_typed_and_cli_overrides_configuration() {
+        use clap::Parser;
+        use ferrum_types::{PrefillFirstPolicy as Policy, PREFILL_FIRST_POLICY_CONFIG_KEY as KEY};
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+        let default = TestCli::try_parse_from(["ferrum", "test-model"]).unwrap();
+        assert!(default.serve.scheduler_prefill_first_policy.is_none());
+        let configured = crate::config::RuntimeCliConfig {
+            scheduler_prefill_first_policy: Some(Policy::CompleteAdmitted),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let parsed = TestCli::try_parse_from([
+            "ferrum",
+            "test-model",
+            "--scheduler-prefill-first-policy",
+            "complete-admitted",
+        ])
+        .unwrap();
+        let mut cli = Vec::new();
+        push_prefill_first_policy_cli_entry(&mut cli, parsed.serve.scheduler_prefill_first_policy);
+        let effective = merge_runtime_config_sources(
+            configured,
+            RuntimeConfigSnapshot::from_env_vars([(KEY, "active-target")]),
+            cli,
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&effective).unwrap();
+        assert_eq!(
+            engine.scheduler.prefill_first_policy,
+            Policy::CompleteAdmitted
+        );
+        assert_eq!(
+            effective
+                .entries
+                .iter()
+                .find(|e| e.key == KEY)
+                .unwrap()
+                .source,
+            RuntimeConfigSource::Cli
+        );
+        assert!(TestCli::try_parse_from([
+            "ferrum",
+            "test-model",
+            "--scheduler-prefill-first-policy",
+            "automatic"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn segment_binding_owner_view_serve_precedence_preserves_upload_policy() {

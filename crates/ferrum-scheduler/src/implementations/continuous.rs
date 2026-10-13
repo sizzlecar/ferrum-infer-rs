@@ -49,8 +49,8 @@ use ferrum_interfaces::vnext::{
     AdmissionRejected, CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
 };
 use ferrum_types::{
-    BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
-    Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
+    BatchId, FerrumError, InferenceRequest, InferenceResponse, PrefillFirstPolicy, Priority,
+    RequestId, RequestState, Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
 };
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
@@ -776,6 +776,10 @@ pub struct ContinuousBatchScheduler {
     /// must share the steady-state token budget instead of pausing incumbents.
     fill_first_initial_cohort_armed: AtomicBool,
 
+    /// None before the optional barrier is sealed; Some(empty) stays sealed
+    /// until actual decode or full-idle rearm, so later arrivals cannot extend it.
+    initial_admitted_prefills: Mutex<Option<HashSet<RequestId>>>,
+
     /// Statistics
     completed_counter: AtomicU64,
     failed_counter: AtomicU64,
@@ -935,6 +939,7 @@ impl ContinuousBatchScheduler {
             request_index: RwLock::new(HashMap::new()),
             current_iteration: AtomicU64::new(0),
             fill_first_initial_cohort_armed: AtomicBool::new(true),
+            initial_admitted_prefills: Mutex::new(None),
             completed_counter: AtomicU64::new(0),
             failed_counter: AtomicU64::new(0),
             cancelled_counter: AtomicU64::new(0),
@@ -3283,6 +3288,7 @@ impl ContinuousBatchScheduler {
         waiting_admission: &mut WaitingAdmissionMode<'_>,
         _capacity_release_epoch: u64,
         capacity_mixed_recompute_epoch: u64,
+        admitted_cohort: Option<&HashSet<RequestId>>,
     ) -> Result<()> {
         if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
             return Ok(());
@@ -3291,6 +3297,9 @@ impl ContinuousBatchScheduler {
         let mut prefill_queue = self.prefill_queue.write();
         self.prioritize_ttft(&mut prefill_queue);
         for req in prefill_queue.iter_mut() {
+            if admitted_cohort.is_some_and(|cohort| !cohort.contains(&req.inner.request.id)) {
+                continue;
+            }
             if batch_requests.len() >= hint.max_batch_size {
                 break;
             }
@@ -3641,6 +3650,46 @@ impl ContinuousBatchScheduler {
         Ok(())
     }
 
+    fn initial_admitted_prefills_for_iteration(
+        &self,
+        target_reached: bool,
+    ) -> Option<HashSet<RequestId>> {
+        // Snapshot queues separately, before taking the policy lock: existing
+        // completion uses queue -> lifecycle-index, and submission uses
+        // lifecycle-index -> policy. No new reverse lock edge is introduced.
+        let admitted = self
+            .prefill_queue
+            .read()
+            .iter()
+            .map(|request| request.inner.request.id.clone())
+            .collect::<HashSet<_>>();
+        let unfinished = self
+            .request_index
+            .read()
+            .iter()
+            .filter(|(_, phase)| {
+                !matches!(
+                    phase,
+                    RequestPhase::Decoding
+                        | RequestPhase::Completed
+                        | RequestPhase::Cancelled
+                        | RequestPhase::AdmissionFailed
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        let mut cohort = self.initial_admitted_prefills.lock();
+        if cohort.is_none() && target_reached {
+            *cohort = Some(admitted);
+        }
+        let pending = cohort.as_mut()?;
+        // A capacity-deferred member can return to Waiting before its prefill
+        // completes. It stays pending so the existing no-runnable-prefill
+        // decode escape, rather than a false completion, releases the barrier.
+        pending.retain(|id| unfinished.contains(id));
+        Some(pending.clone())
+    }
+
     fn create_iteration_batch_with_admission(
         &self,
         hint: BatchHint,
@@ -3670,7 +3719,7 @@ impl ContinuousBatchScheduler {
         let capacity_backpressure_active = self.capacity_backpressure_admit_limit().is_some();
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
-        let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
+        let may_skip_initial_decode = fill_first_initial_cohort_armed
             && !(self.config.slo.is_some() && decoding_count > 0)
             && !(self
                 .runtime_config
@@ -3681,9 +3730,25 @@ impl ContinuousBatchScheduler {
                 || self.prefix_held_waiting_count() == 0)
             && prefill_first_target > 0
             && decoding_count < prefill_first_target
-            && active_count < prefill_first_target
-            && !(capacity_backpressure_active && decoding_count > 0)
-            && (self.prefilling_count() > 0 || self.waiting_count() > 0);
+            && !(capacity_backpressure_active && decoding_count > 0);
+        let admitted_cohort = if may_skip_initial_decode
+            && self.config.prefill_first_policy == PrefillFirstPolicy::CompleteAdmitted
+        {
+            self.initial_admitted_prefills_for_iteration(active_count >= prefill_first_target)
+        } else {
+            None
+        };
+        let skip_decode_for_prefill_first = may_skip_initial_decode
+            && admitted_cohort.as_ref().map_or_else(
+                || {
+                    active_count < prefill_first_target
+                        && (self.prefilling_count() > 0 || self.waiting_count() > 0)
+                },
+                |pending| !pending.is_empty(),
+            );
+        let admitted_cohort_filter = skip_decode_for_prefill_first
+            .then_some(admitted_cohort.as_ref())
+            .flatten();
         // First, collect decode requests (they have priority). The opt-in
         // fill-first experiment skips decodes until the active decode cohort
         // reaches the requested target, reducing early mixed prefill+decode
@@ -3815,6 +3880,7 @@ impl ContinuousBatchScheduler {
             &mut waiting_admission,
             capacity_release_epoch,
             capacity_mixed_recompute_epoch,
+            admitted_cohort_filter,
         )?;
 
         // Check if we should admit new requests from waiting queue.
@@ -3907,6 +3973,7 @@ impl ContinuousBatchScheduler {
             &mut waiting_admission,
             capacity_release_epoch,
             capacity_mixed_recompute_epoch,
+            admitted_cohort_filter,
         )?;
 
         // Fill-first is a throughput policy, not permission to deadlock. A
@@ -3932,6 +3999,9 @@ impl ContinuousBatchScheduler {
         if fill_first_initial_cohort_armed && scheduled_decode_count > 0 {
             self.fill_first_initial_cohort_armed
                 .store(false, Ordering::Release);
+            if self.config.prefill_first_policy == PrefillFirstPolicy::CompleteAdmitted {
+                *self.initial_admitted_prefills.lock() = None;
+            }
         }
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -4288,6 +4358,9 @@ impl Scheduler for ContinuousBatchScheduler {
         // under the index write lock makes the idle transition exact with
         // respect to concurrent completion and submission.
         if request_index.is_empty() {
+            if self.config.prefill_first_policy == PrefillFirstPolicy::CompleteAdmitted {
+                *self.initial_admitted_prefills.lock() = None;
+            }
             self.fill_first_initial_cohort_armed
                 .store(true, Ordering::Release);
         }
@@ -4638,6 +4711,7 @@ mod tests {
     use ferrum_types::{ModelId, SamplingParams};
 
     mod active_decode_budget;
+    mod complete_admitted;
     mod slo_policy;
 
     fn create_test_request(priority: Priority) -> InferenceRequest {

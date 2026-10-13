@@ -269,6 +269,9 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
     pub scheduler_prefill_first_until_active: Option<usize>,
+    /// Initial prefill cohort completion policy; omitted retains active-target.
+    #[serde(default)]
+    pub scheduler_prefill_first_policy: Option<ferrum_types::PrefillFirstPolicy>,
     /// Bound one optional wait for an in-flight exact prefix. Disabled when absent.
     #[serde(default)]
     pub prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
@@ -533,6 +536,12 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
             self.scheduler_prefill_first_until_active,
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::PREFILL_FIRST_POLICY_CONFIG_KEY,
+            self.scheduler_prefill_first_policy
+                .map(ferrum_types::PrefillFirstPolicy::as_runtime_value),
         );
         push_usize_entry(
             &mut entries,
@@ -1139,6 +1148,27 @@ mod tests {
         );
         assert_eq!(config.server.port, 8000);
         assert!(config.models.default_model.is_none());
+    }
+
+    #[test]
+    fn prefill_first_policy_config_file_is_typed_and_rejects_invalid_values() {
+        for value in ["active-target", "complete-admitted"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\nscheduler_prefill_first_policy = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|e| e.key == ferrum_types::PREFILL_FIRST_POLICY_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nscheduler_prefill_first_policy = \"automatic\"\n"
+        )
+        .is_err());
     }
 
     #[test]

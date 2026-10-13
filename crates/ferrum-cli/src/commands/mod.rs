@@ -3,6 +3,23 @@
 use clap::ValueEnum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PrefillFirstPolicyArg {
+    ActiveTarget,
+    CompleteAdmitted,
+}
+
+impl PrefillFirstPolicyArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::ActiveTarget => ferrum_types::PrefillFirstPolicy::ActiveTarget.as_runtime_value(),
+            Self::CompleteAdmitted => {
+                ferrum_types::PrefillFirstPolicy::CompleteAdmitted.as_runtime_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PrefillDecodeExecutionArg {
     Split,
     Mixed,

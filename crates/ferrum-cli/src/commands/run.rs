@@ -899,6 +899,10 @@ pub struct RunCommand {
     #[arg(long, value_name = "TARGETS")]
     pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
 
+    /// Initial prefill policy: active-target (default) or complete-admitted.
+    #[arg(long, value_enum)]
+    pub scheduler_prefill_first_policy: Option<crate::commands::PrefillFirstPolicyArg>,
+
     /// Cap total prefill tokens per scheduler iteration with active decode; 0 disables.
     #[arg(long, value_name = "N")]
     pub scheduler_active_decode_prefill_token_budget: Option<usize>,
@@ -2765,6 +2769,12 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        ferrum_types::PREFILL_FIRST_POLICY_CONFIG_KEY,
+        cmd.scheduler_prefill_first_policy
+            .map(crate::commands::PrefillFirstPolicyArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         "FERRUM_SEQUENCE_FIT_POLICY",
         cmd.sequence_fit_policy
             .map(crate::commands::SequenceFitPolicyArg::as_runtime_value),
@@ -2950,6 +2960,64 @@ mod tests {
             max_tokens,
             ..SamplingParams::default()
         }
+    }
+
+    #[test]
+    fn run_prefill_first_policy_is_typed_and_cli_overrides_configuration() {
+        use clap::Parser;
+        use ferrum_types::{PrefillFirstPolicy as Policy, PREFILL_FIRST_POLICY_CONFIG_KEY as KEY};
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+        let default = TestCli::try_parse_from(["ferrum", "test-model"]).unwrap();
+        assert!(default.run.scheduler_prefill_first_policy.is_none());
+        let mut config = CliConfig::default();
+        config.runtime.scheduler_prefill_first_policy = Some(Policy::CompleteAdmitted);
+        let configured = run_base_runtime_config(&config, RuntimeConfigSnapshot::default());
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&configured).unwrap();
+        assert_eq!(
+            engine.scheduler.prefill_first_policy,
+            Policy::CompleteAdmitted
+        );
+        let env = run_base_runtime_config(
+            &config,
+            RuntimeConfigSnapshot::from_env_vars([(KEY, "active-target")]),
+        );
+        engine.apply_runtime_config_snapshot(&env).unwrap();
+        assert_eq!(engine.scheduler.prefill_first_policy, Policy::ActiveTarget);
+        let parsed = TestCli::try_parse_from([
+            "ferrum",
+            "test-model",
+            "--scheduler-prefill-first-policy",
+            "complete-admitted",
+        ])
+        .unwrap();
+        let effective =
+            run_effective_runtime_config(&env, &run_startup_cli_runtime_entries(&parsed.run, None));
+        engine.apply_runtime_config_snapshot(&effective).unwrap();
+        assert_eq!(
+            engine.scheduler.prefill_first_policy,
+            Policy::CompleteAdmitted
+        );
+        assert_eq!(
+            effective
+                .entries
+                .iter()
+                .find(|e| e.key == KEY)
+                .unwrap()
+                .source,
+            RuntimeConfigSource::Cli
+        );
+        assert!(TestCli::try_parse_from([
+            "ferrum",
+            "test-model",
+            "--scheduler-prefill-first-policy",
+            "automatic"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -3214,6 +3282,7 @@ mod tests {
             causal_decode_preparation_mode: None,
             causal_decode_attention_grouping: None,
             scheduler_slo: None,
+            scheduler_prefill_first_policy: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
             prefix_rendezvous_max_wait_ms: None,
