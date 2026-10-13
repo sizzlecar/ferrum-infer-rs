@@ -1,4 +1,4 @@
-//! Test-only fixed-capacity Indexed replay. Each original row has one slot in
+//! Fixed-capacity Indexed replay. Each original row has one slot in
 //! both maps; fresh device lengths choose exactly one of its existing V1/V2
 //! algorithms. No CPU row permutation or sequence frontier enters the closure.
 use super::*;
@@ -13,6 +13,41 @@ pub(super) struct FixedBatchDecode {
 }
 
 impl FixedBatchDecode {
+    pub(super) fn packed_work(&self) -> Option<PackedDecodeWork> {
+        self.packed_work
+    }
+
+    pub(super) fn dispatch_count(
+        &self,
+        launches: &[CausalAttentionLaunch],
+        output_gate: bool,
+        post_norm: bool,
+    ) -> u64 {
+        6 + u64::from(post_norm)
+            + if self
+                .packed_work
+                .and_then(PackedDecodeWork::prepare)
+                .is_some()
+            {
+                1
+            } else {
+                launches.len() as u64
+            }
+            + 1
+            + if self.v2.is_some() { 3 } else { 1 }
+            + if !output_gate {
+                0
+            } else if self
+                .packed_work
+                .and_then(PackedDecodeWork::gate_tokens)
+                .is_some()
+            {
+                1
+            } else {
+                launches.len() as u64
+            }
+    }
+
     pub(super) fn for_launches(
         launches: &[CausalAttentionLaunch],
         packed: bool,
@@ -82,7 +117,7 @@ impl FixedBatchDecode {
         mut key: CudaCommandReplayKeyBuilder,
     ) -> CudaCommandReplayKeyBuilder {
         key = key
-            .bytes(b"test.causal-fixed-capacity.v1")
+            .bytes(b"ferrum.cuda.causal-fixed-capacity.v1")
             .i32(self.participants)
             .boolean(self.v2.is_some());
         for group in std::iter::once(&self.v1).chain(self.v2.iter()) {

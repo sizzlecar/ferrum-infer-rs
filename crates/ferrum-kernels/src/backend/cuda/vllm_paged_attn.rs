@@ -566,7 +566,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_indexed_batch_raw(
     }
 }
 
-/// Test-only fixed-capacity indexed launch with an identity-or-inactive map.
+/// Fixed-capacity indexed launch with an identity-or-inactive map.
 ///
 /// # Safety
 /// The map has exactly one entry per original row; entry i is i or -1. Each
@@ -577,7 +577,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_indexed_batch_raw(
 /// indexed ABI still hold, including full M-by-capacity V2 scratch. Inactive
 /// entries are rejected by the native kernel before any original-row access.
 #[allow(clippy::too_many_arguments)]
-#[cfg(all(test, feature = "cuda-indexed-causal-attention"))]
+#[cfg(feature = "cuda-indexed-causal-attention")]
 pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_fixed_masked_batch_raw(
     stream: &CudaStream,
     out: u64,

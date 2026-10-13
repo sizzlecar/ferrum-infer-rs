@@ -174,6 +174,8 @@ pub enum CausalDecodeAttentionGrouping {
     #[default]
     Contiguous,
     Indexed,
+    /// Preserve decode command capacities while current device lengths select V1/V2 rows.
+    FixedCapacity,
 }
 
 impl CausalDecodeAttentionGrouping {
@@ -181,6 +183,7 @@ impl CausalDecodeAttentionGrouping {
         match self {
             Self::Contiguous => "contiguous",
             Self::Indexed => "indexed",
+            Self::FixedCapacity => "fixed-capacity",
         }
     }
 
@@ -188,7 +191,10 @@ impl CausalDecodeAttentionGrouping {
         match raw.trim().to_ascii_lowercase().as_str() {
             "contiguous" => Ok(Self::Contiguous),
             "indexed" => Ok(Self::Indexed),
-            _ => Err(format!("expected contiguous or indexed; got {raw:?}")),
+            "fixed-capacity" => Ok(Self::FixedCapacity),
+            _ => Err(format!(
+                "expected contiguous, indexed or fixed-capacity; got {raw:?}"
+            )),
         }
     }
 
@@ -1747,6 +1753,7 @@ mod tests {
         for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
             for mode in [
                 CausalDecodeAttentionGrouping::Indexed,
+                CausalDecodeAttentionGrouping::FixedCapacity,
                 CausalDecodeAttentionGrouping::Contiguous,
             ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
@@ -1757,6 +1764,13 @@ mod tests {
                 config.apply_runtime_config_snapshot(&snapshot).unwrap();
                 assert_eq!(config.runtime.causal_decode_attention_grouping, mode);
                 assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                assert_eq!(
+                    serde_json::from_value::<CausalDecodeAttentionGrouping>(
+                        serde_json::to_value(mode).unwrap()
+                    )
+                    .unwrap(),
+                    mode
+                );
                 config
                     .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
                     .unwrap();
@@ -1822,28 +1836,31 @@ mod tests {
     #[test]
     fn causal_decode_attention_grouping_environment_cannot_activate_or_override_typed_config() {
         let key = CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
-        let mut config = EngineConfig::default();
-        assert!(config
-            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
-                key, "indexed"
-            )]))
-            .unwrap_err()
-            .contains("not environment"));
-        assert_eq!(
-            config.runtime.causal_decode_attention_grouping,
-            CausalDecodeAttentionGrouping::Contiguous
-        );
-        config.runtime.causal_decode_attention_grouping = CausalDecodeAttentionGrouping::Indexed;
-        assert!(config
-            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
-                key,
-                "contiguous"
-            )]))
-            .is_err());
-        assert_eq!(
-            config.runtime.causal_decode_attention_grouping,
-            CausalDecodeAttentionGrouping::Indexed
-        );
+        for grouping in [
+            CausalDecodeAttentionGrouping::Indexed,
+            CausalDecodeAttentionGrouping::FixedCapacity,
+        ] {
+            let mut config = EngineConfig::default();
+            assert!(config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    key,
+                    grouping.as_runtime_value()
+                )]))
+                .unwrap_err()
+                .contains("not environment"));
+            assert_eq!(
+                config.runtime.causal_decode_attention_grouping,
+                CausalDecodeAttentionGrouping::Contiguous
+            );
+            config.runtime.causal_decode_attention_grouping = grouping;
+            assert!(config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    key,
+                    "contiguous"
+                )]))
+                .is_err());
+            assert_eq!(config.runtime.causal_decode_attention_grouping, grouping);
+        }
     }
 
     #[test]
