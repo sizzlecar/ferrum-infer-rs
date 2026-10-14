@@ -15,6 +15,8 @@ const DELTA: &str = "ferrum_test_gdn_delta_implicit_single_token_tiled16_interle
 
 #[path = "implicit_control/pinned_host.rs"]
 mod pinned_host;
+#[path = "implicit_control/singleton_controls.rs"]
+mod singleton_controls;
 
 fn shape(actual: bool) -> AttentionShape {
     let mut s = super::super::tests::test_shape();
