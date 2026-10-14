@@ -513,3 +513,6 @@ fn recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on
         branch_gpu.assert_unchanged(&stream);
     }
 }
+
+#[path = "recurrent_tests/implicit_control.rs"]
+mod implicit_control;
