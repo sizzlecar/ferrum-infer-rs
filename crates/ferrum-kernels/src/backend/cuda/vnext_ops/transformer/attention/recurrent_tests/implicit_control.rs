@@ -17,6 +17,8 @@ const DELTA: &str = "ferrum_test_gdn_delta_implicit_single_token_tiled16_interle
 mod pinned_host;
 #[path = "implicit_control/singleton_controls.rs"]
 mod singleton_controls;
+#[path = "implicit_control/singleton_product.rs"]
+mod singleton_product;
 
 fn shape(actual: bool) -> AttentionShape {
     let mut s = super::super::tests::test_shape();
@@ -233,6 +235,24 @@ impl Layer {
         lengths: u64,
         indices: u64,
     ) {
+        self.enqueue_math_with_control(
+            stream,
+            f,
+            arm,
+            lengths,
+            indices,
+            AttentionControl::Explicit,
+        );
+    }
+    fn enqueue_math_with_control(
+        &self,
+        stream: &Arc<CudaStream>,
+        f: &AttentionFunctions,
+        arm: usize,
+        lengths: u64,
+        indices: u64,
+        control: AttentionControl,
+    ) {
         let a = &self.arms[arm];
         let s = self.shape;
         let cuda = s.cuda_shape().unwrap();
@@ -240,7 +260,10 @@ impl Layer {
         let m = self.counts.len();
         launch_prepare(AttentionPrepareRequest {
             stream,
-            function: &f.prepare_negative_rate,
+            function: match control {
+                AttentionControl::Explicit => &f.prepare_negative_rate,
+                AttentionControl::ImplicitSingleton => &f.prepare_implicit_singleton,
+            },
             buffers: AttentionPrepareBuffers {
                 qkvzba: self.raw.pointer(stream),
                 conv_weight: self.weight.pointer(stream),
@@ -299,6 +322,7 @@ impl Layer {
             m as i32,
             tokens as i32,
             cuda,
+            control,
         )
         .unwrap();
         launch_gated_norm(
