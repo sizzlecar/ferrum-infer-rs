@@ -432,6 +432,29 @@ extern "C" int ferrum_upstream_mmq_dot_v1(const FerrumUpstreamLinearPlanV1 * p,
             static_cast<float *>(fixup),static_cast<cudaStream_t>(stream),0);
     });
 }
+#if defined(FERRUM_TEST_MMQ_FULL_TILE_STREAM_K)
+// Same public plan/pack and MMQ specialization. Only this TEST entry changes
+// the stream-K grid to one complete output tile per block and omits fixup.
+// Partial-sum boundaries change, so cross-route float bit equality is not assumed.
+extern "C" int ferrum_test_upstream_mmq_full_tile_dot_v1(const FerrumUpstreamLinearPlanV1 * p,
+        const void * weights,const void * packed,void * output,void * fixup,void * stream) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmqPlan native{}; if (!upstream_mmq_valid(p,native)) return -1;
+        if (native.rows != 8 || native.j != 8 || native.i != 128 || native.nthreads != 256) return -2;
+        // Preserve the original public plan's pointer/alignment requirements,
+        // including its declared fixup scratch, before selecting the private grid.
+        if (!weights || !packed || !output || (native.fixup && !fixup) ||
+                uintptr_t(weights)%4 || uintptr_t(packed)%16 ||
+                uintptr_t(output)%4 || uintptr_t(fixup)%4) return -5;
+        const uint64_t tiles = uint64_t(native.tiles_y) * ((native.rows + native.j - 1)/native.j);
+        if (!tiles || tiles > UINT32_MAX) return -3;
+        native.blocks = uint32_t(tiles);
+        native.fixup = 0;
+        return ferrum_test_mmq_dot(&native,weights,packed,static_cast<float *>(output),
+            nullptr,static_cast<cudaStream_t>(stream),0);
+    });
+}
+#endif
 extern "C" int ferrum_upstream_mmq_cast_v1(const FerrumUpstreamLinearPlanV1 * p,
         const void * input,void * output,uint32_t stride,void * stream) noexcept {
     return ferrum_upstream_boundary([&]() -> int {

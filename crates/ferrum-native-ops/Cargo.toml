@@ -18,6 +18,8 @@ cuda-upstream-iq4-shared-weight-decode-tests = ["cuda-upstream-shared-weight-dec
 cuda-upstream-small-shared-weight-decode-tests = ["cuda-upstream-shared-weight-decode-tests"]
 # Test-only F16 input pack exports; production pack and dot routes stay unchanged.
 cuda-upstream-direct-f16-pack-tests = ["cuda-upstream-shared-weight-decode-tests"]
+# Test-only full-output-tile MMQ dot supplied by the independent experiment TU.
+cuda-upstream-full-tile-stream-k-tests = ["cuda-upstream-shared-weight-decode-tests"]
 
 [dependencies]
 ferrum-types = { workspace = true }

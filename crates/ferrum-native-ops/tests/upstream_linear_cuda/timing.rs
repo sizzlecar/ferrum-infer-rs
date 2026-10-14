@@ -36,6 +36,10 @@ mod batch_width_boundary;
 #[path = "timing/direct_f16_pack.rs"]
 mod direct_f16_pack;
 
+#[cfg(feature = "cuda-upstream-full-tile-stream-k-tests")]
+#[path = "timing/full_tile_stream_k.rs"]
+mod full_tile_stream_k;
+
 type MmvqDot = unsafe extern "C" fn(
     *const UpstreamLinearPlanV1,
     *const c_void,
@@ -216,6 +220,24 @@ impl Route {
         index: usize,
         dot: MmvqDot,
     ) {
+        self.enqueue_with_native_dot(
+            stream,
+            input,
+            weight,
+            index,
+            ffi::ferrum_upstream_mmq_dot_v1,
+            dot,
+        );
+    }
+    fn enqueue_with_native_dot(
+        &self,
+        stream: &Stream,
+        input: &Buffer,
+        weight: *const c_void,
+        index: usize,
+        mmq_dot: MmvqDot,
+        mmvq_dot: MmvqDot,
+    ) {
         let p = &self.plan;
         unsafe {
             let flag = self.flags.ptr.add(index * 4);
@@ -235,7 +257,7 @@ impl Route {
                         self.rows.ptr,
                         stream.0,
                     ));
-                    ok(ffi::ferrum_upstream_mmq_dot_v1(
+                    ok(mmq_dot(
                         p,
                         weight,
                         self.packed.ptr,
@@ -263,7 +285,7 @@ impl Route {
                         self.rows.ptr,
                         stream.0,
                     ));
-                    ok(dot(
+                    ok(mmvq_dot(
                         p,
                         weight,
                         self.packed.ptr,
