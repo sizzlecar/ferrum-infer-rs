@@ -1580,10 +1580,55 @@ pub(super) struct IdleChunkReclaimCandidate {
     pub(super) chunk_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// Shared immutable claim metadata, not a resource lease. Every projection
+/// still validates its current pool, generation, membership and physical range.
+#[derive(Debug, Clone)]
 pub struct PhysicalBackingClaimIdentity {
     pool_id: DynamicBackingPoolId,
-    resource_ids: Vec<ResourceId>,
+    resource_ids: Arc<[ResourceId]>,
+    shared: bool,
+}
+
+impl PartialEq for PhysicalBackingClaimIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.pool_id == other.pool_id
+            && (Arc::ptr_eq(&self.resource_ids, &other.resource_ids)
+                || self.resource_ids.as_ref() == other.resource_ids.as_ref())
+    }
+}
+
+impl Eq for PhysicalBackingClaimIdentity {}
+
+impl PartialOrd for PhysicalBackingClaimIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PhysicalBackingClaimIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.pool_id.cmp(&other.pool_id).then_with(|| {
+            if Arc::ptr_eq(&self.resource_ids, &other.resource_ids) {
+                std::cmp::Ordering::Equal
+            } else {
+                self.resource_ids.as_ref().cmp(other.resource_ids.as_ref())
+            }
+        })
+    }
+}
+
+impl Serialize for PhysicalBackingClaimIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut identity = serializer.serialize_struct("PhysicalBackingClaimIdentity", 2)?;
+        identity.serialize_field("pool_id", &self.pool_id)?;
+        identity.serialize_field("resource_ids", self.resource_ids.as_ref())?;
+        identity.end()
+    }
 }
 
 impl PhysicalBackingClaimIdentity {
@@ -1597,9 +1642,11 @@ impl PhysicalBackingClaimIdentity {
                 "physical backing claim identity requires unique logical resources",
             ));
         }
+        let shared = resource_ids.len() > 1;
         Ok(Self {
             pool_id,
-            resource_ids,
+            resource_ids: resource_ids.into(),
+            shared,
         })
     }
 
@@ -1612,9 +1659,13 @@ impl PhysicalBackingClaimIdentity {
     }
 
     pub const fn is_shared(&self) -> bool {
-        self.resource_ids.len() > 1
+        self.shared
     }
 }
+
+#[cfg(test)]
+#[path = "physical_backing_claim_identity_tests.rs"]
+mod physical_backing_claim_identity_tests;
 
 #[derive(Clone)]
 pub(super) struct EvaluatedBackingProjection<'a> {
