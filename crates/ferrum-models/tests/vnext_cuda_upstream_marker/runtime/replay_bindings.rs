@@ -78,3 +78,220 @@ fn marker_binding_only_decode_replay_preserves_causal_kv_and_ffn_state() {
         compare_waves(AttentionKind::Causal, participants, 1, false);
     }
 }
+
+#[test]
+#[ignore = "requires exclusive CUDA, actual MMQ prefill and fresh GDN state allocations"]
+fn mmq_prefill_cold_capture_and_fresh_request_replay_cost() {
+    use ferrum_types::InvocationPreparationStrategy;
+    use std::time::Instant;
+
+    struct Preparation;
+    impl InvocationPreparationSink for Preparation {
+        fn record_preparation(&self, _: InvocationPreparationStats) {}
+    }
+    fn elapsed_ns(start: Instant) -> u64 {
+        u64::try_from(start.elapsed().as_nanos()).unwrap()
+    }
+    fn execute(
+        fixture: &Fixture,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: &Arc<[u32]>,
+        range: Range<usize>,
+        path: Path,
+    ) -> BatchObservation {
+        fixture.execute_participant_ranges_with_preparation(
+            &fixture.lane,
+            &fixture.reaper,
+            std::slice::from_ref(session),
+            std::slice::from_ref(tokens),
+            &[range],
+            path,
+            InvocationPreparationStrategy::Full,
+            &Preparation,
+            Some(16),
+        )
+    }
+    fn state_pointers(observation: &BatchObservation) -> Vec<u64> {
+        let rows = observation.binding_rows.as_ref().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 16);
+        let pointers = rows[0]
+            .chunks_exact(8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(pointers.iter().all(|pointer| *pointer != 0));
+        pointers
+    }
+
+    // Two admitted slots keep the old request's real state alive while a new
+    // request executes. Each submission still has exactly one participant.
+    // Both arms use the same weights, initial state and tokens. This is a Core
+    // mechanism diagnostic, not full-model or ShareGPT performance evidence.
+    let width = 54;
+    let kind = AttentionKind::GatedDelta;
+    let arms = ["eager", "reusable"];
+    let mut totals = [0_u64; 2];
+    let fixtures = [false, true].map(|reusable| {
+        let arm = usize::from(reusable);
+        let start = Instant::now();
+        let fixture = Fixture::for_family(kind, reusable, 2, Family::prefill(kind, 2048));
+        let wall_ns = elapsed_ns(start);
+        totals[arm] += wall_ns;
+        println!(
+            "{}",
+            serde_json::json!({"kind":"prefill_capture_cost_stage",
+            "arm":arms[arm],"stage":"fixture_cold_prepare","wall_ns":wall_ns,
+            "inventory":fixture.lane.reusable_executable_preparation().unwrap()})
+        );
+        fixture
+    });
+    let tokens: Arc<[u32]> = (0..2 * width)
+        .map(|position| ((position * 7 + 1) % 32) as u32)
+        .collect();
+    let sessions = fixtures.each_ref().map(|fixture| {
+        let arm = usize::from(fixture.reusable_bucket.is_some());
+        let start = Instant::now();
+        let session = fixture.admit("prefill-capture-original", Arc::clone(&tokens));
+        let wall_ns = elapsed_ns(start);
+        totals[arm] += wall_ns;
+        println!(
+            "{}",
+            serde_json::json!({"kind":"prefill_capture_cost_stage",
+            "arm":arms[arm],"stage":"original_admission","wall_ns":wall_ns})
+        );
+        session
+    });
+
+    let mut old_pointers = [Vec::new(), Vec::new()];
+    for wave in 0..2 {
+        let observations = [0, 1].map(|arm| {
+            let fixture = &fixtures[arm];
+            let before = fixture.lane.reusable_executable_preparation().unwrap();
+            let start = Instant::now();
+            let observation = execute(
+                fixture,
+                &sessions[arm],
+                &tokens,
+                wave * width..(wave + 1) * width,
+                if arm == 0 { Path::Eager } else { Path::Warm },
+            );
+            let wall_ns = elapsed_ns(start);
+            totals[arm] += wall_ns;
+            old_pointers[arm] = state_pointers(&observation);
+            println!(
+                "{}",
+                serde_json::json!({"kind":"prefill_capture_cost_stage",
+                "arm":arms[arm],"stage":if wave==0 {"first_warm"} else {"capture_and_upload"},
+                "range":[wave*width,(wave+1)*width],"wall_ns":wall_ns,
+                "inventory_before":before,
+                "inventory_after":fixture.lane.reusable_executable_preparation().unwrap()})
+            );
+            observation
+        });
+        observations[0].assert_same(&observations[1]);
+        assert_eq!(
+            observations[1].values[&(0, "output".into())].len(),
+            width * HIDDEN as usize * 4
+        );
+        observations[1].dump(kind, 1, wave * width..(wave + 1) * width, Path::Warm);
+    }
+    let captured = fixtures[1].lane.reusable_executable_preparation().unwrap();
+    assert!(
+        captured.captured_executables() > 0,
+        "prefill must actually capture"
+    );
+    assert!(
+        captured.uploaded_executables() > 0,
+        "prefill must actually upload"
+    );
+    assert!(
+        captured.resident_executables() > 0,
+        "prefill must retain executable inventory"
+    );
+    assert_eq!(
+        captured.captured_executables(),
+        captured.uploaded_executables()
+    );
+    assert_eq!(
+        captured.uploaded_executables(),
+        captured.resident_executables()
+    );
+
+    let fresh_tokens: Arc<[u32]> = (0..width)
+        .map(|position| ((position * 5 + 3) % 32) as u32)
+        .collect();
+    let fresh_sessions = fixtures.each_ref().map(|fixture| {
+        let arm = usize::from(fixture.reusable_bucket.is_some());
+        let start = Instant::now();
+        let session = fixture.admit("prefill-capture-fresh", Arc::clone(&fresh_tokens));
+        let wall_ns = elapsed_ns(start);
+        totals[arm] += wall_ns;
+        println!(
+            "{}",
+            serde_json::json!({"kind":"prefill_capture_cost_stage",
+            "arm":arms[arm],"stage":"fresh_admission_old_owner_live","wall_ns":wall_ns})
+        );
+        session
+    });
+    let fresh = [0, 1].map(|arm| {
+        let start = Instant::now();
+        let observation = execute(
+            &fixtures[arm],
+            &fresh_sessions[arm],
+            &fresh_tokens,
+            0..width,
+            if arm == 0 { Path::Eager } else { Path::Replay },
+        );
+        let wall_ns = elapsed_ns(start);
+        totals[arm] += wall_ns;
+        let pointers = state_pointers(&observation);
+        assert!(
+            pointers
+                .iter()
+                .all(|pointer| !old_pointers[arm].contains(pointer)),
+            "fresh GDN conv and recurrent state must not reuse either live old state pointer"
+        );
+        println!(
+            "{}",
+            serde_json::json!({"kind":"prefill_capture_cost_stage",
+            "arm":arms[arm],"stage":"fresh_request_complete","wall_ns":wall_ns,
+            "path":if arm==0 {"Eager"} else {"ReplayedOnly"},
+            "old_state_pointers":old_pointers[arm],"fresh_state_pointers":pointers,
+            "inventory":fixtures[arm].lane.reusable_executable_preparation().unwrap()})
+        );
+        observation
+    });
+    fresh[0].assert_same(&fresh[1]);
+    assert_eq!(
+        fresh[1].values[&(0, "output".into())].len(),
+        width * HIDDEN as usize * 4
+    );
+    assert_eq!(
+        captured,
+        fixtures[1].lane.reusable_executable_preparation().unwrap(),
+        "fresh request must reuse the captured inventory without recapture or eviction"
+    );
+    fresh[1].dump(kind, 1, 0..width, Path::Replay);
+    for arm in [0, 1] {
+        let start = Instant::now();
+        fresh_sessions[arm].try_complete().unwrap();
+        sessions[arm].try_complete().unwrap();
+        let wall_ns = elapsed_ns(start);
+        totals[arm] += wall_ns;
+        println!(
+            "{}",
+            serde_json::json!({"kind":"prefill_capture_cost_stage",
+            "arm":arms[arm],"stage":"complete_both_requests","wall_ns":wall_ns})
+        );
+    }
+    println!(
+        "{}",
+        serde_json::json!({"kind":"prefill_cold_capture_fresh_request_diagnostic",
+        "prefill_tokens":width,"active_slots":2,"submitted_participants":1,
+        "full_output_and_state_bits_equal":true,"fresh_physical_state_distinct":true,
+        "fresh_replayed_only":true,"fresh_inventory_unchanged":true,
+        "eager_total_wall_ns":totals[0],"reusable_total_wall_ns":totals[1],
+        "cost_scope":"cold fixture preparation, both admissions, first warm, capture/upload, fresh replay, terminal completion; each execution includes full readback; independent oracle comparison and fixture teardown excluded",
+        "limit":"single GDN+FFN Core shape, fixed arm order, no whole-model throughput claim"})
+    );
+}
