@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::super::{
     BatchWorkShape, ClaimedSubmissionWaveBacking, ContractVersion, DeviceDescriptor,
@@ -46,10 +46,18 @@ pub struct ReusableExecutionTopologyRequest<'a> {
     scratch_resource: Option<&'a super::super::ResourceId>,
     binding_resource: Option<&'a super::super::ResourceId>,
     persistent_resource: Option<&'a super::super::ResourceId>,
-    memory: &'a MemoryPlan,
     work_shape: &'a BatchWorkShape,
+    address_scopes: &'a CurrentReusableAddressScopes<'a>,
+}
+
+/// Pure address-scope lookup shared only by one topology derivation. The
+/// immutable inputs are owned by this borrow, so a memo cannot be rebound to
+/// another wave or used as physical backing/replay authority.
+pub(super) struct CurrentReusableAddressScopes<'a> {
+    memory: &'a MemoryPlan,
     claimed_backing: &'a ClaimedSubmissionWaveBacking,
     step_backing: &'a [LogicalBackingSliceAuthority],
+    memo: Mutex<HashMap<super::super::ResourceId, Option<DeviceReusableAddressScope>>>,
 }
 
 /// How one resolved value address enters a resident reusable executable.
@@ -103,10 +111,8 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
         scratch_resource: Option<&'a super::super::ResourceId>,
         binding_resource: Option<&'a super::super::ResourceId>,
         persistent_resource: Option<&'a super::super::ResourceId>,
-        memory: &'a MemoryPlan,
         work_shape: &'a BatchWorkShape,
-        claimed_backing: &'a ClaimedSubmissionWaveBacking,
-        step_backing: &'a [LogicalBackingSliceAuthority],
+        address_scopes: &'a CurrentReusableAddressScopes<'a>,
     ) -> Result<Self, VNextError> {
         if work_shape.participants().is_empty() {
             return Err(invalid_operation(
@@ -121,10 +127,8 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
             scratch_resource,
             binding_resource,
             persistent_resource,
-            memory,
             work_shape,
-            claimed_backing,
-            step_backing,
+            address_scopes,
         })
     }
 
@@ -169,7 +173,7 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
                 "reusable topology coordinate ownership requires one resource component",
             ));
         };
-        resource_uses_packed_batch_coordinates(self.memory, component.resource_id())
+        resource_uses_packed_batch_coordinates(self.address_scopes.memory, component.resource_id())
     }
 
     /// Resolves one complete provider address contract. Every value binding
@@ -313,6 +317,44 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
         &self,
         resource_id: &super::super::ResourceId,
     ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        self.address_scopes.lookup(resource_id)
+    }
+}
+
+impl<'a> CurrentReusableAddressScopes<'a> {
+    pub(super) fn new(
+        memory: &'a MemoryPlan,
+        claimed_backing: &'a ClaimedSubmissionWaveBacking,
+        step_backing: &'a [LogicalBackingSliceAuthority],
+    ) -> Self {
+        Self {
+            memory,
+            claimed_backing,
+            step_backing,
+            memo: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lookup(
+        &self,
+        resource_id: &super::super::ResourceId,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        let mut memo = self
+            .memo
+            .lock()
+            .map_err(|_| invalid_operation("reusable address scope memo lock poisoned"))?;
+        if let Some(scope) = memo.get(resource_id) {
+            return Ok(*scope);
+        }
+        let scope = self.lookup_uncached(resource_id)?;
+        memo.insert(resource_id.clone(), scope);
+        Ok(scope)
+    }
+
+    fn lookup_uncached(
+        &self,
+        resource_id: &super::super::ResourceId,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
         if self
             .memory
             .static_allocations()
@@ -355,6 +397,10 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "registry/address_scope_tests.rs"]
+mod address_scope_tests;
 
 fn merge_reusable_address_scope(
     left: DeviceReusableAddressScope,
