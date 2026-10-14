@@ -607,3 +607,6 @@ extern "C" int ferrum_upstream_mmq_cast_v2(const FerrumUpstreamLinearPlanV1 * p,
         return cudaGetLastError();
     });
 }
+
+// Additive capability: existing MMQ entrypoints retain ordered execution.
+#include "mmq-pdl.cuh"

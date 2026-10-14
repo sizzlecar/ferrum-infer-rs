@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.upstream_linear",
   "source_package_kind": "ferrum-native-upstream-linear",
-  "source_package_revision": "marker-v2-mmvq-programmatic-chain-r1-q4-q5-shared-m4-m8-weight+d81235049384534c167caea52b85a694f6103d14",
+  "source_package_revision": "marker-v2-mmq-mmvq-programmatic-chain-r1-q4-q5-shared-m4-m8-weight+d81235049384534c167caea52b85a694f6103d14",
   "upstream_sources": [
     {
       "repository": "https://github.com/ggml-org/llama.cpp.git",
@@ -19,6 +19,7 @@
     "kernels/abi.h",
     "kernels/boundary.h",
     "kernels/marker.cuh",
+    "kernels/mmq-pdl.cuh",
     "llama/ggml/include/ggml-alloc.h",
     "llama/ggml/include/ggml-backend.h",
     "llama/ggml/include/ggml-cuda.h",
@@ -61,6 +62,7 @@
         "kernels/abi.h",
         "kernels/boundary.h",
         "kernels/marker.cuh",
+        "kernels/mmq-pdl.cuh",
         "llama/ggml/include/ggml-alloc.h",
         "llama/ggml/include/ggml-backend.h",
         "llama/ggml/include/ggml-cuda.h",

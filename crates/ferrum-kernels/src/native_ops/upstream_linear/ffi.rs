@@ -1,5 +1,39 @@
 use super::*;
 unsafe extern "C" {
+    #[cfg(ferrum_native_mmq_pdl)]
+    pub(super) fn ferrum_upstream_mmq_programmatic_support_v1(
+        plan: *const UpstreamLinearPlanV1,
+        supported: *mut u32,
+    ) -> i32;
+    #[cfg(ferrum_native_mmq_pdl)]
+    pub(super) fn ferrum_upstream_mmq_programmatic_pack_f16_small_v2(
+        plan: *const UpstreamLinearPlanV1,
+        input: *const c_void,
+        stride: u32,
+        converted: *mut c_void,
+        packed: *mut c_void,
+        rows: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    #[cfg(ferrum_native_mmq_pdl)]
+    pub(super) fn ferrum_upstream_mmq_programmatic_dot_v1(
+        plan: *const UpstreamLinearPlanV1,
+        weights: *const c_void,
+        packed: *const c_void,
+        output: *mut c_void,
+        fixup: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    #[cfg(ferrum_native_mmq_pdl)]
+    pub(super) fn ferrum_upstream_mmq_programmatic_cast_v2(
+        plan: *const UpstreamLinearPlanV1,
+        input: *const c_void,
+        output: *mut c_void,
+        stride: u32,
+        rows: *const c_void,
+        weights: *const c_void,
+        stream: *mut c_void,
+    ) -> i32;
     #[cfg(ferrum_native_mmvq_pdl)]
     pub(super) fn ferrum_upstream_mmvq_pdl_support_v1(
         plan: *const UpstreamLinearPlanV1,

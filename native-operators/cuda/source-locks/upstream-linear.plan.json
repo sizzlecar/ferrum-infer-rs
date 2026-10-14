@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.upstream_linear",
   "source_package": {
     "kind": "ferrum-native-upstream-linear",
-    "revision": "marker-v2-mmvq-programmatic-chain-r1-q4-q5-shared-m4-m8-weight+d81235049384534c167caea52b85a694f6103d14",
-    "sha256": "3c6e1b229b33092a1f7b2c38092d0673fe3d3d8310f32b1631de1eedc47537c6"
+    "revision": "marker-v2-mmq-mmvq-programmatic-chain-r1-q4-q5-shared-m4-m8-weight+d81235049384534c167caea52b85a694f6103d14",
+    "sha256": "1c5c010e809a477b37f3c8ef191bcbf7effb7a10ed33511432ab27e0886cf9d7"
   },
   "upstream_sources": [
     {
@@ -20,7 +20,7 @@
     },
     {
       "path": "kernels/mmq.cu",
-      "sha256": "598a131582e47e53f8bad75afedbfbe80e1c676ca3227b3e47dd0969211cc10d"
+      "sha256": "9f4cfa98fac7bd4c454c9462a10299734f2587500d40b424bb1f7fc0e4bf84c2"
     },
     {
       "path": "kernels/mmvq.cu",
@@ -39,6 +39,10 @@
     {
       "path": "kernels/marker.cuh",
       "sha256": "c9b6b880cc02000bd3518162e911a51106124f4017947ec7451d490830576416"
+    },
+    {
+      "path": "kernels/mmq-pdl.cuh",
+      "sha256": "fc13d1ca8cb66b6d5ddcb4f849fd1a605fe89b53238c5e43d978c81b04d61a55"
     },
     {
       "path": "llama/ggml/include/ggml-alloc.h",
@@ -180,6 +184,10 @@
           "sha256": "c9b6b880cc02000bd3518162e911a51106124f4017947ec7451d490830576416"
         },
         {
+          "path": "kernels/mmq-pdl.cuh",
+          "sha256": "fc13d1ca8cb66b6d5ddcb4f849fd1a605fe89b53238c5e43d978c81b04d61a55"
+        },
+        {
           "path": "llama/ggml/include/ggml-alloc.h",
           "sha256": "d114067f9099c4a0e2bbc0625c676d4894d9cf0ea27168ee072c7de0e71bb51d"
         },
@@ -280,7 +288,7 @@
           "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
         }
       ],
-      "closure_sha256": "6a016a5c8ef1a6cb070d4a5728f400c082d70f77b18be7ea951e89d1c806b368"
+      "closure_sha256": "dcb26ef634192c1ffa9c28bb5dd1e5dec9d2f33956459b154862640b62269ab9"
     },
     {
       "translation_unit": "kernels/mmvq.cu",
