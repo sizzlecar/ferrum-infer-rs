@@ -40,6 +40,10 @@ mod direct_f16_pack;
 #[path = "timing/full_tile_stream_k.rs"]
 mod full_tile_stream_k;
 
+#[cfg(feature = "cuda-upstream-mmvq-pdl-tests")]
+#[path = "timing/mmvq_pdl.rs"]
+mod mmvq_pdl;
+
 type MmvqDot = unsafe extern "C" fn(
     *const UpstreamLinearPlanV1,
     *const c_void,
@@ -48,6 +52,22 @@ type MmvqDot = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
 ) -> i32;
+
+type MmvqPack = unsafe extern "C" fn(
+    *const UpstreamLinearPlanV1,
+    *const c_void,
+    u32,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+
+#[derive(Clone, Copy)]
+struct MmvqOps {
+    pack: MmvqPack,
+    dot: MmvqDot,
+}
 
 unsafe extern "C" {
     fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
@@ -67,11 +87,19 @@ unsafe extern "C" {
 struct Graph(*mut c_void);
 impl Graph {
     fn capture(stream: &Stream, enqueue: impl FnOnce()) -> Self {
+        Self::capture_inspected(stream, enqueue, |_| {})
+    }
+    fn capture_inspected(
+        stream: &Stream,
+        enqueue: impl FnOnce(),
+        inspect: impl FnOnce(*mut c_void),
+    ) -> Self {
         unsafe {
             ok(cudaStreamBeginCapture(stream.0, 0));
             enqueue();
             let mut graph = ptr::null_mut();
             ok(cudaStreamEndCapture(stream.0, &mut graph));
+            inspect(graph);
             let mut exec = ptr::null_mut();
             ok(cudaGraphInstantiateWithFlags(&mut exec, graph, 0));
             ok(cudaGraphDestroy(graph));
@@ -238,6 +266,27 @@ impl Route {
         mmq_dot: MmvqDot,
         mmvq_dot: MmvqDot,
     ) {
+        self.enqueue_with_native_ops(
+            stream,
+            input,
+            weight,
+            index,
+            mmq_dot,
+            MmvqOps {
+                pack: ffi::ferrum_upstream_mmvq_pack_v2,
+                dot: mmvq_dot,
+            },
+        );
+    }
+    fn enqueue_with_native_ops(
+        &self,
+        stream: &Stream,
+        input: &Buffer,
+        weight: *const c_void,
+        index: usize,
+        mmq_dot: MmvqDot,
+        mmvq: MmvqOps,
+    ) {
         let p = &self.plan;
         unsafe {
             let flag = self.flags.ptr.add(index * 4);
@@ -276,7 +325,7 @@ impl Route {
                     ));
                 }
                 UpstreamLinearAlgorithm::Mmvq => {
-                    ok(ffi::ferrum_upstream_mmvq_pack_v2(
+                    ok((mmvq.pack)(
                         p,
                         input.ptr,
                         p.request.inputs,
@@ -285,7 +334,7 @@ impl Route {
                         self.rows.ptr,
                         stream.0,
                     ));
-                    ok(mmvq_dot(
+                    ok((mmvq.dot)(
                         p,
                         weight,
                         self.packed.ptr,

@@ -53,7 +53,8 @@ impl Bank {
         k: usize,
         n: usize,
         count: usize,
-        dot: MmvqDot,
+        ops: [MmvqOps; 2],
+        inspect: Option<fn(&Route, usize, *mut c_void, usize)>,
     ) -> Self {
         let mut host_weights = weights(format, k, n);
         let (block_bytes, code_start) = match format {
@@ -116,16 +117,13 @@ impl Bank {
         let stable = std::array::from_fn(|arm| {
             for (index, &address) in addresses.iter().enumerate() {
                 routes[arm].scan(stream, address, index);
-                routes[arm].enqueue_with_mmvq_dot(
+                routes[arm].enqueue_with_native_ops(
                     stream,
                     &input,
                     address,
                     index,
-                    if arm == 0 {
-                        ffi::ferrum_upstream_mmvq_dot_v1
-                    } else {
-                        dot
-                    },
+                    ffi::ferrum_upstream_mmq_dot_v1,
+                    ops[arm],
                 );
             }
             stream.sync();
@@ -140,23 +138,28 @@ impl Bank {
         shared_matches_reference(&reference, &routes[1], count);
         let laps = 32_usize.div_ceil(count);
         let graphs = [0, 1].map(|arm| {
-            Graph::capture(stream, || {
-                for _ in 0..laps {
-                    for (index, &address) in addresses.iter().enumerate() {
-                        routes[arm].enqueue_with_mmvq_dot(
-                            stream,
-                            &input,
-                            address,
-                            index,
-                            if arm == 0 {
-                                ffi::ferrum_upstream_mmvq_dot_v1
-                            } else {
-                                dot
-                            },
-                        );
+            Graph::capture_inspected(
+                stream,
+                || {
+                    for _ in 0..laps {
+                        for (index, &address) in addresses.iter().enumerate() {
+                            routes[arm].enqueue_with_native_ops(
+                                stream,
+                                &input,
+                                address,
+                                index,
+                                ffi::ferrum_upstream_mmq_dot_v1,
+                                ops[arm],
+                            );
+                        }
                     }
-                }
-            })
+                },
+                |graph| {
+                    if let Some(inspect) = inspect {
+                        inspect(&routes[arm], arm, graph, laps * count);
+                    }
+                },
+            )
         });
         Self {
             graphs,
@@ -243,6 +246,40 @@ pub(super) fn paired_projection_ring_for_rows(
     dot: MmvqDot,
     selected_label: &str,
 ) {
+    paired_projection_ring_with_ops(
+        experiment,
+        format,
+        m,
+        current,
+        k,
+        n,
+        [
+            MmvqOps {
+                pack: ffi::ferrum_upstream_mmvq_pack_v2,
+                dot: ffi::ferrum_upstream_mmvq_dot_v1,
+            },
+            MmvqOps {
+                pack: ffi::ferrum_upstream_mmvq_pack_v2,
+                dot,
+            },
+        ],
+        selected_label,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paired_projection_ring_with_ops(
+    experiment: &str,
+    format: UpstreamLinearFormat,
+    m: usize,
+    current: UpstreamLinearAlgorithm,
+    k: usize,
+    n: usize,
+    ops: [MmvqOps; 2],
+    selected_label: &str,
+    inspect: Option<fn(&Route, usize, *mut c_void, usize)>,
+) {
     let _ = caps();
     let mut l2 = 0;
     unsafe {
@@ -257,7 +294,7 @@ pub(super) fn paired_projection_ring_for_rows(
     let stream = Stream::new();
     // All five physical banks and both graphs exist before any warm/timing.
     let banks = (0..BANKS)
-        .map(|bank| Bank::new(&stream, format, bank, m, current, k, n, count, dot))
+        .map(|bank| Bank::new(&stream, format, bank, m, current, k, n, count, ops, inspect))
         .collect::<Vec<_>>();
     let plan = serde_json::json!({
         "experiment":experiment,
@@ -278,13 +315,13 @@ pub(super) fn paired_projection_ring_for_rows(
             "experiment":experiment,"kind":"scope",
             "timed":"public pack_v2 including flags/guards; dot with actual stream-K fixup; cast",
             "current_algorithm":format!("{current:?}"),
-            "mmvq":"current public pack_v2 F32 activation and kernel flag clear, selected shared dot",
+            "mmvq":"F32 activation pack and kernel flag clear; selected pack/dot entrypoints declared by the experiment",
             "selected_dot":selected_label,
             "precondition":"before each measured arm replay the next bank's complete current-route ring then synchronize; excluded from event and wall intervals; no cache-eviction guarantee",
             "precondition_projection_count":banks[0].laps*count,
             "precondition_weight_address_bytes":count*weight_bytes,
-            "correctness":"own actual-pack nine-point F64; all output finite/cast/guards; full shared-vs-baseline-MMVQ buffers; fresh same-address graph replay",
-            "arithmetic":"MMQ/MMVQ activation quantization differs; no cross-algorithm bit equality",
+            "correctness":"own actual-pack nine-point F64; all output finite/cast/guards; full selected-vs-baseline-MMVQ buffers; fresh same-address graph replay",
+            "arithmetic":if current == UpstreamLinearAlgorithm::Mmq {"MMQ/MMVQ activation quantization differs; no cross-algorithm bit equality"} else {"both arms use ordinary Q8_1 activation pack; full buffer bit comparison against ordinary MMVQ"},
             "excluded":"allocation/upload/plan/cold weight scan/capture/precondition/oracle/readback"
         })
     );

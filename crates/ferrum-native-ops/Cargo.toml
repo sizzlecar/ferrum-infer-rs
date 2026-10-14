@@ -20,6 +20,7 @@ cuda-upstream-small-shared-weight-decode-tests = ["cuda-upstream-shared-weight-d
 cuda-upstream-direct-f16-pack-tests = ["cuda-upstream-shared-weight-decode-tests"]
 # Test-only full-output-tile MMQ dot supplied by the independent experiment TU.
 cuda-upstream-full-tile-stream-k-tests = ["cuda-upstream-shared-weight-decode-tests"]
+cuda-upstream-mmvq-pdl-tests = ["cuda-upstream-shared-weight-decode-tests"]
 
 [dependencies]
 ferrum-types = { workspace = true }
