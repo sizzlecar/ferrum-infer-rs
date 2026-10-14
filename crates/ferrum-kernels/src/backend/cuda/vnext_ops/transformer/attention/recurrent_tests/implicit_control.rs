@@ -1,4 +1,4 @@
-//! TEST-only control-node experiment. Projections are deliberately outside this
+//! Paired production control-node experiment. Projections are deliberately outside this
 //! 48-layer recurrent subgraph; no claim about full-model launch cost is made.
 use super::*;
 use cudarc::driver::sys::{self, CUevent_flags};
@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PREPARE: &str = "ferrum_test_gdn_prepare_implicit_single_token_f16";
-const DELTA: &str = "ferrum_test_gdn_delta_implicit_single_token_tiled16_interleaved_f32";
+const PREPARE: &str = "vnext_gdn_prepare_implicit_single_token_f16";
+const DELTA: &str = "vnext_gdn_delta_implicit_single_token_tiled16_interleaved_f32";
 
 fn shape(actual: bool) -> AttentionShape {
     let mut s = super::super::tests::test_shape();
@@ -283,6 +283,7 @@ impl Layer {
             m as i32,
             tokens as i32,
             cuda,
+            AttentionControl::Explicit,
         )
         .unwrap();
         launch_gated_norm(
@@ -591,7 +592,7 @@ fn runtime() -> CudaDeviceRuntime {
 }
 
 #[test]
-#[ignore = "requires CUDA; test-only implicit control symbols"]
+#[ignore = "requires CUDA; production implicit control symbols"]
 fn implicit_single_token_controls_preserve_bits_state_fresh_and_fallback() {
     let r = runtime();
     // CUDA graph capture cannot begin on the legacy default stream.

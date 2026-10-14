@@ -798,9 +798,9 @@ vnext_linear_attention_prepare_negative_rate_f16_indirect(
       value_dim, conv_kernel, qkvzba_width, qkvzba_width);
 }
 
-// Test-only entrypoint; production exports retain the default explicit controls.
+// Canonical one-token-per-sequence entrypoint; explicit varlen exports remain unchanged.
 extern "C" __global__ void
-ferrum_test_gdn_prepare_implicit_single_token_f16(
+vnext_gdn_prepare_implicit_single_token_f16(
     const __half* __restrict__ mixed_qkvzba_raw,
     const __half* __restrict__ conv_weight,
     const unsigned long long* __restrict__ state_bindings,
