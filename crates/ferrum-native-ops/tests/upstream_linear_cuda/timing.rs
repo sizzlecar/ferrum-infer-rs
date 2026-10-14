@@ -13,6 +13,10 @@ mod shared_weight_decode;
 mod ffn_current_routes;
 
 #[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/attention_current_routes.rs"]
+mod attention_current_routes;
+
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
 #[path = "timing/batch_width_boundary.rs"]
 mod batch_width_boundary;
 
