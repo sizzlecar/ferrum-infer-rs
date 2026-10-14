@@ -12,6 +12,10 @@ mod shared_weight_decode;
 #[path = "timing/ffn_current_routes.rs"]
 mod ffn_current_routes;
 
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/batch_width_boundary.rs"]
+mod batch_width_boundary;
+
 #[cfg(feature = "cuda-upstream-direct-f16-pack-tests")]
 #[path = "timing/direct_f16_pack.rs"]
 mod direct_f16_pack;

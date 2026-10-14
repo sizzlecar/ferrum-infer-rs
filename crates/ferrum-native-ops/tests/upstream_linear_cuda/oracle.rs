@@ -62,6 +62,35 @@ pub(super) fn final_cast_bits(value: f32, row_bad: bool, leaf_bad: bool) -> u16 
         result.to_bits()
     }
 }
+/// Common GGUF weight reference, independent of the activation pack and the
+/// route-specific half coefficient/correction used by `declared_group`.
+pub(super) fn decoded_group(f: F, b: &[u8], g: usize) -> [f64; 32] {
+    const LUT: [i32; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+    if f == F::Iq4Xs {
+        let hi = u16::from_le_bytes([b[2], b[3]]);
+        let s = ((b[4 + g / 2] >> (4 * (g % 2))) & 15) | (((hi >> (2 * g)) as u8 & 3) << 4);
+        let scale = f64::from(h(b, 0)) * f64::from(i32::from(s) - 32);
+        std::array::from_fn(|i| {
+            scale * f64::from(LUT[((b[8 + g * 16 + i % 16] >> (4 * (i / 16))) & 15) as usize])
+        })
+    } else {
+        let (s, m) = affine(b, g);
+        let scale = f64::from(h(b, 0)) * f64::from(s);
+        let minimum = f64::from(h(b, 2)) * f64::from(m);
+        let offset = if f == F::Q5K { 48 } else { 16 };
+        std::array::from_fn(|i| {
+            let low = (b[offset + (g / 2) * 32 + i] >> (4 * (g % 2))) & 15;
+            let high = if f == F::Q5K {
+                ((b[16 + i] >> g) & 1) << 4
+            } else {
+                0
+            };
+            scale * f64::from(low | high) - minimum
+        })
+    }
+}
 pub(super) fn declared_group(
     a: A,
     f: F,
