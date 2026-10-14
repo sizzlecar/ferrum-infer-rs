@@ -92,6 +92,19 @@ fn mmq_prefill_cold_capture_and_fresh_request_replay_cost() {
     fn elapsed_ns(start: Instant) -> u64 {
         u64::try_from(start.elapsed().as_nanos()).unwrap()
     }
+    fn inventory(fixture: &Fixture) -> Option<DeviceReusableExecutionPreparation> {
+        if fixture.reusable_bucket.is_none() {
+            // This arm deliberately never configures reusable execution.
+            None
+        } else {
+            Some(
+                fixture
+                    .lane
+                    .reusable_executable_preparation()
+                    .expect("configured reusable lane must report its preparation"),
+            )
+        }
+    }
     fn execute(
         fixture: &Fixture,
         session: &Arc<SequenceSession<Runtime>>,
@@ -141,7 +154,7 @@ fn mmq_prefill_cold_capture_and_fresh_request_replay_cost() {
             "{}",
             serde_json::json!({"kind":"prefill_capture_cost_stage",
             "arm":arms[arm],"stage":"fixture_cold_prepare","wall_ns":wall_ns,
-            "inventory":fixture.lane.reusable_executable_preparation().unwrap()})
+            "inventory":inventory(&fixture)})
         );
         fixture
     });
@@ -166,7 +179,7 @@ fn mmq_prefill_cold_capture_and_fresh_request_replay_cost() {
     for wave in 0..2 {
         let observations = [0, 1].map(|arm| {
             let fixture = &fixtures[arm];
-            let before = fixture.lane.reusable_executable_preparation().unwrap();
+            let before = inventory(fixture);
             let start = Instant::now();
             let observation = execute(
                 fixture,
@@ -184,7 +197,7 @@ fn mmq_prefill_cold_capture_and_fresh_request_replay_cost() {
                 "arm":arms[arm],"stage":if wave==0 {"first_warm"} else {"capture_and_upload"},
                 "range":[wave*width,(wave+1)*width],"wall_ns":wall_ns,
                 "inventory_before":before,
-                "inventory_after":fixture.lane.reusable_executable_preparation().unwrap()})
+                "inventory_after":inventory(fixture)})
             );
             observation
         });
@@ -257,7 +270,7 @@ fn mmq_prefill_cold_capture_and_fresh_request_replay_cost() {
             "arm":arms[arm],"stage":"fresh_request_complete","wall_ns":wall_ns,
             "path":if arm==0 {"Eager"} else {"ReplayedOnly"},
             "old_state_pointers":old_pointers[arm],"fresh_state_pointers":pointers,
-            "inventory":fixtures[arm].lane.reusable_executable_preparation().unwrap()})
+            "inventory":inventory(&fixtures[arm])})
         );
         observation
     });
