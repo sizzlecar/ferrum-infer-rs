@@ -25,11 +25,11 @@
 // mmq.cuh process_tile/main/fixup, and this adapter's direct F16 quantizer.
 // Only dense (ids_dst == nullptr) branches are retained. The process shell
 // retains the pinned load_tiles/vec_dot/write_back and every __syncthreads.
-// Async-dependent pointers use GGML_CUDA_RESTRICT rather than hard restrict.
+// Async-dependent pointers carry no restrict qualifier in either compiler pass.
 
 template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool Marker, typename Input>
 static __device__ __forceinline__ void test_mmq_pdl_quantize_body(
-        const Input * GGML_CUDA_RESTRICT x, const int32_t * GGML_CUDA_RESTRICT ids, void * GGML_CUDA_RESTRICT vy,
+        const Input * x, const int32_t * ids, void * vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, uint32_t * row_flags) {
 
@@ -145,9 +145,9 @@ static __device__ __forceinline__ void test_mmq_pdl_quantize_body(
 
 template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1 = GGML_PREC_Q8>
 static __device__ __forceinline__ void test_mmq_pdl_process_tile(
-        const char * GGML_CUDA_RESTRICT x, const int offset_x, const int * GGML_CUDA_RESTRICT y,
-        const int * GGML_CUDA_RESTRICT ids_dst, float * GGML_CUDA_RESTRICT dst, float * GGML_CUDA_RESTRICT tmp_fixup,
-        const float * GGML_CUDA_RESTRICT y_scale,
+        const char * x, const int offset_x, const int * y,
+        const int * ids_dst, float * dst, float * tmp_fixup,
+        const float * y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
 
@@ -224,9 +224,9 @@ static __device__ __forceinline__ void test_mmq_pdl_process_tile(
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void test_mmq_pdl_main(
-        const char * GGML_CUDA_RESTRICT x, const int * GGML_CUDA_RESTRICT y, const int32_t * GGML_CUDA_RESTRICT ids_dst,
-        const int32_t * GGML_CUDA_RESTRICT expert_bounds, float * GGML_CUDA_RESTRICT dst, float * GGML_CUDA_RESTRICT tmp_fixup,
-        const float * GGML_CUDA_RESTRICT y_scale,
+        const char * x, const int * y, const int32_t * ids_dst,
+        const int32_t * expert_bounds, float * dst, float * tmp_fixup,
+        const float * y_scale,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -427,8 +427,8 @@ static __global__ void test_mmq_pdl_main(
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1)/2, 1)
 static __global__ void test_mmq_pdl_fixup(
-        const int32_t * GGML_CUDA_RESTRICT ids_dst, const int32_t * GGML_CUDA_RESTRICT expert_bounds, float * GGML_CUDA_RESTRICT dst,
-        float * GGML_CUDA_RESTRICT tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
+        const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
+        float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx) {
     ggml_cuda_pdl_lc(); // No-work CTAs still permit the next launch.
@@ -538,7 +538,7 @@ static __global__ void test_mmq_pdl_fixup(
     
 }
 
-static __global__ void test_mmq_pdl_clear(uint32_t * GGML_CUDA_RESTRICT flags, uint32_t rows) {
+static __global__ void test_mmq_pdl_clear(uint32_t * flags, uint32_t rows) {
     ggml_cuda_pdl_lc();
     const uint32_t i = blockIdx.x*blockDim.x + threadIdx.x;
     ggml_cuda_pdl_sync(); // Previous projection's cast must finish reading flags.
@@ -547,9 +547,9 @@ static __global__ void test_mmq_pdl_clear(uint32_t * GGML_CUDA_RESTRICT flags, u
 
 template<mmq_q8_1_ds_layout Layout>
 static __global__ void test_mmq_pdl_pack_kernel(
-        const half * GGML_CUDA_RESTRICT input, void * GGML_CUDA_RESTRICT packed,
+        const half * input, void * packed,
         int64_t inputs, int64_t input_stride, int64_t padded_inputs,
-        uint32_t rows, uint32_t guard_blocks, uint32_t * GGML_CUDA_RESTRICT flags) {
+        uint32_t rows, uint32_t guard_blocks, uint32_t * flags) {
     ggml_cuda_pdl_lc();
     // Before any input/flag read, packed overwrite, or guard-tail write.
     // Thus a body-level early return cannot bypass the scratch reuse barrier.
@@ -566,10 +566,10 @@ static __global__ void test_mmq_pdl_pack_kernel(
 }
 
 static __global__ void test_mmq_pdl_cast_kernel(
-        const float * GGML_CUDA_RESTRICT input, half * GGML_CUDA_RESTRICT output,
+        const float * input, half * output,
         uint32_t rows, uint32_t columns, uint32_t stride,
-        const uint32_t * GGML_CUDA_RESTRICT row_flags,
-        const uint32_t * GGML_CUDA_RESTRICT weight_flag) {
+        const uint32_t * row_flags,
+        const uint32_t * weight_flag) {
     ggml_cuda_pdl_lc();
     const uint32_t index = blockIdx.x*blockDim.x + threadIdx.x;
     ggml_cuda_pdl_sync(); // Read raw output and both flags only after predecessor completion.
