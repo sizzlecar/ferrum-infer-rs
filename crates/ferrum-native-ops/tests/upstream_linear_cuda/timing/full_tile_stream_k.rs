@@ -11,23 +11,60 @@ unsafe extern "C" {
         fixup: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+    fn ferrum_test_upstream_mmq_i32_full_tile_dot_v1(
+        plan: *const UpstreamLinearPlanV1,
+        weights: *const c_void,
+        packed: *const c_void,
+        output: *mut c_void,
+        fixup: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 const M: usize = 8;
 const PAIRS: usize = 8;
-const DOTS: [MmvqDot; 2] = [
-    ffi::ferrum_upstream_mmq_dot_v1,
-    ferrum_test_upstream_mmq_full_tile_dot_v1,
-];
-const LABELS: [&str; 2] = ["public_mmq_stream_k", "full_tile_no_fixup"];
+#[derive(Clone, Copy)]
+struct Experiment {
+    id: &'static str,
+    candidate_dot: MmvqDot,
+    candidate_label: &'static str,
+    output_tile: usize,
+    threads: u32,
+}
 
-fn enqueue(route: &Route, stream: &Stream, input: &Buffer, weight: *const c_void, arm: usize) {
+const I128: Experiment = Experiment {
+    id: "full_tile_stream_k_m8_complete_173_leaf_ring",
+    candidate_dot: ferrum_test_upstream_mmq_full_tile_dot_v1,
+    candidate_label: "full_tile_no_fixup",
+    output_tile: 128,
+    threads: 256,
+};
+const I32: Experiment = Experiment {
+    id: "full_tile_i32_m8_complete_down_ring",
+    candidate_dot: ferrum_test_upstream_mmq_i32_full_tile_dot_v1,
+    candidate_label: "full_tile_i32_two_warps_no_fixup",
+    output_tile: 32,
+    threads: 64,
+};
+
+fn enqueue(
+    route: &Route,
+    stream: &Stream,
+    input: &Buffer,
+    weight: *const c_void,
+    arm: usize,
+    experiment: Experiment,
+) {
     route.enqueue_with_native_dot(
         stream,
         input,
         weight,
         0,
-        DOTS[arm],
+        if arm == 0 {
+            ffi::ferrum_upstream_mmq_dot_v1
+        } else {
+            experiment.candidate_dot
+        },
         ffi::ferrum_upstream_mmvq_dot_v1,
     );
 }
@@ -146,6 +183,7 @@ struct Group {
     k: usize,
     n: usize,
     seed: usize,
+    experiment: Experiment,
 }
 
 impl Group {
@@ -155,6 +193,7 @@ impl Group {
         role: &'static str,
         count: usize,
         seed: usize,
+        experiment: Experiment,
     ) -> Self {
         let (k, n) = if role == "gate_up" {
             (5120, 17408)
@@ -203,7 +242,7 @@ impl Group {
                 });
                 let stable = std::array::from_fn(|arm| {
                     routes[arm].scan(stream, address, 0);
-                    enqueue(&routes[arm], stream, &input, address, arm);
+                    enqueue(&routes[arm], stream, &input, address, arm, experiment);
                     stream.sync();
                     routes[arm].validate(format, &host_weights, 1)
                 });
@@ -214,7 +253,7 @@ impl Group {
         let graphs = [0, 1].map(|arm| {
             Graph::capture(stream, || {
                 for (leaf, &address) in leaves.iter().zip(&addresses) {
-                    enqueue(&leaf.routes[arm], stream, &input, address, arm);
+                    enqueue(&leaf.routes[arm], stream, &input, address, arm, experiment);
                 }
             })
         });
@@ -230,12 +269,20 @@ impl Group {
             k,
             n,
             seed,
+            experiment,
         }
     }
 
     fn enqueue(&self, stream: &Stream, arm: usize) {
         for (leaf, &address) in self.leaves.iter().zip(&self.addresses) {
-            enqueue(&leaf.routes[arm], stream, &self.input, address, arm);
+            enqueue(
+                &leaf.routes[arm],
+                stream,
+                &self.input,
+                address,
+                arm,
+                self.experiment,
+            );
         }
     }
 
@@ -284,7 +331,7 @@ impl Group {
         println!(
             "{}",
             serde_json::json!({
-                "experiment":"full_tile_stream_k_m8_complete_173_leaf_ring","kind":"correctness",
+                "experiment":self.experiment.id,"kind":"correctness",
                 "scope":"format_role","phase":phase,"format":format!("{:?}",self.format),
                 "role":self.role,"leaves":self.leaves.len(),"K":self.k,"N":self.n,
                 "raw_f32":differences[0].json(),"cast_f16":differences[1].json(),
@@ -302,7 +349,12 @@ struct Ring {
     groups: Vec<Group>,
 }
 
-fn timed_pairs(stream: &Stream, graphs: &[Graph; 2], metadata: &serde_json::Value) {
+fn timed_pairs(
+    stream: &Stream,
+    graphs: &[Graph; 2],
+    metadata: &serde_json::Value,
+    experiment: Experiment,
+) {
     for _ in 0..2 {
         for graph in graphs {
             graph.launch(stream);
@@ -330,8 +382,8 @@ fn timed_pairs(stream: &Stream, graphs: &[Graph; 2], metadata: &serde_json::Valu
             println!(
                 "{}",
                 serde_json::json!({
-                    "experiment":"full_tile_stream_k_m8_complete_173_leaf_ring","kind":"sample",
-                    "metadata":metadata,"pair":pair,"order":order,"arm":LABELS[arm],
+                    "experiment":experiment.id,"kind":"sample",
+                    "metadata":metadata,"pair":pair,"order":order,"arm":if arm == 0 {"public_mmq_stream_k"} else {experiment.candidate_label},
                     "gpu_ns":f64::from(ms)*1_000_000.0,"host_wall_ns":wall_ns
                 })
             );
@@ -339,7 +391,7 @@ fn timed_pairs(stream: &Stream, graphs: &[Graph; 2], metadata: &serde_json::Valu
     }
 }
 
-fn boundary_cases(stream: &Stream) {
+fn boundary_cases(stream: &Stream, experiment: Experiment) {
     for format in [
         UpstreamLinearFormat::Iq4Xs,
         UpstreamLinearFormat::Q4K,
@@ -395,7 +447,7 @@ fn boundary_cases(stream: &Stream) {
             });
             for (arm, route) in routes.iter().enumerate() {
                 route.scan(stream, weight.ptr, 0);
-                enqueue(route, stream, &input, weight.ptr, arm);
+                enqueue(route, stream, &input, weight.ptr, arm, experiment);
             }
             stream.sync();
             same_pack_and_flags(&routes);
@@ -466,7 +518,7 @@ fn boundary_cases(stream: &Stream) {
             println!(
                 "{}",
                 serde_json::json!({
-                    "experiment":"full_tile_stream_k_m8_complete_173_leaf_ring","kind":"marker_boundary",
+                    "experiment":experiment.id,"kind":"marker_boundary",
                     "format":format!("{format:?}"),"input":format!("{kind:?}"),"bad_weight":bad_weight,
                     "M":M,"K":k,"N":n,"own_marker_flags_cast_and_guards":true
                 })
@@ -475,17 +527,74 @@ fn boundary_cases(stream: &Stream) {
     }
 }
 
+fn partial_tile_cases(stream: &Stream, experiment: Experiment) {
+    let (k, n) = (256, 33);
+    for format in [
+        UpstreamLinearFormat::Iq4Xs,
+        UpstreamLinearFormat::Q4K,
+        UpstreamLinearFormat::Q5K,
+    ] {
+        let host = mixed_weights(format, k, n, 7);
+        let weight = Buffer::new(host.len());
+        weight.write(&host);
+        let input = Buffer::new(M * k * 2);
+        input.write(&input_words(k, 7, 0));
+        let routes = std::array::from_fn::<_, 2, _>(|_| {
+            Route::new_with_result_window(
+                UpstreamLinearAlgorithm::Mmq,
+                format,
+                M as u32,
+                k as u32,
+                n as u32,
+                1,
+                n as u32 + 5,
+                2,
+            )
+        });
+        let stable = std::array::from_fn::<_, 2, _>(|arm| {
+            routes[arm].scan(stream, weight.ptr, 0);
+            enqueue(&routes[arm], stream, &input, weight.ptr, arm, experiment);
+            stream.sync();
+            routes[arm].validate(format, &host, 1)
+        });
+        same_pack_and_flags(&routes);
+        // Graphs are declared last so their captured addresses drop first.
+        let graphs = [0, 1].map(|arm| {
+            Graph::capture(stream, || {
+                enqueue(&routes[arm], stream, &input, weight.ptr, arm, experiment);
+            })
+        });
+        input.write(&input_words(k, 7, 1));
+        for graph in &graphs {
+            graph.launch(stream);
+        }
+        stream.sync();
+        for (arm, route) in routes.iter().enumerate() {
+            assert_ne!(
+                route.validate(format, &host, 1),
+                stable[arm],
+                "partial-tile capture ignored fresh same-address input"
+            );
+        }
+        same_pack_and_flags(&routes);
+        input.guards();
+        weight.guards();
+        println!(
+            "{}",
+            serde_json::json!({
+                "experiment":experiment.id,"kind":"partial_tile_boundary",
+                "format":format!("{format:?}"),"input":"Finite","M":M,"K":k,"N":n,
+                "result_stride":n+5,"result_offset":2,"candidate_I":experiment.output_tile,
+                "candidate_blocks":n.div_ceil(experiment.output_tile),
+                "own_actual_pack_f64_cast_flags_and_canaries":true,"fresh_same_address_captured_replay":true
+            })
+        );
+    }
+}
+
 #[test]
 #[ignore = "exclusive CUDA test-only full-tile MMQ; complete 173-leaf FFN bank"]
 fn full_tile_stream_k_m8_complete_173_leaf_ring() {
-    let _ = caps();
-    let mut l2 = 0;
-    unsafe {
-        ok(cudaDeviceGetAttribute(&mut l2, 38, 0));
-    }
-    assert!(l2 > 0);
-    let stream = Stream::new();
-    boundary_cases(&stream);
     let specs = [
         (UpstreamLinearFormat::Iq4Xs, "gate_up", 61),
         (UpstreamLinearFormat::Iq4Xs, "down", 24),
@@ -494,10 +603,39 @@ fn full_tile_stream_k_m8_complete_173_leaf_ring() {
         (UpstreamLinearFormat::Q5K, "gate_up", 28),
         (UpstreamLinearFormat::Q5K, "down", 22),
     ];
+    run_ring(I128, &specs);
+}
+
+#[test]
+#[ignore = "exclusive CUDA test-only I32/two-warp full-tile MMQ; complete 56-leaf down bank"]
+fn full_tile_i32_m8_complete_down_ring() {
+    let specs = [
+        (UpstreamLinearFormat::Iq4Xs, "down", 24),
+        (UpstreamLinearFormat::Q4K, "down", 10),
+        (UpstreamLinearFormat::Q5K, "down", 22),
+    ];
+    run_ring(I32, &specs);
+}
+
+fn run_ring(experiment: Experiment, specs: &[(UpstreamLinearFormat, &'static str, usize)]) {
+    let _ = caps();
+    let mut l2 = 0;
+    unsafe {
+        ok(cudaDeviceGetAttribute(&mut l2, 38, 0));
+    }
+    assert!(l2 > 0);
+    let stream = Stream::new();
+    boundary_cases(&stream, experiment);
+    if experiment.output_tile == 32 {
+        partial_tile_cases(&stream, experiment);
+    }
     let groups = specs
-        .into_iter()
+        .iter()
+        .copied()
         .enumerate()
-        .map(|(seed, (format, role, count))| Group::new(&stream, format, role, count, seed))
+        .map(|(seed, (format, role, count))| {
+            Group::new(&stream, format, role, count, seed, experiment)
+        })
         .collect::<Vec<_>>();
     let graphs = [0, 1].map(|arm| {
         Graph::capture(&stream, || {
@@ -523,12 +661,14 @@ fn full_tile_stream_k_m8_complete_173_leaf_ring() {
         "timed":"complete public pack_v2 and clears, MMQ main and actual fixup, public cast_v2",
         "excluded":"allocation/upload/cold static weight scan/capture/oracle/readback",
         "weight_contents":"same deterministic mixed-mantissa scales within each format/role group; all leaves have distinct physical addresses; same addresses in both arms",
-        "candidate":"test-only full-tile blocks=ceil(N/128), no fixup; original validated Plan",
+        "candidate":"test-only full-output-tile MMQ, no fixup; original validated public Plan",
+        "candidate_I":experiment.output_tile,"candidate_J":8,"candidate_threads":experiment.threads,
+        "candidate_label":experiment.candidate_label,
         "scope":"native diagnostic; no product speed, serving latency, or cache-miss claim"
     });
     println!(
         "{}",
-        serde_json::json!({"experiment":"full_tile_stream_k_m8_complete_173_leaf_ring","kind":"scope","metadata":scope})
+        serde_json::json!({"experiment":experiment.id,"kind":"scope","metadata":scope})
     );
     for group in &ring.groups {
         let p = &group.leaves[0].routes[0].plan;
@@ -540,16 +680,21 @@ fn full_tile_stream_k_m8_complete_173_leaf_ring() {
                 "M":M,"K":group.k,"N":group.n,"leaves":group.leaves.len(),
                 "physical_weight_bytes":group.host_weights.len()*group.leaves.len(),
                 "baseline_blocks":p.blocks,"baseline_fixup":p.fixup,"baseline_fixup_bytes":p.fixup_bytes,
-                "candidate_blocks":group.n.div_ceil(128),"candidate_fixup":false,
+                "baseline_I":p.i,"baseline_J":p.j,"baseline_threads":p.nthreads,
+                "candidate_blocks":group.n.div_ceil(experiment.output_tile),"candidate_fixup":false,
+                "candidate_I":experiment.output_tile,"candidate_J":8,"candidate_threads":experiment.threads,
+                "candidate_grid":[group.n.div_ceil(experiment.output_tile),1,1],"candidate_fixup_mode":0,
                 "result_stride":group.leaves[0].routes[0].result_stride,
                 "gate_up_offsets":"alternating 0/N; other leaf and five trailing elements remain canaries"
             }),
+            experiment,
         );
     }
     timed_pairs(
         &stream,
         &ring.graphs,
         &serde_json::json!({"scope":"weighted_full_ring","configuration":scope}),
+        experiment,
     );
     stream.sync();
     for phase in ["stable", "fresh_same_address_input"] {
@@ -571,7 +716,7 @@ fn full_tile_stream_k_m8_complete_173_leaf_ring() {
         println!(
             "{}",
             serde_json::json!({
-                "experiment":"full_tile_stream_k_m8_complete_173_leaf_ring","kind":"correctness",
+                "experiment":experiment.id,"kind":"correctness",
                 "scope":"weighted_full_ring","phase":phase,"leaves":leaf_count,
                 "raw_f32":total[0].json(),"cast_f16":total[1].json()
             })
