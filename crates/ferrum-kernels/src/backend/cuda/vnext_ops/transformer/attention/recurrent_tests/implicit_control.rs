@@ -364,6 +364,9 @@ impl Layer {
             raw[3] = f16::INFINITY;
         }
         put(stream, self.raw.pointer(stream), &raw);
+        // The raw async copy borrows this local host Vec. Keep it alive until
+        // the transfer completes; every fresh-input update is outside timing.
+        stream.synchronize().unwrap();
     }
     fn oracle_first(&self, stream: &Arc<CudaStream>) {
         let s = self.shape;
