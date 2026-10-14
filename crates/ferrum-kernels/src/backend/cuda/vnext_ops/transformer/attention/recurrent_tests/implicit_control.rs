@@ -594,7 +594,8 @@ fn runtime() -> CudaDeviceRuntime {
 #[ignore = "requires CUDA; test-only implicit control symbols"]
 fn implicit_single_token_controls_preserve_bits_state_fresh_and_fallback() {
     let r = runtime();
-    let stream = r.context().default_stream();
+    // CUDA graph capture cannot begin on the legacy default stream.
+    let stream = r.context().new_stream().unwrap();
     let f = functions(&r);
     for counts in [vec![1], vec![1; 8], vec![1; 32], vec![1, 2, 1]] {
         let layer = Layer::new(&stream, shape(false), counts, 4);
@@ -625,7 +626,8 @@ fn implicit_single_token_controls_preserve_bits_state_fresh_and_fallback() {
 #[ignore = "requires CUDA; 48 independent actual-shape recurrent layers"]
 fn implicit_single_token_controls_forty_eight_layer_graph_pairs() {
     let r = runtime();
-    let stream = r.context().default_stream();
+    // CUDA graph capture cannot begin on the legacy default stream.
+    let stream = r.context().new_stream().unwrap();
     let f = functions(&r);
     let s = shape(true);
     let layers = (0..48)
