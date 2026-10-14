@@ -310,7 +310,6 @@ fn exercise(
             3,
             tokens as i32,
             cuda,
-            AttentionControl::Explicit,
         )
         .unwrap();
         let actual = output.read(stream);

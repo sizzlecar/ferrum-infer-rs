@@ -1307,8 +1307,8 @@ extern "C" __global__ void vnext_gated_delta_varlen_tiled16_interleaved_f32_indi
       scale);
 }
 
-// Canonical one-token-per-sequence entrypoint; explicit varlen exports remain unchanged.
-extern "C" __global__ void vnext_gdn_delta_implicit_single_token_tiled16_interleaved_f32(
+// Test-only entrypoint; production exports retain the default explicit controls.
+extern "C" __global__ void ferrum_test_gdn_delta_implicit_single_token_tiled16_interleaved_f32(
     const float* __restrict__ query,
     const float* __restrict__ key,
     const float* __restrict__ value,
