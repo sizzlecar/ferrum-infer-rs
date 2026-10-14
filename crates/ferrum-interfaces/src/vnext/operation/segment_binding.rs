@@ -514,8 +514,6 @@ pub struct PreparedSegmentBindingFrame<'w, B> {
     pub(super) backing: Option<&'w crate::vnext::SegmentBackingBatch<B>>,
     pub(super) resources: &'w [SegmentFrameResource],
     pub(super) expected: &'w [crate::vnext::SegmentBackingExpectation],
-    pub(super) windows: &'w [crate::vnext::SegmentBackingWindow],
-    pub(super) window_ranges: &'w [Range<usize>],
     pub(super) owners: Vec<SegmentBindingOwnerView<'w, B>>,
     pub(super) work_shape: &'w BatchWorkShape,
     pub(super) program_bindings: Vec<Option<ProgramBindingNodeBinding>>,
@@ -594,7 +592,7 @@ impl<'f, 'w, B> PreparedSegmentBindingNodeView<'f, 'w, B> {
             .resources
             .get(region.resource_index)
             .ok_or_else(|| invalid_operation("segment resource ordinal is outside its frame"))?;
-        let (descriptor, storage_kind, source) = match *fact {
+        let (mut descriptor, storage_kind, source) = match *fact {
             SegmentFrameResource::Plan(index) => {
                 let plan = self
                     .frame
@@ -602,13 +600,7 @@ impl<'f, 'w, B> PreparedSegmentBindingNodeView<'f, 'w, B> {
                     .get(index)
                     .ok_or_else(|| invalid_operation("segment Plan view is absent"))?;
                 let descriptor = plan.leased.committed_descriptor();
-                // The cold component bound and the fresh resource minimum
-                // have already been checked before any backend callback.
-                let SegmentBindingRegionExtent::Exact(length) = region.request.extent else {
-                    return Err(invalid_operation(
-                        "Plan region cannot have a current dynamic extent",
-                    ));
-                };
+                let length = region.length_for_current_view(descriptor.size_bytes)?;
                 (
                     SegmentBindingDescriptorView {
                         resource_id: &descriptor.resource_id,
@@ -626,26 +618,26 @@ impl<'f, 'w, B> PreparedSegmentBindingNodeView<'f, 'w, B> {
                     },
                 )
             }
-            SegmentFrameResource::Dynamic(_) => {
+            SegmentFrameResource::Dynamic(resource) => {
+                let (request, _, bytes) = resource.row(participant, self.frame.expected)?;
+                let expected = &self.frame.expected[request];
+                let length = region.length_for_current_view(bytes)?;
                 let ordinal = region.dynamic_ordinal.ok_or_else(|| {
                     invalid_operation("compiled dynamic window ordinal is absent")
                 })?;
-                let range =
-                    self.frame.window_ranges.get(ordinal).ok_or_else(|| {
-                        invalid_operation("compiled dynamic window range is absent")
+                let window_index = node
+                    .dynamic_window_base
+                    .checked_mul(self.participant_count())
+                    .and_then(|base| {
+                        participant
+                            .checked_mul(node.dynamic_window_count)
+                            .and_then(|offset| base.checked_add(offset))
+                    })
+                    .and_then(|base| base.checked_add(ordinal))
+                    .and_then(|base| base.checked_add(self.frame.expected.len()))
+                    .ok_or_else(|| {
+                        invalid_operation("compiled dynamic window ordinal overflows")
                     })?;
-                let offset = if range.len() == 1 { 0 } else { participant };
-                if offset >= range.len() {
-                    return Err(invalid_operation(
-                        "compiled dynamic window participant is absent",
-                    ));
-                }
-                let window_index = range.start + offset;
-                let description = self.frame.windows.get(window_index).ok_or_else(|| {
-                    invalid_operation("compiled dynamic window description is absent")
-                })?;
-                let expected = &self.frame.expected[description.resource_index];
-                let length = description.length_bytes;
                 let window = self
                     .frame
                     .backing
@@ -676,8 +668,23 @@ impl<'f, 'w, B> PreparedSegmentBindingNodeView<'f, 'w, B> {
                 )
             }
         };
-        // No authority is issued here: the immutable recipe and this attempt's
-        // checked resource/window tables already establish these typed views.
+        if descriptor.element_type != region.request.element_type
+            || descriptor.alignment_bytes < region.request.alignment_bytes
+            || !region
+                .offset_bytes
+                .is_multiple_of(region.request.alignment_bytes)
+        {
+            return Err(invalid_operation(
+                "segment region type or alignment differs from its resource",
+            ));
+        }
+        // The returned descriptor is a borrowed identity plus exact view size.
+        descriptor.size_bytes = match &source {
+            SegmentBindingPhysicalSource::Plan { physical_range, .. } => {
+                physical_range.end - physical_range.start
+            }
+            _ => descriptor.size_bytes,
+        };
         Ok(SegmentBindingRegionView {
             descriptor,
             storage_kind,

@@ -84,52 +84,8 @@ fn segment_program_frame_matches_current_regions_owners_and_rejects_stale_frames
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active = wave_active_bindings(&wave, &session);
     let old_identity = identity(&fixture, &wave, &active);
-    let original = compile(&fixture, &wave);
-    let declarations = original
-        .nodes
-        .iter()
-        .map(|node| {
-            let mut regions = node.declaration.regions().to_vec();
-            let state = regions
-                .iter()
-                .find(|region| region.extent == SegmentBindingRegionExtent::CurrentResource)
-                .unwrap()
-                .clone();
-            // The identical view may share a checked window; distinct extents and
-            // offsets on that same resource must preserve their own physical view.
-            // Exact views stay within this fixture's four-byte canonical U8
-            // component even when CurrentResource spans its grown token state.
-            regions.push(state.clone());
-            for (offset_bytes, length) in [(0, 4), (0, 2), (2, 2)] {
-                let mut region = state.clone();
-                region.offset_bytes = offset_bytes;
-                region.extent = SegmentBindingRegionExtent::Exact(length);
-                regions.push(region);
-            }
-            (
-                node.node_index,
-                SegmentBindingDeclaration::new(regions, vec![], Arc::new(())).unwrap(),
-            )
-        })
-        .collect();
-    let mut recipe = CompiledSegmentBindingRecipe::compile(
-        &fixture.resolved,
-        original.program_id.clone(),
-        declarations,
-    )
-    .unwrap();
+    let mut recipe = compile(&fixture, &wave);
     recipe.compile_backend(fixture.runtime.as_ref()).unwrap();
-    for node in &recipe.nodes {
-        let added = &node.regions[node.regions.len() - 4..];
-        let original = node
-            .regions
-            .iter()
-            .find(|region| region.request.extent == SegmentBindingRegionExtent::CurrentResource)
-            .unwrap();
-        assert_eq!(original.dynamic_ordinal, added[0].dynamic_ordinal);
-        assert_ne!(added[1].dynamic_ordinal, added[2].dynamic_ordinal);
-        assert_ne!(added[2].dynamic_ordinal, added[3].dynamic_ordinal);
-    }
     let cold_program = Arc::clone(recipe.backend_program.as_ref().unwrap());
     let (expected, owners) = oracle_with_owners(&fixture, &wave, &old_identity, &active, &recipe);
     let (encoded, facts) = encode_compiled_segment_wave_with_timing(

@@ -769,10 +769,11 @@ where
     let mut groups = Vec::new();
     let mut expected = Vec::new();
     let mut resources = Vec::with_capacity(recipe.resources.len());
+    let mut window_resources = Vec::with_capacity(recipe.resources.len());
     for resource in &recipe.resources {
         match resource.source {
-            CompiledSegmentResourceSource::PlanStatic { .. } => {
-                let index = resource.plan_view_index.ok_or_else(|| {
+            CompiledSegmentResourceSource::PlanStatic { slot_index } => {
+                let index = recipe.plan_slots.binary_search(&slot_index).map_err(|_| {
                     invalid_operation("segment Plan slot is absent from its schema")
                 })?;
                 if plan_views[index].leased.committed_descriptor().size_bytes
@@ -783,6 +784,7 @@ where
                     ));
                 }
                 resources.push(SegmentFrameResource::Plan(index));
+                window_resources.push(None);
             }
             CompiledSegmentResourceSource::Dynamic { descriptor_index } => {
                 let descriptor = memory
@@ -878,40 +880,58 @@ where
                     }
                 }
                 resources.push(SegmentFrameResource::Dynamic(rows));
+                window_resources.push(Some(rows));
             }
         }
     }
     drop(snapshot_stage);
-    // The cold recipe proves static type/alignment/component bounds and folds
-    // every exact region's end into its resource minimum. Those minima were
-    // just checked against every fresh row. Materialize each distinct dynamic
-    // view once, rather than re-expanding node x participant x declaration at
-    // schema validation, permit sizing, intersection and backend lookup.
-    let mut windows = expected
-        .iter()
-        .enumerate()
-        .map(|(resource_index, requirement)| SegmentBackingWindow {
-            resource_index,
-            offset_bytes: 0,
-            length_bytes: requirement.logical_bytes,
-            element_type: requirement.element_type,
-            alignment_bytes: requirement.alignment_bytes,
-        })
-        .collect::<Vec<_>>();
-    let mut window_ranges = Vec::with_capacity(recipe.window_rules.len());
-    for rule in &recipe.window_rules {
-        let Some(SegmentFrameResource::Dynamic(rows)) = resources.get(rule.resource_index) else {
-            return Err(invalid_operation(
-                "compiled window has no fresh dynamic resource",
-            ));
-        };
-        window_ranges.push(rows.append_rule_windows(
-            &expected,
-            participant_count,
-            rule,
-            &mut windows,
-        )?);
+    // Validate the entire schema before any backend encoding. Only the borrowed
+    // projection is repeated below; no authority or check is deferred to submit.
+    for node in &recipe.nodes {
+        for participant in 0..participant_count {
+            for region in &node.regions {
+                let (bytes, element_type, alignment) = match resources
+                    .get(region.resource_index)
+                    .ok_or_else(|| invalid_operation("segment region resource index is invalid"))?
+                {
+                    SegmentFrameResource::Plan(index) => {
+                        let descriptor = plan_views[*index].leased.committed_descriptor();
+                        (
+                            descriptor.size_bytes,
+                            descriptor.element_type,
+                            descriptor.alignment_bytes,
+                        )
+                    }
+                    SegmentFrameResource::Dynamic(rows) => {
+                        let (request, _, bytes) = rows.row(participant, &expected)?;
+                        (
+                            bytes,
+                            expected[request].element_type,
+                            expected[request].alignment_bytes,
+                        )
+                    }
+                };
+                region.length_for_current_view(bytes)?;
+                if element_type != region.request.element_type
+                    || alignment < region.request.alignment_bytes
+                    || !region
+                        .offset_bytes
+                        .is_multiple_of(region.request.alignment_bytes)
+                {
+                    return Err(invalid_operation(
+                        "segment region type or alignment differs from its resource",
+                    ));
+                }
+            }
+        }
     }
+    let windows = SegmentBackingWindowInput::compiled(
+        &expected,
+        &window_resources,
+        &recipe.window_rules,
+        &recipe.window_nodes,
+        participant_count,
+    )?;
     drop(authority_stage);
     let backing_stage = SubmissionWaveDispatchStageTimer::start(
         timing_sink,
@@ -920,12 +940,7 @@ where
     let backing = if expected.is_empty() {
         None
     } else {
-        Some(context.prepare(
-            &groups,
-            &expected,
-            SegmentBackingWindowInput::Slice(&windows),
-            timing_sink,
-        )?)
+        Some(context.prepare(&groups, &expected, windows, timing_sink)?)
     };
     let metadata_stage = SubmissionWaveDispatchStageTimer::start(
         timing_sink,
@@ -1053,8 +1068,6 @@ where
         backing: backing.as_ref(),
         resources: &resources,
         expected: &expected,
-        windows: &windows,
-        window_ranges: &window_ranges,
         owners,
         work_shape: first.work_shape(),
         program_bindings,

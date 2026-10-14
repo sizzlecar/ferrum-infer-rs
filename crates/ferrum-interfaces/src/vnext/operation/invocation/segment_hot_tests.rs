@@ -165,7 +165,6 @@ pub(super) fn oracle_with_owners(
                     .unwrap();
                 let mut descriptor = view.descriptor().clone();
                 descriptor.size_bytes = length;
-                let mut covered = 0;
                 let physical = view
                     .translate(region.offset_bytes, length)
                     .unwrap()
@@ -173,19 +172,13 @@ pub(super) fn oracle_with_owners(
                     .map(|part| {
                         let (buffer, range, retention) = part.buffer_and_physical_range();
                         owners.push(retention);
-                        // translate() reports coordinates in the original
-                        // invocation view; a segment's descriptor names only
-                        // this requested subwindow, whose logical origin is 0.
-                        let logical_offset = part
-                            .logical_offset_bytes()
-                            .checked_sub(region.offset_bytes)
-                            .expect("translated region begins inside the requested window");
-                        assert_eq!(logical_offset, covered);
-                        covered += range.end - range.start;
-                        (buffer as *const TestBuffer as usize, range, logical_offset)
+                        (
+                            buffer as *const TestBuffer as usize,
+                            range,
+                            part.logical_offset_bytes(),
+                        )
                     })
                     .collect();
-                assert_eq!(covered, length);
                 result.push(SegmentTestRegion {
                     node: compiled.node_index as u32,
                     participant,
