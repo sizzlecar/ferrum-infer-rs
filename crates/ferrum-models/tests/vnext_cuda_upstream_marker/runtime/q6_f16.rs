@@ -163,11 +163,29 @@ fn compare_family(
             } else {
                 SegmentBindingOracleMode::Disabled
             },
-            SegmentBindingOwnerViewMode::Legacy,
+            if mode == InvocationPreparationStrategy::DecodeSegmentProgram {
+                SegmentBindingOwnerViewMode::Indexed
+            } else {
+                SegmentBindingOwnerViewMode::Legacy
+            },
             ferrum_types::AttentionExecutionPolicy::NativeAdaptive,
             ferrum_types::CausalDecodePreparationMode::Packed,
         )
     });
+    for (arm, fixture) in fixtures.iter().enumerate() {
+        assert_eq!(
+            fixture
+                ._composition
+                ._runtime
+                .segment_binding_owner_view_mode(),
+            if arm == 1 {
+                SegmentBindingOwnerViewMode::Indexed
+            } else {
+                SegmentBindingOwnerViewMode::Legacy
+            },
+            "compiled binding programs require the actual indexed owner interpreter"
+        );
+    }
     let sinks = [Preparation::default(), Preparation::default()];
     let lead = if kind == AttentionKind::Causal { 60 } else { 0 };
     // The width change has its own cold/warm program. Returning to eight must
@@ -271,6 +289,10 @@ fn compare_family(
                 ._composition
                 ._runtime
                 .segment_binding_oracle_audited_nodes();
+            let indexed_before = fixture
+                ._composition
+                ._runtime
+                .segment_binding_indexed_encodes();
             let observation = fixture.execute_participant_ranges_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
@@ -283,6 +305,22 @@ fn compare_family(
                 Some(row_bytes),
             );
             let stats = sinks[arm].last();
+            let indexed_encodes = fixture
+                ._composition
+                ._runtime
+                .segment_binding_indexed_encodes()
+                - indexed_before;
+            println!(
+                "{}",
+                serde_json::json!({"kind":"q6_f16_program_preparation", "attention":format!("{kind:?}"),
+                    "strategy":modes[arm],"wave":position,"participants":width,
+                    "stats":stats,"indexed_host_encodes":indexed_encodes,
+                    "published":observation.segment_published})
+            );
+            assert_eq!(
+                indexed_encodes,
+                if arm == 1 { stats.segment_hits } else { 0 }
+            );
             let program = observation
                 .reusable_program_id
                 .as_ref()
@@ -406,6 +444,10 @@ fn compare_family(
                 ._composition
                 ._runtime
                 .segment_binding_oracle_audited_nodes();
+            let indexed_before = fixture
+                ._composition
+                ._runtime
+                .segment_binding_indexed_encodes();
             let observation = fixture.execute_participant_ranges_with_preparation(
                 &fixture.lane,
                 &fixture.reaper,
@@ -422,6 +464,15 @@ fn compare_family(
                 Some(row_bytes),
             );
             let stats = sinks[arm].last();
+            let indexed_encodes = fixture
+                ._composition
+                ._runtime
+                .segment_binding_indexed_encodes()
+                - indexed_before;
+            assert_eq!(
+                indexed_encodes,
+                if arm == 1 { stats.segment_hits } else { 0 }
+            );
             assert_eq!(
                 fixture
                     ._composition
