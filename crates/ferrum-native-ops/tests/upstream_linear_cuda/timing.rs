@@ -44,6 +44,10 @@ mod full_tile_stream_k;
 #[path = "timing/mmvq_pdl.rs"]
 mod mmvq_pdl;
 
+#[cfg(feature = "cuda-upstream-rms-mmvq-pdl-tests")]
+#[path = "timing/rms_mmvq_pdl.rs"]
+mod rms_mmvq_pdl;
+
 #[cfg(feature = "cuda-upstream-mmq-pdl-tests")]
 #[path = "timing/mmq_pdl.rs"]
 mod mmq_pdl;
