@@ -86,18 +86,30 @@ impl Case {
         input_kind: Input,
         bad_weight: bool,
     ) -> Self {
+        Self::new_rows(format, 8, k, n, input_kind, bad_weight)
+    }
+
+    fn new_rows(
+        format: UpstreamLinearFormat,
+        m: usize,
+        k: usize,
+        n: usize,
+        input_kind: Input,
+        bad_weight: bool,
+    ) -> Self {
+        assert!(m >= 2);
         let p = plan(
             ALGORITHM,
             format,
             UpstreamLinearLayout::Columns,
-            8,
+            m as u32,
             k as u32,
             n as u32,
         );
         let input_stride = k + 3;
         let output_stride = n + 5;
-        let mut x = vec![0x3555; 8 * input_stride];
-        for row in 0..8 {
+        let mut x = vec![0x3555; m * input_stride];
+        for row in 0..m {
             for col in 0..k {
                 x[row * input_stride + col] = match input_kind {
                     Input::Zero => 0x8000,
@@ -116,7 +128,7 @@ impl Case {
         if matches!(input_kind, Input::Nonfinite) {
             x[0] = 0x7c00;
             x[input_stride] = 0xfc00;
-            x[7 * input_stride] = 0x7e00;
+            x[(m - 1) * input_stride] = 0x7e00;
         }
         let mut w = weights(format, k, p.padded_outputs as usize);
         let block_bytes = quant_block_bytes(format);
@@ -181,8 +193,8 @@ impl Case {
             converted: Buffer::new(p.converted_bytes as usize),
             packed: Buffer::new(p.packed_bytes as usize),
             output: Buffer::new(p.output_bytes as usize + 4),
-            result: Buffer::new(8 * output_stride * 2 + 2),
-            rows: Buffer::new(8 * 4),
+            result: Buffer::new(m * output_stride * 2 + 2),
+            rows: Buffer::new(m * 4),
             weight_flag: Buffer::new(4),
         }
     }
@@ -253,7 +265,7 @@ impl Case {
             packed: self.packed.read::<u8>(self.packed.bytes),
             output: output[1..].to_vec(),
             result: result[1..].to_vec(),
-            rows: self.rows.read::<u32>(8),
+            rows: self.rows.read::<u32>(p.request.rows as usize),
             weight_flag: self.weight_flag.read::<u32>(1),
         }
     }
@@ -268,7 +280,7 @@ impl Case {
             .chunks_exact(block_bytes)
             .any(|b| oracle::classify_weight(ALGORITHM, format, b));
         assert_eq!(snapshot.weight_flag[0] != 0, bad_weight);
-        for row in 0..8 {
+        for row in 0..p.request.rows as usize {
             let mut row_bad = false;
             for group in 0..p.padded_inputs as usize / 32 {
                 let values = std::array::from_fn(|i| {
@@ -621,4 +633,74 @@ fn paired_working_set(format: UpstreamLinearFormat, dots: [MmvqDot; 2], k: usize
         // Captured graphs relinquish device addresses before their allocations.
         drop(graphs);
     }
+}
+
+#[cfg(feature = "cuda-upstream-small-shared-weight-decode-tests")]
+pub(super) fn assert_small_shared_markers(format: UpstreamLinearFormat, m: usize, dot: MmvqDot) {
+    let _ = caps();
+    let stream = Stream::new();
+    for (k, n) in [(256, 17), (768, 33)] {
+        for input in [
+            Input::Finite,
+            Input::Zero,
+            Input::Subnormal,
+            Input::Nonfinite,
+            Input::SumOverflow,
+        ] {
+            for bad in [false, true] {
+                let case = Case::new_rows(format, m, k, n, input, bad);
+                let expected = case.run(&stream, ffi::ferrum_upstream_mmvq_dot_v1);
+                case.validate(&expected);
+                for _ in 0..2 {
+                    let actual = case.run(&stream, dot);
+                    case.validate(&actual);
+                    assert_eq!(
+                        actual, expected,
+                        "M{m} {format:?} {k}x{n} {input:?} bad_weight={bad}"
+                    );
+                }
+            }
+        }
+    }
+    let case = Case::new_rows(format, m, 512, 17, Input::Finite, false);
+    let w = unsafe { case.weights.ptr.add(4) }.cast_const();
+    let q = case.packed.ptr.cast_const();
+    let o = unsafe { case.output.ptr.add(4) };
+    let invoke =
+        |p: &UpstreamLinearPlanV1, w, q, o, fixup| unsafe { dot(p, w, q, o, fixup, stream.0) };
+    let mut malformed = case.plan;
+    malformed.nwarps += 1;
+    assert_eq!(invoke(&malformed, w, q, o, ptr::null_mut()), -1);
+    assert_eq!(invoke(&case.plan, w, q, o, o), -1);
+    for p in [
+        plan(ALGORITHM, format, UpstreamLinearLayout::Columns, 1, 512, 17),
+        plan(
+            ALGORITHM,
+            format,
+            UpstreamLinearLayout::Channels,
+            4,
+            512,
+            17,
+        ),
+        plan(
+            ALGORITHM,
+            UpstreamLinearFormat::Iq4Xs,
+            UpstreamLinearLayout::Columns,
+            4,
+            512,
+            17,
+        ),
+    ] {
+        assert_eq!(invoke(&p, w, q, o, ptr::null_mut()), -2);
+    }
+    assert_eq!(invoke(&case.plan, ptr::null(), q, o, ptr::null_mut()), -5);
+    assert_eq!(invoke(&case.plan, w, ptr::null(), o, ptr::null_mut()), -5);
+    assert_eq!(
+        invoke(&case.plan, w, q, ptr::null_mut(), ptr::null_mut()),
+        -5
+    );
+    assert_eq!(
+        invoke(&case.plan, unsafe { w.add(1) }, q, o, ptr::null_mut()),
+        -5
+    );
 }

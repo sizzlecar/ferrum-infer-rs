@@ -4,7 +4,7 @@
   "source_package": {
     "kind": "ferrum-native-upstream-linear",
     "revision": "marker-v2-mmq-mmvq-kernel-clear-r1-q4-q5-shared-weight+d81235049384534c167caea52b85a694f6103d14",
-    "sha256": "eb2b76ade5d3c07177d38c1e2bde3f7a16b7c2ccc9e50ef3b13a58273fb986e6"
+    "sha256": "5cbb5f9d82ea4277f8ef37f1ec017fbd1718bb2b76069a2f7f7ceeb03ab7deb9"
   },
   "upstream_sources": [
     {
@@ -24,7 +24,7 @@
     },
     {
       "path": "kernels/mmvq.cu",
-      "sha256": "b54094c0704b93b85b72343683bbc96ea4ded7d242648f31e7cae003ff1d30db"
+      "sha256": "935b09a4405c568a6a443cb6447af27083823839678b2837759ebe826408db65"
     }
   ],
   "headers": [
@@ -406,7 +406,7 @@
           "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
         }
       ],
-      "closure_sha256": "9128ab2304dda51cd21dbe76c810ce6b2079208c40b5e27368d3d333e3c91fa2"
+      "closure_sha256": "741d1daebf1048d527034dbabed72c51e60a136366e8b0f06b7b9e7d1fd0de1d"
     }
   ],
   "include_dirs": [

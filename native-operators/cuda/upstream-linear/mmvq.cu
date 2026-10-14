@@ -521,8 +521,13 @@ static __global__ void mul_mat_vec_q(
 #if defined(FERRUM_TEST_IQ4_XS_SHARED_WEIGHT_DECODE)
         || type == GGML_TYPE_IQ4_XS
 #endif
-        ) && ncols_dst == 8 &&
-        !has_fusion && !small_k && !halve_iters && nwarps == 2 && rows_per_cuda_block == 2 && warp_size == 32),
+        ) &&
+#if defined(FERRUM_TEST_SMALL_M_SHARED_WEIGHT_DECODE)
+        ncols_dst >= 2 && ncols_dst <= 8 && (nwarps == 2 || nwarps == 4) &&
+#else
+        ncols_dst == 8 && nwarps == 2 &&
+#endif
+        !has_fusion && !small_k && !halve_iters && rows_per_cuda_block == 2 && warp_size == 32),
         "shared weight decode requires an explicitly enabled format and original column8 geometry");
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -931,7 +936,11 @@ static int ferrum_test_mmvq_plan(uint32_t format, uint32_t rows, uint32_t k,
     // excluding GB10's independent halve-iters policy).
     if (!out || !rows || !k || k%256 || !n || layout>1 || cc<800 ||
             get_device_table_id(cc)!=MMVQ_PARAMETERS_GENERIC ||
+#if defined(FERRUM_TEST_SMALL_M_SHARED_WEIGHT_DECODE)
+            (layout==0 && rows>8) ||
+#else
             (layout==0 && rows!=1 && rows!=4 && rows!=8) ||
+#endif
             (layout==1 && rows>32)) return -1;
     switch(format) {
         case GGML_TYPE_IQ4_XS: return test_mmvq_plan_type<GGML_TYPE_IQ4_XS>(rows,k,n,layout,cc,out);
@@ -994,6 +1003,13 @@ static int test_mmvq_launch(const TestMmvqPlan & p,const void * w,const void * q
 template<ggml_type T>
 static int test_mmvq_dispatch(const TestMmvqPlan & p,const void * w,const void * q,float * o,cudaStream_t s) {
     if(p.ncols==1) return p.small_k ? test_mmvq_launch<T,1,true>(p,w,q,o,s) : test_mmvq_launch<T,1,false>(p,w,q,o,s);
+#if defined(FERRUM_TEST_SMALL_M_SHARED_WEIGHT_DECODE)
+    if(p.ncols==2) return test_mmvq_launch<T,2,false>(p,w,q,o,s);
+    if(p.ncols==3) return test_mmvq_launch<T,3,false>(p,w,q,o,s);
+    if(p.ncols==5) return test_mmvq_launch<T,5,false>(p,w,q,o,s);
+    if(p.ncols==6) return test_mmvq_launch<T,6,false>(p,w,q,o,s);
+    if(p.ncols==7) return test_mmvq_launch<T,7,false>(p,w,q,o,s);
+#endif
     if(p.ncols==4) return test_mmvq_launch<T,4,false>(p,w,q,o,s);
     if(p.ncols==8) return test_mmvq_launch<T,8,false>(p,w,q,o,s);
     return -1;
@@ -1059,6 +1075,56 @@ extern "C" int ferrum_upstream_mmvq_dot_v1(const FerrumUpstreamLinearPlanV1 * p,
             static_cast<cudaStream_t>(stream));
     });
 }
+#if defined(FERRUM_TEST_SMALL_M_SHARED_WEIGHT_DECODE)
+// Retain the original generic table for each width, including its warp
+// reduction. Only weight-side unpack is shared across the actual columns.
+template<ggml_type T, int C>
+static int test_small_shared_launch(const TestMmvqPlan & n, const void * weights,
+        const void * packed, float * output, cudaStream_t stream) {
+    const dim3 grid(n.padded_outputs/n.rows_per_block,1,1), block(32,n.nwarps,1);
+    const auto one=init_fastdiv_values(1);
+    const uint32_t qstride=n.padded_inputs/32;
+    ggml_cuda_mm_fusion_args_device fusion{};
+    mul_mat_vec_q<T,C,false,false,false,true><<<grid,block,0,stream>>>(weights,packed,
+        static_cast<const int32_t *>(nullptr),fusion,output,
+        n.inputs,make_uint3(0,0,0),n.inputs/256,qstride,n.outputs,one,
+        n.padded_outputs*(n.inputs/256),n.rows*qstride,n.rows*n.outputs,one,
+        n.padded_outputs*(n.inputs/256),n.rows*qstride,n.rows*n.outputs,uint32_t(0));
+    return cudaGetLastError();
+}
+template<ggml_type T>
+static int test_small_shared_dispatch(const TestMmvqPlan & n, const void * w,
+        const void * q, float * o, cudaStream_t s) {
+    switch (n.ncols) {
+        case 2: return test_small_shared_launch<T,2>(n,w,q,o,s);
+        case 3: return test_small_shared_launch<T,3>(n,w,q,o,s);
+        case 4: return test_small_shared_launch<T,4>(n,w,q,o,s);
+        case 5: return test_small_shared_launch<T,5>(n,w,q,o,s);
+        case 6: return test_small_shared_launch<T,6>(n,w,q,o,s);
+        case 7: return test_small_shared_launch<T,7>(n,w,q,o,s);
+        case 8: return test_small_shared_launch<T,8>(n,w,q,o,s);
+        default: return -2;
+    }
+}
+extern "C" int ferrum_test_upstream_mmvq_small_shared_weight_decode_dot_v1(
+        const FerrumUpstreamLinearPlanV1 * p, const void * weights,
+        const void * packed, void * output, void * fixup, void * stream) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmvqPlan n{};
+        if (!upstream_mmvq_valid(p,n) || fixup) return -1;
+        if ((n.format != GGML_TYPE_Q4_K && n.format != GGML_TYPE_Q5_K) ||
+                n.layout != 0 || n.rows < 2 || n.rows > 8 || n.ncols != n.rows ||
+                n.channels != 1 || n.rows_per_block != 2 || n.small_k) return -2;
+        if (!weights || !packed || !output || uintptr_t(weights)%4 ||
+                uintptr_t(packed)%4 || uintptr_t(output)%4) return -5;
+        if (n.format == GGML_TYPE_Q4_K)
+            return test_small_shared_dispatch<GGML_TYPE_Q4_K>(n,weights,packed,
+                static_cast<float *>(output),static_cast<cudaStream_t>(stream));
+        return test_small_shared_dispatch<GGML_TYPE_Q5_K>(n,weights,packed,
+            static_cast<float *>(output),static_cast<cudaStream_t>(stream));
+    });
+}
+#endif
 // Additive opt-in dot. The baseline export above remains selectable in the
 // same archive with the exact same plan/pack/cast contracts.
 extern "C" int ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1(

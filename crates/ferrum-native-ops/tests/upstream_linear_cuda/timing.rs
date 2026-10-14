@@ -16,6 +16,10 @@ mod complete_projection;
 #[path = "timing/iq4_shared_weight_decode.rs"]
 mod iq4_shared_weight_decode;
 
+#[cfg(feature = "cuda-upstream-small-shared-weight-decode-tests")]
+#[path = "timing/small_shared_weight_decode.rs"]
+mod small_shared_weight_decode;
+
 #[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
 #[path = "timing/ffn_current_routes.rs"]
 mod ffn_current_routes;

@@ -1,4 +1,4 @@
-//! Complete M8 MMQ-versus-selected-MMVQ projection ring used by route diagnostics.
+//! Complete current-route-versus-selected-MMVQ projection ring used by route diagnostics.
 //! Both arms retain public packing/cast and share each physical weight address.
 use super::*;
 
@@ -19,8 +19,8 @@ fn shared_matches_reference(reference: &Route, selected: &Route, count: usize) {
     assert_eq!(selected.flags.read::<u32>(count), vec![0; count]);
 }
 
-fn input_words(bank: usize, k: usize, generation: usize) -> Vec<u16> {
-    (0..8 * k)
+fn input_words(bank: usize, m: usize, k: usize, generation: usize) -> Vec<u16> {
+    (0..m * k)
         .map(|i| {
             f16::from_f32(((i * 17 + bank * 13 + generation * 29) % 101) as f32 / 2048.0 - 0.024)
                 .to_bits()
@@ -43,10 +43,13 @@ struct Bank {
 }
 
 impl Bank {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stream: &Stream,
         format: UpstreamLinearFormat,
         bank: usize,
+        m: usize,
+        current: UpstreamLinearAlgorithm,
         k: usize,
         n: usize,
         count: usize,
@@ -84,27 +87,26 @@ impl Bank {
                 ));
             }
         }
-        let input = Buffer::new(8 * k * 2);
-        input.write(&input_words(bank, k, 0));
+        let input = Buffer::new(m * k * 2);
+        input.write(&input_words(bank, m, k, 0));
         // A nonzero physical output window verifies the other leaf and padding.
         let (output_stride, output_offset) = (2 * n + 5, n + 2);
-        let routes =
-            [UpstreamLinearAlgorithm::Mmq, UpstreamLinearAlgorithm::Mmvq].map(|algorithm| {
-                Route::new_with_result_window(
-                    algorithm,
-                    format,
-                    8,
-                    k as u32,
-                    n as u32,
-                    count,
-                    output_stride as u32,
-                    output_offset as u32,
-                )
-            });
+        let routes = [current, UpstreamLinearAlgorithm::Mmvq].map(|algorithm| {
+            Route::new_with_result_window(
+                algorithm,
+                format,
+                m as u32,
+                k as u32,
+                n as u32,
+                count,
+                output_stride as u32,
+                output_offset as u32,
+            )
+        });
         let reference = Route::new_with_result_window(
             UpstreamLinearAlgorithm::Mmvq,
             format,
-            8,
+            m as u32,
             k as u32,
             n as u32,
             count,
@@ -114,7 +116,17 @@ impl Bank {
         let stable = std::array::from_fn(|arm| {
             for (index, &address) in addresses.iter().enumerate() {
                 routes[arm].scan(stream, address, index);
-                routes[arm].enqueue_with_mmvq_dot(stream, &input, address, index, dot);
+                routes[arm].enqueue_with_mmvq_dot(
+                    stream,
+                    &input,
+                    address,
+                    index,
+                    if arm == 0 {
+                        ffi::ferrum_upstream_mmvq_dot_v1
+                    } else {
+                        dot
+                    },
+                );
             }
             stream.sync();
             routes[arm].validate(format, &host_weights, count)
@@ -131,7 +143,17 @@ impl Bank {
             Graph::capture(stream, || {
                 for _ in 0..laps {
                     for (index, &address) in addresses.iter().enumerate() {
-                        routes[arm].enqueue_with_mmvq_dot(stream, &input, address, index, dot);
+                        routes[arm].enqueue_with_mmvq_dot(
+                            stream,
+                            &input,
+                            address,
+                            index,
+                            if arm == 0 {
+                                ffi::ferrum_upstream_mmvq_dot_v1
+                            } else {
+                                dot
+                            },
+                        );
                     }
                 }
             })
@@ -165,7 +187,12 @@ impl Bank {
     }
 
     fn fresh_replay(&self, stream: &Stream, format: UpstreamLinearFormat, bank: usize, k: usize) {
-        self.input.write(&input_words(bank, k, 1));
+        self.input.write(&input_words(
+            bank,
+            self.routes[0].plan.request.rows as usize,
+            k,
+            1,
+        ));
         for graph in &self.graphs {
             graph.launch(stream);
         }
@@ -193,6 +220,29 @@ pub(super) fn paired_projection_ring(
     dot: MmvqDot,
     selected_label: &str,
 ) {
+    paired_projection_ring_for_rows(
+        experiment,
+        format,
+        8,
+        UpstreamLinearAlgorithm::Mmq,
+        k,
+        n,
+        dot,
+        selected_label,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paired_projection_ring_for_rows(
+    experiment: &str,
+    format: UpstreamLinearFormat,
+    m: usize,
+    current: UpstreamLinearAlgorithm,
+    k: usize,
+    n: usize,
+    dot: MmvqDot,
+    selected_label: &str,
+) {
     let _ = caps();
     let mut l2 = 0;
     unsafe {
@@ -207,12 +257,12 @@ pub(super) fn paired_projection_ring(
     let stream = Stream::new();
     // All five physical banks and both graphs exist before any warm/timing.
     let banks = (0..BANKS)
-        .map(|bank| Bank::new(&stream, format, bank, k, n, count, dot))
+        .map(|bank| Bank::new(&stream, format, bank, m, current, k, n, count, dot))
         .collect::<Vec<_>>();
     let plan = serde_json::json!({
         "experiment":experiment,
         "scope":"test-only native projection; no provider/model throughput claim",
-        "format":format!("{format:?}"),"M":8,"K":k,"N":n,
+        "format":format!("{format:?}"),"M":m,"K":k,"N":n,
         "banks":BANKS,"matrices_per_bank":count,"weight_bytes":weight_bytes,
         "physical_working_set_bytes":BANKS*count*weight_bytes,
         "device_l2_bytes":l2,"laps":banks[0].laps,
@@ -227,10 +277,10 @@ pub(super) fn paired_projection_ring(
         serde_json::json!({
             "experiment":experiment,"kind":"scope",
             "timed":"public pack_v2 including flags/guards; dot with actual stream-K fixup; cast",
-            "mmq":"current public pack_v2 direct-F16 small rows and kernel flag clear",
+            "current_algorithm":format!("{current:?}"),
             "mmvq":"current public pack_v2 F32 activation and kernel flag clear, selected shared dot",
             "selected_dot":selected_label,
-            "precondition":"before each measured arm replay the next bank's complete MMQ ring then synchronize; excluded from event and wall intervals; no cache-eviction guarantee",
+            "precondition":"before each measured arm replay the next bank's complete current-route ring then synchronize; excluded from event and wall intervals; no cache-eviction guarantee",
             "precondition_projection_count":banks[0].laps*count,
             "precondition_weight_address_bytes":count*weight_bytes,
             "correctness":"own actual-pack nine-point F64; all output finite/cast/guards; full shared-vs-baseline-MMVQ buffers; fresh same-address graph replay",
@@ -289,9 +339,9 @@ pub(super) fn paired_projection_ring(
             "{}",
             serde_json::json!({
                 "experiment":experiment,"kind":"sample",
-                "format":format!("{format:?}"),"M":8,"K":k,"N":n,
+                "format":format!("{format:?}"),"M":m,"K":k,"N":n,
                 "bank":bank,"pair":pair,"order":order,
-                "route":if arm==0 {"mmq_current"} else {selected_label},
+                "route":if arm==0 {if current == UpstreamLinearAlgorithm::Mmq {"mmq_current"} else {"mmvq_current"}} else {selected_label},
                 "gpu_ns":gpu_ns,"wall_ns":wall_ns,
                 "projections":banks[bank].laps*count
             })
