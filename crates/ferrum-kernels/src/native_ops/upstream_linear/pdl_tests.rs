@@ -76,30 +76,6 @@ fn native_support(plan: &PreparedUpstreamLinear) -> Option<bool> {
     }
 }
 
-fn native_mmq_support(plan: &PreparedUpstreamLinear) -> Option<bool> {
-    // The product policy deliberately leaves prefill and old pack contracts
-    // ordered, independently of the current device's PDL capability.
-    if !(1..=32).contains(&plan.raw.request.rows) {
-        return Some(false);
-    }
-    if plan.small_mmq_pack != SmallMmqPack::DirectF16KernelClear {
-        return None;
-    }
-    #[cfg(all(feature = "cuda-upstream-linear", ferrum_native_mmq_pdl))]
-    {
-        let mut supported = 0;
-        Error::from_status(unsafe {
-            ffi::ferrum_upstream_mmq_programmatic_support_v1(&plan.raw, &mut supported)
-        })
-        .unwrap();
-        Some(supported != 0)
-    }
-    #[cfg(not(all(feature = "cuda-upstream-linear", ferrum_native_mmq_pdl)))]
-    {
-        None
-    }
-}
-
 fn verify(
     stream: &Arc<CudaStream>,
     device: Device,
@@ -109,30 +85,8 @@ fn verify(
     outputs: u32,
     shared: bool,
 ) {
-    verify_prepared(
-        stream,
-        device,
-        Algorithm::Mmvq,
-        format,
-        rows,
-        inputs,
-        outputs,
-        shared,
-    );
-}
-
-fn verify_prepared(
-    stream: &Arc<CudaStream>,
-    device: Device,
-    algorithm: Algorithm,
-    format: Format,
-    rows: u32,
-    inputs: u32,
-    outputs: u32,
-    shared: bool,
-) {
     let ordered = PreparedUpstreamLinear::new(
-        algorithm,
+        Algorithm::Mmvq,
         Arithmetic::MarkerV2,
         format,
         Layout::Columns,
@@ -156,47 +110,19 @@ fn verify_prepared(
     } else {
         ordered
     };
-    let native_supported = match algorithm {
-        Algorithm::Mmvq => native_support(&ordered),
-        Algorithm::Mmq => native_mmq_support(&ordered),
+    assert_eq!(ordered.mmvq_launch_kind(), MmvqLaunchKind::Ordered);
+    let native_supported = native_support(&ordered);
+    let candidate = ordered.clone().with_automatic_mmvq_launch().unwrap();
+    let expected_launch = if native_supported == Some(true) {
+        MmvqLaunchKind::Programmatic
+    } else {
+        MmvqLaunchKind::Ordered
     };
-    let candidate = match algorithm {
-        Algorithm::Mmvq => ordered.clone().with_automatic_mmvq_launch(),
-        Algorithm::Mmq => ordered.clone().with_automatic_mmq_launch(),
-    }
-    .unwrap();
-    let (ordered_launch, candidate_launch) = match algorithm {
-        Algorithm::Mmvq => {
-            assert_eq!(ordered.mmvq_launch_kind(), MmvqLaunchKind::Ordered);
-            let expected = if native_supported == Some(true) {
-                MmvqLaunchKind::Programmatic
-            } else {
-                MmvqLaunchKind::Ordered
-            };
-            assert_eq!(candidate.mmvq_launch_kind(), expected);
-            (
-                format!("{:?}", ordered.mmvq_launch_kind()),
-                format!("{:?}", candidate.mmvq_launch_kind()),
-            )
-        }
-        Algorithm::Mmq => {
-            assert_eq!(ordered.mmq_launch_kind(), MmqLaunchKind::Ordered);
-            let expected = if native_supported == Some(true) {
-                MmqLaunchKind::Programmatic
-            } else {
-                MmqLaunchKind::Ordered
-            };
-            assert_eq!(
-                candidate.mmq_launch_kind(),
-                expected,
-                "automatic launch must agree with the linked native GPU/PTX support result"
-            );
-            (
-                format!("{:?}", ordered.mmq_launch_kind()),
-                format!("{:?}", candidate.mmq_launch_kind()),
-            )
-        }
-    };
+    assert_eq!(
+        candidate.mmvq_launch_kind(),
+        expected_launch,
+        "automatic launch must agree with the linked native GPU/PTX support result"
+    );
     assert_eq!(ordered.geometry(), candidate.geometry());
     assert_eq!(ordered.pack_work_counts(), candidate.pack_work_counts());
     assert_eq!(
@@ -211,9 +137,7 @@ fn verify_prepared(
     let (input_stride, output_stride, output_offset) = (inputs + 3, outputs + 5, 2);
     let mut input = Buffer::new(stream, u64::from(rows * input_stride) * 2);
     let mut weights = Buffer::new(stream, geometry.weight_bytes);
-    // Independently owned spans per arm; the optional MMQ fixup span must not
-    // alias raw output. Both arms start with identical bytes, including parts
-    // of the fixup allocation which the original split plan may never write.
+    // Six independently owned spans per arm; native scratch must not alias.
     let buffers = [&ordered, &candidate].map(|plan| {
         [
             Buffer::new(stream, geometry.converted_bytes),
@@ -222,7 +146,6 @@ fn verify_prepared(
             Buffer::new(stream, u64::from(rows * output_stride) * 2),
             Buffer::new(stream, plan.row_poison_bytes()),
             Buffer::new(stream, 4),
-            Buffer::new(stream, geometry.fixup_bytes),
         ]
     });
     let plans = [&ordered, &candidate];
@@ -273,7 +196,10 @@ fn verify_prepared(
                 weights.span(stream),
                 b[1].span(stream),
                 b[2].span(stream),
-                b[6].span(stream),
+                DeviceSpan {
+                    address: 0,
+                    bytes: 0,
+                },
                 s,
             )
             .unwrap();
@@ -335,13 +261,6 @@ fn verify_prepared(
             .each_ref()
             .map(|b| b.each_ref().map(|v| v.read(stream)));
         assert_eq!(observed[0], observed[1], "format={format:?} M={rows} K={inputs} N={outputs} shared={shared} generation={generation}");
-        if algorithm == Algorithm::Mmq {
-            let packed_body = rows as usize * geometry.padded_inputs as usize * 9 / 8;
-            assert!(observed[1][1][packed_body..].iter().all(|v| *v == 0));
-            if rows <= 32 && ordered.small_mmq_pack != SmallMmqPack::LegacyF32 {
-                assert!(observed[1][0].iter().all(|v| *v == 0x35));
-            }
-        }
         let output = &observed[1][3];
         for (row_index, row) in output.chunks_exact(output_stride as usize * 2).enumerate() {
             assert!(row[..output_offset as usize * 2]
@@ -382,7 +301,10 @@ fn verify_prepared(
     let s = stream.cu_stream().cast();
     let raw_before = b[2].read(stream);
     let packed = b[1].span(stream);
-    let fixup = b[6].span(stream);
+    let fixup = DeviceSpan {
+        address: 0,
+        bytes: 0,
+    };
     assert!(matches!(
         unsafe {
             candidate.dot(
@@ -398,23 +320,6 @@ fn verify_prepared(
         },
         Err(Error::Span)
     ));
-    if fixup.bytes != 0 {
-        assert!(matches!(
-            unsafe {
-                candidate.dot(
-                    weights.span(stream),
-                    packed,
-                    b[2].span(stream),
-                    DeviceSpan {
-                        bytes: fixup.bytes - 1,
-                        ..fixup
-                    },
-                    s,
-                )
-            },
-            Err(Error::Span)
-        ));
-    }
     assert!(matches!(
         unsafe { candidate.dot(weights.span(stream), packed, weights.span(stream), fixup, s) },
         Err(Error::Span)
@@ -423,7 +328,7 @@ fn verify_prepared(
     assert_eq!(raw_before, b[2].read(stream));
     println!(
         "{}",
-        serde_json::json!({"case":if algorithm == Algorithm::Mmq {"prepared_mmq_programmatic"} else {"prepared_mmvq_programmatic"}, "format":format!("{format:?}"),"M":rows,"K":inputs,"N":outputs,"I":geometry.i,"J":geometry.j,"fixup":geometry.fixup,"fixup_bytes":geometry.fixup_bytes,"shared":shared,"ordered":ordered_launch,"candidate":candidate_launch,"native_support":native_supported,"fallback":if rows > 32 { Some("prefill_rows_outside_small_pdl_domain") } else { match native_supported { None => Some("native_or_pack_capability_not_compiled"), Some(false) => Some("native_gpu_or_loaded_ptx_unsupported"), Some(true) => None } },"full_buffers_equal":true,"captured_fresh_poison_recovery":true,"guards_padding_and_rejected_spans":true})
+        serde_json::json!({"case":"prepared_mmvq_programmatic", "format":format!("{format:?}"),"M":rows,"K":inputs,"N":outputs,"shared":shared,"ordered":format!("{:?}",ordered.mmvq_launch_kind()),"candidate":format!("{:?}",candidate.mmvq_launch_kind()),"native_support":native_supported,"fallback":match native_supported { None => Some("native_capability_not_compiled"), Some(false) => Some("native_gpu_or_loaded_ptx_unsupported"), Some(true) => None },"full_buffers_equal":true,"captured_fresh_poison_recovery":true,"guards_padding_and_rejected_spans":true})
     );
 }
 
@@ -452,107 +357,4 @@ fn prepared_mmvq_programmatic_launch_matches_ordered_across_actual_templates() {
     }
     verify(&stream, device, Format::Q4K, 8, 5120, 10240, true);
     verify(&stream, device, Format::Q5K, 8, 6144, 5120, true);
-}
-
-#[test]
-#[ignore = "requires CUDA and locked native MMQ exports; validates actual PDL or explicit ordered fallback"]
-fn prepared_mmq_programmatic_launch_matches_ordered_across_actual_templates() {
-    let context = CudaContext::new(0).unwrap();
-    unsafe { context.disable_event_tracking() };
-    let stream = context.new_stream().unwrap();
-    let attr = |key| u32::try_from(context.attribute(key).unwrap()).unwrap();
-    let device = Device {
-        architecture: attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR) * 100
-            + attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR) * 10,
-        multiprocessors: attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
-        maximum_dynamic_shared_bytes: u64::from(attr(
-            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-        )),
-    };
-    for format in [Format::Iq4Xs, Format::Q4K, Format::Q5K] {
-        // Partial N and K256 exercise the original all-no-work fixup boundary.
-        // Row widths also select the existing J8/16/24/32 template families;
-        // report the actual plan rather than requiring a device-specific tile.
-        for rows in [2, 16, 24, 32] {
-            verify_prepared(
-                &stream,
-                device,
-                Algorithm::Mmq,
-                format,
-                rows,
-                256,
-                33,
-                false,
-            );
-        }
-        verify_prepared(
-            &stream,
-            device,
-            Algorithm::Mmq,
-            format,
-            8,
-            5120,
-            17408,
-            false,
-        );
-        verify_prepared(
-            &stream,
-            device,
-            Algorithm::Mmq,
-            format,
-            2,
-            17408,
-            5120,
-            false,
-        );
-        let probe = PreparedUpstreamLinear::new(
-            Algorithm::Mmq,
-            Arithmetic::MarkerV2,
-            format,
-            Layout::Columns,
-            8,
-            256,
-            128,
-            device,
-        )
-        .unwrap();
-        let outputs = probe
-            .geometry()
-            .i
-            .checked_mul(device.multiprocessors)
-            .unwrap();
-        let no_fixup = PreparedUpstreamLinear::new(
-            Algorithm::Mmq,
-            Arithmetic::MarkerV2,
-            format,
-            Layout::Columns,
-            8,
-            256,
-            outputs,
-            device,
-        )
-        .unwrap();
-        assert_eq!(no_fixup.geometry().fixup, 0);
-        verify_prepared(
-            &stream,
-            device,
-            Algorithm::Mmq,
-            format,
-            8,
-            256,
-            outputs,
-            false,
-        );
-    }
-    // The prefill planner and F32 intermediate contract remain ordered.
-    verify_prepared(
-        &stream,
-        device,
-        Algorithm::Mmq,
-        Format::Iq4Xs,
-        33,
-        256,
-        33,
-        false,
-    );
 }

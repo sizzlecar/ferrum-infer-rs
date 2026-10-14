@@ -1,21 +1,6 @@
-//! Cold qualification of complete MMVQ and small-row MMQ launch chains. This changes
+//! Cold qualification of one complete MMVQ launch chain. This changes
 //! scheduling only; numerical/weight-decode selection remains authoritative.
 use super::*;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum MmqLaunchKind {
-    #[default]
-    Ordered,
-    Programmatic,
-}
-impl MmqLaunchKind {
-    pub const fn as_runtime_value(self) -> &'static str {
-        match self {
-            Self::Ordered => "ordered",
-            Self::Programmatic => "programmatic",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MmvqLaunchKind {
@@ -99,48 +84,6 @@ pub(super) fn qualify(plan: &PreparedUpstreamLinear) -> Result<MmvqLaunchKind, E
     }
 }
 
-fn mmq_eligible(plan: &PreparedUpstreamLinear) -> bool {
-    #[cfg(any(feature = "cuda-upstream-linear", test))]
-    {
-        let p = &plan.raw;
-        plan.family == Family::Original
-            && plan.arithmetic == Arithmetic::MarkerV2
-            && p.algorithm == Algorithm::Mmq as u32
-            && p.request.layout == Layout::Columns as u32
-            && (1..=32).contains(&p.request.rows)
-            && plan.small_mmq_pack == SmallMmqPack::DirectF16KernelClear
-            && matches!(p.request.format, v if v == Format::Q4K as u32
-                || v == Format::Q5K as u32 || v == Format::Iq4Xs as u32)
-    }
-    #[cfg(not(any(feature = "cuda-upstream-linear", test)))]
-    {
-        let _ = plan;
-        false
-    }
-}
-
-pub(super) fn qualify_mmq(plan: &PreparedUpstreamLinear) -> Result<MmqLaunchKind, Error> {
-    if !mmq_eligible(plan) {
-        return Ok(MmqLaunchKind::Ordered);
-    }
-    #[cfg(all(feature = "cuda-upstream-linear", ferrum_native_mmq_pdl))]
-    {
-        let mut supported = 0;
-        Error::from_status(unsafe {
-            ffi::ferrum_upstream_mmq_programmatic_support_v1(&plan.raw, &mut supported)
-        })?;
-        Ok(if supported == 0 {
-            MmqLaunchKind::Ordered
-        } else {
-            MmqLaunchKind::Programmatic
-        })
-    }
-    #[cfg(not(all(feature = "cuda-upstream-linear", ferrum_native_mmq_pdl)))]
-    {
-        Ok(MmqLaunchKind::Ordered)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,62 +104,8 @@ mod tests {
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             mmvq_launch: MmvqLaunchKind::Ordered,
-            mmq_launch: MmqLaunchKind::Ordered,
         }
     }
-    #[test]
-    fn mmq_pdl_eligibility_keeps_small_direct_f16_original_routes() {
-        for format in [Format::Q4K, Format::Q5K, Format::Iq4Xs] {
-            for rows in 1..=32 {
-                let mut p = prepared(rows, format);
-                p.raw.algorithm = Algorithm::Mmq as u32;
-                p.small_mmq_pack = SmallMmqPack::DirectF16KernelClear;
-                // Both exact tiles and split-K plans are part of this chain.
-                for fixup in [0, 4096] {
-                    p.raw.fixup_bytes = fixup;
-                    assert!(mmq_eligible(&p));
-                }
-            }
-        }
-        let mut original = prepared(8, Format::Q4K);
-        original.raw.algorithm = Algorithm::Mmq as u32;
-        original.small_mmq_pack = SmallMmqPack::DirectF16KernelClear;
-        for changed in 0..9 {
-            let mut p = original.clone();
-            match changed {
-                0 => p.family = Family::Extra,
-                1 => p.arithmetic = Arithmetic::V1,
-                2 => p.raw.algorithm = Algorithm::Mmvq as u32,
-                3 => p.raw.request.layout = Layout::Channels as u32,
-                4 => p.raw.request.rows = 0,
-                5 => p.raw.request.rows = 33,
-                6 => p.small_mmq_pack = SmallMmqPack::LegacyF32,
-                7 => p.small_mmq_pack = SmallMmqPack::DirectF16Memset,
-                _ => p.raw.request.format = u32::MAX,
-            }
-            assert!(!mmq_eligible(&p));
-            assert_eq!(
-                p.with_automatic_mmq_launch().unwrap().mmq_launch_kind(),
-                MmqLaunchKind::Ordered
-            );
-        }
-        #[cfg(not(all(feature = "cuda-upstream-linear", ferrum_native_mmq_pdl)))]
-        assert_eq!(
-            original
-                .clone()
-                .with_automatic_mmq_launch()
-                .unwrap()
-                .mmq_launch_kind(),
-            MmqLaunchKind::Ordered
-        );
-        original.mmq_launch = MmqLaunchKind::Programmatic;
-        assert_eq!(original.pack_work_counts(), (2, 0));
-        assert_ne!(
-            MmqLaunchKind::Ordered.as_runtime_value(),
-            MmqLaunchKind::Programmatic.as_runtime_value()
-        );
-    }
-
     #[test]
     fn mmvq_pdl_eligibility_preserves_original_numeric_family_and_actual_columns() {
         for format in [Format::Q4K, Format::Q5K, Format::Iq4Xs] {

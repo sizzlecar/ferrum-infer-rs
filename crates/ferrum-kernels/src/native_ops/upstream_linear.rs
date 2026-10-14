@@ -18,7 +18,7 @@ pub use ferrum_native_ops::upstream_linear::{
 };
 use std::ffi::c_void;
 mod pdl;
-pub use pdl::{MmqLaunchKind, MmvqLaunchKind};
+pub use pdl::MmvqLaunchKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceSpan {
@@ -139,7 +139,6 @@ pub struct PreparedUpstreamLinear {
     q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
     mmvq_launch: MmvqLaunchKind,
-    mmq_launch: MmqLaunchKind,
 }
 impl PreparedUpstreamLinear {
     pub fn new(
@@ -179,7 +178,6 @@ impl PreparedUpstreamLinear {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
-                mmq_launch: MmqLaunchKind::Ordered,
             })
         }
     }
@@ -220,7 +218,6 @@ impl PreparedUpstreamLinear {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
-                mmq_launch: MmqLaunchKind::Ordered,
             })
         }
     }
@@ -260,7 +257,6 @@ impl PreparedUpstreamLinear {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
-                mmq_launch: MmqLaunchKind::Ordered,
             })
         }
     }
@@ -274,9 +270,6 @@ impl PreparedUpstreamLinear {
     /// The linked archive capability is captured during cold preparation. Older
     /// archives and every other route retain their existing work accounting.
     pub fn pack_work_counts(&self) -> (u64, u64) {
-        if self.mmq_launch == MmqLaunchKind::Programmatic {
-            return (2, 0);
-        }
         if self.mmvq_launch == MmvqLaunchKind::Programmatic {
             return (3, 0);
         }
@@ -391,15 +384,6 @@ impl PreparedUpstreamLinear {
     pub fn mmvq_launch_kind(&self) -> MmvqLaunchKind {
         self.mmvq_launch
     }
-    /// Qualify the original small-row MMQ chain during preparation. The native
-    /// capability query preserves the exact plan, including split-K fixup.
-    pub fn with_automatic_mmq_launch(mut self) -> Result<Self, Error> {
-        self.mmq_launch = pdl::qualify_mmq(&self)?;
-        Ok(self)
-    }
-    pub fn mmq_launch_kind(&self) -> MmqLaunchKind {
-        self.mmq_launch
-    }
     pub fn q5_shared_weight_decode_eligible(&self) -> bool {
         self.shared_weight_decode_geometry(Format::Q5K, 8)
     }
@@ -467,14 +451,6 @@ impl PreparedUpstreamLinear {
                     )
                 });
             }
-            #[cfg(ferrum_native_mmq_pdl)]
-            if self.mmq_launch == MmqLaunchKind::Programmatic {
-                return Error::from_status(unsafe {
-                    ffi::ferrum_upstream_mmq_programmatic_pack_f16_small_v2(
-                        &self.raw, x, stride, c, q, poison, stream,
-                    )
-                });
-            }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
             Error::from_status(unsafe {
                 match self.arithmetic {
@@ -524,12 +500,6 @@ impl PreparedUpstreamLinear {
                         stream,
                         pdl::dot_kind(self) as u32,
                     )
-                });
-            }
-            #[cfg(ferrum_native_mmq_pdl)]
-            if self.mmq_launch == MmqLaunchKind::Programmatic {
-                return Error::from_status(unsafe {
-                    ffi::ferrum_upstream_mmq_programmatic_dot_v1(&self.raw, w, q, o, f, stream)
                 });
             }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
@@ -603,14 +573,6 @@ impl PreparedUpstreamLinear {
             if self.mmvq_launch == MmvqLaunchKind::Programmatic {
                 return Error::from_status(unsafe {
                     ffi::ferrum_upstream_mmvq_pdl_cast_v2(&self.raw, i, o, stride, rp, wp, stream)
-                });
-            }
-            #[cfg(ferrum_native_mmq_pdl)]
-            if self.mmq_launch == MmqLaunchKind::Programmatic {
-                return Error::from_status(unsafe {
-                    ffi::ferrum_upstream_mmq_programmatic_cast_v2(
-                        &self.raw, i, o, stride, rp, wp, stream,
-                    )
                 });
             }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
@@ -726,7 +688,6 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
-                mmq_launch: MmqLaunchKind::Ordered,
             };
             assert_eq!(prepared.pack_work_counts(), expected,
                 "{family:?}/{arithmetic:?}/{algorithm:?}/M{rows}/capability{capability:?}/guard{guard}");
@@ -804,7 +765,6 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
-                mmq_launch: MmqLaunchKind::Ordered,
             };
             assert_eq!(prepared.pack_work_counts(), expected,
                 "{family:?}/{arithmetic:?}/{algorithm:?}/M{rows}/capability{capability:?}/guard{guard}");
@@ -831,7 +791,6 @@ mod tests {
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             mmvq_launch: MmvqLaunchKind::Ordered,
-            mmq_launch: MmqLaunchKind::Ordered,
         };
         assert!(plan.q4_shared_weight_decode_eligible());
         let mutate = |f: fn(&mut PreparedUpstreamLinear)| {
@@ -880,7 +839,6 @@ mod tests {
             small_mmvq_pack: SmallMmvqPack::F32Memset,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             mmvq_launch: MmvqLaunchKind::Ordered,
-            mmq_launch: MmqLaunchKind::Ordered,
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
         };
         assert!(plan.q5_shared_weight_decode_eligible());
@@ -932,7 +890,6 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
-                mmq_launch: MmqLaunchKind::Ordered,
             };
             assert!(plan.shared_weight_decode_geometry(format, 4));
             assert!(!plan.q4_shared_weight_decode_eligible());
@@ -1040,7 +997,6 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
-                mmq_launch: MmqLaunchKind::Ordered,
             };
             assert_eq!(plan.operator(), family.operator());
         }
