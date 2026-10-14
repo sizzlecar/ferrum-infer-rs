@@ -28,7 +28,6 @@ use super::dispatch_contract::{
 };
 use super::foundation::invalid_operation;
 use super::invocation::OperationInvocationResources;
-use super::registry::CurrentReusableAddressScopes;
 use super::workspace_encoding::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
 };
@@ -660,11 +659,6 @@ impl OperationDispatch {
         };
 
         const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v3\0";
-        let address_scopes = CurrentReusableAddressScopes::new(
-            plan.payload().memory(),
-            wave.claimed_backing(),
-            wave.step_resources().backing_slices(),
-        );
         let mut digest = Sha256::new();
         let mut eager_boundary_node_indices = Vec::new();
         digest.update(DOMAIN);
@@ -695,8 +689,10 @@ impl OperationDispatch {
                 node.scratch_resource(),
                 node.binding_resource(),
                 node.persistent_resource(),
+                plan.payload().memory(),
                 prepared_node.work_shape(),
-                &address_scopes,
+                wave.claimed_backing(),
+                wave.step_resources().backing_slices(),
             )?;
             let declared = node.provider_execution_semantics().replay_equivalence();
             let topology = provider.provider().reusable_execution_topology(request)?;
