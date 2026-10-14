@@ -19,6 +19,22 @@ unsafe extern "C" {
         fixup: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+    fn ferrum_upstream_mmvq_q4_shared_weight_decode_m4_dot_v1(
+        plan: *const UpstreamLinearPlanV1,
+        weights: *const c_void,
+        packed: *const c_void,
+        output: *mut c_void,
+        fixup: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn ferrum_upstream_mmvq_q5_shared_weight_decode_m4_dot_v1(
+        plan: *const UpstreamLinearPlanV1,
+        weights: *const c_void,
+        packed: *const c_void,
+        output: *mut c_void,
+        fixup: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 const DOTS: [MmvqDot; 2] = [
@@ -363,6 +379,187 @@ fn quant_block_bytes(format: UpstreamLinearFormat) -> usize {
         UpstreamLinearFormat::Q4K => 144,
         UpstreamLinearFormat::Q5K => 176,
     }
+}
+
+/// Exercise mantissas in both half coefficients, all packed scale bytes, and
+/// signed activations. Padded weight rows and input padding remain untouched.
+fn overwrite_mixed_finite_scales(case: &mut Case, seed: u64) {
+    let mixed = |mut value: u64| {
+        value = value.wrapping_add(0x9e3779b97f4a7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    };
+    let (m, k, n) = (
+        case.plan.request.rows as usize,
+        case.plan.request.inputs as usize,
+        case.plan.request.outputs as usize,
+    );
+    for row in 0..m {
+        for col in 0..k {
+            let bits = mixed(seed ^ ((row * k + col) as u64));
+            case.host_input[row * case.input_stride + col] =
+                0x2400 | (bits as u16 & 0x0fff) | ((bits >> 32) as u16 & 0x8000);
+        }
+    }
+    let block_bytes = quant_block_bytes(case.format);
+    let real_bytes = n * (k / 256) * block_bytes;
+    for (index, block) in case.host_weights[..real_bytes]
+        .chunks_exact_mut(block_bytes)
+        .enumerate()
+    {
+        let bits = mixed(seed.wrapping_add(index as u64));
+        // Nearby positive coefficients combine with signed dot terms and the
+        // subtractive minimum term to exercise cancellation. All are finite
+        // normal halves with nonzero mantissas, varying at every block.
+        let d = 0x1400 | (bits as u16 & 0x0fff) | 1;
+        let dmin = 0x1400 | ((bits >> 16) as u16 & 0x0fff) | 1;
+        block[..2].copy_from_slice(&d.to_le_bytes());
+        block[2..4].copy_from_slice(&dmin.to_le_bytes());
+        for (offset, byte) in block[4..].iter_mut().enumerate() {
+            *byte = mixed(bits.wrapping_add(offset as u64)) as u8;
+        }
+    }
+    unsafe {
+        ok(cudaMemcpy(
+            case.input.ptr.add(2),
+            case.host_input.as_ptr().cast(),
+            case.host_input.len() * 2,
+            1,
+        ));
+        ok(cudaMemcpy(
+            case.weights.ptr.add(4),
+            case.host_weights.as_ptr().cast(),
+            case.host_weights.len(),
+            1,
+        ));
+    }
+}
+
+#[test]
+#[ignore = "requires the production Q4/Q5 shared M4 and M8 CUDA exports"]
+fn m4_m8_shared_weight_decode_preserves_mixed_finite_scale_bits() {
+    let _ = caps();
+    let stream = Stream::new();
+    let mut failures = Vec::new();
+    let mut cases = 0;
+    for format in [UpstreamLinearFormat::Q4K, UpstreamLinearFormat::Q5K] {
+        for m in [4, 8] {
+            let dot = match (format, m) {
+                (UpstreamLinearFormat::Q4K, 4) => {
+                    ferrum_upstream_mmvq_q4_shared_weight_decode_m4_dot_v1 as MmvqDot
+                }
+                (UpstreamLinearFormat::Q5K, 4) => {
+                    ferrum_upstream_mmvq_q5_shared_weight_decode_m4_dot_v1 as MmvqDot
+                }
+                (UpstreamLinearFormat::Q4K, 8) => DOTS[1],
+                (UpstreamLinearFormat::Q5K, 8) => Q5_DOTS[1],
+                _ => unreachable!(),
+            };
+            for (k, n) in [
+                (5120, 10240),
+                (6144, 5120),
+                (5120, 17408),
+                (17408, 5120),
+                (512, 17),
+            ] {
+                for seed in [0, 1] {
+                    let mut case = Case::new_rows(format, m, k, n, Input::Finite, false);
+                    overwrite_mixed_finite_scales(&mut case, seed);
+                    let reference = case.run(&stream, ffi::ferrum_upstream_mmvq_dot_v1);
+                    let actual = case.run(&stream, dot);
+                    let mut raw_mismatches = 0;
+                    let mut max_abs = 0.0_f64;
+                    let mut max_ulp = 0_u32;
+                    let mut first = Vec::new();
+                    let ordered = |bits: u32| {
+                        if bits & 0x80000000 == 0 {
+                            bits | 0x80000000
+                        } else {
+                            !bits
+                        }
+                    };
+                    for (index, (&a, &b)) in reference.output.iter().zip(&actual.output).enumerate()
+                    {
+                        if a != b {
+                            raw_mismatches += 1;
+                            let abs =
+                                (f64::from(f32::from_bits(a)) - f64::from(f32::from_bits(b))).abs();
+                            let ulp = ordered(a).abs_diff(ordered(b));
+                            max_abs = max_abs.max(abs);
+                            max_ulp = max_ulp.max(ulp);
+                            if first.len() < 6 {
+                                first.push(serde_json::json!({"row":index/n,"column":index%n,"baseline_bits":a,"shared_bits":b,"absolute_error":abs,"ulp":ulp}));
+                            }
+                        }
+                    }
+                    let cast_mismatches = reference
+                        .result
+                        .iter()
+                        .zip(&actual.result)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    let same_pack_and_flags = reference.converted == actual.converted
+                        && reference.packed == actual.packed
+                        && reference.rows == actual.rows
+                        && reference.weight_flag == actual.weight_flag;
+                    let finite = reference
+                        .output
+                        .iter()
+                        .chain(&actual.output)
+                        .all(|&x| f32::from_bits(x).is_finite());
+                    let flags_clear = reference
+                        .rows
+                        .iter()
+                        .chain(&actual.rows)
+                        .chain(&reference.weight_flag)
+                        .chain(&actual.weight_flag)
+                        .all(|&x| x == 0);
+                    let mut cast_and_padding_errors = 0;
+                    for snapshot in [&reference, &actual] {
+                        for row in 0..m {
+                            for column in 0..n {
+                                cast_and_padding_errors += usize::from(
+                                    snapshot.result[row * case.output_stride + column]
+                                        != oracle::final_cast_bits(
+                                            f32::from_bits(snapshot.output[row * n + column]),
+                                            false,
+                                            false,
+                                        ),
+                                );
+                            }
+                            cast_and_padding_errors += snapshot.result
+                                [row * case.output_stride + n..(row + 1) * case.output_stride]
+                                .iter()
+                                .filter(|&&x| x != 0x3535)
+                                .count();
+                        }
+                    }
+                    let pass = raw_mismatches == 0
+                        && cast_mismatches == 0
+                        && same_pack_and_flags
+                        && finite
+                        && flags_clear
+                        && cast_and_padding_errors == 0;
+                    let report = serde_json::json!({"kind":"mixed_finite_scale_bits","format":format!("{format:?}"),"M":m,"K":k,"N":n,"seed":seed,
+                        "raw_f32_mismatches":raw_mismatches,"cast_f16_mismatches":cast_mismatches,"max_absolute_error":max_abs,"max_ulp":max_ulp,
+                        "same_actual_pack_and_flags":same_pack_and_flags,"finite":finite,"flags_clear":flags_clear,"cast_and_padding_errors":cast_and_padding_errors,"first":first,"pass":pass});
+                    println!("{report}");
+                    cases += 1;
+                    if !pass {
+                        failures.push(report);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "mixed finite scale differential: {}/{} cases failed; first={}",
+        failures.len(),
+        cases,
+        serde_json::Value::Array(failures.into_iter().take(4).collect())
+    );
 }
 
 #[test]
