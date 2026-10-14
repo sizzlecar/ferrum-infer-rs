@@ -13,6 +13,9 @@ use std::{
 const PREPARE: &str = "ferrum_test_gdn_prepare_implicit_single_token_f16";
 const DELTA: &str = "ferrum_test_gdn_delta_implicit_single_token_tiled16_interleaved_f32";
 
+#[path = "implicit_control/pinned_host.rs"]
+mod pinned_host;
+
 fn shape(actual: bool) -> AttentionShape {
     let mut s = super::super::tests::test_shape();
     s.hidden_size = if actual { 5120 } else { 16 };
@@ -203,10 +206,6 @@ impl Layer {
         let a = &self.arms[arm];
         let implicit = arm == 1 && self.implicit();
         let f = if implicit { &funcs.1 } else { &funcs.0 };
-        let s = self.shape;
-        let cuda = s.cuda_shape().unwrap();
-        let tokens = self.indices.len();
-        let m = self.counts.len();
         if !implicit {
             put(stream, a.lengths.pointer(stream), &self.lengths);
             put(stream, a.indices.pointer(stream), &self.indices);
@@ -222,6 +221,21 @@ impl Layer {
         } else {
             a.indices.pointer(stream)
         };
+        self.enqueue_math(stream, f, arm, lengths, indices);
+    }
+    fn enqueue_math(
+        &self,
+        stream: &Arc<CudaStream>,
+        f: &AttentionFunctions,
+        arm: usize,
+        lengths: u64,
+        indices: u64,
+    ) {
+        let a = &self.arms[arm];
+        let s = self.shape;
+        let cuda = s.cuda_shape().unwrap();
+        let tokens = self.indices.len();
+        let m = self.counts.len();
         launch_prepare(AttentionPrepareRequest {
             stream,
             function: &f.prepare_negative_rate,
@@ -306,6 +320,9 @@ impl Layer {
         .unwrap();
     }
     fn check(&self, stream: &Arc<CudaStream>) {
+        self.check_controls(stream, self.implicit());
+    }
+    fn check_controls(&self, stream: &Arc<CudaStream>, implicit: bool) {
         let [a, b] = &self.arms;
         for (x, y) in [
             (&a.state, &b.state),
@@ -341,7 +358,7 @@ impl Layer {
             a.lengths.read(stream);
             a.indices.read(stream);
         }
-        if self.implicit() {
+        if implicit {
             b.lengths.assert_unchanged(stream);
             b.indices.assert_unchanged(stream);
         }
@@ -423,7 +440,12 @@ struct Graph {
     nodes: usize,
     kernels: usize,
     copies: usize,
+    memsets: usize,
     edges: usize,
+    roots: usize,
+    capture_ns: u128,
+    instantiate_ns: u128,
+    upload_ns: u128,
 }
 fn ok(r: sys::CUresult) {
     assert_eq!(r, sys::CUresult::CUDA_SUCCESS);
@@ -431,6 +453,7 @@ fn ok(r: sys::CUresult) {
 impl Graph {
     fn new(stream: &Arc<CudaStream>, enqueue: impl FnOnce()) -> Self {
         stream.synchronize().unwrap();
+        let capture_start = Instant::now();
         unsafe {
             ok(sys::cuStreamBeginCapture_v2(
                 stream.cu_stream(),
@@ -450,6 +473,7 @@ impl Graph {
             }
             std::panic::resume_unwind(p);
         }
+        let capture_ns = capture_start.elapsed().as_nanos();
         let mut count = 0;
         unsafe {
             ok(sys::cuGraphGetNodes(
@@ -462,8 +486,8 @@ impl Graph {
         unsafe {
             ok(sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut count));
         }
-        let (mut kernels, mut copies) = (0, 0);
-        for node in nodes {
+        let (mut kernels, mut copies, mut memsets) = (0, 0, 0);
+        for &node in &nodes {
             let mut kind = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
             unsafe {
                 ok(sys::cuGraphNodeGetType(node, &mut kind));
@@ -471,6 +495,7 @@ impl Graph {
             match kind {
                 sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL => kernels += 1,
                 sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY => copies += 1,
+                sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMSET => memsets += 1,
                 _ => panic!("unexpected node {kind:?}"),
             }
         }
@@ -513,12 +538,23 @@ impl Graph {
             indegree.values().chain(outdegree.values()).all(|&n| n == 1),
             "captured layer dependencies must remain a single chain"
         );
+        let roots = nodes
+            .iter()
+            .filter(|node| !indegree.contains_key(*node))
+            .count();
+        assert_eq!(roots, 1, "captured subgraph must have one root");
         let mut exec = std::ptr::null_mut();
+        let instantiate_start = Instant::now();
         unsafe {
             ok(sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0));
+        }
+        let instantiate_ns = instantiate_start.elapsed().as_nanos();
+        let upload_start = Instant::now();
+        unsafe {
             ok(sys::cuGraphUpload(exec, stream.cu_stream()));
         }
         stream.synchronize().unwrap();
+        let upload_ns = upload_start.elapsed().as_nanos();
         Self {
             graph,
             exec,
@@ -526,7 +562,12 @@ impl Graph {
             nodes: count,
             kernels,
             copies,
+            memsets,
             edges,
+            roots,
+            capture_ns,
+            instantiate_ns,
+            upload_ns,
         }
     }
     fn launch(&self) {
