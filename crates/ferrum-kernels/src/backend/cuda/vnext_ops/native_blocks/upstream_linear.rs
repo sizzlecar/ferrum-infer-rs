@@ -155,16 +155,20 @@ impl UpstreamPlanFactory {
             .map(|format| format as u32)
             .or_else(|| extra.map(|format| format as u32))
             .ok_or("native format is absent")?;
-        let shared_dot = self.q4_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM8
-            && family == NativeFamily::Base
+        let shared_dot = match self.q4_weight_decode {
+            ferrum_types::Q4MmvqWeightDecode::Baseline => false,
+            ferrum_types::Q4MmvqWeightDecode::SharedM8 => rows == 8,
+            ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => matches!(rows, 4 | 8),
+        } && family == NativeFamily::Base
             && algorithm == Algorithm::Mmvq
-            && base == Some(Format::Q4K)
-            && rows == 8;
-        let q5_shared_dot = self.q5_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM8
-            && family == NativeFamily::Base
+            && base == Some(Format::Q4K);
+        let q5_shared_dot = match self.q5_weight_decode {
+            ferrum_types::Q5MmvqWeightDecode::Baseline => false,
+            ferrum_types::Q5MmvqWeightDecode::SharedM8 => rows == 8,
+            ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => matches!(rows, 4 | 8),
+        } && family == NativeFamily::Base
             && algorithm == Algorithm::Mmvq
-            && base == Some(Format::Q5K)
-            && rows == 8;
+            && base == Some(Format::Q5K);
         let key = (
             family,
             algorithm as u32,
@@ -222,13 +226,13 @@ impl UpstreamPlanFactory {
         }
         .map_err(|error| format!("{error}; family={family:?} algorithm={algorithm:?} format={format_code} rows={rows} inputs={inputs} outputs={outputs}"))?;
         let plan = if shared_dot {
-            plan.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8)
+            plan.with_q4_mmvq_weight_decode(self.q4_weight_decode)
                 .map_err(|error| format!("{error}; shared Q4 MMVQ native geometry"))?
         } else {
             plan
         };
         let plan = if q5_shared_dot {
-            plan.with_q5_mmvq_weight_decode(ferrum_types::Q5MmvqWeightDecode::SharedM8)
+            plan.with_q5_mmvq_weight_decode(self.q5_weight_decode)
                 .map_err(|error| format!("{error}; shared Q5 MMVQ native geometry"))?
         } else {
             plan
@@ -609,12 +613,12 @@ impl PreparedUpstreamLeaf {
             native
                 .dot(weights, packed, temporary, fixup, stream.cu_stream().cast())
                 .map_err(|e| error(e.to_string()))?;
-            if native.q4_mmvq_weight_decode() == ferrum_types::Q4MmvqWeightDecode::SharedM8 {
+            if native.q4_mmvq_weight_decode() != ferrum_types::Q4MmvqWeightDecode::Baseline {
                 if let Some(counter) = &self.shared_weight_decode_encodes {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            if native.q5_mmvq_weight_decode() == ferrum_types::Q5MmvqWeightDecode::SharedM8 {
+            if native.q5_mmvq_weight_decode() != ferrum_types::Q5MmvqWeightDecode::Baseline {
                 if let Some(counter) = &self.q5_shared_weight_decode_encodes {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }

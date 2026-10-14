@@ -138,8 +138,20 @@ impl CudaUpstreamSwiGluProvider {
                 UpstreamPlanFactory::new(
                     runtime.context(),
                     fingerprint,
-                    ferrum_types::Q4MmvqWeightDecode::Baseline,
-                    ferrum_types::Q5MmvqWeightDecode::Baseline,
+                    // Only the new mode opts FFN MMVQ plans into shared decode.
+                    // Existing MMQ routes and the old SharedM8 scope stay fixed.
+                    match runtime.q4_mmvq_weight_decode() {
+                        ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => {
+                            ferrum_types::Q4MmvqWeightDecode::SharedM4M8
+                        }
+                        _ => ferrum_types::Q4MmvqWeightDecode::Baseline,
+                    },
+                    match runtime.q5_mmvq_weight_decode() {
+                        ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => {
+                            ferrum_types::Q5MmvqWeightDecode::SharedM4M8
+                        }
+                        _ => ferrum_types::Q5MmvqWeightDecode::Baseline,
+                    },
                     runtime.q4_shared_weight_decode_counter(),
                     runtime.q5_shared_weight_decode_counter(),
                 )

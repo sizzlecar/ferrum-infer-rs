@@ -568,7 +568,10 @@ fn verify_options_with_execution_capacity(
                     ._runtime
                     .q4_shared_weight_decode_encodes()
                     - q4_before;
-                if q4_modes[arm] == Q4MmvqWeightDecode::Baseline || participants != 8 {
+                if !matches!(
+                    (q4_modes[arm], participants),
+                    (Q4MmvqWeightDecode::SharedM8, 8) | (Q4MmvqWeightDecode::SharedM4M8, 4 | 8)
+                ) {
                     assert_eq!(
                         q4_encodes, 0,
                         "baseline and ineligible decode widths must keep the original Q4 route"
@@ -576,7 +579,7 @@ fn verify_options_with_execution_capacity(
                 } else if wave == 0 {
                     assert!(
                         q4_encodes > 0,
-                        "the paired physical-M8 candidate must execute the shared-weight Q4 route"
+                        "the eligible physical-width candidate must execute the shared-weight Q4 route"
                     );
                 }
                 let q5_encodes = fixture
@@ -584,7 +587,10 @@ fn verify_options_with_execution_capacity(
                     ._runtime
                     .q5_shared_weight_decode_encodes()
                     - q5_before;
-                if q5_modes[arm] == Q5MmvqWeightDecode::Baseline || participants != 8 {
+                if !matches!(
+                    (q5_modes[arm], participants),
+                    (Q5MmvqWeightDecode::SharedM8, 8) | (Q5MmvqWeightDecode::SharedM4M8, 4 | 8)
+                ) {
                     assert_eq!(
                         q5_encodes, 0,
                         "baseline and ineligible decode widths must keep the original Q5 route"
@@ -592,7 +598,7 @@ fn verify_options_with_execution_capacity(
                 } else if wave == 0 {
                     assert!(
                         q5_encodes > 0,
-                        "the paired physical-M8 candidate must execute the shared-weight Q5 route"
+                        "the eligible physical-width candidate must execute the shared-weight Q5 route"
                     );
                 }
                 weight_encode_counts[arm] = [q4_encodes, q5_encodes];
@@ -781,20 +787,22 @@ fn q4_shared_weight_decode_matches_baseline_across_core_m8_replay_and_fresh_requ
 ))]
 #[ignore = "requires CUDA shared-weight Q4 and fixed-capacity NativeAdaptive, actual Core admission and replay"]
 fn q4_shared_weight_decode_matches_baseline_with_fixed_capacity_replay_and_growth() {
-    let modes = [Q4MmvqWeightDecode::Baseline, Q4MmvqWeightDecode::SharedM8];
     // At wave4 the 508 rows cross V1/V2 without replacing the fixed program.
     // The 57 rows grow physical KV pages at wave7, after capture, publication
-    // and caller reordering. The M4 case keeps the original Q4 dot selected.
-    for leads in [
-        &[508, 57, 1084, 57, 508, 1084, 57, 1084][..],
-        &[508, 57, 1084, 57][..],
-    ] {
-        verify_options_with_q4_grouping(
-            leads,
-            false,
-            modes,
-            CausalDecodeAttentionGrouping::FixedCapacity,
-        );
+    // and caller reordering. Old SharedM8 keeps M4 on baseline; the new mode
+    // must actually enqueue the same-geometry M4 shared dot there.
+    for selected in [Q4MmvqWeightDecode::SharedM8, Q4MmvqWeightDecode::SharedM4M8] {
+        for leads in [
+            &[508, 57, 1084, 57, 508, 1084, 57, 1084][..],
+            &[508, 57, 1084, 57][..],
+        ] {
+            verify_options_with_q4_grouping(
+                leads,
+                false,
+                [Q4MmvqWeightDecode::Baseline, selected],
+                CausalDecodeAttentionGrouping::FixedCapacity,
+            );
+        }
     }
 }
 
@@ -805,16 +813,28 @@ fn q4_shared_weight_decode_gated_delta_matches_baseline_across_core_m8_replay_an
     verify_gdn_weight_decode(
         [Q4MmvqWeightDecode::Baseline, Q4MmvqWeightDecode::SharedM8],
         [Q5MmvqWeightDecode::Baseline; 2],
+        8,
     );
+    for participants in [4, 8] {
+        verify_gdn_weight_decode(
+            [Q4MmvqWeightDecode::Baseline, Q4MmvqWeightDecode::SharedM4M8],
+            [Q5MmvqWeightDecode::Baseline; 2],
+            participants,
+        );
+    }
 }
 
-fn verify_gdn_weight_decode(q4_modes: [Q4MmvqWeightDecode; 2], q5_modes: [Q5MmvqWeightDecode; 2]) {
+fn verify_gdn_weight_decode(
+    q4_modes: [Q4MmvqWeightDecode; 2],
+    q5_modes: [Q5MmvqWeightDecode; 2],
+    participants: usize,
+) {
     let q5_comparison = q5_modes[0] != q5_modes[1];
     let fixtures = std::array::from_fn::<_, 2, _>(|arm| {
         Fixture::for_family_with_mmvq_weight_decode(
             AttentionKind::GatedDelta,
             true,
-            8,
+            participants as u32,
             Family::new(AttentionKind::GatedDelta),
             ProgramBindingUploadStrategy::CompactScatter,
             SegmentBindingOracleMode::CompareReference,
@@ -841,7 +861,7 @@ fn verify_gdn_weight_decode(q4_modes: [Q4MmvqWeightDecode; 2], q5_modes: [Q5Mmvq
     let mut old_authorities = BTreeSet::new();
     let mut programs = [None, None];
     for generation in 0..2 {
-        let tokens: Vec<Arc<[u32]>> = (0..8)
+        let tokens: Vec<Arc<[u32]>> = (0..participants)
             .map(|owner| {
                 (0..6)
                     .map(|position| ((position * 7 + owner * 3 + generation * 11 + 1) % 32) as u32)
@@ -871,9 +891,9 @@ fn verify_gdn_weight_decode(q4_modes: [Q4MmvqWeightDecode; 2], q5_modes: [Q5Mmvq
                 Path::Replay
             };
             let order: Vec<_> = if position >= 4 {
-                (0..8).rev().collect()
+                (0..participants).rev().collect()
             } else {
-                (0..8).collect()
+                (0..participants).collect()
             };
             let local_tokens: Vec<_> = order
                 .iter()
@@ -913,7 +933,11 @@ fn verify_gdn_weight_decode(q4_modes: [Q4MmvqWeightDecode; 2], q5_modes: [Q5Mmvq
                     ._runtime
                     .q4_shared_weight_decode_encodes()
                     - before;
-                if q4_modes[arm] == Q4MmvqWeightDecode::Baseline || matches!(path, Path::Replay) {
+                if !matches!(
+                    (q4_modes[arm], participants),
+                    (Q4MmvqWeightDecode::SharedM8, 8) | (Q4MmvqWeightDecode::SharedM4M8, 4 | 8)
+                ) || matches!(path, Path::Replay)
+                {
                     assert_eq!(
                         encodes, 0,
                         "baseline and hot replay do not enqueue a shared dot on the host"
@@ -921,7 +945,7 @@ fn verify_gdn_weight_decode(q4_modes: [Q4MmvqWeightDecode; 2], q5_modes: [Q5Mmvq
                 } else if position == 0 {
                     assert!(
                         encodes > 0,
-                        "actual GDN M8 must execute the selected shared-weight Q4 route"
+                        "eligible GDN width must execute the selected shared-weight Q4 route"
                     );
                 }
                 let q5_encodes = fixture
@@ -929,7 +953,11 @@ fn verify_gdn_weight_decode(q4_modes: [Q4MmvqWeightDecode; 2], q5_modes: [Q5Mmvq
                     ._runtime
                     .q5_shared_weight_decode_encodes()
                     - q5_before;
-                if q5_modes[arm] == Q5MmvqWeightDecode::Baseline || matches!(path, Path::Replay) {
+                if !matches!(
+                    (q5_modes[arm], participants),
+                    (Q5MmvqWeightDecode::SharedM8, 8) | (Q5MmvqWeightDecode::SharedM4M8, 4 | 8)
+                ) || matches!(path, Path::Replay)
+                {
                     assert_eq!(
                         q5_encodes, 0,
                         "baseline and hot replay do not enqueue a shared dot on the host"
@@ -937,7 +965,7 @@ fn verify_gdn_weight_decode(q4_modes: [Q4MmvqWeightDecode; 2], q5_modes: [Q5Mmvq
                 } else if position == 0 {
                     assert!(
                         q5_encodes > 0,
-                        "actual GDN M8 must execute the selected shared-weight Q5 route"
+                        "eligible GDN width must execute the selected shared-weight Q5 route"
                     );
                 }
                 weight_encode_counts[arm] = [encodes, q5_encodes];
@@ -988,17 +1016,19 @@ fn q5_shared_weight_decode_matches_baseline_with_fixed_capacity_replay_and_growt
     } else {
         Q4MmvqWeightDecode::Baseline
     };
-    for leads in [
-        &[508, 57, 1084, 57, 508, 1084, 57, 1084][..],
-        &[508, 57, 1084, 57][..],
-    ] {
-        verify_options_with_weight_decode_grouping(
-            leads,
-            false,
-            [q4; 2],
-            [Q5MmvqWeightDecode::Baseline, Q5MmvqWeightDecode::SharedM8],
-            CausalDecodeAttentionGrouping::FixedCapacity,
-        );
+    for selected in [Q5MmvqWeightDecode::SharedM8, Q5MmvqWeightDecode::SharedM4M8] {
+        for leads in [
+            &[508, 57, 1084, 57, 508, 1084, 57, 1084][..],
+            &[508, 57, 1084, 57][..],
+        ] {
+            verify_options_with_weight_decode_grouping(
+                leads,
+                false,
+                [q4; 2],
+                [Q5MmvqWeightDecode::Baseline, selected],
+                CausalDecodeAttentionGrouping::FixedCapacity,
+            );
+        }
     }
 }
 
@@ -1041,5 +1071,13 @@ fn q5_shared_weight_decode_gated_delta_matches_baseline_across_core_m8_replay_an
     verify_gdn_weight_decode(
         [q4; 2],
         [Q5MmvqWeightDecode::Baseline, Q5MmvqWeightDecode::SharedM8],
+        8,
     );
+    for participants in [4, 8] {
+        verify_gdn_weight_decode(
+            [q4; 2],
+            [Q5MmvqWeightDecode::Baseline, Q5MmvqWeightDecode::SharedM4M8],
+            participants,
+        );
+    }
 }

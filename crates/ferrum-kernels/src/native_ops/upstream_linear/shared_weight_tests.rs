@@ -58,7 +58,17 @@ fn prepared_shared_q4_mmvq_preserves_marker_buffers_and_rejects_ineligible_spans
         )),
     };
     for (inputs, outputs) in [(512, 17), (5120, 10240), (6144, 5120)] {
-        verify_prepared_shared_mmvq(&stream, device, Format::Q4K, inputs, outputs);
+        for (rows, extended) in [(8, false), (4, true), (8, true)] {
+            verify_prepared_shared_mmvq(
+                &stream,
+                device,
+                Format::Q4K,
+                inputs,
+                outputs,
+                rows,
+                extended,
+            );
+        }
     }
 }
 
@@ -79,7 +89,17 @@ fn prepared_shared_q5_mmvq_preserves_marker_buffers_and_rejects_ineligible_spans
         )),
     };
     for (inputs, outputs) in [(512, 17), (5120, 10240), (6144, 5120)] {
-        verify_prepared_shared_mmvq(&stream, device, Format::Q5K, inputs, outputs);
+        for (rows, extended) in [(8, false), (4, true), (8, true)] {
+            verify_prepared_shared_mmvq(
+                &stream,
+                device,
+                Format::Q5K,
+                inputs,
+                outputs,
+                rows,
+                extended,
+            );
+        }
     }
 }
 
@@ -89,32 +109,52 @@ fn verify_prepared_shared_mmvq(
     format: Format,
     inputs: u32,
     outputs: u32,
+    row_count: u32,
+    extended: bool,
 ) {
     let baseline = PreparedUpstreamLinear::new(
         Algorithm::Mmvq,
         Arithmetic::MarkerV2,
         format,
         Layout::Columns,
-        8,
+        row_count,
         inputs,
         outputs,
         device,
     )
     .unwrap();
+    let q4_mode = if extended {
+        ferrum_types::Q4MmvqWeightDecode::SharedM4M8
+    } else {
+        ferrum_types::Q4MmvqWeightDecode::SharedM8
+    };
+    let q5_mode = if extended {
+        ferrum_types::Q5MmvqWeightDecode::SharedM4M8
+    } else {
+        ferrum_types::Q5MmvqWeightDecode::SharedM8
+    };
     let select = |plan: PreparedUpstreamLinear| match format {
-        Format::Q4K => plan.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8),
-        Format::Q5K => plan.with_q5_mmvq_weight_decode(ferrum_types::Q5MmvqWeightDecode::SharedM8),
+        Format::Q4K => plan.with_q4_mmvq_weight_decode(q4_mode),
+        Format::Q5K => plan.with_q5_mmvq_weight_decode(q5_mode),
         _ => unreachable!("shared MMVQ format"),
     };
     let shared = select(baseline.clone()).unwrap();
     assert_eq!(shared.geometry(), baseline.geometry());
     assert_eq!(
-        shared.q4_mmvq_weight_decode() == ferrum_types::Q4MmvqWeightDecode::SharedM8,
-        format == Format::Q4K
+        shared.q4_mmvq_weight_decode(),
+        if format == Format::Q4K {
+            q4_mode
+        } else {
+            ferrum_types::Q4MmvqWeightDecode::Baseline
+        }
     );
     assert_eq!(
-        shared.q5_mmvq_weight_decode() == ferrum_types::Q5MmvqWeightDecode::SharedM8,
-        format == Format::Q5K
+        shared.q5_mmvq_weight_decode(),
+        if format == Format::Q5K {
+            q5_mode
+        } else {
+            ferrum_types::Q5MmvqWeightDecode::Baseline
+        }
     );
     let other_format = if format == Format::Q4K {
         Format::Q5K
@@ -122,7 +162,13 @@ fn verify_prepared_shared_mmvq(
         Format::Q4K
     };
     for (algorithm, format, layout, rows) in [
-        (Algorithm::Mmvq, format, Layout::Columns, 4),
+        // SharedM8 must keep rejecting M4; the new mode must reject M1.
+        (
+            Algorithm::Mmvq,
+            format,
+            Layout::Columns,
+            if extended { 1 } else { 4 },
+        ),
         (Algorithm::Mmvq, other_format, Layout::Columns, 8),
         (Algorithm::Mmvq, format, Layout::Channels, 8),
         (Algorithm::Mmq, format, Layout::Columns, 8),
@@ -146,9 +192,9 @@ fn verify_prepared_shared_mmvq(
     let output_stride = u64::from(outputs) + 3;
     for nonfinite_input in [false, true] {
         for bad_weight in [false, true] {
-            let mut input = Buffer::new(&stream, input_stride * 8 * 2);
+            let mut input = Buffer::new(&stream, input_stride * u64::from(row_count) * 2);
             let mut weights = Buffer::new(&stream, geometry.weight_bytes);
-            let mut xs = (0..input_stride * 8)
+            let mut xs = (0..input_stride * u64::from(row_count))
                 .map(|i| f16::from_f32(((i % 29) as f32 - 14.0) * 0.03125).to_bits())
                 .collect::<Vec<_>>();
             if nonfinite_input {
@@ -185,7 +231,7 @@ fn verify_prepared_shared_mmvq(
                 let converted = Buffer::new(&stream, geometry.converted_bytes);
                 let packed = Buffer::new(&stream, geometry.packed_bytes);
                 let raw = Buffer::new(&stream, geometry.output_bytes);
-                let output = Buffer::new(&stream, output_stride * 8 * 2);
+                let output = Buffer::new(&stream, output_stride * u64::from(row_count) * 2);
                 let rows = Buffer::new(&stream, plan.row_poison_bytes());
                 let weight_flag = Buffer::new(&stream, 4);
                 let fixup = DeviceSpan {
@@ -260,11 +306,15 @@ fn verify_prepared_shared_mmvq(
                 ));
                 stream.synchronize().unwrap();
                 assert_eq!(raw.read(&stream), raw_before);
+                let output_bytes = output.read(&stream);
+                for row in output_bytes.chunks_exact(output_stride as usize * 2) {
+                    assert!(row[outputs as usize * 2..].iter().all(|byte| *byte == 0x35));
+                }
                 observations.push([
                     converted.read(&stream),
                     packed.read(&stream),
                     raw_before,
-                    output.read(&stream),
+                    output_bytes,
                     rows.read(&stream),
                     weight_flag.read(&stream),
                 ]);

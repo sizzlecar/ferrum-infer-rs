@@ -375,6 +375,28 @@ pub fn q4_shared_weight_decode_compiled() -> bool {
             })
 }
 
+fn q4_shared_weight_decode_m4_m8_exports_present(exports: &[String]) -> bool {
+    q4_shared_weight_decode_exports_present(exports)
+        && exports
+            .iter()
+            .any(|name| name == "ferrum_upstream_mmvq_q4_shared_weight_decode_m4_dot_v1")
+}
+
+/// Whether both opt-in Q4_K M4 and M8 dots share the linked MarkerV2 contract.
+pub fn q4_shared_weight_decode_m4_m8_compiled() -> bool {
+    cfg!(feature = "cuda-q4-shared-weight-decode")
+        && upstream_marker_v2_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && q4_shared_weight_decode_m4_m8_exports_present(&artifact.exports)
+            })
+}
+
 fn q5_shared_weight_decode_exports_present(exports: &[String]) -> bool {
     upstream_marker_v2_exports_present(exports)
         && exports
@@ -394,6 +416,28 @@ pub fn q5_shared_weight_decode_compiled() -> bool {
                     && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
                     && artifact.operator_abi_version == "1"
                     && q5_shared_weight_decode_exports_present(&artifact.exports)
+            })
+}
+
+fn q5_shared_weight_decode_m4_m8_exports_present(exports: &[String]) -> bool {
+    q5_shared_weight_decode_exports_present(exports)
+        && exports
+            .iter()
+            .any(|name| name == "ferrum_upstream_mmvq_q5_shared_weight_decode_m4_dot_v1")
+}
+
+/// Whether both opt-in Q5_K M4 and M8 dots share the linked MarkerV2 contract.
+pub fn q5_shared_weight_decode_m4_m8_compiled() -> bool {
+    cfg!(feature = "cuda-q5-shared-weight-decode")
+        && upstream_marker_v2_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && q5_shared_weight_decode_m4_m8_exports_present(&artifact.exports)
             })
 }
 
@@ -489,6 +533,46 @@ mod upstream_marker_registration_tests {
                 .cloned()
                 .collect::<Vec<_>>();
             assert!(!super::q5_shared_weight_decode_exports_present(&incomplete));
+        }
+    }
+
+    #[test]
+    fn shared_m4_m8_requires_both_dots_and_complete_original_marker_contract() {
+        for (old_check, combined_check, format) in [
+            (
+                super::q4_shared_weight_decode_exports_present as fn(&[String]) -> bool,
+                super::q4_shared_weight_decode_m4_m8_exports_present as fn(&[String]) -> bool,
+                "q4",
+            ),
+            (
+                super::q5_shared_weight_decode_exports_present as fn(&[String]) -> bool,
+                super::q5_shared_weight_decode_m4_m8_exports_present as fn(&[String]) -> bool,
+                "q5",
+            ),
+        ] {
+            let mut exports = UPSTREAM_MARKER_V2_EXPORTS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            assert!(!combined_check(&exports));
+            exports.push(format!(
+                "ferrum_upstream_mmvq_{format}_shared_weight_decode_dot_v1"
+            ));
+            assert!(old_check(&exports));
+            assert!(!combined_check(&exports));
+            exports.push(format!(
+                "ferrum_upstream_mmvq_{format}_shared_weight_decode_m4_dot_v1"
+            ));
+            assert!(old_check(&exports));
+            assert!(combined_check(&exports));
+            for missing in &exports {
+                let incomplete = exports
+                    .iter()
+                    .filter(|name| *name != missing)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert!(!combined_check(&incomplete), "accepted without {missing}");
+            }
         }
     }
 
@@ -1178,23 +1262,41 @@ impl CudaVNextComposition {
                 "fixed execution capacity requires a positive execution context limit",
             ));
         }
-        if q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM8
+        if q4_mmvq_weight_decode != ferrum_types::Q4MmvqWeightDecode::Baseline
             && (!cfg!(feature = "cuda-q4-shared-weight-decode")
                 || (matches!(purpose, CudaCompositionPurpose::Execution)
-                    && !q4_shared_weight_decode_compiled()))
+                    && !match q4_mmvq_weight_decode {
+                        ferrum_types::Q4MmvqWeightDecode::Baseline => true,
+                        ferrum_types::Q4MmvqWeightDecode::SharedM8 => {
+                            q4_shared_weight_decode_compiled()
+                        }
+                        ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => {
+                            q4_shared_weight_decode_m4_m8_compiled()
+                        }
+                    }))
         {
-            return Err(CudaDeviceRuntimeError::contract(
-                "shared M8 Q4 weight decode requires its compiled upstream native export",
-            ));
+            return Err(CudaDeviceRuntimeError::contract(format!(
+                "{} Q4 weight decode requires its compiled upstream native exports",
+                q4_mmvq_weight_decode.as_runtime_value()
+            )));
         }
-        if q5_mmvq_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM8
+        if q5_mmvq_weight_decode != ferrum_types::Q5MmvqWeightDecode::Baseline
             && (!cfg!(feature = "cuda-q5-shared-weight-decode")
                 || (matches!(purpose, CudaCompositionPurpose::Execution)
-                    && !q5_shared_weight_decode_compiled()))
+                    && !match q5_mmvq_weight_decode {
+                        ferrum_types::Q5MmvqWeightDecode::Baseline => true,
+                        ferrum_types::Q5MmvqWeightDecode::SharedM8 => {
+                            q5_shared_weight_decode_compiled()
+                        }
+                        ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => {
+                            q5_shared_weight_decode_m4_m8_compiled()
+                        }
+                    }))
         {
-            return Err(CudaDeviceRuntimeError::contract(
-                "shared M8 Q5 weight decode requires its compiled upstream native export",
-            ));
+            return Err(CudaDeviceRuntimeError::contract(format!(
+                "{} Q5 weight decode requires its compiled upstream native exports",
+                q5_mmvq_weight_decode.as_runtime_value()
+            )));
         }
         if matches!(
             causal_decode_attention_grouping,

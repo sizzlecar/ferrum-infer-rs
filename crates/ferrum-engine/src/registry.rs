@@ -1294,27 +1294,29 @@ fn causal_decode_execution_context_limit(config: &ComponentConfig) -> Result<Opt
 
 fn validate_q4_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
     if config.engine_config.runtime.q4_mmvq_weight_decode
-        == ferrum_types::Q4MmvqWeightDecode::SharedM8
+        != ferrum_types::Q4MmvqWeightDecode::Baseline
         && (!matches!(config.device, Device::CUDA(_))
             || !plan_runtime
             || !cfg!(feature = "cuda-q4-shared-weight-decode"))
     {
-        return Err(FerrumError::unsupported(
-            "shared-m8 Q4 weight decode requires a CUDA plan runtime with the cuda-q4-shared-weight-decode build feature and a Q4_K MarkerV2 MMVQ M8 numerical route",
-        ));
+        return Err(FerrumError::unsupported(format!(
+            "{} Q4 weight decode requires a CUDA plan runtime with the cuda-q4-shared-weight-decode build feature and a Q4_K MarkerV2 MMVQ numerical route for the requested rows",
+            config.engine_config.runtime.q4_mmvq_weight_decode.as_runtime_value(),
+        )));
     }
     Ok(())
 }
 fn validate_q5_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
     if config.engine_config.runtime.q5_mmvq_weight_decode
-        == ferrum_types::Q5MmvqWeightDecode::SharedM8
+        != ferrum_types::Q5MmvqWeightDecode::Baseline
         && (!matches!(config.device, Device::CUDA(_))
             || !plan_runtime
             || !cfg!(feature = "cuda-q5-shared-weight-decode"))
     {
-        return Err(FerrumError::unsupported(
-            "shared-m8 Q5 weight decode requires a CUDA plan runtime with the cuda-q5-shared-weight-decode build feature and a Q5_K MarkerV2 MMVQ M8 numerical route",
-        ));
+        return Err(FerrumError::unsupported(format!(
+            "{} Q5 weight decode requires a CUDA plan runtime with the cuda-q5-shared-weight-decode build feature and a Q5_K MarkerV2 MMVQ numerical route for the requested rows",
+            config.engine_config.runtime.q5_mmvq_weight_decode.as_runtime_value(),
+        )));
     }
     Ok(())
 }
@@ -3399,14 +3401,18 @@ mod tests {
                 config.engine_config.runtime.q4_mmvq_weight_decode =
                     ferrum_types::Q4MmvqWeightDecode::Baseline;
                 validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
-                config.engine_config.runtime.q4_mmvq_weight_decode =
-                    ferrum_types::Q4MmvqWeightDecode::SharedM8;
-                assert_eq!(
-                    validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
-                    matches!(config.device, Device::CUDA(_))
-                        && plan_runtime
-                        && cfg!(feature = "cuda-q4-shared-weight-decode")
-                );
+                for mode in [
+                    ferrum_types::Q4MmvqWeightDecode::SharedM8,
+                    ferrum_types::Q4MmvqWeightDecode::SharedM4M8,
+                ] {
+                    config.engine_config.runtime.q4_mmvq_weight_decode = mode;
+                    assert_eq!(
+                        validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
+                        matches!(config.device, Device::CUDA(_))
+                            && plan_runtime
+                            && cfg!(feature = "cuda-q4-shared-weight-decode")
+                    );
+                }
             }
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -3424,14 +3430,18 @@ mod tests {
                 config.engine_config.runtime.q5_mmvq_weight_decode =
                     ferrum_types::Q5MmvqWeightDecode::Baseline;
                 validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
-                config.engine_config.runtime.q5_mmvq_weight_decode =
-                    ferrum_types::Q5MmvqWeightDecode::SharedM8;
-                assert_eq!(
-                    validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
-                    matches!(config.device, Device::CUDA(_))
-                        && plan_runtime
-                        && cfg!(feature = "cuda-q5-shared-weight-decode")
-                );
+                for mode in [
+                    ferrum_types::Q5MmvqWeightDecode::SharedM8,
+                    ferrum_types::Q5MmvqWeightDecode::SharedM4M8,
+                ] {
+                    config.engine_config.runtime.q5_mmvq_weight_decode = mode;
+                    assert_eq!(
+                        validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
+                        matches!(config.device, Device::CUDA(_))
+                            && plan_runtime
+                            && cfg!(feature = "cuda-q5-shared-weight-decode")
+                    );
+                }
             }
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -3470,38 +3480,50 @@ mod tests {
 
     #[test]
     fn q4_mmvq_weight_decode_rejects_unsupported_factories_before_loading() {
-        let mut engine = EngineConfig::default();
-        engine.runtime.q4_mmvq_weight_decode = ferrum_types::Q4MmvqWeightDecode::SharedM8;
-        let mut config = ComponentConfig::from_engine_config(&engine);
-        config.device = Device::CPU;
-        assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("shared-m8 Q4 weight decode"));
-        config.device = Device::CUDA(0);
-        assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("shared-m8 Q4 weight decode"));
+        for mode in [
+            ferrum_types::Q4MmvqWeightDecode::SharedM8,
+            ferrum_types::Q4MmvqWeightDecode::SharedM4M8,
+        ] {
+            let mut engine = EngineConfig::default();
+            engine.runtime.q4_mmvq_weight_decode = mode;
+            let mut config = ComponentConfig::from_engine_config(&engine);
+            let expected = format!("{} Q4 weight decode", mode.as_runtime_value());
+            config.device = Device::CPU;
+            assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+            config.device = Device::CUDA(0);
+            assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+        }
     }
     #[test]
     fn q5_mmvq_weight_decode_rejects_unsupported_factories_before_loading() {
-        let mut engine = EngineConfig::default();
-        engine.runtime.q5_mmvq_weight_decode = ferrum_types::Q5MmvqWeightDecode::SharedM8;
-        let mut config = ComponentConfig::from_engine_config(&engine);
-        config.device = Device::CPU;
-        assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("shared-m8 Q5 weight decode"));
-        config.device = Device::CUDA(0);
-        assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("shared-m8 Q5 weight decode"));
+        for mode in [
+            ferrum_types::Q5MmvqWeightDecode::SharedM8,
+            ferrum_types::Q5MmvqWeightDecode::SharedM4M8,
+        ] {
+            let mut engine = EngineConfig::default();
+            engine.runtime.q5_mmvq_weight_decode = mode;
+            let mut config = ComponentConfig::from_engine_config(&engine);
+            let expected = format!("{} Q5 weight decode", mode.as_runtime_value());
+            config.device = Device::CPU;
+            assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+            config.device = Device::CUDA(0);
+            assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+        }
     }
 }

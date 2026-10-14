@@ -5748,6 +5748,30 @@ mod tests {
                 Mode::SharedM8,
                 Some(RuntimeConfigSource::Cli),
             ),
+            (
+                Some(Mode::SharedM4M8),
+                None,
+                Mode::SharedM4M8,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::SharedM8),
+                Some(Arg::SharedM4M8),
+                Mode::SharedM4M8,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::SharedM4M8),
+                Some(Arg::SharedM8),
+                Mode::SharedM8,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::SharedM4M8),
+                Some(Arg::Baseline),
+                Mode::Baseline,
+                Some(RuntimeConfigSource::Cli),
+            ),
         ] {
             let config_entries = crate::config::RuntimeCliConfig {
                 q4_mmvq_weight_decode: config_mode,
@@ -5805,6 +5829,30 @@ mod tests {
                 Some(Mode::Baseline),
                 Some(Arg::SharedM8),
                 Mode::SharedM8,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::SharedM4M8),
+                None,
+                Mode::SharedM4M8,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::SharedM8),
+                Some(Arg::SharedM4M8),
+                Mode::SharedM4M8,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::SharedM4M8),
+                Some(Arg::SharedM8),
+                Mode::SharedM8,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::SharedM4M8),
+                Some(Arg::Baseline),
+                Mode::Baseline,
                 Some(RuntimeConfigSource::Cli),
             ),
         ] {

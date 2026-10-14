@@ -2913,14 +2913,14 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if mode == crate::Q4MmvqWeightDecode::SharedM8
+        if mode != crate::Q4MmvqWeightDecode::Baseline
             && (!self.is_cuda_backend()
                 || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
                 || !self.hardware.compiled_features.cuda_q4_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
-                reason: "shared-m8 Q4 weight decode requires the cuda-q4-shared-weight-decode build feature, a CUDA plan runtime, and a selected Q4_K MarkerV2 MMVQ M8 numerical route".to_owned(),
+                reason: "shared Q4 weight decode requires the cuda-q4-shared-weight-decode build feature, a CUDA plan runtime, and a selected Q4_K MarkerV2 MMVQ numerical route for the requested rows".to_owned(),
             });
         }
         Ok(self.decision(
@@ -2928,7 +2928,7 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["baseline", "shared-m8"],
+            ["baseline", "shared-m8", "shared-m4-m8"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -2952,14 +2952,14 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if mode == crate::Q5MmvqWeightDecode::SharedM8
+        if mode != crate::Q5MmvqWeightDecode::Baseline
             && (!self.is_cuda_backend()
                 || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
                 || !self.hardware.compiled_features.cuda_q5_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
-                reason: "shared-m8 Q5 weight decode requires the cuda-q5-shared-weight-decode build feature, a CUDA plan runtime, and a selected Q5_K MarkerV2 MMVQ M8 numerical route".to_owned(),
+                reason: "shared Q5 weight decode requires the cuda-q5-shared-weight-decode build feature, a CUDA plan runtime, and a selected Q5_K MarkerV2 MMVQ numerical route for the requested rows".to_owned(),
             });
         }
         Ok(self.decision(
@@ -2967,7 +2967,7 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["baseline", "shared-m8"],
+            ["baseline", "shared-m8", "shared-m4-m8"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -7222,7 +7222,7 @@ mod tests {
                 ExecutionResourceAuthority::PlanRuntime,
             ] {
                 for compiled in [false, true] {
-                    for mode in ["baseline", "shared-m8"] {
+                    for mode in ["baseline", "shared-m8", "shared-m4-m8"] {
                         let mut hardware = HardwareCapabilities::unknown();
                         hardware.backend = backend.into();
                         hardware.compiled_features.cuda = backend == "cuda";
@@ -7297,7 +7297,7 @@ mod tests {
                 ExecutionResourceAuthority::PlanRuntime,
             ] {
                 for compiled in [false, true] {
-                    for mode in ["baseline", "shared-m8"] {
+                    for mode in ["baseline", "shared-m8", "shared-m4-m8"] {
                         let mut hardware = HardwareCapabilities::unknown();
                         hardware.backend = backend.into();
                         hardware.compiled_features.cuda = backend == "cuda";
@@ -7441,7 +7441,7 @@ mod tests {
                 .effective_value,
             "baseline"
         );
-        for value in ["baseline", "shared-m8", "invalid"] {
+        for value in ["baseline", "shared-m8", "shared-m4-m8", "invalid"] {
             let result = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
                 RuntimeConfigEntry::new(key, value, RuntimeConfigSource::Env),
             ]))
@@ -7483,7 +7483,7 @@ mod tests {
                 .effective_value,
             "baseline"
         );
-        for value in ["baseline", "shared-m8", "invalid"] {
+        for value in ["baseline", "shared-m8", "shared-m4-m8", "invalid"] {
             let result = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
                 RuntimeConfigEntry::new(key, value, RuntimeConfigSource::Env),
             ]))

@@ -128,6 +128,26 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                 "shared-m8 Q5 weight decode requires a selected causal or GDN numerical profile declaring Q5_K Columns M8 MarkerV2 MMVQ; select an appropriate explicit numerical profile",
             ));
         }
+        if engine.runtime.q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM4M8
+            && !profile_has_shared_m4_m8_route(
+                profile,
+                ferrum_interfaces::vnext::ProjectionBlockFormat::Q4K,
+            )
+        {
+            return Err(FerrumError::unsupported(
+                "shared-m4-m8 Q4 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q4_K Columns M4 or M8 MarkerV2 MMVQ",
+            ));
+        }
+        if engine.runtime.q5_mmvq_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM4M8
+            && !profile_has_shared_m4_m8_route(
+                profile,
+                ferrum_interfaces::vnext::ProjectionBlockFormat::Q5K,
+            )
+        {
+            return Err(FerrumError::unsupported(
+                "shared-m4-m8 Q5 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q5_K Columns M4 or M8 MarkerV2 MMVQ",
+            ));
+        }
         let prepared = match defined.prepare(&profile.id) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -399,6 +419,50 @@ fn route_supports_shared_m8(
     route.arithmetic == UpstreamProjectionArithmetic::MmvqQ8_1MarkerV2
         && route.layout == UpstreamProjectionLayout::Columns
         && route.contains_rows(8)
+}
+
+fn profile_has_shared_m4_m8_route(
+    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
+    format: ferrum_interfaces::vnext::ProjectionBlockFormat,
+) -> bool {
+    profile
+        .operations
+        .iter()
+        .filter_map(|operation| operation.composite_arithmetic.as_ref())
+        .any(|arithmetic| composite_has_shared_m4_m8_route(arithmetic, format))
+}
+
+fn composite_has_shared_m4_m8_route(
+    arithmetic: &ferrum_interfaces::vnext::CompositeNumericalArithmetic,
+    format: ferrum_interfaces::vnext::ProjectionBlockFormat,
+) -> bool {
+    use ferrum_interfaces::vnext::{
+        NumericalArithmeticStage, UpstreamProjectionArithmetic, UpstreamProjectionLayout,
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+    };
+    // The new policy is also wired to the SwiGLU factory. Keep the original
+    // SharedM8 attention-only eligibility above unchanged.
+    matches!(
+        arithmetic.strict_base.operation_id.as_str(),
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID
+            | GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
+            | DENSE_SWIGLU_OPERATION_ID
+    ) && arithmetic
+        .projections
+        .iter()
+        .flat_map(|projection| &projection.leaves)
+        .flat_map(|leaf| &leaf.arithmetic.stages)
+        .any(|stage| {
+            matches!(stage,
+            NumericalArithmeticStage::UpstreamProjection { policy }
+                if policy.format == format
+                    && policy.routes.iter().any(|route| {
+                        route.arithmetic == UpstreamProjectionArithmetic::MmvqQ8_1MarkerV2
+                            && route.layout == UpstreamProjectionLayout::Columns
+                            && (route.contains_rows(4) || route.contains_rows(8))
+                    }))
+        })
 }
 
 fn resolve_model_plan(
@@ -954,5 +1018,93 @@ mod tests {
             !composite_has_shared_m8_q5_route(&unrelated),
             "an eligible leaf in an unwired composite cannot activate the product option"
         );
+    }
+
+    #[test]
+    fn shared_m4_m8_accepts_wired_attention_and_swiglu_routes_only() {
+        use ferrum_interfaces::vnext::{
+            NumericalArithmeticStage, OperationId, ProjectionBlockFormat as Format,
+            UpstreamMarkerV2Profile as Profile, UpstreamProjectionArithmetic as Arithmetic,
+            UpstreamProjectionLayout as Layout,
+        };
+        for format in [Format::Q4K, Format::Q5K] {
+            for profile in [
+                Profile::Causal,
+                Profile::GatedDelta,
+                Profile::SwiGlu,
+                Profile::CausalExtraAllRows,
+                Profile::GatedDeltaExtraAllRows,
+                Profile::SwiGluExtraAllRows,
+            ] {
+                assert!(composite_has_shared_m4_m8_route(
+                    &profile.arithmetic(),
+                    format
+                ));
+            }
+            for profile in [
+                Profile::CausalG32MmqPrefill,
+                Profile::GatedDeltaG32MmqPrefill,
+                Profile::SwiGluG32MmqPrefill,
+            ] {
+                assert!(!composite_has_shared_m4_m8_route(
+                    &profile.arithmetic(),
+                    format
+                ));
+            }
+            let mut unrelated = Profile::Causal.arithmetic();
+            unrelated.strict_base.operation_id = OperationId::new("test.unwired").unwrap();
+            assert!(!composite_has_shared_m4_m8_route(&unrelated, format));
+
+            for (rows, layout, arithmetic, expected) in [
+                (
+                    vec![1],
+                    Layout::Columns,
+                    Arithmetic::MmvqQ8_1MarkerV2,
+                    false,
+                ),
+                (vec![4], Layout::Columns, Arithmetic::MmvqQ8_1MarkerV2, true),
+                (vec![8], Layout::Columns, Arithmetic::MmvqQ8_1MarkerV2, true),
+                (
+                    vec![16, 32],
+                    Layout::Columns,
+                    Arithmetic::MmvqQ8_1MarkerV2,
+                    false,
+                ),
+                (
+                    vec![4, 8],
+                    Layout::Channels,
+                    Arithmetic::MmvqQ8_1MarkerV2,
+                    false,
+                ),
+                (vec![4, 8], Layout::Columns, Arithmetic::MmvqQ8_1V1, false),
+            ] {
+                let mut contract = Profile::SwiGlu.arithmetic();
+                for stage in contract
+                    .projections
+                    .iter_mut()
+                    .flat_map(|projection| &mut projection.leaves)
+                    .flat_map(|leaf| &mut leaf.arithmetic.stages)
+                {
+                    if let NumericalArithmeticStage::UpstreamProjection { policy } = stage {
+                        for route in &mut policy.routes {
+                            route.local_rows = rows.iter().copied().collect();
+                            route.prefill_rows = None;
+                            route.layout = layout;
+                            route.arithmetic = arithmetic;
+                        }
+                    }
+                }
+                assert_eq!(
+                    composite_has_shared_m4_m8_route(&contract, format),
+                    expected
+                );
+            }
+        }
+        let mut q4_only = Profile::SwiGlu.arithmetic();
+        for projection in &mut q4_only.projections {
+            projection.leaves.retain(|leaf| leaf.format != Format::Q5K);
+        }
+        assert!(composite_has_shared_m4_m8_route(&q4_only, Format::Q4K));
+        assert!(!composite_has_shared_m4_m8_route(&q4_only, Format::Q5K));
     }
 }

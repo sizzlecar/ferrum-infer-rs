@@ -123,6 +123,8 @@ pub enum SequenceFitPolicyArg {
 pub enum Q4MmvqWeightDecodeArg {
     Baseline,
     SharedM8,
+    #[value(name = "shared-m4-m8")]
+    SharedM4M8,
 }
 
 impl Q4MmvqWeightDecodeArg {
@@ -130,6 +132,7 @@ impl Q4MmvqWeightDecodeArg {
         match self {
             Self::Baseline => ferrum_types::Q4MmvqWeightDecode::Baseline.as_runtime_value(),
             Self::SharedM8 => ferrum_types::Q4MmvqWeightDecode::SharedM8.as_runtime_value(),
+            Self::SharedM4M8 => ferrum_types::Q4MmvqWeightDecode::SharedM4M8.as_runtime_value(),
         }
     }
 }
@@ -138,6 +141,8 @@ impl Q4MmvqWeightDecodeArg {
 pub enum Q5MmvqWeightDecodeArg {
     Baseline,
     SharedM8,
+    #[value(name = "shared-m4-m8")]
+    SharedM4M8,
 }
 
 impl Q5MmvqWeightDecodeArg {
@@ -145,6 +150,7 @@ impl Q5MmvqWeightDecodeArg {
         match self {
             Self::Baseline => ferrum_types::Q5MmvqWeightDecode::Baseline.as_runtime_value(),
             Self::SharedM8 => ferrum_types::Q5MmvqWeightDecode::SharedM8.as_runtime_value(),
+            Self::SharedM4M8 => ferrum_types::Q5MmvqWeightDecode::SharedM4M8.as_runtime_value(),
         }
     }
 }
@@ -576,6 +582,7 @@ mod tests {
             for (value, expected) in [
                 ("baseline", Q4MmvqWeightDecodeArg::Baseline),
                 ("shared-m8", Q4MmvqWeightDecodeArg::SharedM8),
+                ("shared-m4-m8", Q4MmvqWeightDecodeArg::SharedM4M8),
             ] {
                 let parsed = TestCli::try_parse_from([
                     "ferrum",
@@ -609,6 +616,7 @@ mod tests {
             for (value, expected) in [
                 ("baseline", Q5MmvqWeightDecodeArg::Baseline),
                 ("shared-m8", Q5MmvqWeightDecodeArg::SharedM8),
+                ("shared-m4-m8", Q5MmvqWeightDecodeArg::SharedM4M8),
             ] {
                 let parsed = TestCli::try_parse_from([
                     "ferrum",

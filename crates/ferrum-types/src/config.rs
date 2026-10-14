@@ -177,6 +177,7 @@ pub enum Q4MmvqWeightDecode {
     #[default]
     Baseline,
     SharedM8,
+    SharedM4M8,
 }
 
 impl Q4MmvqWeightDecode {
@@ -184,6 +185,7 @@ impl Q4MmvqWeightDecode {
         match self {
             Self::Baseline => "baseline",
             Self::SharedM8 => "shared-m8",
+            Self::SharedM4M8 => "shared-m4-m8",
         }
     }
 
@@ -191,7 +193,10 @@ impl Q4MmvqWeightDecode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "baseline" => Ok(Self::Baseline),
             "shared-m8" => Ok(Self::SharedM8),
-            _ => Err(format!("expected baseline or shared-m8; got {raw:?}")),
+            "shared-m4-m8" => Ok(Self::SharedM4M8),
+            _ => Err(format!(
+                "expected baseline, shared-m8 or shared-m4-m8; got {raw:?}"
+            )),
         }
     }
 
@@ -217,6 +222,7 @@ pub enum Q5MmvqWeightDecode {
     #[default]
     Baseline,
     SharedM8,
+    SharedM4M8,
 }
 
 impl Q5MmvqWeightDecode {
@@ -224,6 +230,7 @@ impl Q5MmvqWeightDecode {
         match self {
             Self::Baseline => "baseline",
             Self::SharedM8 => "shared-m8",
+            Self::SharedM4M8 => "shared-m4-m8",
         }
     }
 
@@ -231,7 +238,10 @@ impl Q5MmvqWeightDecode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "baseline" => Ok(Self::Baseline),
             "shared-m8" => Ok(Self::SharedM8),
-            _ => Err(format!("expected baseline or shared-m8; got {raw:?}")),
+            "shared-m4-m8" => Ok(Self::SharedM4M8),
+            _ => Err(format!(
+                "expected baseline, shared-m8 or shared-m4-m8; got {raw:?}"
+            )),
         }
     }
 
@@ -2490,7 +2500,11 @@ mod tests {
         let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
         assert_eq!(restored.q4_mmvq_weight_decode, Q4MmvqWeightDecode::Baseline);
         for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
-            for mode in [Q4MmvqWeightDecode::SharedM8, Q4MmvqWeightDecode::Baseline] {
+            for mode in [
+                Q4MmvqWeightDecode::SharedM8,
+                Q4MmvqWeightDecode::SharedM4M8,
+                Q4MmvqWeightDecode::Baseline,
+            ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
                     key,
                     mode.as_runtime_value(),
@@ -2526,7 +2540,11 @@ mod tests {
         let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
         assert_eq!(restored.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Baseline);
         for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
-            for mode in [Q5MmvqWeightDecode::SharedM8, Q5MmvqWeightDecode::Baseline] {
+            for mode in [
+                Q5MmvqWeightDecode::SharedM8,
+                Q5MmvqWeightDecode::SharedM4M8,
+                Q5MmvqWeightDecode::Baseline,
+            ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
                     key,
                     mode.as_runtime_value(),
