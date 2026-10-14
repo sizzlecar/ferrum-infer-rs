@@ -13,6 +13,8 @@ description = "Native operator ABI and artifact resolver for Ferrum"
 cuda-upstream-linear-tests = []
 # Test-only dot export supplied by the independent shared-weight-decode archive.
 cuda-upstream-shared-weight-decode-tests = ["cuda-upstream-linear-tests"]
+# IQ4 shared-dot test symbol supplied only by the independent IQ4 experiment TU.
+cuda-upstream-iq4-shared-weight-decode-tests = ["cuda-upstream-shared-weight-decode-tests"]
 # Test-only F16 input pack exports; production pack and dot routes stay unchanged.
 cuda-upstream-direct-f16-pack-tests = ["cuda-upstream-shared-weight-decode-tests"]
 

@@ -9,6 +9,14 @@ use std::time::Instant;
 mod shared_weight_decode;
 
 #[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/complete_projection.rs"]
+mod complete_projection;
+
+#[cfg(feature = "cuda-upstream-iq4-shared-weight-decode-tests")]
+#[path = "timing/iq4_shared_weight_decode.rs"]
+mod iq4_shared_weight_decode;
+
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
 #[path = "timing/ffn_current_routes.rs"]
 mod ffn_current_routes;
 

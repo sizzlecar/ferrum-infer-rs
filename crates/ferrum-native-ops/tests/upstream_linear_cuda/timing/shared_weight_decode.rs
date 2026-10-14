@@ -128,7 +128,13 @@ impl Case {
                         .to_bits()
                         .to_le_bytes(),
                 );
-                let qs_offset = if matches!(format, UpstreamLinearFormat::Q5K) {
+                let qs_offset = if matches!(format, UpstreamLinearFormat::Iq4Xs) {
+                    // IQ4_XS: d[2], scales_h[2], scales_l[4], qs[128].
+                    for (i, scale) in block[2..8].iter_mut().enumerate() {
+                        *scale = ((column * 29 + block_index * 31 + i * 53) % 256) as u8;
+                    }
+                    8
+                } else if matches!(format, UpstreamLinearFormat::Q5K) {
                     // Exercise both scale encodings and nonconstant fifth bits,
                     // including qh words with the sign bit set.
                     for (i, code) in block[4..48].iter_mut().enumerate() {
@@ -341,9 +347,9 @@ impl Case {
 
 fn quant_block_bytes(format: UpstreamLinearFormat) -> usize {
     match format {
+        UpstreamLinearFormat::Iq4Xs => 136,
         UpstreamLinearFormat::Q4K => 144,
         UpstreamLinearFormat::Q5K => 176,
-        _ => panic!("shared-weight fixture requires Q4K or Q5K"),
     }
 }
 
@@ -363,7 +369,7 @@ fn q5_shared_weight_decode_preserves_marker_bits_and_boundaries() {
     );
 }
 
-fn assert_marker_bits_and_boundaries(
+pub(super) fn assert_marker_bits_and_boundaries(
     format: UpstreamLinearFormat,
     dots: [MmvqDot; 2],
     shapes: &[(usize, usize)],

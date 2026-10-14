@@ -447,6 +447,50 @@ static __device__ __forceinline__ float q5_shared_weight_dot(
 }
 #endif
 
+#if defined(FERRUM_TEST_IQ4_XS_SHARED_WEIGHT_DECODE)
+// Test-only IQ4_XS weight decode shared across the original eight activation
+// columns. Scalar int2 fields keep the four LUT results independent of local
+// array addressing; compiled register/code generation still needs measurement.
+struct Iq4XsSharedWeightDecode {
+    int2 v0, v1, v2, v3;
+    int scale;
+    half d;
+};
+
+static __device__ __forceinline__ Iq4XsSharedWeightDecode iq4_xs_shared_weight_decode(
+        const void * vx, const int kbx, const int iqs) {
+    const block_iq4_xs * block = static_cast<const block_iq4_xs *>(vx) + kbx;
+    const int ls = ((block->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) |
+        (((block->scales_h >> (iqs/2)) & 0x03) << 4);
+    return {
+        get_int_from_table_16(get_int_b4(block->qs, iqs + 0), kvalues_iq4nl),
+        get_int_from_table_16(get_int_b4(block->qs, iqs + 1), kvalues_iq4nl),
+        get_int_from_table_16(get_int_b4(block->qs, iqs + 2), kvalues_iq4nl),
+        get_int_from_table_16(get_int_b4(block->qs, iqs + 3), kvalues_iq4nl),
+        ls, block->d,
+    };
+}
+
+static __device__ __forceinline__ float iq4_xs_shared_weight_dot(
+        const Iq4XsSharedWeightDecode & weight, const block_q8_1 * bq8_1, const int iqs) {
+    // Exactly vec_dot_iq4_xs_q8_1's DP4A, scale multiplication and floating
+    // expression order. Only column-independent weight loads/LUT moved out.
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int2 v = l == 0 ? weight.v0 : l == 1 ? weight.v1 :
+            l == 2 ? weight.v2 : weight.v3;
+        const int u0 = get_int_b4(bq8_1[iqs/4].qs, l + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/4].qs, l + 4);
+        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+    }
+    sumi *= weight.scale - 32;
+    const float d = __half2float(weight.d) * __low2float(bq8_1[iqs/4].ds);
+    return d * sumi;
+}
+#endif
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
           bool halve_iters = false, bool shared_weight_decode = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
@@ -473,6 +517,9 @@ static __global__ void mul_mat_vec_q(
     static_assert(!shared_weight_decode || ((type == GGML_TYPE_Q4_K
 #if defined(FERRUM_TEST_Q5_SHARED_WEIGHT_DECODE) || defined(FERRUM_Q5_SHARED_WEIGHT_DECODE)
         || type == GGML_TYPE_Q5_K
+#endif
+#if defined(FERRUM_TEST_IQ4_XS_SHARED_WEIGHT_DECODE)
+        || type == GGML_TYPE_IQ4_XS
 #endif
         ) && ncols_dst == 8 &&
         !has_fusion && !small_k && !halve_iters && nwarps == 2 && rows_per_cuda_block == 2 && warp_size == 32),
@@ -628,6 +675,21 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
                     tmp[j][i] += q5_shared_weight_dot(weights[i], &y[j*stride_col_y + kby], kqs);
+                }
+            }
+        }
+#endif
+#if defined(FERRUM_TEST_IQ4_XS_SHARED_WEIGHT_DECODE)
+        else if constexpr (shared_weight_decode && type == GGML_TYPE_IQ4_XS) {
+            const Iq4XsSharedWeightDecode weights[2] = {
+                iq4_xs_shared_weight_decode(vx, kbx_offset + kbx, kqs),
+                iq4_xs_shared_weight_decode(vx, kbx_offset + stride_row_x + kbx, kqs),
+            };
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += iq4_xs_shared_weight_dot(weights[i], &y[j*stride_col_y + kby], kqs);
                 }
             }
         }
@@ -1040,6 +1102,34 @@ extern "C" int ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1(
         const uint32_t qstride = n.padded_inputs/32;
         ggml_cuda_mm_fusion_args_device fusion{};
         mul_mat_vec_q<GGML_TYPE_Q5_K,8,false,false,false,true><<<grid,block,0,
+                static_cast<cudaStream_t>(stream)>>>(weights,packed,
+            static_cast<const int32_t *>(nullptr),fusion,static_cast<float *>(output),
+            n.inputs,make_uint3(0,0,0),n.inputs/256,qstride,n.outputs,one,
+            n.padded_outputs*(n.inputs/256),n.rows*qstride,n.rows*n.outputs,one,
+            n.padded_outputs*(n.inputs/256),n.rows*qstride,n.rows*n.outputs,uint32_t(0));
+        return cudaGetLastError();
+    });
+}
+#endif
+#if defined(FERRUM_TEST_IQ4_XS_SHARED_WEIGHT_DECODE)
+// Independent test-only export. Baseline plan/pack/check/cast and all existing
+// product entrypoints retain their original acceptance and arithmetic.
+extern "C" int ferrum_test_upstream_mmvq_iq4_shared_weight_decode_dot_v1(
+        const FerrumUpstreamLinearPlanV1 * p, const void * weights,
+        const void * packed, void * output, void * fixup, void * stream) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmvqPlan n{};
+        if (!upstream_mmvq_valid(p,n) || fixup) return -1;
+        if (n.format != GGML_TYPE_IQ4_XS || n.layout != 0 || n.rows != 8 ||
+                n.ncols != 8 || n.channels != 1 || n.nwarps != 2 ||
+                n.rows_per_block != 2 || n.small_k) return -2;
+        if (!weights || !packed || !output || uintptr_t(weights)%4 ||
+                uintptr_t(packed)%4 || uintptr_t(output)%4) return -5;
+        const dim3 grid(n.padded_outputs/n.rows_per_block,1,1), block(32,n.nwarps,1);
+        const auto one = init_fastdiv_values(1);
+        const uint32_t qstride = n.padded_inputs/32;
+        ggml_cuda_mm_fusion_args_device fusion{};
+        mul_mat_vec_q<GGML_TYPE_IQ4_XS,8,false,false,false,true><<<grid,block,0,
                 static_cast<cudaStream_t>(stream)>>>(weights,packed,
             static_cast<const int32_t *>(nullptr),fusion,static_cast<float *>(output),
             n.inputs,make_uint3(0,0,0),n.inputs/256,qstride,n.outputs,one,
