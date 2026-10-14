@@ -76,9 +76,6 @@ const PREPARE_FUNCTION: &str =
     "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect";
 const PREPARE_NEGATIVE_RATE_FUNCTION: &str =
     "vnext_linear_attention_prepare_negative_rate_f16_indirect";
-const PREPARE_IMPLICIT_SINGLETON_FUNCTION: &str = "vnext_gdn_prepare_implicit_singleton_f16";
-const DELTA_IMPLICIT_SINGLETON_FUNCTION: &str =
-    "vnext_gdn_delta_implicit_singleton_tiled16_interleaved_f32";
 const CONV_STATE_COMMIT_FUNCTION: &str = "recurrent_conv_state_commit_f16_indirect";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
 const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_indirect";
@@ -114,14 +111,12 @@ struct AttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     prepare_negative_rate: CudaFunction,
-    prepare_implicit_singleton: CudaFunction,
     conv_state_commit: CudaFunction,
     qk_norm: CudaFunction,
     delta: CudaFunction,
     delta_tiled: CudaFunction,
     delta_interleaved: CudaFunction,
     delta_tiled_interleaved: CudaFunction,
-    delta_implicit_singleton: CudaFunction,
     gated_norm: CudaFunction,
     f32_to_f16: CudaFunction,
     residual_add: CudaFunction,
@@ -452,16 +447,6 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 &linear_module,
                 PREPARE_NEGATIVE_RATE_FUNCTION,
                 "attention negative-rate prepare",
-            )?,
-            prepare_implicit_singleton: load_function(
-                &linear_module,
-                PREPARE_IMPLICIT_SINGLETON_FUNCTION,
-                "attention implicit singleton prepare",
-            )?,
-            delta_implicit_singleton: load_function(
-                &delta_module,
-                DELTA_IMPLICIT_SINGLETON_FUNCTION,
-                "attention implicit singleton delta",
             )?,
             conv_state_commit: load_function(
                 &linear_module,
@@ -1430,48 +1415,8 @@ impl StateBindingLayout {
     }
 }
 
-/// Only a whole singleton invocation may omit its scratch control producers.
-/// Fresh indirect state bindings and the reserved scratch layout are unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttentionControl {
-    Explicit,
-    ImplicitSingleton,
-}
-
-impl AttentionControl {
-    fn for_invocation(shape: AttentionShape, participants: usize, tokens: u64) -> Self {
-        // This provider uses F16 prepare/conv state and F32 recurrent state.
-        if participants == 1
-            && tokens == 1
-            && shape.decay_parameterization == GatedDeltaDecayParameterization::NegativeRate
-            && shape.value_head_mapping == GatedDeltaValueHeadMapping::InterleavedByKeyHead
-            && shape.key_head_dim == 128
-            && shape.value_head_dim == 128
-        {
-            Self::ImplicitSingleton
-        } else {
-            Self::Explicit
-        }
-    }
-
-    const fn transfers(self) -> u64 {
-        match self {
-            Self::Explicit => 2,
-            Self::ImplicitSingleton => 0,
-        }
-    }
-
-    const fn replay_tag(self) -> &'static [u8] {
-        match self {
-            Self::Explicit => b"explicit-varlen-control-v1",
-            Self::ImplicitSingleton => b"implicit-singleton-control-v1",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct AttentionLaunch {
-    control: AttentionControl,
     input_region: usize,
     output_region: usize,
     state_binding_offset: u64,
@@ -1692,12 +1637,10 @@ fn attention_dispatches_per_launch(
 fn attention_transfers_per_launch(
     qkvzba: &SharedProjectionWeight,
     output: &SharedProjectionWeight,
-    control: AttentionControl,
 ) -> Result<u64, String> {
     let qkvzba = qkvzba.marlin_workspace_zero_count()?;
     let output = output.marlin_workspace_zero_count()?;
-    control
-        .transfers()
+    2_u64
         .checked_add(qkvzba)
         .and_then(|count| count.checked_add(output))
         .ok_or_else(|| "attention transfer attribution overflows".to_owned())
@@ -1956,11 +1899,6 @@ fn encode_attention(
             let host_control = host_storage.len();
             host_storage.push(sequence_control(&[tokens])?);
             launches.push(AttentionLaunch {
-                control: if tokens == total_tokens {
-                    AttentionControl::for_invocation(shape, participant_count_usize, total_tokens)
-                } else {
-                    AttentionControl::Explicit
-                },
                 input_region,
                 output_region,
                 state_binding_offset: binding_offset,
@@ -1984,7 +1922,6 @@ fn encode_attention(
         let host_token_seq_indices = host_storage.len();
         host_storage.push(token_sequence_indices(&participant_token_counts)?);
         launches.push(AttentionLaunch {
-            control: AttentionControl::Explicit,
             input_region,
             output_region,
             state_binding_offset: 0,
@@ -2133,6 +2070,7 @@ fn encode_attention(
 
     let q8act = q8act.map(PreparedAttentionProjections::into_owned);
     let functions = functions.clone();
+    let transfers_per_launch = attention_transfers_per_launch(&shared.qkvzba, &shared.output)?;
     let mut replay_key = CudaCommandReplayKeyBuilder::new(
         provider_fingerprint,
         "vnext_gated_delta_recurrent_attention",
@@ -2169,7 +2107,6 @@ fn encode_attention(
     }
     for launch in &launches {
         replay_key = replay_key
-            .bytes(launch.control.replay_tag())
             .u64(launch.input_region as u64)
             .u64(launch.output_region as u64)
             .u64(launch.state_binding_offset)
@@ -2204,15 +2141,9 @@ fn encode_attention(
             .checked_add(count)
             .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())
     })?;
-    let physical_transfer_commands = launches.iter().try_fold(0_u64, |total, launch| {
-        total
-            .checked_add(attention_transfers_per_launch(
-                &shared.qkvzba,
-                &shared.output,
-                launch.control,
-            )?)
-            .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())
-    })?;
+    let physical_transfer_commands = attributed_launches
+        .checked_mul(transfers_per_launch)
+        .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())?;
 
     let physical_transfer_commands =
         launches
@@ -2453,63 +2384,53 @@ fn enqueue_attention(
     let scratch_base = scratch.device_ptr();
     let cu_seqlens = scratch_base;
     let token_seq_indices = scratch_pointer(scratch_base, layout.token_seq_indices)?;
-    // The implicit path neither initializes nor reads these scratch spans.
-    // Their contents may belong to a previous projection or request.
-    if launch.control == AttentionControl::Explicit {
+    unsafe {
+        cudarc::driver::result::memcpy_htod_async(
+            cu_seqlens,
+            host_storage[launch.host_control].as_ref(),
+            stream.cu_stream(),
+        )
+    }
+    .map_err(|error| CudaDeviceRuntimeError::driver("attention sequence upload", error))?;
+    let token_index_bytes = usize::try_from(
+        launch
+            .tokens
+            .checked_mul(ElementType::U32.size_bytes())
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("attention token index size overflows")
+            })?,
+    )
+    .map_err(|_| CudaDeviceRuntimeError::contract("attention token index size exceeds usize"))?;
+    if let Some(host_token_seq_indices) = launch.host_token_seq_indices {
+        let payload = host_storage.get(host_token_seq_indices).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("attention token sequence payload is missing")
+        })?;
+        if payload.len() != token_index_bytes {
+            return Err(CudaDeviceRuntimeError::contract(
+                "attention token sequence payload differs from its admitted token count",
+            ));
+        }
         unsafe {
             cudarc::driver::result::memcpy_htod_async(
-                cu_seqlens,
-                host_storage[launch.host_control].as_ref(),
+                token_seq_indices,
+                payload.as_ref(),
                 stream.cu_stream(),
             )
         }
-        .map_err(|error| CudaDeviceRuntimeError::driver("attention sequence upload", error))?;
-        let token_index_bytes = usize::try_from(
-            launch
-                .tokens
-                .checked_mul(ElementType::U32.size_bytes())
-                .ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract("attention token index size overflows")
-                })?,
-        )
-        .map_err(|_| {
-            CudaDeviceRuntimeError::contract("attention token index size exceeds usize")
+        .map_err(|error| {
+            CudaDeviceRuntimeError::driver("attention token sequence upload", error)
         })?;
-        if let Some(host_token_seq_indices) = launch.host_token_seq_indices {
-            let payload = host_storage.get(host_token_seq_indices).ok_or_else(|| {
-                CudaDeviceRuntimeError::contract("attention token sequence payload is missing")
-            })?;
-            if payload.len() != token_index_bytes {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "attention token sequence payload differs from its admitted token count",
-                ));
-            }
-            unsafe {
-                cudarc::driver::result::memcpy_htod_async(
-                    token_seq_indices,
-                    payload.as_ref(),
-                    stream.cu_stream(),
-                )
-            }
-            .map_err(|error| {
-                CudaDeviceRuntimeError::driver("attention token sequence upload", error)
-            })?;
-        } else {
-            unsafe {
-                cudarc::driver::result::memset_d8_async(
-                    token_seq_indices,
-                    0,
-                    token_index_bytes,
-                    stream.cu_stream(),
-                )
-            }
-            .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
+    } else {
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                token_seq_indices,
+                0,
+                token_index_bytes,
+                stream.cu_stream(),
+            )
         }
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention token index zero", error))?;
     }
-    let (cu_seqlens, token_seq_indices) = match launch.control {
-        AttentionControl::Explicit => (cu_seqlens, token_seq_indices),
-        AttentionControl::ImplicitSingleton => (0, 0),
-    };
 
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
@@ -2560,10 +2481,7 @@ fn enqueue_attention(
 
     launch_prepare(AttentionPrepareRequest {
         stream,
-        function: match launch.control {
-            AttentionControl::Explicit => functions.prepare_for(shape.decay_parameterization),
-            AttentionControl::ImplicitSingleton => &functions.prepare_implicit_singleton,
-        },
+        function: functions.prepare_for(shape.decay_parameterization),
         buffers: AttentionPrepareBuffers {
             qkvzba,
             conv_weight: regions[shared.conv].device_ptr(),
@@ -2627,7 +2545,6 @@ fn enqueue_attention(
         launch.batch_i32,
         launch.tokens_i32,
         cuda,
-        launch.control,
     )?;
     launch_gated_norm(
         stream,
@@ -3368,34 +3285,18 @@ fn launch_delta(
     batch: i32,
     tokens: i32,
     shape: CudaAttentionShape,
-    control: AttentionControl,
 ) -> Result<(), CudaDeviceRuntimeError> {
     if batch <= 0 {
         return Err(CudaDeviceRuntimeError::contract(
             "attention delta batch is not positive",
         ));
     }
-    let function = if control == AttentionControl::ImplicitSingleton {
-        if batch != 1
-            || tokens != 1
-            || !shape.tiled_delta
-            || shape.value_head_mapping != GatedDeltaValueHeadMapping::InterleavedByKeyHead
-        {
-            return Err(CudaDeviceRuntimeError::contract(
-                "implicit singleton delta domain changed",
-            ));
-        }
-        &functions.delta_implicit_singleton
-    } else {
-        match (shape.tiled_delta, shape.value_head_mapping) {
-            (false, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta,
-            (true, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta_tiled,
-            (false, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
-                &functions.delta_interleaved
-            }
-            (true, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
-                &functions.delta_tiled_interleaved
-            }
+    let function = match (shape.tiled_delta, shape.value_head_mapping) {
+        (false, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta,
+        (true, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta_tiled,
+        (false, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => &functions.delta_interleaved,
+        (true, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
+            &functions.delta_tiled_interleaved
         }
     };
     let pointers = [
@@ -4402,54 +4303,6 @@ mod tests {
     }
 
     #[test]
-    fn implicit_singleton_requires_whole_invocation_and_supported_kernel_domain() {
-        let mut shape = test_shape();
-        shape.decay_parameterization = GatedDeltaDecayParameterization::NegativeRate;
-        shape.value_head_mapping = GatedDeltaValueHeadMapping::InterleavedByKeyHead;
-        shape.key_head_dim = 128;
-        shape.value_head_dim = 128;
-        assert_eq!(
-            AttentionControl::for_invocation(shape, 1, 1),
-            AttentionControl::ImplicitSingleton
-        );
-        for (participants, tokens) in [(0, 0), (1, 0), (1, 2), (2, 1), (2, 2)] {
-            assert_eq!(
-                AttentionControl::for_invocation(shape, participants, tokens),
-                AttentionControl::Explicit
-            );
-        }
-        for changed in [
-            AttentionShape {
-                decay_parameterization: GatedDeltaDecayParameterization::LogRate,
-                ..shape
-            },
-            AttentionShape {
-                value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
-                ..shape
-            },
-            AttentionShape {
-                key_head_dim: 64,
-                ..shape
-            },
-            AttentionShape {
-                value_head_dim: 64,
-                ..shape
-            },
-        ] {
-            assert_eq!(
-                AttentionControl::for_invocation(changed, 1, 1),
-                AttentionControl::Explicit
-            );
-        }
-        assert_eq!(AttentionControl::ImplicitSingleton.transfers(), 0);
-        assert_eq!(AttentionControl::Explicit.transfers(), 2);
-        assert_ne!(
-            AttentionControl::ImplicitSingleton.replay_tag(),
-            AttentionControl::Explicit.replay_tag()
-        );
-    }
-
-    #[test]
     fn launch_extent_validation_covers_packed_projection_strides() {
         let mut shape = test_shape();
 
@@ -4671,15 +4524,7 @@ mod tests {
         );
         assert_eq!(qkvzba.marlin_workspace_zero_count().unwrap(), 2);
         assert_eq!(output.marlin_workspace_zero_count().unwrap(), 1);
-        assert_eq!(
-            attention_transfers_per_launch(&qkvzba, &output, AttentionControl::Explicit).unwrap(),
-            5
-        );
-        assert_eq!(
-            attention_transfers_per_launch(&qkvzba, &output, AttentionControl::ImplicitSingleton)
-                .unwrap(),
-            3
-        );
+        assert_eq!(attention_transfers_per_launch(&qkvzba, &output).unwrap(), 5);
 
         let canonical = qkvzba
             .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))

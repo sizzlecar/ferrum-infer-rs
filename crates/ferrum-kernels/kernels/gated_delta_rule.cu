@@ -1331,26 +1331,6 @@ extern "C" __global__ void ferrum_test_gdn_delta_implicit_single_token_tiled16_i
       scale);
 }
 
-// Product singleton entrypoint; the general and TEST varlen entrypoints remain.
-extern "C" __global__ void vnext_gdn_delta_implicit_singleton_tiled16_interleaved_f32(
-    const float* __restrict__ query,
-    const float* __restrict__ key,
-    const float* __restrict__ value,
-    const float* __restrict__ g,
-    const float* __restrict__ beta,
-    const unsigned long long* __restrict__ state_bindings,
-    const unsigned int* __restrict__ cu_seqlens,
-    float* __restrict__ out,
-    const int batch, const int total_tokens,
-    const int key_heads, const int value_heads,
-    const int key_dim, const int value_dim, const float scale) {
-  if (batch != 1 || total_tokens != 1) return;
-  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true, true>(
-      query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
-      nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
-      scale);
-}
-
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_state_f16(
     const float* __restrict__ query,
     const float* __restrict__ key,

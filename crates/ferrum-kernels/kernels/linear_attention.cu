@@ -836,39 +836,6 @@ ferrum_test_gdn_prepare_implicit_single_token_f16(
       value_dim, conv_kernel, qkvzba_width, qkvzba_width);
 }
 
-// Product singleton entrypoint. Same tested arithmetic, narrower whole-invocation domain.
-extern "C" __global__ void vnext_gdn_prepare_implicit_singleton_f16(
-    const __half* __restrict__ mixed_qkvzba_raw,
-    const __half* __restrict__ conv_weight,
-    const unsigned long long* __restrict__ state_bindings,
-    const float* __restrict__ a_log,
-    const float* __restrict__ dt_bias,
-    const unsigned int* __restrict__ cu_seqlens,
-    const unsigned int* __restrict__ token_seq_indices,
-    float* __restrict__ query,
-    float* __restrict__ key,
-    float* __restrict__ value,
-    __half* __restrict__ z,
-    float* __restrict__ g,
-    float* __restrict__ beta,
-    __half* __restrict__ final_conv_states,
-    const int batch, const int total_tokens,
-    const int key_heads, const int value_heads,
-    const int key_dim, const int value_dim, const int conv_kernel) {
-  if (batch != 1 || total_tokens != 1) return;
-  const int qk_total = key_heads * key_dim;
-  const int value_total = value_heads * value_dim;
-  const int qkvz_width = 2 * qk_total + 2 * value_total;
-  const int qkvzba_width = qkvz_width + 2 * value_heads;
-  const __half* ba_raw = mixed_qkvzba_raw + qkvz_width;
-  linear_attention_prepare_varlen_packed_qkvz_ba_impl<
-      __half, float, __half, __half, true, true>(
-      mixed_qkvzba_raw, ba_raw, conv_weight, nullptr, state_bindings, a_log,
-      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
-      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
-      value_dim, conv_kernel, qkvzba_width, qkvzba_width);
-}
-
 template <typename InputT, typename ParamT>
 static __device__ void linear_attention_decode_prepare_impl(
     const InputT* __restrict__ mixed_qkv_raw,
