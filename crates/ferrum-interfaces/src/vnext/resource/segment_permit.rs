@@ -135,6 +135,104 @@ mod timing_tests {
     }
 
     #[test]
+    fn fresh_segment_rule_windows_keep_shared_rows_and_current_extents_distinct() {
+        let mut expected = [expectation(32), expectation(24), expectation(40)];
+        expected[2].logical_size_rule = SegmentLogicalSizeRule::AtLeast;
+        let full = |expected: &[SegmentBackingExpectation]| {
+            expected
+                .iter()
+                .enumerate()
+                .map(|(resource_index, requirement)| SegmentBackingWindow {
+                    resource_index,
+                    offset_bytes: 0,
+                    length_bytes: requirement.logical_bytes,
+                    element_type: requirement.element_type,
+                    alignment_bytes: requirement.alignment_bytes,
+                })
+                .collect::<Vec<_>>()
+        };
+        let rule = |offset_bytes, length_bytes| SegmentWindowRule {
+            resource_index: 0,
+            offset_bytes,
+            length_bytes,
+            element_type: ElementType::U8,
+            alignment_bytes: 1,
+        };
+        let mut windows = full(&expected);
+        let shared = SegmentWindowResource {
+            first_request: 0,
+            shared: true,
+            participant_stride: None,
+        };
+        // All participants refer to this exact whole-resource window.
+        assert_eq!(
+            shared
+                .append_rule_windows(&expected, 2, &rule(0, None), &mut windows)
+                .unwrap(),
+            0..1
+        );
+        assert_eq!(windows.len(), expected.len());
+        let strided = SegmentWindowResource {
+            participant_stride: Some(16),
+            ..shared
+        };
+        let rows = strided
+            .append_rule_windows(&expected, 2, &rule(4, Some(8)), &mut windows)
+            .unwrap();
+        assert_eq!(
+            windows[rows]
+                .iter()
+                .map(|w| (w.resource_index, w.offset_bytes, w.length_bytes))
+                .collect::<Vec<_>>(),
+            vec![(0, 4, 8), (0, 20, 8)]
+        );
+        let per_participant = SegmentWindowResource {
+            first_request: 1,
+            shared: false,
+            participant_stride: None,
+        };
+        assert_eq!(
+            per_participant
+                .append_rule_windows(&expected, 2, &rule(0, None), &mut windows)
+                .unwrap(),
+            1..3
+        );
+        let current = per_participant
+            .append_rule_windows(&expected, 2, &rule(8, None), &mut windows)
+            .unwrap();
+        assert_eq!(
+            windows[current]
+                .iter()
+                .map(|w| w.length_bytes)
+                .collect::<Vec<_>>(),
+            vec![16, 32]
+        );
+        // A new wave rebuilds views from its current logical extent, never the
+        // previous window or an AtLeast lease's physical capacity.
+        expected[2].logical_bytes = 56;
+        let mut grown = full(&expected);
+        let current = per_participant
+            .append_rule_windows(&expected, 2, &rule(8, None), &mut grown)
+            .unwrap();
+        assert_eq!(
+            grown[current]
+                .iter()
+                .map(|w| w.length_bytes)
+                .collect::<Vec<_>>(),
+            vec![16, 48]
+        );
+        assert!(strided
+            .append_rule_windows(&expected, 2, &rule(9, Some(8)), &mut full(&expected))
+            .is_err());
+        assert!(strided
+            .append_rule_windows(&expected, 3, &rule(0, None), &mut full(&expected))
+            .is_err());
+        assert!(shared
+            .append_rule_windows(&expected, 0, &rule(0, None), &mut full(&expected))
+            .is_err());
+    }
+
+    #[test]
     fn compiled_segment_windows_preserve_node_participant_order_and_fresh_growth() {
         // One shared Step allocation with two rows, followed by each current
         // Sequence. Two nodes have different declaration counts; no flattened
@@ -298,6 +396,7 @@ pub struct SegmentBackingWindow {
 }
 
 /// Immutable window instructions. They name resource ordinals, never owners.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SegmentWindowRule {
     pub resource_index: usize,
     pub offset_bytes: u64,
@@ -314,6 +413,63 @@ pub(crate) struct SegmentWindowResource {
 }
 
 impl SegmentWindowResource {
+    /// Resolve one unique cold rule against this wave's rows. The initial
+    /// `expected.len()` windows are its complete fresh resource views.
+    pub(crate) fn append_rule_windows(
+        self,
+        expected: &[SegmentBackingExpectation],
+        participants: usize,
+        rule: &SegmentWindowRule,
+        windows: &mut Vec<SegmentBackingWindow>,
+    ) -> Result<Range<usize>, VNextError> {
+        if participants == 0 || windows.len() < expected.len() {
+            return Err(invalid_resource(
+                "compiled window has no complete fresh frame",
+            ));
+        }
+        let start = windows.len();
+        let count = if self.shared && self.participant_stride.is_none() {
+            1
+        } else {
+            participants
+        };
+        let mut whole_resource = true;
+        for participant in 0..count {
+            let (resource_index, offset, available) = self.row(participant, expected)?;
+            let length_bytes = match rule.length_bytes {
+                Some(length) => length,
+                None => available.checked_sub(rule.offset_bytes).ok_or_else(|| {
+                    invalid_resource("compiled resource shrank before its window")
+                })?,
+            };
+            if length_bytes == 0
+                || rule
+                    .offset_bytes
+                    .checked_add(length_bytes)
+                    .is_none_or(|end| end > available)
+            {
+                return Err(invalid_resource("compiled window exceeds its current row"));
+            }
+            let window = SegmentBackingWindow {
+                resource_index,
+                offset_bytes: offset
+                    .checked_add(rule.offset_bytes)
+                    .ok_or_else(|| invalid_resource("compiled window offset overflows"))?,
+                length_bytes,
+                element_type: rule.element_type,
+                alignment_bytes: rule.alignment_bytes,
+            };
+            whole_resource &= window == windows[resource_index];
+            windows.push(window);
+        }
+        if whole_resource {
+            windows.truncate(start);
+            Ok(self.first_request..self.first_request + count)
+        } else {
+            Ok(start..windows.len())
+        }
+    }
+
     pub(crate) fn row(
         self,
         participant: usize,

@@ -4,7 +4,6 @@
 use crate::vnext::resource::SegmentWindowRule;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
 use std::sync::Arc;
 
 use super::buffer_view::{validate_value_binding_physical_coverage, ValueBindingPhysicalCoverage};
@@ -32,6 +31,8 @@ pub(super) struct CompiledSegmentResource {
     pub resource_id: ResourceId,
     pub source: CompiledSegmentResourceSource,
     pub required_minimum_bytes: u64,
+    /// Index into the recipe's unique Plan views, resolved once at compile time.
+    pub plan_view_index: Option<usize>,
 }
 
 pub(super) struct CompiledSegmentRegion {
@@ -78,8 +79,6 @@ pub(super) struct CompiledSegmentBindingNode {
     pub persistent_preserve: bool,
     /// Full captured node closure, including resources not exported as patches.
     pub resource_indices: Vec<usize>,
-    pub dynamic_window_base: usize,
-    pub dynamic_window_count: usize,
 }
 
 pub(crate) struct CompiledSegmentBindingRecipe {
@@ -89,7 +88,6 @@ pub(crate) struct CompiledSegmentBindingRecipe {
     /// Sorted, unique indices into the exact Plan's static allocations.
     pub(super) plan_slots: Vec<usize>,
     pub(super) window_rules: Vec<SegmentWindowRule>,
-    pub(super) window_nodes: Vec<Range<usize>>,
     pub(crate) backend_program: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -99,18 +97,13 @@ impl CompiledSegmentBindingRecipe {
         runtime: &R,
     ) -> Result<(), VNextError> {
         let mut window_rules = Vec::new();
-        let mut window_nodes = Vec::new();
         for node in &mut self.nodes {
-            node.dynamic_window_count = 0;
-            node.dynamic_window_base = window_rules.len();
             for region in &mut node.regions {
                 if matches!(
                     self.resources[region.resource_index].source,
                     CompiledSegmentResourceSource::Dynamic { .. }
                 ) {
-                    region.dynamic_ordinal = Some(node.dynamic_window_count);
-                    node.dynamic_window_count += 1;
-                    window_rules.push(SegmentWindowRule {
+                    let rule = SegmentWindowRule {
                         resource_index: region.resource_index,
                         offset_bytes: region.offset_bytes,
                         length_bytes: match region.request.extent {
@@ -119,15 +112,23 @@ impl CompiledSegmentBindingRecipe {
                         },
                         element_type: region.request.element_type,
                         alignment_bytes: region.request.alignment_bytes,
-                    });
+                    };
+                    // Rules describe logical views, never current owners. A
+                    // shared declaration is projected once in the fresh frame,
+                    // even when several nodes/participants consume that view.
+                    let ordinal = window_rules
+                        .iter()
+                        .position(|existing| existing == &rule)
+                        .unwrap_or_else(|| {
+                            let ordinal = window_rules.len();
+                            window_rules.push(rule);
+                            ordinal
+                        });
+                    region.dynamic_ordinal = Some(ordinal);
                 }
-            }
-            if node.dynamic_window_count != 0 {
-                window_nodes.push(node.dynamic_window_base..window_rules.len());
             }
         }
         self.window_rules = window_rules;
-        self.window_nodes = window_nodes;
         let declarations = self
             .nodes
             .iter()
@@ -411,6 +412,10 @@ impl CompiledSegmentBindingRecipe {
                             checked_range(request.offset_bytes, length, bound)?;
                         }
                         checked_range(offset_bytes, length, metadata.bytes)?;
+                        resources[resource_index].required_minimum_bytes = resources
+                            [resource_index]
+                            .required_minimum_bytes
+                            .max(offset_bytes + length);
                     }
                     SegmentBindingRegionExtent::CurrentResource => {
                         checked_range(offset_bytes, 1, metadata.bytes)?;
@@ -520,11 +525,9 @@ impl CompiledSegmentBindingRecipe {
                 dependencies,
                 persistent_preserve,
                 resource_indices,
-                dynamic_window_base: 0,
-                dynamic_window_count: 0,
             });
         }
-        let plan_slots = resources
+        let plan_slots: Vec<_> = resources
             .iter()
             .filter_map(|r| match r.source {
                 CompiledSegmentResourceSource::PlanStatic { slot_index } => Some(slot_index),
@@ -533,13 +536,21 @@ impl CompiledSegmentBindingRecipe {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        for resource in &mut resources {
+            if let CompiledSegmentResourceSource::PlanStatic { slot_index } = resource.source {
+                resource.plan_view_index = Some(
+                    plan_slots
+                        .binary_search(&slot_index)
+                        .expect("collected Plan slot"),
+                );
+            }
+        }
         Ok(Self {
             program_id,
             nodes,
             resources,
             plan_slots,
             window_rules: Vec::new(),
-            window_nodes: Vec::new(),
             backend_program: None,
         })
     }
@@ -577,6 +588,7 @@ fn resolve_resource(
         resource_id: resource_id.clone(),
         source,
         required_minimum_bytes: 0,
+        plan_view_index: None,
     });
     indices.insert(resource_id.clone(), index);
     Ok(index)
