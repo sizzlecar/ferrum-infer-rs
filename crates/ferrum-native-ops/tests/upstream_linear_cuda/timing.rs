@@ -44,6 +44,10 @@ mod full_tile_stream_k;
 #[path = "timing/mmvq_pdl.rs"]
 mod mmvq_pdl;
 
+#[cfg(feature = "cuda-upstream-mmq-pdl-tests")]
+#[path = "timing/mmq_pdl.rs"]
+mod mmq_pdl;
+
 type MmvqDot = unsafe extern "C" fn(
     *const UpstreamLinearPlanV1,
     *const c_void,
