@@ -281,6 +281,9 @@ impl UpstreamPlanFactory {
         } else {
             plan
         };
+        let plan = plan
+            .with_automatic_mmvq_launch()
+            .map_err(|error| format!("{error}; automatic MMVQ launch qualification"))?;
         let plan = Arc::new(plan);
         plans.insert(key, plan.clone());
         Ok(plan)
@@ -541,6 +544,7 @@ impl UpstreamPlanFactory {
                 self.fingerprint.as_bytes(),
                 plan.q4_mmvq_weight_decode().as_runtime_value().as_bytes(),
                 plan.q5_mmvq_weight_decode().as_runtime_value().as_bytes(),
+                plan.mmvq_launch_kind().as_runtime_value().as_bytes(),
             ]),
             device_architecture: self.device.architecture,
             multiprocessors: self.device.multiprocessors,

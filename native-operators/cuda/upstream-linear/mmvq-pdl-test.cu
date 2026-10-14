@@ -201,111 +201,34 @@ extern "C" int ferrum_test_upstream_mmvq_pdl_graph_edges_v1(
     });
 }
 
-// Small private bodies preserve the ordinary clear/widen/cast expressions.
-// Trigger before any return; wait before reads OR scratch overwrites. The
-// latter also protects a preceding projection's reads of these shared spans.
-static __global__ void test_mmvq_full_pdl_clear(uint32_t * flags, uint32_t rows) {
-    ggml_cuda_pdl_lc();
-    const uint64_t row = uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    ggml_cuda_pdl_sync();
-    if (row < rows) flags[row] = 0;
-}
-
-static __global__ void test_mmvq_full_pdl_widen(const half * input, float * converted,
-        int rows, int inputs, int stride, int padded) {
-    ggml_cuda_pdl_lc();
-    const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    ggml_cuda_pdl_sync();
-    if (i < rows*padded) converted[i] = i%padded<inputs
-        ? __half2float(input[(i/padded)*stride+i%padded]) : 0.0f;
-}
-
-static __global__ void test_mmvq_full_pdl_cast(const float * input, half * output,
-        uint32_t rows, uint32_t columns, uint32_t stride,
-        const uint32_t * row_flags, const uint32_t * weight_flag) {
-    ggml_cuda_pdl_lc();
-    const uint32_t index = blockIdx.x*blockDim.x + threadIdx.x;
-    ggml_cuda_pdl_sync();
-    if (index >= rows*columns) return;
-    const float value = input[index]; const half rounded = __float2half_rn(value);
-    const bool bad = *weight_flag || row_flags[index/columns] ||
-        !marker_finite(value) || !marker_half_finite(rounded);
-    output[(index/columns)*stride+index%columns] = bad ? __ushort_as_half(0x7e00) : rounded;
-}
-
 extern "C" int ferrum_test_upstream_mmvq_full_pdl_support_v1(
         const FerrumUpstreamLinearPlanV1 * p, uint32_t * supported) noexcept {
-    return ferrum_upstream_boundary([&]() -> int {
-        const auto status = ferrum_test_upstream_mmvq_pdl_support_v1(p,supported);
-        if (status || !*supported) return status;
+    TestMmvqPlan n{};
+    if (!supported || !test_mmvq_pdl_valid(p,n)) return -1;
+    *supported = 0;
 #if defined(GGML_CUDA_USE_PDL) && CUDART_VERSION >= 12030
-        const void * kernels[] = {
-            reinterpret_cast<const void *>(test_mmvq_full_pdl_clear),
-            reinterpret_cast<const void *>(test_mmvq_full_pdl_widen),
-            reinterpret_cast<const void *>(test_mmvq_full_pdl_cast),
-        };
-        for (const auto kernel : kernels) {
-            cudaFuncAttributes attributes{};
-            const auto error = cudaFuncGetAttributes(&attributes,kernel);
-            if (error != cudaSuccess) return error;
-            if (attributes.ptxVersion < 90) *supported = 0;
-        }
+    const uint32_t kind = n.rows == 8 && n.format == GGML_TYPE_Q4_K ? 1
+        : n.rows == 8 && n.format == GGML_TYPE_Q5_K ? 2 : 0;
+    return ferrum_upstream_mmvq_pdl_support_v1(p,kind,supported);
+#else
+    return 0; // This diagnostic also requires versioned graph-edge inspection.
 #endif
-        return 0;
-    });
 }
 
 extern "C" int ferrum_test_upstream_mmvq_full_pdl_pack_v2(const FerrumUpstreamLinearPlanV1 * p,
         const void * input, uint32_t stride, void * converted, void * packed,
         void * flags, void * s) noexcept {
-    return ferrum_upstream_boundary([&]() -> int {
-        TestMmvqPlan n{};
-        if (!test_mmvq_pdl_valid(p,n)) return -1;
-        if (!input || !converted || !packed || !flags || stride<n.inputs ||
-                uint64_t(stride)*n.rows>INT_MAX || uintptr_t(input)%2 ||
-                uintptr_t(converted)%16 || uintptr_t(packed)%4 || uintptr_t(flags)%4) return -5;
-#if defined(GGML_CUDA_USE_PDL)
-        if (n.cc < GGML_CUDA_CC_HOPPER) return -2;
-        const auto stream = static_cast<cudaStream_t>(s);
-        auto status = test_mmvq_launch_pdl(test_mmvq_full_pdl_clear,
-            dim3((uint64_t(n.rows)+127)/128),dim3(128),stream,static_cast<uint32_t *>(flags),n.rows);
-        if (status != cudaSuccess) return status;
-        status = test_mmvq_launch_pdl(test_mmvq_full_pdl_widen,
-            dim3((n.rows*n.padded_inputs+255)/256),dim3(256),stream,
-            static_cast<const half *>(input),static_cast<float *>(converted),
-            int(n.rows),int(n.inputs),int(stride),int(n.padded_inputs));
-        if (status != cudaSuccess) return status;
-        const dim3 grid((n.padded_inputs+CUDA_QUANTIZE_BLOCK_SIZE-1)/CUDA_QUANTIZE_BLOCK_SIZE,n.rows,1);
-        return test_mmvq_launch_pdl(quantize_q8_1<true>,grid,
-            dim3(CUDA_QUANTIZE_BLOCK_SIZE,1,1),stream,
-            static_cast<const float *>(converted),packed,int64_t(n.inputs),int64_t(n.padded_inputs),
-            int64_t(n.rows)*n.padded_inputs,int64_t(n.rows)*n.padded_inputs,
-            int64_t(n.padded_inputs),n.rows,init_fastdiv_values(1),static_cast<uint32_t *>(flags));
-#else
-        return -2;
-#endif
-    });
+    TestMmvqPlan n{};
+    if (!test_mmvq_pdl_valid(p,n)) return -1;
+    return ferrum_upstream_mmvq_pdl_pack_v2(p,input,stride,converted,packed,flags,s);
 }
 
 extern "C" int ferrum_test_upstream_mmvq_full_pdl_cast_v2(const FerrumUpstreamLinearPlanV1 * p,
         const void * input, void * output, uint32_t stride,
         const void * rows, const void * weights, void * s) noexcept {
-    return ferrum_upstream_boundary([&]() -> int {
-        TestMmvqPlan n{};
-        if (!test_mmvq_pdl_valid(p,n)) return -1;
-        if (!input || !output || !rows || !weights || stride<n.outputs ||
-                uint64_t(stride)*n.rows>INT_MAX || uintptr_t(input)%4 ||
-                uintptr_t(output)%2 || uintptr_t(rows)%4 || uintptr_t(weights)%4) return -5;
-#if defined(GGML_CUDA_USE_PDL)
-        if (n.cc < GGML_CUDA_CC_HOPPER) return -2;
-        return test_mmvq_launch_pdl(test_mmvq_full_pdl_cast,
-            dim3((n.rows*n.outputs+255)/256),dim3(256),static_cast<cudaStream_t>(s),
-            static_cast<const float *>(input),static_cast<half *>(output),n.rows,n.outputs,stride,
-            static_cast<const uint32_t *>(rows),static_cast<const uint32_t *>(weights));
-#else
-        return -2;
-#endif
-    });
+    TestMmvqPlan n{};
+    if (!test_mmvq_pdl_valid(p,n)) return -1;
+    return ferrum_upstream_mmvq_pdl_cast_v2(p,input,output,stride,rows,weights,s);
 }
 
 // counts: all edges, programmatic, clear->widen, widen->quantize,
@@ -328,11 +251,11 @@ extern "C" int ferrum_test_upstream_mmvq_full_pdl_graph_edges_v1(
         if (status != cudaSuccess) return status;
         counts[0] = count;
         const void * kernels[] = {
-            reinterpret_cast<const void *>(test_mmvq_full_pdl_clear),
-            reinterpret_cast<const void *>(test_mmvq_full_pdl_widen),
+            reinterpret_cast<const void *>(upstream_mmvq_pdl_clear),
+            reinterpret_cast<const void *>(upstream_mmvq_pdl_widen),
             reinterpret_cast<const void *>(quantize_q8_1<true>),
             test_mmvq_pdl_kernel(n),
-            reinterpret_cast<const void *>(test_mmvq_full_pdl_cast),
+            reinterpret_cast<const void *>(upstream_mmvq_pdl_cast_kernel),
         };
         for (size_t i = 0; i < count; ++i) {
             if (data[i].type != cudaGraphDependencyTypeProgrammatic) continue;

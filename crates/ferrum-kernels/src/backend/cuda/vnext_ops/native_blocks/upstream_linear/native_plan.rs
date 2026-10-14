@@ -71,6 +71,18 @@ impl PreparedProjectionNative {
             Self::Q6F16(_) => ferrum_types::Q5MmvqWeightDecode::Baseline,
         }
     }
+    pub fn with_automatic_mmvq_launch(self) -> Result<Self, Error> {
+        match self {
+            Self::Upstream(plan) => plan.with_automatic_mmvq_launch().map(Self::Upstream),
+            Self::Q6F16(_) => Ok(self),
+        }
+    }
+    pub fn mmvq_launch_kind(&self) -> crate::native_ops::upstream_linear::MmvqLaunchKind {
+        match self {
+            Self::Upstream(plan) => plan.mmvq_launch_kind(),
+            Self::Q6F16(_) => crate::native_ops::upstream_linear::MmvqLaunchKind::Ordered,
+        }
+    }
 
     pub fn with_q4_mmvq_weight_decode(
         self,

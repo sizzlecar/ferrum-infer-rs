@@ -5,6 +5,13 @@ use cudarc::driver::{sys::CUdevice_attribute::*, CudaContext, CudaSlice, CudaStr
 use half::f16;
 use std::sync::Arc;
 
+#[cfg(all(
+    feature = "cuda-q4-shared-weight-decode",
+    feature = "cuda-q5-shared-weight-decode"
+))]
+#[path = "pdl_tests.rs"]
+mod pdl_tests;
+
 struct Buffer {
     data: CudaSlice<u8>,
     bytes: usize,

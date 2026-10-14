@@ -700,6 +700,28 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
             ),
         }
         system_libraries.extend(artifact.lock.system_libraries.iter().copied());
+        // Optional additive launch capability. Do not emit any extern reference
+        // when an older, otherwise compatible archive lacks the complete ABI.
+        if resolved.manifest.operator == "ferrum.cuda.upstream_linear"
+            && resolved.manifest.operator_abi_version == "1"
+            && resolved.manifest.linkage == NativeOperatorLinkage::Static
+            && [
+                "ferrum_upstream_mmvq_pdl_support_v1",
+                "ferrum_upstream_mmvq_pdl_pack_v2",
+                "ferrum_upstream_mmvq_pdl_dot_v1",
+                "ferrum_upstream_mmvq_pdl_cast_v2",
+            ]
+            .iter()
+            .all(|required| {
+                resolved
+                    .manifest
+                    .exports
+                    .iter()
+                    .any(|export| export.as_str() == *required)
+            })
+        {
+            println!("cargo:rustc-cfg=ferrum_native_mmvq_pdl");
+        }
         inventory.push(serde_json::json!({
             "schema_version": resolved.manifest.schema_version,
             "operator": resolved.manifest.operator,
@@ -1199,6 +1221,7 @@ sha256={} import_dir={}",
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(ferrum_native_mmvq_pdl)");
     initialize_cuda_build_summary_receipt();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support/host.rs");

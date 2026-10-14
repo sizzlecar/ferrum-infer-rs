@@ -1,5 +1,41 @@
 use super::*;
 unsafe extern "C" {
+    #[cfg(ferrum_native_mmvq_pdl)]
+    pub(super) fn ferrum_upstream_mmvq_pdl_support_v1(
+        plan: *const UpstreamLinearPlanV1,
+        dot_kind: u32,
+        supported: *mut u32,
+    ) -> i32;
+    #[cfg(ferrum_native_mmvq_pdl)]
+    pub(super) fn ferrum_upstream_mmvq_pdl_pack_v2(
+        plan: *const UpstreamLinearPlanV1,
+        input: *const c_void,
+        stride: u32,
+        converted: *mut c_void,
+        packed: *mut c_void,
+        rows: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    #[cfg(ferrum_native_mmvq_pdl)]
+    pub(super) fn ferrum_upstream_mmvq_pdl_dot_v1(
+        plan: *const UpstreamLinearPlanV1,
+        weights: *const c_void,
+        packed: *const c_void,
+        output: *mut c_void,
+        fixup: *mut c_void,
+        stream: *mut c_void,
+        dot_kind: u32,
+    ) -> i32;
+    #[cfg(ferrum_native_mmvq_pdl)]
+    pub(super) fn ferrum_upstream_mmvq_pdl_cast_v2(
+        plan: *const UpstreamLinearPlanV1,
+        input: *const c_void,
+        output: *mut c_void,
+        stride: u32,
+        rows: *const c_void,
+        weights: *const c_void,
+        stream: *mut c_void,
+    ) -> i32;
     #[cfg(feature = "cuda-q4-shared-weight-decode")]
     pub(super) fn ferrum_upstream_mmvq_q4_shared_weight_decode_m4_dot_v1(
         plan: *const UpstreamLinearPlanV1,
