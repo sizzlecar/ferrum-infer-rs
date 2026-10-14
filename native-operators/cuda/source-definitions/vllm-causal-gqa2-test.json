@@ -1,0 +1,66 @@
+{
+  "schema_version": 3,
+  "operator": "ferrum.cuda.vllm_paged_attention_v2",
+  "source_package_kind": "ferrum-native-source-overlay",
+  "source_package_revision": "ferrum-vllm-addressed-indexed-gqa2-test-r1",
+  "upstream_sources": [
+    {
+      "repository": "https://github.com/vllm-project/vllm.git",
+      "revision": "bc150f50299199599673614f80d12a196f377655",
+      "license": "Apache-2.0"
+    }
+  ],
+  "translation_units": [
+    "kernels/vllm_attn/launcher_gqa2_test.cu"
+  ],
+  "headers": [
+    "kernels/vllm_attn/attention_dtypes.h",
+    "kernels/vllm_attn/attention_generic.cuh",
+    "kernels/vllm_attn/attention_gqa2_test.cuh",
+    "kernels/vllm_attn/attention_kernels.cuh",
+    "kernels/vllm_attn/attention_utils.cuh",
+    "kernels/vllm_attn/dtype_bfloat16.cuh",
+    "kernels/vllm_attn/dtype_float16.cuh",
+    "kernels/vllm_attn/dtype_float32.cuh",
+    "kernels/vllm_attn/dtype_fp8.cuh",
+    "kernels/vllm_attn/ferrum_shim.h",
+    "kernels/vllm_attn/include/cuda_compat.h",
+    "kernels/vllm_attn/quant_utils_stub.cuh"
+  ],
+  "dependency_closures": [
+    {
+      "translation_unit": "kernels/vllm_attn/launcher_gqa2_test.cu",
+      "headers": [
+        "kernels/vllm_attn/attention_dtypes.h",
+        "kernels/vllm_attn/attention_generic.cuh",
+        "kernels/vllm_attn/attention_gqa2_test.cuh",
+        "kernels/vllm_attn/attention_kernels.cuh",
+        "kernels/vllm_attn/attention_utils.cuh",
+        "kernels/vllm_attn/dtype_bfloat16.cuh",
+        "kernels/vllm_attn/dtype_float16.cuh",
+        "kernels/vllm_attn/dtype_float32.cuh",
+        "kernels/vllm_attn/dtype_fp8.cuh",
+        "kernels/vllm_attn/ferrum_shim.h",
+        "kernels/vllm_attn/include/cuda_compat.h",
+        "kernels/vllm_attn/quant_utils_stub.cuh"
+      ]
+    }
+  ],
+  "include_dirs": [
+    "kernels/vllm_attn"
+  ],
+  "defines": [
+    "FERRUM_TEST_CAUSAL_GQA2"
+  ],
+  "nvcc_policy": {
+    "cpp_standard": "cpp17",
+    "optimization": "o3",
+    "use_fast_math": true,
+    "relaxed_constexpr": true,
+    "extended_lambda": true,
+    "host_position_independent_code": true,
+    "host_default_visibility": false
+  },
+  "architecture": "device_compute_capability",
+  "archive_file": "libferrum_causal_gqa2_test.a"
+}

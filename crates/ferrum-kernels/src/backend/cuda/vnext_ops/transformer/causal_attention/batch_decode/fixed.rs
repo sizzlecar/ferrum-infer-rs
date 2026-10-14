@@ -144,6 +144,77 @@ impl FixedBatchDecode {
         key_norm: u64,
         output_gate: bool,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        self.enqueue_with_attention(
+            stream,
+            functions,
+            launches,
+            binding,
+            binding_layout,
+            shape,
+            layout,
+            scratch,
+            query_norm,
+            key_norm,
+            output_gate,
+            |group, lengths, rows, expected| {
+                let partition = layout.vllm.ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("fixed causal partition scratch absent")
+                })?;
+                // The same-stream gather establishes identity-or--1 masks.
+                // Current bindings retain every original KV range/frontier.
+                unsafe {
+                    dispatch_vnext_addressed_paged_attention_fixed_masked_batch_raw(
+                        stream,
+                        scratch_pointer(scratch, layout.context)?,
+                        scratch_pointer(scratch, layout.query)?,
+                        scratch_pointer(binding, BINDING_CONTROL_BYTES)?,
+                        lengths,
+                        rows,
+                        group.maximum_sequence,
+                        Some(scratch_pointer(scratch, partition.exp_sums)?),
+                        Some(scratch_pointer(scratch, partition.max_logits)?),
+                        Some(scratch_pointer(scratch, partition.temporary_output)?),
+                        group.sequences,
+                        self.participants,
+                        shape.query_heads,
+                        shape.key_value_heads,
+                        shape.head_dim,
+                        group.table_stride,
+                        expected,
+                    )
+                }
+                .map(|_| ())
+                .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))
+            },
+        )
+    }
+
+    // Static dispatch keeps the normal path unchanged. The test-only caller can
+    // substitute a V2 launcher while sharing this entire preparation/gate bundle.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_with_attention<F>(
+        &self,
+        stream: &CudaStream,
+        functions: &CausalAttentionFunctions,
+        launches: &[CausalAttentionLaunch],
+        binding: u64,
+        binding_layout: BindingLayout,
+        shape: CudaCausalAttentionShape,
+        layout: ScratchLayout,
+        scratch: u64,
+        query_norm: u64,
+        key_norm: u64,
+        output_gate: bool,
+        mut attention: F,
+    ) -> Result<(), CudaDeviceRuntimeError>
+    where
+        F: FnMut(
+            BatchGeometry,
+            u64,
+            u64,
+            VnextAddressedPagedAttentionKernel,
+        ) -> Result<(), CudaDeviceRuntimeError>,
+    {
         if launches.len() != self.participants as usize {
             return Err(CudaDeviceRuntimeError::contract(
                 "fixed causal participant count changed",
@@ -211,31 +282,7 @@ impl FixedBatchDecode {
                     .map(|group| (group, v2_rows, VnextAddressedPagedAttentionKernel::V2)),
             )
         {
-            // The same-stream gather establishes identity-or--1 masks. Current
-            // validated bindings retain every original KV range and frontier;
-            // the fixed capacities bound all selected lengths and V2 scratch.
-            unsafe {
-                dispatch_vnext_addressed_paged_attention_fixed_masked_batch_raw(
-                    stream,
-                    scratch_pointer(scratch, layout.context)?,
-                    scratch_pointer(scratch, layout.query)?,
-                    scratch_pointer(binding, BINDING_CONTROL_BYTES)?,
-                    lengths,
-                    rows,
-                    group.maximum_sequence,
-                    Some(scratch_pointer(scratch, partition.exp_sums)?),
-                    Some(scratch_pointer(scratch, partition.max_logits)?),
-                    Some(scratch_pointer(scratch, partition.temporary_output)?),
-                    group.sequences,
-                    self.participants,
-                    shape.query_heads,
-                    shape.key_value_heads,
-                    shape.head_dim,
-                    group.table_stride,
-                    expected,
-                )
-            }
-            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+            attention(*group, lengths, rows, expected)?;
         }
         if output_gate {
             if let Some(tokens) = self.packed_work.and_then(PackedDecodeWork::gate_tokens) {

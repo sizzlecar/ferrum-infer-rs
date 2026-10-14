@@ -54,6 +54,7 @@ vllm-paged-attn-v2 = ["cuda"]  # vLLM paged-attention-v2 native artifact.
                         # layout. Runtime selection remains a typed product
                         # policy; source compilation is external to Cargo.
 cuda-indexed-causal-attention = ["vllm-paged-attn-v2"] # Opt-in additive indexed native ABI.
+cuda-causal-gqa2-tests = ["cuda-indexed-causal-attention"] # Test-only separately built GQA2 native export.
 fa2-source = ["cuda"]  # Backward-compatible obsolete alias. It no longer
                         # compiles vendored FlashAttention/CUTLASS source;
                         # FA2 must come from a Ferrum native operator artifact.
