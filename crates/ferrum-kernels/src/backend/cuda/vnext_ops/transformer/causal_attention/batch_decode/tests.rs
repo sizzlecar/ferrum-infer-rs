@@ -607,3 +607,59 @@ fn build_launches(
         })
         .collect()
 }
+
+#[test]
+#[cfg(feature = "cuda-indexed-causal-attention")]
+fn paired_query_heads_selects_only_supported_fixed_execution_shapes() {
+    use ferrum_types::CausalDecodeKvReuse::{None, PairedQueryHeads};
+    let grouping = CausalDecodeAttentionGrouping::FixedExecutionCapacity;
+    let supported = shape(256);
+    let eligible =
+        |mode, grouping, shape| fixed::paired_query_heads_eligible(mode, grouping, shape);
+    assert_eq!(
+        eligible(PairedQueryHeads, grouping, supported),
+        cfg!(feature = "cuda-causal-gqa2")
+    );
+    assert!(!eligible(None, grouping, supported));
+    assert!(!eligible(
+        PairedQueryHeads,
+        CausalDecodeAttentionGrouping::FixedCapacity,
+        supported
+    ));
+    assert!(!eligible(PairedQueryHeads, grouping, shape(128)));
+    for length in [512, 2049] {
+        let mut unsupported = supported;
+        unsupported.maximum_context_tokens = length;
+        assert!(!eligible(PairedQueryHeads, grouping, unsupported));
+    }
+    let mut unsupported = supported;
+    unsupported.query_heads = 6;
+    assert!(!eligible(PairedQueryHeads, grouping, unsupported));
+    unsupported = supported;
+    unsupported.int8_kv = true;
+    assert!(!eligible(PairedQueryHeads, grouping, unsupported));
+    // Product M1 deliberately retains the existing per-participant attention.
+    let binding = BindingLayout::new(supported, 1).unwrap();
+    let layout = ScratchLayout::for_participants(
+        supported,
+        1,
+        1,
+        CausalProjection::F16,
+        AttentionExecutionPolicy::NativeAdaptive,
+    )
+    .unwrap();
+    let launches = build_launches(supported, binding, layout, &[1024]);
+    assert!(PreparedBatchDecode::for_launches(
+        &launches,
+        true,
+        binding,
+        supported,
+        layout,
+        true,
+        true,
+        grouping,
+        PairedQueryHeads
+    )
+    .unwrap()
+    .is_none());
+}

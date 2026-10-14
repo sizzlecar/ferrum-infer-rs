@@ -301,6 +301,46 @@ impl Q8ProjectionWeightPreparation {
     }
 }
 
+/// Configuration provenance key; this policy is selected through CLI or config.
+pub const CAUSAL_DECODE_KV_REUSE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECODE_KV_REUSE";
+
+/// Reuse KV loads across query heads without changing each head's arithmetic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalDecodeKvReuse {
+    #[default]
+    None,
+    PairedQueryHeads,
+}
+
+impl CausalDecodeKvReuse {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PairedQueryHeads => "paired-query-heads",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "paired-query-heads" => Ok(Self::PairedQueryHeads),
+            _ => Err(format!("expected none or paired-query-heads; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select causal decode KV reuse through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Grouping of already selected native V1/V2 causal decode rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -561,6 +601,9 @@ pub struct RuntimeKnobs {
     /// Indexed grouping requires packed preparation with native CUDA attention.
     #[serde(default)]
     pub causal_decode_attention_grouping: CausalDecodeAttentionGrouping,
+    /// Eligible fixed-capacity CUDA V2 attention may share KV loads across two heads.
+    #[serde(default)]
+    pub causal_decode_kv_reuse: CausalDecodeKvReuse,
     /// Shared weight decoding affects only eligible Q4_K MarkerV2 MMVQ M8 leaves.
     #[serde(default)]
     pub q4_mmvq_weight_decode: Q4MmvqWeightDecode,
@@ -748,6 +791,14 @@ impl EngineConfig {
                 CausalDecodeAttentionGrouping::parse_config_entry(entry).map_err(|reason| {
                     format!("{CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY}: {reason}")
                 })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == CAUSAL_DECODE_KV_REUSE_CONFIG_KEY)
+        {
+            self.runtime.causal_decode_kv_reuse = CausalDecodeKvReuse::parse_config_entry(entry)
+                .map_err(|reason| format!("{CAUSAL_DECODE_KV_REUSE_CONFIG_KEY}: {reason}"))?;
         }
         if let Some(entry) = snapshot
             .entries
@@ -2572,6 +2623,52 @@ mod tests {
                 RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
             ]))
             .is_err());
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_defaults_and_explicit_sources() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let mut engine = EngineConfig::default();
+        let key = CAUSAL_DECODE_KV_REUSE_CONFIG_KEY;
+        assert_eq!(
+            engine.runtime.causal_decode_kv_reuse,
+            CausalDecodeKvReuse::None
+        );
+        let mut old = serde_json::to_value(&engine.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("causal_decode_kv_reuse");
+        assert_eq!(
+            serde_json::from_value::<RuntimeKnobs>(old)
+                .unwrap()
+                .causal_decode_kv_reuse,
+            CausalDecodeKvReuse::None
+        );
+        for source in [RuntimeConfigSource::Cli, RuntimeConfigSource::ConfigFile] {
+            for mode in [
+                CausalDecodeKvReuse::PairedQueryHeads,
+                CausalDecodeKvReuse::None,
+            ] {
+                engine
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                        RuntimeConfigEntry::new(key, mode.as_runtime_value(), source),
+                    ]))
+                    .unwrap();
+                assert_eq!(engine.runtime.causal_decode_kv_reuse, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+            }
+        }
+        for (value, source) in [
+            ("paired-query-heads", RuntimeConfigSource::Env),
+            ("none", RuntimeConfigSource::Env),
+            ("auto", RuntimeConfigSource::Cli),
+        ] {
+            assert!(engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, value, source),
+                ]))
+                .is_err());
+        }
     }
 
     #[test]

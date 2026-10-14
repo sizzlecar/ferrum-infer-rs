@@ -355,6 +355,18 @@ jobs:
                 $stage = 'materialize-source'
                 $operatorSource = Join-Path $work 'indexed-source'
                 & $builder materialize-source --spec 'native-operators/cuda/source-overlays/vllm-paged-attention-indexed.json' --base-source-root $source --override-source-root $env:GITHUB_WORKSPACE --out $operatorSource
+                $sourceLock = Get-Content 'native-operators/cuda/source-locks/vllm-paged-attention-v2.plan.json' -Raw | ConvertFrom-Json
+                $lockedMembers = @($sourceLock.translation_units) + @($sourceLock.headers)
+                foreach ($name in @('attention_gqa2.cuh', 'launcher_gqa2.cu')) {
+                  $relative = "kernels/vllm_attn/$name"
+                  $member = @($lockedMembers | Where-Object { $_.path -eq $relative })
+                  if ($member.Count -ne 1 -or $member[0].sha256 -notmatch '^[0-9a-f]{64}$') { throw "Missing or invalid source lock member: $relative" }
+                  $repositoryFile = Join-Path $env:GITHUB_WORKSPACE "native-operators/cuda/vllm-paged-attention-indexed/$name"
+                  if ((Get-FileHash $repositoryFile -Algorithm SHA256).Hash.ToLowerInvariant() -ne $member[0].sha256) { throw "Repository source hash mismatch: $relative" }
+                  $stagedFile = Join-Path $operatorSource $relative
+                  Copy-Item -LiteralPath $repositoryFile -Destination $stagedFile
+                  if ((Get-FileHash $stagedFile -Algorithm SHA256).Hash.ToLowerInvariant() -ne $member[0].sha256) { throw "Staged source hash mismatch: $relative" }
+                }
               }
               $stage = 'lock-source'
               & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $operatorSource --out $plan

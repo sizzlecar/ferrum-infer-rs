@@ -146,6 +146,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     packed_decode_prepare_gate: bool,
     decode_attention_grouping: CausalDecodeAttentionGrouping,
+    causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
     execution_context_limit: Option<usize>,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
@@ -450,6 +451,7 @@ impl CudaCausalPagedAttentionProvider {
         let packed_decode_prepare_gate = runtime.packed_decode_prepare_gate_enabled();
         let packed_decode_mode = [u8::from(packed_decode_prepare_gate)];
         let decode_attention_grouping = runtime.causal_decode_attention_grouping();
+        let causal_decode_kv_reuse = runtime.causal_decode_kv_reuse();
         let grouping_identity = decode_attention_grouping.as_runtime_value().as_bytes();
         let execution_context_limit =
             if decode_attention_grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity {
@@ -467,6 +469,7 @@ impl CudaCausalPagedAttentionProvider {
             source.as_bytes(),
             packed_decode_mode.as_slice(),
             grouping_identity,
+            causal_decode_kv_reuse.as_runtime_value().as_bytes(),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
@@ -545,6 +548,7 @@ impl CudaCausalPagedAttentionProvider {
             source.as_bytes(),
             packed_decode_mode.as_slice(),
             grouping_identity,
+            causal_decode_kv_reuse.as_runtime_value().as_bytes(),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             estimator_id.as_bytes(),
@@ -848,6 +852,7 @@ impl CudaCausalPagedAttentionProvider {
             program_binding_upload_strategy: runtime.program_binding_upload_strategy(),
             packed_decode_prepare_gate,
             decode_attention_grouping,
+            causal_decode_kv_reuse,
             execution_context_limit,
             semantics,
             precision,
@@ -1088,6 +1093,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.program_binding_upload_strategy,
             self.packed_decode_prepare_gate,
             self.decode_attention_grouping,
+            self.causal_decode_kv_reuse,
             self.execution_context_limit,
             self.semantics,
             self.precision,
@@ -1130,6 +1136,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.program_binding_upload_strategy,
             self.packed_decode_prepare_gate,
             self.decode_attention_grouping,
+            self.causal_decode_kv_reuse,
             self.execution_context_limit,
             self.semantics,
             self.precision,
@@ -1186,6 +1193,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
                 self.program_binding_upload_strategy,
                 self.packed_decode_prepare_gate,
                 self.decode_attention_grouping,
+                self.causal_decode_kv_reuse,
                 self.execution_context_limit,
                 self.semantics,
                 self.precision,
@@ -2605,6 +2613,7 @@ fn encode_attention(
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     packed_decode_prepare_gate: bool,
     decode_attention_grouping: CausalDecodeAttentionGrouping,
+    causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
     execution_context_limit: Option<usize>,
     semantics: CausalAttentionSemantics,
     precision: CausalPrecision,
@@ -3150,6 +3159,7 @@ fn encode_attention(
         packed_decode_prepare_gate,
         independent_sequence_kv,
         decode_attention_grouping,
+        causal_decode_kv_reuse,
     )?;
     let compute_operation = if batch_decode.as_ref().is_some_and(|batch| batch.is_fixed()) {
         COMPUTE_FIXED_OPERATION

@@ -16,7 +16,31 @@ enum ReplayBatch {
 }
 
 impl ReplayBatch {
-    fn test_candidate(self, gqa2: bool) -> Self {
+    fn test_candidate(self, gqa2: bool, production: bool, shape: CausalAttentionShape) -> Self {
+        if production {
+            #[cfg(feature = "cuda-causal-gqa2")]
+            return match self {
+                Self::Fixed(batch) => {
+                    let batch = batch.with_kv_reuse(
+                        ferrum_types::CausalDecodeKvReuse::PairedQueryHeads,
+                        CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                        shape,
+                    );
+                    assert_eq!(
+                        batch.uses_paired_query_heads(),
+                        shape.head_dim == 256
+                            && shape.maximum_context_tokens <= 2048
+                            && shape.maximum_context_tokens > 512,
+                        "production fixture must exercise paired V2 or its explicit shape fallback"
+                    );
+                    Self::Fixed(batch)
+                }
+                _ => panic!("production paired query heads require fixed execution capacity"),
+            };
+            #[cfg(not(feature = "cuda-causal-gqa2"))]
+            panic!("production paired query heads require cuda-causal-gqa2");
+        }
+        let _ = shape;
         #[cfg(feature = "cuda-causal-gqa2-tests")]
         if gqa2 {
             return match self {
@@ -162,7 +186,9 @@ fn layer(
             request.grow_to(stream, shape, length);
             arm.requests.push(request);
         }
-        arm.share_allocation_with_disjoint_first_pages(stream, 0);
+        if lengths.len() > 1 {
+            arm.share_allocation_with_disjoint_first_pages(stream, 0);
+        }
         let words = arm.binding_words(stream, shape, binding, &requests, lengths);
         stream.memcpy_htod(&words, &mut arm.binding).unwrap();
         arm
@@ -400,6 +426,14 @@ fn captured_capacity_replay_with_gqa2(
     cases: &[(u64, usize, bool, u64, Option<usize>)],
     gqa2: bool,
 ) {
+    captured_capacity_replay_candidate(cases, gqa2, false);
+}
+
+fn captured_capacity_replay_candidate(
+    cases: &[(u64, usize, bool, u64, Option<usize>)],
+    gqa2: bool,
+    production: bool,
+) {
     let runtime = CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
             0,
@@ -415,8 +449,7 @@ fn captured_capacity_replay_with_gqa2(
     let stream = runtime.context().new_stream().unwrap();
     for &(head_dim, participants, output_gate, maximum_context, execution_limit) in cases {
         let mut shape = shape(head_dim);
-        if gqa2 {
-            assert_eq!(head_dim, 256);
+        if gqa2 && head_dim == 256 {
             shape.hidden_size = 5120;
             shape.query_heads = 24;
             shape.key_value_heads = 4;
@@ -443,7 +476,8 @@ fn captured_capacity_replay_with_gqa2(
         .unwrap();
         let initial = vec![129; participants];
         let launches = build_launches(shape, binding, layout, &initial);
-        let fixed = ReplayBatch::new(true, &launches, binding, shape, layout).test_candidate(gqa2);
+        let fixed = ReplayBatch::new(true, &launches, binding, shape, layout)
+            .test_candidate(gqa2, production, shape);
         let replay_key = |batch: &ReplayBatch| match batch {
             ReplayBatch::Fixed(batch) => batch
                 .bind_replay(CudaCommandReplayKeyBuilder::new("fixture", "fixed-causal"))
@@ -484,11 +518,13 @@ fn captured_capacity_replay_with_gqa2(
                             request.grow_to(&stream, shape, shape.maximum_context_tokens);
                             arm.requests.push(request);
                         }
-                        arm.share_allocation_with_disjoint_first_pages(&stream, participants);
+                        if participants > 1 {
+                            arm.share_allocation_with_disjoint_first_pages(&stream, participants);
+                        }
                     }
                 }
                 requests = (0..participants)
-                    .map(|row| participants + (row ^ 1))
+                    .map(|row| participants + if participants > 1 { row ^ 1 } else { row })
                     .collect();
             } else if wave == 2 {
                 requests.reverse();
@@ -508,7 +544,8 @@ fn captured_capacity_replay_with_gqa2(
                 .map(|length| length.min(shape.maximum_context_tokens))
                 .collect::<Vec<_>>();
             let current = build_launches(shape, binding, layout, &lengths);
-            let fresh_fixed = ReplayBatch::new(true, &current, binding, shape, layout);
+            let fresh_fixed = ReplayBatch::new(true, &current, binding, shape, layout)
+                .test_candidate(gqa2, production, shape);
             assert_eq!(
                 initial_key,
                 replay_key(&fresh_fixed),
@@ -580,11 +617,12 @@ fn fixed_capacity_m8_m32_sixteen_layer_inclusive_paired_on_cuda() {
 }
 
 fn sixteen_layer_inclusive_paired(gqa2: bool) {
-    #[cfg(not(feature = "cuda-causal-gqa2-tests"))]
-    assert!(
-        !gqa2,
-        "GQA2 requires its separately linked test-only native export"
-    );
+    sixteen_layer_inclusive_candidate(gqa2, false);
+}
+
+fn sixteen_layer_inclusive_candidate(gqa2: bool, production: bool) {
+    #[cfg(not(any(feature = "cuda-causal-gqa2-tests", feature = "cuda-causal-gqa2")))]
+    assert!(!gqa2, "GQA2 requires its linked native export");
     let runtime = CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
             0,
@@ -618,8 +656,8 @@ fn sixteen_layer_inclusive_paired(gqa2: bool) {
         .unwrap();
         let capacity_lengths = vec![shape.maximum_context_tokens; participants];
         let capacity_launches = build_launches(shape, binding, layout, &capacity_lengths);
-        let fixed =
-            ReplayBatch::new(true, &capacity_launches, binding, shape, layout).test_candidate(gqa2);
+        let fixed = ReplayBatch::new(true, &capacity_launches, binding, shape, layout)
+            .test_candidate(gqa2, production, shape);
         // Distinct allocations and seed data for sixteen actual causal layers.
         // Max-context pages are allocated once, outside every timing window.
         let mut layers = (0..16)
@@ -709,7 +747,7 @@ fn sixteen_layer_inclusive_paired(gqa2: bool) {
                     host_ns[arm] = started.elapsed().as_nanos() / 4;
                     gpu_ms[arm] = f64::from(begin.elapsed_ms(&end).unwrap()) / 4.0;
                 }
-                println!("{{\"diagnostic\":\"{}\",\"case\":\"{case}\",\"M\":{participants},\"pair\":{pair},\"first_arm\":\"{}\",\"original_gpu_ms\":{},\"fixed_gpu_ms\":{},\"original_submit_wait_ns\":{},\"fixed_submit_wait_ns\":{},\"layers\":16,\"query_heads\":24,\"kv_heads\":4,\"head_dim\":256,\"maximum_context\":2048,\"gqa2_v2_only\":{gqa2},\"includes_prepare_gather_attention_reduce_gate\":true,\"excludes_cold_capture_and_binding_upload\":true}}", if gqa2 { "gqa2_fixed_sixteen_layer_bundle" } else { "fixed_capacity_sixteen_layer_bundle" }, if pair % 2 == 0 { "original" } else { "fixed" }, gpu_ms[0], gpu_ms[1], host_ns[0], host_ns[1]);
+                println!("{{\"diagnostic\":\"{}\",\"case\":\"{case}\",\"M\":{participants},\"pair\":{pair},\"first_arm\":\"{}\",\"original_gpu_ms\":{},\"fixed_gpu_ms\":{},\"original_submit_wait_ns\":{},\"fixed_submit_wait_ns\":{},\"layers\":16,\"query_heads\":24,\"kv_heads\":4,\"head_dim\":256,\"maximum_context\":2048,\"gqa2_v2_only\":{gqa2},\"production_gqa2\":{production},\"includes_prepare_gather_attention_reduce_gate\":true,\"excludes_cold_capture_and_binding_upload\":true}}", if gqa2 { "gqa2_fixed_sixteen_layer_bundle" } else { "fixed_capacity_sixteen_layer_bundle" }, if pair % 2 == 0 { "original" } else { "fixed" }, gpu_ms[0], gpu_ms[1], host_ns[0], host_ns[1]);
             }
             // Full output/state checks are outside the timed CUDA intervals.
             for (seed, layer) in layers.iter_mut().enumerate() {
@@ -741,4 +779,30 @@ fn sixteen_layer_inclusive_paired(gqa2: bool) {
         }
         drop(fixed_graph);
     }
+}
+
+#[test]
+#[cfg(feature = "cuda-causal-gqa2")]
+#[ignore = "requires the production CUDA GQA2 archive and GPU"]
+fn production_gqa2_preserves_fixed_bits_state_fallback_and_fresh_replay_on_cuda() {
+    assert!(crate::backend::cuda::vnext_ops::causal_decode_kv_reuse_compiled());
+    captured_capacity_replay_candidate(
+        &[
+            (256, 8, true, 2048, None),
+            (256, 32, true, 2048, None),
+            // Unsupported H128 and capacity >2048 explicitly retain original V2.
+            (128, 8, true, 2048, None),
+            (256, 8, true, 4096, None),
+        ],
+        true,
+        true,
+    );
+}
+
+#[test]
+#[cfg(feature = "cuda-causal-gqa2")]
+#[ignore = "requires the production CUDA GQA2 archive and GPU; complete sixteen-layer timing"]
+fn production_gqa2_m8_m32_sixteen_layer_inclusive_paired_on_cuda() {
+    assert!(crate::backend::cuda::vnext_ops::causal_decode_kv_reuse_compiled());
+    sixteen_layer_inclusive_candidate(true, true);
 }

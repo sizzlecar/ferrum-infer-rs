@@ -117,6 +117,7 @@ vllm-paged-attn-v2 = ["cuda", "ferrum-kernels/vllm-paged-attn-v2"]  # 2026-05-12
 cuda-indexed-causal-attention = ["vllm-paged-attn-v2", "ferrum-kernels/cuda-indexed-causal-attention", "ferrum-engine/cuda-indexed-causal-attention", "ferrum-models/cuda-indexed-causal-attention"]
 cuda-q4-shared-weight-decode = ["cuda", "ferrum-kernels/cuda-q4-shared-weight-decode", "ferrum-engine/cuda-q4-shared-weight-decode", "ferrum-models/cuda-q4-shared-weight-decode"]
 cuda-q5-shared-weight-decode = ["cuda", "ferrum-kernels/cuda-q5-shared-weight-decode", "ferrum-engine/cuda-q5-shared-weight-decode", "ferrum-models/cuda-q5-shared-weight-decode"]
+cuda-causal-gqa2 = ["cuda-indexed-causal-attention", "ferrum-kernels/cuda-causal-gqa2", "ferrum-engine/cuda-causal-gqa2", "ferrum-models/cuda-causal-gqa2"]
 fa2-source = ["cuda", "ferrum-kernels/fa2-source"]  # Obsolete compatibility alias; FA2 now requires a native operator artifact.
 native-op-artifact = ["cuda", "ferrum-kernels/native-op-artifact"]  # Consume explicit Ferrum native operator artifact manifests during CUDA builds.
 tensor-parallel = ["cuda"]  # backward compat alias

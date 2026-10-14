@@ -3041,6 +3041,7 @@ pub struct CudaDeviceRuntime {
     q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
     q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
     q4_shared_weight_decode_encodes: Arc<AtomicU64>,
     q5_shared_weight_decode_encodes: Arc<AtomicU64>,
     runtime_instance: u64,
@@ -3253,6 +3254,7 @@ impl CudaDeviceRuntime {
             q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             q8_projection_weight_preparation:
                 ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+            causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse::None,
             q4_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
             q5_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
             runtime_instance,
@@ -3367,6 +3369,15 @@ impl CudaDeviceRuntime {
 
     pub fn q8_projection_weight_preparation(&self) -> ferrum_types::Q8ProjectionWeightPreparation {
         self.q8_projection_weight_preparation
+    }
+
+    pub fn with_causal_decode_kv_reuse(mut self, mode: ferrum_types::CausalDecodeKvReuse) -> Self {
+        self.causal_decode_kv_reuse = mode;
+        self
+    }
+
+    pub fn causal_decode_kv_reuse(&self) -> ferrum_types::CausalDecodeKvReuse {
+        self.causal_decode_kv_reuse
     }
 
     /// Selected weight decoding for eligible original Q5_K M8 MMVQ plans.

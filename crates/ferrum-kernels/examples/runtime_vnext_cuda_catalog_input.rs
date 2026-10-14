@@ -4,18 +4,19 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_q8_projection_weight_preparation;
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_causal_decode_kv_reuse;
 use ferrum_types::{
-    AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
-    Q4MmvqWeightDecode, Q5MmvqWeightDecode, Q8ProjectionWeightPreparation,
+    AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodeKvReuse,
+    CausalDecodePreparationMode, Q4MmvqWeightDecode, Q5MmvqWeightDecode,
+    Q8ProjectionWeightPreparation,
 };
 use serde::Serialize;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if !matches!(arguments.len(), 5 | 6 | 7 | 8 | 9 | 10 | 11) {
+    if !matches!(arguments.len(), 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12) {
         return Err(format!(
-            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode] [q5-mmvq-weight-decode] [execution-context-limit] [q8-projection-weight-preparation]",
+            "usage: {} <cuda-ordinal> <attention-policy> <provider-catalog-out> <capability-catalog-out> [causal-decode-preparation-mode] [causal-decode-attention-grouping] [q4-mmvq-weight-decode] [q5-mmvq-weight-decode] [execution-context-limit] [q8-projection-weight-preparation] [causal-decode-kv-reuse]",
             arguments
                 .first()
                 .map(String::as_str)
@@ -56,7 +57,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|value| Q8ProjectionWeightPreparation::parse_runtime_value(value))
         .transpose()?
         .unwrap_or_default();
-    let snapshot = cuda_native_operator_catalog_input_with_q8_projection_weight_preparation(
+    let causal_decode_kv_reuse = arguments
+        .get(11)
+        .map(|value| CausalDecodeKvReuse::parse_runtime_value(value))
+        .transpose()?
+        .unwrap_or_default();
+    let snapshot = cuda_native_operator_catalog_input_with_causal_decode_kv_reuse(
         ordinal,
         DeviceId::new(format!("cuda:{ordinal}"))?,
         policy,
@@ -66,6 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         q5_mmvq_weight_decode,
         execution_context_limit,
         q8_projection_weight_preparation,
+        causal_decode_kv_reuse,
     )?;
     let capability_fingerprint = snapshot.capability_catalog().fingerprint()?;
     let (provider_catalog, capability_catalog) = snapshot.into_parts();

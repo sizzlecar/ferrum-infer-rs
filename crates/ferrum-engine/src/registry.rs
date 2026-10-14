@@ -1214,6 +1214,19 @@ fn validate_causal_decode_preparation_mode(
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
     validate_q8_projection_weight_preparation(config, plan_runtime)?;
+    if config.engine_config.runtime.causal_decode_kv_reuse
+        == ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
+        && (!cfg!(feature = "cuda-causal-gqa2")
+            || config
+                .engine_config
+                .runtime
+                .causal_decode_attention_grouping
+                != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity)
+    {
+        return Err(FerrumError::unsupported(
+            "paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and fixed-execution-capacity causal decode grouping",
+        ));
+    }
     causal_decode_execution_context_limit(config)?;
     use ferrum_types::{
         AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
@@ -1436,7 +1449,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_q8_projection_weight_preparation(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_causal_decode_kv_reuse(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1452,6 +1465,7 @@ fn create_registered_vnext_executor(
                         config.engine_config.runtime.q5_mmvq_weight_decode,
                         causal_decode_execution_context_limit(config)?,
                         config.engine_config.runtime.q8_projection_weight_preparation,
+                        config.engine_config.runtime.causal_decode_kv_reuse,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -3449,6 +3463,26 @@ mod tests {
             config.device = Device::Metal;
             assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
         }
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_rejects_direct_config_without_fixed_native_execution() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        config.engine_config.runtime.causal_decode_kv_reuse =
+            ferrum_types::CausalDecodeKvReuse::PairedQueryHeads;
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                assert!(validate_causal_decode_preparation_mode(&config, plan_runtime).is_err());
+            }
+        }
+        config
+            .engine_config
+            .runtime
+            .causal_decode_attention_grouping =
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity;
+        // Fixed grouping alone must not bypass the required packed preparation.
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
     }
 
     #[test]

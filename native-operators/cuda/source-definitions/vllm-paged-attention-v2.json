@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_paged_attention_v2",
   "source_package_kind": "ferrum-native-source-overlay",
-  "source_package_revision": "ferrum-vllm-addressed-indexed-v1+sha256.3dca5c7432c174ed9b2e905c67fd4314de8e0ad04319788366cf66465841a4d5",
+  "source_package_revision": "ferrum-vllm-addressed-indexed-gqa2-v1+sha256.2e033b16220e13c0c2093d64d63c5613862e24efca21085a2150b9a27869d314",
   "upstream_sources": [
     {
       "repository": "https://github.com/vllm-project/vllm.git",
@@ -11,11 +11,13 @@
     }
   ],
   "translation_units": [
-    "kernels/vllm_attn/launcher.cu"
+    "kernels/vllm_attn/launcher.cu",
+    "kernels/vllm_attn/launcher_gqa2.cu"
   ],
   "headers": [
     "kernels/vllm_attn/attention_dtypes.h",
     "kernels/vllm_attn/attention_generic.cuh",
+    "kernels/vllm_attn/attention_gqa2.cuh",
     "kernels/vllm_attn/attention_kernels.cuh",
     "kernels/vllm_attn/attention_utils.cuh",
     "kernels/vllm_attn/dtype_bfloat16.cuh",
@@ -42,14 +44,29 @@
         "kernels/vllm_attn/include/cuda_compat.h",
         "kernels/vllm_attn/quant_utils_stub.cuh"
       ]
+    },
+    {
+      "translation_unit": "kernels/vllm_attn/launcher_gqa2.cu",
+      "headers": [
+        "kernels/vllm_attn/attention_dtypes.h",
+        "kernels/vllm_attn/attention_generic.cuh",
+        "kernels/vllm_attn/attention_gqa2.cuh",
+        "kernels/vllm_attn/attention_kernels.cuh",
+        "kernels/vllm_attn/attention_utils.cuh",
+        "kernels/vllm_attn/dtype_bfloat16.cuh",
+        "kernels/vllm_attn/dtype_float16.cuh",
+        "kernels/vllm_attn/dtype_float32.cuh",
+        "kernels/vllm_attn/dtype_fp8.cuh",
+        "kernels/vllm_attn/ferrum_shim.h",
+        "kernels/vllm_attn/include/cuda_compat.h",
+        "kernels/vllm_attn/quant_utils_stub.cuh"
+      ]
     }
   ],
   "include_dirs": [
     "kernels/vllm_attn"
   ],
-  "defines": [
-
-  ],
+  "defines": [],
   "nvcc_policy": {
     "cpp_standard": "cpp17",
     "optimization": "o3",

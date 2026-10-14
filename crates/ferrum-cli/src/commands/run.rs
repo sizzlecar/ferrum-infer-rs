@@ -895,6 +895,9 @@ pub struct RunCommand {
     /// Fixed-execution-capacity also uses the declared --max-model-len bound.
     #[arg(long, value_enum)]
     pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
+    /// Causal decode K/V load reuse (default: none). Paired query heads requires native CUDA GQA2 support.
+    #[arg(long, value_enum)]
+    pub causal_decode_kv_reuse: Option<crate::commands::CausalDecodeKvReuseArg>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub q4_mmvq_weight_decode: Option<crate::commands::Q4MmvqWeightDecodeArg>,
@@ -2771,6 +2774,12 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY,
+        cmd.causal_decode_kv_reuse
+            .map(crate::commands::CausalDecodeKvReuseArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
         cmd.q4_mmvq_weight_decode
             .map(crate::commands::Q4MmvqWeightDecodeArg::as_runtime_value),
@@ -3262,6 +3271,7 @@ mod tests {
             segment_binding_owner_view_mode: None,
             causal_decode_preparation_mode: None,
             causal_decode_attention_grouping: None,
+            causal_decode_kv_reuse: None,
             q4_mmvq_weight_decode: None,
             q5_mmvq_weight_decode: None,
             q8_projection_weight_preparation: None,
@@ -5964,6 +5974,65 @@ mod tests {
             );
             let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
             assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_run_precedence_preserves_grouping() {
+        use crate::commands::CausalDecodeKvReuseArg as Arg;
+        use ferrum_types::{CausalDecodeKvReuse as Mode, CAUSAL_DECODE_KV_REUSE_CONFIG_KEY as KEY};
+
+        for (file_mode, cli_mode, expected, source) in [
+            (None, None, Mode::None, None),
+            (
+                Some(Mode::PairedQueryHeads),
+                None,
+                Mode::PairedQueryHeads,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::PairedQueryHeads),
+                Some(Arg::None),
+                Mode::None,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::None),
+                Some(Arg::PairedQueryHeads),
+                Mode::PairedQueryHeads,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                causal_decode_kv_reuse: file_mode,
+                causal_decode_attention_grouping: Some(
+                    ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.causal_decode_kv_reuse = cli_mode;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                entries,
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.causal_decode_kv_reuse, expected);
+            assert_eq!(
+                engine.runtime.causal_decode_attention_grouping,
+                ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+            );
+            assert_eq!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == KEY)
+                    .map(|entry| entry.source),
+                source
+            );
         }
     }
 }

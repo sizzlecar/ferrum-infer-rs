@@ -163,6 +163,8 @@ pub struct CompiledKernelFeatures {
     #[serde(default)]
     pub cuda_indexed_causal_attention: bool,
     #[serde(default)]
+    pub cuda_causal_gqa2: bool,
+    #[serde(default)]
     pub cuda_q4_shared_weight_decode: bool,
     #[serde(default)]
     pub cuda_q5_shared_weight_decode: bool,
@@ -184,6 +186,7 @@ impl Default for CompiledKernelFeatures {
             cuda: false,
             vllm_paged_attn: false,
             cuda_indexed_causal_attention: false,
+            cuda_causal_gqa2: false,
             cuda_q4_shared_weight_decode: false,
             cuda_q5_shared_weight_decode: false,
             vllm_moe_marlin: false,
@@ -204,6 +207,7 @@ impl CompiledKernelFeatures {
             cuda: true,
             vllm_paged_attn: true,
             cuda_indexed_causal_attention: false,
+            cuda_causal_gqa2: false,
             cuda_q4_shared_weight_decode: false,
             cuda_q5_shared_weight_decode: false,
             vllm_moe_marlin: true,
@@ -1218,6 +1222,16 @@ impl FerrumConfigBuilder {
             );
         }
         if self
+            .entry(crate::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY,
+                crate::CausalDecodeKvReuse::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
+        if self
             .entry(crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY)
             .is_none()
         {
@@ -1331,6 +1345,7 @@ impl FerrumConfigBuilder {
         decisions.push(self.causal_decode_preparation_mode_decision(
             plan_attention.as_ref().map(|(_, compiled)| compiled.value),
         )?);
+        decisions.push(self.causal_decode_kv_reuse_decision()?);
         decisions.push(self.sampling_decision(greedy));
         decisions.push(self.q4_mmvq_weight_decode_decision()?);
         decisions.push(self.q5_mmvq_weight_decode_decision()?);
@@ -2889,6 +2904,50 @@ impl FerrumConfigBuilder {
                 "fixed-capacity",
                 "fixed-execution-capacity",
             ],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn causal_decode_kv_reuse_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY;
+        let invalid = |reason| AutoConfigError::InvalidOverride {
+            key: key.to_owned(),
+            reason,
+        };
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::CausalDecodeKvReuse::parse_config_entry(entry).map_err(invalid)?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::CausalDecodeKvReuse::None,
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::CausalDecodeKvReuse::PairedQueryHeads {
+            let grouping = self
+                .entry(crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY)
+                .map(crate::CausalDecodeAttentionGrouping::parse_config_entry)
+                .transpose()
+                .map_err(invalid)?
+                .unwrap_or_default();
+            // The grouping decision above checks packed preparation, native
+            // attention, F16 KV and the CUDA plan-runtime authority.
+            if !self.hardware.compiled_features.cuda_causal_gqa2
+                || grouping != crate::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+            {
+                return Err(invalid("paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and fixed-execution-capacity causal decode grouping".into()));
+            }
+        }
+        Ok(self.decision(
+            "causal_decode_kv_reuse",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["none", "paired-query-heads"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -6247,6 +6306,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_requires_compiled_fixed_native_execution() {
+        let key = crate::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY;
+        for (mode, compiled, grouping, supported) in [
+            ("none", false, "contiguous", true),
+            (
+                "paired-query-heads",
+                false,
+                "fixed-execution-capacity",
+                false,
+            ),
+            ("paired-query-heads", true, "indexed", false),
+            ("paired-query-heads", true, "fixed-execution-capacity", true),
+        ] {
+            let entries = snapshot_with_sources(&[
+                (key, mode, RuntimeConfigSource::Cli),
+                (
+                    crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
+                    grouping,
+                    RuntimeConfigSource::Cli,
+                ),
+                (
+                    crate::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY,
+                    "packed",
+                    RuntimeConfigSource::Cli,
+                ),
+            ]);
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = "cuda".to_owned();
+            hardware.compiled_features.cuda = true;
+            hardware.compiled_features.vllm_paged_attn = true;
+            hardware.compiled_features.cuda_indexed_causal_attention = true;
+            hardware.compiled_features.cuda_causal_gqa2 = compiled;
+            let result = FerrumConfigBuilder::new(entries)
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .resolve();
+            assert_eq!(result.is_ok(), supported, "{mode}/{grouping}: {result:?}");
+            if let Ok(resolved) = result {
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine.runtime.causal_decode_kv_reuse.as_runtime_value(),
+                    mode
+                );
+            }
+        }
+        let mut old = serde_json::to_value(CompiledKernelFeatures::default()).unwrap();
+        old.as_object_mut().unwrap().remove("cuda_causal_gqa2");
+        assert!(
+            !serde_json::from_value::<CompiledKernelFeatures>(old)
+                .unwrap()
+                .cuda_causal_gqa2
+        );
     }
 
     #[test]

@@ -148,6 +148,9 @@ pub struct ServeCommand {
     /// Fixed-execution-capacity also uses the declared --max-model-len bound.
     #[arg(long, value_enum)]
     pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
+    /// Causal decode K/V load reuse (default: none). Paired query heads requires native CUDA GQA2 support.
+    #[arg(long, value_enum)]
+    pub causal_decode_kv_reuse: Option<crate::commands::CausalDecodeKvReuseArg>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub q4_mmvq_weight_decode: Option<crate::commands::Q4MmvqWeightDecodeArg>,
@@ -447,6 +450,7 @@ async fn execute_with_compatibility(
         segment_binding_owner_view_mode,
         causal_decode_preparation_mode,
         causal_decode_attention_grouping,
+        causal_decode_kv_reuse,
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
         q8_projection_weight_preparation,
@@ -920,6 +924,7 @@ async fn execute_with_compatibility(
         &mut startup_cli_runtime_entries,
         causal_decode_attention_grouping,
     );
+    push_causal_decode_kv_reuse_cli_entry(&mut startup_cli_runtime_entries, causal_decode_kv_reuse);
     push_q4_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q4_mmvq_weight_decode);
     push_q5_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q5_mmvq_weight_decode);
     push_q8_projection_weight_preparation_cli_entry(
@@ -1719,6 +1724,17 @@ fn push_q8_projection_weight_preparation_cli_entry(
     );
 }
 
+fn push_causal_decode_kv_reuse_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    mode: Option<crate::commands::CausalDecodeKvReuseArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY,
+        mode.map(crate::commands::CausalDecodeKvReuseArg::as_runtime_value),
+    );
+}
+
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
     kv_capacity: Option<usize>,
@@ -2462,6 +2478,17 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         cuda: cfg!(feature = "cuda"),
         vllm_paged_attn: cfg!(feature = "vllm-paged-attn-v2"),
         cuda_indexed_causal_attention: cfg!(feature = "cuda-indexed-causal-attention"),
+        cuda_causal_gqa2: {
+            #[cfg(feature = "cuda")]
+            {
+                cfg!(feature = "cuda-causal-gqa2")
+                    && ferrum_kernels::backend::cuda::vnext_ops::causal_decode_kv_reuse_compiled()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                false
+            }
+        },
         cuda_q4_shared_weight_decode: cfg!(feature = "cuda-q4-shared-weight-decode"),
         cuda_q5_shared_weight_decode: {
             #[cfg(feature = "cuda")]
@@ -4539,6 +4566,65 @@ mod tests {
             );
             let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
             assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_serve_precedence_preserves_grouping() {
+        use crate::commands::CausalDecodeKvReuseArg as Arg;
+        use ferrum_types::{CausalDecodeKvReuse as Mode, CAUSAL_DECODE_KV_REUSE_CONFIG_KEY as KEY};
+
+        for (file_mode, cli_mode, expected, source) in [
+            (None, None, Mode::None, None),
+            (
+                Some(Mode::PairedQueryHeads),
+                None,
+                Mode::PairedQueryHeads,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::PairedQueryHeads),
+                Some(Arg::None),
+                Mode::None,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::None),
+                Some(Arg::PairedQueryHeads),
+                Mode::PairedQueryHeads,
+                Some(RuntimeConfigSource::Cli),
+            ),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                causal_decode_kv_reuse: file_mode,
+                causal_decode_attention_grouping: Some(
+                    ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+                ),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_causal_decode_kv_reuse_cli_entry(&mut cli_entries, cli_mode);
+            let snapshot = merge_runtime_config_sources(
+                entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.causal_decode_kv_reuse, expected);
+            assert_eq!(
+                engine.runtime.causal_decode_attention_grouping,
+                ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+            );
+            assert_eq!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == KEY)
+                    .map(|entry| entry.source),
+                source
+            );
         }
     }
 }

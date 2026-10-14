@@ -114,6 +114,23 @@ impl CausalDecodeAttentionGroupingArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CausalDecodeKvReuseArg {
+    None,
+    PairedQueryHeads,
+}
+
+impl CausalDecodeKvReuseArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::None => ferrum_types::CausalDecodeKvReuse::None.as_runtime_value(),
+            Self::PairedQueryHeads => {
+                ferrum_types::CausalDecodeKvReuse::PairedQueryHeads.as_runtime_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
@@ -267,6 +284,13 @@ mod tests {
             match self.command {
                 TestCommand::Run(command) => command.q8_projection_weight_preparation,
                 TestCommand::Serve(command) => command.q8_projection_weight_preparation,
+            }
+        }
+
+        fn causal_decode_kv_reuse(self) -> Option<CausalDecodeKvReuseArg> {
+            match self.command {
+                TestCommand::Run(command) => command.causal_decode_kv_reuse,
+                TestCommand::Serve(command) => command.causal_decode_kv_reuse,
             }
         }
 
@@ -669,6 +693,44 @@ mod tests {
                 command,
                 "test-model",
                 "--q8-projection-weight-preparation",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .causal_decode_kv_reuse(),
+                None
+            );
+            for (value, expected) in [
+                ("none", CausalDecodeKvReuseArg::None),
+                (
+                    "paired-query-heads",
+                    CausalDecodeKvReuseArg::PairedQueryHeads,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--causal-decode-kv-reuse",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.causal_decode_kv_reuse(), Some(expected));
+                assert_eq!(expected.as_runtime_value(), value);
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--causal-decode-kv-reuse",
                 "automatic",
             ])
             .is_err());

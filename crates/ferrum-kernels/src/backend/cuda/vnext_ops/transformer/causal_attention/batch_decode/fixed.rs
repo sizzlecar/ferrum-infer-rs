@@ -10,6 +10,7 @@ pub(super) struct FixedBatchDecode {
     packed_work: Option<PackedDecodeWork>,
     v1: BatchGeometry,
     v2: Option<BatchGeometry>,
+    paired_query_heads: bool,
 }
 
 impl FixedBatchDecode {
@@ -103,6 +104,7 @@ impl FixedBatchDecode {
             )
         };
         Ok(Some(Self {
+            paired_query_heads: false,
             participants: validated.participants,
             packed_work: validated.packed_work,
             v1: dimensions(VLLM_PARTITION_TOKENS.min(shape.maximum_context_tokens))?,
@@ -112,6 +114,21 @@ impl FixedBatchDecode {
         }))
     }
 
+    #[cfg(test)]
+    pub(super) fn uses_paired_query_heads(&self) -> bool {
+        self.paired_query_heads
+    }
+
+    pub(super) fn with_kv_reuse(
+        mut self,
+        mode: ferrum_types::CausalDecodeKvReuse,
+        grouping: CausalDecodeAttentionGrouping,
+        shape: CausalAttentionShape,
+    ) -> Self {
+        self.paired_query_heads = paired_query_heads_eligible(mode, grouping, shape);
+        self
+    }
+
     pub(super) fn bind_replay(
         &self,
         mut key: CudaCommandReplayKeyBuilder,
@@ -119,7 +136,8 @@ impl FixedBatchDecode {
         key = key
             .bytes(b"ferrum.cuda.causal-fixed-capacity.v1")
             .i32(self.participants)
-            .boolean(self.v2.is_some());
+            .boolean(self.v2.is_some())
+            .boolean(self.paired_query_heads);
         for group in std::iter::once(&self.v1).chain(self.v2.iter()) {
             key = key
                 .i32(group.sequences)
@@ -160,6 +178,23 @@ impl FixedBatchDecode {
                 let partition = layout.vllm.ok_or_else(|| {
                     CudaDeviceRuntimeError::contract("fixed causal partition scratch absent")
                 })?;
+                #[cfg(feature = "cuda-causal-gqa2")]
+                if self.paired_query_heads && expected == VnextAddressedPagedAttentionKernel::V2 {
+                    return unsafe {
+                        crate::backend::cuda::vllm_paged_attn::dispatch_vnext_addressed_paged_attention_gqa2_fixed_masked_batch_raw(
+                            stream,
+                            scratch_pointer(scratch, layout.context)?,
+                            scratch_pointer(scratch, layout.query)?,
+                            scratch_pointer(binding, BINDING_CONTROL_BYTES)?,
+                            lengths, rows, group.maximum_sequence,
+                            Some(scratch_pointer(scratch, partition.exp_sums)?),
+                            Some(scratch_pointer(scratch, partition.max_logits)?),
+                            Some(scratch_pointer(scratch, partition.temporary_output)?),
+                            group.sequences, self.participants, shape.query_heads,
+                            shape.key_value_heads, shape.head_dim, group.table_stride, expected,
+                        )
+                    }.map(|_| ()).map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()));
+                }
                 // The same-stream gather establishes identity-or--1 masks.
                 // Current bindings retain every original KV range/frontier.
                 unsafe {
@@ -309,4 +344,21 @@ impl FixedBatchDecode {
         }
         Ok(())
     }
+}
+
+// Qualification is per provider shape; original V1/V2 remains the fallback.
+pub(super) fn paired_query_heads_eligible(
+    mode: ferrum_types::CausalDecodeKvReuse,
+    grouping: CausalDecodeAttentionGrouping,
+    shape: CausalAttentionShape,
+) -> bool {
+    cfg!(feature = "cuda-causal-gqa2")
+        && mode == ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
+        && grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        && !shape.int8_kv
+        && shape.head_dim == 256
+        && shape.key_value_heads > 0
+        && shape.query_heads % shape.key_value_heads == 0
+        && (shape.query_heads / shape.key_value_heads) % 2 == 0
+        && (513..=2048).contains(&shape.maximum_context_tokens)
 }

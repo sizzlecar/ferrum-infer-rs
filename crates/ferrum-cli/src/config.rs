@@ -264,6 +264,9 @@ pub struct RuntimeCliConfig {
     /// Group selected native causal decode paths (default: contiguous).
     #[serde(default)]
     pub causal_decode_attention_grouping: Option<ferrum_types::CausalDecodeAttentionGrouping>,
+    /// Reuse K/V loads for eligible native causal decode query heads (default: none).
+    #[serde(default)]
+    pub causal_decode_kv_reuse: Option<ferrum_types::CausalDecodeKvReuse>,
     /// Weight decode implementation for eligible Q4_K MarkerV2 MMVQ M8 leaves.
     #[serde(default)]
     pub q4_mmvq_weight_decode: Option<ferrum_types::Q4MmvqWeightDecode>,
@@ -527,6 +530,12 @@ impl RuntimeCliConfig {
             ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY,
             self.causal_decode_attention_grouping
                 .map(ferrum_types::CausalDecodeAttentionGrouping::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY,
+            self.causal_decode_kv_reuse
+                .map(ferrum_types::CausalDecodeKvReuse::as_runtime_value),
         );
         push_string_entry(
             &mut entries,
@@ -1670,5 +1679,26 @@ mod tests {
             "[runtime]\nq8_projection_weight_preparation = \"automatic\"\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_config_file_parses_explicit_mode() {
+        for value in ["none", "paired-query-heads"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\ncausal_decode_kv_reuse = \"{value}\"\n"
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(
+            toml::from_str::<CliConfig>("[runtime]\ncausal_decode_kv_reuse = \"automatic\"\n")
+                .is_err()
+        );
     }
 }
