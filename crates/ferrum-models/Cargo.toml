@@ -104,6 +104,7 @@ cuda-q5-shared-weight-decode = ["cuda", "ferrum-kernels/cuda-q5-shared-weight-de
 cuda-upstream-linear = ["cuda", "ferrum-kernels/cuda-upstream-linear"] # Explicit locked upstream projection artifact.
 cuda-upstream-extra-linear = ["cuda-upstream-linear", "ferrum-kernels/cuda-upstream-extra-linear"] # Independent locked extra-format artifact.
 cuda-upstream-q6-f32-linear = ["cuda-upstream-extra-linear", "ferrum-kernels/cuda-upstream-q6-f32-linear"] # Independent locked Q6 F32 head artifact.
+cuda-q6-f16-linear = ["cuda-upstream-q6-f32-linear", "ferrum-kernels/cuda-q6-f16-linear"]
 candle-cuda-compat = [
     "cuda",
     "candle-core/cuda",

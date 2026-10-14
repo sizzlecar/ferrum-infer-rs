@@ -62,7 +62,7 @@ fn check_compiled_upload(
     }
 }
 
-fn physical_pages(
+pub(super) fn physical_pages(
     fixture: &Fixture,
     session: &Arc<SequenceSession<Runtime>>,
     tokens: Arc<[u32]>,
@@ -106,7 +106,7 @@ fn physical_pages(
     bytes / 65_536
 }
 
-fn check_binding_controls(
+pub(super) fn check_binding_controls(
     kind: AttentionKind,
     observations: &[BatchObservation],
     ranges: &[Range<usize>],

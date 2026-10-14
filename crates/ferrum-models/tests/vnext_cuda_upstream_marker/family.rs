@@ -6,6 +6,8 @@ pub mod extra_all_rows;
 #[path = "family/extra_prefill.rs"]
 pub mod extra_prefill;
 pub use extra::Weights;
+#[path = "family/q6_f16.rs"]
+pub mod q6_f16;
 
 const INTERMEDIATE: u64 = 768;
 const PROFILE: &str = "fixture.attention-ffn.require-upstream-marker-v2";
@@ -132,7 +134,9 @@ impl Family {
         self.selected
     }
     pub fn swiglu_profile(&self) -> UpstreamMarkerV2Profile {
-        if self.selected.extra_all_rows() {
+        if self.selected.q6_f16() {
+            UpstreamMarkerV2Profile::SwiGluQ6F16
+        } else if self.selected.extra_all_rows() {
             UpstreamMarkerV2Profile::SwiGluExtraAllRows
         } else if self.selected.extra_prefill() {
             UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
@@ -146,8 +150,18 @@ impl Family {
             UpstreamMarkerV2Profile::SwiGlu
         }
     }
+    pub fn hidden_size(&self) -> u64 {
+        if self.selected.q6_f16() {
+            q6_f16::WIDE_HIDDEN
+        } else {
+            HIDDEN
+        }
+    }
     pub fn states(&self) -> Vec<StateSpec> {
         let mut states = self.base.states();
+        if self.selected.q6_f16() {
+            q6_f16::resize_states(&mut states);
+        }
         for state in &mut states {
             if let StateCapacityDemand::TokenScaled { maximum_tokens, .. } =
                 &mut state.capacity_demand
@@ -158,7 +172,9 @@ impl Family {
         states
     }
     pub fn profile_id(&self) -> &'static str {
-        if self.g32_baseline {
+        if self.selected.q6_f16() {
+            q6_f16::PROFILE
+        } else if self.g32_baseline {
             "fixture.attention-ffn.require-atn-g32"
         } else if self.selected.extra_all_rows() {
             extra_all_rows::PROFILE
@@ -210,12 +226,17 @@ impl ModelFamilyProvider for Family {
 
     fn weight_schema(&self, config: &AttentionKind) -> Result<WeightSchema, VNextError> {
         let mut schema = self.base.weight_schema(config)?;
+        let hidden = self.hidden_size();
+        let intermediate = self.intermediate_size();
+        if self.selected.q6_f16() {
+            q6_f16::resize_schema(&mut schema, *config);
+        }
         let norm: WeightId = id("component.ffn_norm");
         schema.components.push(WeightComponentSpec {
             id: norm.clone(),
             role: WeightComponentRole::Values,
             external_names: vec!["ffn_norm".into()],
-            dimensions: vec![HIDDEN],
+            dimensions: vec![hidden],
             encoding: WeightEncoding::Dense {
                 element_type: ElementType::F16,
             },
@@ -223,17 +244,19 @@ impl ModelFamilyProvider for Family {
         });
         schema.tensors.push(WeightTensorSpec {
             id: id("weight.ffn_norm"),
-            dimensions: vec![HIDDEN],
+            dimensions: vec![hidden],
             logical_element_type: ElementType::F16,
             physical_layout: PhysicalWeightLayout::Dense { component_id: norm },
             required: true,
         });
-        mixed_weight(&mut schema, "ffn_gate_up", 2, INTERMEDIATE, HIDDEN);
-        mixed_weight(&mut schema, "ffn_down", 1, HIDDEN, INTERMEDIATE);
+        mixed_weight(&mut schema, "ffn_gate_up", 2, intermediate, hidden);
+        mixed_weight(&mut schema, "ffn_down", 1, hidden, intermediate);
         // One extra physical dense leaf in each operation makes the validation
         // payload an odd number of eight-byte banks. Its admitted Plan buffer
         // must include alignment padding; no dimensions or budget change.
-        if self.selected.extra() {
+        if self.selected.q6_f16() {
+            q6_f16::replace_projection_leaves(&mut schema);
+        } else if self.selected.extra() {
             extra::extend_schema(&mut schema);
             // 7 leaves per bank gives 21 FFN leaves; only attention needs a
             // split to keep both admitted flag extents genuinely padded.
@@ -423,6 +446,11 @@ impl ModelFamilyProvider for Family {
         }
         let old = self.base.semantic_program(config, profile)?;
         let mut blocks = old.blocks().to_vec();
+        let hidden_size = self.hidden_size();
+        let intermediate = self.intermediate_size();
+        if self.selected.q6_f16() {
+            q6_f16::resize_nodes(&mut blocks, *config);
+        }
         let attention = &mut blocks[0].nodes[1];
         attention.operation_id = id(self.attention_operation());
         if attention
@@ -450,7 +478,7 @@ impl ModelFamilyProvider for Family {
                 attributes: attrs,
             });
         };
-        let hidden = || BTreeMap::from([(id("hidden_size"), SemanticValue::Unsigned(HIDDEN))]);
+        let hidden = || BTreeMap::from([(id("hidden_size"), SemanticValue::Unsigned(hidden_size))]);
         let mut norm = hidden();
         norm.insert(
             id("epsilon"),
@@ -466,7 +494,7 @@ impl ModelFamilyProvider for Family {
         let mut ffn = hidden();
         ffn.insert(
             id("intermediate_size"),
-            SemanticValue::Unsigned(INTERMEDIATE),
+            SemanticValue::Unsigned(intermediate),
         );
         node(
             "node.swiglu",
@@ -487,10 +515,13 @@ impl ModelFamilyProvider for Family {
             hidden(),
         );
         let mut weights = old.weights().to_vec();
+        if self.selected.q6_f16() {
+            q6_f16::resize_weights(&mut weights, *config);
+        }
         for (name, dimensions) in [
-            ("ffn_norm", vec![HIDDEN]),
-            ("ffn_gate_up", vec![2, INTERMEDIATE, HIDDEN]),
-            ("ffn_down", vec![HIDDEN, INTERMEDIATE]),
+            ("ffn_norm", vec![hidden_size]),
+            ("ffn_gate_up", vec![2, intermediate, hidden_size]),
+            ("ffn_down", vec![hidden_size, intermediate]),
         ] {
             weights.push(WeightReference {
                 weight_id: id(format!("weight.{name}")),

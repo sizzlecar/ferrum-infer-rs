@@ -337,11 +337,13 @@ fn composite_supports_q8_preparation(
         Profile::GatedDeltaExtraPrefill,
         Profile::GatedDeltaExtraLargePrefill,
         Profile::GatedDeltaExtraAllRows,
+        Profile::GatedDeltaQ6F16,
         Profile::Causal,
         Profile::CausalPrefill,
         Profile::CausalExtraPrefill,
         Profile::CausalExtraLargePrefill,
         Profile::CausalExtraAllRows,
+        Profile::CausalQ6F16,
     ]
     .into_iter()
     .any(|profile| profile.arithmetic() == *arithmetic)
@@ -858,6 +860,8 @@ mod tests {
             Profile::Causal,
             Profile::GatedDeltaExtraAllRows,
             Profile::CausalExtraAllRows,
+            Profile::GatedDeltaQ6F16,
+            Profile::CausalQ6F16,
         ] {
             assert!(composite_supports_q8_preparation(&profile.arithmetic()));
         }
@@ -865,6 +869,7 @@ mod tests {
             Profile::SwiGlu,
             Profile::SwiGluG32MmqPrefill,
             Profile::SwiGluExtraAllRows,
+            Profile::SwiGluQ6F16,
             Profile::GatedDeltaG32MmqPrefill,
             Profile::CausalG32MmqPrefill,
         ] {
@@ -963,6 +968,8 @@ mod tests {
             Profile::GatedDelta,
             Profile::CausalExtraAllRows,
             Profile::GatedDeltaExtraAllRows,
+            Profile::CausalQ6F16,
+            Profile::GatedDeltaQ6F16,
         ] {
             assert!(composite_has_shared_m8_q4_route(&profile.arithmetic()));
         }
@@ -971,6 +978,7 @@ mod tests {
             Profile::CausalG32MmqPrefill,
             Profile::GatedDeltaG32MmqPrefill,
             Profile::SwiGluExtraAllRows,
+            Profile::SwiGluQ6F16,
         ] {
             assert!(!composite_has_shared_m8_q4_route(&profile.arithmetic()));
         }
@@ -993,6 +1001,8 @@ mod tests {
             Profile::GatedDelta,
             Profile::CausalExtraAllRows,
             Profile::GatedDeltaExtraAllRows,
+            Profile::CausalQ6F16,
+            Profile::GatedDeltaQ6F16,
         ] {
             assert!(composite_has_shared_m8_q5_route(&profile.arithmetic()));
         }
@@ -1001,6 +1011,7 @@ mod tests {
             Profile::CausalG32MmqPrefill,
             Profile::GatedDeltaG32MmqPrefill,
             Profile::SwiGluExtraAllRows,
+            Profile::SwiGluQ6F16,
         ] {
             assert!(!composite_has_shared_m8_q5_route(&profile.arithmetic()));
         }
@@ -1035,6 +1046,9 @@ mod tests {
                 Profile::CausalExtraAllRows,
                 Profile::GatedDeltaExtraAllRows,
                 Profile::SwiGluExtraAllRows,
+                Profile::CausalQ6F16,
+                Profile::GatedDeltaQ6F16,
+                Profile::SwiGluQ6F16,
             ] {
                 assert!(composite_has_shared_m4_m8_route(
                     &profile.arithmetic(),

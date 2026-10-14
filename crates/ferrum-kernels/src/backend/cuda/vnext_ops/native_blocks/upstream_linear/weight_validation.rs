@@ -12,11 +12,12 @@ use super::super::CudaNativeBlockKernels;
 use cudarc::driver::{CudaEvent, CudaStream};
 use ferrum_interfaces::vnext::{DeviceNativeOperationId, ElementType};
 
+use super::native_plan::PreparedProjectionNative;
 use crate::backend::cuda::vnext_runtime::{
     CudaBufferRegion, CudaDependencyWork, CudaDeviceCommand, CudaDeviceRuntimeError,
     CudaPlanBackingIdentity,
 };
-use crate::native_ops::upstream_linear::{Arithmetic, DeviceSpan, PreparedUpstreamLinear};
+use crate::native_ops::upstream_linear::{Arithmetic, DeviceSpan};
 use crate::native_ops::upstream_q6_f32_linear::PreparedQ6F32Linear;
 
 const RETAINED_WEIGHT_VALIDATION_OPERATION: DeviceNativeOperationId =
@@ -26,7 +27,7 @@ const RETAINED_WEIGHT_VALIDATION_OPERATION: DeviceNativeOperationId =
     };
 
 enum ValidationPlan {
-    Upstream(Arc<PreparedUpstreamLinear>),
+    Upstream(Arc<PreparedProjectionNative>),
     Q6F32(Arc<PreparedQ6F32Linear>),
     Q8F32 {
         kernels: CudaNativeBlockKernels,
@@ -76,6 +77,7 @@ struct ValidationIdentity {
     weight: CudaPlanBackingIdentity,
     implementation: String,
     native_operator: &'static str,
+    native_boundary_abi: u32,
     algorithm: u32,
     format: u32,
     inputs: u32,
@@ -98,6 +100,9 @@ impl ValidationIdentity {
             self.padded_outputs,
             self.weight_bytes,
         );
+        if self.native_boundary_abi != 1 {
+            identity.push_str(&format!(":boundary{}", self.native_boundary_abi));
+        }
         if self.native_operator == "ferrum.q8_0.exact-f32-predecode.v1" {
             identity.push(':');
             identity.push_str(&self.destination_bytes.to_string());
@@ -117,7 +122,7 @@ pub(in crate::backend::cuda::vnext_ops) struct WeightValidationRegistry {
 impl WeightValidationRegistry {
     pub fn prepare(
         &self,
-        native: Arc<PreparedUpstreamLinear>,
+        native: Arc<PreparedProjectionNative>,
         implementation: &str,
         weights: CudaBufferRegion,
         flag: CudaBufferRegion,
@@ -132,6 +137,7 @@ impl WeightValidationRegistry {
             weight: weights.plan_backing_identity()?,
             implementation: implementation.to_owned(),
             native_operator: native.operator(),
+            native_boundary_abi: native.boundary_abi(),
             algorithm: geometry.algorithm,
             format: geometry.request.format,
             inputs: geometry.request.inputs,
@@ -155,6 +161,7 @@ impl WeightValidationRegistry {
             weight: weights.plan_backing_identity()?,
             implementation: implementation.to_owned(),
             native_operator: native.operator(),
+            native_boundary_abi: 1,
             algorithm: geometry.algorithm,
             format: geometry.request.format,
             inputs: geometry.request.inputs,
@@ -187,6 +194,7 @@ impl WeightValidationRegistry {
             weight: weights.plan_backing_identity()?,
             implementation: implementation.to_owned(),
             native_operator: "ferrum.q8_0.exact-f32-predecode.v1",
+            native_boundary_abi: 1,
             algorithm: 0,
             format: 8,
             inputs,

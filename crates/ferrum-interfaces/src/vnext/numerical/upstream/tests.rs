@@ -6,6 +6,8 @@ use super::super::prepared::tests::binding;
 
 #[path = "extra_tests.rs"]
 mod extra;
+#[path = "q6_f16_tests.rs"]
+mod q6_f16;
 
 #[test]
 fn upstream_prefill_interval_preserves_legacy_wire_and_rejects_ambiguous_domains() {
@@ -150,6 +152,7 @@ fn policy(
             local_rows: rows.iter().copied().collect(),
             prefill_rows: None,
         }],
+        geometry_selection: None,
         fallback: StrictProjectionFallback::RetainBaseArithmetic {},
     }
 }

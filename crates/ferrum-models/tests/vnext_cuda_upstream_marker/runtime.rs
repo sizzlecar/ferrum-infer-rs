@@ -21,6 +21,9 @@ mod identity_projection;
 mod packed_decode_preparation;
 #[path = "runtime/prefill.rs"]
 mod prefill;
+#[path = "runtime/q6_f16.rs"]
+#[cfg(feature = "cuda-q6-f16-linear")]
+mod q6_f16;
 #[path = "runtime/replay_bindings.rs"]
 mod replay_bindings;
 #[path = "runtime/two_streams.rs"]
@@ -329,7 +332,11 @@ impl Fixture {
             SchedulingDiscipline::FirstReady,
             RuntimeMemoryPolicy {
                 checkpoint_capacity: None,
-                capacity_bytes: 256 << 20,
+                capacity_bytes: if selected.q6_f16() {
+                    512 << 20
+                } else {
+                    256 << 20
+                },
                 reserve_bytes: 1 << 20,
                 maximum_active_sequences: participants,
                 dynamic_storage_profile_order: runtime
@@ -455,7 +462,7 @@ impl Fixture {
                     * requirement.alignment_bytes(),
                 "Plan admission must charge the complete aligned persistent extent"
             );
-            if persistent_bytes == flag_bytes && q8_leaves.is_empty() {
+            if persistent_bytes == flag_bytes && q8_leaves.is_empty() && !selected.q6_f16() {
                 assert_ne!(flag_bytes % requirement.alignment_bytes(), 0);
                 assert!(allocation.size_bytes() > flag_bytes);
             }
@@ -473,7 +480,13 @@ impl Fixture {
                         _ => None,
                     })
                     .collect();
-                let expected = if selected.extra() {
+                let expected = if selected.q6_f16() {
+                    if projection.has_staged_leaf() {
+                        BTreeSet::from(["quantization.gguf.q6-k"])
+                    } else {
+                        BTreeSet::new()
+                    }
+                } else if selected.extra() {
                     BTreeSet::from(family::extra::FORMATS)
                 } else {
                     BTreeSet::from([
@@ -531,7 +544,7 @@ impl Fixture {
         // admission provisions the actual first work shape. Preallocating each
         // minimum can strand a smaller contiguous extent below a full-width
         // claim even when no execution owns that extent.
-        let source = family::Weights::new(family.weight_schema());
+        let source = family::q6_f16::FixtureWeights::new(family.weight_schema(), selected.q6_f16());
         let initialized = committed
             .initialize_static(
                 &family,

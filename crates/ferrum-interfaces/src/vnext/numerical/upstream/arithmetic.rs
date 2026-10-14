@@ -7,6 +7,7 @@ use super::super::{
     StrictProjectionFallback, NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM,
     NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA,
     NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL,
+    NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16,
 };
 
 /// Numerical versions follow the pinned upstream projection equations,
@@ -33,6 +34,8 @@ pub enum UpstreamProjectionArithmetic {
     MmqD4ExtraMarkerV2,
     /// Separate no-min Q8_1 dot ABI. The stored half original sum is unused.
     MmvqQ8_1ExtraMarkerV2,
+    /// Independent Q6_K F16 input/output ABI using D4 MMQ and canonical markers.
+    MmqD4Q6F16MarkerV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -146,12 +149,15 @@ impl UpstreamProjectionArithmetic {
                 | Self::MmvqQ8_1MarkerV2
                 | Self::MmqD4ExtraMarkerV2
                 | Self::MmvqQ8_1ExtraMarkerV2
+                | Self::MmqD4Q6F16MarkerV1
         )
     }
 
     pub(super) const fn finite_expression(self) -> Self {
         match self {
-            Self::MmqD4MarkerV2 | Self::MmqD4ExtraMarkerV2 => Self::MmqD4V1,
+            Self::MmqD4MarkerV2 | Self::MmqD4ExtraMarkerV2 | Self::MmqD4Q6F16MarkerV1 => {
+                Self::MmqD4V1
+            }
             Self::MmqDs4MarkerV2 => Self::MmqDs4V1,
             Self::MmvqQ8_1MarkerV2 | Self::MmvqQ8_1ExtraMarkerV2 => Self::MmvqQ8_1V1,
             other => other,
@@ -162,8 +168,10 @@ impl UpstreamProjectionArithmetic {
         format: ProjectionBlockFormat,
     ) -> Result<UpstreamArithmeticSemantics, String> {
         use crate::vnext::ElementType;
-        use ProjectionBlockFormat::{Iq3S, Iq4Nl, Iq4Xs, Q3K, Q4K, Q5K};
-        if self.is_extra() != format.is_extra() {
+        use ProjectionBlockFormat::{Iq3S, Iq4Nl, Iq4Xs, Q3K, Q4K, Q5K, Q6K};
+        if self.is_extra() != format.is_extra()
+            || (self == Self::MmqD4Q6F16MarkerV1) != (format == Q6K)
+        {
             return Err(
                 "upstream arithmetic and weight format belong to different native families".into(),
             );
@@ -177,7 +185,7 @@ impl UpstreamProjectionArithmetic {
             reduction,
             dynamic_domain,
         ) = match (self.finite_expression(), format) {
-            (Self::MmqD4V1, Iq4Xs | Q3K | Iq3S | Iq4Nl) => (
+            (Self::MmqD4V1, Iq4Xs | Q3K | Iq3S | Iq4Nl | Q6K) => (
                 UpstreamActivationPack::MmqTransposedD4_144BytesPer128,
                 UpstreamScaleExpression::Reciprocal127OverAbsMaxThenReciprocal,
                 ElementType::F32,
@@ -287,11 +295,16 @@ fn unique_rows<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeSet<u32>, 
 pub struct UpstreamProjectionPolicy {
     pub format: ProjectionBlockFormat,
     pub routes: Vec<UpstreamProjectionRouteDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_selection: Option<super::UpstreamProjectionGeometrySelection>,
     pub fallback: StrictProjectionFallback,
 }
 
 impl UpstreamProjectionPolicy {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(selection) = self.geometry_selection {
+            selection.validate(self)?;
+        }
         if self.routes.is_empty() {
             return Err("upstream policy needs an explicit route".into());
         }
@@ -350,7 +363,9 @@ impl UpstreamProjectionPolicy {
     pub fn staged(self) -> Result<StagedNumericalArithmetic, String> {
         self.validate()?;
         Ok(StagedNumericalArithmetic {
-            schema_version: if self.format.is_extra()
+            schema_version: if self.format == ProjectionBlockFormat::Q6K {
+                NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+            } else if self.format.is_extra()
                 && self.routes.iter().any(|route| route.prefill_rows.is_some())
             {
                 NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL

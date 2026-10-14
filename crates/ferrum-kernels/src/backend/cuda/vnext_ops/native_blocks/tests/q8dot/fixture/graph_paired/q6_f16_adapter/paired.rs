@@ -64,6 +64,16 @@ impl Bank {
 #[test]
 #[ignore = "exclusive CUDA; current M8 Q6 body ring and the qualified F16 ABI2 artifact"]
 fn q6_f16_adapter_current_m8_complete_projection_ring_pairs() {
+    complete_projection_ring_pairs(8);
+}
+
+#[test]
+#[ignore = "exclusive CUDA; current M32 Q6 body ring and the qualified F16 ABI2 artifact"]
+fn q6_f16_adapter_current_m32_complete_projection_ring_pairs() {
+    complete_projection_ring_pairs(32);
+}
+
+fn complete_projection_ring_pairs(m: usize) {
     let (ctx, stream, kernels) = context();
     let l2 = usize::try_from(
         ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
@@ -90,7 +100,7 @@ fn q6_f16_adapter_current_m8_complete_projection_ring_pairs() {
                 let (k, n) = SHAPES[shape];
                 let leaf = bank_index * ORDER.len() + index;
                 let mut case =
-                    Case::with_encoded_weights(&stream, 8, k, n, encoded_weights(k, n, leaf));
+                    Case::with_encoded_weights(&stream, m, k, n, encoded_weights(k, n, leaf));
                 let address = case.weight_ptr(&stream) as usize;
                 assert_eq!(address % 4, 0, "Q6 MMQ requires a four-byte weight base");
                 assert!(addresses.insert(address), "distinct live weight allocation");
@@ -177,7 +187,7 @@ fn q6_f16_adapter_current_m8_complete_projection_ring_pairs() {
     println!(
         "{}",
         serde_json::json!({"kind":"q6_f16_adapter_current_ring_plan",
-            "product_status":"test_only_existing_F16_D4_MMQ_boundary","m":8,
+            "product_status":"test_only_existing_F16_D4_MMQ_boundary","m":m,
             "shapes":SHAPES,"leaf_shape_order":ORDER,"shape_counts":[12,9,1,1],
             "projections_per_observation":ORDER.len(),"physical_banks":bank_count,
             "distinct_physical_weight_leaves":addresses.len(),"compressed_bytes_per_ring":ring_bytes,
@@ -210,7 +220,7 @@ fn q6_f16_adapter_current_m8_complete_projection_ring_pairs() {
             println!(
                 "{}",
                 serde_json::json!({"kind":"q6_f16_adapter_current_ring_pair",
-                    "m":8,"pair":pair,"position":position,"bank":bank_index,
+                    "m":m,"pair":pair,"position":position,"bank":bank_index,
                     "pair_order":if pair%2==0 {"AB"} else {"BA"},
                     "route":if route==0 {"current_strict_f16_t8"} else {"existing_f16_d4_q6_mmq_marker"},
                     "projections":ORDER.len(),"gpu_ns":gpu_ns,"wall_ns":wall_ns,

@@ -366,7 +366,8 @@ impl Fixture {
                         component.offset_bytes(),
                         HostTransferLayout::new(
                             ElementType::F32,
-                            ranges[p as usize].len() as u64 * HIDDEN,
+                            ranges[p as usize].len() as u64
+                                * output.tensor().dimensions().last().copied().unwrap(),
                         )
                         .unwrap(),
                     )
@@ -523,6 +524,7 @@ impl Fixture {
                     COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
                         | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
                         | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
                 );
                 if arithmetic.schema_version
                     == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ
