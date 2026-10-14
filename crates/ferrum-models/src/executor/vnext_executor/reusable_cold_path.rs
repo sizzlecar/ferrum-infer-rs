@@ -106,6 +106,53 @@ struct ProgramGaps {
 }
 
 #[derive(Serialize)]
+struct StageDurationRecord {
+    samples: u64,
+    total_ns: u64,
+    overflowed: bool,
+}
+
+/// Existing stage callbacks may repeat within one attempt. Keep their totals
+/// separate from the first-only provider and backend observations.
+#[derive(Default)]
+struct StageDurationAccumulator {
+    samples: AtomicU64,
+    total_ns: AtomicU64,
+    overflowed: AtomicBool,
+}
+
+impl StageDurationAccumulator {
+    fn add(&self, counter: &AtomicU64, value: u64) {
+        if let Ok(previous) =
+            counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            })
+        {
+            if previous.checked_add(value).is_none() {
+                self.overflowed.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record(&self, elapsed: Duration) {
+        if elapsed.as_nanos() > u128::from(u64::MAX) {
+            self.overflowed.store(true, Ordering::Relaxed);
+        }
+        self.add(&self.samples, 1);
+        self.add(&self.total_ns, duration_ns(elapsed));
+    }
+
+    fn into_record(self) -> Option<StageDurationRecord> {
+        let samples = self.samples.into_inner();
+        (samples != 0).then(|| StageDurationRecord {
+            samples,
+            total_ns: self.total_ns.into_inner(),
+            overflowed: self.overflowed.into_inner(),
+        })
+    }
+}
+
+#[derive(Serialize)]
 struct AttemptRecord {
     ordinal: usize,
     program_id: Option<DeviceReusableExecutionProgramId>,
@@ -119,6 +166,12 @@ struct AttemptRecord {
     provider_encode_submit_ns: Option<u64>,
     provider_node_encode_ns: Option<u64>,
     enqueue_commands_ns: Option<u64>,
+    contract_validate_reserve: Option<StageDurationRecord>,
+    segment_binding_prepare_encode: Option<StageDurationRecord>,
+    segment_fresh_authority_and_windows: Option<StageDurationRecord>,
+    segment_backing_permit_and_metadata: Option<StageDurationRecord>,
+    segment_node_dependencies_and_regions: Option<StageDurationRecord>,
+    segment_backend_encode_and_validate: Option<StageDurationRecord>,
     backend_preparation: Option<BackendPreparation>,
     program_gaps: Option<ProgramGaps>,
     backend_submission_observation: Option<DeviceReusableExecutionObservation>,
@@ -215,6 +268,8 @@ impl Ledger {
                 "each wave owns one host_encode_submit interval including all retries; attempt intervals are nested and must not be added to it",
                 "provider_encode_submit includes core dispatch; provider_node_encode and enqueue_commands reuse their original stage scopes",
                 "missing callback or interval is null, not zero; prepare and final submission observations are separate boundaries",
+                "selected stage records accumulate all callbacks within this attempt; null means no callback, and a sampled zero duration is valid; overflowed totals or counts saturate and are lower bounds",
+                "selected stages reuse existing scopes after the attempt observer is attached; preceding program identity lookup and resource preparation are excluded; segment substages are nested inside segment_binding_prepare_encode and provider_node_encode and must not be added to their parents",
                 "program_gaps counts actual node gaps by reason before on-demand tombstone removal; segment counters have a different denominator",
                 "program_id retains every field; exact backend identity comparison is diagnostic and never changes dispatch",
                 "capture_allowed_at_entry is the backend quiescence decision, not proof of later completion",
@@ -340,7 +395,7 @@ impl<T> ObservationCell<T> {
     }
 }
 
-/// Callbacks only borrow identity and copy fixed-size data. No locks, clocks,
+/// Callbacks only borrow identity and update fixed-size data. No locks, clocks,
 /// allocation, or serialization occur on the backend submission thread.
 pub(super) struct AttemptObservation<'a, T> {
     timing: &'a T,
@@ -350,6 +405,12 @@ pub(super) struct AttemptObservation<'a, T> {
     catalog_miss: Option<VNextReusableExecutionCatalogMissReason>,
     provider_ns: ObservationCell<u64>,
     enqueue_ns: ObservationCell<u64>,
+    contract_validate_reserve: StageDurationAccumulator,
+    segment_binding_prepare_encode: StageDurationAccumulator,
+    segment_fresh_authority_and_windows: StageDurationAccumulator,
+    segment_backing_permit_and_metadata: StageDurationAccumulator,
+    segment_node_dependencies_and_regions: StageDurationAccumulator,
+    segment_backend_encode_and_validate: StageDurationAccumulator,
     preparation: ObservationCell<BackendPreparation>,
     gaps: ObservationCell<ProgramGaps>,
     submission: ObservationCell<DeviceReusableExecutionObservation>,
@@ -372,6 +433,12 @@ impl<'a, T> AttemptObservation<'a, T> {
             catalog_miss,
             provider_ns: ObservationCell::new(),
             enqueue_ns: ObservationCell::new(),
+            contract_validate_reserve: StageDurationAccumulator::default(),
+            segment_binding_prepare_encode: StageDurationAccumulator::default(),
+            segment_fresh_authority_and_windows: StageDurationAccumulator::default(),
+            segment_backing_permit_and_metadata: StageDurationAccumulator::default(),
+            segment_node_dependencies_and_regions: StageDurationAccumulator::default(),
+            segment_backend_encode_and_validate: StageDurationAccumulator::default(),
             preparation: ObservationCell::new(),
             gaps: ObservationCell::new(),
             submission: ObservationCell::new(),
@@ -405,6 +472,20 @@ impl<'a, T> AttemptObservation<'a, T> {
             provider_encode_submit_ns: provider_encode_submit.map(duration_ns),
             provider_node_encode_ns: self.provider_ns.into_inner(),
             enqueue_commands_ns: self.enqueue_ns.into_inner(),
+            contract_validate_reserve: self.contract_validate_reserve.into_record(),
+            segment_binding_prepare_encode: self.segment_binding_prepare_encode.into_record(),
+            segment_fresh_authority_and_windows: self
+                .segment_fresh_authority_and_windows
+                .into_record(),
+            segment_backing_permit_and_metadata: self
+                .segment_backing_permit_and_metadata
+                .into_record(),
+            segment_node_dependencies_and_regions: self
+                .segment_node_dependencies_and_regions
+                .into_record(),
+            segment_backend_encode_and_validate: self
+                .segment_backend_encode_and_validate
+                .into_record(),
             backend_preparation: self.preparation.into_inner(),
             program_gaps: self.gaps.into_inner(),
             backend_submission_observation: self.submission.into_inner(),
@@ -487,8 +568,31 @@ impl<T: SubmissionWaveDispatchTimingSink> SubmissionWaveDispatchTimingSink
 {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         self.timing.record(stage, elapsed);
-        if T::ENABLED && stage == SubmissionWaveDispatchStage::ProviderNodeEncode {
-            self.set(&self.provider_ns, duration_ns(elapsed));
+        if T::ENABLED {
+            match stage {
+                SubmissionWaveDispatchStage::ProviderNodeEncode => {
+                    self.set(&self.provider_ns, duration_ns(elapsed));
+                }
+                SubmissionWaveDispatchStage::ContractValidateAndReserve => {
+                    self.contract_validate_reserve.record(elapsed);
+                }
+                SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode => {
+                    self.segment_binding_prepare_encode.record(elapsed);
+                }
+                SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows => {
+                    self.segment_fresh_authority_and_windows.record(elapsed);
+                }
+                SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata => {
+                    self.segment_backing_permit_and_metadata.record(elapsed);
+                }
+                SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions => {
+                    self.segment_node_dependencies_and_regions.record(elapsed);
+                }
+                SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate => {
+                    self.segment_backend_encode_and_validate.record(elapsed);
+                }
+                _ => {}
+            }
         }
     }
 }

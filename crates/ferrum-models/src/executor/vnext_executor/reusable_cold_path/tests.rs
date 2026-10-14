@@ -6,6 +6,33 @@ use ferrum_kernels::backend::cpu::vnext_runtime::CpuDeviceRuntime;
 use serde_json::{json, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+const SELECTED_STAGES: [(SubmissionWaveDispatchStage, &str); 6] = [
+    (
+        SubmissionWaveDispatchStage::ContractValidateAndReserve,
+        "contract_validate_reserve",
+    ),
+    (
+        SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode,
+        "segment_binding_prepare_encode",
+    ),
+    (
+        SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+        "segment_fresh_authority_and_windows",
+    ),
+    (
+        SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+        "segment_backing_permit_and_metadata",
+    ),
+    (
+        SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+        "segment_node_dependencies_and_regions",
+    ),
+    (
+        SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
+        "segment_backend_encode_and_validate",
+    ),
+];
+
 struct IdentityFixture {
     composition: CpuVNextComposition,
     lane: Arc<ExecutionLane<CpuDeviceRuntime>>,
@@ -302,6 +329,18 @@ fn reusable_cold_path_retry_and_phase_keep_nested_intervals_on_their_own_attempt
         DeviceSubmissionStage::EnqueueCommands,
         Duration::from_nanos(5),
     );
+    first.record(
+        SubmissionWaveDispatchStage::ContractValidateAndReserve,
+        Duration::from_nanos(2),
+    );
+    first.record(
+        SubmissionWaveDispatchStage::ContractValidateAndReserve,
+        Duration::from_nanos(3),
+    );
+    first.record(
+        SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+        Duration::ZERO,
+    );
     wave.record_attempt(
         first,
         InvocationPreparationStats {
@@ -317,6 +356,10 @@ fn reusable_cold_path_retry_and_phase_keep_nested_intervals_on_their_own_attempt
     retry.record(
         SubmissionWaveDispatchStage::ProviderNodeEncode,
         Duration::from_nanos(11),
+    );
+    retry.record(
+        SubmissionWaveDispatchStage::ContractValidateAndReserve,
+        Duration::from_nanos(7),
     );
     wave.record_attempt(
         retry,
@@ -354,16 +397,34 @@ fn reusable_cold_path_retry_and_phase_keep_nested_intervals_on_their_own_attempt
     assert_eq!(rows[0]["attempts"][0]["provider_encode_submit_ns"], 13);
     assert_eq!(rows[0]["attempts"][0]["provider_node_encode_ns"], 7);
     assert_eq!(rows[0]["attempts"][0]["enqueue_commands_ns"], 5);
+    assert_eq!(
+        rows[0]["attempts"][0]["contract_validate_reserve"],
+        json!({"samples": 2, "total_ns": 5, "overflowed": false})
+    );
+    assert_eq!(
+        rows[0]["attempts"][0]["segment_fresh_authority_and_windows"],
+        json!({"samples": 1, "total_ns": 0, "overflowed": false})
+    );
+    assert_eq!(rows[0]["attempts"][0]["repeated_callback"], false);
     assert_eq!(rows[0]["attempts"][1]["ordinal"], 1);
     assert_eq!(rows[0]["attempts"][1]["provider_encode_submit_ns"], 17);
     assert_eq!(rows[0]["attempts"][1]["provider_node_encode_ns"], 11);
     assert!(rows[0]["attempts"][1]["enqueue_commands_ns"].is_null());
+    assert_eq!(
+        rows[0]["attempts"][1]["contract_validate_reserve"],
+        json!({"samples": 1, "total_ns": 7, "overflowed": false})
+    );
+    assert!(rows[0]["attempts"][1]["segment_fresh_authority_and_windows"].is_null());
+    assert_eq!(rows[0]["attempts"][1]["repeated_callback"], false);
     assert_eq!(rows[1]["ordinal"], 1);
     assert_eq!(rows[1]["phase"], "prefill");
     assert_eq!(rows[1]["attempts"][0]["ordinal"], 0);
     assert_eq!(rows[1]["attempts"][0]["disposition"], "before_decision");
     assert!(rows[1]["attempts"][0]["program_id"].is_null());
     assert!(rows[1]["attempts"][0]["provider_encode_submit_ns"].is_null());
+    for (_, field) in SELECTED_STAGES {
+        assert!(rows[1]["attempts"][0][field].is_null(), "{field}");
+    }
     assert_eq!(
         rows[1]["attempts"][0]["backend_preparation"]["identity"],
         "both_unavailable"
@@ -378,6 +439,24 @@ fn reusable_cold_path_retry_and_phase_keep_nested_intervals_on_their_own_attempt
     );
     assert_eq!(
         metrics.prefill_wave_timing.provider_node_encode.snapshot()["samples"],
+        0
+    );
+    assert_eq!(
+        metrics.wave_timing.contract_validate_reserve.snapshot()["total_ns"],
+        12
+    );
+    assert_eq!(
+        metrics
+            .decode_wave_timing
+            .contract_validate_reserve
+            .snapshot()["samples"],
+        3
+    );
+    assert_eq!(
+        metrics
+            .prefill_wave_timing
+            .contract_validate_reserve
+            .snapshot()["samples"],
         0
     );
 }
@@ -407,6 +486,10 @@ fn reusable_cold_path_callbacks_forward_unchanged_and_repeats_remain_visible() {
             SubmissionWaveDispatchStage::SegmentBackingWindowIntersections,
             Duration::from_nanos(3),
         );
+        for (index, (stage, _)) in SELECTED_STAGES.into_iter().enumerate() {
+            sink.record(stage, Duration::ZERO);
+            sink.record(stage, Duration::from_nanos(index as u64 + 1));
+        }
         sink.record_device_submission(DeviceSubmissionStage::EnqueueCommands, Duration::ZERO);
         sink.record_device_submission(
             DeviceSubmissionStage::EnqueueCommands,
@@ -457,6 +540,13 @@ fn reusable_cold_path_callbacks_forward_unchanged_and_repeats_remain_visible() {
     assert_eq!(attempt["repeated_callback"], true);
     assert_eq!(attempt["provider_node_encode_ns"], 7);
     assert_eq!(attempt["enqueue_commands_ns"], 0);
+    for (index, (_, field)) in SELECTED_STAGES.into_iter().enumerate() {
+        assert_eq!(
+            attempt[field],
+            json!({"samples": 2, "total_ns": index as u64 + 1, "overflowed": false}),
+            "{field}"
+        );
+    }
     assert_eq!(attempt["backend_preparation"]["identity"], "exact");
     assert_eq!(
         attempt["backend_preparation"]["capture_allowed_at_entry"],
@@ -470,6 +560,42 @@ fn reusable_cold_path_callbacks_forward_unchanged_and_repeats_remain_visible() {
     assert_eq!(
         attempt["backend_submission_observation"]["warmup_required_segments"],
         1
+    );
+}
+
+#[test]
+fn reusable_cold_path_stage_totals_saturate_without_losing_overflow_evidence() {
+    assert!(StageDurationAccumulator::default().into_record().is_none());
+
+    let exact_limit = StageDurationAccumulator::default();
+    exact_limit.record(Duration::from_nanos(u64::MAX));
+    assert_eq!(
+        serde_json::to_value(exact_limit.into_record()).unwrap(),
+        json!({"samples": 1, "total_ns": u64::MAX, "overflowed": false})
+    );
+
+    let total_overflow = StageDurationAccumulator::default();
+    total_overflow.record(Duration::from_nanos(u64::MAX));
+    total_overflow.record(Duration::from_nanos(1));
+    total_overflow.record(Duration::ZERO);
+    assert_eq!(
+        serde_json::to_value(total_overflow.into_record()).unwrap(),
+        json!({"samples": 3, "total_ns": u64::MAX, "overflowed": true})
+    );
+
+    let duration_overflow = StageDurationAccumulator::default();
+    duration_overflow.record(Duration::from_nanos(u64::MAX) + Duration::from_nanos(1));
+    assert_eq!(
+        serde_json::to_value(duration_overflow.into_record()).unwrap(),
+        json!({"samples": 1, "total_ns": u64::MAX, "overflowed": true})
+    );
+
+    let samples_overflow = StageDurationAccumulator::default();
+    samples_overflow.samples.store(u64::MAX, Ordering::Relaxed);
+    samples_overflow.record(Duration::ZERO);
+    assert_eq!(
+        serde_json::to_value(samples_overflow.into_record()).unwrap(),
+        json!({"samples": u64::MAX, "total_ns": 0, "overflowed": true})
     );
 }
 
@@ -542,6 +668,18 @@ fn reusable_cold_path_disabled_observation_and_enabled_records_retain_no_lane_ow
     assert!(!<AttemptObservation<'_, DisabledDeviceSubmissionTimingSink> as DeviceSubmissionTimingSink>::ENABLED);
     assert_eq!(ledger.snapshot()["waves_started"], 0);
     assert_eq!(metrics.snapshot()["samples"], 0);
+    let disabled = invocation_preparation::DisabledTiming;
+    let observer = AttemptObservation::new(&disabled, None, 1, None, None);
+    for (stage, _) in SELECTED_STAGES {
+        observer.record(stage, Duration::from_nanos(1));
+    }
+    let disabled_record =
+        serde_json::to_value(observer.finish(0, Default::default(), Outcome::Submitted, None))
+            .unwrap();
+    for (_, field) in SELECTED_STAGES {
+        assert!(disabled_record[field].is_null(), "{field}");
+    }
+    assert_eq!(disabled_record["repeated_callback"], false);
 
     let sink = CaptureSink::default();
     let mut wave = ledger.begin(true, VNextExecutionWaveKind::Decode).unwrap();
@@ -568,4 +706,10 @@ fn reusable_cold_path_disabled_observation_and_enabled_records_retain_no_lane_ow
     assert!(lane.upgrade().is_none());
     assert!(runtime.upgrade().is_none());
     assert_eq!(records(&ledger.snapshot()).len(), 1);
+    for (_, field) in SELECTED_STAGES {
+        assert!(
+            ledger.snapshot()["records"][0]["attempts"][0][field].is_null(),
+            "{field}"
+        );
+    }
 }
