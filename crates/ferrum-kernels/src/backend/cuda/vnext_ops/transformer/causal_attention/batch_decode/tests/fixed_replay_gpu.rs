@@ -8,6 +8,10 @@ use cudarc::driver::{sys::CUevent_flags, CudaGraph};
 #[path = "fixed_replay_gpu/gqa2.rs"]
 mod gqa2;
 
+#[cfg(feature = "cuda-causal-gqa2")]
+#[path = "fixed_replay_gpu/singleton_gqa2.rs"]
+mod singleton_gqa2;
+
 enum ReplayBatch {
     Indexed(BatchDecode),
     Fixed(FixedBatchDecode),
