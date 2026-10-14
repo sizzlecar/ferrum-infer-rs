@@ -63,10 +63,21 @@ type MmvqPack = unsafe extern "C" fn(
     *mut c_void,
 ) -> i32;
 
+type MmvqCast = unsafe extern "C" fn(
+    *const UpstreamLinearPlanV1,
+    *const c_void,
+    *mut c_void,
+    u32,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+) -> i32;
+
 #[derive(Clone, Copy)]
 struct MmvqOps {
     pack: MmvqPack,
     dot: MmvqDot,
+    cast: MmvqCast,
 }
 
 unsafe extern "C" {
@@ -275,6 +286,7 @@ impl Route {
             MmvqOps {
                 pack: ffi::ferrum_upstream_mmvq_pack_v2,
                 dot: mmvq_dot,
+                cast: ffi::ferrum_upstream_mmvq_cast_v2,
             },
         );
     }
@@ -342,7 +354,7 @@ impl Route {
                         fixup,
                         stream.0,
                     ));
-                    ok(ffi::ferrum_upstream_mmvq_cast_v2(
+                    ok((mmvq.cast)(
                         p,
                         self.output.ptr,
                         self.result.ptr.add(self.result_offset as usize * 2),

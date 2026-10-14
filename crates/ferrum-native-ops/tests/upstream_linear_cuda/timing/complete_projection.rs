@@ -257,10 +257,12 @@ pub(super) fn paired_projection_ring_for_rows(
             MmvqOps {
                 pack: ffi::ferrum_upstream_mmvq_pack_v2,
                 dot: ffi::ferrum_upstream_mmvq_dot_v1,
+                cast: ffi::ferrum_upstream_mmvq_cast_v2,
             },
             MmvqOps {
                 pack: ffi::ferrum_upstream_mmvq_pack_v2,
                 dot,
+                cast: ffi::ferrum_upstream_mmvq_cast_v2,
             },
         ],
         selected_label,
@@ -313,9 +315,9 @@ pub(super) fn paired_projection_ring_with_ops(
         "{}",
         serde_json::json!({
             "experiment":experiment,"kind":"scope",
-            "timed":"public pack_v2 including flags/guards; dot with actual stream-K fixup; cast",
+            "timed":"declared pack including flags/guards; declared dot with actual stream-K fixup; declared cast",
             "current_algorithm":format!("{current:?}"),
-            "mmvq":"F32 activation pack and kernel flag clear; selected pack/dot entrypoints declared by the experiment",
+            "mmvq":"F32 activation pack and kernel flag clear; selected pack/dot/cast entrypoints declared by the experiment",
             "selected_dot":selected_label,
             "precondition":"before each measured arm replay the next bank's complete current-route ring then synchronize; excluded from event and wall intervals; no cache-eviction guarantee",
             "precondition_projection_count":banks[0].laps*count,
