@@ -1,10 +1,29 @@
 //! Explicit, CPU-only diagnostic of the real token commit/text publication transaction.
 //! Inputs and results stay outside the repository. This is not a serving benchmark.
 use super::*;
+use ferrum_interfaces::tokenizer::TokenizerInfo;
+use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensorFactory};
 use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use ferrum_types::SpecialTokens;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Mutex};
+
+fn policy_request() -> InferenceRequest {
+    InferenceRequest {
+        id: RequestId::new(),
+        prompt: "test".to_owned(),
+        model_id: ferrum_types::ModelId::new("test"),
+        sampling_params: SamplingParams::greedy(),
+        stream: true,
+        priority: Priority::Normal,
+        client_id: None,
+        session_id: None,
+        created_at: chrono::Utc::now(),
+        api_request: None,
+        evidence_request: Default::default(),
+        metadata: HashMap::new(),
+    }
+}
 
 #[derive(Deserialize)]
 struct ProbeInput {

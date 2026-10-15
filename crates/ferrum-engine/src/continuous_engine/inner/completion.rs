@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod output_decode_budget;
+
 impl SequencePhysicalResources {
     pub(super) fn is_empty(&self) -> bool {
         self.legacy_kv_allocation.is_none()

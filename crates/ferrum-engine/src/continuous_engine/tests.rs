@@ -30,8 +30,6 @@ use std::time::Duration;
 #[path = "stop_boundary_tests.rs"]
 mod stop_boundary_tests;
 
-mod output_decode_budget;
-
 #[path = "prefix_rendezvous_tests.rs"]
 mod prefix_rendezvous_tests;
 #[path = "prefix_restore_deferred_tests.rs"]
