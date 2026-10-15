@@ -11,6 +11,8 @@ use ferrum_interfaces::vnext::{
 pub(in crate::backend::cuda::vnext_ops) struct CausalRecipe {
     shape: CausalAttentionShape,
     participants: usize,
+    attention_policy: AttentionExecutionPolicy,
+    replay_topologies: Vec<ResidentCausalReplayTopology>,
     upload_strategy: ProgramBindingUploadStrategy,
 }
 
@@ -43,6 +45,10 @@ pub(crate) fn resident_control_rules(
         .enumerate()
     {
         let shape = recipe.shape;
+        let policy = recipe.attention_policy;
+        let Some(&replay_topology) = recipe.replay_topologies.get(participant) else {
+            return Err(invalid("resident causal replay row is absent"));
+        };
         let source = token.source_token_range();
         let bytes = shape
             .physical_state_bytes_for_source_frontier(source.end, token.full_input_tokens())
@@ -61,6 +67,16 @@ pub(crate) fn resident_control_rules(
                     || token.full_input_tokens() > shape.maximum_context_tokens
                 {
                     return Err(invalid("resident causal frontier exceeds admitted context"));
+                }
+                // Updating the binding scalars cannot enlarge a captured
+                // native kernel's partition/table envelope. Decline before
+                // transport preparation or dependency consumption so Core
+                // can retire this use and take ordinary topology selection.
+                if !replay_topology
+                    .accepts(policy, shape, token.immediate_tokens(), source.end)
+                    .map_err(CudaDeviceRuntimeError::contract)?
+                {
+                    return Ok(None);
                 }
                 let current_entries = shape
                     .table_entries(source.end)
@@ -120,6 +136,9 @@ pub(crate) fn resident_control_rules(
 pub(super) fn declare(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     shape: CausalAttentionShape,
+    attention_policy: AttentionExecutionPolicy,
+    launches: &[CausalAttentionLaunch],
+    fixed_capacity: bool,
     upload_strategy: ProgramBindingUploadStrategy,
     validations: Vec<ValidationRecipe>,
 ) -> Result<Option<SegmentBindingDeclaration>, String> {
@@ -168,6 +187,20 @@ pub(super) fn declare(
         DynamicRecipe::Causal(CausalRecipe {
             shape,
             participants: invocation.participants().len(),
+            attention_policy,
+            replay_topologies: launches
+                .iter()
+                .map(|launch| {
+                    if fixed_capacity {
+                        ResidentCausalReplayTopology::FixedCapacity
+                    } else {
+                        ResidentCausalReplayTopology::CapturedRow {
+                            path: launch.path,
+                            topology: launch.replay_topology,
+                        }
+                    }
+                })
+                .collect(),
             upload_strategy,
         }),
         regions,

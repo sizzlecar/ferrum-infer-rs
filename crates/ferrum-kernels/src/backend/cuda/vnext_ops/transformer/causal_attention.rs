@@ -1476,6 +1476,46 @@ impl CausalAttentionReplayTopology {
     }
 }
 
+/// The native launch geometry captured by the ordinary encoder. A fixed
+/// multi-row launch already contains both native paths at full capacity;
+/// ordinary per-row launches retain their selected path and partition count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentCausalReplayTopology {
+    FixedCapacity,
+    CapturedRow {
+        path: CausalAttentionKernelPath,
+        topology: CausalAttentionReplayTopology,
+    },
+}
+
+impl ResidentCausalReplayTopology {
+    fn accepts(
+        self,
+        policy: AttentionExecutionPolicy,
+        shape: CausalAttentionShape,
+        active_tokens: u64,
+        sequence_tokens: u64,
+    ) -> Result<bool, String> {
+        if active_tokens != 1 {
+            return Ok(false);
+        }
+        let path =
+            CausalAttentionKernelPath::select(policy, shape, active_tokens, sequence_tokens)?;
+        let topology = CausalAttentionReplayTopology::new(shape, path, sequence_tokens)?;
+        Ok(match self {
+            Self::FixedCapacity => matches!(
+                path,
+                CausalAttentionKernelPath::VllmAddressedDecodeV1
+                    | CausalAttentionKernelPath::VllmAddressedDecodeV2
+            ),
+            Self::CapturedRow {
+                path: captured_path,
+                topology: captured_topology,
+            } => path == captured_path && topology == captured_topology,
+        })
+    }
+}
+
 fn execution_context_identity(limit: Option<usize>) -> [u8; 9] {
     let mut identity = [0_u8; 9];
     if let Some(limit) = limit {
@@ -3112,15 +3152,6 @@ fn encode_attention(
         return Ok(Encoding::Bindings(bindings));
     }
 
-    if let Some(declaration) = segment_declaration {
-        *declaration = segment_bindings::declare(
-            &invocation,
-            shape,
-            program_binding_upload_strategy,
-            segment_validations.unwrap_or_default(),
-        )?;
-    }
-
     let q8act = q8act.map(PreparedAttentionProjections::into_owned);
     let upstream_work = {
         let rows = if packed.is_some() {
@@ -3163,6 +3194,17 @@ fn encode_attention(
         decode_attention_grouping,
         causal_decode_kv_reuse,
     )?;
+    if let Some(declaration) = segment_declaration {
+        *declaration = segment_bindings::declare(
+            &invocation,
+            shape,
+            attention_policy,
+            &launches,
+            batch_decode.as_ref().is_some_and(|batch| batch.is_fixed()),
+            program_binding_upload_strategy,
+            segment_validations.unwrap_or_default(),
+        )?;
+    }
     let compute_operation = if batch_decode.as_ref().is_some_and(|batch| batch.is_fixed()) {
         COMPUTE_FIXED_OPERATION
     } else {
@@ -6652,6 +6694,70 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[test]
+    fn resident_causal_replay_bound_tracks_native_partitions() {
+        let shape = goal_shape(16, 2, 256, 4_096);
+        let policy = AttentionExecutionPolicy::NativeAdaptive;
+        let captured = |sequence_tokens| {
+            let path =
+                CausalAttentionKernelPath::select(policy, shape, 1, sequence_tokens).unwrap();
+            ResidentCausalReplayTopology::CapturedRow {
+                path,
+                topology: CausalAttentionReplayTopology::new(shape, path, sequence_tokens).unwrap(),
+            }
+        };
+        let v1 = captured(511);
+        assert!(v1.accepts(policy, shape, 1, 512).unwrap());
+        assert!(!v1.accepts(policy, shape, 1, 513).unwrap());
+        let v2 = captured(513);
+        assert!(v2.accepts(policy, shape, 1, 1_024).unwrap());
+        assert!(!v2.accepts(policy, shape, 1, 1_025).unwrap());
+        assert!(!v2.accepts(policy, shape, 1, 512).unwrap());
+        assert!(!v2.accepts(policy, shape, 2, 514).unwrap());
+        assert!(captured(1_025).accepts(policy, shape, 1, 1_536).unwrap());
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[test]
+    fn resident_causal_replay_bound_preserves_fixed_capacity_native_switches() {
+        let shape = goal_shape(24, 4, 256, 2_048);
+        // Issued only from an actual PreparedBatchDecode::Fixed. A configured
+        // fixed grouping with one row does not obtain this authorization.
+        let captured = ResidentCausalReplayTopology::FixedCapacity;
+        for sequence_tokens in [1, 511, 512, 513, 1_024, 1_025, 2_048] {
+            assert!(captured
+                .accepts(
+                    AttentionExecutionPolicy::NativeAdaptive,
+                    shape,
+                    1,
+                    sequence_tokens,
+                )
+                .unwrap());
+        }
+        assert!(captured
+            .accepts(AttentionExecutionPolicy::NativeAdaptive, shape, 1, 2_049)
+            .is_err());
+        assert!(!captured
+            .accepts(AttentionExecutionPolicy::Portable, shape, 1, 513)
+            .unwrap());
+    }
+
+    #[test]
+    fn resident_causal_replay_bound_keeps_portable_full_context() {
+        let shape = goal_shape(16, 2, 256, 2_048);
+        let policy = AttentionExecutionPolicy::Portable;
+        let path = CausalAttentionKernelPath::select(policy, shape, 1, 511).unwrap();
+        let captured = ResidentCausalReplayTopology::CapturedRow {
+            path,
+            topology: CausalAttentionReplayTopology::new(shape, path, 511).unwrap(),
+        };
+        for sequence_tokens in [512, 513, 1_025, 2_048] {
+            assert!(captured.accepts(policy, shape, 1, sequence_tokens).unwrap());
+        }
+        assert!(captured.accepts(policy, shape, 1, 2_049).is_err());
     }
 
     #[cfg(feature = "vllm-paged-attn-v2")]
