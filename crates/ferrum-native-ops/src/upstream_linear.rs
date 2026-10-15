@@ -6,30 +6,6 @@ use std::mem::{align_of, offset_of, size_of};
 pub const UPSTREAM_LINEAR_ABI: u32 = 1;
 pub const UPSTREAM_LINEAR_OPERATOR: &str = "ferrum.cuda.upstream_linear";
 
-/// Additive capability: exact MarkerV2 M1 F16 input/output boundary.
-pub const UPSTREAM_MMVQ_M1_F16_PDL_EXPORTS: [&str; 3] = [
-    "ferrum_upstream_mmvq_m1_f16_pdl_support_v1",
-    "ferrum_upstream_mmvq_m1_f16_pdl_pack_v1",
-    "ferrum_upstream_mmvq_m1_f16_pdl_dot_v1",
-];
-
-/// The mathematical profile is unchanged; this records the selected physical
-/// activation/output boundary for preparation, replay identity and accounting.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum UpstreamMmvqBoundaryKind {
-    #[default]
-    F32Scratch,
-    DirectF16,
-}
-impl UpstreamMmvqBoundaryKind {
-    pub const fn as_runtime_value(self) -> &'static str {
-        match self {
-            Self::F32Scratch => "f32-scratch",
-            Self::DirectF16 => "direct-f16-marker-v2",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum UpstreamLinearAlgorithm {

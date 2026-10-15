@@ -76,26 +76,6 @@ fn native_support(plan: &PreparedUpstreamLinear) -> Option<bool> {
     }
 }
 
-fn native_boundary_support(plan: &PreparedUpstreamLinear) -> Option<bool> {
-    if plan.raw.request.rows != 1 {
-        return None;
-    }
-    #[cfg(all(feature = "cuda-upstream-linear", ferrum_native_mmvq_m1_f16_pdl))]
-    {
-        let mut supported = 0;
-        Error::from_status(unsafe {
-            ffi::ferrum_upstream_mmvq_m1_f16_pdl_support_v1(&plan.raw, &mut supported)
-        })
-        .unwrap();
-        Some(supported != 0)
-    }
-    #[cfg(not(all(feature = "cuda-upstream-linear", ferrum_native_mmvq_m1_f16_pdl)))]
-    {
-        let _ = plan;
-        None
-    }
-}
-
 fn verify(
     stream: &Arc<CudaStream>,
     device: Device,
@@ -104,7 +84,6 @@ fn verify(
     inputs: u32,
     outputs: u32,
     shared: bool,
-    boundary: bool,
 ) {
     let ordered = PreparedUpstreamLinear::new(
         Algorithm::Mmvq,
@@ -133,32 +112,8 @@ fn verify(
     };
     assert_eq!(ordered.mmvq_launch_kind(), MmvqLaunchKind::Ordered);
     let native_supported = native_support(&ordered);
-    // The boundary comparison uses the retained complete PDL chain, with a
-    // matched eager reference for every fresh input/weight generation.
-    let ordered = if boundary {
-        ordered.with_automatic_mmvq_launch().unwrap()
-    } else {
-        ordered
-    };
-    let boundary_supported = boundary
-        .then(|| native_boundary_support(&ordered))
-        .flatten();
     let candidate = ordered.clone().with_automatic_mmvq_launch().unwrap();
-    let candidate = if boundary {
-        candidate.with_automatic_mmvq_boundary().unwrap()
-    } else {
-        candidate
-    };
-    let direct = boundary_supported == Some(true);
-    assert_eq!(
-        candidate.mmvq_boundary_kind(),
-        if direct {
-            MmvqBoundaryKind::DirectF16
-        } else {
-            MmvqBoundaryKind::F32Scratch
-        }
-    );
-    let expected_launch = if native_supported == Some(true) || direct {
+    let expected_launch = if native_supported == Some(true) {
         MmvqLaunchKind::Programmatic
     } else {
         MmvqLaunchKind::Ordered
@@ -169,12 +124,7 @@ fn verify(
         "automatic launch must agree with the linked native GPU/PTX support result"
     );
     assert_eq!(ordered.geometry(), candidate.geometry());
-    if direct {
-        assert_eq!(candidate.pack_work_counts(), (2, 0));
-        assert_eq!(candidate.output_work_count(), 1);
-    } else {
-        assert_eq!(ordered.pack_work_counts(), candidate.pack_work_counts());
-    }
+    assert_eq!(ordered.pack_work_counts(), candidate.pack_work_counts());
     assert_eq!(
         ordered.q4_mmvq_weight_decode(),
         candidate.q4_mmvq_weight_decode()
@@ -242,19 +192,6 @@ fn verify(
                 s,
             )
             .unwrap();
-            if p.mmvq_boundary_kind() == MmvqBoundaryKind::DirectF16 {
-                p.dot_f16(
-                    weights.span(stream),
-                    b[1].span(stream),
-                    output,
-                    output_stride,
-                    b[4].span(stream),
-                    b[5].span(stream),
-                    s,
-                )
-                .unwrap();
-                return;
-            }
             p.dot(
                 weights.span(stream),
                 b[1].span(stream),
@@ -280,7 +217,7 @@ fn verify(
     // Capture owns no host data; all device spans outlive graphs and completion.
     let graphs = [0, 1].map(|arm| Graph::capture(stream, || enqueue(arm, &input, &weights)));
     let mut first_finite = None;
-    for generation in 0..if boundary { 5 } else { 4 } {
+    for generation in 0..4 {
         let mut words = (0..rows * input_stride)
             .map(|i| {
                 f16::from_f32(((i * 17 + generation * 23) % 101) as f32 / 256.0 - 0.2).to_bits()
@@ -288,9 +225,6 @@ fn verify(
             .collect::<Vec<_>>();
         if generation == 1 {
             words[0] = 0x7e00;
-        }
-        if generation == 4 {
-            words.fill(f16::MAX.to_bits());
         }
         let input_bytes = words
             .into_iter()
@@ -316,7 +250,7 @@ fn verify(
         stream.synchronize().unwrap();
         // First execute eagerly; subsequent inputs exercise captured fresh replay.
         for arm in 0..2 {
-            if generation == 0 || (boundary && arm == 0) {
+            if generation == 0 {
                 enqueue(arm, &input, &weights);
             } else {
                 graphs[arm].launch(stream);
@@ -326,21 +260,7 @@ fn verify(
         let observed = buffers
             .each_ref()
             .map(|b| b.each_ref().map(|v| v.read(stream)));
-        if direct {
-            for index in [1, 3, 4, 5] {
-                assert!(observed[0][index] == observed[1][index],
-                    "complete boundary buffer {index} differs; format={format:?} generation={generation}");
-            }
-            assert!(
-                observed[1][0]
-                    .iter()
-                    .chain(&observed[1][2])
-                    .all(|v| *v == 0x35),
-                "direct boundary must leave converted/raw scratch untouched"
-            );
-        } else {
-            assert_eq!(observed[0], observed[1], "format={format:?} M={rows} K={inputs} N={outputs} shared={shared} generation={generation}");
-        }
+        assert_eq!(observed[0], observed[1], "format={format:?} M={rows} K={inputs} N={outputs} shared={shared} generation={generation}");
         let output = &observed[1][3];
         for (row_index, row) in output.chunks_exact(output_stride as usize * 2).enumerate() {
             assert!(row[..output_offset as usize * 2]
@@ -353,8 +273,6 @@ fn verify(
                 let bits = u16::from_le_bytes([word[0], word[1]]);
                 if generation == 2 || (generation == 1 && row_index == 0) {
                     assert_eq!(bits, 0x7e00);
-                } else if generation == 4 {
-                    assert!(f16::from_bits(bits).is_finite() || bits == 0x7e00);
                 } else {
                     assert!(f16::from_bits(bits).is_finite());
                 }
@@ -374,10 +292,7 @@ fn verify(
             first_finite = Some(output.clone());
         }
         if generation == 3 {
-            assert!(
-                first_finite.as_ref().unwrap() != output,
-                "fresh finite input must change the complete result"
-            );
+            assert_ne!(first_finite.as_ref().unwrap(), output);
         }
         assert_eq!(input.read(stream), input_bytes);
         assert_eq!(weights.read(stream), weight_bytes);
@@ -390,58 +305,30 @@ fn verify(
         address: 0,
         bytes: 0,
     };
-    if direct {
-        for (q, output) in [
-            (
+    assert!(matches!(
+        unsafe {
+            candidate.dot(
+                weights.span(stream),
                 DeviceSpan {
                     bytes: packed.bytes - 1,
                     ..packed
                 },
-                b[3].span(stream),
-            ),
-            (packed, weights.span(stream)),
-        ] {
-            assert!(matches!(
-                unsafe {
-                    candidate.dot_f16(
-                        weights.span(stream),
-                        q,
-                        output,
-                        output_stride,
-                        b[4].span(stream),
-                        b[5].span(stream),
-                        s,
-                    )
-                },
-                Err(Error::Span)
-            ));
-        }
-    } else {
-        assert!(matches!(
-            unsafe {
-                candidate.dot(
-                    weights.span(stream),
-                    DeviceSpan {
-                        bytes: packed.bytes - 1,
-                        ..packed
-                    },
-                    b[2].span(stream),
-                    fixup,
-                    s,
-                )
-            },
-            Err(Error::Span)
-        ));
-        assert!(matches!(
-            unsafe { candidate.dot(weights.span(stream), packed, weights.span(stream), fixup, s) },
-            Err(Error::Span)
-        ));
-    }
+                b[2].span(stream),
+                fixup,
+                s,
+            )
+        },
+        Err(Error::Span)
+    ));
+    assert!(matches!(
+        unsafe { candidate.dot(weights.span(stream), packed, weights.span(stream), fixup, s) },
+        Err(Error::Span)
+    ));
     stream.synchronize().unwrap();
     assert_eq!(raw_before, b[2].read(stream));
     println!(
         "{}",
-        serde_json::json!({"case":"prepared_mmvq_programmatic", "format":format!("{format:?}"),"M":rows,"K":inputs,"N":outputs,"shared":shared,"ordered":format!("{:?}",ordered.mmvq_launch_kind()),"candidate":format!("{:?}",candidate.mmvq_launch_kind()),"native_support":native_supported,"boundary_requested":boundary,"boundary_support":boundary_supported,"boundary_kind":format!("{:?}",candidate.mmvq_boundary_kind()),"boundary_fallback":if !boundary { None } else if rows != 1 { Some("ineligible_rows") } else { match boundary_supported { None => Some("native_capability_not_compiled"), Some(false) => Some("native_gpu_or_loaded_ptx_unsupported"), Some(true) => None } },"removed_scratch_untouched":direct,"fresh_matched_eager_reference":boundary,"fallback":match native_supported { None => Some("native_capability_not_compiled"), Some(false) => Some("native_gpu_or_loaded_ptx_unsupported"), Some(true) => None },"full_buffers_equal":if direct {None} else {Some(true)},"complete_outputs_packed_and_flags_equal":true,"captured_fresh_poison_recovery":true,"guards_padding_and_rejected_spans":true})
+        serde_json::json!({"case":"prepared_mmvq_programmatic", "format":format!("{format:?}"),"M":rows,"K":inputs,"N":outputs,"shared":shared,"ordered":format!("{:?}",ordered.mmvq_launch_kind()),"candidate":format!("{:?}",candidate.mmvq_launch_kind()),"native_support":native_supported,"fallback":match native_supported { None => Some("native_capability_not_compiled"), Some(false) => Some("native_gpu_or_loaded_ptx_unsupported"), Some(true) => None },"full_buffers_equal":true,"captured_fresh_poison_recovery":true,"guards_padding_and_rejected_spans":true})
     );
 }
 
@@ -462,36 +349,12 @@ fn prepared_mmvq_programmatic_launch_matches_ordered_across_actual_templates() {
     };
     for format in [Format::Q4K, Format::Q5K, Format::Iq4Xs] {
         for (rows, inputs) in [(1, 256), (1, 5120), (4, 768), (8, 768)] {
-            verify(&stream, device, format, rows, inputs, 17, false, false);
+            verify(&stream, device, format, rows, inputs, 17, false);
         }
     }
     for format in [Format::Q4K, Format::Q5K] {
-        verify(&stream, device, format, 4, 512, 17, true, false);
+        verify(&stream, device, format, 4, 512, 17, true);
     }
-    verify(&stream, device, Format::Q4K, 8, 5120, 10240, true, false);
-    verify(&stream, device, Format::Q5K, 8, 6144, 5120, true, false);
-}
-
-#[test]
-#[ignore = "requires CUDA and locked native MMVQ M1 F16 exports; records explicit old-archive/hardware fallback"]
-fn prepared_mmvq_m1_f16_boundary_matches_current_pdl_and_fallback() {
-    let context = CudaContext::new(0).unwrap();
-    unsafe { context.disable_event_tracking() };
-    let stream = context.new_stream().unwrap();
-    let attr = |key| u32::try_from(context.attribute(key).unwrap()).unwrap();
-    let device = Device {
-        architecture: attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR) * 100
-            + attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR) * 10,
-        multiprocessors: attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
-        maximum_dynamic_shared_bytes: u64::from(attr(
-            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-        )),
-    };
-    for format in [Format::Q4K, Format::Q5K, Format::Iq4Xs] {
-        for (inputs, outputs) in [(256, 17), (768, 33), (5120, 17408)] {
-            verify(&stream, device, format, 1, inputs, outputs, false, true);
-        }
-        // Actual M8 remains the existing numeric and complete PDL path.
-        verify(&stream, device, format, 8, 768, 17, false, true);
-    }
+    verify(&stream, device, Format::Q4K, 8, 5120, 10240, true);
+    verify(&stream, device, Format::Q5K, 8, 6144, 5120, true);
 }

@@ -84,35 +84,6 @@ pub(super) fn qualify(plan: &PreparedUpstreamLinear) -> Result<MmvqLaunchKind, E
     }
 }
 
-fn boundary_eligible(plan: &PreparedUpstreamLinear) -> bool {
-    eligible(plan)
-        && plan.raw.request.rows == 1
-        && plan.q4_weight_decode == ferrum_types::Q4MmvqWeightDecode::Baseline
-        && plan.q5_weight_decode == ferrum_types::Q5MmvqWeightDecode::Baseline
-}
-
-pub(super) fn qualify_boundary(plan: &PreparedUpstreamLinear) -> Result<MmvqBoundaryKind, Error> {
-    if !boundary_eligible(plan) {
-        return Ok(MmvqBoundaryKind::F32Scratch);
-    }
-    #[cfg(all(feature = "cuda-upstream-linear", ferrum_native_mmvq_m1_f16_pdl))]
-    {
-        let mut supported = 0;
-        Error::from_status(unsafe {
-            ffi::ferrum_upstream_mmvq_m1_f16_pdl_support_v1(&plan.raw, &mut supported)
-        })?;
-        Ok(if supported == 0 {
-            MmvqBoundaryKind::F32Scratch
-        } else {
-            MmvqBoundaryKind::DirectF16
-        })
-    }
-    #[cfg(not(all(feature = "cuda-upstream-linear", ferrum_native_mmvq_m1_f16_pdl)))]
-    {
-        Ok(MmvqBoundaryKind::F32Scratch)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,7 +104,6 @@ mod tests {
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             mmvq_launch: MmvqLaunchKind::Ordered,
-            mmvq_boundary: MmvqBoundaryKind::F32Scratch,
         }
     }
     #[test]
@@ -193,63 +163,5 @@ mod tests {
             MmvqLaunchKind::Ordered.as_runtime_value(),
             MmvqLaunchKind::Programmatic.as_runtime_value()
         );
-    }
-    #[test]
-    fn mmvq_f16_boundary_eligibility_and_accounting_preserve_fallbacks() {
-        for format in [Format::Q4K, Format::Q5K, Format::Iq4Xs] {
-            assert!(boundary_eligible(&prepared(1, format)));
-            for rows in [2, 4, 8, 32] {
-                let p = prepared(rows, format)
-                    .with_automatic_mmvq_boundary()
-                    .unwrap();
-                assert_eq!(p.mmvq_boundary_kind(), MmvqBoundaryKind::F32Scratch);
-                assert_eq!(p.output_work_count(), 2);
-            }
-        }
-        for change in 0..8 {
-            let mut p = prepared(1, Format::Q4K);
-            match change {
-                0 => p.family = Family::Extra,
-                1 => p.arithmetic = Arithmetic::V1,
-                2 => p.raw.algorithm = Algorithm::Mmq as u32,
-                3 => p.raw.request.layout = Layout::Channels as u32,
-                4 => p.raw.ncols = 2,
-                5 => p.raw.channels = 2,
-                6 => p.raw.fixup_bytes = 4,
-                _ => p.q4_weight_decode = ferrum_types::Q4MmvqWeightDecode::SharedM8,
-            }
-            assert!(!boundary_eligible(&p));
-            assert_eq!(
-                p.with_automatic_mmvq_boundary()
-                    .unwrap()
-                    .mmvq_boundary_kind(),
-                MmvqBoundaryKind::F32Scratch
-            );
-        }
-        let mut p = prepared(1, Format::Q4K);
-        p.mmvq_launch = MmvqLaunchKind::Programmatic;
-        p.mmvq_boundary = MmvqBoundaryKind::DirectF16;
-        assert_eq!(p.pack_work_counts(), (2, 0));
-        assert_eq!(p.output_work_count(), 1);
-        assert_ne!(
-            MmvqBoundaryKind::DirectF16.as_runtime_value(),
-            MmvqBoundaryKind::F32Scratch.as_runtime_value()
-        );
-        assert_eq!(
-            p.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::Baseline)
-                .unwrap()
-                .mmvq_boundary_kind(),
-            MmvqBoundaryKind::F32Scratch
-        );
-    }
-
-    #[test]
-    #[cfg(not(all(feature = "cuda-upstream-linear", ferrum_native_mmvq_m1_f16_pdl)))]
-    fn mmvq_f16_boundary_old_archive_retains_f32_scratch() {
-        let p = prepared(1, Format::Q4K)
-            .with_automatic_mmvq_boundary()
-            .unwrap();
-        assert_eq!(p.mmvq_boundary_kind(), MmvqBoundaryKind::F32Scratch);
-        assert_eq!(p.mmvq_launch_kind(), MmvqLaunchKind::Ordered);
     }
 }

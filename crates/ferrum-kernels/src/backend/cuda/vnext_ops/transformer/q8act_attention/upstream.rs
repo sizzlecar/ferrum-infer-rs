@@ -388,8 +388,7 @@ impl<'a> PreparedAttentionProjections<'a> {
                 let (pack_kernels, pack_transfers) = native.pack_work_counts();
                 extra_dispatches = add(
                     extra_dispatches,
-                    pack_kernels + native.output_work_count() - 1
-                        + u64::from(native.geometry().fixup != 0),
+                    pack_kernels + 1 + u64::from(native.geometry().fixup != 0),
                 )?;
                 transfers = add(transfers, pack_transfers)?;
                 Some(validation)
