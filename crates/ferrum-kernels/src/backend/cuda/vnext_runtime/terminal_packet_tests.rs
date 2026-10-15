@@ -52,6 +52,7 @@ type Result<T> = std::result::Result<T, CudaDeviceRuntimeError>;
 enum Route {
     Scalar,
     AsyncPacket,
+    PooledPacket,
 }
 
 struct Packet {
@@ -121,6 +122,8 @@ struct Fixture {
     table: CudaDeviceBuffer,
     producer: CudaFunction,
     last_packet: Weak<Packet>,
+    pooled_host: Option<PinnedHostSlice<u32>>,
+    pool_returns: u64,
 }
 
 fn buffer(
@@ -191,7 +194,21 @@ impl Fixture {
             table,
             producer,
             last_packet: Weak::new(),
+            pooled_host: None,
+            pool_returns: 0,
         })
+    }
+
+    fn prepare_pool(&mut self) -> Result<u128> {
+        assert!(self.pooled_host.is_none());
+        let started = Instant::now();
+        let mut host = unsafe { self.stream.stream.context().alloc_pinned::<u32>(CAPACITY) }
+            .map_err(|e| CudaDeviceRuntimeError::driver("terminal packet cold pool pin", e))?;
+        host.as_mut_slice()
+            .map_err(|e| CudaDeviceRuntimeError::driver("terminal pool initialize", e))?
+            .fill(0xdeadbeef);
+        self.pooled_host = Some(host);
+        Ok(started.elapsed().as_nanos())
     }
 
     fn run(
@@ -252,9 +269,15 @@ impl Fixture {
             },
         )?;
         let mut commands = vec![producer];
-        let packet = if matches!(route, Route::AsyncPacket) {
-            let mut host = unsafe { self.stream.stream.context().alloc_pinned::<u32>(count) }
-                .map_err(|e| CudaDeviceRuntimeError::driver("terminal packet pin", e))?;
+        let packet = if !matches!(route, Route::Scalar) {
+            let mut host = if matches!(route, Route::PooledPacket) {
+                self.pooled_host.take().ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("terminal pinned pool is unavailable")
+                })?
+            } else {
+                unsafe { self.stream.stream.context().alloc_pinned::<u32>(count) }
+                    .map_err(|e| CudaDeviceRuntimeError::driver("terminal packet pin", e))?
+            };
             host.as_mut_slice()
                 .map_err(|e| CudaDeviceRuntimeError::driver("packet poison", e))?
                 .fill(0xdeadbeef);
@@ -325,9 +348,13 @@ impl Fixture {
             let host = packet.host.lock().map_err(|_| {
                 CudaDeviceRuntimeError::contract("terminal packet extract mutex poisoned")
             })?;
-            output[..count].copy_from_slice(
-                host.as_slice()
-                    .map_err(|e| CudaDeviceRuntimeError::driver("terminal packet extract", e))?,
+            let values = host
+                .as_slice()
+                .map_err(|e| CudaDeviceRuntimeError::driver("terminal packet extract", e))?;
+            output[..count].copy_from_slice(&values[..count]);
+            assert!(
+                values[count..].iter().all(|&word| word == 0xdeadbeef),
+                "inactive pinned packet tail changed"
             );
         } else {
             for (row, &(source, offset)) in mapping.iter().enumerate() {
@@ -343,7 +370,23 @@ impl Fixture {
         let extracted_ns = started.elapsed().as_nanos();
         drop(receipt);
         drop(pending);
-        drop(packet);
+        if let Some(packet) = packet {
+            if matches!(route, Route::PooledPacket) {
+                // No cached graph or old command may retain this wave's Packet.
+                // Only the pinned storage returns; all source mappings are fresh.
+                let packet = Arc::try_unwrap(packet).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("terminal packet still has an owner")
+                })?;
+                let host = packet.host.into_inner().map_err(|_| {
+                    CudaDeviceRuntimeError::contract("terminal pool return mutex poisoned")
+                })?;
+                assert!(self.pooled_host.is_none());
+                self.pooled_host = Some(host);
+                self.pool_returns += 1;
+            } else {
+                drop(packet);
+            }
+        }
         drop(event_start);
         drop(regions);
         drop(mapping);
@@ -437,15 +480,19 @@ fn scattered_terminal_packet_preserves_fresh_values_and_complete_transaction_pai
     .unwrap();
     let mut scalar = Fixture::new(&runtime).unwrap();
     let mut packet = Fixture::new(&runtime).unwrap();
+    let mut pooled = Fixture::new(&runtime).unwrap();
+    let pool_pin_ns = pooled.prepare_pool().unwrap();
     println!(
         "terminal_packet {}",
         json!({ "kind": "scope", "cold_setup_ns": cold_started.elapsed().as_nanos(),
         "scope": "backend fresh mapping/pin/producer enqueue/original fence/readback/extract/drop; excludes Core lane locks, admission, argmax, model execution and serving",
-        "producer": "same one-CTA fresh U32 writer plus pointer-table upload in both arms",
+        "producer": "same one-CTA fresh U32 writer plus pointer-table upload in all three arms",
         "graph_capture": false, "packet_reused_across_waves": false,
+        "pooled_storage_capacity_u32": CAPACITY, "pool_cold_pin_ns": pool_pin_ns,
+        "pooled_storage_rule": "only pinned allocation reused; fresh Packet and mappings each wave; return after successful original fence, extraction and last command drop",
         "persistent_source_capacity": CAPACITY, "source_allocations_per_arm": CAPACITY,
-        "timing_events": "one start and original completion fence per transaction; B additionally retains pinned DMA-use guard event",
-        "gpu_span_limit": "A span ends before scalar readbacks; B includes async copies. Only complete host total is comparable net transaction time" })
+        "timing_events": "one start and original completion fence per transaction; B/C additionally retain pinned DMA-use guard event",
+        "gpu_span_limit": "A span ends before scalar readbacks; B/C include async copies. Only complete host total is comparable net transaction time" })
     );
     for (generation, count) in [(1, 32), (2, 8), (3, 32)] {
         let a = scalar
@@ -462,8 +509,22 @@ fn scattered_terminal_packet_preserves_fresh_values_and_complete_transaction_pai
             )
             .unwrap();
         assert_eq!(a.0, b.0);
+        let c = pooled
+            .run(
+                &runtime,
+                Route::PooledPacket,
+                count,
+                generation,
+                100_000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(a.0, c.0);
         scalar.check_sources(&runtime).unwrap();
         packet.check_sources(&runtime).unwrap();
+        pooled.check_sources(&runtime).unwrap();
+        assert!(pooled.last_packet.upgrade().is_none());
+        assert!(pooled.pooled_host.is_some());
         assert!(
             packet.last_packet.upgrade().is_none(),
             "fresh pin survived terminal destruction"
@@ -471,31 +532,55 @@ fn scattered_terminal_packet_preserves_fresh_values_and_complete_transaction_pai
         println!(
             "terminal_packet {}",
             json!({ "kind": "correctness_transaction",
-            "first_sample": generation == 1, "a": a.1, "b": b.1 })
+            "first_sample": generation == 1, "a": a.1, "b": b.1, "c": c.1 })
         );
     }
     for count in [8, 32] {
         for pair in 0..8 {
             let generation = 1000 + count as u32 * 100 + pair * 16;
-            let (a, b) = if pair % 2 == 0 {
-                let a = measured_group(&mut scalar, &runtime, Route::Scalar, count, generation);
-                let b =
-                    measured_group(&mut packet, &runtime, Route::AsyncPacket, count, generation);
-                (a, b)
-            } else {
-                let b =
-                    measured_group(&mut packet, &runtime, Route::AsyncPacket, count, generation);
-                let a = measured_group(&mut scalar, &runtime, Route::Scalar, count, generation);
-                (a, b)
-            };
+            // All six permutations, then a reverse pair: each pair of arms
+            // appears in each relative order four times across eight rounds.
+            let (order, indices) = [
+                ("ABC", [0, 1, 2]),
+                ("CBA", [2, 1, 0]),
+                ("BCA", [1, 2, 0]),
+                ("ACB", [0, 2, 1]),
+                ("CAB", [2, 0, 1]),
+                ("BAC", [1, 0, 2]),
+                ("ABC", [0, 1, 2]),
+                ("CBA", [2, 1, 0]),
+            ][pair as usize];
+            let mut rows = [
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ];
+            for index in indices {
+                rows[index] = match index {
+                    0 => measured_group(&mut scalar, &runtime, Route::Scalar, count, generation),
+                    1 => {
+                        measured_group(&mut packet, &runtime, Route::AsyncPacket, count, generation)
+                    }
+                    2 => measured_group(
+                        &mut pooled,
+                        &runtime,
+                        Route::PooledPacket,
+                        count,
+                        generation,
+                    ),
+                    _ => unreachable!(),
+                };
+            }
             println!(
                 "terminal_packet {}",
                 json!({ "kind": "pair", "pair": pair,
-                "order": if pair % 2 == 0 { "AB" } else { "BA" }, "a": a, "b": b })
+                "order": order, "a": rows[0], "b": rows[1], "c": rows[2] })
             );
         }
         scalar.check_sources(&runtime).unwrap();
         packet.check_sources(&runtime).unwrap();
+        pooled.check_sources(&runtime).unwrap();
+        assert!(pooled.pooled_host.is_some());
     }
     // A safe injected partial enqueue error exercises actual quarantine retention.
     let mut failed = Fixture::new(&runtime).unwrap();
@@ -508,11 +593,41 @@ fn scattered_terminal_packet_preserves_fresh_values_and_complete_transaction_pai
     runtime.release_quarantine(failed.stream.id);
     failed.stream.state.synchronized();
     assert!(failed.last_packet.upgrade().is_none());
+    let mut failed_pool = Fixture::new(&runtime).unwrap();
+    failed_pool.prepare_pool().unwrap();
+    assert!(failed_pool
+        .run(&runtime, Route::PooledPacket, 32, 1001, 100_000, Some(3))
+        .is_err());
+    assert!(failed_pool.pooled_host.is_none());
+    assert!(failed_pool.last_packet.upgrade().is_some());
+    failed_pool.stream.stream.synchronize().unwrap();
+    runtime.release_quarantine(failed_pool.stream.id);
+    failed_pool.stream.state.synchronized();
+    assert!(failed_pool.last_packet.upgrade().is_none());
+    assert!(
+        failed_pool.pooled_host.is_none(),
+        "quarantined storage re-entered pool"
+    );
+    assert_eq!(failed_pool.pool_returns, 0);
+    assert!(failed_pool
+        .run(&runtime, Route::PooledPacket, 8, 1002, 0, None)
+        .is_err());
+    // Pool ownership destruction is a distinct cold/close lifecycle cost.
+    let pool_close_started = Instant::now();
+    drop(pooled.pooled_host.take());
+    println!(
+        "terminal_packet {}",
+        json!({ "kind": "pool_close",
+        "pool_unpin_ns": pool_close_started.elapsed().as_nanos(),
+        "successful_exclusive_returns": pooled.pool_returns,
+        "cold_pin_ns": pool_pin_ns })
+    );
     println!(
         "terminal_packet {}",
         json!({ "kind": "correctness",
         "fresh_values_and_order": true, "capacity_32_8_32": true,
         "all_source_bytes_and_guards": true, "partial_enqueue_retained_until_drain": true,
+        "pooled_partial_failure_never_returns_storage": true,
         "backend_only_no_core_cancellation_claim": true })
     );
 }
