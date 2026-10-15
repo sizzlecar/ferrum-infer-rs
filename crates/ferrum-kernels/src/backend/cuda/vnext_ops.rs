@@ -162,6 +162,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime/segment_oracle/packet.rs").as_bytes(),
         include_str!("vnext_runtime/segment_owners.rs").as_bytes(),
         include_str!("vnext_runtime/sequence_physical.rs").as_bytes(),
+        include_str!("vnext_runtime/terminal_readback.rs").as_bytes(),
         include_str!("vnext_ops/transformer/segment_bindings/physical.rs").as_bytes(),
         include_str!("../program_binding_rows.rs").as_bytes(),
         include_str!("../program_binding_upload.rs").as_bytes(),

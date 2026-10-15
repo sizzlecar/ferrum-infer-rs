@@ -53,6 +53,7 @@ enum Route {
     Scalar,
     AsyncPacket,
     PooledPacket,
+    ProductPacket,
 }
 
 struct Packet {
@@ -122,6 +123,7 @@ struct Fixture {
     table: CudaDeviceBuffer,
     producer: CudaFunction,
     last_packet: Weak<Packet>,
+    last_product_packet: Option<Weak<dyn std::any::Any + Send + Sync>>,
     pooled_host: Option<PinnedHostSlice<u32>>,
     pool_returns: u64,
 }
@@ -194,6 +196,7 @@ impl Fixture {
             table,
             producer,
             last_packet: Weak::new(),
+            last_product_packet: None,
             pooled_host: None,
             pool_returns: 0,
         })
@@ -269,7 +272,7 @@ impl Fixture {
             },
         )?;
         let mut commands = vec![producer];
-        let packet = if !matches!(route, Route::Scalar) {
+        let packet = if matches!(route, Route::AsyncPacket | Route::PooledPacket) {
             let mut host = if matches!(route, Route::PooledPacket) {
                 self.pooled_host.take().ok_or_else(|| {
                     CudaDeviceRuntimeError::contract("terminal pinned pool is unavailable")
@@ -292,6 +295,21 @@ impl Fixture {
                 move |stream, regions| retained.enqueue(stream, regions, fail_after),
             )?);
             Some(packet)
+        } else {
+            None
+        };
+        let product_payload = if matches!(route, Route::ProductPacket) {
+            let (tail, payload) =
+                terminal_readback::prepare_regions(runtime, &mut self.stream, regions.clone())?
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract("product terminal pool declined")
+                    })?;
+            if let Some(after) = fail_after {
+                terminal_readback::inject_failure(&payload, after);
+            }
+            self.last_product_packet = Some(Arc::downgrade(&payload));
+            commands.push(tail);
+            Some(payload)
         } else {
             None
         };
@@ -356,7 +374,7 @@ impl Fixture {
                 values[count..].iter().all(|&word| word == 0xdeadbeef),
                 "inactive pinned packet tail changed"
             );
-        } else {
+        } else if matches!(route, Route::Scalar) {
             for (row, &(source, offset)) in mapping.iter().enumerate() {
                 let bytes = runtime.readback(
                     pending.stream,
@@ -367,9 +385,16 @@ impl Fixture {
                 output[row] = u32::from_le_bytes(bytes.try_into().unwrap());
             }
         }
-        let extracted_ns = started.elapsed().as_nanos();
         drop(receipt);
         drop(pending);
+        if let Some(payload) = product_payload {
+            let values = runtime
+                .finish_terminal_u32_readbacks(payload)
+                .expect("CUDA accepted product terminal packet")?;
+            assert_eq!(values.len(), count);
+            output[..count].copy_from_slice(&values);
+        }
+        let extracted_ns = started.elapsed().as_nanos();
         if let Some(packet) = packet {
             if matches!(route, Route::PooledPacket) {
                 // No cached graph or old command may retain this wave's Packet.
@@ -629,5 +654,135 @@ fn scattered_terminal_packet_preserves_fresh_values_and_complete_transaction_pai
         "all_source_bytes_and_guards": true, "partial_enqueue_retained_until_drain": true,
         "pooled_partial_failure_never_returns_storage": true,
         "backend_only_no_core_cancellation_claim": true })
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device; actual terminal prepare/tail/finish lifecycle"]
+fn product_terminal_packet_reuses_only_after_original_fence() {
+    let runtime = CudaDeviceRuntime::new(
+        crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config(
+            0,
+            DeviceId::new("device.test.product-terminal-packet").unwrap(),
+            AttentionExecutionPolicy::Portable,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut scalar = Fixture::new(&runtime).unwrap();
+    let mut product = Fixture::new(&runtime).unwrap();
+    assert!(terminal_readback::available_storage(&product.stream).is_none());
+    assert!(
+        terminal_readback::prepare_regions(&runtime, &mut product.stream, Vec::new())
+            .unwrap()
+            .is_none()
+    );
+    let one_source = product.sources[0].region(4..8).unwrap();
+    assert!(terminal_readback::prepare_regions(
+        &runtime,
+        &mut product.stream,
+        vec![one_source; CAPACITY + 1]
+    )
+    .unwrap()
+    .is_none());
+    let wrong_element = product.table.region(4..8).unwrap();
+    assert!(
+        terminal_readback::prepare_regions(&runtime, &mut product.stream, vec![wrong_element])
+            .is_err()
+    );
+    assert!(terminal_readback::available_storage(&product.stream).is_none());
+    for (generation, count) in [(11, 32), (12, 8), (13, 32)] {
+        let reference = scalar
+            .run(&runtime, Route::Scalar, count, generation, 100_000, None)
+            .unwrap();
+        let actual = product
+            .run(
+                &runtime,
+                Route::ProductPacket,
+                count,
+                generation,
+                100_000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(actual.0, reference.0);
+        scalar.check_sources(&runtime).unwrap();
+        product.check_sources(&runtime).unwrap();
+        assert!(product
+            .last_product_packet
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .is_none());
+        let storage = terminal_readback::available_storage(&product.stream).unwrap();
+        assert_eq!(storage.len(), CAPACITY);
+        assert_eq!(&storage[..count], &actual.0[..count]);
+        assert!(storage[count..].iter().all(|&v| v == 0xdeadbeef));
+        println!(
+            "terminal_packet_product {}",
+            json!({
+                "participants": count, "generation": generation,
+                "actual_product_prepare_tail_finish": true,
+                "all_values_order_and_source_guards": true,
+                "inactive_capacity_poison_preserved": true,
+                "no_core_batch_or_submit_integration_claim": true,
+                "a": reference.1, "b": actual.1,
+            })
+        );
+    }
+    // A prepared packet checks out the only storage. Decline another prepare
+    // without allocating a second pin; early finish cannot consume live work.
+    let regions = vec![product.sources[0].region(4..8).unwrap()];
+    let (tail, payload) =
+        terminal_readback::prepare_regions(&runtime, &mut product.stream, regions.clone())
+            .unwrap()
+            .unwrap();
+    assert!(
+        terminal_readback::prepare_regions(&runtime, &mut product.stream, regions.clone())
+            .unwrap()
+            .is_none()
+    );
+    assert!(runtime
+        .finish_terminal_u32_readbacks(Arc::clone(&payload))
+        .unwrap()
+        .is_err());
+    drop(tail);
+    drop(payload);
+    assert!(
+        terminal_readback::prepare_regions(&runtime, &mut product.stream, regions)
+            .unwrap()
+            .is_none(),
+        "discarded packet must not silently allocate or recycle"
+    );
+
+    let mut failed = Fixture::new(&runtime).unwrap();
+    assert!(failed
+        .run(&runtime, Route::ProductPacket, 32, 21, 100_000, Some(3))
+        .is_err());
+    assert!(failed
+        .last_product_packet
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .is_some());
+    assert!(terminal_readback::available_storage(&failed.stream).is_none());
+    failed.stream.stream.synchronize().unwrap();
+    runtime.release_quarantine(failed.stream.id);
+    failed.stream.state.synchronized();
+    assert!(failed
+        .last_product_packet
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .is_none());
+    assert!(terminal_readback::available_storage(&failed.stream).is_none());
+    println!(
+        "terminal_packet_product {}",
+        json!({
+            "kind": "lifecycle", "pool_busy_declines_before_enqueue": true,
+            "premature_finish_rejected": true, "discarded_pin_not_reallocated": true,
+            "partial_failure_retained_until_quarantine_drain": true,
+            "failed_pin_not_recycled": true,
+        })
     );
 }

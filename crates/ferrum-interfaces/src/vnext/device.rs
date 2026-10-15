@@ -16,6 +16,10 @@ pub use immutable_metadata::{
 };
 mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
+mod terminal_readback;
+pub use terminal_readback::{
+    DevicePreparedTerminalReadback, DeviceScalarU32ReadbackBatch, DeviceScalarU32ReadbackSource,
+};
 
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
@@ -3292,6 +3296,7 @@ impl<C> DeviceCommandEntry<C> {
 #[must_use = "encoded device command batches must be submitted"]
 pub struct DeviceCommandBatch<C> {
     commands: Vec<DeviceCommandEntry<C>>,
+    terminal_readback: Option<C>,
     timing_mode: DeviceTimingMode,
     compute_path_requirement: DeviceComputePathRequirement,
     declared_eager_compute_node_indices: Vec<u32>,
@@ -3313,6 +3318,7 @@ impl<C> DeviceCommandBatch<C> {
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
+            terminal_readback: None,
         }
     }
 
@@ -3324,6 +3330,7 @@ impl<C> DeviceCommandBatch<C> {
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
+            terminal_readback: None,
         }
     }
 
@@ -3335,6 +3342,7 @@ impl<C> DeviceCommandBatch<C> {
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
+            terminal_readback: None,
         }
     }
 
@@ -3350,6 +3358,7 @@ impl<C> DeviceCommandBatch<C> {
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
+            terminal_readback: None,
         }
     }
 
@@ -3514,6 +3523,21 @@ impl<C> DeviceCommandBatch<C> {
 
     pub const fn attribution_requirement(&self) -> DeviceSubmissionAttributionRequirement {
         self.attribution_requirement
+    }
+
+    pub(crate) fn set_terminal_readback(&mut self, command: C) -> Result<(), VNextError> {
+        if self.terminal_readback.is_some() {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "submission already has a terminal readback tail".to_owned(),
+            });
+        }
+        self.terminal_readback = Some(command);
+        Ok(())
+    }
+
+    /// Supporting backends take this separately from captured/model commands.
+    pub fn take_terminal_readback(&mut self) -> Option<C> {
+        self.terminal_readback.take()
     }
 
     pub fn into_commands(self) -> Vec<C> {
@@ -3964,6 +3988,30 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         region: CopyRegion,
         output_layout: HostTransferLayout,
     ) -> Result<Vec<u8>, Self::Error>;
+
+    /// Prepare without enqueuing anything. None declines the entire packet
+    /// before submission and preserves ordinary readback. A supporting runtime
+    /// must take the batch's separate terminal tail, enqueue it after all model
+    /// work and before the original fence, and retain it on indeterminate work.
+    fn prepare_terminal_u32_readbacks(
+        &self,
+        _stream: &mut Self::Stream,
+        _request: DeviceScalarU32ReadbackBatch<'_, Self::Buffer>,
+    ) -> Result<Option<DevicePreparedTerminalReadback<Self::Command>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Core calls this only after a successful original fence and after dropping
+    /// that fence's commands. Consume this wave's payload, extract exactly the
+    /// declared scalar count, then reclaim storage only with exclusive ownership.
+    /// No GPU work or scalar fallback is permitted here. None after a successful
+    /// prepare is a contract failure. Other terminal paths simply discard state.
+    fn finish_terminal_u32_readbacks(
+        &self,
+        _payload: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<Result<Vec<u32>, Self::Error>> {
+        None
+    }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError>;
 }

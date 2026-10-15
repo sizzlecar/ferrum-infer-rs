@@ -253,6 +253,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub program_binding_upload_strategy: Option<ferrum_types::ProgramBindingUploadStrategy>,
 
+    /// Optional batched terminal U32 token transfers; synchronous by default.
+    #[serde(default)]
+    pub completion_readback_policy: Option<ferrum_types::CompletionReadbackPolicy>,
+
     /// Fresh decode-segment owner representation. Indexed requires a CUDA plan runtime.
     #[serde(default)]
     pub segment_binding_owner_view_mode: Option<ferrum_types::SegmentBindingOwnerViewMode>,
@@ -512,6 +516,12 @@ impl RuntimeCliConfig {
             "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
             self.program_binding_upload_strategy
                 .map(ferrum_types::ProgramBindingUploadStrategy::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::COMPLETION_READBACK_POLICY_CONFIG_KEY,
+            self.completion_readback_policy
+                .map(ferrum_types::CompletionReadbackPolicy::as_runtime_value),
         );
         push_string_entry(
             &mut entries,
@@ -1265,6 +1275,27 @@ mod tests {
         }
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\ninvocation_preparation_strategy = \"automatic\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn completion_readback_policy_config_file_parses_explicit_policy() {
+        for policy in ["synchronous", "batched-u32"] {
+            let config: CliConfig = toml::from_str(&format!(
+                "[runtime]\ncompletion_readback_policy = \"{policy}\"\n",
+            ))
+            .unwrap();
+            let entries = config.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == ferrum_types::COMPLETION_READBACK_POLICY_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, policy);
+            assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        }
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\ncompletion_readback_policy = \"automatic\"\n",
         )
         .is_err());
     }

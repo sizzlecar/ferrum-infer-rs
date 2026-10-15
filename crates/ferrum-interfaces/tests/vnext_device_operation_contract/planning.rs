@@ -280,23 +280,35 @@ pub(crate) fn resolved_model_plan_with_zero_state(
 }
 
 fn test_raw_config(state_profile: TestStateProfile) -> Value {
+    if state_profile.scalar_u32_state {
+        assert!(
+            state_profile.zero_state
+                && !state_profile.token_scaled_state
+                && !state_profile.recurrent_state
+        );
+        return json!({"width":4,"zero_state":true,"scalar_u32_state":true});
+    }
     match state_profile {
         TestStateProfile {
+            scalar_u32_state: false,
             zero_state: false,
             token_scaled_state: false,
             recurrent_state: false,
         } => json!({"width": 4}),
         TestStateProfile {
+            scalar_u32_state: false,
             zero_state: true,
             token_scaled_state: false,
             recurrent_state: false,
         } => json!({"width": 4, "zero_state": true}),
         TestStateProfile {
+            scalar_u32_state: false,
             zero_state: true,
             token_scaled_state: true,
             recurrent_state: false,
         } => json!({"width": 4, "zero_state": true, "token_scaled_state": true}),
         TestStateProfile {
+            scalar_u32_state: false,
             zero_state: true,
             token_scaled_state: true,
             recurrent_state: true,
@@ -1072,6 +1084,18 @@ fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
         execution_semantics,
         execution_determinism,
         retain_determinism_outputs,
+    )
+}
+
+pub(crate) fn fixture_with_scalar_u32_readback() -> Fixture {
+    let mut profile = TestStateProfile::fixed_sequence();
+    profile.scalar_u32_state = true;
+    fixture_with_provider_behavior_execution_semantics_retention_and_storage(
+        profile,
+        ProviderBehavior::Success,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
     )
 }
 

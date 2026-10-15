@@ -128,6 +128,8 @@ pub(crate) struct TestConfig {
     #[serde(default)]
     pub(crate) zero_state: bool,
     #[serde(default)]
+    pub(crate) scalar_u32_state: bool,
+    #[serde(default)]
     pub(crate) token_scaled_state: bool,
     #[serde(default)]
     pub(crate) recurrent_state: bool,
@@ -138,6 +140,7 @@ pub(crate) struct TestConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TestStateProfile {
     pub(crate) zero_state: bool,
+    pub(crate) scalar_u32_state: bool,
     pub(crate) token_scaled_state: bool,
     pub(crate) recurrent_state: bool,
 }
@@ -148,6 +151,7 @@ impl TestStateProfile {
             zero_state: false,
             token_scaled_state: false,
             recurrent_state: false,
+            scalar_u32_state: false,
         }
     }
 
@@ -156,6 +160,7 @@ impl TestStateProfile {
             zero_state: true,
             token_scaled_state: false,
             recurrent_state: false,
+            scalar_u32_state: false,
         }
     }
 
@@ -164,6 +169,7 @@ impl TestStateProfile {
             zero_state: true,
             token_scaled_state: true,
             recurrent_state: false,
+            scalar_u32_state: false,
         }
     }
 
@@ -172,6 +178,7 @@ impl TestStateProfile {
             zero_state: true,
             token_scaled_state: true,
             recurrent_state: true,
+            scalar_u32_state: false,
         }
     }
 
@@ -319,7 +326,11 @@ impl ModelFamilyProvider for TestFamily {
                 value_id: id("value.state"),
                 tensor: ProgramTensorSpec {
                     dimensions: vec![config.width],
-                    element_type: ElementType::U8,
+                    element_type: if config.scalar_u32_state {
+                        ElementType::U32
+                    } else {
+                        ElementType::U8
+                    },
                     layout: ResolvedTensorLayout::Contiguous,
                 },
                 lifetime: StateLifetime::Sequence,
@@ -550,6 +561,7 @@ fn operation_with_resource_options_and_work(
             zero_state,
             token_scaled_state,
             recurrent_state: false,
+            scalar_u32_state: false,
         },
         scratch,
     )
@@ -569,7 +581,11 @@ fn operation_with_resource_profile(
     ];
     if state_profile.zero_state {
         inputs.push(typed_tensor_contract(
-            ElementType::U8,
+            if state_profile.scalar_u32_state {
+                ElementType::U32
+            } else {
+                ElementType::U8
+            },
             TensorAccess::ReadWrite,
         ));
     }
@@ -1302,12 +1318,30 @@ pub(crate) fn node_values_with_state_profile_for(
                 id("value.state"),
                 ResolvedValueRole::Input,
                 2,
-                resolved_tensor_for(ElementType::U8),
+                resolved_tensor_for(if state_profile.scalar_u32_state {
+                    ElementType::U32
+                } else {
+                    ElementType::U8
+                }),
                 TensorAccess::ReadWrite,
                 AliasPolicy::NoAlias,
                 BufferUsage::State,
                 None,
-                ResolvedValueStorage::single(id("resource.state"), 0, 4, ElementType::U8).unwrap(),
+                ResolvedValueStorage::single(
+                    id("resource.state"),
+                    0,
+                    if state_profile.scalar_u32_state {
+                        16
+                    } else {
+                        4
+                    },
+                    if state_profile.scalar_u32_state {
+                        ElementType::U32
+                    } else {
+                        ElementType::U8
+                    },
+                )
+                .unwrap(),
             )
             .unwrap(),
         );
@@ -1375,7 +1409,30 @@ pub(crate) enum TestCommand {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TestFence(u64, DeviceTimingMode, Option<DeviceSubmissionAttribution>);
+pub(crate) struct TestFence(
+    u64,
+    DeviceTimingMode,
+    Option<DeviceSubmissionAttribution>,
+    Option<Arc<TestTerminalPacket>>,
+);
+
+pub(crate) struct TestTerminalPacket {
+    values: Vec<u32>,
+    _retentions: Vec<DeviceBufferRetention>,
+    drops: Arc<AtomicU64>,
+}
+impl fmt::Debug for TestTerminalPacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestTerminalPacket")
+            .field("values", &self.values)
+            .finish()
+    }
+}
+impl Drop for TestTerminalPacket {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 impl TestFence {
     fn terminal_receipt(
@@ -1475,6 +1532,14 @@ struct TestSegmentProgram(Vec<(u32, usize, usize)>);
 
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) terminal_readback_enabled: bool,
+    pub(crate) terminal_prepare_calls: usize,
+    pub(crate) terminal_finish_calls: usize,
+    pub(crate) terminal_tail_calls: usize,
+    pub(crate) terminal_bad_count: bool,
+    pub(crate) terminal_source_offsets: Vec<u64>,
+    pub(crate) terminal_packet_drops: Arc<AtomicU64>,
+    terminal_pending: std::sync::Weak<TestTerminalPacket>,
     pub(crate) segment_metadata_enabled: bool,
     pub(crate) segment_foreign_runtime_metadata: bool,
     pub(crate) segment_encoder_enabled: bool,
@@ -2217,7 +2282,7 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        commands: DeviceCommandBatch<Self::Command>,
+        mut commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
@@ -2231,6 +2296,16 @@ impl DeviceRuntime for TestRuntime {
             .collect::<BTreeSet<_>>();
         let attribution_requirement = commands.attribution_requirement();
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
+        let terminal_tail = commands.take_terminal_readback();
+        let terminal_packet = terminal_tail.map(|tail| {
+            assert_eq!(tail, TestCommand::Copy);
+            let mut trace = self.trace.lock().unwrap();
+            trace.terminal_tail_calls += 1;
+            trace
+                .terminal_pending
+                .upgrade()
+                .expect("tail must retain its fresh packet")
+        });
         let entries = commands.into_entries();
         let mut compute_command_count = 0_usize;
         let mut replayed_compute_command_count = 0_usize;
@@ -2345,7 +2420,7 @@ impl DeviceRuntime for TestRuntime {
             (
                 trace.drift_on_submit,
                 trace.submit_behavior,
-                TestFence(trace.next_fence, timing_mode, attribution),
+                TestFence(trace.next_fence, timing_mode, attribution, terminal_packet),
             )
         };
         match behavior {
@@ -2430,6 +2505,57 @@ impl DeviceRuntime for TestRuntime {
         } else {
             Ok(())
         }
+    }
+
+    fn prepare_terminal_u32_readbacks(
+        &self,
+        _stream: &mut Self::Stream,
+        request: DeviceScalarU32ReadbackBatch<'_, Self::Buffer>,
+    ) -> Result<Option<DevicePreparedTerminalReadback<Self::Command>>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        trace.terminal_prepare_calls += 1;
+        if !trace.terminal_readback_enabled {
+            return Ok(None);
+        }
+        let mut retentions = Vec::new();
+        for source in request.sources() {
+            assert_eq!(source.descriptor(), &source.buffer().descriptor);
+            assert_eq!(source.descriptor().element_type, ElementType::U32);
+            assert_eq!(source.region().length_bytes(), 4);
+            trace
+                .terminal_source_offsets
+                .push(source.region().source_offset_bytes());
+            retentions.push(source.retention().clone());
+        }
+        let packet = Arc::new(TestTerminalPacket {
+            values: vec![0; request.sources().len()],
+            _retentions: retentions,
+            drops: Arc::clone(&trace.terminal_packet_drops),
+        });
+        trace.terminal_pending = Arc::downgrade(&packet);
+        Ok(Some(DevicePreparedTerminalReadback::new(
+            TestCommand::Copy,
+            packet,
+        )))
+    }
+
+    fn finish_terminal_u32_readbacks(
+        &self,
+        payload: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<Result<Vec<u32>, Self::Error>> {
+        let packet = payload
+            .downcast::<TestTerminalPacket>()
+            .expect("exact runtime packet");
+        let mut packet = Arc::try_unwrap(packet)
+            .expect("original fence/command owners must be gone before finish");
+        let mut trace = self.trace.lock().unwrap();
+        assert!(trace.wait_fence_calls > 0);
+        trace.terminal_finish_calls += 1;
+        let mut values = std::mem::take(&mut packet.values);
+        if trace.terminal_bad_count {
+            values.push(0);
+        }
+        Some(Ok(values))
     }
 
     fn readback(

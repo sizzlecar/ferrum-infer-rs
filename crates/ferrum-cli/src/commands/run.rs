@@ -883,6 +883,10 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
 
+    /// Completion transfers: synchronous (default) or batched-u32 when supported.
+    #[arg(long, value_enum)]
+    pub completion_readback_policy: Option<crate::commands::CompletionReadbackPolicyArg>,
+
     /// Fresh decode-segment owner views (default: legacy). Indexed requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub segment_binding_owner_view_mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
@@ -2756,6 +2760,12 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        ferrum_types::COMPLETION_READBACK_POLICY_CONFIG_KEY,
+        cmd.completion_readback_policy
+            .map(crate::commands::CompletionReadbackPolicyArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
         cmd.segment_binding_owner_view_mode
             .map(crate::commands::SegmentBindingOwnerViewModeArg::as_runtime_value),
@@ -3268,6 +3278,7 @@ mod tests {
             prefill_decode_execution: None,
             invocation_preparation_strategy: None,
             program_binding_upload_strategy: None,
+            completion_readback_policy: None,
             segment_binding_owner_view_mode: None,
             causal_decode_preparation_mode: None,
             causal_decode_attention_grouping: None,
@@ -3304,6 +3315,39 @@ mod tests {
             request_dump_dir: None,
             profile_sample_rate: crate::observability_product::default_profile_sample_rate(),
             output_format: OutputFormat::Text,
+        }
+    }
+
+    #[test]
+    fn completion_readback_policy_run_override_reaches_engine_config() {
+        use crate::commands::CompletionReadbackPolicyArg;
+        use ferrum_types::CompletionReadbackPolicy;
+        let mut command = test_run_cmd();
+        let config_entries = crate::config::RuntimeCliConfig {
+            completion_readback_policy: Some(CompletionReadbackPolicy::BatchedU32),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, expected) in [
+            (None, CompletionReadbackPolicy::BatchedU32),
+            (
+                Some(CompletionReadbackPolicyArg::Synchronous),
+                CompletionReadbackPolicy::Synchronous,
+            ),
+            (
+                Some(CompletionReadbackPolicyArg::BatchedU32),
+                CompletionReadbackPolicy::BatchedU32,
+            ),
+        ] {
+            command.completion_readback_policy = option;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.completion_readback_policy, expected);
         }
     }
 

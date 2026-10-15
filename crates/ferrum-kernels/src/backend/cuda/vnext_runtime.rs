@@ -57,6 +57,7 @@ mod compact_upload_scatter_tests;
 mod segment_oracle;
 mod segment_owners;
 mod sequence_physical;
+mod terminal_readback;
 use segment_owners::CudaProgramBindingRetention;
 pub(crate) use segment_owners::{CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, CudaSegmentRange};
 pub(crate) use sequence_physical::{
@@ -2636,6 +2637,7 @@ pub struct CudaDeviceStream {
     blas: Arc<CudaBlas>,
     state: Arc<CudaStreamState>,
     executable_cache: CudaExecutableCache,
+    terminal_readback_pool: Arc<terminal_readback::Pool>,
 }
 
 impl fmt::Debug for CudaDeviceStream {
@@ -4587,6 +4589,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             blas,
             state: Arc::new(CudaStreamState::new()),
             executable_cache: CudaExecutableCache::new(),
+            terminal_readback_pool: Arc::new(terminal_readback::Pool::new()),
         })
     }
 
@@ -5063,7 +5066,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn submit_with_timing<S>(
         &self,
         stream: &mut Self::Stream,
-        commands: DeviceCommandBatch<Self::Command>,
+        mut commands: DeviceCommandBatch<Self::Command>,
         timing_sink: &S,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>
     where
@@ -5077,6 +5080,19 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if commands.is_empty() {
             return Err(DefinitelyNotSubmitted::new(
                 CudaDeviceRuntimeError::contract("CUDA command batch is empty"),
+            ));
+        }
+        let mut terminal_readback = commands.take_terminal_readback();
+        if terminal_readback.as_ref().is_some_and(|tail| {
+            tail.runtime_instance != self.runtime_instance
+                || tail.replay_key.is_some()
+                || tail.reusable_execution.is_some()
+                || !tail.completion_checks.is_empty()
+        }) {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "CUDA terminal readback tail is foreign or replayable",
+                ),
             ));
         }
         let timing_mode = commands.timing_mode();
@@ -5166,7 +5182,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 .map(|(_, node_index, _)| *node_index)
                 .collect::<Vec<_>>()
         });
-        let commands = entries
+        let mut commands = entries
             .into_iter()
             .map(|(_, _, command)| command)
             .collect::<Vec<_>>();
@@ -5705,6 +5721,19 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 "CUDA submission became indeterminate while snapshotting numerical status: {error}"
             );
         }
+        // This fresh host destination is deliberately outside every captured
+        // segment and its logical attribution. Keep all tail owners through
+        // the original fence, or through quarantine after any partial enqueue.
+        if let Some(tail) = terminal_readback.as_ref() {
+            if let Err(error) = tail.enqueue(&stream.stream, &stream.blas) {
+                commands.push(terminal_readback.take().expect("present terminal tail"));
+                stream.state.fail();
+                self.quarantine(stream, commands);
+                panic!(
+                    "CUDA submission became indeterminate while copying terminal outputs: {error}"
+                );
+            }
+        }
         drop(enqueue_stage);
         if S::ENABLED {
             timing_sink.record_reusable_execution(replay_observation);
@@ -5726,6 +5755,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             None => None,
             Some(Ok(attribution)) => Some(attribution),
             Some(Err(error)) => {
+                if let Some(tail) = terminal_readback.take() {
+                    commands.push(tail);
+                }
                 stream.state.fail();
                 self.quarantine(stream, commands);
                 panic!(
@@ -5749,6 +5781,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 },
             ),
         };
+        if let Some(tail) = terminal_readback.take() {
+            commands.push(tail);
+        }
 
         let fence_stage = CudaSubmissionStageTimer::start(
             timing_sink,
@@ -5853,6 +5888,24 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 ))
             }
         }
+    }
+
+    fn prepare_terminal_u32_readbacks(
+        &self,
+        stream: &mut Self::Stream,
+        request: ferrum_interfaces::vnext::DeviceScalarU32ReadbackBatch<'_, Self::Buffer>,
+    ) -> Result<
+        Option<ferrum_interfaces::vnext::DevicePreparedTerminalReadback<Self::Command>>,
+        Self::Error,
+    > {
+        terminal_readback::prepare(self, stream, request)
+    }
+
+    fn finish_terminal_u32_readbacks(
+        &self,
+        payload: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Option<Result<Vec<u32>, Self::Error>> {
+        Some(terminal_readback::finish(self, payload))
     }
 
     fn readback(
