@@ -193,38 +193,65 @@ fn execute(
         .unwrap()
         .unwrap();
         let catalog = lane.reusable_execution_catalog().unwrap();
-        if let Some(replay) = catalog
+        let replay = catalog
             .programs()
             .iter()
             .find(|p| p.program_id() == &program_id)
-        {
-            if replay.is_determinism_ready() {
-                installing = OperationDispatch::try_compile_resident_decode(
-                    Arc::clone(reservation),
-                    executable,
-                    &wave,
-                    &topology,
-                    replay,
-                    lane,
-                )
-                .unwrap();
-            }
+            .filter(|p| p.is_determinism_ready());
+        if let Some(replay) = replay {
+            installing = OperationDispatch::try_compile_resident_decode(
+                Arc::clone(reservation),
+                executable,
+                &wave,
+                &topology,
+                replay,
+                lane,
+            )
+            .unwrap();
         }
-        let profiled = OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
-            fixture.providers.providers(),
-            executable,
-            &identity,
-            active.iter(),
-            DeviceTimingMode::Off,
-            &uploads,
-            SubmissionExecutionPolicy::adaptive(),
-            InvocationPreparationStrategy::DecodeSegmentProgram,
-            &Quiet,
-            &Preparation::default(),
-            wave,
-            lane,
-            &fixture.reaper,
-        )
+        println!(
+            "{}",
+            serde_json::json!({"kind":"resident_bootstrap_preparation",
+            "source_start":ranges[0].start,"replay_ready":replay.is_some(),
+            "cold_compile_attempted":replay.is_some(),"resident_compiled":installing.is_some()})
+        );
+        // As in the ordinary fixture's Path::Replay, a ready catalog must use
+        // the direct reusable entry: this path publishes the complete segment
+        // binding recipe after successful completion and retirement.
+        let profiled = if let Some(replay) = replay {
+            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
+                fixture.providers.providers(),
+                executable,
+                &identity,
+                active.iter(),
+                DeviceTimingMode::Off,
+                &uploads,
+                replay,
+                SubmissionExecutionPolicy::determinism_replayed(0xa5),
+                InvocationPreparationStrategy::DecodeSegmentProgram,
+                &Quiet,
+                &Preparation::default(),
+                wave,
+                lane,
+                &fixture.reaper,
+            )
+        } else {
+            OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
+                fixture.providers.providers(),
+                executable,
+                &identity,
+                active.iter(),
+                DeviceTimingMode::Off,
+                &uploads,
+                SubmissionExecutionPolicy::adaptive(),
+                InvocationPreparationStrategy::DecodeSegmentProgram,
+                &Quiet,
+                &Preparation::default(),
+                wave,
+                lane,
+                &fixture.reaper,
+            )
+        }
         .unwrap();
         (profiled, Retire::Bootstrap(step))
     };
