@@ -642,7 +642,7 @@ fn compare(kind: AttentionKind) {
                     Arc::from(&tokens[0][..=position]),
                     position + 1
                 ),
-                position / 16 + 1
+                u64::try_from(position / 16 + 1).unwrap()
             );
         }
         assert_eq!(
