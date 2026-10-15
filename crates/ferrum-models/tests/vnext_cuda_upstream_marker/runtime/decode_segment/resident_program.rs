@@ -132,7 +132,7 @@ fn execute(
             ._composition
             ._runtime
             .segment_binding_indexed_encodes();
-        let profiled = OperationDispatch::encode_and_submit_resident_decode_with_inputs(
+        let submission = OperationDispatch::encode_and_submit_resident_decode_with_inputs(
             program,
             executable,
             &identity,
@@ -142,8 +142,25 @@ fn execute(
             &fixture.reaper,
             DeviceTimingMode::Off,
             &Quiet,
-        )
-        .unwrap();
+        );
+        let profiled = match submission {
+            Ok(profiled) => profiled,
+            Err(ResidentDecodeDispatchError::Unavailable { use_ }) => {
+                assert_eq!(
+                    fixture
+                        ._composition
+                        ._runtime
+                        .resident_decode_program_encodes(),
+                    before,
+                    "a topology miss must precede resident encoding"
+                );
+                drop((use_, identity, active));
+                retirement.try_rollback_unsubmitted().unwrap();
+                assert!(program.is_idle());
+                return None;
+            }
+            Err(error) => panic!("resident submission failed: {error:?}"),
+        };
         assert_eq!(
             fixture
                 ._composition
@@ -472,12 +489,15 @@ fn readbacks(
     }
     let resource = attention.binding_resource().unwrap().clone();
     names.insert(resource.clone(), "binding_parameters".into());
-    let row_bytes = if fixture
+    let row_bytes = if let Some(state) = fixture
         .states
         .iter()
-        .any(|state| state.id.as_str() == "state.kv")
+        .find(|state| state.id.as_str() == "state.kv")
     {
-        88
+        let StateCapacityDemand::TokenScaled { maximum_tokens, .. } = state.capacity_demand else {
+            panic!("causal KV must declare token-scaled capacity")
+        };
+        24 + maximum_tokens.div_ceil(16) * 8
     } else {
         16
     };
@@ -711,4 +731,172 @@ fn resident_decode_program_gdn_matches_ordinary_with_fresh_frames() {
 #[ignore = "requires exclusive CUDA, unchanged graph and real append-only KV growth"]
 fn resident_decode_program_causal_refreshes_sixteen_token_pages_without_recapture() {
     compare(AttentionKind::Causal);
+}
+
+/// M1 uses the native partition envelope even with fixed-capacity grouping.
+/// Crossing it must release the unsubmitted frame and let ordinary execution
+/// capture the new native graph before any resident replay can resume.
+fn compare_native_partition_boundary(boundary: usize) {
+    let fixtures = [0, 1].map(|_| {
+        Fixture::for_family_with_decode_attention_grouping(
+            AttentionKind::Causal,
+            true,
+            1,
+            Family::new(AttentionKind::Causal)
+                .with_maximum_tokens((boundary + 32) as u64)
+                .with_causal_sixteen_token_pages(),
+            ProgramBindingUploadStrategy::CompactScatter,
+            SegmentBindingOracleMode::Disabled,
+            SegmentBindingOwnerViewMode::Indexed,
+            ferrum_types::AttentionExecutionPolicy::NativeAdaptive,
+            ferrum_types::CausalDecodePreparationMode::Packed,
+            ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
+        )
+    });
+    let tokens: Vec<Arc<[u32]>> = vec![(0..boundary + 8)
+        .map(|t| ((t * 7 + 1) % 32) as u32)
+        .collect()];
+    let sessions = fixtures.each_ref().map(|fixture| {
+        vec![fixture.admit_with_ceiling(
+            "resident-native-partition",
+            Arc::from(&tokens[0][..1]),
+            tokens[0].len(),
+        )]
+    });
+    let sinks = [Preparation::default(), Preparation::default()];
+    let prefix_end = boundary - 8;
+    // Use genuine executed prefixes, in chunks that fit this fixture's four
+    // token reusable bucket. The final four ordinary decode waves establish
+    // the old partition's replay graph and its binding recipe.
+    let prefix_ranges = (0..prefix_end)
+        .step_by(4)
+        .map(|start| start..start + 4)
+        .chain((prefix_end..boundary - 4).map(|start| start..start + 1));
+    for range in prefix_ranges {
+        let observations = fixtures
+            .iter()
+            .zip(&sessions)
+            .enumerate()
+            .map(|(arm, (fixture, group))| {
+                fixture.extend(&group[0], Arc::from(&tokens[0][..range.end]));
+                fixture.execute_participant_ranges_with_preparation(
+                    &fixture.lane,
+                    &fixture.reaper,
+                    group,
+                    &tokens,
+                    std::slice::from_ref(&range),
+                    Path::Warm,
+                    InvocationPreparationStrategy::DecodeSegmentProgram,
+                    &sinks[arm],
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        observations[0].assert_same(&observations[1]);
+    }
+
+    let mut resident = Resident::default();
+    let mut hot_before = 0;
+    let mut hot_after = 0;
+    let mut misses = Vec::new();
+    let mut previous_partition_program = None;
+    let mut prior_frames = None;
+    for position in boundary - 4..boundary + 7 {
+        let ranges = [position..position + 1];
+        for (fixture, group) in fixtures.iter().zip(&sessions) {
+            fixture.extend(&group[0], Arc::from(&tokens[0][..position + 1]));
+        }
+        let reference = fixtures[0].execute_participant_ranges_with_preparation(
+            &fixtures[0].lane,
+            &fixtures[0].reaper,
+            &sessions[0],
+            &tokens,
+            &ranges,
+            Path::Warm,
+            InvocationPreparationStrategy::DecodeSegmentProgram,
+            &sinks[0],
+            None,
+        );
+        let (values, hot, frames) =
+            match execute(&fixtures[1], &mut resident, &sessions[1], &tokens, &ranges) {
+                Some(observation) => observation,
+                None => {
+                    assert_eq!(position, boundary, "only a native topology change may miss");
+                    assert!(resident.program.as_ref().unwrap().is_idle());
+                    misses.push(position);
+                    previous_partition_program = resident.replay_id.clone();
+                    // Release the old reserved slots before ordinary admission.
+                    // The unsubmitted attempt was rolled back, so this is the
+                    // same source frontier, with no skipped token or KV write.
+                    resident = Resident::default();
+                    let ordinary = fixtures[1].execute_participant_ranges_with_preparation(
+                        &fixtures[1].lane,
+                        &fixtures[1].reaper,
+                        &sessions[1],
+                        &tokens,
+                        &ranges,
+                        Path::Warm,
+                        InvocationPreparationStrategy::DecodeSegmentProgram,
+                        &sinks[1],
+                        None,
+                    );
+                    (ordinary.values, false, ordinary.participant_frames)
+                }
+            };
+        assert_eq!(
+            values, reference.values,
+            "complete output and valid KV bits"
+        );
+        if let Some(previous) = prior_frames {
+            assert_ne!(frames, previous, "successful uses need fresh frame IDs");
+        }
+        prior_frames = Some(frames);
+        if hot && position < boundary {
+            hot_before += 1;
+        }
+        if hot && position > boundary {
+            hot_after += 1;
+        }
+        println!(
+            "{}",
+            serde_json::json!({"kind":"resident_native_partition_correctness",
+                "boundary":boundary,"position":position,"participants":1,
+                "resident_hot":hot,"full_output_state_bits_equal":true})
+        );
+    }
+    assert_eq!(
+        misses,
+        [boundary],
+        "the old native graph must never cross its envelope"
+    );
+    assert!(
+        hot_before >= 1,
+        "the old partition must exercise resident replay"
+    );
+    assert!(
+        hot_after >= 2,
+        "the new partition must resume resident replay"
+    );
+    assert_ne!(
+        previous_partition_program, resident.replay_id,
+        "the new partition must use its own replay topology"
+    );
+    drop(resident);
+    for group in sessions {
+        for session in group {
+            session.try_complete().unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA and native M1 V1-to-V2 graph recapture"]
+fn resident_decode_program_causal_rejects_native_v1_partition_crossing() {
+    compare_native_partition_boundary(512);
+}
+
+#[test]
+#[ignore = "requires exclusive CUDA and native M1 V2 partition graph recapture"]
+fn resident_decode_program_causal_rejects_native_v2_partition_growth() {
+    compare_native_partition_boundary(1_024);
 }
