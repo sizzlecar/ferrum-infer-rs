@@ -1561,3 +1561,6 @@ fn stale_reusable_topology_is_rejected_before_dispatch_or_encoding() {
     drop(lane);
     teardown(fixture, sequence, session, batch, step);
 }
+
+#[path = "vnext_device_operation_wave_contract/terminal_packet.rs"]
+mod terminal_packet;

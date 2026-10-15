@@ -54,6 +54,25 @@ impl ProgramBindingUploadStrategyArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CompletionReadbackPolicyArg {
+    Synchronous,
+    BatchedU32,
+}
+
+impl CompletionReadbackPolicyArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Synchronous => {
+                ferrum_types::CompletionReadbackPolicy::Synchronous.as_runtime_value()
+            }
+            Self::BatchedU32 => {
+                ferrum_types::CompletionReadbackPolicy::BatchedU32.as_runtime_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SegmentBindingOwnerViewModeArg {
     Legacy,
     Indexed,
@@ -291,6 +310,13 @@ mod tests {
             match self.command {
                 TestCommand::Run(command) => command.causal_decode_kv_reuse,
                 TestCommand::Serve(command) => command.causal_decode_kv_reuse,
+            }
+        }
+
+        fn completion_readback_policy(self) -> Option<CompletionReadbackPolicyArg> {
+            match self.command {
+                TestCommand::Run(command) => command.completion_readback_policy,
+                TestCommand::Serve(command) => command.completion_readback_policy,
             }
         }
 
@@ -554,6 +580,40 @@ mod tests {
             .is_err());
         }
     }
+    #[test]
+    fn completion_readback_policy_cli_values_and_default_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .completion_readback_policy(),
+                None
+            );
+            for (value, expected) in [
+                ("synchronous", CompletionReadbackPolicyArg::Synchronous),
+                ("batched-u32", CompletionReadbackPolicyArg::BatchedU32),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--completion-readback-policy",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.completion_readback_policy(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--completion-readback-policy",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
     #[test]
     fn program_binding_upload_cli_values_and_default_match_for_run_and_serve() {
         for command in ["run", "serve"] {

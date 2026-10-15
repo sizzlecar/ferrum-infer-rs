@@ -1031,6 +1031,8 @@ where
                 batch_invocation_id,
                 fingerprint: wave_fingerprint,
                 purpose,
+                terminal_readback_request: None,
+                terminal_readback_payload: None,
             },
         ))
     }
@@ -1718,6 +1720,8 @@ pub struct PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
+    // Drop packet-owned fresh retentions before releasing any wave backing.
+    terminal_readback_payload: Option<Arc<dyn std::any::Any + Send + Sync>>,
     // Drop wave backing and participant flights before releasing the Step.
     claimed_backing: ClaimedSubmissionWaveBacking,
     initializations: Option<PreparedBackingInitializations>,
@@ -1730,6 +1734,7 @@ where
     batch_invocation_id: BatchInvocationId,
     fingerprint: String,
     purpose: SubmissionWavePurpose,
+    terminal_readback_request: Option<crate::vnext::CompletionReadbackBatchRequest>,
 }
 
 /// One attempt's borrowed participant mapping. Captured snapshots remain owned
@@ -1847,6 +1852,53 @@ impl<R> PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
+    /// Declare a single optional terminal output batch. This grants no resource
+    /// authority; Core resolves and validates it from this fresh wave at dispatch.
+    pub fn set_terminal_readbacks(
+        &mut self,
+        request: crate::vnext::CompletionReadbackBatchRequest,
+    ) -> Result<(), VNextError> {
+        if self.terminal_readback_request.is_some() {
+            return Err(invalid_resource("wave terminal readbacks already declared"));
+        }
+        self.terminal_readback_request = Some(request);
+        Ok(())
+    }
+
+    pub(crate) fn terminal_readback_request(
+        &self,
+    ) -> Option<&crate::vnext::CompletionReadbackBatchRequest> {
+        self.terminal_readback_request.as_ref()
+    }
+
+    pub(crate) fn install_terminal_readback_payload(
+        &mut self,
+        payload: Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        assert!(self.terminal_readback_payload.is_none());
+        self.terminal_readback_payload = Some(payload);
+    }
+
+    pub(crate) fn take_terminal_readbacks(
+        &mut self,
+    ) -> Option<(
+        crate::vnext::CompletionReadbackBatchRequest,
+        Arc<dyn std::any::Any + Send + Sync>,
+    )> {
+        self.terminal_readback_payload.take().map(|payload| {
+            (
+                self.terminal_readback_request
+                    .take()
+                    .expect("prepared terminal payload has a request"),
+                payload,
+            )
+        })
+    }
+
+    pub(crate) fn has_prepared_terminal_readbacks(&self) -> bool {
+        self.terminal_readback_payload.is_some()
+    }
+
     pub(crate) fn segment_backing_context(
         &self,
     ) -> Result<SegmentBackingContext<'_, R>, VNextError> {
@@ -2239,6 +2291,10 @@ where
         reset_submission_wave_participant_flights_after_definitely_not_submitted(
             &mut self.prepared_participant_flights,
         )?;
+        // This attempt provably enqueued nothing. A prepared packet belongs to
+        // that attempt, while its declarative request remains valid for retry.
+        // Unknown submission outcomes retain the packet through quarantine.
+        self.terminal_readback_payload.take();
         let topology_fingerprint = self.fingerprint.clone();
         let prior_attempt = self.batch_invocation_id;
         Ok(DefinitelyNotSubmittedWaveRetryAuthority {

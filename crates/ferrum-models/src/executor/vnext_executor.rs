@@ -535,6 +535,7 @@ pub struct VNextExecutorConfig {
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
     pub invocation_preparation_strategy: InvocationPreparationStrategy,
+    pub completion_readback_policy: ferrum_types::CompletionReadbackPolicy,
     pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
@@ -798,6 +799,7 @@ impl VNextExecutorConfig {
             static_initialization,
             runtime_policy,
             invocation_preparation_strategy: engine.runtime.invocation_preparation_strategy,
+            completion_readback_policy: engine.runtime.completion_readback_policy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
@@ -2034,6 +2036,33 @@ fn decode_output_width(output_elements: usize, vocabulary_size: usize) -> Result
 enum VNextTerminalReadbacks {
     Batch(CompletionReadbackBatchRequest),
     Collection(CompletionReadbackCollectionRequest),
+}
+
+impl VNextTerminalReadbacks {
+    fn terminal_packet_request(
+        &self,
+        policy: ferrum_types::CompletionReadbackPolicy,
+        output_mode: VNextProductOutputMode,
+        checkpoint_capture: bool,
+    ) -> Option<&CompletionReadbackBatchRequest> {
+        if policy != ferrum_types::CompletionReadbackPolicy::BatchedU32
+            || output_mode != VNextProductOutputMode::GreedyToken
+            || checkpoint_capture
+        {
+            return None;
+        }
+        let Self::Batch(batch) = self else {
+            return None;
+        };
+        // The batch constructor establishes canonical order and one typed
+        // node/resource group. Core validates its exact fresh wave authority.
+        ((1..=32).contains(&batch.len())
+            && batch.requests().iter().all(|request| {
+                let layout = request.output_layout();
+                layout.element_type() == ElementType::U32 && layout.element_count() == 1
+            }))
+        .then_some(batch)
+    }
 }
 
 impl VNextExecutionWaveKind {
@@ -4693,6 +4722,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     providers: BoundOperationProviderSet<R>,
     policy: ResolvedRuntimePolicy,
     invocation_preparation_strategy: InvocationPreparationStrategy,
+    completion_readback_policy: ferrum_types::CompletionReadbackPolicy,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
     submission_wave_identity: CompiledSubmissionWaveIdentity,
@@ -5255,6 +5285,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             providers,
             policy: config.runtime_policy,
             invocation_preparation_strategy: config.invocation_preparation_strategy,
+            completion_readback_policy: config.completion_readback_policy,
             plan_resources,
             lane,
             submission_wave_identity,
@@ -8247,7 +8278,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
-        let PreparedVNextPrefill { step, wave } = prepared;
+        let PreparedVNextPrefill { step, mut wave } = prepared;
         let capture_claim = match (kind, self.checkpoint_capture.as_ref()) {
             (VNextExecutionWaveKind::Prefill, Some(capture)) => {
                 let first = participants.first();
@@ -8287,6 +8318,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
+        if let Some(request) = readbacks.terminal_packet_request(
+            self.completion_readback_policy,
+            output_mode,
+            capture_claim.is_some(),
+        ) {
+            wave.set_terminal_readbacks(request.clone())
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+        }
         let mut cold_wave = self
             .metrics
             .reusable_cold_path
@@ -10141,6 +10180,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             serde_json::json!(self.invocation_preparation_strategy),
         );
         fields.insert(
+            "completion_readback_policy".to_owned(),
+            serde_json::json!(self.completion_readback_policy),
+        );
+        fields.insert(
             "attention_execution_policy".to_owned(),
             serde_json::json!(self.policy.attention_execution()),
         );
@@ -11980,6 +12023,68 @@ mod tests {
             DecodeFailureDisposition::from_error(&error),
             DecodeFailureDisposition::AbortSequence
         );
+    }
+
+    #[test]
+    fn completion_readback_policy_declares_only_canonical_greedy_scalar_batches() {
+        use super::{ElementType, VNextTerminalReadbacks};
+        use ferrum_interfaces::vnext::{
+            CompletionReadbackBatchRequest, CompletionReadbackCollectionRequest,
+            CompletionReadbackRequest, HostTransferLayout, NodeId, ResourceId,
+        };
+        use ferrum_types::CompletionReadbackPolicy::{BatchedU32, Synchronous};
+        let batch = |count: u32, element, elements| {
+            CompletionReadbackBatchRequest::new(
+                (0..count)
+                    .map(|participant| {
+                        CompletionReadbackRequest::new(
+                            NodeId::new("node.token").unwrap(),
+                            participant,
+                            ResourceId::new("output.token").unwrap(),
+                            u64::from(participant) * 16,
+                            HostTransferLayout::new(element, elements).unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+        };
+        for count in [1, 8, 32] {
+            let expected = batch(count, ElementType::U32, 1);
+            let readbacks = VNextTerminalReadbacks::Batch(expected.clone());
+            assert_eq!(
+                readbacks.terminal_packet_request(
+                    BatchedU32,
+                    VNextProductOutputMode::GreedyToken,
+                    false,
+                ),
+                Some(&expected)
+            );
+            assert!(readbacks
+                .terminal_packet_request(Synchronous, VNextProductOutputMode::GreedyToken, false,)
+                .is_none());
+            assert!(readbacks
+                .terminal_packet_request(BatchedU32, VNextProductOutputMode::FullLogits, false,)
+                .is_none());
+            assert!(readbacks
+                .terminal_packet_request(BatchedU32, VNextProductOutputMode::GreedyToken, true,)
+                .is_none());
+        }
+        for request in [
+            batch(33, ElementType::U32, 1),
+            batch(2, ElementType::U32, 2),
+            batch(2, ElementType::F32, 1),
+        ] {
+            assert!(VNextTerminalReadbacks::Batch(request)
+                .terminal_packet_request(BatchedU32, VNextProductOutputMode::GreedyToken, false,)
+                .is_none());
+        }
+        let collection =
+            CompletionReadbackCollectionRequest::new(vec![batch(2, ElementType::U32, 1)]).unwrap();
+        assert!(VNextTerminalReadbacks::Collection(collection)
+            .terminal_packet_request(BatchedU32, VNextProductOutputMode::GreedyToken, false,)
+            .is_none());
     }
 
     #[test]

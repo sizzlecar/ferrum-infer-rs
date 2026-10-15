@@ -25,6 +25,8 @@ use super::{
     ReusableExecutionCatalogLifetime, StreamState, VNextError,
 };
 
+mod terminal_readback;
+pub(crate) use terminal_readback::TerminalReadbackPrepareError;
 mod readback_collection;
 pub use readback_collection::*;
 mod segment_binding_publication;
@@ -2040,6 +2042,20 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         slot_id: CompletionSlotId,
         request: CompletionReadbackRequest,
     ) -> Result<CompletionReadbackObservation, VNextError> {
+        {
+            let record = self.lookup(slot_id)?;
+            let guard = record
+                .lock()
+                .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
+            if matches!(&*guard,
+                CompletionRecord::InFlight { resources, .. } | CompletionRecord::SubmissionIndeterminate { resources, .. }
+                if resources.prepared_terminal_request().is_some())
+            {
+                return Err(invalid_completion(
+                    "prepared terminal packet requires wait_with_readbacks with its exact batch",
+                ));
+            }
+        }
         let observation = self.observe_bound_with(
             slot_id,
             true,
@@ -2173,9 +2189,26 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .lock()
             .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
         match &*guard {
-            CompletionRecord::InFlight { batch_identity, .. }
-            | CompletionRecord::SubmissionIndeterminate { batch_identity, .. } => {
-                request.validate_for(batch_identity)
+            CompletionRecord::InFlight {
+                batch_identity,
+                resources,
+                ..
+            }
+            | CompletionRecord::SubmissionIndeterminate {
+                batch_identity,
+                resources,
+                ..
+            } => {
+                request.validate_for(batch_identity)?;
+                if resources
+                    .prepared_terminal_request()
+                    .is_some_and(|prepared| prepared != request)
+                {
+                    return Err(invalid_completion(
+                        "readback request differs from the prepared terminal batch",
+                    ));
+                }
+                Ok(())
             }
             CompletionRecord::Reserved => Err(invalid_completion(
                 "completion slot has not reached submission",
@@ -2200,9 +2233,23 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .lock()
             .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
         match &*guard {
-            CompletionRecord::InFlight { batch_identity, .. }
-            | CompletionRecord::SubmissionIndeterminate { batch_identity, .. } => {
-                request.validate_for(batch_identity)
+            CompletionRecord::InFlight {
+                batch_identity,
+                resources,
+                ..
+            }
+            | CompletionRecord::SubmissionIndeterminate {
+                batch_identity,
+                resources,
+                ..
+            } => {
+                request.validate_for(batch_identity)?;
+                if resources.prepared_terminal_request().is_some() {
+                    return Err(invalid_completion(
+                        "prepared terminal packet requires its exact batch, not a collection",
+                    ));
+                }
+                Ok(())
             }
             CompletionRecord::Reserved => Err(invalid_completion(
                 "completion slot has not reached submission",
@@ -2248,7 +2295,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
     ) -> Result<BoundCompletionObservation<T>, VNextError>
     where
         F: FnOnce(
-            &CompletionResourceLease<R>,
+            &mut CompletionResourceLease<R>,
             &Arc<ExecutionLane<R>>,
             &BatchOperationIdentity,
             &OperationCompletionDisposition,
@@ -2349,8 +2396,9 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         {
             let old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
             let CompletionRecord::InFlight {
-                resources,
+                mut resources,
                 lane,
+                fence,
                 batch_identity,
                 receipt,
                 timing_mode,
@@ -2359,8 +2407,11 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             else {
                 unreachable!("terminal observation came from an in-flight record")
             };
+            // The fence has proved terminal quiescence. Drop its commands before
+            // consuming a prepared packet, allowing exclusive storage recovery.
+            drop(fence);
             let terminal = terminal_action(
-                &resources,
+                &mut resources,
                 &lane,
                 &batch_identity,
                 &disposition,
@@ -2371,7 +2422,6 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
             let initialization_succeeded =
                 matches!(disposition, OperationCompletionDisposition::Succeeded);
-            let mut resources = resources;
             if let Err(error) = resources.finish_backing_initializations(initialization_succeeded) {
                 disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
                     QuiescentCompletionContractFailure::new(format!(
@@ -3364,13 +3414,24 @@ fn attempt_completion_readback<R: DeviceRuntime>(
 }
 
 fn attempt_completion_readbacks<R: DeviceRuntime>(
-    resources: &CompletionResourceLease<R>,
+    resources: &mut CompletionResourceLease<R>,
     lane: &Arc<ExecutionLane<R>>,
     batch_identity: &BatchOperationIdentity,
     completion_disposition: &OperationCompletionDisposition,
     timing_mode: DeviceTimingMode,
     request: CompletionReadbackBatchRequest,
 ) -> Vec<CompletionReadbackDisposition> {
+    if let Some((prepared_request, payload)) = resources.take_terminal_readbacks() {
+        return terminal_readback::finish_prepared_terminal_readbacks(
+            lane,
+            batch_identity,
+            completion_disposition,
+            timing_mode,
+            request,
+            prepared_request,
+            payload,
+        );
+    }
     request
         .into_requests()
         .into_iter()

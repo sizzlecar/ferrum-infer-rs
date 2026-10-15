@@ -136,6 +136,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
 
+    /// Completion transfers: synchronous (default) or batched-u32 when supported.
+    #[arg(long, value_enum)]
+    pub completion_readback_policy: Option<crate::commands::CompletionReadbackPolicyArg>,
+
     /// Fresh decode-segment owner views (default: legacy). Indexed requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub segment_binding_owner_view_mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
@@ -447,6 +451,7 @@ async fn execute_with_compatibility(
         prefill_decode_execution,
         invocation_preparation_strategy,
         program_binding_upload_strategy,
+        completion_readback_policy,
         segment_binding_owner_view_mode,
         causal_decode_preparation_mode,
         causal_decode_attention_grouping,
@@ -911,6 +916,10 @@ async fn execute_with_compatibility(
     push_program_binding_upload_strategy_cli_entry(
         &mut startup_cli_runtime_entries,
         program_binding_upload_strategy,
+    );
+    push_completion_readback_policy_cli_entry(
+        &mut startup_cli_runtime_entries,
+        completion_readback_policy,
     );
     push_segment_binding_owner_view_mode_cli_entry(
         &mut startup_cli_runtime_entries,
@@ -1656,6 +1665,17 @@ fn push_program_binding_upload_strategy_cli_entry(
         entries,
         "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
         strategy.map(crate::commands::ProgramBindingUploadStrategyArg::as_runtime_value),
+    );
+}
+
+fn push_completion_readback_policy_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    policy: Option<crate::commands::CompletionReadbackPolicyArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::COMPLETION_READBACK_POLICY_CONFIG_KEY,
+        policy.map(crate::commands::CompletionReadbackPolicyArg::as_runtime_value),
     );
 }
 
@@ -2935,6 +2955,39 @@ mod tests {
                     RuntimeConfigSource::ConfigFile
                 }
             );
+        }
+    }
+
+    #[test]
+    fn completion_readback_policy_serve_override_reaches_engine_config() {
+        use crate::commands::CompletionReadbackPolicyArg;
+        use ferrum_types::CompletionReadbackPolicy;
+        let config_entries = crate::config::RuntimeCliConfig {
+            completion_readback_policy: Some(CompletionReadbackPolicy::BatchedU32),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, expected) in [
+            (None, CompletionReadbackPolicy::BatchedU32),
+            (
+                Some(CompletionReadbackPolicyArg::Synchronous),
+                CompletionReadbackPolicy::Synchronous,
+            ),
+            (
+                Some(CompletionReadbackPolicyArg::BatchedU32),
+                CompletionReadbackPolicy::BatchedU32,
+            ),
+        ] {
+            let mut cli = Vec::new();
+            push_completion_readback_policy_cli_entry(&mut cli, option);
+            let snapshot = merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                cli,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.completion_readback_policy, expected);
         }
     }
 

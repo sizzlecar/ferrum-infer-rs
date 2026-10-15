@@ -134,6 +134,45 @@ pub enum ProgramBindingUploadStrategy {
     CompactScatter,
 }
 
+/// Completion transfer policy. Unsupported batched scalar transfers retain
+/// synchronous readback; sampling and output layouts are unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompletionReadbackPolicy {
+    #[default]
+    Synchronous,
+    BatchedU32,
+}
+
+/// Snapshot identity for an explicit CLI/config option, not an environment switch.
+pub const COMPLETION_READBACK_POLICY_CONFIG_KEY: &str = "FERRUM_COMPLETION_READBACK_POLICY";
+
+impl CompletionReadbackPolicy {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Synchronous => "synchronous",
+            Self::BatchedU32 => "batched-u32",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "synchronous" => Ok(Self::Synchronous),
+            "batched-u32" => Ok(Self::BatchedU32),
+            _ => Err(format!("expected synchronous or batched-u32; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err("select completion readback through CLI or config, not environment".into());
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 impl ProgramBindingUploadStrategy {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
@@ -592,6 +631,9 @@ pub struct RuntimeKnobs {
     /// CUDA upload policy; uniform prefixes pad to the current batch maximum per node.
     #[serde(default)]
     pub program_binding_upload_strategy: ProgramBindingUploadStrategy,
+    /// Optional batching of terminal scalar token transfers; synchronous by default.
+    #[serde(default)]
+    pub completion_readback_policy: CompletionReadbackPolicy,
     /// Fresh owner representation for CUDA decode segments; Legacy is default.
     #[serde(default)]
     pub segment_binding_owner_view_mode: SegmentBindingOwnerViewMode,
@@ -760,6 +802,16 @@ impl EngineConfig {
             self.runtime.program_binding_upload_strategy =
                 ProgramBindingUploadStrategy::parse_runtime_value(value).map_err(|reason| {
                     format!("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == COMPLETION_READBACK_POLICY_CONFIG_KEY)
+        {
+            self.runtime.completion_readback_policy =
+                CompletionReadbackPolicy::parse_config_entry(entry).map_err(|reason| {
+                    format!("{COMPLETION_READBACK_POLICY_CONFIG_KEY}: {reason}")
                 })?;
         }
         if let Some(entry) = snapshot
@@ -1866,6 +1918,52 @@ mod tests {
             )]))
             .unwrap_err()
             .contains(key));
+    }
+
+    #[test]
+    fn completion_readback_policy_defaults_and_explicit_overrides() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = COMPLETION_READBACK_POLICY_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.completion_readback_policy,
+            CompletionReadbackPolicy::Synchronous
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("completion_readback_policy");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.completion_readback_policy,
+            CompletionReadbackPolicy::Synchronous
+        );
+        for policy in [
+            CompletionReadbackPolicy::BatchedU32,
+            CompletionReadbackPolicy::Synchronous,
+        ] {
+            for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    policy.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.completion_readback_policy, policy);
+                assert_eq!(
+                    serde_json::to_value(policy).unwrap(),
+                    policy.as_runtime_value()
+                );
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                key,
+                "batched-u32"
+            ),]))
+            .unwrap_err()
+            .contains("not environment"));
+        assert!(CompletionReadbackPolicy::parse_runtime_value("automatic").is_err());
     }
 
     #[test]

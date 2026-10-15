@@ -2422,6 +2422,30 @@ impl OperationDispatch {
             timing_sink,
             SubmissionWaveDispatchStage::DeviceRuntimeSubmit,
         );
+        match completion.prepare_terminal_readbacks(&mut lane_reservation, &mut commands) {
+            Ok(()) => {}
+            Err(super::super::TerminalReadbackPrepareError::Contract(error)) => {
+                return Err(SubmissionWaveDispatchError::Contract(error));
+            }
+            Err(super::super::TerminalReadbackPrepareError::Runtime(error)) => {
+                drop(lane_reservation);
+                let retry = completion
+                    .definitely_not_submitted_wave()
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                let failures = batch_identity
+                    .participants()
+                    .iter()
+                    .map(|participant| {
+                        classify_device_error(runtime, participant.identity().clone(), &error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                return Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted {
+                    failures,
+                    retry,
+                });
+            }
+        }
         completion.mark_submission_started();
         let submit_outcome = lane_reservation.submit_with_timing(commands, timing_sink);
         drop(lane_reservation);

@@ -1192,6 +1192,16 @@ impl FerrumConfigBuilder {
             );
         }
         if self
+            .entry(crate::COMPLETION_READBACK_POLICY_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::COMPLETION_READBACK_POLICY_CONFIG_KEY,
+                crate::CompletionReadbackPolicy::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
+        if self
             .entry(crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
             .is_none()
         {
@@ -1338,6 +1348,7 @@ impl FerrumConfigBuilder {
         decisions.push(self.prefill_decode_execution_decision()?);
         decisions.push(self.invocation_preparation_strategy_decision()?);
         decisions.push(self.program_binding_upload_strategy_decision()?);
+        decisions.push(self.completion_readback_policy_decision()?);
         decisions.push(self.segment_binding_owner_view_mode_decision()?);
         decisions.push(self.causal_decode_attention_grouping_decision(
             plan_attention.as_ref().map(|(_, compiled)| compiled.value),
@@ -2692,6 +2703,36 @@ impl FerrumConfigBuilder {
                 "decode-segment",
                 "decode-segment-program",
             ],
+            Vec::new(),
+            vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn completion_readback_policy_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::COMPLETION_READBACK_POLICY_CONFIG_KEY;
+        let (policy, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::CompletionReadbackPolicy::parse_config_entry(entry).map_err(|reason| {
+                    AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    }
+                })?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::CompletionReadbackPolicy::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        Ok(self.decision(
+            "completion_readback_policy",
+            policy.as_runtime_value(),
+            source,
+            source_key,
+            ["synchronous", "batched-u32"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -6664,6 +6705,62 @@ mod tests {
                 ExecutionResourceAuthority::LegacyEngine,
                 4,
                 RuntimeConfigSnapshot::default(),
+            );
+        }
+    }
+
+    #[test]
+    fn completion_readback_policy_resolves_explicit_config_and_preserves_default() {
+        let key = crate::COMPLETION_READBACK_POLICY_CONFIG_KEY;
+        for backend in ["cpu", "metal", "cuda"] {
+            for (value, source) in [
+                (None, RuntimeConfigSource::Default),
+                (Some("batched-u32"), RuntimeConfigSource::ConfigFile),
+                (Some("synchronous"), RuntimeConfigSource::Cli),
+            ] {
+                let snapshot = value
+                    .map(|value| snapshot_with_sources(&[(key, value, source)]))
+                    .unwrap_or_default();
+                let resolved = scheduler_resolution(
+                    backend,
+                    ExecutionResourceAuthority::PlanRuntime,
+                    4,
+                    snapshot,
+                );
+                let expected = value.unwrap_or("synchronous");
+                let entry = resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .unwrap();
+                assert_eq!(entry.effective_value, expected);
+                assert_eq!(entry.source, source);
+                let decision = resolved
+                    .decisions
+                    .iter()
+                    .find(|decision| decision.selection == "completion_readback_policy")
+                    .unwrap();
+                assert_eq!(decision.selected, expected);
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine.runtime.completion_readback_policy.as_runtime_value(),
+                    expected
+                );
+            }
+        }
+        for (value, source) in [
+            ("batched-u32", RuntimeConfigSource::Env),
+            ("automatic", RuntimeConfigSource::Cli),
+        ] {
+            let error = FerrumConfigBuilder::new(snapshot_with_sources(&[(key, value, source)]))
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
             );
         }
     }
