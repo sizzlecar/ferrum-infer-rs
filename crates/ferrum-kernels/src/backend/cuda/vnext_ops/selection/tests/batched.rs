@@ -103,18 +103,19 @@ impl Fixture {
         }
     }
 
-    fn readback(&self, stream: &cudarc::driver::CudaStream) -> Vec<u32> {
-        self.rows
+    fn readback(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        arguments: &[ArgmaxArguments],
+    ) -> Vec<u32> {
+        arguments
             .iter()
             .map(|row| {
                 // Match the retained runtime's per-output stream synchronization
                 // and four-byte synchronous copy. No coalescing in either arm.
                 stream.synchronize().unwrap();
                 let mut selected = [0_u32];
-                unsafe {
-                    result::memcpy_dtoh_sync(&mut selected, row.output.device_ptr(stream).0 + 4)
-                }
-                .unwrap();
+                unsafe { result::memcpy_dtoh_sync(&mut selected, row.output) }.unwrap();
                 selected[0]
             })
             .collect()
@@ -204,7 +205,7 @@ fn batched_argmax_parameter_abi_and_supported_domain() {
 #[ignore = "requires an actual CUDA device"]
 fn batched_argmax_matches_individual_rows_and_captured_graph_on_cuda() {
     let context = CudaContext::new(0).expect("batched selection requires CUDA");
-    let stream = context.default_stream();
+    let stream = context.new_stream().unwrap();
     for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
         let functions = ArgmaxFunctions::load(&context, precision).unwrap();
         for (width, vocabulary) in [(2, 65536), (32, 248320)] {
@@ -215,7 +216,7 @@ fn batched_argmax_matches_individual_rows_and_captured_graph_on_cuda() {
             let expected = fixture.expected();
             for batched in [false, true] {
                 fixture.enqueue(&stream, &functions, &arguments, batched);
-                assert_eq!(fixture.readback(&stream), expected);
+                assert_eq!(fixture.readback(&stream, &arguments), expected);
                 fixture.verify_storage(&stream);
                 // The stack parameter table dies inside capture; the graph
                 // must own its kernel arguments while fixture buffers survive.
@@ -224,7 +225,7 @@ fn batched_argmax_matches_individual_rows_and_captured_graph_on_cuda() {
                 });
                 assert_eq!(graph.node_count, if batched { 2 } else { width * 2 });
                 graph.launch();
-                assert_eq!(fixture.readback(&stream), expected);
+                assert_eq!(fixture.readback(&stream, &arguments), expected);
                 fixture.verify_storage(&stream);
                 if batched {
                     // Replay must read fresh per-row policies through the
@@ -242,7 +243,7 @@ fn batched_argmax_matches_individual_rows_and_captured_graph_on_cuda() {
                         )
                         .unwrap();
                     graph.launch();
-                    assert_eq!(fixture.readback(&stream), fixture.expected());
+                    assert_eq!(fixture.readback(&stream, &arguments), fixture.expected());
                     fixture.verify_storage(&stream);
                 }
                 println!(
@@ -258,7 +259,7 @@ fn batched_argmax_matches_individual_rows_and_captured_graph_on_cuda() {
 #[ignore = "requires an actual CUDA device; emits complete terminal-transaction diagnostics"]
 fn batched_argmax_m32_complete_terminal_transaction_diagnostic() {
     let context = CudaContext::new(0).expect("batched selection diagnostic requires CUDA");
-    let stream = context.default_stream();
+    let stream = context.new_stream().unwrap();
     for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
         let functions = ArgmaxFunctions::load(&context, precision).unwrap();
         let fixture = Fixture::new(&stream, precision, 32, 248320);
@@ -291,7 +292,7 @@ fn batched_argmax_m32_complete_terminal_transaction_diagnostic() {
                         // parameter copying and every native kernel launch.
                         fixture.enqueue(&stream, &functions, &arguments, batched);
                     }
-                    let selected = fixture.readback(&stream);
+                    let selected = fixture.readback(&stream, &arguments);
                     let wall_ns = wall.elapsed().as_nanos();
                     assert_eq!(selected, expected);
                     let graph = if batched { &candidate } else { &original };
