@@ -1,5 +1,47 @@
 use super::*;
+use ferrum_interfaces::vnext::{DecodeSessionPrepareDecision, DecodeSessionReservation};
 use ferrum_types::InvocationPreparationStrategy;
+
+/// Test-owned reservation. The baseline records the same complete boundaries
+/// but never reserves a session. No existing fixture caller opts into this.
+pub(super) struct DecodeSessionFixtureState {
+    enabled: bool,
+    reservation: Option<DecodeSessionReservation<Runtime>>,
+    pub prepared_steps: u64,
+    pub fallback_steps: u64,
+    pub reservations: u64,
+    pub close_ns: u64,
+}
+
+impl DecodeSessionFixtureState {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            reservation: None,
+            prepared_steps: 0,
+            fallback_steps: 0,
+            reservations: 0,
+            close_ns: 0,
+        }
+    }
+
+    pub fn close(&mut self) {
+        let started = std::time::Instant::now();
+        drop(self.reservation.take());
+        self.close_ns += u64::try_from(started.elapsed().as_nanos()).unwrap();
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct DecodeSessionWaveTiming {
+    pub reserved: bool,
+    pub prepared: bool,
+    pub fallback: bool,
+    pub resource_prepare_ns: u64,
+    pub prepare_through_submit_ns: u64,
+    pub retire_ns: u64,
+    pub complete_helper_ns: u64,
+}
 
 struct NoHostTiming;
 impl DeviceSubmissionTimingSink for NoHostTiming {
@@ -59,6 +101,7 @@ pub struct BatchObservation {
     /// Complete authorized blocks read by Core, including currently invalid
     /// token positions. Only same-owner preservation may compare those bytes.
     pub raw_kv_blocks: BTreeMap<u32, Vec<u8>>,
+    pub(super) decode_session: Option<DecodeSessionWaveTiming>,
 }
 
 impl BatchObservation {
@@ -205,6 +248,46 @@ impl Fixture {
         binding_row_bytes: Option<usize>,
         observation: BatchObservationOptions,
     ) -> BatchObservation {
+        self.execute_participant_ranges_with_decode_session(
+            lane,
+            reaper,
+            sessions,
+            tokens,
+            ranges,
+            path,
+            preparation_strategy,
+            preparation_sink,
+            binding_row_bytes,
+            observation,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_participant_ranges_with_decode_session<P: InvocationPreparationSink>(
+        &self,
+        lane: &Arc<ExecutionLane<Runtime>>,
+        reaper: &Arc<CompletionReaper<Runtime>>,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        ranges: &[Range<usize>],
+        path: Path,
+        preparation_strategy: InvocationPreparationStrategy,
+        preparation_sink: &P,
+        binding_row_bytes: Option<usize>,
+        observation: BatchObservationOptions,
+        mut decode_session: Option<&mut DecodeSessionFixtureState>,
+    ) -> BatchObservation {
+        let timed_start = decode_session.as_ref().map(|_| std::time::Instant::now());
+        let mut session_timing = timed_start.map(|_| DecodeSessionWaveTiming {
+            reserved: false,
+            prepared: false,
+            fallback: false,
+            resource_prepare_ns: 0,
+            prepare_through_submit_ns: 0,
+            retire_ns: 0,
+            complete_helper_ns: 0,
+        });
         assert_eq!(sessions.len(), tokens.len());
         assert_eq!(sessions.len(), ranges.len());
         let participants = sessions.len() as u32;
@@ -251,43 +334,90 @@ impl Fixture {
         {
             request = request.with_reusable_execution_bucket(bucket.clone());
         }
-        let step = loop {
-            match batch.try_begin_step(request.clone(), lane).unwrap() {
-                StepResourceAdmissionDecision::Admitted(step) => break step,
-                StepResourceAdmissionDecision::BackingDeferred(d) => {
-                    require_progress(d.maintain().unwrap())
+        let session_prepared =
+            if let Some(state) = decode_session.as_deref_mut().filter(|s| s.enabled) {
+                if state.reservation.is_none() {
+                    state.reservation = batch.try_reserve_decode_session(&request, lane).unwrap();
+                    if state.reservation.is_some() {
+                        state.reservations += 1;
+                        session_timing.as_mut().unwrap().reserved = true;
+                    }
                 }
-                StepResourceAdmissionDecision::Deferred(reason) => require_progress(
-                    self.resources
-                        .maintain_for_admission_deferred(&reason)
-                        .unwrap(),
-                ),
-                StepResourceAdmissionDecision::PermanentRejected(reason) => {
-                    panic!("batch admission: {reason:?}")
+                if let Some(reservation) = state.reservation.as_mut() {
+                    let before = reservation.prepared_steps();
+                    match reservation.try_prepare_step(&request).unwrap() {
+                        DecodeSessionPrepareDecision::Prepared { step, wave } => {
+                            assert_eq!(reservation.prepared_steps(), before + 1);
+                            state.prepared_steps += 1;
+                            session_timing.as_mut().unwrap().prepared = true;
+                            Some((step, wave))
+                        }
+                        DecodeSessionPrepareDecision::Fallback => {
+                            // Release the reserved slot before the ordinary allocator
+                            // is asked to prepare the changed cohort or shape.
+                            state.close();
+                            state.fallback_steps += 1;
+                            session_timing.as_mut().unwrap().fallback = true;
+                            None
+                        }
+                        other => panic!(
+                            "unexpected session hazard decision: {:?}",
+                            std::mem::discriminant(&other)
+                        ),
+                    }
+                } else {
+                    state.fallback_steps += 1;
+                    session_timing.as_mut().unwrap().fallback = true;
+                    None
                 }
-            }
+            } else {
+                None
+            };
+        let (step, wave) = if let Some(prepared) = session_prepared {
+            prepared
+        } else {
+            let step = loop {
+                match batch.try_begin_step(request.clone(), lane).unwrap() {
+                    StepResourceAdmissionDecision::Admitted(step) => break step,
+                    StepResourceAdmissionDecision::BackingDeferred(d) => {
+                        require_progress(d.maintain().unwrap())
+                    }
+                    StepResourceAdmissionDecision::Deferred(reason) => require_progress(
+                        self.resources
+                            .maintain_for_admission_deferred(&reason)
+                            .unwrap(),
+                    ),
+                    StepResourceAdmissionDecision::PermanentRejected(reason) => {
+                        panic!("batch admission: {reason:?}")
+                    }
+                }
+            };
+            let wave = loop {
+                match step
+                    .try_prepare_full_plan_submission_wave(
+                        Arc::new(step.work_shape().clone()),
+                        AdmissionFitPolicy::ImmediateOnly,
+                        AdmissionPressureAction::WaitForRelease,
+                    )
+                    .unwrap()
+                {
+                    StepSubmissionWaveAdmissionDecision::Prepared(wave) => break wave,
+                    StepSubmissionWaveAdmissionDecision::BackingDeferred(d) => {
+                        require_progress(d.maintain().unwrap())
+                    }
+                    StepSubmissionWaveAdmissionDecision::Deferred(reason) => require_progress(
+                        self.resources
+                            .maintain_for_admission_deferred(&reason)
+                            .unwrap(),
+                    ),
+                    other => panic!("batch wave rejected: {:?}", std::mem::discriminant(&other)),
+                }
+            };
+            (step, wave)
         };
-        let wave = loop {
-            match step
-                .try_prepare_full_plan_submission_wave(
-                    Arc::new(step.work_shape().clone()),
-                    AdmissionFitPolicy::ImmediateOnly,
-                    AdmissionPressureAction::WaitForRelease,
-                )
-                .unwrap()
-            {
-                StepSubmissionWaveAdmissionDecision::Prepared(wave) => break wave,
-                StepSubmissionWaveAdmissionDecision::BackingDeferred(d) => {
-                    require_progress(d.maintain().unwrap())
-                }
-                StepSubmissionWaveAdmissionDecision::Deferred(reason) => require_progress(
-                    self.resources
-                        .maintain_for_admission_deferred(&reason)
-                        .unwrap(),
-                ),
-                other => panic!("batch wave rejected: {:?}", std::mem::discriminant(&other)),
-            }
-        };
+        if let (Some(timing), Some(started)) = (session_timing.as_mut(), timed_start) {
+            timing.resource_prepare_ns = u64::try_from(started.elapsed().as_nanos()).unwrap();
+        }
         let active: Vec<_> = sessions
             .iter()
             .map(|s| TrustedActiveSequenceBinding::from_session(s).unwrap())
@@ -610,6 +740,9 @@ impl Fixture {
             )
             .unwrap()
         };
+        if let (Some(timing), Some(started)) = (session_timing.as_mut(), timed_start) {
+            timing.prepare_through_submit_ns = u64::try_from(started.elapsed().as_nanos()).unwrap();
+        }
         let (handle, attribution) = profiled.into_parts();
         let segment_publication = handle.take_segment_binding_publication();
         let receipt = match handle
@@ -679,6 +812,7 @@ impl Fixture {
             participants as usize * (names.len() - usize::from(binding_rows.is_some()))
         );
         drop((receipt, handle, identity, active));
+        let retire_started = timed_start.map(|_| std::time::Instant::now());
         let retirement = step.try_retire_normal().unwrap();
         let canonical_frames: Vec<_> = retirement
             .participants()
@@ -695,6 +829,18 @@ impl Fixture {
         let segment_published = ready_segment
             .map(|ready| ready.publish(&retirement).unwrap())
             .unwrap_or(false);
+        if let Some(reservation) = decode_session.as_ref().and_then(|s| s.reservation.as_ref()) {
+            assert!(
+                reservation.is_idle(),
+                "normal terminal retirement must release the session busy guard"
+            );
+        }
+        if let (Some(timing), Some(started), Some(retire_started)) =
+            (session_timing.as_mut(), timed_start, retire_started)
+        {
+            timing.retire_ns = u64::try_from(retire_started.elapsed().as_nanos()).unwrap();
+            timing.complete_helper_ns = u64::try_from(started.elapsed().as_nanos()).unwrap();
+        }
         BatchObservation {
             values,
             types,
@@ -705,6 +851,7 @@ impl Fixture {
             participant_frames,
             attribution,
             raw_kv_blocks,
+            decode_session: session_timing,
         }
     }
 }

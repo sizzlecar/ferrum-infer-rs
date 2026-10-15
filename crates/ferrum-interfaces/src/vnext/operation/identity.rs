@@ -1047,7 +1047,8 @@ impl BatchOperationIdentity {
                     }
                     InvocationPreparationStrategy::IdentityProjection
                     | InvocationPreparationStrategy::DecodeSegment
-                    | InvocationPreparationStrategy::DecodeSegmentProgram => {
+                    | InvocationPreparationStrategy::DecodeSegmentProgram
+                    | InvocationPreparationStrategy::DecodeSessionProgram => {
                         ParticipantIdentitySeeds::Projected(participant_seeds.into())
                     }
                 },

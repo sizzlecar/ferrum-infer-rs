@@ -2649,7 +2649,7 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if strategy == crate::InvocationPreparationStrategy::DecodeSegmentProgram {
+        if strategy.uses_compiled_decode_segment() {
             let owner_mode = self
                 .entry(crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
                 .map(crate::SegmentBindingOwnerViewMode::parse_config_entry)
@@ -2677,7 +2677,7 @@ impl FerrumConfigBuilder {
             {
                 return Err(AutoConfigError::InvalidOverride {
                     key: key.to_owned(),
-                    reason: "decode-segment-program requires a CUDA plan runtime, indexed owner views and compact-scatter uploads".to_owned(),
+                    reason: format!("{} requires a CUDA plan runtime, indexed owner views and compact-scatter uploads", strategy.as_runtime_value()),
                 });
             }
         }
@@ -2691,6 +2691,7 @@ impl FerrumConfigBuilder {
                 "identity-projection",
                 "decode-segment",
                 "decode-segment-program",
+                "decode-session-program",
             ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],

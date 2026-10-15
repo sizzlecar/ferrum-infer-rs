@@ -107,6 +107,8 @@ pub(crate) use backing_initialization::{
 };
 mod invocation;
 pub use invocation::*;
+mod decode_session;
+pub use decode_session::*;
 mod execution_session;
 pub use execution_session::*;
 mod transaction;

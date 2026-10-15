@@ -85,6 +85,8 @@ pub enum InvocationPreparationStrategy {
     DecodeSegment,
     /// Compile the entire binding write program and bind it from one fresh frame.
     DecodeSegmentProgram,
+    /// Retain decode backing across steps while issuing fresh execution authority.
+    DecodeSessionProgram,
 }
 
 impl InvocationPreparationStrategy {
@@ -94,18 +96,32 @@ impl InvocationPreparationStrategy {
             Self::IdentityProjection => "identity-projection",
             Self::DecodeSegment => "decode-segment",
             Self::DecodeSegmentProgram => "decode-segment-program",
+            Self::DecodeSessionProgram => "decode-session-program",
         }
     }
 
     pub const fn uses_identity_projection(self) -> bool {
         matches!(
             self,
-            Self::IdentityProjection | Self::DecodeSegment | Self::DecodeSegmentProgram
+            Self::IdentityProjection
+                | Self::DecodeSegment
+                | Self::DecodeSegmentProgram
+                | Self::DecodeSessionProgram
         )
     }
 
     pub const fn uses_decode_segment(self) -> bool {
-        matches!(self, Self::DecodeSegment | Self::DecodeSegmentProgram)
+        matches!(
+            self,
+            Self::DecodeSegment | Self::DecodeSegmentProgram | Self::DecodeSessionProgram
+        )
+    }
+
+    pub const fn uses_compiled_decode_segment(self) -> bool {
+        matches!(
+            self,
+            Self::DecodeSegmentProgram | Self::DecodeSessionProgram
+        )
     }
 
     pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
@@ -114,8 +130,9 @@ impl InvocationPreparationStrategy {
             "identity-projection" => Ok(Self::IdentityProjection),
             "decode-segment" => Ok(Self::DecodeSegment),
             "decode-segment-program" => Ok(Self::DecodeSegmentProgram),
+            "decode-session-program" => Ok(Self::DecodeSessionProgram),
             _ => Err(format!(
-                "expected full, identity-projection, decode-segment or decode-segment-program; got {raw:?}"
+                "expected full, identity-projection, decode-segment, decode-segment-program or decode-session-program; got {raw:?}"
             )),
         }
     }
@@ -1793,6 +1810,7 @@ mod tests {
             InvocationPreparationStrategy::IdentityProjection,
             InvocationPreparationStrategy::DecodeSegment,
             InvocationPreparationStrategy::DecodeSegmentProgram,
+            InvocationPreparationStrategy::DecodeSessionProgram,
             InvocationPreparationStrategy::Full,
         ] {
             config

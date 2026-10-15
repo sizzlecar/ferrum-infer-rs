@@ -2,6 +2,9 @@
 //! authorization. Each comparison uses the same numerical policy in both arms.
 use super::*;
 
+#[path = "decode_session.rs"]
+mod decode_session;
+
 fn compare_resident_programs(kind: AttentionKind, segment_strategy: InvocationPreparationStrategy) {
     let compiled = segment_strategy == InvocationPreparationStrategy::DecodeSegmentProgram;
     let modes = [

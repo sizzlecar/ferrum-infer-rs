@@ -1698,8 +1698,9 @@ impl OperationDispatch {
         let mut program_binding_resources = BTreeSet::new();
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
-        let use_compiled_segment = batch_identity.preparation_strategy()
-            == ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram;
+        let use_compiled_segment = batch_identity
+            .preparation_strategy()
+            .uses_compiled_decode_segment();
         let use_segment = batch_identity.preparation_strategy().uses_decode_segment()
             && determinism_restore.is_none()
             && completion

@@ -23,6 +23,7 @@ pub enum InvocationPreparationStrategyArg {
     IdentityProjection,
     DecodeSegment,
     DecodeSegmentProgram,
+    DecodeSessionProgram,
 }
 
 impl InvocationPreparationStrategyArg {
@@ -32,6 +33,7 @@ impl InvocationPreparationStrategyArg {
             Self::IdentityProjection => "identity-projection",
             Self::DecodeSegment => "decode-segment",
             Self::DecodeSegmentProgram => "decode-segment-program",
+            Self::DecodeSessionProgram => "decode-session-program",
         }
     }
 }
@@ -532,6 +534,10 @@ mod tests {
                 (
                     "decode-segment-program",
                     InvocationPreparationStrategyArg::DecodeSegmentProgram,
+                ),
+                (
+                    "decode-session-program",
+                    InvocationPreparationStrategyArg::DecodeSessionProgram,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

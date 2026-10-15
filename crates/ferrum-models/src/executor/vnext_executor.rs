@@ -69,6 +69,7 @@ pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
 mod program_binding_upload;
 mod request;
+mod resident_decode;
 mod reusable_catalog;
 mod reusable_cold_path;
 mod state_memory;
@@ -4722,6 +4723,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     prefix_cache: Mutex<prefix_cache::PrefixIndex<SequenceCheckpoint<R>>>,
     prefix_capture_identity: Arc<()>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
+    decode_session: Mutex<Option<DecodeSessionReservation<R>>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
     diagnostic_fault: Option<VNextDiagnosticFault>,
@@ -5282,6 +5284,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             prefix_cache: Mutex::new(prefix_cache::PrefixIndex::default()),
             prefix_capture_identity: Arc::new(()),
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
+            decode_session: Mutex::new(None),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             diagnostic_fault: config.diagnostic_fault,
@@ -5951,6 +5954,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn reset_request_metrics_after_startup(&self) -> Result<()> {
+        self.release_decode_session();
         if self.sequences.lock().total_len() != 0 {
             return Err(FerrumError::internal(
                 "vNext startup cleanup retained synthetic sequence authority",
@@ -6465,6 +6469,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         request_id: RequestIdentity,
         work: ResourceWorkShape,
     ) -> Result<VNextSequenceAdmissionDecision<R>> {
+        // A new cohort must not wait on resources retained only for an idle
+        // previous decode cohort. In-flight uses retain their own ownership.
+        self.release_decode_session();
         let binding = self
             .plan_resources
             .trusted_runtime_binding()
@@ -6703,6 +6710,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence: &VNextSequence<R>,
         target: ResourceWorkShape,
     ) -> Result<VNextExecutionCapacityDecision<()>> {
+        let outcome = self.extend_sequence_with_reserved_capacity(sequence, target.clone())?;
+        if matches!(outcome, VNextExecutionCapacityDecision::Deferred(_))
+            && self.release_decode_session()
+        {
+            return self.extend_sequence_with_reserved_capacity(sequence, target);
+        }
+        Ok(outcome)
+    }
+
+    fn extend_sequence_with_reserved_capacity(
+        &self,
+        sequence: &VNextSequence<R>,
+        target: ResourceWorkShape,
+    ) -> Result<VNextExecutionCapacityDecision<()>> {
         let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
         let mut maintenance_receipts = Vec::new();
@@ -6875,12 +6896,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         )
     }
 
-    fn try_begin_step_for_spans(
+    fn step_request_for_spans(
         &self,
         batch: &ExecutionBatchParticipants<R>,
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
-    ) -> Result<StepResourceAdmissionDecision<R>> {
+    ) -> Result<StepResourceAdmissionRequest> {
         let timing_enabled = self.host_dispatch_timing_enabled();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let request = {
@@ -6926,6 +6947,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 None => request,
             }
         };
+        Ok(request)
+    }
+
+    fn try_begin_step_for_spans(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
+    ) -> Result<StepResourceAdmissionDecision<R>> {
+        let timing_enabled = self.host_dispatch_timing_enabled();
+        let phase_timing = self.metrics.wave_timing_for(kind);
+        let request = self.step_request_for_spans(batch, spans, kind)?;
         {
             let _timing = self
                 .metrics
@@ -6994,6 +7027,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<Arc<StepResourceLease<R>>>> {
+        if kind != VNextExecutionWaveKind::Decode {
+            self.release_decode_session();
+        }
         if sequences.is_empty()
             || sequences.len() != batch.sessions().len()
             || batch
@@ -8081,12 +8117,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .start();
             let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let step = self.begin_step(&batch, sequence, &span)?;
-            let wave = match self.prepare_wave(&step, sequence, &span) {
-                Ok(wave) => wave,
-                Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
-            };
-            PreparedVNextPrefill { step, wave }
+            if let Some(prepared) = self.try_prepare_resident_decode(
+                &batch,
+                std::slice::from_ref(&span),
+                VNextExecutionWaveKind::Decode,
+            )? {
+                prepared
+            } else {
+                let step = self.begin_step(&batch, sequence, &span)?;
+                let wave = match self.prepare_wave(&step, sequence, &span) {
+                    Ok(wave) => wave,
+                    Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+                };
+                PreparedVNextPrefill { step, wave }
+            }
         };
         self.execute_prepared_step(
             sequence,
@@ -8151,20 +8195,24 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            let step =
-                match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
-                    VNextExecutionCapacityDecision::Ready(step) => step,
-                    VNextExecutionCapacityDecision::Deferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
-                    }
-                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                            deferred,
-                        ))
-                    }
-                };
-            let wave_decision =
-                match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind) {
+            if let Some(prepared) = self.try_prepare_resident_decode(batch, spans, kind)? {
+                prepared
+            } else {
+                let step =
+                    match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
+                        VNextExecutionCapacityDecision::Ready(step) => step,
+                        VNextExecutionCapacityDecision::Deferred(deferred) => {
+                            return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+                        }
+                        VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                            return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                                deferred,
+                            ))
+                        }
+                    };
+                let wave_decision = match self
+                    .prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)
+                {
                     Ok(decision) => decision,
                     Err(error) => {
                         if let Err(cleanup_error) = self
@@ -8175,26 +8223,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(error);
                     }
                 };
-            let wave = match wave_decision {
-                VNextExecutionCapacityDecision::Ready(wave) => wave,
-                VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    self.rollback_unsubmitted_step(
-                        step,
-                        "vNext capacity-deferred unsubmitted step",
-                    )?;
-                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
-                }
-                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                    self.rollback_unsubmitted_step(
-                        step,
-                        "vNext readiness-deferred unsubmitted step",
-                    )?;
-                    return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                        deferred,
-                    ));
-                }
-            };
-            PreparedVNextPrefill { step, wave }
+                let wave = match wave_decision {
+                    VNextExecutionCapacityDecision::Ready(wave) => wave,
+                    VNextExecutionCapacityDecision::Deferred(deferred) => {
+                        self.rollback_unsubmitted_step(
+                            step,
+                            "vNext capacity-deferred unsubmitted step",
+                        )?;
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
+                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                        self.rollback_unsubmitted_step(
+                            step,
+                            "vNext readiness-deferred unsubmitted step",
+                        )?;
+                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                            deferred,
+                        ));
+                    }
+                };
+                PreparedVNextPrefill { step, wave }
+            }
         };
         let participants = sequences
             .iter()
@@ -8991,6 +9040,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn abort_decode_candidates(&self, candidates: &[VNextDecodeCandidate<R>]) {
+        self.release_decode_session();
         {
             let mut registry = self.sequences.lock();
             for candidate in candidates {
@@ -10773,12 +10823,14 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn release_cache(&self, cache_id: &str) {
+        self.release_decode_session();
         if let Some(sequence) = self.sequences.lock().active.remove(cache_id) {
             sequence.abort();
         }
     }
 
     async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+        self.release_decode_session();
         let sequence = self
             .sequences
             .lock()
