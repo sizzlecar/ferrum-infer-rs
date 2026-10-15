@@ -239,10 +239,12 @@ impl<R: DeviceRuntime> ResidentDecodeReservation<R> {
     ) -> Result<ResidentDecodeDecision<R>, VNextError> {
         let plan = &self.participants.sessions[0].resources().request.plan;
         let mut tables = Vec::with_capacity(frame.participants.len());
-        for (p, cold) in frame.participants.iter().zip(&self.cold_snapshots) {
-            if !p.backing_snapshot.shares_physical_catalog(cold) {
-                return Ok(ResidentDecodeDecision::Fallback);
-            }
+        let mut prior = self
+            .physical_snapshots
+            .lock()
+            .map_err(|_| invalid_resource("resident physical append history is poisoned"))?;
+        let mut advanced = false;
+        for p in &frame.participants {
             let Some(table) = p.backing_snapshot.physical_binding_table(
                 plan.dynamic_pools(),
                 plan.runtime().as_ref(),
@@ -260,6 +262,30 @@ impl<R: DeviceRuntime> ResidentDecodeReservation<R> {
         )? {
             return Ok(ResidentDecodeDecision::Fallback);
         }
+        for ((p, cold), table) in frame.participants.iter().zip(prior.iter()).zip(&tables) {
+            if !p.backing_snapshot.shares_physical_catalog(cold) {
+                advanced = true;
+                let Some(previous) = cold.physical_binding_table(
+                    plan.dynamic_pools(),
+                    plan.runtime().as_ref(),
+                    &DisabledSubmissionWaveDispatchTimingSink,
+                )?
+                else {
+                    return Ok(ResidentDecodeDecision::Fallback);
+                };
+                if !table.is_append_of(&previous) {
+                    return Ok(ResidentDecodeDecision::Fallback);
+                }
+            }
+        }
+        if advanced {
+            *prior = frame
+                .participants
+                .iter()
+                .map(|p| Arc::clone(&p.backing_snapshot))
+                .collect();
+        }
+        drop(prior);
         let requests = frame
             .participants
             .iter()

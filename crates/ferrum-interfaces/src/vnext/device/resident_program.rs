@@ -2,7 +2,40 @@
 use super::DeviceBufferRetention;
 use crate::vnext::{
     BatchWorkShape, DeviceResidentPlanDependencyBatch, EncodedResidentPlanDependency,
+    SequencePhysicalBindingTable,
 };
+use std::sync::Arc;
+
+/// An append-only physical-table transition checked by Core under current
+/// resource authority. Creating this does not consume dependencies or enqueue.
+pub struct DeviceResidentDecodeRefresh<'a, B> {
+    work: &'a BatchWorkShape,
+    previous: &'a [Arc<SequencePhysicalBindingTable<B>>],
+    current: &'a [Arc<SequencePhysicalBindingTable<B>>],
+}
+
+impl<'a, B> DeviceResidentDecodeRefresh<'a, B> {
+    pub(crate) fn new(
+        work: &'a BatchWorkShape,
+        previous: &'a [Arc<SequencePhysicalBindingTable<B>>],
+        current: &'a [Arc<SequencePhysicalBindingTable<B>>],
+    ) -> Self {
+        Self {
+            work,
+            previous,
+            current,
+        }
+    }
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.work
+    }
+    pub fn previous_tables(&self) -> &[Arc<SequencePhysicalBindingTable<B>>] {
+        self.previous
+    }
+    pub fn current_tables(&self) -> &[Arc<SequencePhysicalBindingTable<B>>] {
+        self.current
+    }
+}
 
 /// Core constructs this only after current resource/frame/window validation.
 /// It cannot be cloned or manufactured by an operation provider.

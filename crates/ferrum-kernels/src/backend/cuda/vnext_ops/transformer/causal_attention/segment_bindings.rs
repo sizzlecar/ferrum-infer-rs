@@ -21,7 +21,7 @@ impl CausalRecipe {
 }
 
 /// Freeze physical page/address shape; each use still supplies its current
-/// logical frontier. A changed page shape is a valid pre-enqueue miss.
+/// logical frontier. Append refresh rebuilds addresses from authorized pages.
 pub(crate) fn resident_control_rules(
     node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
@@ -50,7 +50,8 @@ pub(crate) fn resident_control_rules(
         rules.push(ResidentControlRule {
             node_index: node.node_index(),
             write_index: participant,
-            values: Box::new(move |work| {
+            state_bytes: bytes,
+            values: Arc::new(move |work| {
                 let Some(token) = work.participant_token_ranges().get(participant) else {
                     return Ok(None);
                 };
@@ -67,19 +68,49 @@ pub(crate) fn resident_control_rules(
                 let current_bytes = shape
                     .physical_state_bytes_for_source_frontier(source.end, token.full_input_tokens())
                     .map_err(CudaDeviceRuntimeError::contract)?;
-                if current_bytes != bytes {
-                    return Ok(None);
-                }
                 let value =
                     |v, label| checked_i32(v, label).map_err(CudaDeviceRuntimeError::contract);
-                Ok(Some([
-                    value(current_entries, "resident table entries")?,
-                    value(source.start, "resident source position")?,
-                    value(token.immediate_tokens(), "resident token count")?,
-                    value(source.end, "resident sequence tokens")?,
-                    value(packed.start, "resident packed token start")?,
-                    0,
-                ]))
+                Ok(Some((
+                    [
+                        value(current_entries, "resident table entries")?,
+                        value(source.start, "resident source position")?,
+                        value(token.immediate_tokens(), "resident token count")?,
+                        value(source.end, "resident sequence tokens")?,
+                        value(packed.start, "resident packed token start")?,
+                        0,
+                    ],
+                    current_bytes,
+                )))
+            }),
+            payload: Arc::new(move |controls, pages| {
+                let layout = shape
+                    .kv_layout()
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let maximum = shape
+                    .table_entries(shape.maximum_context_tokens)
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let entries = resident_address_prefix(layout, pages.len() as u64, maximum)
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let entries = checked_i32(entries, "resident refreshed address prefix")
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let mut payload = Vec::new();
+                for value in controls {
+                    payload.extend_from_slice(&value.to_ne_bytes());
+                }
+                visit_binding_addresses(
+                    layout,
+                    entries,
+                    pages.len(),
+                    |index| {
+                        pages
+                            .get(index)
+                            .copied()
+                            .ok_or_else(|| "refreshed causal page absent".into())
+                    },
+                    |address| payload.extend_from_slice(&address.to_ne_bytes()),
+                )
+                .map_err(CudaDeviceRuntimeError::contract)?;
+                Ok(payload.into_boxed_slice())
             }),
         });
     }

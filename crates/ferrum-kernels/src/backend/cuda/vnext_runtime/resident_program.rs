@@ -2,16 +2,22 @@
 //! Graph ownership remains in the stream cache. No old Step/Wave is retained.
 use super::*;
 use ferrum_interfaces::vnext::{
-    BatchWorkShape, DeviceEncodedResidentDecode, DeviceResidentDecodeRequest,
-    RetainedPlanDependencyIdentity,
+    BatchWorkShape, DeviceEncodedResidentDecode, DeviceResidentDecodeRefresh,
+    DeviceResidentDecodeRequest, RetainedPlanDependencyIdentity,
 };
 
+#[derive(Clone)]
 pub(crate) struct ResidentControlRule {
     pub node_index: u32,
     pub write_index: usize,
-    pub values: Box<
-        dyn Fn(&BatchWorkShape) -> Result<Option<[i32; 6]>, CudaDeviceRuntimeError> + Send + Sync,
+    pub state_bytes: u64,
+    pub values: Arc<
+        dyn Fn(&BatchWorkShape) -> Result<Option<([i32; 6], u64)>, CudaDeviceRuntimeError>
+            + Send
+            + Sync,
     >,
+    pub payload:
+        Arc<dyn Fn([i32; 6], &[u64]) -> Result<Box<[u8]>, CudaDeviceRuntimeError> + Send + Sync>,
 }
 
 pub(crate) struct ResidentColdParts {
@@ -36,7 +42,7 @@ struct ResidentProgramData {
     projection: Arc<CudaBindingProgramProjection>,
     controls: Vec<ControlPatch>,
     dependency_count: usize,
-    dependencies: Vec<CudaDeviceCommand>,
+    dependencies: Arc<[CudaDeviceCommand]>,
     upload_plan: DeviceProgramBindingUploadSnapshot,
 }
 
@@ -46,10 +52,27 @@ pub(super) fn compile(
     runtime: &CudaDeviceRuntime,
     parts: ResidentColdParts,
 ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, CudaDeviceRuntimeError> {
+    seal(
+        runtime,
+        parts.sink,
+        parts.owners,
+        parts.controls,
+        parts.dependency_identities.len(),
+        parts.dependencies.into(),
+    )
+}
+
+fn seal(
+    runtime: &CudaDeviceRuntime,
+    sink: CudaBindingProgramSink,
+    owners: Arc<CudaSegmentOwnerTable>,
+    rules: Vec<ResidentControlRule>,
+    dependency_count: usize,
+    dependencies: Arc<[CudaDeviceCommand]>,
+) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, CudaDeviceRuntimeError> {
     let invalid = CudaDeviceRuntimeError::contract;
-    if parts.sink.nodes.is_empty()
-        || parts
-            .sink
+    if sink.nodes.is_empty()
+        || sink
             .nodes
             .iter()
             .any(|node| node.numerical_status.is_some())
@@ -60,10 +83,11 @@ pub(super) fn compile(
         .binding_scatter
         .as_ref()
         .ok_or_else(|| invalid("resident scatter module is absent"))?;
-    // The ordinary sink validates and coalesces exactly once. Its temporary
-    // transport allocation is never enqueued and is dropped after freezing.
-    let mut command = parts.sink.finish(
-        parts.owners,
+    // Reuse the sink at cold installation or append refresh. Its temporary
+    // transport allocation/synchronization is real refresh cost; it is never
+    // enqueued and is dropped after freezing the immutable packet.
+    let mut command = sink.finish(
+        owners,
         scatter,
         &runtime.allocation_stream,
         Arc::clone(&runtime.program_binding_upload_counters),
@@ -99,8 +123,8 @@ pub(super) fn compile(
         .device_ptr
         .checked_sub(first.binding.slot().physical_offset_bytes())
         .ok_or_else(|| invalid("resident arena underflows"))?;
-    let mut controls = Vec::with_capacity(parts.controls.len());
-    for rule in parts.controls {
+    let mut controls = Vec::with_capacity(rules.len());
+    for rule in rules {
         let node = projection
             .nodes
             .iter()
@@ -145,12 +169,118 @@ pub(super) fn compile(
         packet,
         projection: Arc::new(projection),
         controls,
-        dependency_count: parts.dependency_identities.len(),
-        dependencies: parts.dependencies,
+        dependency_count,
+        dependencies,
         upload_plan,
     };
     drop(command);
     Ok(Some(Arc::new(ResidentProgram(Arc::new(data)))))
+}
+
+pub(super) fn refresh(
+    runtime: &CudaDeviceRuntime,
+    previous: &(dyn std::any::Any + Send + Sync),
+    refresh: &DeviceResidentDecodeRefresh<'_, CudaDeviceBuffer>,
+) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, CudaDeviceRuntimeError> {
+    let invalid = CudaDeviceRuntimeError::contract;
+    let Some(previous) = previous.downcast_ref::<ResidentProgram>() else {
+        return Ok(None);
+    };
+    let data = &previous.0;
+    if data.runtime_instance != runtime.runtime_instance {
+        return Err(invalid("resident refresh belongs to another CUDA runtime"));
+    }
+    let work = refresh.work_shape();
+    if refresh.previous_tables().len() != refresh.current_tables().len()
+        || work.participant_token_ranges().len() != data.participants as usize
+        || work.immediate_tokens() != data.tokens
+        || work
+            .participant_token_ranges()
+            .iter()
+            .any(|p| p.immediate_tokens() != 1)
+    {
+        return Ok(None);
+    }
+    // Preserve the old projection's ordinal table order. Core has proved exact
+    // physical prefix identity; we only replace its owning immutable version.
+    let mut tables = Vec::with_capacity(data.projection.owners.physical_tables().len());
+    for old in data.projection.owners.physical_tables() {
+        let Some(index) = refresh.previous_tables().iter().position(|table| {
+            table.backend_bindings().is_some_and(|backend| {
+                Arc::as_ptr(backend) as *const () == Arc::as_ptr(old) as *const ()
+            })
+        }) else {
+            return Err(invalid("resident refresh omitted a physical owner"));
+        };
+        let backend = refresh.current_tables()[index]
+            .backend_bindings()
+            .ok_or_else(|| invalid("resident refresh backend is absent"))?;
+        let table = Arc::clone(backend)
+            .downcast::<sequence_physical::CudaSequencePhysicalTable>()
+            .map_err(|_| invalid("resident refresh has another physical provider"))?;
+        tables.push(table);
+    }
+    let owners = Arc::new(CudaSegmentOwnerTable::physical(tables));
+    let mut sink = CudaBindingProgramSink::new();
+    let mut rules = Vec::with_capacity(data.controls.len());
+    for node in &data.projection.nodes {
+        let CudaBindingProgramRanges::Physical(old_rows) = &node.ranges else {
+            return Ok(None);
+        };
+        let mut rows = old_rows.clone();
+        sink.begin_node(
+            node.operation,
+            node.binding.clone(),
+            node.destination.clone(),
+            node.participants,
+            node.tokens,
+        )?;
+        for (index, write) in node.writes.iter().enumerate() {
+            let patch = data.controls.iter().find(|patch| {
+                patch.rule.node_index as usize == node.binding.node_index()
+                    && patch.rule.write_index == index
+            });
+            let payload = if let Some(patch) = patch {
+                let Some((values, bytes)) = (patch.rule.values)(work)? else {
+                    return Ok(None);
+                };
+                let row = rows
+                    .get_mut(index)
+                    .ok_or_else(|| invalid("resident refresh causal row is absent"))?;
+                *row = row.refreshed(owners.physical_tables(), bytes)?;
+                let addresses = (0..row.len())
+                    .map(|i| {
+                        row.region(owners.physical_tables(), i)
+                            .map(|region| region.device_ptr())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut rule = patch.rule.clone();
+                rule.state_bytes = bytes;
+                rules.push(rule);
+                (patch.rule.payload)(values, &addresses)?
+            } else {
+                data.packet
+                    .get(write.payload.clone())
+                    .ok_or_else(|| invalid("resident refresh payload is outside packet"))?
+                    .into()
+            };
+            sink.write(write.destination_offset_bytes, payload.len(), |target| {
+                target.extend_from_slice(&payload);
+                Ok(())
+            })?;
+        }
+        sink.end_physical_node(rows, None)?;
+    }
+    // Re-seal only on growth. This validates packet destinations and current
+    // physical ranges; it neither encodes compute nor captures a graph.
+    seal(
+        runtime,
+        sink,
+        owners,
+        rules,
+        data.dependency_count,
+        Arc::clone(&data.dependencies),
+    )
 }
 
 pub(super) fn encode(
@@ -186,9 +316,12 @@ pub(super) fn encode(
     }
     let mut packet = data.packet.clone();
     for patch in &data.controls {
-        let Some(values) = (patch.rule.values)(work)? else {
+        let Some((values, bytes)) = (patch.rule.values)(work)? else {
             return Ok(None);
         };
+        if bytes != patch.rule.state_bytes {
+            return Ok(None);
+        }
         for (index, value) in values.into_iter().enumerate() {
             let begin = patch.offset + index * 4;
             packet[begin..begin + 4].copy_from_slice(&value.to_ne_bytes());
@@ -265,7 +398,7 @@ pub(super) fn encode(
                 move |stream, blas, _regions, _storage| {
                     let _current_use = &dependency_retention;
                     let (mut compute, mut transfer, mut waits) = (0u64, 0u64, 0u64);
-                    for command in &dependency_data.dependencies {
+                    for command in dependency_data.dependencies.iter() {
                         let CudaEnqueuedWork::Dependency(work) = command.enqueue(stream, blas)?
                         else {
                             return Err(invalid("resident prefix contains non-dependency work"));

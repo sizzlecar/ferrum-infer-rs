@@ -6789,7 +6789,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::thread::yield_now();
                 }
                 SequenceResourceExtensionDecision::Deferred(deferred) => {
-                    self.release_resident_decode();
+                    let retained_resident =
+                        if deferred.action() == DeferredAction::AwaitBackingGrowth {
+                            self.retain_resident_decode_for_growth()
+                        } else {
+                            self.release_resident_decode();
+                            false
+                        };
                     match self.recover_prefix_pressure(&mut prefix_maintenance, &deferred)? {
                         prefix_cache::PrefixPressureRecovery::Maintained(receipt) => {
                             if !receipt.growths().is_empty() {
@@ -6825,6 +6831,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         backing_attempts,
                         &maintenance_receipts,
                     ) {
+                        if retained_resident {
+                            self.release_resident_decode();
+                            continue;
+                        }
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6851,11 +6861,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &mut maintenance_receipts,
                         &mut prefix_maintenance,
                     )? {
+                        if retained_resident {
+                            // Retry after releasing retained claims before
+                            // exposing a pressure deferral to the scheduler.
+                            self.release_resident_decode();
+                            continue;
+                        }
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
                 }
                 SequenceResourceExtensionDecision::BackingDeferred(deferred) => {
-                    self.release_resident_decode();
+                    let retained_resident = self.retain_resident_decode_for_growth();
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
@@ -6864,6 +6880,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         backing_attempts,
                         &maintenance_receipts,
                     ) {
+                        if retained_resident {
+                            self.release_resident_decode();
+                            continue;
+                        }
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6889,6 +6909,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &mut maintenance_receipts,
                         &mut prefix_maintenance,
                     )? {
+                        if retained_resident {
+                            self.release_resident_decode();
+                            continue;
+                        }
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
                 }

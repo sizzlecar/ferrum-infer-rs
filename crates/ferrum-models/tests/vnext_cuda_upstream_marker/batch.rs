@@ -390,11 +390,14 @@ impl Fixture {
                 StateCapacityDemand::TokenScaled { .. } => {
                     assert_eq!(state.id.as_str(), "state.kv");
                     assert_eq!(state.tensor.element_type, ElementType::F16);
-                    assert_eq!(state.tensor.dimensions, vec![2, 2, 128]);
+                    assert_eq!(state.tensor.dimensions.len(), 3);
+                    assert_eq!(state.tensor.dimensions[0], 2);
+                    assert_eq!(state.tensor.dimensions[2], 128);
+                    assert!(state.tensor.dimensions[1] > 0);
                     // The real F16 KV provider uses VllmBlocks16 for these
                     // dimensions. Read complete physical blocks, then select
                     // all valid K/V positions; padding is not numerical state.
-                    range.end.div_ceil(16) as u64 * 16 * 2 * 2 * 128 * 2
+                    range.end.div_ceil(16) as u64 * 16 * state.tensor.byte_len().unwrap()
                 }
             };
             names.insert(component.resource_id().clone(), state.id.to_string());
@@ -661,7 +664,16 @@ impl Fixture {
                         .insert(caller_participant as u32, result.bytes().to_vec())
                         .is_none());
                 }
-                valid_kv_positions(result.bytes(), ranges[participant].end)
+                valid_kv_positions(
+                    result.bytes(),
+                    ranges[participant].end,
+                    self.states
+                        .iter()
+                        .find(|s| s.id.as_str() == "state.kv")
+                        .unwrap()
+                        .tensor
+                        .dimensions[1] as usize,
+                )
             } else {
                 result.bytes().to_vec()
             };
@@ -712,18 +724,18 @@ impl Fixture {
 
 /// Canonical token/K-or-V/head/dim ordering from this fixture's real vLLM
 /// blocks16 F16 state ABI. Reads every valid position, including later blocks.
-fn valid_kv_positions(bytes: &[u8], tokens: usize) -> Vec<u8> {
-    let mut output = Vec::with_capacity(tokens * 1024);
+fn valid_kv_positions(bytes: &[u8], tokens: usize, heads: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(tokens * 2 * heads * 128 * 2);
     for token in 0..tokens {
-        let block = token / 16 * (2 * 2 * 128 * 16);
+        let block = token / 16 * (2 * heads * 128 * 16);
         for kv in 0..2 {
-            for head in 0..2 {
+            for head in 0..heads {
                 for dim in 0..128 {
                     let offset = block
                         + if kv == 0 {
                             head * 128 * 16 + (dim / 8) * 16 * 8 + (token % 16) * 8 + dim % 8
                         } else {
-                            2 * 128 * 16 + head * 128 * 16 + dim * 16 + token % 16
+                            heads * 128 * 16 + head * 128 * 16 + dim * 16 + token % 16
                         };
                     output.extend_from_slice(&bytes[offset * 2..offset * 2 + 2]);
                 }

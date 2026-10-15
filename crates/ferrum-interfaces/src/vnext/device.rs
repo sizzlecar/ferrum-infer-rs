@@ -18,7 +18,9 @@ mod program_binding_upload;
 pub use program_binding_upload::DeviceProgramBindingUploadSnapshot;
 mod resident_program;
 mod terminal_readback;
-pub use resident_program::{DeviceEncodedResidentDecode, DeviceResidentDecodeRequest};
+pub use resident_program::{
+    DeviceEncodedResidentDecode, DeviceResidentDecodeRefresh, DeviceResidentDecodeRequest,
+};
 pub use terminal_readback::{
     DevicePreparedTerminalReadback, DeviceScalarU32ReadbackBatch, DeviceScalarU32ReadbackSource,
 };
@@ -3737,6 +3739,16 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         &self,
         _program: &(dyn std::any::Any + Send + Sync),
         _wave: &super::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Refresh physical facts after Core proves an append-only transition.
+    /// The returned version must not mutate any version retained by in-flight work.
+    fn refresh_resident_decode_program(
+        &self,
+        _previous: &(dyn std::any::Any + Send + Sync),
+        _refresh: &DeviceResidentDecodeRefresh<'_, Self::Buffer>,
     ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
         Ok(None)
     }

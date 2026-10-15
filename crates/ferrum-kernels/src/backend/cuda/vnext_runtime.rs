@@ -4802,6 +4802,17 @@ impl DeviceRuntime for CudaDeviceRuntime {
         resident_program::compile(self, parts)
     }
 
+    fn refresh_resident_decode_program(
+        &self,
+        previous: &(dyn std::any::Any + Send + Sync),
+        refresh: &ferrum_interfaces::vnext::DeviceResidentDecodeRefresh<'_, Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        if !self.supports_physical_segment_bindings() {
+            return Ok(None);
+        }
+        resident_program::refresh(self, previous, refresh)
+    }
+
     fn encode_resident_decode_program(
         &self,
         program: &(dyn std::any::Any + Send + Sync),

@@ -74,7 +74,10 @@ pub struct ResidentDecodeReservation<R: DeviceRuntime> {
     wave_backing: ClaimedSubmissionWaveBacking,
     used_pools: Vec<Arc<DynamicBackingPool<R>>>,
     pool_proofs: Vec<ReservedPoolProof<R::Buffer>>,
-    cold_snapshots: Vec<Arc<SequenceBackingSnapshot<R>>>,
+    // Only immutable physical append history, never fresh frame authority.
+    // Advancing this after a checked append avoids rescanning the initial
+    // prefix on every subsequent token.
+    physical_snapshots: Mutex<Vec<Arc<SequenceBackingSnapshot<R>>>>,
     participants: ExecutionBatchParticipants<R>,
     lane: Arc<ExecutionLane<R>>,
     bucket: ReusableExecutionBucketSpec,
@@ -274,11 +277,12 @@ impl<R: DeviceRuntime> ExecutionBatchParticipants<R> {
                 pressure_action: request.pressure_action(),
                 state: Arc::new(AtomicU8::new(IDLE)),
                 full_nodes: (0..plan.nodes().len()).collect(),
-                cold_snapshots: step
-                    .participants
-                    .iter()
-                    .map(|p| Arc::clone(&p.backing_snapshot))
-                    .collect(),
+                physical_snapshots: Mutex::new(
+                    step.participants
+                        .iter()
+                        .map(|p| Arc::clone(&p.backing_snapshot))
+                        .collect(),
+                ),
             })))
         })();
         step.try_rollback_unsubmitted()

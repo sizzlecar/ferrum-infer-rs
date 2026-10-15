@@ -6,6 +6,7 @@ use super::*;
 struct Resident {
     reservation: Option<Arc<ResidentDecodeReservation<Runtime>>>,
     program: Option<Arc<ResidentDecodeProgram<Runtime>>>,
+    replay_id: Option<DeviceReusableExecutionProgramId>,
 }
 
 struct Quiet;
@@ -110,6 +111,10 @@ fn execute(
             ResidentDecodeDecision::Fallback => return None,
             _ => panic!("unexpected resident request-state deferral"),
         };
+        let entry_before = lane
+            .reusable_execution_entry_identity(state.replay_id.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
         let identity =
             OperationDispatch::bind_resident_decode_identity(program, active.iter(), &use_, lane)
                 .unwrap();
@@ -161,6 +166,14 @@ fn execute(
             indexed_before,
             "whole resident hit must bypass the ordinary owner/frame encoder"
         );
+        let entry_after = lane
+            .reusable_execution_entry_identity(state.replay_id.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            entry_before.same_entry(&entry_after),
+            "append refresh must retain the captured graph entry"
+        );
         (profiled, Retire::Resident(retirement))
     } else {
         if state.reservation.is_none() {
@@ -208,6 +221,9 @@ fn execute(
                 lane,
             )
             .unwrap();
+        }
+        if installing.is_some() {
+            state.replay_id = Some(program_id.clone());
         }
         println!(
             "{}",
@@ -309,7 +325,17 @@ fn execute(
             continue;
         }
         let bytes = if name == "state.kv" {
-            valid_kv(result.bytes(), ranges[canonical].end)
+            valid_kv(
+                result.bytes(),
+                ranges[canonical].end,
+                fixture
+                    .states
+                    .iter()
+                    .find(|s| s.id.as_str() == "state.kv")
+                    .unwrap()
+                    .tensor
+                    .dimensions[1] as usize,
+            )
         } else {
             result.bytes().to_vec()
         };
@@ -414,7 +440,9 @@ fn readbacks(
                             StateCapacityDemand::FixedPerScope => state.tensor.byte_len().unwrap(),
                             StateCapacityDemand::TokenScaled { .. } => {
                                 assert_eq!(state.id.as_str(), "state.kv");
-                                range.end.div_ceil(16) as u64 * 16 * 1024
+                                range.end.div_ceil(16) as u64
+                                    * 16
+                                    * state.tensor.byte_len().unwrap()
                             }
                         };
                         CompletionReadbackRequest::new_typed(
@@ -471,17 +499,17 @@ fn readbacks(
     )
 }
 
-fn valid_kv(bytes: &[u8], tokens: usize) -> Vec<u8> {
-    let mut result = Vec::with_capacity(tokens * 1024);
+fn valid_kv(bytes: &[u8], tokens: usize, heads: usize) -> Vec<u8> {
+    let mut result = Vec::with_capacity(tokens * 2 * heads * 128 * 2);
     for token in 0..tokens {
         for kv in 0..2 {
-            for head in 0..2 {
+            for head in 0..heads {
                 for dim in 0..128 {
-                    let offset = token / 16 * (2 * 2 * 128 * 16)
+                    let offset = token / 16 * (2 * heads * 128 * 16)
                         + if kv == 0 {
                             head * 128 * 16 + dim / 8 * 16 * 8 + token % 16 * 8 + dim % 8
                         } else {
-                            2 * 128 * 16 + head * 128 * 16 + dim * 16 + token % 16
+                            heads * 128 * 16 + head * 128 * 16 + dim * 16 + token % 16
                         };
                     result.extend_from_slice(&bytes[offset * 2..offset * 2 + 2]);
                 }
@@ -497,7 +525,14 @@ fn compare(kind: AttentionKind) {
             kind,
             true,
             2,
-            Family::new(kind).with_maximum_tokens(128),
+            {
+                let family = Family::new(kind).with_maximum_tokens(128);
+                if kind == AttentionKind::Causal {
+                    family.with_causal_sixteen_token_pages()
+                } else {
+                    family
+                }
+            },
             ProgramBindingUploadStrategy::CompactScatter,
             SegmentBindingOracleMode::Disabled,
             SegmentBindingOwnerViewMode::Indexed,
@@ -508,6 +543,18 @@ fn compare(kind: AttentionKind) {
     let tokens: Vec<Arc<[u32]>> = (0..2)
         .map(|p| (0..68).map(|t| ((t * 7 + p * 3 + 1) % 32) as u32).collect())
         .collect();
+    if kind == AttentionKind::Causal {
+        for fixture in &fixtures {
+            let state = fixture
+                .states
+                .iter()
+                .find(|s| s.id.as_str() == "state.kv")
+                .unwrap();
+            assert_eq!(state.tensor.dimensions, [2, 8, 128]);
+            assert_eq!(state.tensor.byte_len().unwrap(), 4096);
+            assert_eq!(65_536 / state.tensor.byte_len().unwrap(), 16);
+        }
+    }
     let sessions = fixtures.each_ref().map(|f| {
         tokens
             .iter()
@@ -522,7 +569,7 @@ fn compare(kind: AttentionKind) {
             .collect::<Vec<_>>()
     });
     // Start before a blocks16 boundary: controls and the live address count
-    // must advance inside the same allocated 64-token physical page.
+    // must advance across genuine 16-token physical pages without a new graph.
     let lead = if kind == AttentionKind::Causal { 10 } else { 2 };
     let sinks = [Preparation::default(), Preparation::default()];
     // Ordinary real work establishes state and allocates the reusable slots.
@@ -553,7 +600,7 @@ fn compare(kind: AttentionKind) {
     let mut hot_count = 0;
     let mut prior_frames = None;
     let mut prior_values = None;
-    for position in lead..64 {
+    for position in lead..36 {
         let ranges = vec![position..position + 1; 2];
         for (f, group) in fixtures.iter().zip(&sessions) {
             for (s, t) in group.iter().zip(&tokens) {
@@ -585,7 +632,19 @@ fn compare(kind: AttentionKind) {
         reference.assert_same(&reference);
         let (values, hot, frames) =
             execute(&fixtures[1], &mut resident, &sessions[1], &tokens, &ranges)
-                .expect("same physical page and cohort must remain eligible");
+                .expect("same cohort and append-only physical growth must remain eligible");
+        if kind == AttentionKind::Causal && [16, 32].contains(&position) {
+            assert!(hot, "cross-page execution must use the resident path");
+            assert_eq!(
+                physical_pages(
+                    &fixtures[1],
+                    &sessions[1][0],
+                    Arc::from(&tokens[0][..=position]),
+                    position + 1
+                ),
+                position / 16 + 1
+            );
+        }
         assert_eq!(
             values, reference.values,
             "complete output/state/KV comparison"
@@ -628,58 +687,6 @@ fn compare(kind: AttentionKind) {
         "changed cohort must not borrow the old complete program's authority"
     );
     assert!(program.is_idle());
-    if kind == AttentionKind::Causal {
-        let ranges = vec![64..65; 2];
-        for (f, group) in fixtures.iter().zip(&sessions) {
-            for (s, t) in group.iter().zip(&tokens) {
-                f.extend(s, Arc::from(&t[..65]));
-            }
-        }
-        assert_eq!(
-            physical_pages(
-                &fixtures[1],
-                &sessions[1][0],
-                Arc::from(&tokens[0][..65]),
-                65
-            ),
-            2
-        );
-        let before = fixtures[1]
-            ._composition
-            ._runtime
-            .resident_decode_program_encodes();
-        assert!(
-            execute(&fixtures[1], &mut resident, &sessions[1], &tokens, &ranges).is_none(),
-            "new physical KV must miss before encoding the stale resident table"
-        );
-        assert_eq!(
-            fixtures[1]
-                ._composition
-                ._runtime
-                .resident_decode_program_encodes(),
-            before
-        );
-        resident = Resident::default(); // Release claims before ordinary fallback.
-        let observations = fixtures
-            .iter()
-            .zip(&sessions)
-            .enumerate()
-            .map(|(arm, (f, group))| {
-                f.execute_participant_ranges_with_preparation(
-                    &f.lane,
-                    &f.reaper,
-                    group,
-                    &tokens,
-                    &ranges,
-                    Path::Replay,
-                    InvocationPreparationStrategy::DecodeSegmentProgram,
-                    &sinks[arm],
-                    None,
-                )
-            })
-            .collect::<Vec<_>>();
-        observations[0].assert_same(&observations[1]);
-    }
     drop(resident);
     for group in sessions {
         for session in group {
@@ -695,7 +702,7 @@ fn resident_decode_program_gdn_matches_ordinary_with_fresh_frames() {
 }
 
 #[test]
-#[ignore = "requires exclusive CUDA, same-page replay and real KV growth fallback"]
-fn resident_decode_program_causal_matches_ordinary_and_rejects_new_pages() {
+#[ignore = "requires exclusive CUDA, unchanged graph and real append-only KV growth"]
+fn resident_decode_program_causal_refreshes_sixteen_token_pages_without_recapture() {
     compare(AttentionKind::Causal);
 }

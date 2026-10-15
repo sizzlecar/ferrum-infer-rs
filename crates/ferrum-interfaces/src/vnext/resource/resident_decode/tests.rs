@@ -222,7 +222,7 @@ fn resident_decode_retry_keeps_program_but_clears_attempt_payload() {
 }
 
 #[test]
-fn resident_decode_rejects_poison_cancel_and_physical_growth_before_enqueue() {
+fn resident_decode_append_refresh_keeps_slots_and_rejects_stale_authority() {
     let (harness, lane, bucket) = setup();
     let sequence = admitted_sequence_with_ceiling(&harness.root, "resident-current", 4);
     let session = sequence.open_session().unwrap();
@@ -248,11 +248,31 @@ fn resident_decode_rejects_poison_cancel_and_physical_growth_before_enqueue() {
     drop(foreign_batch);
     drop(foreign_session);
     drop(foreign_sequence);
-    let pool = &harness.root.dynamic_pools.pools[&harness.pool_ids[0]];
-    pool.state.lock().unwrap().poisoned = true;
-    assert!(reservation.try_begin_use(&batch, &req).is_err());
-    assert!(reservation.is_idle());
-    pool.state.lock().unwrap().poisoned = false;
+
+    let (first, first_retirement) = ready(&reservation, &batch, &req);
+    let old_snapshot = Arc::clone(first.backing_snapshots().next().unwrap());
+    let old_table = Arc::clone(&first.sequence_physical_tables()[0]);
+    let old_table_weak = Arc::downgrade(&old_table);
+    let old_backend = Arc::clone(old_table.backend_bindings().unwrap());
+    let old_backend_weak = Arc::downgrade(&old_backend);
+    // This CPU fixture has a real Step arena; actual Invocation binding slots
+    // are covered by the complete CUDA fixture, not by comparing absent slots.
+    let step_slot = first.lane_stable_slot_identity();
+    assert!(step_slot.is_some());
+    let first_step = first.batch_step_id();
+    let first_attempt = first.batch_invocation_id();
+    assert_eq!(
+        old_table
+            .rows()
+            .next()
+            .unwrap()
+            .descriptor()
+            .view_size_bytes(),
+        64
+    );
+    drop(first);
+    first_retirement.try_rollback_unsubmitted().unwrap();
+
     let snapshot = match session
         .try_ensure_backing_covers(
             SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
@@ -263,25 +283,195 @@ fn resident_decode_rejects_poison_cancel_and_physical_growth_before_enqueue() {
         SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
         _ => panic!("real larger Sequence physical allocation must be admitted"),
     };
+    assert_ne!(snapshot.generation(), old_snapshot.generation());
+    let fresh_request = request(&batch, &bucket, 9);
+    let (fresh, retirement) = ready(&reservation, &batch, &fresh_request);
+    let current_table = Arc::clone(&fresh.sequence_physical_tables()[0]);
+    assert!(!Arc::ptr_eq(&old_table, &current_table));
+    assert!(current_table.is_append_of(&old_table));
+    assert!(!old_table.is_append_of(&current_table));
+    assert_eq!(
+        current_table
+            .rows()
+            .next()
+            .unwrap()
+            .descriptor()
+            .view_size_bytes(),
+        128
+    );
+    assert_eq!(
+        old_table
+            .rows()
+            .next()
+            .unwrap()
+            .descriptor()
+            .view_size_bytes(),
+        64
+    );
+    assert!(Arc::ptr_eq(
+        fresh.backing_snapshots().next().unwrap(),
+        &snapshot
+    ));
+    assert_eq!(fresh.lane_stable_slot_identity(), step_slot);
+    assert_ne!(fresh.batch_step_id(), first_step);
+    assert_ne!(fresh.batch_invocation_id(), first_attempt);
+    assert_eq!(fresh.work_shape().as_ref(), fresh_request.work_shape());
+    drop(fresh);
+    retirement.try_rollback_unsubmitted().unwrap();
+    assert!(reservation.is_idle());
+
+    // A deliberately stale real snapshot tests the forbidden reverse transition.
+    // It is restored before releasing any backing owner; no fabricated table is used.
+    session.resources().lock_backing_state().unwrap().current = Arc::clone(&old_snapshot);
     assert!(matches!(
-        reservation.try_begin_use(&batch, &req).unwrap(),
+        reservation.try_begin_use(&batch, &fresh_request).unwrap(),
         ResidentDecodeDecision::Fallback
     ));
     assert!(
         reservation.is_idle(),
-        "physical mismatch must roll back the fresh unsubmitted frame"
+        "shrink must roll back the unsubmitted frame"
     );
+    session.resources().lock_backing_state().unwrap().current = Arc::clone(&snapshot);
+
+    let sequence_pool_id = snapshot.backing_slices()[0].evidence().pool_id();
+    let pool = &harness.root.dynamic_pools.pools[sequence_pool_id];
+    pool.state.lock().unwrap().poisoned = true;
+    assert!(reservation.try_begin_use(&batch, &fresh_request).is_err());
+    assert!(reservation.is_idle());
+    pool.state.lock().unwrap().poisoned = false;
+    let (again, retirement) = ready(&reservation, &batch, &fresh_request);
+    assert!(Arc::ptr_eq(
+        &again.sequence_physical_tables()[0],
+        &current_table
+    ));
+    assert_eq!(again.lane_stable_slot_identity(), step_slot);
+    drop(again);
+    retirement.try_rollback_unsubmitted().unwrap();
+
+    drop(old_table);
+    drop(old_snapshot);
+    assert!(
+        old_table_weak.upgrade().is_none(),
+        "old backend payload must not retain a catalog cycle"
+    );
+    assert!(old_backend_weak.upgrade().is_some());
     session.request_cancel().unwrap();
-    assert!(reservation.try_begin_use(&batch, &req).is_err());
+    assert!(reservation.try_begin_use(&batch, &fresh_request).is_err());
     assert!(reservation.is_idle());
     drop(reservation);
     drop(snapshot);
+    drop(current_table);
     session.try_abort().unwrap();
     drop(batch);
     drop(session);
     drop(sequence);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .snapshot()
+            .unwrap()
+            .active_sequences(),
+        1,
+        "old immutable backend version independently retains its physical/logical owner"
+    );
+    drop(old_backend);
+    assert!(old_backend_weak.upgrade().is_none());
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .snapshot()
+            .unwrap()
+            .active_sequences(),
+        0
+    );
     drop(lane);
     close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn resident_decode_append_refresh_rejects_same_identity_replacement_and_missing_chunk() {
+    let (harness, lane, bucket) = setup();
+    let (donor, donor_lane, _) = setup();
+    let sequence = admitted_sequence_with_ceiling(&harness.root, "resident-replacement", 4);
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let req = request(&batch, &bucket, 5);
+    let reservation = batch
+        .try_reserve_resident_decode(&req, &lane)
+        .unwrap()
+        .unwrap();
+    let (use_, retirement) = ready(&reservation, &batch, &req);
+    let snapshot = Arc::clone(use_.backing_snapshots().next().unwrap());
+    drop(use_);
+    retirement.try_rollback_unsubmitted().unwrap();
+    let evidence = snapshot.backing_slices()[0].evidence();
+    let pool = &harness.root.dynamic_pools.pools[evidence.pool_id()];
+    let donor_pool = &donor.root.dynamic_pools.pools[evidence.pool_id()];
+    let ordinal = evidence.segments()[0].chunk_ordinal();
+    let original = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    assert!(matches!(
+        reservation.try_begin_use(&batch, &req).unwrap(),
+        ResidentDecodeDecision::Fallback
+    ));
+    assert!(reservation.is_idle());
+    let mut replacement = donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .remove(&ordinal)
+        .unwrap();
+    let donor_identity = replacement.backing.identity.clone();
+    let donor_descriptor = replacement.backing.descriptor.clone();
+    let backing = Arc::get_mut(&mut replacement.backing).unwrap();
+    backing.identity = original.backing.identity.clone();
+    backing.descriptor = original.backing.descriptor.clone();
+    pool.state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    assert!(
+        matches!(
+            reservation.try_begin_use(&batch, &req).unwrap(),
+            ResidentDecodeDecision::Fallback
+        ),
+        "equal identity/descriptor must not authorize a replacement allocation Arc"
+    );
+    assert!(reservation.is_idle());
+    let mut replacement = pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, original)
+        .unwrap();
+    let backing = Arc::get_mut(&mut replacement.backing).unwrap();
+    backing.identity = donor_identity;
+    backing.descriptor = donor_descriptor;
+    donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    let (current, retirement) = ready(&reservation, &batch, &req);
+    drop(current);
+    retirement.try_rollback_unsubmitted().unwrap();
+    drop(reservation);
+    drop(snapshot);
+    close_session(&session);
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    drop(donor_lane);
+    close_dynamic_test_root(harness.root);
+    close_dynamic_test_root(donor.root);
 }
 
 #[test]

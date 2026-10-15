@@ -128,6 +128,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
+    /// Keep an idle compiled program while Sequence pages are appended. The
+    /// next use must validate and refresh its physical snapshot before enqueue.
+    /// Bootstrap claims cannot be refreshed and must be released for maintenance.
+    pub(super) fn retain_resident_decode_for_growth(&self) -> bool {
+        if self.invocation_preparation_strategy
+            != InvocationPreparationStrategy::ResidentDecodeProgram
+        {
+            return false;
+        }
+        let mut cached = self.resident_decode.lock();
+        if matches!(cached.as_ref(), Some(ResidentCache::Ready(program)) if program.is_idle()) {
+            return true;
+        }
+        if let Some(cached) = cached.take() {
+            cached.reservation().revoke();
+        }
+        false
+    }
+
     pub(super) fn try_prepare_resident_decode(
         &self,
         batch: &ExecutionBatchParticipants<R>,

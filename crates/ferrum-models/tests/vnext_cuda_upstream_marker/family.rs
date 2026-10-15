@@ -21,6 +21,7 @@ pub struct Family {
     g32_baseline: bool,
     small_q8_projection: bool,
     q8_projection_pair_adjacent: Option<bool>,
+    causal_sixteen_token_pages: bool,
 }
 
 impl Family {
@@ -31,6 +32,7 @@ impl Family {
             g32_baseline: false,
             small_q8_projection: false,
             q8_projection_pair_adjacent: None,
+            causal_sixteen_token_pages: false,
             selected: match kind {
                 AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDelta,
                 AttentionKind::Causal => UpstreamMarkerV2Profile::Causal,
@@ -41,6 +43,13 @@ impl Family {
     pub fn with_small_q8_projection(mut self) -> Self {
         self.small_q8_projection = true;
         self.q8_projection_pair_adjacent = None;
+        self
+    }
+    /// 8 KV heads x 128 x K/V x F16 = 4096 bytes/token: a real 64-KiB
+    /// physical page holds exactly one 16-token vLLM block.
+    pub fn with_causal_sixteen_token_pages(mut self) -> Self {
+        assert_eq!(self.selected, UpstreamMarkerV2Profile::Causal);
+        self.causal_sixteen_token_pages = true;
         self
     }
     pub fn with_small_q8_projection_pair(mut self, adjacent: bool) -> Self {
@@ -159,6 +168,19 @@ impl Family {
     }
     pub fn states(&self) -> Vec<StateSpec> {
         let mut states = self.base.states();
+        if self.causal_sixteen_token_pages {
+            let kv = states
+                .iter_mut()
+                .find(|s| s.id.as_str() == "state.kv")
+                .unwrap();
+            kv.tensor.dimensions = vec![2, 8, 128];
+            if let StateCapacityDemand::TokenScaled {
+                bytes_per_token, ..
+            } = &mut kv.capacity_demand
+            {
+                *bytes_per_token = kv.tensor.byte_len().unwrap();
+            }
+        }
         if self.selected.q6_f16() {
             q6_f16::resize_states(&mut states);
         }
@@ -226,6 +248,34 @@ impl ModelFamilyProvider for Family {
 
     fn weight_schema(&self, config: &AttentionKind) -> Result<WeightSchema, VNextError> {
         let mut schema = self.base.weight_schema(config)?;
+        if self.causal_sixteen_token_pages {
+            for (name, axis, factor) in [("q", 0, 2), ("k", 0, 4), ("v", 0, 4), ("o", 1, 2)] {
+                let tensor = schema
+                    .tensors
+                    .iter_mut()
+                    .find(|t| t.id.as_str() == format!("weight.{name}"))
+                    .unwrap();
+                tensor.dimensions[axis] *= factor;
+                let PhysicalWeightLayout::Composite { parts } = &mut tensor.physical_layout else {
+                    unreachable!()
+                };
+                for part in parts {
+                    part.logical_offsets[axis] *= factor;
+                    part.extents[axis] *= factor;
+                    let component_id = match part.layout.as_ref() {
+                        PhysicalWeightLayout::Dense { component_id } => component_id,
+                        PhysicalWeightLayout::BlockQuantized { blocks, .. } => &blocks.component_id,
+                        _ => unreachable!(),
+                    };
+                    schema
+                        .components
+                        .iter_mut()
+                        .find(|c| c.id == *component_id)
+                        .unwrap()
+                        .dimensions[axis] *= factor;
+                }
+            }
+        }
         let hidden = self.hidden_size();
         let intermediate = self.intermediate_size();
         if self.selected.q6_f16() {
@@ -452,6 +502,19 @@ impl ModelFamilyProvider for Family {
             q6_f16::resize_nodes(&mut blocks, *config);
         }
         let attention = &mut blocks[0].nodes[1];
+        if self.causal_sixteen_token_pages {
+            for (name, value) in [
+                ("query_heads", 8),
+                ("key_value_heads", 8),
+                ("query_features", 1024),
+                ("query_projection_features", 2048),
+                ("kv_features", 1024),
+            ] {
+                attention
+                    .attributes
+                    .insert(id(name), SemanticValue::Unsigned(value));
+            }
+        }
         attention.operation_id = id(self.attention_operation());
         if attention
             .attributes
@@ -515,6 +578,16 @@ impl ModelFamilyProvider for Family {
             hidden(),
         );
         let mut weights = old.weights().to_vec();
+        if self.causal_sixteen_token_pages {
+            for (name, axis, factor) in [("q", 0, 2), ("k", 0, 4), ("v", 0, 4), ("o", 1, 2)] {
+                weights
+                    .iter_mut()
+                    .find(|w| w.weight_id.as_str() == format!("weight.{name}"))
+                    .unwrap()
+                    .tensor
+                    .dimensions[axis] *= factor;
+            }
+        }
         if self.selected.q6_f16() {
             q6_f16::resize_weights(&mut weights, *config);
         }

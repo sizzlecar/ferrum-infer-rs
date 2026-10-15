@@ -13,7 +13,7 @@ use crate::vnext::resource::SegmentPlanResourceRequest;
 use crate::vnext::*;
 use std::any::Any;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // Emit the existing first-only parent callback once, excluding interleaved
 // initialization/input preparation without changing execution order.
@@ -58,6 +58,12 @@ struct SequenceWindowRule {
     maximum: Option<u64>,
 }
 
+struct ResidentDecodeVersion<B> {
+    backend: Arc<dyn Any + Send + Sync>,
+    tables: Vec<Arc<SequencePhysicalBindingTable<B>>>,
+    facts: (u64, u64, u64),
+}
+
 /// Closed constructor: the backend program and dependency closure come from
 /// the same fully checked cold physical frame, using the reservation's slots.
 /// No old Step, invocation, fresh scope, or completion proof is cached here.
@@ -66,9 +72,8 @@ pub struct ResidentDecodeProgram<R: DeviceRuntime> {
     topology: CompiledSubmissionWaveIdentity,
     replay: DeviceReusableExecutionProgram,
     _recipe: Arc<CompiledSegmentBindingRecipe>,
-    tables: Vec<Arc<SequencePhysicalBindingTable<R::Buffer>>>,
-    facts: (u64, u64, u64),
-    backend: Arc<dyn Any + Send + Sync>,
+    version: Mutex<Arc<ResidentDecodeVersion<R::Buffer>>>,
+    fixed_buffer_identities: Vec<usize>,
     dependencies: Arc<SealedResidentPlanDependencies>,
     sequence_windows: Vec<SequenceWindowRule>,
     lane: Arc<ExecutionLane<R>>,
@@ -106,10 +111,13 @@ impl<R: DeviceRuntime> ResidentDecodeProgram<R> {
         self.reservation.try_begin_use(participants, request)
     }
 
-    fn validate_current_windows(&self, use_: &ResidentDecodeUse<R>) -> Result<(), VNextError> {
-        if self.tables.len() != use_.sequence_physical_tables().len()
-            || self
-                .tables
+    fn validate_current_windows(
+        &self,
+        use_: &ResidentDecodeUse<R>,
+        tables: &[Arc<SequencePhysicalBindingTable<R::Buffer>>],
+    ) -> Result<(), VNextError> {
+        if tables.len() != use_.sequence_physical_tables().len()
+            || tables
                 .iter()
                 .zip(use_.sequence_physical_tables())
                 .any(|(cold, current)| !Arc::ptr_eq(cold, current))
@@ -137,7 +145,7 @@ impl<R: DeviceRuntime> ResidentDecodeProgram<R> {
                             snapshot.committed_shape(),
                             tokens.source_token_range().end,
                         )?)?;
-                let row = self.tables[participant]
+                let row = tables[participant]
                     .resource(rule.ordinal)
                     .ok_or_else(|| invalid_operation("resident Sequence row is absent"))?;
                 if row.resource_id() != rule.descriptor.base_resource_id()
@@ -152,6 +160,84 @@ impl<R: DeviceRuntime> ResidentDecodeProgram<R> {
             }
         }
         Ok(())
+    }
+
+    /// The reservation's fresh-use gate excludes another use while this
+    /// immutable binding version is replaced. Old commands/completions retain
+    /// their own version; publishing an append never changes their owners.
+    fn prepare_current_version(
+        &self,
+        use_: &ResidentDecodeUse<R>,
+    ) -> Result<Option<Arc<ResidentDecodeVersion<R::Buffer>>>, VNextError> {
+        let previous = {
+            let version = self
+                .version
+                .lock()
+                .map_err(|_| invalid_operation("resident binding version is poisoned"))?;
+            Arc::clone(&version)
+        };
+        let tables = use_.sequence_physical_tables();
+        if previous.tables.len() != tables.len() {
+            return Ok(None);
+        }
+        if previous
+            .tables
+            .iter()
+            .zip(tables)
+            .all(|(old, current)| Arc::ptr_eq(old, current))
+        {
+            self.validate_current_windows(use_, &previous.tables)?;
+            return Ok(Some(previous));
+        }
+        if previous
+            .tables
+            .iter()
+            .zip(tables)
+            .any(|(old, current)| !Arc::ptr_eq(old, current) && !current.is_append_of(old))
+        {
+            return Ok(None);
+        }
+        self.validate_current_windows(use_, tables)?;
+        let refresh = DeviceResidentDecodeRefresh::new(use_.work_shape(), &previous.tables, tables);
+        let Some(backend) = self
+            .lane
+            .runtime()
+            .refresh_resident_decode_program(previous.backend.as_ref(), &refresh)
+            .map_err(|error| {
+                invalid_operation(format!("resident append refresh failed: {error}"))
+            })?
+        else {
+            return Ok(None);
+        };
+        // Exact telemetry is rebuilt only at a physical append, using the
+        // original recipe's Sequence rows and retained Plan/Step identities.
+        let mut identities = self.fixed_buffer_identities.clone();
+        for rule in &self.sequence_windows {
+            for table in tables {
+                let row = table.resource(rule.ordinal).ok_or_else(|| {
+                    invalid_operation("refreshed resident Sequence row is absent")
+                })?;
+                identities.extend_from_slice(row.metadata_identities());
+            }
+        }
+        identities.sort_unstable();
+        identities.dedup();
+        let next = Arc::new(ResidentDecodeVersion {
+            backend,
+            tables: tables.to_vec(),
+            facts: (previous.facts.0, previous.facts.1, identities.len() as u64),
+        });
+        let mut version = self
+            .version
+            .lock()
+            .map_err(|_| invalid_operation("resident binding version is poisoned"))?;
+        if !Arc::ptr_eq(&version, &previous) {
+            return Err(invalid_operation(
+                "resident append raced another binding version",
+            ));
+        }
+        *version = Arc::clone(&next);
+        Ok(Some(next))
     }
 }
 
@@ -348,6 +434,21 @@ impl OperationDispatch {
                         invalid_operation(format!("resident cold compilation failed: {e}"))
                     })?;
                 Ok(backend.map(|backend| {
+                    let mut fixed_buffer_identities = physical
+                        .plan_views
+                        .iter()
+                        .map(|plan| plan.leased.buffer() as *const R::Buffer as usize)
+                        .collect::<Vec<_>>();
+                    if let Some(backing) = physical.fresh_backing {
+                        fixed_buffer_identities.extend(
+                            backing
+                                .bindings()
+                                .iter()
+                                .map(|binding| binding.buffer() as *const R::Buffer as usize),
+                        );
+                    }
+                    fixed_buffer_identities.sort_unstable();
+                    fixed_buffer_identities.dedup();
                     (
                         backend,
                         dependencies,
@@ -357,11 +458,12 @@ impl OperationDispatch {
                             facts.dynamic_resource_requests,
                             facts.unique_physical_buffers,
                         ),
+                        fixed_buffer_identities,
                     )
                 }))
             },
         )?;
-        let Some((backend, dependencies, tables, facts)) = compiled else {
+        let Some((backend, dependencies, tables, facts, fixed_buffer_identities)) = compiled else {
             return Ok(None);
         };
         Ok(Some(Arc::new(ResidentDecodeProgram {
@@ -369,9 +471,12 @@ impl OperationDispatch {
             topology: topology.clone(),
             replay: replay.clone(),
             _recipe: recipe,
-            tables,
-            facts,
-            backend,
+            version: Mutex::new(Arc::new(ResidentDecodeVersion {
+                backend,
+                tables,
+                facts,
+            })),
+            fixed_buffer_identities,
             dependencies,
             sequence_windows,
             lane: Arc::clone(lane),
@@ -520,9 +625,14 @@ impl OperationDispatch {
                 "resident submission identity or reservation differs from its fresh use",
             )));
         }
-        program.validate_current_windows(&use_).map_err(invalid)?;
-        use_.retain_resident_program(DeviceBufferRetention::plan(Arc::clone(program)))
-            .map_err(invalid)?;
+        let Some(version) = program.prepare_current_version(&use_).map_err(invalid)? else {
+            return Err(ResidentDecodeDispatchError::Unavailable { use_ });
+        };
+        use_.retain_resident_program(DeviceBufferRetention::pair(
+            Arc::clone(program),
+            Arc::clone(&version),
+        ))
+        .map_err(invalid)?;
         let fresh_retention = use_.retention();
         let dependencies = program.dependencies.issue(fresh_retention.clone());
         let scope = Arc::clone(dependencies.scope());
@@ -532,7 +642,7 @@ impl OperationDispatch {
         let mut provider_stage = ResidentProviderTimer::start(timing);
         let encoded = lane
             .runtime()
-            .encode_resident_decode_program(program.backend.as_ref(), &mut request)
+            .encode_resident_decode_program(version.backend.as_ref(), &mut request)
             .map_err(|e| {
                 invalid(invalid_operation(format!(
                     "resident binding encode failed: {e}"
@@ -631,9 +741,9 @@ impl OperationDispatch {
         }
         identity.record_segment_preparation(
             true,
-            program.facts.0,
-            program.facts.1,
-            program.facts.2,
+            version.facts.0,
+            version.facts.1,
+            version.facts.2,
         );
         drop(provider_stage);
         let lane_stage = SubmissionWaveDispatchStageTimer::start(
