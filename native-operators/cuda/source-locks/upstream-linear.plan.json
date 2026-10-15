@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.upstream_linear",
   "source_package": {
     "kind": "ferrum-native-upstream-linear",
-    "revision": "marker-v2-tail-safe-r1+d81235049384534c167caea52b85a694f6103d14",
-    "sha256": "260c1c130610384fb188d239554909d7001fc233edbb186ea969ffa0a169b1ec"
+    "revision": "marker-v2-mmvq-programmatic-chain-r1-q4-q5-shared-m4-m8-weight+d81235049384534c167caea52b85a694f6103d14",
+    "sha256": "3c6e1b229b33092a1f7b2c38092d0673fe3d3d8310f32b1631de1eedc47537c6"
   },
   "upstream_sources": [
     {
@@ -20,17 +20,17 @@
     },
     {
       "path": "kernels/mmq.cu",
-      "sha256": "3f811bb970f178471825cc19d0b546e5b292a3d82de0f87792f40c6e0293ec32"
+      "sha256": "598a131582e47e53f8bad75afedbfbe80e1c676ca3227b3e47dd0969211cc10d"
     },
     {
       "path": "kernels/mmvq.cu",
-      "sha256": "a578869fc6455e54e6d06018ab8b30f358ea69ecc7c0c0ddf81e5d6a2f8f58e8"
+      "sha256": "43f9585454313dae8912b4f66568b08144a270547ec0ac5a2cf09b0c1a16b76a"
     }
   ],
   "headers": [
     {
       "path": "kernels/abi.h",
-      "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+      "sha256": "1c6e12ee03f1913670c2dfab559a1b80947d87da9123902d5d811c1d271eaed0"
     },
     {
       "path": "kernels/boundary.h",
@@ -155,21 +155,21 @@
       "headers": [
         {
           "path": "kernels/abi.h",
-          "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+          "sha256": "1c6e12ee03f1913670c2dfab559a1b80947d87da9123902d5d811c1d271eaed0"
         },
         {
           "path": "kernels/boundary.h",
           "sha256": "a329674a5e0b35bdab150db775b9e4793257b7359a9ce8dd8a5e70519e48d47d"
         }
       ],
-      "closure_sha256": "01cae1a5204dbf5e7bed860b60f08ecf315099ab54c36ca02e97b0c5a6b0c68e"
+      "closure_sha256": "4ee3166b232c366fbe54c953d95e9091e8319946e23f12a375cd906ab10a6204"
     },
     {
       "translation_unit": "kernels/mmq.cu",
       "headers": [
         {
           "path": "kernels/abi.h",
-          "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+          "sha256": "1c6e12ee03f1913670c2dfab559a1b80947d87da9123902d5d811c1d271eaed0"
         },
         {
           "path": "kernels/boundary.h",
@@ -280,14 +280,14 @@
           "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
         }
       ],
-      "closure_sha256": "eb3a15cba3b379c3c8d712b47b0325632278c6898f59ab93f956d59c208a57a0"
+      "closure_sha256": "6a016a5c8ef1a6cb070d4a5728f400c082d70f77b18be7ea951e89d1c806b368"
     },
     {
       "translation_unit": "kernels/mmvq.cu",
       "headers": [
         {
           "path": "kernels/abi.h",
-          "sha256": "58045ccf26f06843fbfc05705feac0af41ede1f00eda1fa164aa5ac91130ec5c"
+          "sha256": "1c6e12ee03f1913670c2dfab559a1b80947d87da9123902d5d811c1d271eaed0"
         },
         {
           "path": "kernels/boundary.h",
@@ -406,7 +406,7 @@
           "sha256": "43564db0238aebb7ed68501e346c194866b5dac218d1d37b26baff9f458c00d3"
         }
       ],
-      "closure_sha256": "34a99cf9f3ff1617d826ff027f1c80f2f5d51d9cb3339023e4c4dd6291030afd"
+      "closure_sha256": "5c6c4b8b087c78c87cc88c9abf1a32ca4e6eb85532dbd1863170f160c5cb2143"
     }
   ],
   "include_dirs": [
@@ -416,7 +416,9 @@
     "llama/ggml/src/ggml-cuda",
     "llama/include"
   ],
-  "defines": [],
+  "defines": [
+    "FERRUM_Q5_SHARED_WEIGHT_DECODE=1"
+  ],
   "nvcc_policy": {
     "cpp_standard": "cpp17",
     "optimization": "o3",

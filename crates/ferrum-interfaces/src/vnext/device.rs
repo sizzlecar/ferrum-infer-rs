@@ -866,6 +866,15 @@ pub enum DeviceSubmissionStage {
     RecordFenceAndAccount,
 }
 
+/// Per-call host intervals nested inside command enqueue. These are not
+/// additional submission stages or GPU execution durations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceEnqueueStage {
+    GraphLaunch,
+    EagerCommand,
+    DeferredSnapshotReadback,
+}
+
 /// Aggregate reusable-execution work observed inside one backend submission.
 ///
 /// The observation carries no execution authority and is recorded only by an
@@ -1830,6 +1839,19 @@ pub trait DeviceSubmissionTimingSink: Send + Sync {
     const ENABLED: bool;
 
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration);
+
+    /// One entered enqueue call, including a call that returns an error.
+    /// `wall` uses the host monotonic clock; `thread_cpu` is optional CPU time
+    /// from the calling thread over that call's measurement envelope. Missing
+    /// CPU timing must remain unavailable rather than being reported as zero.
+    /// Backends must skip both clocks and this callback when `ENABLED = false`.
+    fn record_device_enqueue(
+        &self,
+        _stage: DeviceEnqueueStage,
+        _wall: Duration,
+        _thread_cpu: Option<Duration>,
+    ) {
+    }
 
     fn record_reusable_execution(&self, _observation: DeviceReusableExecutionObservation) {}
 

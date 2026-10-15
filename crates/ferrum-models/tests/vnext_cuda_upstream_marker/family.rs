@@ -6,6 +6,8 @@ pub mod extra_all_rows;
 #[path = "family/extra_prefill.rs"]
 pub mod extra_prefill;
 pub use extra::Weights;
+#[path = "family/q6_f16.rs"]
+pub mod q6_f16;
 
 const INTERMEDIATE: u64 = 768;
 const PROFILE: &str = "fixture.attention-ffn.require-upstream-marker-v2";
@@ -17,6 +19,8 @@ pub struct Family {
     selected: UpstreamMarkerV2Profile,
     maximum_tokens: u64,
     g32_baseline: bool,
+    small_q8_projection: bool,
+    q8_projection_pair_adjacent: Option<bool>,
 }
 
 impl Family {
@@ -25,11 +29,31 @@ impl Family {
             base: attention_family::Family::new(kind),
             maximum_tokens: MAX_TOKENS,
             g32_baseline: false,
+            small_q8_projection: false,
+            q8_projection_pair_adjacent: None,
             selected: match kind {
                 AttentionKind::GatedDelta => UpstreamMarkerV2Profile::GatedDelta,
                 AttentionKind::Causal => UpstreamMarkerV2Profile::Causal,
                 _ => panic!("MarkerV2 gate declares GDN and FP16-KV causal"),
             },
+        }
+    }
+    pub fn with_small_q8_projection(mut self) -> Self {
+        self.small_q8_projection = true;
+        self.q8_projection_pair_adjacent = None;
+        self
+    }
+    pub fn with_small_q8_projection_pair(mut self, adjacent: bool) -> Self {
+        self.small_q8_projection = false;
+        self.q8_projection_pair_adjacent = Some(adjacent);
+        self
+    }
+    pub fn small_q8_projection_layout(&self) -> Vec<(u64, u64)> {
+        match self.q8_projection_pair_adjacent {
+            Some(true) => vec![(192, 13), (205, 19)],
+            Some(false) => vec![(192, 13), (221, 19)],
+            None if self.small_q8_projection => vec![(192, 32)],
+            None => Vec::new(),
         }
     }
     pub fn prefill(kind: AttentionKind, maximum_tokens: u64) -> Self {
@@ -110,7 +134,9 @@ impl Family {
         self.selected
     }
     pub fn swiglu_profile(&self) -> UpstreamMarkerV2Profile {
-        if self.selected.extra_all_rows() {
+        if self.selected.q6_f16() {
+            UpstreamMarkerV2Profile::SwiGluQ6F16
+        } else if self.selected.extra_all_rows() {
             UpstreamMarkerV2Profile::SwiGluExtraAllRows
         } else if self.selected.extra_prefill() {
             UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
@@ -124,8 +150,18 @@ impl Family {
             UpstreamMarkerV2Profile::SwiGlu
         }
     }
+    pub fn hidden_size(&self) -> u64 {
+        if self.selected.q6_f16() {
+            q6_f16::WIDE_HIDDEN
+        } else {
+            HIDDEN
+        }
+    }
     pub fn states(&self) -> Vec<StateSpec> {
         let mut states = self.base.states();
+        if self.selected.q6_f16() {
+            q6_f16::resize_states(&mut states);
+        }
         for state in &mut states {
             if let StateCapacityDemand::TokenScaled { maximum_tokens, .. } =
                 &mut state.capacity_demand
@@ -136,7 +172,9 @@ impl Family {
         states
     }
     pub fn profile_id(&self) -> &'static str {
-        if self.g32_baseline {
+        if self.selected.q6_f16() {
+            q6_f16::PROFILE
+        } else if self.g32_baseline {
             "fixture.attention-ffn.require-atn-g32"
         } else if self.selected.extra_all_rows() {
             extra_all_rows::PROFILE
@@ -188,12 +226,17 @@ impl ModelFamilyProvider for Family {
 
     fn weight_schema(&self, config: &AttentionKind) -> Result<WeightSchema, VNextError> {
         let mut schema = self.base.weight_schema(config)?;
+        let hidden = self.hidden_size();
+        let intermediate = self.intermediate_size();
+        if self.selected.q6_f16() {
+            q6_f16::resize_schema(&mut schema, *config);
+        }
         let norm: WeightId = id("component.ffn_norm");
         schema.components.push(WeightComponentSpec {
             id: norm.clone(),
             role: WeightComponentRole::Values,
             external_names: vec!["ffn_norm".into()],
-            dimensions: vec![HIDDEN],
+            dimensions: vec![hidden],
             encoding: WeightEncoding::Dense {
                 element_type: ElementType::F16,
             },
@@ -201,17 +244,19 @@ impl ModelFamilyProvider for Family {
         });
         schema.tensors.push(WeightTensorSpec {
             id: id("weight.ffn_norm"),
-            dimensions: vec![HIDDEN],
+            dimensions: vec![hidden],
             logical_element_type: ElementType::F16,
             physical_layout: PhysicalWeightLayout::Dense { component_id: norm },
             required: true,
         });
-        mixed_weight(&mut schema, "ffn_gate_up", 2, INTERMEDIATE, HIDDEN);
-        mixed_weight(&mut schema, "ffn_down", 1, HIDDEN, INTERMEDIATE);
+        mixed_weight(&mut schema, "ffn_gate_up", 2, intermediate, hidden);
+        mixed_weight(&mut schema, "ffn_down", 1, hidden, intermediate);
         // One extra physical dense leaf in each operation makes the validation
         // payload an odd number of eight-byte banks. Its admitted Plan buffer
         // must include alignment padding; no dimensions or budget change.
-        if self.selected.extra() {
+        if self.selected.q6_f16() {
+            q6_f16::replace_projection_leaves(&mut schema);
+        } else if self.selected.extra() {
             extra::extend_schema(&mut schema);
             // 7 leaves per bank gives 21 FFN leaves; only attention needs a
             // split to keep both admitted flag extents genuinely padded.
@@ -219,6 +264,116 @@ impl ModelFamilyProvider for Family {
         } else {
             split_dense_leaf(&mut schema, "o");
             split_dense_leaf(&mut schema, "ffn_down");
+        }
+        if self.small_q8_projection {
+            // Replace one of the split o leaves; the other remains dense.
+            // Logical offsets and output stride therefore exercise a real
+            // mixed projection, rather than a standalone synthetic dot.
+            let tensor = schema
+                .tensors
+                .iter_mut()
+                .find(|t| t.id.as_str() == "weight.o")
+                .unwrap();
+            let PhysicalWeightLayout::Composite { parts } = &mut tensor.physical_layout else {
+                unreachable!()
+            };
+            let part = parts
+                .iter_mut()
+                .find(|p| matches!(p.layout.as_ref(), PhysicalWeightLayout::Dense { .. }))
+                .unwrap();
+            let PhysicalWeightLayout::Dense { component_id } = part.layout.as_ref() else {
+                unreachable!()
+            };
+            let component_id = component_id.clone();
+            let component = schema
+                .components
+                .iter_mut()
+                .find(|c| c.id == component_id)
+                .unwrap();
+            assert_eq!(part.extents, vec![32, HIDDEN]);
+            component.role = WeightComponentRole::PackedValues;
+            component.dimensions = vec![32, HIDDEN / 32];
+            component.encoding = WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                format_id: id("quantization.gguf.q8-0"),
+                logical_values_per_block: 32,
+                bytes_per_block: 34,
+            });
+            part.layout = Box::new(PhysicalWeightLayout::BlockQuantized {
+                blocks: PhysicalWeightComponentBinding::exact_contiguous(component_id),
+                block_axis: 1,
+                block_padding: PhysicalWeightPadding::Exact,
+            });
+        }
+        if let Some(adjacent) = self.q8_projection_pair_adjacent {
+            let tensor = schema
+                .tensors
+                .iter_mut()
+                .find(|t| t.id.as_str() == "weight.o")
+                .unwrap();
+            let PhysicalWeightLayout::Composite { parts } = &mut tensor.physical_layout else {
+                unreachable!()
+            };
+            let removed: BTreeSet<_> = parts
+                .iter()
+                .filter_map(|part| match part.layout.as_ref() {
+                    PhysicalWeightLayout::Dense { component_id } => Some(component_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            parts
+                .retain(|part| !matches!(part.layout.as_ref(), PhysicalWeightLayout::Dense { .. }));
+            schema
+                .components
+                .retain(|component| !removed.contains(&component.id));
+            // The same 64 output columns contain two odd, unequal Q8 leaves.
+            // The fallback inserts a dense output interval between them while
+            // their separately prepared F32 destinations remain contiguous.
+            let widths: &[(u64, bool)] = if adjacent {
+                &[(13, true), (19, true), (32, false)]
+            } else {
+                &[(13, true), (16, false), (19, true), (16, false)]
+            };
+            let mut offset = 192;
+            for (index, &(outputs, quantized)) in widths.iter().enumerate() {
+                let component_id: WeightId = id(format!("component.o.q8-pair.{index}"));
+                schema.components.push(WeightComponentSpec {
+                    id: component_id.clone(),
+                    role: if quantized {
+                        WeightComponentRole::PackedValues
+                    } else {
+                        WeightComponentRole::Values
+                    },
+                    external_names: vec![format!("o.q8-pair.{index}")],
+                    dimensions: vec![outputs, if quantized { HIDDEN / 32 } else { HIDDEN }],
+                    encoding: if quantized {
+                        WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                            format_id: id("quantization.gguf.q8-0"),
+                            logical_values_per_block: 32,
+                            bytes_per_block: 34,
+                        })
+                    } else {
+                        WeightEncoding::Dense {
+                            element_type: ElementType::F16,
+                        }
+                    },
+                    required: true,
+                });
+                parts.push(CompositeWeightPart {
+                    layout: Box::new(if quantized {
+                        PhysicalWeightLayout::BlockQuantized {
+                            blocks: PhysicalWeightComponentBinding::exact_contiguous(component_id),
+                            block_axis: 1,
+                            block_padding: PhysicalWeightPadding::Exact,
+                        }
+                    } else {
+                        PhysicalWeightLayout::Dense { component_id }
+                    }),
+                    logical_offsets: vec![offset, 0],
+                    extents: vec![outputs, HIDDEN],
+                });
+                offset += outputs;
+            }
+            assert_eq!(offset, HIDDEN);
         }
         Ok(schema)
     }
@@ -291,6 +446,11 @@ impl ModelFamilyProvider for Family {
         }
         let old = self.base.semantic_program(config, profile)?;
         let mut blocks = old.blocks().to_vec();
+        let hidden_size = self.hidden_size();
+        let intermediate = self.intermediate_size();
+        if self.selected.q6_f16() {
+            q6_f16::resize_nodes(&mut blocks, *config);
+        }
         let attention = &mut blocks[0].nodes[1];
         attention.operation_id = id(self.attention_operation());
         if attention
@@ -318,7 +478,7 @@ impl ModelFamilyProvider for Family {
                 attributes: attrs,
             });
         };
-        let hidden = || BTreeMap::from([(id("hidden_size"), SemanticValue::Unsigned(HIDDEN))]);
+        let hidden = || BTreeMap::from([(id("hidden_size"), SemanticValue::Unsigned(hidden_size))]);
         let mut norm = hidden();
         norm.insert(
             id("epsilon"),
@@ -334,7 +494,7 @@ impl ModelFamilyProvider for Family {
         let mut ffn = hidden();
         ffn.insert(
             id("intermediate_size"),
-            SemanticValue::Unsigned(INTERMEDIATE),
+            SemanticValue::Unsigned(intermediate),
         );
         node(
             "node.swiglu",
@@ -355,10 +515,13 @@ impl ModelFamilyProvider for Family {
             hidden(),
         );
         let mut weights = old.weights().to_vec();
+        if self.selected.q6_f16() {
+            q6_f16::resize_weights(&mut weights, *config);
+        }
         for (name, dimensions) in [
-            ("ffn_norm", vec![HIDDEN]),
-            ("ffn_gate_up", vec![2, INTERMEDIATE, HIDDEN]),
-            ("ffn_down", vec![HIDDEN, INTERMEDIATE]),
+            ("ffn_norm", vec![hidden_size]),
+            ("ffn_gate_up", vec![2, intermediate, hidden_size]),
+            ("ffn_down", vec![hidden_size, intermediate]),
         ] {
             weights.push(WeightReference {
                 weight_id: id(format!("weight.{name}")),

@@ -11,6 +11,16 @@ description = "Native operator ABI and artifact resolver for Ferrum"
 # Explicit native ABI conformance only. The caller supplies a source-builder
 # archive through the standard linker search path; default builds stay CPU-only.
 cuda-upstream-linear-tests = []
+# Test-only dot export supplied by the independent shared-weight-decode archive.
+cuda-upstream-shared-weight-decode-tests = ["cuda-upstream-linear-tests"]
+# IQ4 shared-dot test symbol supplied only by the independent IQ4 experiment TU.
+cuda-upstream-iq4-shared-weight-decode-tests = ["cuda-upstream-shared-weight-decode-tests"]
+cuda-upstream-small-shared-weight-decode-tests = ["cuda-upstream-shared-weight-decode-tests"]
+# Test-only F16 input pack exports; production pack and dot routes stay unchanged.
+cuda-upstream-direct-f16-pack-tests = ["cuda-upstream-shared-weight-decode-tests"]
+# Test-only full-output-tile MMQ dot supplied by the independent experiment TU.
+cuda-upstream-full-tile-stream-k-tests = ["cuda-upstream-shared-weight-decode-tests"]
+cuda-upstream-mmvq-pdl-tests = ["cuda-upstream-shared-weight-decode-tests"]
 
 [dependencies]
 ferrum-types = { workspace = true }

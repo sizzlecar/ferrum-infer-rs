@@ -25,7 +25,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -46,7 +48,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -67,7 +71,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -88,7 +94,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -108,7 +116,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -129,7 +139,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -275,7 +287,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -296,7 +310,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -317,7 +333,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -338,7 +356,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -358,7 +378,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     },
     {
@@ -379,7 +401,9 @@
         "ferrum_upstream_mmvq_dot_v1",
         "ferrum_upstream_mmvq_pack_v1",
         "ferrum_upstream_mmvq_pack_v2",
-        "ferrum_upstream_mmvq_plan_v1"
+        "ferrum_upstream_mmvq_plan_v1",
+        "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+        "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1"
       ]
     }
   ],
@@ -388,6 +412,8 @@
     "ferrum_upstream_mmq_cast_v2",
     "ferrum_upstream_mmq_check_weights_v2",
     "ferrum_upstream_mmq_dot_v1",
+    "ferrum_upstream_mmq_pack_f16_small_v1",
+    "ferrum_upstream_mmq_pack_f16_small_v2",
     "ferrum_upstream_mmq_pack_v1",
     "ferrum_upstream_mmq_pack_v2",
     "ferrum_upstream_mmq_plan_v1",
@@ -396,9 +422,18 @@
     "ferrum_upstream_mmvq_cast_v2",
     "ferrum_upstream_mmvq_check_weights_v2",
     "ferrum_upstream_mmvq_dot_v1",
+    "ferrum_upstream_mmvq_pack_kernel_clear_small_v1",
     "ferrum_upstream_mmvq_pack_v1",
     "ferrum_upstream_mmvq_pack_v2",
-    "ferrum_upstream_mmvq_plan_v1"
+    "ferrum_upstream_mmvq_pdl_cast_v2",
+    "ferrum_upstream_mmvq_pdl_dot_v1",
+    "ferrum_upstream_mmvq_pdl_pack_v2",
+    "ferrum_upstream_mmvq_pdl_support_v1",
+    "ferrum_upstream_mmvq_plan_v1",
+    "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1",
+    "ferrum_upstream_mmvq_q4_shared_weight_decode_m4_dot_v1",
+    "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1",
+    "ferrum_upstream_mmvq_q5_shared_weight_decode_m4_dot_v1"
   ],
   "license_files": [
     {

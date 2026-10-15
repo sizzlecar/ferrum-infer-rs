@@ -1,7 +1,8 @@
 # Indexed addressed paged attention
 
-These two modified sources extend the pinned vLLM source bundle with four
-additive `addressed_indexed_v1` entrypoints. Existing entrypoints and their
+The two modified baseline sources extend the pinned vLLM source bundle with four
+additive `addressed_indexed_v1` entrypoints. The additional `attention_gqa2.cuh`
+and `launcher_gqa2.cu` provide the paired-query-head V2 entrypoint. Existing entrypoints and their
 per-row arithmetic are retained. The upstream revision and Apache-2.0 license
 remain those in the source definition; the header retains its copyright notice.
 
@@ -16,6 +17,22 @@ builder:
 ferrum-native-ops-builder materialize-source \
   --spec <repo>/native-operators/cuda/source-overlays/vllm-paged-attention-indexed.json \
   --base-source-root <unpacked-a9> --override-source-root <repo> --out <source>
+```
+
+The overlay materializes the twelve baseline members. Stage the two additional
+repository files before locking the expanded source definition, and verify every
+staged member against the checked-in source lock. For example, on Linux with
+`repo` and `source` set to the repository and materialized directory:
+
+```sh
+cp "$repo/native-operators/cuda/vllm-paged-attention-indexed/attention_gqa2.cuh" \
+  "$source/kernels/vllm_attn/attention_gqa2.cuh"
+cp "$repo/native-operators/cuda/vllm-paged-attention-indexed/launcher_gqa2.cu" \
+  "$source/kernels/vllm_attn/launcher_gqa2.cu"
+jq -r '(.translation_units + .headers)[] | [.sha256, .path] | join("  ")' \
+  "$repo/native-operators/cuda/source-locks/vllm-paged-attention-v2.plan.json" \
+  > "$source/source-files.sha256"
+(cd "$source" && sha256sum --check source-files.sha256)
 ```
 
 Then use the existing `lock-source`, `source-build` and `package` commands with

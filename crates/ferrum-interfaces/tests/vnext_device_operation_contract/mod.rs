@@ -131,6 +131,8 @@ pub(crate) struct TestConfig {
     pub(crate) token_scaled_state: bool,
     #[serde(default)]
     pub(crate) recurrent_state: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retention_chain_nodes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -227,6 +229,17 @@ impl ModelFamilyProvider for TestFamily {
                 family_id: self.family_id().to_string(),
                 field: "width".to_owned(),
                 reason: "fixture requires width 4".to_owned(),
+            });
+        }
+        if config.retention_chain_nodes.is_some_and(|nodes| nodes < 2)
+            || (config.retention_chain_nodes.is_some()
+                && (config.zero_state || config.token_scaled_state || config.recurrent_state))
+        {
+            return Err(VNextError::InvalidModelConfig {
+                family_id: self.family_id().to_string(),
+                field: "retention_chain_nodes".to_owned(),
+                reason: "retention chain requires at least two nodes and no semantic state"
+                    .to_owned(),
             });
         }
         Ok(config)
@@ -339,6 +352,18 @@ impl ModelFamilyProvider for TestFamily {
                 checkpoint: StateCheckpointCapability::Unsupported,
             });
         }
+        if let Some(nodes) = config.retention_chain_nodes {
+            let outputs = (0..nodes)
+                .map(|node| format!("value.retention.{node}"))
+                .collect::<Vec<_>>();
+            let output_refs = outputs.iter().map(String::as_str).collect::<Vec<_>>();
+            return fixture_f32_profiles(
+                self.family_id(),
+                &output_refs,
+                &["operation.main"],
+                states,
+            );
+        }
         fixture_f32_profiles(
             self.family_id(),
             &["value.intermediate", "value.output"],
@@ -352,6 +377,44 @@ impl ModelFamilyProvider for TestFamily {
         config: &Self::Config,
         profile: &NumericalExecutionProfile,
     ) -> Result<ModelProgram, VNextError> {
+        if let Some(nodes) = config.retention_chain_nodes {
+            return ModelProgram::new(
+                self.family_id().clone(),
+                vec![id("value.input")],
+                vec![ProgramBlock {
+                    id: "block.retention".to_owned(),
+                    nodes: (0..nodes)
+                        .map(|node| ProgramNode {
+                            id: id(format!("node.retention.{node}")),
+                            operation_id: id("operation.main"),
+                            required_version: ContractVersion::new(1, 0),
+                            work: ProgramNodeWorkSpec::Fixed,
+                            inputs: vec![
+                                if node == 0 {
+                                    id("value.input")
+                                } else {
+                                    id(format!("value.retention.{}", node - 1))
+                                },
+                                id("value.weight"),
+                            ],
+                            outputs: vec![id(format!("value.retention.{node}"))],
+                            attributes: BTreeMap::new(),
+                        })
+                        .collect(),
+                }],
+                profile.states.clone(),
+                vec![WeightReference {
+                    weight_id: id("weight.matrix"),
+                    value_id: id("value.weight"),
+                    tensor: ProgramTensorSpec {
+                        dimensions: vec![config.width],
+                        element_type: ElementType::F32,
+                        layout: ResolvedTensorLayout::Contiguous,
+                    },
+                }],
+                vec![id(format!("value.retention.{}", nodes - 1))],
+            );
+        }
         let mut main_inputs = vec![id("value.input"), id("value.weight")];
         let mut tail_inputs = vec![id("value.intermediate"), id("value.weight")];
         if config.zero_state {

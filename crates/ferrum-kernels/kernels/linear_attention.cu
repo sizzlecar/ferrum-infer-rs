@@ -475,7 +475,7 @@ extern "C" __global__ void recurrent_conv_state_commit_f16_indirect(
 }
 
 template <typename InputT, typename ParamT, typename StateT = float,
-          typename ZT = float, bool NegativeRate = false>
+          typename ZT = float, bool NegativeRate = false, bool ImplicitSingleToken = false>
 static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const InputT* __restrict__ mixed_qkvz_raw,
     const InputT* __restrict__ ba_raw,
@@ -524,13 +524,13 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
   if (idx < conv_total) {
     const int token = idx / conv_channels;
     const int channel = idx - token * conv_channels;
-    const int seq = static_cast<int>(token_seq_indices[token]);
+    const int seq = ImplicitSingleToken ? token : static_cast<int>(token_seq_indices[token]);
     if (seq < 0 || seq >= batch) return;
     const StateT* sequence_initial_conv_state =
         state_bindings == nullptr
             ? initial_conv_states + seq * conv_state_len
             : reinterpret_cast<const StateT*>(state_bindings[seq * 2]);
-    const int token_start = static_cast<int>(cu_seqlens[seq]);
+    const int token_start = ImplicitSingleToken ? seq : static_cast<int>(cu_seqlens[seq]);
     const int local_token = token - token_start;
     const int state_base = channel * state_len;
 
@@ -589,8 +589,8 @@ static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
         state_bindings == nullptr
             ? initial_conv_states + seq * conv_state_len
             : reinterpret_cast<const StateT*>(state_bindings[seq * 2]);
-    const int token_start = static_cast<int>(cu_seqlens[seq]);
-    const int token_end = static_cast<int>(cu_seqlens[seq + 1]);
+    const int token_start = ImplicitSingleToken ? seq : static_cast<int>(cu_seqlens[seq]);
+    const int token_end = ImplicitSingleToken ? seq + 1 : static_cast<int>(cu_seqlens[seq + 1]);
     const int seq_tokens = token_end - token_start;
     const int source = seq_tokens + pos - state_len;
     const int state_base = channel * state_len;
@@ -792,6 +792,44 @@ vnext_linear_attention_prepare_negative_rate_f16_indirect(
   const __half* ba_raw = mixed_qkvzba_raw + qkvz_width;
   linear_attention_prepare_varlen_packed_qkvz_ba_impl<
       __half, float, __half, __half, true>(
+      mixed_qkvzba_raw, ba_raw, conv_weight, nullptr, state_bindings, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel, qkvzba_width, qkvzba_width);
+}
+
+// Test-only entrypoint; production exports retain the default explicit controls.
+extern "C" __global__ void
+ferrum_test_gdn_prepare_implicit_single_token_f16(
+    const __half* __restrict__ mixed_qkvzba_raw,
+    const __half* __restrict__ conv_weight,
+    const unsigned long long* __restrict__ state_bindings,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    __half* __restrict__ z,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    __half* __restrict__ final_conv_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  if (batch <= 0 || total_tokens != batch) return;
+  const int qk_total = key_heads * key_dim;
+  const int value_total = value_heads * value_dim;
+  const int qkvz_width = 2 * qk_total + 2 * value_total;
+  const int qkvzba_width = qkvz_width + 2 * value_heads;
+  const __half* ba_raw = mixed_qkvzba_raw + qkvz_width;
+  linear_attention_prepare_varlen_packed_qkvz_ba_impl<
+      __half, float, __half, __half, true, true>(
       mixed_qkvzba_raw, ba_raw, conv_weight, nullptr, state_bindings, a_log,
       dt_bias, cu_seqlens, token_seq_indices, query, key, value, z, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,

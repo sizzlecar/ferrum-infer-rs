@@ -167,6 +167,180 @@ pub const CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECOD
 pub const CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY: &str =
     "FERRUM_CAUSAL_DECODE_ATTENTION_GROUPING";
 
+/// Snapshot identity for explicit Q4 MMVQ decode, never an environment switch.
+pub const Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY: &str = "FERRUM_Q4_MMVQ_WEIGHT_DECODE";
+
+/// Weight decode implementation for already selected Q4_K MarkerV2 MMVQ rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Q4MmvqWeightDecode {
+    #[default]
+    Baseline,
+    SharedM8,
+    SharedM4M8,
+}
+
+impl Q4MmvqWeightDecode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::SharedM8 => "shared-m8",
+            Self::SharedM4M8 => "shared-m4-m8",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "baseline" => Ok(Self::Baseline),
+            "shared-m8" => Ok(Self::SharedM8),
+            "shared-m4-m8" => Ok(Self::SharedM4M8),
+            _ => Err(format!(
+                "expected baseline, shared-m8 or shared-m4-m8; got {raw:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select Q4 MMVQ weight decode through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
+/// Snapshot identity for explicit Q5 MMVQ decode, never an environment switch.
+pub const Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY: &str = "FERRUM_Q5_MMVQ_WEIGHT_DECODE";
+
+/// Weight decode implementation for already selected Q5_K MarkerV2 MMVQ rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Q5MmvqWeightDecode {
+    #[default]
+    Baseline,
+    SharedM8,
+    SharedM4M8,
+}
+
+impl Q5MmvqWeightDecode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::SharedM8 => "shared-m8",
+            Self::SharedM4M8 => "shared-m4-m8",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "baseline" => Ok(Self::Baseline),
+            "shared-m8" => Ok(Self::SharedM8),
+            "shared-m4-m8" => Ok(Self::SharedM4M8),
+            _ => Err(format!(
+                "expected baseline, shared-m8 or shared-m4-m8; got {raw:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select Q5 MMVQ weight decode through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
+/// Explicit preparation policy snapshot key; never an environment switch.
+pub const Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY: &str =
+    "FERRUM_Q8_PROJECTION_WEIGHT_PREPARATION";
+
+/// Retained representation of eligible strict Q8_0 projection leaves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Q8ProjectionWeightPreparation {
+    #[default]
+    Compressed,
+    PredecodedF32,
+}
+
+impl Q8ProjectionWeightPreparation {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Compressed => "compressed",
+            Self::PredecodedF32 => "predecoded-f32",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "compressed" => Ok(Self::Compressed),
+            "predecoded-f32" => Ok(Self::PredecodedF32),
+            _ => Err(format!(
+                "expected compressed or predecoded-f32; got {raw:?}"
+            )),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select Q8 projection weight preparation through CLI or config, not environment"
+                    .into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
+/// Configuration provenance key; this policy is selected through CLI or config.
+pub const CAUSAL_DECODE_KV_REUSE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECODE_KV_REUSE";
+
+/// Reuse KV loads across query heads without changing each head's arithmetic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalDecodeKvReuse {
+    #[default]
+    None,
+    PairedQueryHeads,
+}
+
+impl CausalDecodeKvReuse {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PairedQueryHeads => "paired-query-heads",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "paired-query-heads" => Ok(Self::PairedQueryHeads),
+            _ => Err(format!("expected none or paired-query-heads; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select causal decode KV reuse through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Grouping of already selected native V1/V2 causal decode rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -176,6 +350,8 @@ pub enum CausalDecodeAttentionGrouping {
     Indexed,
     /// Preserve decode command capacities while current device lengths select V1/V2 rows.
     FixedCapacity,
+    /// Bound fixed native scratch by the declared execution context limit.
+    FixedExecutionCapacity,
 }
 
 impl CausalDecodeAttentionGrouping {
@@ -184,6 +360,7 @@ impl CausalDecodeAttentionGrouping {
             Self::Contiguous => "contiguous",
             Self::Indexed => "indexed",
             Self::FixedCapacity => "fixed-capacity",
+            Self::FixedExecutionCapacity => "fixed-execution-capacity",
         }
     }
 
@@ -192,8 +369,9 @@ impl CausalDecodeAttentionGrouping {
             "contiguous" => Ok(Self::Contiguous),
             "indexed" => Ok(Self::Indexed),
             "fixed-capacity" => Ok(Self::FixedCapacity),
+            "fixed-execution-capacity" => Ok(Self::FixedExecutionCapacity),
             _ => Err(format!(
-                "expected contiguous, indexed or fixed-capacity; got {raw:?}"
+                "expected contiguous, indexed, fixed-capacity or fixed-execution-capacity; got {raw:?}"
             )),
         }
     }
@@ -423,6 +601,18 @@ pub struct RuntimeKnobs {
     /// Indexed grouping requires packed preparation with native CUDA attention.
     #[serde(default)]
     pub causal_decode_attention_grouping: CausalDecodeAttentionGrouping,
+    /// Eligible fixed-capacity CUDA V2 attention may share KV loads across two heads.
+    #[serde(default)]
+    pub causal_decode_kv_reuse: CausalDecodeKvReuse,
+    /// Shared weight decoding affects only eligible Q4_K MarkerV2 MMVQ M8 leaves.
+    #[serde(default)]
+    pub q4_mmvq_weight_decode: Q4MmvqWeightDecode,
+    /// Shared weight decoding affects only eligible Q5_K MarkerV2 MMVQ M8 leaves.
+    #[serde(default)]
+    pub q5_mmvq_weight_decode: Q5MmvqWeightDecode,
+    /// Cold preparation of eligible strict Q8_0 projection leaves on CUDA.
+    #[serde(default)]
+    pub q8_projection_weight_preparation: Q8ProjectionWeightPreparation,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -600,6 +790,40 @@ impl EngineConfig {
             self.runtime.causal_decode_attention_grouping =
                 CausalDecodeAttentionGrouping::parse_config_entry(entry).map_err(|reason| {
                     format!("{CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY}: {reason}")
+                })?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == CAUSAL_DECODE_KV_REUSE_CONFIG_KEY)
+        {
+            self.runtime.causal_decode_kv_reuse = CausalDecodeKvReuse::parse_config_entry(entry)
+                .map_err(|reason| format!("{CAUSAL_DECODE_KV_REUSE_CONFIG_KEY}: {reason}"))?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY)
+        {
+            self.runtime.q4_mmvq_weight_decode = Q4MmvqWeightDecode::parse_config_entry(entry)
+                .map_err(|reason| format!("{Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY}: {reason}"))?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY)
+        {
+            self.runtime.q5_mmvq_weight_decode = Q5MmvqWeightDecode::parse_config_entry(entry)
+                .map_err(|reason| format!("{Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY}: {reason}"))?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY)
+        {
+            self.runtime.q8_projection_weight_preparation =
+                Q8ProjectionWeightPreparation::parse_config_entry(entry).map_err(|reason| {
+                    format!("{Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY}: {reason}")
                 })?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
@@ -1754,6 +1978,7 @@ mod tests {
             for mode in [
                 CausalDecodeAttentionGrouping::Indexed,
                 CausalDecodeAttentionGrouping::FixedCapacity,
+                CausalDecodeAttentionGrouping::FixedExecutionCapacity,
                 CausalDecodeAttentionGrouping::Contiguous,
             ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
@@ -1839,6 +2064,7 @@ mod tests {
         for grouping in [
             CausalDecodeAttentionGrouping::Indexed,
             CausalDecodeAttentionGrouping::FixedCapacity,
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut config = EngineConfig::default();
             assert!(config
@@ -2310,5 +2536,189 @@ mod tests {
             .expect_err("unknown profile detail must fail closed");
 
         assert!(error.contains("FERRUM_PROFILE_DETAIL"));
+    }
+    #[test]
+    fn q4_mmvq_weight_decode_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.runtime.q4_mmvq_weight_decode,
+            Q4MmvqWeightDecode::Baseline
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut().unwrap().remove("q4_mmvq_weight_decode");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.q4_mmvq_weight_decode, Q4MmvqWeightDecode::Baseline);
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                Q4MmvqWeightDecode::SharedM8,
+                Q4MmvqWeightDecode::SharedM4M8,
+                Q4MmvqWeightDecode::Baseline,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.q4_mmvq_weight_decode, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.q4_mmvq_weight_decode, mode);
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_defaults_and_explicit_config_preserve_typed_values() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        let mut config = EngineConfig::default();
+        config.runtime.q4_mmvq_weight_decode = Q4MmvqWeightDecode::SharedM8;
+        assert_eq!(
+            config.runtime.q5_mmvq_weight_decode,
+            Q5MmvqWeightDecode::Baseline
+        );
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut().unwrap().remove("q5_mmvq_weight_decode");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Baseline);
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                Q5MmvqWeightDecode::SharedM8,
+                Q5MmvqWeightDecode::SharedM4M8,
+                Q5MmvqWeightDecode::Baseline,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                config.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(config.runtime.q5_mmvq_weight_decode, mode);
+                assert_eq!(
+                    config.runtime.q4_mmvq_weight_decode,
+                    Q4MmvqWeightDecode::SharedM8
+                );
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                config
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                    .unwrap();
+                assert_eq!(config.runtime.q5_mmvq_weight_decode, mode);
+                assert_eq!(
+                    config.runtime.q4_mmvq_weight_decode,
+                    Q4MmvqWeightDecode::SharedM8
+                );
+            }
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "automatic", RuntimeConfigSource::Cli)
+            ]))
+            .is_err());
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_defaults_and_explicit_sources() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let mut engine = EngineConfig::default();
+        let key = CAUSAL_DECODE_KV_REUSE_CONFIG_KEY;
+        assert_eq!(
+            engine.runtime.causal_decode_kv_reuse,
+            CausalDecodeKvReuse::None
+        );
+        let mut old = serde_json::to_value(&engine.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("causal_decode_kv_reuse");
+        assert_eq!(
+            serde_json::from_value::<RuntimeKnobs>(old)
+                .unwrap()
+                .causal_decode_kv_reuse,
+            CausalDecodeKvReuse::None
+        );
+        for source in [RuntimeConfigSource::Cli, RuntimeConfigSource::ConfigFile] {
+            for mode in [
+                CausalDecodeKvReuse::PairedQueryHeads,
+                CausalDecodeKvReuse::None,
+            ] {
+                engine
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                        RuntimeConfigEntry::new(key, mode.as_runtime_value(), source),
+                    ]))
+                    .unwrap();
+                assert_eq!(engine.runtime.causal_decode_kv_reuse, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+            }
+        }
+        for (value, source) in [
+            ("paired-query-heads", RuntimeConfigSource::Env),
+            ("none", RuntimeConfigSource::Env),
+            ("auto", RuntimeConfigSource::Cli),
+        ] {
+            assert!(engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, value, source),
+                ]))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn q8_projection_weight_preparation_defaults_and_explicit_sources() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let mut engine = EngineConfig::default();
+        let key = Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
+        assert_eq!(
+            engine.runtime.q8_projection_weight_preparation,
+            Q8ProjectionWeightPreparation::Compressed
+        );
+        let mut old = serde_json::to_value(&engine.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("q8_projection_weight_preparation");
+        assert_eq!(
+            serde_json::from_value::<RuntimeKnobs>(old)
+                .unwrap()
+                .q8_projection_weight_preparation,
+            Q8ProjectionWeightPreparation::Compressed
+        );
+        engine.runtime.q5_mmvq_weight_decode = Q5MmvqWeightDecode::SharedM8;
+        for source in [RuntimeConfigSource::Cli, RuntimeConfigSource::ConfigFile] {
+            for mode in [
+                Q8ProjectionWeightPreparation::PredecodedF32,
+                Q8ProjectionWeightPreparation::Compressed,
+            ] {
+                engine
+                    .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                        RuntimeConfigEntry::new(key, mode.as_runtime_value(), source),
+                    ]))
+                    .unwrap();
+                assert_eq!(engine.runtime.q8_projection_weight_preparation, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                assert_eq!(
+                    engine.runtime.q5_mmvq_weight_decode,
+                    Q5MmvqWeightDecode::SharedM8
+                );
+            }
+        }
+        for (value, source) in [
+            ("predecoded-f32", RuntimeConfigSource::Env),
+            ("compressed", RuntimeConfigSource::Env),
+            ("auto", RuntimeConfigSource::Cli),
+        ] {
+            assert!(engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, value, source),
+                ]))
+                .is_err());
+        }
     }
 }

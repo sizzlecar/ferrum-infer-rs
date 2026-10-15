@@ -35,6 +35,13 @@ extern "C" int prefix##_cast_v2(const FerrumUpstreamLinearPlanV1 *,const void *,
 FERRUM_UPSTREAM_ABI_DECL(ferrum_upstream_mmq)
 FERRUM_UPSTREAM_ABI_DECL(ferrum_upstream_mmvq)
 #undef FERRUM_UPSTREAM_ABI_DECL
+// Additive, same-plan Q4_K Columns M8 dot. Pack, cast, coefficient validation
+// and every plan extent retain the original MMVQ MarkerV2 contracts.
+extern "C" int ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1(
+        const FerrumUpstreamLinearPlanV1 *,const void *,const void *,void *,void *,void *) noexcept;
+// Additive Q5_K Columns M8 dot, independently selected from Q4 weight decode.
+extern "C" int ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1(
+        const FerrumUpstreamLinearPlanV1 *,const void *,const void *,void *,void *,void *) noexcept;
 // Explicit dense Columns M33..2048 admission, using fixed MMQ J32/I128.
 // Old MMQ plan retains its <=32 domain; launch ABI and numerical rules are shared.
 extern "C" int ferrum_upstream_mmq_prefill_plan_v1(const FerrumUpstreamLinearRequestV1 *,

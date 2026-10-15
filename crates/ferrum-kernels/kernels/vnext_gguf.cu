@@ -247,6 +247,51 @@ NATIVE_Q8_0_LINEAR(f16, 1)
 NATIVE_Q8_0_LINEAR(tiled_f16, 8)
 #undef NATIVE_Q8_0_LINEAR
 
+// Diagnostic-only cold expansion. No product launcher selects these exports.
+// Keep the exact strict Q8_0 F32 coefficient expression; caching in F16 would
+// introduce another rounding boundary. Input views retain byte-safe scale loads.
+extern "C" __global__ void vnext_gguf_q8_0_predecode_f32(
+    const byte* w, float* decoded, unsigned inputs, unsigned outputs) {
+    if (inputs == 0 || inputs % 32 != 0 || outputs == 0) return;
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= size_t(outputs) * inputs) return;
+    const unsigned column = unsigned(index / inputs);
+    const unsigned i = unsigned(index % inputs);
+    const byte* source = w + (size_t(column) * (inputs / 32) + i / 32) * 34;
+    decoded[index] = native_half(source, 0)
+        * float(static_cast<signed char>(source[2 + i % 32]));
+}
+
+// Same T1 four-output/128-thread geometry, per-lane K order, accumulation and
+// reduction as native_q8_0_linear<1>. Only coefficient reconstruction is cold.
+extern "C" __global__ void vnext_gguf_linear_q8_0_predecoded_f32_f16(
+    const half* x, const float* decoded, half* y, unsigned rows,
+    unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
+    if (inputs == 0 || inputs % 32 != 0) return;
+    const unsigned row = blockIdx.y;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned column = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= rows || column >= outputs) return;
+    const unsigned blocks = inputs / 32;
+    const float* weights = decoded + size_t(column) * inputs;
+    float sums[1] = {};
+    for (unsigned block = 0; block < blocks; ++block) {
+        const unsigned i = block * 32 + lane;
+        const float weight = weights[i];
+        #pragma unroll
+        for (unsigned r = 0; r < 1; ++r) {
+            if (row + r < rows) sums[r] += float(x[size_t(row + r) * inputs + i]) * weight;
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < 1; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && row + r < rows)
+            y[size_t(row + r) * stride + offset + column] = half(sums[r]);
+    }
+}
+
 // Fix a 256-value block's format and byte stride without changing reconstructed
 // F32 coefficients, each lane's K order, or the final warp reduction. Byte-safe
 // coefficient loads preserve odd-offset views. F32 operands remain F32: the
@@ -305,6 +350,10 @@ NATIVE_FIXED256_LINEAR(half, half, iq4xs_constant, 23, 136, f16, 1, false)
 NATIVE_FIXED256_LINEAR(half, half, iq4xs_constant, 23, 136, tiled_f16, 8, false)
 NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, f16, 1, false)
 NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, tiled_f16, 8, false)
+// Test-only alternative launch geometry. Production dispatch retains T8. The
+// template, F32 coefficient reconstruction, lane K order and reduction are
+// shared verbatim; only the number of independent row accumulators changes.
+NATIVE_FIXED256_LINEAR(half, half, q6k, 14, 210, test_t4_f16, 4, false)
 NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, f32, 1, false)
 NATIVE_FIXED256_LINEAR(float, float, q6k, 14, 210, tiled_f32, 8, false)
 #undef NATIVE_FIXED256_LINEAR

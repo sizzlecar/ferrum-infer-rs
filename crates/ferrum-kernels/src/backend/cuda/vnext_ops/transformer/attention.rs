@@ -159,6 +159,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         Self::with_precision(runtime, AttentionPrecision::F32MasterUpstreamExtraAllRows)
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_upstream_q6_f16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterUpstreamQ6F16)
+    }
+
     pub(in crate::backend::cuda::vnext_ops) fn new_g32_mmq_prefill(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
@@ -235,11 +241,34 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         ]);
 
         if precision.upstream() {
+            provider_fingerprint_parts.push(
+                runtime
+                    .q8_projection_weight_preparation()
+                    .as_runtime_value()
+                    .as_bytes(),
+            );
             provider_fingerprint_parts
                 .extend(super::q8act_attention::upstream::fingerprint_sources());
+            provider_fingerprint_parts.push(
+                runtime
+                    .q4_mmvq_weight_decode()
+                    .as_runtime_value()
+                    .as_bytes(),
+            );
+
+            provider_fingerprint_parts.push(
+                runtime
+                    .q5_mmvq_weight_decode()
+                    .as_runtime_value()
+                    .as_bytes(),
+            );
         }
         let provider_fingerprint = implementation_fingerprint(&provider_fingerprint_parts);
         let estimator_fingerprint = implementation_fingerprint(&[
+            runtime
+                .q8_projection_weight_preparation()
+                .as_runtime_value()
+                .as_bytes(),
             source.as_bytes(),
             include_bytes!("q8act_attention.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
@@ -400,6 +429,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                         runtime.context(),
                         descriptor.provider_implementation_fingerprint(),
                         precision.upstream_profile(),
+                        runtime.q4_mmvq_weight_decode(),
+                        runtime.q5_mmvq_weight_decode(),
+                        runtime.q4_shared_weight_decode_counter(),
+                        runtime.q5_shared_weight_decode_counter(),
+                        runtime.q8_projection_weight_preparation(),
                     )
                 })
                 .transpose()?,
@@ -2096,16 +2130,13 @@ fn encode_attention(
             )
             .ok_or("Q8act recurrent dispatch count overflows")?;
 
-        let count = count
-            .checked_add(
-                q8act
-                    .as_ref()
-                    .map(|p| p.upstream_work(launch.tokens as u32))
-                    .transpose()?
-                    .unwrap_or_default()
-                    .0,
-            )
-            .ok_or("attention upstream dispatch overflow")?;
+        let (extra, _, reduction) = q8act
+            .as_ref()
+            .map(|p| p.upstream_work(launch.tokens as u32))
+            .transpose()?
+            .unwrap_or_default();
+        let count =
+            PreparedAttentionProjections::adjust_upstream_dispatch_count(count, extra, reduction)?;
         total
             .checked_add(count)
             .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())

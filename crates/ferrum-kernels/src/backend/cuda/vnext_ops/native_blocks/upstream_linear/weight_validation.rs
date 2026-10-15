@@ -1,20 +1,23 @@
-//! Once-per-physical-leaf MarkerV2 coefficient checks on admitted storage.
+//! Once-per-physical-leaf coefficient preparation on admitted storage.
 //!
 //! The dynamic command remains outside capture. Compute must unconditionally
-//! retain the returned Arc and read its device flag; a host Ready state means
-//! the scan/event were queued, never that the coefficients passed the check.
+//! retain the returned Arc and consume its declared destination; a host Ready
+//! state means the scan/conversion and event were queued. MarkerV2 consumers
+//! still read the device flag rather than assuming the coefficients passed.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
+use super::super::CudaNativeBlockKernels;
 use cudarc::driver::{CudaEvent, CudaStream};
-use ferrum_interfaces::vnext::DeviceNativeOperationId;
+use ferrum_interfaces::vnext::{DeviceNativeOperationId, ElementType};
 
+use super::native_plan::PreparedProjectionNative;
 use crate::backend::cuda::vnext_runtime::{
     CudaBufferRegion, CudaDependencyWork, CudaDeviceCommand, CudaDeviceRuntimeError,
     CudaPlanBackingIdentity,
 };
-use crate::native_ops::upstream_linear::{Arithmetic, DeviceSpan, PreparedUpstreamLinear};
+use crate::native_ops::upstream_linear::{Arithmetic, DeviceSpan};
 use crate::native_ops::upstream_q6_f32_linear::PreparedQ6F32Linear;
 
 const RETAINED_WEIGHT_VALIDATION_OPERATION: DeviceNativeOperationId =
@@ -24,19 +27,47 @@ const RETAINED_WEIGHT_VALIDATION_OPERATION: DeviceNativeOperationId =
     };
 
 enum ValidationPlan {
-    Upstream(Arc<PreparedUpstreamLinear>),
+    Upstream(Arc<PreparedProjectionNative>),
     Q6F32(Arc<PreparedQ6F32Linear>),
+    Q8F32 {
+        kernels: CudaNativeBlockKernels,
+        inputs: u32,
+        outputs: u32,
+    },
 }
+fn source_alignment_valid(address: u64, byte_safe_q8: bool) -> bool {
+    byte_safe_q8 || address % 4 == 0
+}
+
 impl ValidationPlan {
-    unsafe fn check_weights(
+    fn prepare_destination(
         &self,
-        weights: DeviceSpan,
-        flag: DeviceSpan,
-        stream: *mut std::ffi::c_void,
-    ) -> Result<(), crate::native_ops::upstream_linear::Error> {
+        weights: &CudaBufferRegion,
+        destination: &CudaBufferRegion,
+        stream: &CudaStream,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let source = DeviceSpan {
+            address: weights.device_ptr(),
+            bytes: weights.length_bytes(),
+        };
+        let target = DeviceSpan {
+            address: destination.device_ptr(),
+            bytes: destination.length_bytes(),
+        };
         match self {
-            Self::Upstream(plan) => unsafe { plan.check_weights(weights, flag, stream) },
-            Self::Q6F32(plan) => unsafe { plan.check_weights(weights, flag, stream) },
+            Self::Upstream(plan) => {
+                unsafe { plan.check_weights(source, target, stream.cu_stream().cast()) }
+                    .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))
+            }
+            Self::Q6F32(plan) => {
+                unsafe { plan.check_weights(source, target, stream.cu_stream().cast()) }
+                    .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))
+            }
+            Self::Q8F32 {
+                kernels,
+                inputs,
+                outputs,
+            } => kernels.predecode_q8_0_f32(stream, weights, destination, *inputs, *outputs),
         }
     }
 }
@@ -46,12 +77,38 @@ struct ValidationIdentity {
     weight: CudaPlanBackingIdentity,
     implementation: String,
     native_operator: &'static str,
+    native_boundary_abi: u32,
     algorithm: u32,
     format: u32,
     inputs: u32,
     outputs: u32,
     padded_outputs: u32,
     weight_bytes: u64,
+    destination_bytes: u64,
+}
+
+impl ValidationIdentity {
+    fn declaration_identity(&self) -> String {
+        let mut identity = format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}",
+            self.implementation,
+            self.native_operator,
+            self.algorithm,
+            self.format,
+            self.inputs,
+            self.outputs,
+            self.padded_outputs,
+            self.weight_bytes,
+        );
+        if self.native_boundary_abi != 1 {
+            identity.push_str(&format!(":boundary{}", self.native_boundary_abi));
+        }
+        if self.native_operator == "ferrum.q8_0.exact-f32-predecode.v1" {
+            identity.push(':');
+            identity.push_str(&self.destination_bytes.to_string());
+        }
+        identity
+    }
 }
 
 /// Weak entries never keep an old model/plan alive. Each live validation owns
@@ -65,7 +122,7 @@ pub(in crate::backend::cuda::vnext_ops) struct WeightValidationRegistry {
 impl WeightValidationRegistry {
     pub fn prepare(
         &self,
-        native: Arc<PreparedUpstreamLinear>,
+        native: Arc<PreparedProjectionNative>,
         implementation: &str,
         weights: CudaBufferRegion,
         flag: CudaBufferRegion,
@@ -80,12 +137,14 @@ impl WeightValidationRegistry {
             weight: weights.plan_backing_identity()?,
             implementation: implementation.to_owned(),
             native_operator: native.operator(),
+            native_boundary_abi: native.boundary_abi(),
             algorithm: geometry.algorithm,
             format: geometry.request.format,
             inputs: geometry.request.inputs,
             outputs: geometry.request.outputs,
             padded_outputs: geometry.padded_outputs,
             weight_bytes: geometry.weight_bytes,
+            destination_bytes: 4,
         };
         self.prepare_plan(ValidationPlan::Upstream(native), identity, weights, flag)
     }
@@ -102,14 +161,58 @@ impl WeightValidationRegistry {
             weight: weights.plan_backing_identity()?,
             implementation: implementation.to_owned(),
             native_operator: native.operator(),
+            native_boundary_abi: 1,
             algorithm: geometry.algorithm,
             format: geometry.request.format,
             inputs: geometry.request.inputs,
             outputs: geometry.request.outputs,
             padded_outputs: geometry.padded_outputs,
             weight_bytes: geometry.weight_bytes,
+            destination_bytes: 4,
         };
         self.prepare_plan(ValidationPlan::Q6F32(native), identity, weights, flag)
+    }
+
+    pub fn prepare_q8_f32(
+        &self,
+        inputs: u32,
+        outputs: u32,
+        kernels: &CudaNativeBlockKernels,
+        implementation: &str,
+        weights: CudaBufferRegion,
+        destination: CudaBufferRegion,
+    ) -> Result<Arc<WeightValidation>, CudaDeviceRuntimeError> {
+        kernels.validate_q8_0_f32_destination(&weights, &destination, inputs, outputs)?;
+        if destination.element_type() != ElementType::U8 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "Q8 F32 Plan destination requires declared opaque U8 storage",
+            ));
+        }
+        let (weight_bytes, destination_bytes) =
+            super::super::q8_predecode::q8_f32_bytes(inputs, outputs)?;
+        let identity = ValidationIdentity {
+            weight: weights.plan_backing_identity()?,
+            implementation: implementation.to_owned(),
+            native_operator: "ferrum.q8_0.exact-f32-predecode.v1",
+            native_boundary_abi: 1,
+            algorithm: 0,
+            format: 8,
+            inputs,
+            outputs,
+            padded_outputs: outputs,
+            weight_bytes,
+            destination_bytes,
+        };
+        self.prepare_plan(
+            ValidationPlan::Q8F32 {
+                kernels: kernels.clone(),
+                inputs,
+                outputs,
+            },
+            identity,
+            weights,
+            destination,
+        )
     }
 
     fn prepare_plan(
@@ -123,10 +226,13 @@ impl WeightValidationRegistry {
         let flag_identity = flag.plan_backing_identity()?;
         if identity.implementation.is_empty()
             || identity.weight.runtime_instance != flag_identity.runtime_instance
-            || weights.device_ptr() % 4 != 0
+            || !source_alignment_valid(
+                weights.device_ptr(),
+                matches!(&native, ValidationPlan::Q8F32 { .. }),
+            )
             || weights.length_bytes() != identity.weight_bytes
             || flag.device_ptr() % 4 != 0
-            || flag.length_bytes() != 4
+            || flag.length_bytes() != identity.destination_bytes
         {
             return Err(error(
                 "weight validation differs from its exact admitted MarkerV2 views",
@@ -138,7 +244,7 @@ impl WeightValidationRegistry {
             .ok_or_else(|| error("weight validation range overflow"))?;
         let flag_end = flag
             .device_ptr()
-            .checked_add(4)
+            .checked_add(identity.destination_bytes)
             .ok_or_else(|| error("weight validation flag overflow"))?;
         if weights.device_ptr() < flag_end && flag.device_ptr() < weight_end {
             return Err(error("weight validation flag aliases immutable weights"));
@@ -184,6 +290,10 @@ impl WeightValidation {
         }
     }
 
+    pub fn destination_region(&self) -> &CudaBufferRegion {
+        &self.flag
+    }
+
     /// The existing scan/publication/wait is authorized independently from
     /// request binding slots and runs before every consuming wave, including replay.
     pub fn retained_dependency(
@@ -199,17 +309,7 @@ impl WeightValidation {
         ferrum_interfaces::vnext::EncodedRetainedPlanDependency<CudaDeviceCommand>,
         CudaDeviceRuntimeError,
     > {
-        let identity = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
-            self.identity.implementation,
-            self.identity.native_operator,
-            self.identity.algorithm,
-            self.identity.format,
-            self.identity.inputs,
-            self.identity.outputs,
-            self.identity.padded_outputs,
-            self.identity.weight_bytes
-        );
+        let identity = self.identity.declaration_identity();
         let authority = invocation
             .retained_plan_dependency(ferrum_interfaces::vnext::RetainedPlanDependencySpec {
                 input_ordinal,
@@ -217,7 +317,7 @@ impl WeightValidation {
                 source_offset_bytes: 0,
                 source_length_bytes: self.identity.weight_bytes,
                 persistent_offset_bytes,
-                persistent_length_bytes: 4,
+                persistent_length_bytes: self.identity.destination_bytes,
                 alignment_bytes: 4,
                 validation_identity: &identity,
             })
@@ -240,19 +340,9 @@ impl WeightValidation {
                 source_offset_bytes: 0,
                 source_length_bytes: self.identity.weight_bytes,
                 persistent_offset_bytes,
-                persistent_length_bytes: 4,
+                persistent_length_bytes: self.identity.destination_bytes,
                 alignment_bytes: 4,
-                validation_identity: format!(
-                    "{}:{}:{}:{}:{}:{}:{}:{}",
-                    self.identity.implementation,
-                    self.identity.native_operator,
-                    self.identity.algorithm,
-                    self.identity.format,
-                    self.identity.inputs,
-                    self.identity.outputs,
-                    self.identity.padded_outputs,
-                    self.identity.weight_bytes,
-                ),
+                validation_identity: self.identity.declaration_identity(),
             },
             weight_element_type: self.weights.element_type(),
         }
@@ -295,17 +385,8 @@ impl WeightValidation {
             || {
                 // Only this callback publishes the flag. On any enqueue or
                 // event-record error, no later stream may assume it is ready.
-                unsafe {
-                    self.native.check_weights(
-                        DeviceSpan {
-                            address: self.weights.device_ptr(),
-                            bytes: self.weights.length_bytes(),
-                        },
-                        self.flag_span(),
-                        stream.cu_stream().cast(),
-                    )
-                }
-                .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+                self.native
+                    .prepare_destination(&self.weights, &self.flag, stream)?;
                 stream.record_event(None).map_err(|e| {
                     CudaDeviceRuntimeError::driver("weight validation event record", e)
                 })
@@ -362,8 +443,20 @@ impl<E> ScanPublication<E> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaDependencyWork, ScanPublication};
+    use super::{source_alignment_valid, CudaDependencyWork, ScanPublication};
     use std::cell::Cell;
+
+    #[test]
+    fn q8_f32_byte_safe_source_accepts_odd_offsets_without_relaxing_native_alignment() {
+        for address in [1, 2, 3, 5, 7] {
+            assert!(source_alignment_valid(address, true));
+            assert!(!source_alignment_valid(address, false));
+        }
+        for address in [4, 8, 12] {
+            assert!(source_alignment_valid(address, true));
+            assert!(source_alignment_valid(address, false));
+        }
+    }
 
     #[test]
     fn upstream_weight_validation_publishes_once_but_orders_every_consumer() {

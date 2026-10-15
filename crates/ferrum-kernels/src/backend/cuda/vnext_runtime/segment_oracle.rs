@@ -136,10 +136,12 @@ fn exact_node_coverage(actual: &[u32], expected: &[u32]) -> bool {
     actual == expected && actual.windows(2).all(|pair| pair[0] < pair[1])
 }
 
+#[track_caller]
 fn mismatch() -> CudaDeviceRuntimeError {
-    CudaDeviceRuntimeError::contract(
-        "same-wave compiled program bytes, exact owners/ranges, status, node coverage or attribution differ",
-    )
+    let location = std::panic::Location::caller();
+    CudaDeviceRuntimeError::contract(format!(
+        "same-wave compiled program bytes, exact owners/ranges, status, node coverage or attribution differ at {location}"
+    ))
 }
 
 /// Compare the real final prelude with ordinary same-wave provider commands.

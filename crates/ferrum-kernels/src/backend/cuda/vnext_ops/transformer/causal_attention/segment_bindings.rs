@@ -30,6 +30,7 @@ pub(super) fn declare(
         return Ok(None);
     }
     let layout = BindingLayout::new(shape, invocation.participants().len())?;
+    let workspace_bytes = align_up(layout.required_bytes, SCRATCH_ALIGNMENT)?;
     let mut regions = vec![
         SegmentBindingRegionRequest {
             selector: SegmentBindingRegionSelector::Value {
@@ -45,7 +46,10 @@ pub(super) fn declare(
         SegmentBindingRegionRequest {
             selector: SegmentBindingRegionSelector::ProgramBinding,
             offset_bytes: 0,
-            extent: SegmentBindingRegionExtent::Exact(layout.required_bytes),
+            // Match the provider workspace formula and ordinary encoder's
+            // complete aligned region. Odd participant counts can leave a
+            // tail after the logical rows; writes retain their live bounds.
+            extent: SegmentBindingRegionExtent::Exact(workspace_bytes),
             element_type: ElementType::U8,
             alignment_bytes: 1,
         },

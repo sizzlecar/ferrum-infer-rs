@@ -26,9 +26,9 @@ use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
     DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
-    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
-    DeviceNativeWorkAttribution, DeviceProgramBindingUploadSnapshot,
+    DeviceEnqueueStage, DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind,
+    DeviceExecutionPath, DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId,
+    DeviceNativeOperationId, DeviceNativeWorkAttribution, DeviceProgramBindingUploadSnapshot,
     DeviceReplayedLogicalCommandAttribution, DeviceReplayedSegmentAttribution,
     DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
@@ -47,6 +47,7 @@ use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 use super::vnext_tool_correlation;
+use crate::backend::enqueue_timing;
 use crate::backend::program_binding_upload::ProgramBindingUploadCounters;
 
 mod binding_scatter;
@@ -274,6 +275,12 @@ pub(crate) struct CudaPlanBackingIdentity {
 }
 
 impl CudaBufferRegion {
+    pub(crate) const fn runtime_instance(&self) -> u64 {
+        self.runtime_instance
+    }
+    pub(crate) fn context(&self) -> &Arc<CudaContext> {
+        self._allocation._base.context()
+    }
     /// Physical offset in the retained allocation, including nested slices.
     /// This is shape/range evidence only; it does not confer Plan ownership.
     pub(crate) fn backing_byte_offset(&self) -> u64 {
@@ -3030,6 +3037,13 @@ pub struct CudaDeviceRuntime {
     segment_binding_indexed_encodes: AtomicU64,
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    execution_context_limit: Option<usize>,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
+    q4_shared_weight_decode_encodes: Arc<AtomicU64>,
+    q5_shared_weight_decode_encodes: Arc<AtomicU64>,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
@@ -3235,6 +3249,14 @@ impl CudaDeviceRuntime {
             packed_decode_prepare_gate: false,
             causal_decode_attention_grouping:
                 ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
+            execution_context_limit: None,
+            q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
+            q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
+            q8_projection_weight_preparation:
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+            causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse::None,
+            q4_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
+            q5_shared_weight_decode_encodes: Arc::new(AtomicU64::new(0)),
             runtime_instance,
             context,
             allocation_stream,
@@ -3296,6 +3318,85 @@ impl CudaDeviceRuntime {
         &self,
     ) -> ferrum_types::CausalDecodeAttentionGrouping {
         self.causal_decode_attention_grouping
+    }
+
+    /// Stable execution ceiling selected before providers and replay identities are built.
+    pub fn with_execution_context_limit(mut self, limit: Option<usize>) -> Self {
+        self.execution_context_limit = limit;
+        self
+    }
+
+    pub fn execution_context_limit(&self) -> Option<usize> {
+        self.execution_context_limit
+    }
+
+    pub fn with_q4_mmvq_weight_decode(mut self, mode: ferrum_types::Q4MmvqWeightDecode) -> Self {
+        self.q4_mmvq_weight_decode = mode;
+        self
+    }
+
+    /// Selected weight decoding for eligible original Q4_K M8 MMVQ plans.
+    pub fn q4_mmvq_weight_decode(&self) -> ferrum_types::Q4MmvqWeightDecode {
+        self.q4_mmvq_weight_decode
+    }
+
+    /// Successful host enqueues under the explicit CompareReference diagnostic,
+    /// including capture. Disabled product execution does not update this counter.
+    /// Hot graph replay does not call the adapter and does not advance this
+    /// diagnostic counter; this is not a count of hardware kernel executions.
+    pub fn q4_shared_weight_decode_encodes(&self) -> u64 {
+        self.q4_shared_weight_decode_encodes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn q4_shared_weight_decode_counter(&self) -> Option<Arc<AtomicU64>> {
+        (self.segment_binding_oracle
+            == ferrum_interfaces::vnext::SegmentBindingOracleMode::CompareReference)
+            .then(|| self.q4_shared_weight_decode_encodes.clone())
+    }
+
+    pub fn with_q5_mmvq_weight_decode(mut self, mode: ferrum_types::Q5MmvqWeightDecode) -> Self {
+        self.q5_mmvq_weight_decode = mode;
+        self
+    }
+
+    pub fn with_q8_projection_weight_preparation(
+        mut self,
+        mode: ferrum_types::Q8ProjectionWeightPreparation,
+    ) -> Self {
+        self.q8_projection_weight_preparation = mode;
+        self
+    }
+
+    pub fn q8_projection_weight_preparation(&self) -> ferrum_types::Q8ProjectionWeightPreparation {
+        self.q8_projection_weight_preparation
+    }
+
+    pub fn with_causal_decode_kv_reuse(mut self, mode: ferrum_types::CausalDecodeKvReuse) -> Self {
+        self.causal_decode_kv_reuse = mode;
+        self
+    }
+
+    pub fn causal_decode_kv_reuse(&self) -> ferrum_types::CausalDecodeKvReuse {
+        self.causal_decode_kv_reuse
+    }
+
+    /// Selected weight decoding for eligible original Q5_K M8 MMVQ plans.
+    pub fn q5_mmvq_weight_decode(&self) -> ferrum_types::Q5MmvqWeightDecode {
+        self.q5_mmvq_weight_decode
+    }
+
+    /// Successful host enqueues under the explicit CompareReference diagnostic,
+    /// including capture. Disabled product execution does not update this counter.
+    /// Hot graph replay does not call the adapter and does not advance this
+    /// diagnostic counter; this is not a count of hardware kernel executions.
+    pub fn q5_shared_weight_decode_encodes(&self) -> u64 {
+        self.q5_shared_weight_decode_encodes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn q5_shared_weight_decode_counter(&self) -> Option<Arc<AtomicU64>> {
+        (self.segment_binding_oracle
+            == ferrum_interfaces::vnext::SegmentBindingOracleMode::CompareReference)
+            .then(|| self.q5_shared_weight_decode_encodes.clone())
     }
 
     pub(super) fn program_binding_upload_strategy(&self) -> ProgramBindingUploadStrategy {
@@ -5227,6 +5328,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     invocation,
                     timing_mode,
                     logical_attribution,
+                    timing_sink,
                 );
                 let end = command_spans.as_ref().and_then(|_| {
                     stream
@@ -5338,10 +5440,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             ))
                             .ok()
                     });
-                    let launched =
-                        stream
-                            .executable_cache
-                            .launch(&stream.stream, candidate, timing_mode);
+                    let launched = stream.executable_cache.launch(
+                        &stream.stream,
+                        candidate,
+                        timing_mode,
+                        timing_sink,
+                    );
                     let end = command_spans.as_ref().and_then(|_| {
                         stream
                             .stream
@@ -5362,10 +5466,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     }
                 }
                 Some(candidate) if !physical_span_attribution => {
-                    match stream
-                        .executable_cache
-                        .launch(&stream.stream, candidate, timing_mode)
-                    {
+                    match stream.executable_cache.launch(
+                        &stream.stream,
+                        candidate,
+                        timing_mode,
+                        timing_sink,
+                    ) {
                         Ok(Some(_)) => Some(Ok((candidate.end(), None, None, None))),
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
@@ -5429,7 +5535,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
                     .ok()
             });
-            let work = match commands[index].enqueue(&stream.stream, &stream.blas) {
+            let work = match enqueue_timing::measure(
+                timing_sink,
+                DeviceEnqueueStage::EagerCommand,
+                false,
+                || commands[index].enqueue(&stream.stream, &stream.blas),
+            ) {
                 Ok(work) => work,
                 Err(error) => {
                     stream.state.fail();
@@ -5472,11 +5583,18 @@ impl DeviceRuntime for CudaDeviceRuntime {
         // Snapshot non-aliasing typed binding statuses after all eager or
         // replayed computation and before the fence. The prelude commands own
         // both their source regions and pinned host destinations until terminal.
-        let numerical_snapshot = commands
-            .iter()
-            .flat_map(|command| &command.completion_checks)
-            .filter(|check| check.deferred)
-            .try_for_each(|check| check.enqueue(&stream.stream));
+        let numerical_snapshot = enqueue_timing::measure(
+            timing_sink,
+            DeviceEnqueueStage::DeferredSnapshotReadback,
+            false,
+            || {
+                commands
+                    .iter()
+                    .flat_map(|command| &command.completion_checks)
+                    .filter(|check| check.deferred)
+                    .try_for_each(|check| check.enqueue(&stream.stream))
+            },
+        );
         if let Err(error) = numerical_snapshot {
             stream.state.fail();
             self.quarantine(stream, commands);

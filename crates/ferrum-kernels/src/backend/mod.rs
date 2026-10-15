@@ -18,6 +18,9 @@ pub use memory::probe_device_memory;
 mod native_status;
 
 #[cfg(any(feature = "cuda", test))]
+pub(crate) mod enqueue_timing;
+
+#[cfg(any(feature = "cuda", test))]
 mod reusable_execution;
 
 #[cfg(any(feature = "cuda", test))]

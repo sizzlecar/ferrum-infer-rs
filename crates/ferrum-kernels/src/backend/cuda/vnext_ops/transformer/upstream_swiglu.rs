@@ -39,6 +39,7 @@ impl CudaUpstreamSwiGluProvider {
                 | UpstreamMarkerV2Profile::SwiGluExtraPrefill
                 | UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
                 | UpstreamMarkerV2Profile::SwiGluExtraAllRows
+                | UpstreamMarkerV2Profile::SwiGluQ6F16
         ) {
             return Err(CudaDeviceRuntimeError::contract("not a SwiGLU profile"));
         }
@@ -48,6 +49,25 @@ impl CudaUpstreamSwiGluProvider {
             include_bytes!("upstream_swiglu/encode.rs"),
             include_bytes!("replay_encoding.rs"),
             include_bytes!("../native_blocks/upstream_linear.rs"),
+            include_bytes!("../native_blocks/upstream_linear/native_plan.rs"),
+            include_bytes!("../../../../native_ops/upstream_q6_f16_linear.rs"),
+            include_bytes!("../../../../native_ops/upstream_q6_f16_linear/ffi.rs"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ferrum-native-ops/src/upstream_q6_f16_linear.rs"
+            )),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../native-operators/cuda/upstream-q6-f32-linear/abi.h"
+            )),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../native-operators/cuda/upstream-q6-f32-linear/mmq.cu"
+            )),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../native-operators/cuda/upstream-q6-f32-linear/f16_adapter.cuh"
+            )),
             include_bytes!("../native_blocks/upstream_linear/preparation.rs"),
             include_bytes!("../native_blocks/upstream_linear/weight_validation.rs"),
             include_bytes!("segment_bindings.rs"),
@@ -135,8 +155,27 @@ impl CudaUpstreamSwiGluProvider {
                 .then(|| Q8ActKernels::load_attention(runtime.context()))
                 .transpose()?,
             plans: Arc::new(
-                UpstreamPlanFactory::new(runtime.context(), fingerprint)
-                    .map_err(CudaDeviceRuntimeError::contract)?,
+                UpstreamPlanFactory::new(
+                    runtime.context(),
+                    fingerprint,
+                    // Only the new mode opts FFN MMVQ plans into shared decode.
+                    // Existing MMQ routes and the old SharedM8 scope stay fixed.
+                    match runtime.q4_mmvq_weight_decode() {
+                        ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => {
+                            ferrum_types::Q4MmvqWeightDecode::SharedM4M8
+                        }
+                        _ => ferrum_types::Q4MmvqWeightDecode::Baseline,
+                    },
+                    match runtime.q5_mmvq_weight_decode() {
+                        ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => {
+                            ferrum_types::Q5MmvqWeightDecode::SharedM4M8
+                        }
+                        _ => ferrum_types::Q5MmvqWeightDecode::Baseline,
+                    },
+                    runtime.q4_shared_weight_decode_counter(),
+                    runtime.q5_shared_weight_decode_counter(),
+                )
+                .map_err(CudaDeviceRuntimeError::contract)?,
             ),
             validation: Arc::new(WeightValidationRegistry::default()),
             arithmetic: profile.arithmetic(),

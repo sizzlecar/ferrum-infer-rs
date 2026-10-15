@@ -92,6 +92,7 @@ fn policy(format: ProjectionBlockFormat) -> UpstreamProjectionPolicy {
     };
     UpstreamProjectionPolicy {
         format,
+        geometry_selection: None,
         fallback: StrictProjectionFallback::RetainBaseArithmetic {},
         routes: [
             (UpstreamProjectionArithmetic::MmvqQ8_1ExtraMarkerV2, mmvq),

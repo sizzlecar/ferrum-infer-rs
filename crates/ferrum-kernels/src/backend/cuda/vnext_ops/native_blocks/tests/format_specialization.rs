@@ -2,6 +2,8 @@
 
 use super::{q4k::Fixture, *};
 
+mod q6_t4;
+
 fn f16_kernels(
     kernels: &CudaNativeBlockKernels,
     format: GgufBlockFormat,

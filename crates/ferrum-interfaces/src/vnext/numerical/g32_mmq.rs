@@ -32,6 +32,7 @@ impl G32MmqPrefillPolicy {
             g32,
             mmq: UpstreamProjectionPolicy {
                 format,
+                geometry_selection: None,
                 fallback: StrictProjectionFallback::RetainBaseArithmetic {},
                 routes: vec![UpstreamProjectionRouteDeclaration {
                     arithmetic: if format == ProjectionBlockFormat::Iq4Xs {

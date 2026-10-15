@@ -189,6 +189,18 @@ pub(crate) fn fixture_with_retained_dependencies(
     bytes: u64,
     dependency_mode: DependencyMode,
 ) -> Fixture {
+    fixture_with_retained_dependencies_and_chain_nodes(bytes, dependency_mode, None)
+}
+
+pub(crate) fn fixture_with_padded_persistent_nodes(bytes: u64, nodes: usize) -> Fixture {
+    fixture_with_retained_dependencies_and_chain_nodes(bytes, DependencyMode::None, Some(nodes))
+}
+
+fn fixture_with_retained_dependencies_and_chain_nodes(
+    bytes: u64,
+    dependency_mode: DependencyMode,
+    chain_nodes: Option<usize>,
+) -> Fixture {
     let original = catalog();
     let mut operation = operation();
     operation.resources.persistent = ResourcePresenceRequirement::Required;
@@ -250,12 +262,13 @@ pub(crate) fn fixture_with_retained_dependencies(
             let (policy, bucket) = reusable_policy();
             (policy, Some(bucket))
         };
-    let (resolved, plan) = planning::resolved_model_plan_with_zero_state_and_policy(
+    let (resolved, plan) = planning::resolved_model_plan_with_zero_state_policy_and_chain_nodes(
         &registry,
         TestStateProfile::none(),
         &runtime_policy,
         &catalog,
         false,
+        chain_nodes,
     );
     let impostor_registry =
         operation_registry(&original, Arc::clone(&behavior), Arc::clone(&trace));

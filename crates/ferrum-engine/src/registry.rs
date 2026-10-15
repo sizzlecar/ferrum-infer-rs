@@ -1211,6 +1211,23 @@ fn validate_causal_decode_preparation_mode(
     config: &ComponentConfig,
     plan_runtime: bool,
 ) -> Result<()> {
+    validate_q4_mmvq_weight_decode(config, plan_runtime)?;
+    validate_q5_mmvq_weight_decode(config, plan_runtime)?;
+    validate_q8_projection_weight_preparation(config, plan_runtime)?;
+    if config.engine_config.runtime.causal_decode_kv_reuse
+        == ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
+        && (!cfg!(feature = "cuda-causal-gqa2")
+            || config
+                .engine_config
+                .runtime
+                .causal_decode_attention_grouping
+                != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity)
+    {
+        return Err(FerrumError::unsupported(
+            "paired-query-heads KV reuse requires the cuda-causal-gqa2 build feature and fixed-execution-capacity causal decode grouping",
+        ));
+    }
+    causal_decode_execution_context_limit(config)?;
     use ferrum_types::{
         AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodePreparationMode,
     };
@@ -1219,7 +1236,9 @@ fn validate_causal_decode_preparation_mode(
             .engine_config
             .runtime
             .causal_decode_attention_grouping,
-        CausalDecodeAttentionGrouping::Indexed | CausalDecodeAttentionGrouping::FixedCapacity
+        CausalDecodeAttentionGrouping::Indexed
+            | CausalDecodeAttentionGrouping::FixedCapacity
+            | CausalDecodeAttentionGrouping::FixedExecutionCapacity
     ) && (config.engine_config.runtime.causal_decode_preparation_mode
         != CausalDecodePreparationMode::Packed
         || !matches!(config.device, Device::CUDA(_))
@@ -1267,6 +1286,71 @@ fn validate_causal_decode_preparation_mode(
     Ok(())
 }
 
+// Composition precedes automatic startup fitting. Forward the declared hard
+// upper bound; a later fit may shrink it further. The backend also clamps it
+// to the model shape and uses it only for FixedExecutionCapacity.
+fn causal_decode_execution_context_limit(config: &ComponentConfig) -> Result<Option<usize>> {
+    let limit = config.engine_config.runtime.max_model_len;
+    if config
+        .engine_config
+        .runtime
+        .causal_decode_attention_grouping
+        == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        && limit == Some(0)
+    {
+        return Err(FerrumError::config(
+            "fixed-execution-capacity requires a positive maximum model length when configured",
+        ));
+    }
+    Ok(limit)
+}
+
+fn validate_q4_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
+    if config.engine_config.runtime.q4_mmvq_weight_decode
+        != ferrum_types::Q4MmvqWeightDecode::Baseline
+        && (!matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || !cfg!(feature = "cuda-q4-shared-weight-decode"))
+    {
+        return Err(FerrumError::unsupported(format!(
+            "{} Q4 weight decode requires a CUDA plan runtime with the cuda-q4-shared-weight-decode build feature and a Q4_K MarkerV2 MMVQ numerical route for the requested rows",
+            config.engine_config.runtime.q4_mmvq_weight_decode.as_runtime_value(),
+        )));
+    }
+    Ok(())
+}
+fn validate_q5_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
+    if config.engine_config.runtime.q5_mmvq_weight_decode
+        != ferrum_types::Q5MmvqWeightDecode::Baseline
+        && (!matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || !cfg!(feature = "cuda-q5-shared-weight-decode"))
+    {
+        return Err(FerrumError::unsupported(format!(
+            "{} Q5 weight decode requires a CUDA plan runtime with the cuda-q5-shared-weight-decode build feature and a Q5_K MarkerV2 MMVQ numerical route for the requested rows",
+            config.engine_config.runtime.q5_mmvq_weight_decode.as_runtime_value(),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_q8_projection_weight_preparation(
+    config: &ComponentConfig,
+    plan_runtime: bool,
+) -> Result<()> {
+    if config
+        .engine_config
+        .runtime
+        .q8_projection_weight_preparation
+        == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
+        && (!matches!(config.device, Device::CUDA(_)) || !plan_runtime || !cfg!(feature = "cuda"))
+    {
+        return Err(FerrumError::unsupported(
+            "predecoded-f32 Q8 projection weights require a CUDA plan runtime and a supported strict Q8 projection numerical route",
+        ));
+    }
+    Ok(())
+}
 fn validate_registered_vnext_backend(
     kind: ferrum_models::vnext::ProductionExecutionKind,
     device: &Device,
@@ -1365,7 +1449,7 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_causal_decode_attention_grouping(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_causal_decode_kv_reuse(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
@@ -1377,6 +1461,11 @@ fn create_registered_vnext_executor(
                         config.engine_config.runtime.segment_binding_owner_view_mode,
                         config.engine_config.runtime.causal_decode_preparation_mode,
                         config.engine_config.runtime.causal_decode_attention_grouping,
+                        config.engine_config.runtime.q4_mmvq_weight_decode,
+                        config.engine_config.runtime.q5_mmvq_weight_decode,
+                        causal_decode_execution_context_limit(config)?,
+                        config.engine_config.runtime.q8_projection_weight_preparation,
+                        config.engine_config.runtime.causal_decode_kv_reuse,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -2235,11 +2324,46 @@ mod tests {
     }
 
     #[test]
+    fn causal_decode_attention_grouping_execution_context_limit_preserves_bound_and_rejects_zero() {
+        use ferrum_types::CausalDecodeAttentionGrouping;
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        config
+            .engine_config
+            .runtime
+            .causal_decode_attention_grouping =
+            CausalDecodeAttentionGrouping::FixedExecutionCapacity;
+        for limit in [None, Some(1), Some(512), Some(2048), Some(usize::MAX)] {
+            config.engine_config.runtime.max_model_len = limit;
+            assert_eq!(
+                causal_decode_execution_context_limit(&config).unwrap(),
+                limit
+            );
+        }
+        config.engine_config.runtime.max_model_len = Some(0);
+        assert!(causal_decode_execution_context_limit(&config).is_err());
+        assert!(validate_causal_decode_preparation_mode(&config, true)
+            .unwrap_err()
+            .to_string()
+            .contains("positive maximum model length"));
+        // The original grouping keeps its previous interpretation; only the
+        // new mode authorizes a context-bound native scratch plan.
+        config
+            .engine_config
+            .runtime
+            .causal_decode_attention_grouping = CausalDecodeAttentionGrouping::FixedCapacity;
+        assert_eq!(
+            causal_decode_execution_context_limit(&config).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn causal_decode_attention_grouping_checks_direct_config_before_default_early_return() {
         use ferrum_types::{CausalDecodeAttentionGrouping, CausalDecodePreparationMode};
         for grouping in [
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             assert_eq!(
@@ -2297,6 +2421,7 @@ mod tests {
         for grouping in [
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
             config.device = Device::CUDA(0);
@@ -2362,6 +2487,7 @@ mod tests {
         for grouping in [
             ferrum_types::CausalDecodeAttentionGrouping::Indexed,
             ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity,
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity,
         ] {
             let mut engine = EngineConfig::default();
             engine.runtime.causal_decode_attention_grouping = grouping;
@@ -3279,5 +3405,159 @@ mod tests {
         let token = sampler.sample(&logits, &mut rng).unwrap();
 
         assert_eq!(token.get(), 3); // Index of 0.9
+    }
+    #[test]
+    fn q4_mmvq_weight_decode_checks_direct_config_before_default_preparation_return() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config.engine_config.runtime.q4_mmvq_weight_decode =
+                    ferrum_types::Q4MmvqWeightDecode::Baseline;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                for mode in [
+                    ferrum_types::Q4MmvqWeightDecode::SharedM8,
+                    ferrum_types::Q4MmvqWeightDecode::SharedM4M8,
+                ] {
+                    config.engine_config.runtime.q4_mmvq_weight_decode = mode;
+                    assert_eq!(
+                        validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
+                        matches!(config.device, Device::CUDA(_))
+                            && plan_runtime
+                            && cfg!(feature = "cuda-q4-shared-weight-decode")
+                    );
+                }
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        }
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_checks_direct_config_before_default_preparation_return() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config.engine_config.runtime.q5_mmvq_weight_decode =
+                    ferrum_types::Q5MmvqWeightDecode::Baseline;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                for mode in [
+                    ferrum_types::Q5MmvqWeightDecode::SharedM8,
+                    ferrum_types::Q5MmvqWeightDecode::SharedM4M8,
+                ] {
+                    config.engine_config.runtime.q5_mmvq_weight_decode = mode;
+                    assert_eq!(
+                        validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
+                        matches!(config.device, Device::CUDA(_))
+                            && plan_runtime
+                            && cfg!(feature = "cuda-q5-shared-weight-decode")
+                    );
+                }
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            config.device = Device::Metal;
+            assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_rejects_direct_config_without_fixed_native_execution() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        config.engine_config.runtime.causal_decode_kv_reuse =
+            ferrum_types::CausalDecodeKvReuse::PairedQueryHeads;
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                assert!(validate_causal_decode_preparation_mode(&config, plan_runtime).is_err());
+            }
+        }
+        config
+            .engine_config
+            .runtime
+            .causal_decode_attention_grouping =
+            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity;
+        // Fixed grouping alone must not bypass the required packed preparation.
+        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
+    }
+
+    #[test]
+    fn q8_projection_weight_preparation_checks_direct_config_before_default_return() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            for plan_runtime in [false, true] {
+                config
+                    .engine_config
+                    .runtime
+                    .q8_projection_weight_preparation =
+                    ferrum_types::Q8ProjectionWeightPreparation::Compressed;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                config
+                    .engine_config
+                    .runtime
+                    .q8_projection_weight_preparation =
+                    ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32;
+                assert_eq!(
+                    validate_causal_decode_preparation_mode(&config, plan_runtime).is_ok(),
+                    matches!(config.device, Device::CUDA(_))
+                        && plan_runtime
+                        && cfg!(feature = "cuda")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4_mmvq_weight_decode_rejects_unsupported_factories_before_loading() {
+        for mode in [
+            ferrum_types::Q4MmvqWeightDecode::SharedM8,
+            ferrum_types::Q4MmvqWeightDecode::SharedM4M8,
+        ] {
+            let mut engine = EngineConfig::default();
+            engine.runtime.q4_mmvq_weight_decode = mode;
+            let mut config = ComponentConfig::from_engine_config(&engine);
+            let expected = format!("{} Q4 weight decode", mode.as_runtime_value());
+            config.device = Device::CPU;
+            assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+            config.device = Device::CUDA(0);
+            assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+        }
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_rejects_unsupported_factories_before_loading() {
+        for mode in [
+            ferrum_types::Q5MmvqWeightDecode::SharedM8,
+            ferrum_types::Q5MmvqWeightDecode::SharedM4M8,
+        ] {
+            let mut engine = EngineConfig::default();
+            engine.runtime.q5_mmvq_weight_decode = mode;
+            let mut config = ComponentConfig::from_engine_config(&engine);
+            let expected = format!("{} Q5 weight decode", mode.as_runtime_value());
+            config.device = Device::CPU;
+            assert!(tokio_test::block_on(LlmExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+            config.device = Device::CUDA(0);
+            assert!(tokio_test::block_on(StubExecutorFactory.create(&config))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(&expected));
+        }
     }
 }

@@ -562,6 +562,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_indexed_batch_raw(
             head_dim,
             max_num_blocks_per_seq,
             expected_kernel,
+            false,
         )
     }
 }
@@ -621,6 +622,57 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_fixed_masked_batch
             head_dim,
             max_num_blocks_per_seq,
             expected_kernel,
+            false,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda-causal-gqa2")]
+pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_gqa2_fixed_masked_batch_raw(
+    stream: &CudaStream,
+    out: u64,
+    query: u64,
+    block_addresses: u64,
+    sequence_length_device: u64,
+    row_map: u64,
+    sequence_length: u64,
+    exp_sums: Option<u64>,
+    max_logits: Option<u64>,
+    temporary_output: Option<u64>,
+    num_group_rows: i32,
+    num_original_rows: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    max_num_blocks_per_seq: i32,
+    expected_kernel: VnextAddressedPagedAttentionKernel,
+) -> Result<VnextAddressedPagedAttentionKernel> {
+    if num_group_rows != num_original_rows {
+        return Err(FerrumError::model(
+            "fixed-capacity causal mask must contain every original row",
+        ));
+    }
+    unsafe {
+        dispatch_vnext_addressed_paged_attention_indexed_impl(
+            stream,
+            out,
+            query,
+            block_addresses,
+            sequence_length_device,
+            row_map,
+            sequence_length,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            num_group_rows,
+            num_original_rows,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_num_blocks_per_seq,
+            expected_kernel,
+            true,
         )
     }
 }
@@ -647,6 +699,7 @@ unsafe fn dispatch_vnext_addressed_paged_attention_indexed_impl(
     head_dim: i32,
     max_num_blocks_per_seq: i32,
     expected_kernel: VnextAddressedPagedAttentionKernel,
+    paired_query_heads: bool,
 ) -> Result<VnextAddressedPagedAttentionKernel> {
     if out == 0
         || query == 0
@@ -724,6 +777,16 @@ unsafe fn dispatch_vnext_addressed_paged_attention_indexed_impl(
         .ok_or_else(|| FerrumError::model("vNext addressed KV block stride overflows"))?;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+    if paired_query_heads
+        && (head_dim != 256
+            || num_heads / num_kv_heads % 2 != 0
+            || expected_kernel != VnextAddressedPagedAttentionKernel::V2
+            || sequence_length > 2048)
+    {
+        return Err(FerrumError::unsupported(
+            "paired query heads require V2 F16 H256 B16, even GQA and capacity <=2048",
+        ));
+    }
     let kernel = expected_kernel;
     match kernel {
         VnextAddressedPagedAttentionKernel::V1 => {
@@ -784,6 +847,42 @@ unsafe fn dispatch_vnext_addressed_paged_attention_indexed_impl(
             {
                 return Err(FerrumError::model(
                     "vNext addressed paged attention v2 received null scratch",
+                ));
+            }
+            if paired_query_heads {
+                #[cfg(feature = "cuda-causal-gqa2")]
+                {
+                    let status = ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_gqa2_indexed_v1(
+                        out as *mut std::ffi::c_void,
+                        exp_sums as *mut f32,
+                        max_logits as *mut f32,
+                        temporary_output as *mut std::ffi::c_void,
+                        query as *const std::ffi::c_void,
+                        num_kv_heads,
+                        scale,
+                        block_addresses as *const u64,
+                        sequence_length_device as *const i32,
+                        row_map as *const i32,
+                        num_group_rows,
+                        num_original_rows,
+                        num_heads,
+                        max_num_blocks_per_seq,
+                        q_stride,
+                        kv_block_stride,
+                        kv_head_stride,
+                        sequence_length_i32,
+                        raw_stream,
+                    );
+                    if status != 0 {
+                        return Err(FerrumError::model(format!(
+                            "paired query-head attention launch failed: CUDA status {status}"
+                        )));
+                    }
+                    return Ok(kernel);
+                }
+                #[cfg(not(feature = "cuda-causal-gqa2"))]
+                return Err(FerrumError::unsupported(
+                    "paired query-head attention is not compiled",
                 ));
             }
             if head_dim == 128 {
@@ -1154,4 +1253,29 @@ mod tests {
         assert_eq!(v1.dispatch_count(), 1);
         assert_eq!(v2.dispatch_count(), 2);
     }
+}
+
+#[cfg(feature = "cuda-causal-gqa2")]
+unsafe extern "C" {
+    fn ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_gqa2_indexed_v1(
+        out: *mut std::ffi::c_void,
+        exp_sums: *mut f32,
+        max_logits: *mut f32,
+        tmp_out: *mut std::ffi::c_void,
+        query: *const std::ffi::c_void,
+        num_kv_heads: i32,
+        scale: f32,
+        block_addresses: *const u64,
+        seq_lens: *const i32,
+        row_map: *const i32,
+        num_seqs: i32,
+        original_num_seqs: i32,
+        num_heads: i32,
+        max_num_blocks_per_seq: i32,
+        q_stride: i32,
+        kv_block_stride: i32,
+        kv_head_stride: i32,
+        max_seq_len: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
 }

@@ -4,6 +4,82 @@
 use super::*;
 use std::time::Instant;
 
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/shared_weight_decode.rs"]
+mod shared_weight_decode;
+
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/complete_projection.rs"]
+mod complete_projection;
+
+#[cfg(feature = "cuda-upstream-iq4-shared-weight-decode-tests")]
+#[path = "timing/iq4_shared_weight_decode.rs"]
+mod iq4_shared_weight_decode;
+
+#[cfg(feature = "cuda-upstream-small-shared-weight-decode-tests")]
+#[path = "timing/small_shared_weight_decode.rs"]
+mod small_shared_weight_decode;
+
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/ffn_current_routes.rs"]
+mod ffn_current_routes;
+
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/attention_current_routes.rs"]
+mod attention_current_routes;
+
+#[cfg(feature = "cuda-upstream-shared-weight-decode-tests")]
+#[path = "timing/batch_width_boundary.rs"]
+mod batch_width_boundary;
+
+#[cfg(feature = "cuda-upstream-direct-f16-pack-tests")]
+#[path = "timing/direct_f16_pack.rs"]
+mod direct_f16_pack;
+
+#[cfg(feature = "cuda-upstream-full-tile-stream-k-tests")]
+#[path = "timing/full_tile_stream_k.rs"]
+mod full_tile_stream_k;
+
+#[cfg(feature = "cuda-upstream-mmvq-pdl-tests")]
+#[path = "timing/mmvq_pdl.rs"]
+mod mmvq_pdl;
+
+type MmvqDot = unsafe extern "C" fn(
+    *const UpstreamLinearPlanV1,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+
+type MmvqPack = unsafe extern "C" fn(
+    *const UpstreamLinearPlanV1,
+    *const c_void,
+    u32,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+) -> i32;
+
+type MmvqCast = unsafe extern "C" fn(
+    *const UpstreamLinearPlanV1,
+    *const c_void,
+    *mut c_void,
+    u32,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+) -> i32;
+
+#[derive(Clone, Copy)]
+struct MmvqOps {
+    pack: MmvqPack,
+    dot: MmvqDot,
+    cast: MmvqCast,
+}
+
 unsafe extern "C" {
     fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
     fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
@@ -22,11 +98,19 @@ unsafe extern "C" {
 struct Graph(*mut c_void);
 impl Graph {
     fn capture(stream: &Stream, enqueue: impl FnOnce()) -> Self {
+        Self::capture_inspected(stream, enqueue, |_| {})
+    }
+    fn capture_inspected(
+        stream: &Stream,
+        enqueue: impl FnOnce(),
+        inspect: impl FnOnce(*mut c_void),
+    ) -> Self {
         unsafe {
             ok(cudaStreamBeginCapture(stream.0, 0));
             enqueue();
             let mut graph = ptr::null_mut();
             ok(cudaStreamEndCapture(stream.0, &mut graph));
+            inspect(graph);
             let mut exec = ptr::null_mut();
             ok(cudaGraphInstantiateWithFlags(&mut exec, graph, 0));
             ok(cudaGraphDestroy(graph));
@@ -70,6 +154,8 @@ struct Route {
     result: Buffer,
     rows: Buffer,
     flags: Buffer,
+    result_stride: u32,
+    result_offset: u32,
 }
 impl Route {
     fn new(
@@ -80,21 +166,67 @@ impl Route {
         n: u32,
         count: usize,
     ) -> Self {
-        let p = plan(algorithm, format, UpstreamLinearLayout::Columns, m, k, n);
+        Self::new_with_result_window(algorithm, format, m, k, n, count, n, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_result_window(
+        algorithm: UpstreamLinearAlgorithm,
+        format: UpstreamLinearFormat,
+        m: u32,
+        k: u32,
+        n: u32,
+        count: usize,
+        result_stride: u32,
+        result_offset: u32,
+    ) -> Self {
+        Self::new_with_layout_and_result_window(
+            algorithm,
+            format,
+            UpstreamLinearLayout::Columns,
+            m,
+            k,
+            n,
+            count,
+            result_stride,
+            result_offset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_layout_and_result_window(
+        algorithm: UpstreamLinearAlgorithm,
+        format: UpstreamLinearFormat,
+        layout: UpstreamLinearLayout,
+        m: u32,
+        k: u32,
+        n: u32,
+        count: usize,
+        result_stride: u32,
+        result_offset: u32,
+    ) -> Self {
+        assert!(result_offset
+            .checked_add(n)
+            .is_some_and(|end| end <= result_stride));
+        let p = plan(algorithm, format, layout, m, k, n);
         assert_eq!(
             p.padded_outputs, n,
             "benchmark uses complete physical output rows"
         );
+        let result = Buffer::new(m as usize * result_stride as usize * 2);
+        result.write(&vec![0x3535_u16; m as usize * result_stride as usize]);
         Self {
             algorithm,
             converted: Buffer::new(p.converted_bytes as usize),
             packed: Buffer::new(p.packed_bytes as usize),
             output: Buffer::new(p.output_bytes as usize),
             fixup: Buffer::new(p.fixup_bytes.max(4) as usize),
-            result: Buffer::new(m as usize * n as usize * 2),
+            result,
             rows: Buffer::new(m as usize * 4),
             flags: Buffer::new(count * 4),
             plan: p,
+            result_stride,
+            result_offset,
         }
     }
     fn scan(&self, stream: &Stream, weight: *const c_void, index: usize) {
@@ -111,6 +243,62 @@ impl Route {
         }
     }
     fn enqueue(&self, stream: &Stream, input: &Buffer, weight: *const c_void, index: usize) {
+        self.enqueue_with_mmvq_dot(
+            stream,
+            input,
+            weight,
+            index,
+            ffi::ferrum_upstream_mmvq_dot_v1,
+        );
+    }
+    fn enqueue_with_mmvq_dot(
+        &self,
+        stream: &Stream,
+        input: &Buffer,
+        weight: *const c_void,
+        index: usize,
+        dot: MmvqDot,
+    ) {
+        self.enqueue_with_native_dot(
+            stream,
+            input,
+            weight,
+            index,
+            ffi::ferrum_upstream_mmq_dot_v1,
+            dot,
+        );
+    }
+    fn enqueue_with_native_dot(
+        &self,
+        stream: &Stream,
+        input: &Buffer,
+        weight: *const c_void,
+        index: usize,
+        mmq_dot: MmvqDot,
+        mmvq_dot: MmvqDot,
+    ) {
+        self.enqueue_with_native_ops(
+            stream,
+            input,
+            weight,
+            index,
+            mmq_dot,
+            MmvqOps {
+                pack: ffi::ferrum_upstream_mmvq_pack_v2,
+                dot: mmvq_dot,
+                cast: ffi::ferrum_upstream_mmvq_cast_v2,
+            },
+        );
+    }
+    fn enqueue_with_native_ops(
+        &self,
+        stream: &Stream,
+        input: &Buffer,
+        weight: *const c_void,
+        index: usize,
+        mmq_dot: MmvqDot,
+        mmvq: MmvqOps,
+    ) {
         let p = &self.plan;
         unsafe {
             let flag = self.flags.ptr.add(index * 4);
@@ -130,7 +318,7 @@ impl Route {
                         self.rows.ptr,
                         stream.0,
                     ));
-                    ok(ffi::ferrum_upstream_mmq_dot_v1(
+                    ok(mmq_dot(
                         p,
                         weight,
                         self.packed.ptr,
@@ -141,15 +329,15 @@ impl Route {
                     ok(ffi::ferrum_upstream_mmq_cast_v2(
                         p,
                         self.output.ptr,
-                        self.result.ptr,
-                        p.request.outputs,
+                        self.result.ptr.add(self.result_offset as usize * 2),
+                        self.result_stride,
                         self.rows.ptr,
                         flag,
                         stream.0,
                     ));
                 }
                 UpstreamLinearAlgorithm::Mmvq => {
-                    ok(ffi::ferrum_upstream_mmvq_pack_v2(
+                    ok((mmvq.pack)(
                         p,
                         input.ptr,
                         p.request.inputs,
@@ -158,7 +346,7 @@ impl Route {
                         self.rows.ptr,
                         stream.0,
                     ));
-                    ok(ffi::ferrum_upstream_mmvq_dot_v1(
+                    ok((mmvq.dot)(
                         p,
                         weight,
                         self.packed.ptr,
@@ -166,11 +354,11 @@ impl Route {
                         fixup,
                         stream.0,
                     ));
-                    ok(ffi::ferrum_upstream_mmvq_cast_v2(
+                    ok((mmvq.cast)(
                         p,
                         self.output.ptr,
-                        self.result.ptr,
-                        p.request.outputs,
+                        self.result.ptr.add(self.result_offset as usize * 2),
+                        self.result_stride,
                         self.rows.ptr,
                         flag,
                         stream.0,
@@ -189,7 +377,19 @@ impl Route {
         assert_eq!(self.rows.read::<u32>(m), vec![0; m]);
         assert_eq!(self.flags.read::<u32>(count), vec![0; count]);
         let values = self.output.read::<f32>(m * n);
-        let bits = self.result.read::<u16>(m * n);
+        let destination = self.result.read::<u16>(m * self.result_stride as usize);
+        let mut bits = Vec::with_capacity(m * n);
+        for row in destination.chunks_exact(self.result_stride as usize) {
+            let start = self.result_offset as usize;
+            bits.extend_from_slice(&row[start..start + n]);
+            assert!(
+                row[..start]
+                    .iter()
+                    .chain(&row[start + n..])
+                    .all(|&bit| bit == 0x3535),
+                "projection overwrote another leaf or output stride padding"
+            );
+        }
         for (value, &bits) in values.iter().zip(&bits) {
             assert!(value.is_finite());
             assert!(f16::from_bits(bits).is_finite());

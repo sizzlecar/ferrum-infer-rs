@@ -41,6 +41,10 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
         if entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
+            || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
+            || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
         {
             continue;
         }
@@ -58,6 +62,10 @@ pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Ve
         if entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
+            || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
+            || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
+            || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
         {
             continue;
         }
@@ -182,17 +190,19 @@ mod tests {
     fn causal_decode_attention_grouping_provenance_is_never_materialized_as_environment() {
         let key = ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY;
         let original = std::env::var_os(key);
-        for source in [
-            RuntimeConfigSource::Default,
-            RuntimeConfigSource::ConfigFile,
-            RuntimeConfigSource::Cli,
-        ] {
-            let current = snapshot(&[(key, "indexed", source)]);
-            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
-            assert!(materialize_runtime_env_effective(&current).is_empty());
-            assert_eq!(std::env::var_os(key), original);
-            assert_eq!(runtime_snapshot_value(&current, key), Some("indexed"));
-            assert_eq!(current.entries[0].source, source);
+        for mode in ["indexed", "fixed-capacity", "fixed-execution-capacity"] {
+            for source in [
+                RuntimeConfigSource::Default,
+                RuntimeConfigSource::ConfigFile,
+                RuntimeConfigSource::Cli,
+            ] {
+                let current = snapshot(&[(key, mode, source)]);
+                assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+                assert!(materialize_runtime_env_effective(&current).is_empty());
+                assert_eq!(std::env::var_os(key), original);
+                assert_eq!(runtime_snapshot_value(&current, key), Some(mode));
+                assert_eq!(current.entries[0].source, source);
+            }
         }
     }
 
@@ -231,5 +241,88 @@ mod tests {
         );
         #[cfg(not(feature = "vllm-moe-marlin"))]
         assert!(resolved.entries.is_empty());
+    }
+    #[test]
+    fn q4_mmvq_weight_decode_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "shared-m8", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(runtime_snapshot_value(&current, key), Some("shared-m8"));
+            assert_eq!(current.entries[0].source, source);
+        }
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "shared-m8", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(runtime_snapshot_value(&current, key), Some("shared-m8"));
+            assert_eq!(current.entries[0].source, source);
+        }
+    }
+    #[test]
+    fn q8_projection_weight_preparation_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "predecoded-f32", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(
+                runtime_snapshot_value(&current, key),
+                Some("predecoded-f32")
+            );
+            assert_eq!(current.entries[0].source, source);
+        }
+        let from_environment = snapshot(&[(key, "predecoded-f32", RuntimeConfigSource::Env)]);
+        assert!(ferrum_types::EngineConfig::default()
+            .apply_runtime_config_snapshot(&from_environment)
+            .is_err());
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_provenance_is_never_materialized_as_environment() {
+        let key = ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "paired-query-heads", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+            assert_eq!(
+                runtime_snapshot_value(&current, key),
+                Some("paired-query-heads")
+            );
+            assert_eq!(current.entries[0].source, source);
+        }
+        let environment = snapshot(&[(key, "paired-query-heads", RuntimeConfigSource::Env)]);
+        assert!(ferrum_types::EngineConfig::default()
+            .apply_runtime_config_snapshot(&environment)
+            .is_err());
     }
 }

@@ -67,13 +67,52 @@ impl<T: Scalar> Fixture<T> {
         dense_input: bool,
         encoded: Vec<u8>,
     ) -> Self {
+        Self::from_encoded(
+            stream,
+            format,
+            rows,
+            inputs,
+            outputs,
+            dense_input,
+            encoded,
+            true,
+        )
+    }
+
+    // Full real-shape rings compare every GPU output bit. Keep independent F64
+    // decoding in the small boundary test instead of expanding gigabytes here.
+    pub(super) fn for_encoded_weights_without_f64(
+        stream: &Arc<CudaStream>,
+        format: GgufBlockFormat,
+        rows: usize,
+        inputs: usize,
+        outputs: usize,
+        encoded: Vec<u8>,
+    ) -> Self {
+        Self::from_encoded(stream, format, rows, inputs, outputs, true, encoded, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_encoded(
+        stream: &Arc<CudaStream>,
+        format: GgufBlockFormat,
+        rows: usize,
+        inputs: usize,
+        outputs: usize,
+        dense_input: bool,
+        encoded: Vec<u8>,
+        f64_oracle: bool,
+    ) -> Self {
         assert_eq!(inputs % format.block_values(), 0);
         assert_eq!(
             encoded.len(),
             outputs * (inputs / format.block_values()) * format.block_bytes()
         );
-        let mut decoded = vec![0.0; inputs * outputs];
-        format.decode(&encoded, &mut decoded).unwrap();
+        let mut decoded = Vec::new();
+        if f64_oracle {
+            decoded.resize(inputs * outputs, 0.0);
+            format.decode(&encoded, &mut decoded).unwrap();
+        }
         let guard = T::from_f32(-12345.0);
         let mut input = vec![guard; INPUT_PREFIX + rows * inputs + 8];
         input[INPUT_PREFIX..INPUT_PREFIX + rows * inputs].fill(T::from_f32(0.0));
@@ -97,7 +136,7 @@ impl<T: Scalar> Fixture<T> {
             sparse.push(entries);
         }
         let mut expected = Vec::new();
-        for entries in &sparse {
+        for entries in sparse.iter().filter(|_| f64_oracle) {
             for output in 0..outputs {
                 let products = entries
                     .iter()
@@ -146,49 +185,7 @@ impl<T: Scalar> Fixture<T> {
         let start = stream
             .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
             .unwrap();
-        {
-            let input = self
-                .input_gpu
-                .slice(INPUT_PREFIX..INPUT_PREFIX + self.rows * self.inputs);
-            let weights = self
-                .weights_gpu
-                .slice(WEIGHT_PREFIX..self.weights.len() - 8);
-            let mut output = self
-                .output_gpu
-                .slice_mut(OUTPUT_PREFIX..OUTPUT_PREFIX + self.rows * self.stride);
-            let parameters = [
-                self.rows as u32,
-                self.inputs as u32,
-                self.outputs as u32,
-                self.stride as u32,
-                OUTPUT_COLUMN as u32,
-                self.format.ggml_type_id(),
-                self.format.block_values() as u32,
-                self.format.block_bytes() as u32,
-            ];
-            for _ in 0..iterations {
-                let mut launch = stream.launch_builder(kernel);
-                launch.arg(&input).arg(&weights).arg(&mut output);
-                for parameter in &parameters {
-                    launch.arg(parameter);
-                }
-                // SAFETY: the typed views retain complete matrices. Both
-                // kernels guard partial row tiles and output column groups;
-                // the odd source-byte offset requires byte-safe GGUF loads.
-                unsafe {
-                    launch.launch(LaunchConfig {
-                        grid_dim: (
-                            (self.outputs as u32).div_ceil(4),
-                            (self.rows as u32).div_ceil(row_tile),
-                            1,
-                        ),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .unwrap();
-            }
-        }
+        self.enqueue(stream, kernel, row_tile, iterations);
         let end = stream
             .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
             .unwrap();
@@ -196,6 +193,80 @@ impl<T: Scalar> Fixture<T> {
         let wall_ns = wall.elapsed().as_secs_f64() * 1e9;
         let gpu_ns = f64::from(start.elapsed_ms(&end).unwrap()) * 1e6;
         (wall_ns, gpu_ns)
+    }
+
+    // No upload, event, allocation or synchronization: safe during capture.
+    pub(super) fn enqueue(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        kernel: &CudaFunction,
+        row_tile: u32,
+        iterations: u32,
+    ) {
+        let input = self
+            .input_gpu
+            .slice(INPUT_PREFIX..INPUT_PREFIX + self.rows * self.inputs);
+        let weights = self
+            .weights_gpu
+            .slice(WEIGHT_PREFIX..self.weights.len() - 8);
+        let mut output = self
+            .output_gpu
+            .slice_mut(OUTPUT_PREFIX..OUTPUT_PREFIX + self.rows * self.stride);
+        let parameters = [
+            self.rows as u32,
+            self.inputs as u32,
+            self.outputs as u32,
+            self.stride as u32,
+            OUTPUT_COLUMN as u32,
+            self.format.ggml_type_id(),
+            self.format.block_values() as u32,
+            self.format.block_bytes() as u32,
+        ];
+        for _ in 0..iterations {
+            let mut launch = stream.launch_builder(kernel);
+            launch.arg(&input).arg(&weights).arg(&mut output);
+            for parameter in &parameters {
+                launch.arg(parameter);
+            }
+            // SAFETY: the typed views retain complete matrices. Both
+            // kernels guard partial row tiles and output column groups;
+            // the odd source-byte offset requires byte-safe GGUF loads.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (
+                        (self.outputs as u32).div_ceil(4),
+                        (self.rows as u32).div_ceil(row_tile),
+                        1,
+                    ),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .unwrap();
+        }
+    }
+
+    pub(super) fn reset_output(&mut self, stream: &Arc<CudaStream>) {
+        stream
+            .memcpy_htod(&self.output_initial, &mut self.output_gpu)
+            .unwrap();
+    }
+
+    pub(super) fn negate_input(&mut self, stream: &Arc<CudaStream>) {
+        for value in &mut self.input[INPUT_PREFIX..INPUT_PREFIX + self.rows * self.inputs] {
+            *value = T::from_f32(-value.as_f32());
+        }
+        for (sum, _) in &mut self.expected {
+            *sum = -*sum;
+        }
+        stream
+            .memcpy_htod(&self.input, &mut self.input_gpu)
+            .unwrap();
+    }
+
+    pub(super) fn weight_address(&self, stream: &Arc<CudaStream>) -> u64 {
+        let (address, _guard) = self.weights_gpu.device_ptr(stream);
+        address
     }
 
     pub(super) fn run_dispatch(
@@ -267,6 +338,7 @@ impl<T: Scalar> Fixture<T> {
 
     pub(super) fn validate_output(&self, stream: &Arc<CudaStream>) -> Vec<u32> {
         let actual = stream.clone_dtoh(&self.output_gpu).unwrap();
+        stream.synchronize().unwrap();
         for (index, value) in actual.iter().enumerate() {
             let location = index
                 .checked_sub(OUTPUT_PREFIX)
@@ -275,6 +347,10 @@ impl<T: Scalar> Fixture<T> {
                     (OUTPUT_COLUMN..OUTPUT_COLUMN + self.outputs).contains(&(index % self.stride))
                 });
             if let Some(index) = location {
+                assert!(value.as_f32().is_finite(), "nonfinite output at {index}");
+                if self.expected.is_empty() {
+                    continue;
+                }
                 let (expected, sum_abs) = self.expected
                     [index / self.stride * self.outputs + index % self.stride - OUTPUT_COLUMN];
                 let bound =

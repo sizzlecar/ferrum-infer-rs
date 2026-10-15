@@ -717,8 +717,13 @@ impl PreparedBatchDecode {
         packed_prepare_gate: bool,
         independent_sequence_kv: bool,
         grouping: CausalDecodeAttentionGrouping,
+        kv_reuse: ferrum_types::CausalDecodeKvReuse,
     ) -> Result<Option<Self>, String> {
-        if grouping == CausalDecodeAttentionGrouping::FixedCapacity {
+        if matches!(
+            grouping,
+            CausalDecodeAttentionGrouping::FixedCapacity
+                | CausalDecodeAttentionGrouping::FixedExecutionCapacity
+        ) {
             #[cfg(feature = "cuda-indexed-causal-attention")]
             return fixed::FixedBatchDecode::for_launches(
                 launches,
@@ -729,7 +734,9 @@ impl PreparedBatchDecode {
                 packed_prepare_gate,
                 independent_sequence_kv,
             )
-            .map(|batch| batch.map(Self::Fixed));
+            .map(|batch| {
+                batch.map(|batch| Self::Fixed(batch.with_kv_reuse(kv_reuse, grouping, shape)))
+            });
             #[cfg(not(feature = "cuda-indexed-causal-attention"))]
             return Err("fixed causal replay requires compiled indexed attention".into());
         }

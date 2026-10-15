@@ -416,6 +416,15 @@ impl<'a, T> AttemptObservation<'a, T> {
 impl<T: DeviceSubmissionTimingSink> DeviceSubmissionTimingSink for AttemptObservation<'_, T> {
     const ENABLED: bool = T::ENABLED;
 
+    fn record_device_enqueue(
+        &self,
+        stage: DeviceEnqueueStage,
+        wall: Duration,
+        thread_cpu: Option<Duration>,
+    ) {
+        self.timing.record_device_enqueue(stage, wall, thread_cpu);
+    }
+
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration) {
         self.timing.record_device_submission(stage, elapsed);
         if T::ENABLED && stage == DeviceSubmissionStage::EnqueueCommands {

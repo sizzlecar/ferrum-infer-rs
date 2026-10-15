@@ -90,6 +90,7 @@ pub enum CausalDecodeAttentionGroupingArg {
     Contiguous,
     Indexed,
     FixedCapacity,
+    FixedExecutionCapacity,
 }
 
 impl CausalDecodeAttentionGroupingArg {
@@ -104,6 +105,27 @@ impl CausalDecodeAttentionGroupingArg {
             Self::FixedCapacity => {
                 ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity.as_runtime_value()
             }
+            Self::FixedExecutionCapacity => {
+                ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                    .as_runtime_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CausalDecodeKvReuseArg {
+    None,
+    PairedQueryHeads,
+}
+
+impl CausalDecodeKvReuseArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::None => ferrum_types::CausalDecodeKvReuse::None.as_runtime_value(),
+            Self::PairedQueryHeads => {
+                ferrum_types::CausalDecodeKvReuse::PairedQueryHeads.as_runtime_value()
+            }
         }
     }
 }
@@ -112,6 +134,61 @@ impl CausalDecodeAttentionGroupingArg {
 pub enum SequenceFitPolicyArg {
     FullInputMustFit,
     ImmediateOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Q4MmvqWeightDecodeArg {
+    Baseline,
+    SharedM8,
+    #[value(name = "shared-m4-m8")]
+    SharedM4M8,
+}
+
+impl Q4MmvqWeightDecodeArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Baseline => ferrum_types::Q4MmvqWeightDecode::Baseline.as_runtime_value(),
+            Self::SharedM8 => ferrum_types::Q4MmvqWeightDecode::SharedM8.as_runtime_value(),
+            Self::SharedM4M8 => ferrum_types::Q4MmvqWeightDecode::SharedM4M8.as_runtime_value(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Q5MmvqWeightDecodeArg {
+    Baseline,
+    SharedM8,
+    #[value(name = "shared-m4-m8")]
+    SharedM4M8,
+}
+
+impl Q5MmvqWeightDecodeArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Baseline => ferrum_types::Q5MmvqWeightDecode::Baseline.as_runtime_value(),
+            Self::SharedM8 => ferrum_types::Q5MmvqWeightDecode::SharedM8.as_runtime_value(),
+            Self::SharedM4M8 => ferrum_types::Q5MmvqWeightDecode::SharedM4M8.as_runtime_value(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Q8ProjectionWeightPreparationArg {
+    Compressed,
+    PredecodedF32,
+}
+
+impl Q8ProjectionWeightPreparationArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Compressed => {
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed.as_runtime_value()
+            }
+            Self::PredecodedF32 => {
+                ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32.as_runtime_value()
+            }
+        }
+    }
 }
 
 impl SequenceFitPolicyArg {
@@ -187,6 +264,33 @@ mod tests {
             match self.command {
                 TestCommand::Run(command) => command.causal_decode_attention_grouping,
                 TestCommand::Serve(command) => command.causal_decode_attention_grouping,
+            }
+        }
+
+        fn q4_mmvq_weight_decode(self) -> Option<Q4MmvqWeightDecodeArg> {
+            match self.command {
+                TestCommand::Run(command) => command.q4_mmvq_weight_decode,
+                TestCommand::Serve(command) => command.q4_mmvq_weight_decode,
+            }
+        }
+        fn q5_mmvq_weight_decode(self) -> Option<Q5MmvqWeightDecodeArg> {
+            match self.command {
+                TestCommand::Run(command) => command.q5_mmvq_weight_decode,
+                TestCommand::Serve(command) => command.q5_mmvq_weight_decode,
+            }
+        }
+
+        fn q8_projection_weight_preparation(self) -> Option<Q8ProjectionWeightPreparationArg> {
+            match self.command {
+                TestCommand::Run(command) => command.q8_projection_weight_preparation,
+                TestCommand::Serve(command) => command.q8_projection_weight_preparation,
+            }
+        }
+
+        fn causal_decode_kv_reuse(self) -> Option<CausalDecodeKvReuseArg> {
+            match self.command {
+                TestCommand::Run(command) => command.causal_decode_kv_reuse,
+                TestCommand::Serve(command) => command.causal_decode_kv_reuse,
             }
         }
 
@@ -298,6 +402,10 @@ mod tests {
                 (
                     "fixed-capacity",
                     CausalDecodeAttentionGroupingArg::FixedCapacity,
+                ),
+                (
+                    "fixed-execution-capacity",
+                    CausalDecodeAttentionGroupingArg::FixedExecutionCapacity,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([
@@ -482,6 +590,148 @@ mod tests {
                 "test-model",
                 "--program-binding-upload-strategy",
                 "automatic"
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn q4_mmvq_weight_decode_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .q4_mmvq_weight_decode(),
+                None
+            );
+            for (value, expected) in [
+                ("baseline", Q4MmvqWeightDecodeArg::Baseline),
+                ("shared-m8", Q4MmvqWeightDecodeArg::SharedM8),
+                ("shared-m4-m8", Q4MmvqWeightDecodeArg::SharedM4M8),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--q4-mmvq-weight-decode",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.q4_mmvq_weight_decode(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--q4-mmvq-weight-decode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn q5_mmvq_weight_decode_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .q5_mmvq_weight_decode(),
+                None
+            );
+            for (value, expected) in [
+                ("baseline", Q5MmvqWeightDecodeArg::Baseline),
+                ("shared-m8", Q5MmvqWeightDecodeArg::SharedM8),
+                ("shared-m4-m8", Q5MmvqWeightDecodeArg::SharedM4M8),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--q5-mmvq-weight-decode",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.q5_mmvq_weight_decode(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--q5-mmvq-weight-decode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+    #[test]
+    fn q8_projection_weight_preparation_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .q8_projection_weight_preparation(),
+                None
+            );
+            for (value, expected) in [
+                ("compressed", Q8ProjectionWeightPreparationArg::Compressed),
+                (
+                    "predecoded-f32",
+                    Q8ProjectionWeightPreparationArg::PredecodedF32,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--q8-projection-weight-preparation",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.q8_projection_weight_preparation(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--q8-projection-weight-preparation",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn causal_decode_kv_reuse_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .causal_decode_kv_reuse(),
+                None
+            );
+            for (value, expected) in [
+                ("none", CausalDecodeKvReuseArg::None),
+                (
+                    "paired-query-heads",
+                    CausalDecodeKvReuseArg::PairedQueryHeads,
+                ),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--causal-decode-kv-reuse",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.causal_decode_kv_reuse(), Some(expected));
+                assert_eq!(expected.as_runtime_value(), value);
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--causal-decode-kv-reuse",
+                "automatic",
             ])
             .is_err());
         }

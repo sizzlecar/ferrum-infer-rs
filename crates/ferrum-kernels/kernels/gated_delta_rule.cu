@@ -1057,7 +1057,7 @@ static __device__ void recurrent_gated_delta_rule_varlen_warp128_f32(
   }
 }
 
-template <typename StateT, int BV_TILE, bool InterleavedByKeyHead = false>
+template <typename StateT, int BV_TILE, bool InterleavedByKeyHead = false, bool ImplicitSingleToken = false>
 static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -1081,8 +1081,8 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
   const int seq = blockIdx.z;
   if (value_head >= value_heads || seq >= batch) return;
 
-  const int token_start = static_cast<int>(cu_seqlens[seq]);
-  const int token_end = static_cast<int>(cu_seqlens[seq + 1]);
+  const int token_start = ImplicitSingleToken ? seq : static_cast<int>(cu_seqlens[seq]);
+  const int token_end = ImplicitSingleToken ? seq + 1 : static_cast<int>(cu_seqlens[seq + 1]);
   if (token_start < 0 || token_end <= token_start || token_end > total_tokens) {
     return;
   }
@@ -1302,6 +1302,30 @@ extern "C" __global__ void vnext_gated_delta_varlen_tiled16_interleaved_f32_indi
     const int value_dim,
     const float scale) {
   recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true>(
+      query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
+      nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
+      scale);
+}
+
+// Test-only entrypoint; production exports retain the default explicit controls.
+extern "C" __global__ void ferrum_test_gdn_delta_implicit_single_token_tiled16_interleaved_f32(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const unsigned long long* __restrict__ state_bindings,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  if (batch <= 0 || total_tokens != batch) return;
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true, true>(
       query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
       nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
       scale);

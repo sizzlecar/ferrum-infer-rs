@@ -200,6 +200,14 @@ pub fn cuda_vnext_runtime_config(
             include_bytes!("vnext_ops/transformer/upstream_swiglu/encode.rs").as_slice(),
             include_bytes!("vnext_ops/transformer/q8act_attention/upstream.rs").as_slice(),
             include_bytes!("vnext_ops/native_blocks/upstream_linear.rs").as_slice(),
+            include_bytes!("vnext_ops/native_blocks/upstream_linear/native_plan.rs").as_slice(),
+            include_bytes!("../../native_ops/upstream_q6_f16_linear.rs").as_slice(),
+            include_bytes!("../../native_ops/upstream_q6_f16_linear/ffi.rs").as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ferrum-native-ops/src/upstream_q6_f16_linear.rs"
+            ))
+            .as_slice(),
             include_bytes!("vnext_ops/native_blocks/upstream_linear/preparation.rs").as_slice(),
             include_bytes!("vnext_ops/native_blocks/upstream_linear/weight_validation.rs")
                 .as_slice(),
@@ -316,6 +324,22 @@ fn upstream_profile_exports_present(exports: &[String], prefill: bool) -> bool {
                 .any(|export| export == "ferrum_upstream_mmq_prefill_plan_v1"))
 }
 
+/// The production pair-of-query-heads ABI must be present in the validated archive.
+pub fn causal_decode_kv_reuse_compiled() -> bool {
+    cfg!(feature = "cuda-causal-gqa2")
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.vllm_paged_attention_v2"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && artifact.exports.iter().any(|name| {
+                        name == "ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_gqa2_indexed_v1"
+                    })
+            })
+}
+
 pub(crate) fn q6_mmq_f32_compiled() -> bool {
     cfg!(feature = "cuda-upstream-q6-f32-linear")
         && crate::native_ops::compiled_native_operator_artifacts()
@@ -337,6 +361,10 @@ pub(crate) fn q6_mmq_f32_compiled() -> bool {
             })
 }
 
+pub(crate) fn upstream_q6_f16_profile_compiled() -> bool {
+    native_blocks::upstream_linear::q6_f16_compiled()
+}
+
 pub(crate) fn upstream_marker_v2_compiled() -> bool {
     upstream_profile_compiled(false)
 }
@@ -350,6 +378,94 @@ pub(crate) fn upstream_profile_compiled(prefill: bool) -> bool {
                     && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
                     && artifact.operator_abi_version == "1"
                     && upstream_profile_exports_present(&artifact.exports, prefill)
+            })
+}
+
+fn q4_shared_weight_decode_exports_present(exports: &[String]) -> bool {
+    upstream_marker_v2_exports_present(exports)
+        && exports
+            .iter()
+            .any(|name| name == "ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1")
+}
+
+/// Whether the opt-in Q4_K M8 dot and its original MarkerV2 contract are linked.
+pub fn q4_shared_weight_decode_compiled() -> bool {
+    cfg!(feature = "cuda-q4-shared-weight-decode")
+        && upstream_marker_v2_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && q4_shared_weight_decode_exports_present(&artifact.exports)
+            })
+}
+
+fn q4_shared_weight_decode_m4_m8_exports_present(exports: &[String]) -> bool {
+    q4_shared_weight_decode_exports_present(exports)
+        && exports
+            .iter()
+            .any(|name| name == "ferrum_upstream_mmvq_q4_shared_weight_decode_m4_dot_v1")
+}
+
+/// Whether both opt-in Q4_K M4 and M8 dots share the linked MarkerV2 contract.
+pub fn q4_shared_weight_decode_m4_m8_compiled() -> bool {
+    cfg!(feature = "cuda-q4-shared-weight-decode")
+        && upstream_marker_v2_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && q4_shared_weight_decode_m4_m8_exports_present(&artifact.exports)
+            })
+}
+
+fn q5_shared_weight_decode_exports_present(exports: &[String]) -> bool {
+    upstream_marker_v2_exports_present(exports)
+        && exports
+            .iter()
+            .any(|name| name == "ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1")
+}
+
+/// Whether the opt-in Q5_K M8 dot and its original MarkerV2 contract are linked.
+pub fn q5_shared_weight_decode_compiled() -> bool {
+    cfg!(feature = "cuda-q5-shared-weight-decode")
+        && upstream_marker_v2_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && q5_shared_weight_decode_exports_present(&artifact.exports)
+            })
+}
+
+fn q5_shared_weight_decode_m4_m8_exports_present(exports: &[String]) -> bool {
+    q5_shared_weight_decode_exports_present(exports)
+        && exports
+            .iter()
+            .any(|name| name == "ferrum_upstream_mmvq_q5_shared_weight_decode_m4_dot_v1")
+}
+
+/// Whether both opt-in Q5_K M4 and M8 dots share the linked MarkerV2 contract.
+pub fn q5_shared_weight_decode_m4_m8_compiled() -> bool {
+    cfg!(feature = "cuda-q5-shared-weight-decode")
+        && upstream_marker_v2_compiled()
+        && crate::native_ops::compiled_native_operator_artifacts()
+            .iter()
+            .any(|artifact| {
+                artifact.operator == "ferrum.cuda.upstream_linear"
+                    && artifact.backend == NativeOperatorBackend::Cuda
+                    && artifact.linkage == ferrum_types::NativeOperatorLinkage::Static
+                    && artifact.operator_abi_version == "1"
+                    && q5_shared_weight_decode_m4_m8_exports_present(&artifact.exports)
             })
 }
 
@@ -401,6 +517,92 @@ mod upstream_marker_registration_tests {
         upstream_marker_v2_exports_present, upstream_profile_exports_present,
         UPSTREAM_MARKER_V2_EXPORTS,
     };
+
+    #[cfg(feature = "cuda-q4-shared-weight-decode")]
+    #[test]
+    fn shared_weight_decode_requires_additive_dot_and_complete_original_marker_contract() {
+        let baseline = UPSTREAM_MARKER_V2_EXPORTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        assert!(upstream_marker_v2_exports_present(&baseline));
+        assert!(!super::q4_shared_weight_decode_exports_present(&baseline));
+        let mut shared = baseline;
+        shared.push("ferrum_upstream_mmvq_q4_shared_weight_decode_dot_v1".into());
+        assert!(super::q4_shared_weight_decode_exports_present(&shared));
+        assert!(!super::q5_shared_weight_decode_exports_present(&shared));
+        for missing in &shared {
+            let incomplete = shared
+                .iter()
+                .filter(|name| *name != missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(!super::q4_shared_weight_decode_exports_present(&incomplete));
+        }
+    }
+
+    #[cfg(feature = "cuda-q5-shared-weight-decode")]
+    #[test]
+    fn shared_q5_weight_decode_requires_additive_dot_and_complete_original_marker_contract() {
+        let baseline = UPSTREAM_MARKER_V2_EXPORTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        assert!(upstream_marker_v2_exports_present(&baseline));
+        assert!(!super::q5_shared_weight_decode_exports_present(&baseline));
+        let mut shared = baseline;
+        shared.push("ferrum_upstream_mmvq_q5_shared_weight_decode_dot_v1".into());
+        assert!(super::q5_shared_weight_decode_exports_present(&shared));
+        assert!(!super::q4_shared_weight_decode_exports_present(&shared));
+        for missing in &shared {
+            let incomplete = shared
+                .iter()
+                .filter(|name| *name != missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(!super::q5_shared_weight_decode_exports_present(&incomplete));
+        }
+    }
+
+    #[test]
+    fn shared_m4_m8_requires_both_dots_and_complete_original_marker_contract() {
+        for (old_check, combined_check, format) in [
+            (
+                super::q4_shared_weight_decode_exports_present as fn(&[String]) -> bool,
+                super::q4_shared_weight_decode_m4_m8_exports_present as fn(&[String]) -> bool,
+                "q4",
+            ),
+            (
+                super::q5_shared_weight_decode_exports_present as fn(&[String]) -> bool,
+                super::q5_shared_weight_decode_m4_m8_exports_present as fn(&[String]) -> bool,
+                "q5",
+            ),
+        ] {
+            let mut exports = UPSTREAM_MARKER_V2_EXPORTS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            assert!(!combined_check(&exports));
+            exports.push(format!(
+                "ferrum_upstream_mmvq_{format}_shared_weight_decode_dot_v1"
+            ));
+            assert!(old_check(&exports));
+            assert!(!combined_check(&exports));
+            exports.push(format!(
+                "ferrum_upstream_mmvq_{format}_shared_weight_decode_m4_dot_v1"
+            ));
+            assert!(old_check(&exports));
+            assert!(combined_check(&exports));
+            for missing in &exports {
+                let incomplete = exports
+                    .iter()
+                    .filter(|name| *name != missing)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert!(!combined_check(&incomplete), "accepted without {missing}");
+            }
+        }
+    }
 
     #[test]
     fn extra_marker_capability_requires_its_own_complete_symbol_family() {
@@ -594,13 +796,17 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluQ6F16,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
             ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16,
         ] {
             if upstream_profile_compiled(profile.prefill() || profile.hybrid())
                 && (!profile.extra() || upstream_extra_profile_compiled(profile.extra_prefill()))
+                && (!profile.q6_f16() || upstream_q6_f16_profile_compiled())
                 && (!profile.hybrid()
                     || q8act_g32_profile_compiled(
                         ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
@@ -919,10 +1125,13 @@ pub fn cuda_vnext_operation_registry(
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluQ6F16,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
         ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16,
     ] {
         if runtime
             .descriptor()
@@ -932,6 +1141,9 @@ pub fn cuda_vnext_operation_registry(
         {
             contracts.push(Box::new(profile.contract().map_err(contract_error)?));
             match profile {
+                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16 => {
+                    providers.push(Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_q6_f16(runtime)?))
+                }
                 ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows => {
                     providers.push(Box::new(
                         transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra_all_rows(runtime)?,
@@ -961,7 +1173,8 @@ pub fn cuda_vnext_operation_registry(
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows => {
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluQ6F16 => {
                     providers.push(Box::new(transformer::CudaUpstreamSwiGluProvider::new(
                         runtime, profile,
                     )?))
@@ -979,7 +1192,8 @@ pub fn cuda_vnext_operation_registry(
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill
                 | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows => {
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows
+                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16 => {
                     providers.push(Box::new(
                         transformer::CudaCausalPagedAttentionProvider::new_upstream(
                             runtime,
@@ -1075,16 +1289,84 @@ impl CudaVNextComposition {
         owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+        execution_context_limit: Option<usize>,
+        q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+        causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        if causal_decode_attention_grouping
+            == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+            && execution_context_limit == Some(0)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "fixed execution capacity requires a positive execution context limit",
+            ));
+        }
+        if q4_mmvq_weight_decode != ferrum_types::Q4MmvqWeightDecode::Baseline
+            && (!cfg!(feature = "cuda-q4-shared-weight-decode")
+                || (matches!(purpose, CudaCompositionPurpose::Execution)
+                    && !match q4_mmvq_weight_decode {
+                        ferrum_types::Q4MmvqWeightDecode::Baseline => true,
+                        ferrum_types::Q4MmvqWeightDecode::SharedM8 => {
+                            q4_shared_weight_decode_compiled()
+                        }
+                        ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => {
+                            q4_shared_weight_decode_m4_m8_compiled()
+                        }
+                    }))
+        {
+            return Err(CudaDeviceRuntimeError::contract(format!(
+                "{} Q4 weight decode requires its compiled upstream native exports",
+                q4_mmvq_weight_decode.as_runtime_value()
+            )));
+        }
+        if q5_mmvq_weight_decode != ferrum_types::Q5MmvqWeightDecode::Baseline
+            && (!cfg!(feature = "cuda-q5-shared-weight-decode")
+                || (matches!(purpose, CudaCompositionPurpose::Execution)
+                    && !match q5_mmvq_weight_decode {
+                        ferrum_types::Q5MmvqWeightDecode::Baseline => true,
+                        ferrum_types::Q5MmvqWeightDecode::SharedM8 => {
+                            q5_shared_weight_decode_compiled()
+                        }
+                        ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => {
+                            q5_shared_weight_decode_m4_m8_compiled()
+                        }
+                    }))
+        {
+            return Err(CudaDeviceRuntimeError::contract(format!(
+                "{} Q5 weight decode requires its compiled upstream native exports",
+                q5_mmvq_weight_decode.as_runtime_value()
+            )));
+        }
         if matches!(
             causal_decode_attention_grouping,
             ferrum_types::CausalDecodeAttentionGrouping::Indexed
                 | ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity
+                | ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
         ) && !cfg!(feature = "cuda-indexed-causal-attention")
         {
             return Err(CudaDeviceRuntimeError::contract(
                 "indexed causal decode attention grouping requires compiled indexed native attention",
             ));
+        }
+        if causal_decode_kv_reuse == ferrum_types::CausalDecodeKvReuse::PairedQueryHeads {
+            if causal_decode_attention_grouping
+                != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                || causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "paired query heads require packed fixed-execution-capacity attention",
+                ));
+            }
+            if !cfg!(feature = "cuda-causal-gqa2")
+                || (matches!(purpose, CudaCompositionPurpose::Execution)
+                    && !causal_decode_kv_reuse_compiled())
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "paired query heads require the compiled production GQA2 native export",
+                ));
+            }
         }
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
@@ -1092,6 +1374,7 @@ impl CudaVNextComposition {
             causal_decode_attention_grouping,
             ferrum_types::CausalDecodeAttentionGrouping::Indexed
                 | ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity
+                | ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
         ) && causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed
         {
             return Err(CudaDeviceRuntimeError::contract(
@@ -1123,7 +1406,12 @@ impl CudaVNextComposition {
             .with_packed_decode_prepare_gate(
                 causal_decode_preparation == ferrum_types::CausalDecodePreparationMode::Packed,
             )
-            .with_causal_decode_attention_grouping(causal_decode_attention_grouping),
+            .with_causal_decode_attention_grouping(causal_decode_attention_grouping)
+            .with_q4_mmvq_weight_decode(q4_mmvq_weight_decode)
+            .with_q5_mmvq_weight_decode(q5_mmvq_weight_decode)
+            .with_q8_projection_weight_preparation(q8_projection_weight_preparation)
+            .with_causal_decode_kv_reuse(causal_decode_kv_reuse)
+            .with_execution_context_limit(execution_context_limit),
         );
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[allow(unused_mut)]
@@ -1278,6 +1566,151 @@ impl CudaVNextComposition {
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_q4_mmvq_weight_decode(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            causal_decode_preparation,
+            causal_decode_attention_grouping,
+            ferrum_types::Q4MmvqWeightDecode::Baseline,
+        )
+    }
+
+    /// Select the bit-preserving native dot variant before constructing the registry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_q4_mmvq_weight_decode(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+        causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_mmvq_weight_decode(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            causal_decode_preparation,
+            causal_decode_attention_grouping,
+            q4_mmvq_weight_decode,
+            ferrum_types::Q5MmvqWeightDecode::Baseline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_mmvq_weight_decode(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+        causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_execution_context_limit(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            causal_decode_preparation,
+            causal_decode_attention_grouping,
+            q4_mmvq_weight_decode,
+            q5_mmvq_weight_decode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_execution_context_limit(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+        causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+        execution_context_limit: Option<usize>,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_q8_projection_weight_preparation(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            causal_decode_preparation,
+            causal_decode_attention_grouping,
+            q4_mmvq_weight_decode,
+            q5_mmvq_weight_decode,
+            execution_context_limit,
+            ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_q8_projection_weight_preparation(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+        causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+        execution_context_limit: Option<usize>,
+        q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::create_with_causal_decode_kv_reuse(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            upload_strategy,
+            oracle,
+            owner_view_mode,
+            causal_decode_preparation,
+            causal_decode_attention_grouping,
+            q4_mmvq_weight_decode,
+            q5_mmvq_weight_decode,
+            execution_context_limit,
+            q8_projection_weight_preparation,
+            ferrum_types::CausalDecodeKvReuse::None,
+        )
+    }
+
+    pub fn create_with_causal_decode_kv_reuse(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        upload_strategy: ProgramBindingUploadStrategy,
+        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+        causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+        q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+        q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+        execution_context_limit: Option<usize>,
+        q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+        causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let composition = Self::prepare(
             ordinal,
             device_id,
@@ -1288,6 +1721,11 @@ impl CudaVNextComposition {
             owner_view_mode,
             causal_decode_preparation,
             causal_decode_attention_grouping,
+            q4_mmvq_weight_decode,
+            q5_mmvq_weight_decode,
+            execution_context_limit,
+            q8_projection_weight_preparation,
+            causal_decode_kv_reuse,
         )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
@@ -1407,6 +1845,116 @@ pub fn cuda_validated_native_operator_catalog_input_with_causal_decode_attention
     causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        ferrum_types::Q4MmvqWeightDecode::Baseline,
+    )
+}
+
+pub fn cuda_validated_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_mmvq_weight_decode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        ferrum_types::Q5MmvqWeightDecode::Baseline,
+    )
+}
+
+pub fn cuda_validated_native_operator_catalog_input_with_mmvq_weight_decode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_execution_context_limit(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        None,
+    )
+}
+
+pub fn cuda_validated_native_operator_catalog_input_with_execution_context_limit(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_q8_projection_weight_preparation(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+    )
+}
+
+pub fn cuda_validated_native_operator_catalog_input_with_q8_projection_weight_preparation(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_validated_native_operator_catalog_input_with_causal_decode_kv_reuse(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        q8_projection_weight_preparation,
+        ferrum_types::CausalDecodeKvReuse::None,
+    )
+}
+
+pub fn cuda_validated_native_operator_catalog_input_with_causal_decode_kv_reuse(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1417,6 +1965,11 @@ pub fn cuda_validated_native_operator_catalog_input_with_causal_decode_attention
         ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
         causal_decode_preparation,
         causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        q8_projection_weight_preparation,
+        causal_decode_kv_reuse,
     )?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
@@ -1465,6 +2018,116 @@ pub fn cuda_native_operator_catalog_input_with_causal_decode_attention_grouping(
     causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        ferrum_types::Q4MmvqWeightDecode::Baseline,
+    )
+}
+
+pub fn cuda_native_operator_catalog_input_with_q4_mmvq_weight_decode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_mmvq_weight_decode(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        ferrum_types::Q5MmvqWeightDecode::Baseline,
+    )
+}
+
+pub fn cuda_native_operator_catalog_input_with_mmvq_weight_decode(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_execution_context_limit(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        None,
+    )
+}
+
+pub fn cuda_native_operator_catalog_input_with_execution_context_limit(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_q8_projection_weight_preparation(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        ferrum_types::Q8ProjectionWeightPreparation::Compressed,
+    )
+}
+
+pub fn cuda_native_operator_catalog_input_with_q8_projection_weight_preparation(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    cuda_native_operator_catalog_input_with_causal_decode_kv_reuse(
+        ordinal,
+        device_id,
+        requested_attention_policy,
+        causal_decode_preparation,
+        causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        q8_projection_weight_preparation,
+        ferrum_types::CausalDecodeKvReuse::None,
+    )
+}
+
+pub fn cuda_native_operator_catalog_input_with_causal_decode_kv_reuse(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+    causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
+    causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
+    q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
+    q5_mmvq_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    execution_context_limit: Option<usize>,
+    q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
+    causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition = CudaVNextComposition::prepare(
         ordinal,
         device_id,
@@ -1475,6 +2138,11 @@ pub fn cuda_native_operator_catalog_input_with_causal_decode_attention_grouping(
         ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
         causal_decode_preparation,
         causal_decode_attention_grouping,
+        q4_mmvq_weight_decode,
+        q5_mmvq_weight_decode,
+        execution_context_limit,
+        q8_projection_weight_preparation,
+        causal_decode_kv_reuse,
     )?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }
