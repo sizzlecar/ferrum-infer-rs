@@ -9,16 +9,17 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Default, serde::Serialize)]
 struct HostStages {
-    // contract, provider parent, binding parent, runtime submit. The binding
-    // parent is nested in provider; these entries are not independent costs.
-    samples: [u64; 4],
-    total_ns: [u64; 4],
+    // Preserve the first four indices. Fresh is an inclusive parent on a
+    // Resident hit; snapshot/backing/dependencies/backend are nested within it.
+    // A zero sample count means unobserved, not measured zero cost.
+    samples: [u64; 9],
+    total_ns: [u64; 9],
 }
 
 #[derive(Default)]
 struct HostTiming {
-    samples: [AtomicU64; 4],
-    total_ns: [AtomicU64; 4],
+    samples: [AtomicU64; 9],
+    total_ns: [AtomicU64; 9],
 }
 impl HostTiming {
     fn snapshot(&self) -> HostStages {
@@ -39,6 +40,11 @@ impl SubmissionWaveDispatchTimingSink for HostTiming {
             SubmissionWaveDispatchStage::ProviderNodeEncode => 1,
             SubmissionWaveDispatchStage::SegmentBindingPrepareAndEncode => 2,
             SubmissionWaveDispatchStage::DeviceRuntimeSubmit => 3,
+            SubmissionWaveDispatchStage::SegmentBackingSnapshotLookup => 4,
+            SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows => 5,
+            SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata => 6,
+            SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions => 7,
+            SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate => 8,
             _ => return,
         };
         let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -71,7 +77,7 @@ impl Work {
         self.resident_hits += other.resident_hits;
         self.template_installs += other.template_installs;
         self.helper_wall_ns += other.helper_wall_ns;
-        for i in 0..4 {
+        for i in 0..9 {
             self.stages.samples[i] += other.stages.samples[i];
             self.stages.total_ns[i] += other.stages.total_ns[i];
         }
@@ -179,9 +185,10 @@ fn pair(
                 "order":if reverse {"BA"} else {"AB"},"hot_pair":hot_pair,
                 "participants":ranges.len(),"ranges":ranges,"physical_kv_pages":pages,
                 "work":work[arm],"preparation":stats,"published":result.segment_published,
-                "stage_order":["contract_validate_reserve","provider_node_encode_parent","segment_binding_prepare_encode_parent","device_runtime_submit"],
+                "stage_order":["contract_validate_reserve","provider_node_encode_parent","segment_binding_prepare_encode_parent","device_runtime_submit","segment_backing_snapshot_lookup","segment_fresh_authority_and_windows_inclusive","segment_backing_permit_and_metadata","segment_node_dependencies_and_regions","segment_backend_encode_and_validate"],
                 "wall_scope":"complete existing execute helper including admission, dispatch, GPU wait, full output/state/control readback and retirement; extension/diagnostic page query and comparisons excluded",
                 "nested_stages_not_additive":true,
+                "stage_scope":"Resident hot Fresh is inclusive of snapshot/backing/dependencies/backend; ordinary path nesting differs; samples=0 means no observed callback, not measured zero cost",
             })
         );
         observed[arm] = Some(result);

@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use super::dispatch_contract::SubmissionWaveDispatchStageTimer;
 use super::foundation::invalid_operation;
 use super::retained_dependency::{RetainedPlanDependencyAuthority, RetainedPlanDependencyIdentity};
 use super::segment_binding::{PreparedSegmentBindingFrame, SegmentFrameResource};
@@ -191,7 +192,7 @@ impl<B> ResidentSegmentTemplate<B> {
     }
 }
 
-pub(super) fn try_encode<'w, R: DeviceRuntime>(
+pub(super) fn try_encode<'w, R: DeviceRuntime, S: SubmissionWaveDispatchTimingSink>(
     runtime: &R,
     recipe: &CompiledSegmentBindingRecipe,
     wave: &'w PreparedStepSubmissionWave<R>,
@@ -200,7 +201,12 @@ pub(super) fn try_encode<'w, R: DeviceRuntime>(
     groups: &[&[LogicalBackingSliceAuthority]],
     expected: &[SegmentBackingExpectation],
     resources: &[SegmentFrameResource],
+    timing_sink: &S,
 ) -> Result<Option<(EncodedSegmentBindingProgram<R::Command>, Arc<()>, u64)>, VNextError> {
+    let backing_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackingPermitAndMetadata,
+    );
     let cached = recipe
         .resident_frame
         .lock()
@@ -253,6 +259,13 @@ pub(super) fn try_encode<'w, R: DeviceRuntime>(
             Ok(bytes)
         })
         .collect::<Result<Vec<_>, VNextError>>()?;
+    // authorize_resident returns only after releasing every pool guard, so
+    // diagnostic callbacks never run inside its validation critical section.
+    drop(backing_stage);
+    let node_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentNodeDependenciesAndRegions,
+    );
     let scope = Arc::new(());
     let mut owner_retentions = plans
         .iter()
@@ -305,6 +318,11 @@ pub(super) fn try_encode<'w, R: DeviceRuntime>(
         batch_taken: false,
         resource_view_bytes,
     };
+    drop(node_stage);
+    let _backend_stage = SubmissionWaveDispatchStageTimer::start(
+        timing_sink,
+        SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
+    );
     let encoded = runtime
         .encode_resident_segment_bindings(template.backend.as_ref(), &mut permit)
         .map_err(|error| invalid_operation(format!("resident segment encoding failed: {error}")))?;

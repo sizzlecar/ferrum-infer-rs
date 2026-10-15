@@ -905,6 +905,7 @@ where
                 &groups,
                 &expected,
                 &resources,
+                timing_sink,
             )?
         {
             if encoded.nodes.len() != recipe.nodes.len()
