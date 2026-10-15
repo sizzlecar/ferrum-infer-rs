@@ -51,6 +51,9 @@ enum Disposition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Outcome {
+    PreparationDeferred,
+    PreparationError,
+    PreparationCompletedWithoutDispatch,
     Submitted,
     DefinitelyNotSubmitted,
     ContractError,
@@ -183,9 +186,158 @@ struct WaveRecord {
     ordinal: u64,
     phase: &'static str,
     outcome: Outcome,
+    preparation: Option<DecodePreparationRecord>,
     host_encode_submit_ns: Option<u64>,
     attempts: Vec<AttemptRecord>,
     attempt_overflow: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PreparationStage {
+    CanonicalParticipants = 0,
+    OperationLockWait = 1,
+    TokensAndExtension = 2,
+    ResourcePrepareAttempt = 3,
+    StepRequestPrepare = 4,
+    StepAdmission = 5,
+    SubmissionWavePrepare = 6,
+}
+
+#[derive(Serialize)]
+struct DecodePreparationRecord {
+    input_width: u64,
+    prepared_width: Option<u64>,
+    reached_dispatch: bool,
+    executor_to_dispatch_ns: Option<u64>,
+    executor_returned_before_dispatch_ns: Option<u64>,
+    executor_prefix_ns: Option<u64>,
+    resource_prepare_ns: Option<u64>,
+    dispatch_tail_ns: Option<u64>,
+    canonical_participants: Option<StageDurationRecord>,
+    operation_lock_wait: Option<StageDurationRecord>,
+    tokens_and_extension: Option<StageDurationRecord>,
+    resource_prepare_attempt: Option<StageDurationRecord>,
+    step_request_prepare: Option<StageDurationRecord>,
+    step_admission: Option<StageDurationRecord>,
+    submission_wave_prepare: Option<StageDurationRecord>,
+}
+
+pub(super) struct DecodePreparation {
+    started: Instant,
+    input_width: u64,
+    resource_started: OnceLock<Instant>,
+    resource_ready: OnceLock<(Instant, u64)>,
+    closed: OnceLock<(Instant, bool)>,
+    stages: [StageDurationAccumulator; 7],
+}
+
+impl DecodePreparation {
+    fn new(started: Instant, input_width: usize) -> Self {
+        Self {
+            started,
+            input_width: u64::try_from(input_width).unwrap_or(u64::MAX),
+            resource_started: OnceLock::new(),
+            resource_ready: OnceLock::new(),
+            closed: OnceLock::new(),
+            stages: std::array::from_fn(|_| StageDurationAccumulator::default()),
+        }
+    }
+
+    pub(super) fn begin_resource(&self) {
+        let _ = self.resource_started.set(Instant::now());
+    }
+
+    pub(super) fn resource_ready(&self, width: u64) {
+        let _ = self.resource_ready.set((Instant::now(), width));
+    }
+
+    fn close(&self, dispatched: bool) {
+        let _ = self.closed.set((Instant::now(), dispatched));
+    }
+
+    fn into_record(self) -> DecodePreparationRecord {
+        let closed = self.closed.into_inner();
+        let resource_started = self.resource_started.into_inner();
+        let resource_ready = self.resource_ready.into_inner();
+        let elapsed =
+            |end: Instant, start: Instant| end.checked_duration_since(start).map(duration_ns);
+        let reached_dispatch = closed.is_some_and(|(_, dispatched)| dispatched);
+        let total = closed.and_then(|(end, _)| elapsed(end, self.started));
+        let [canonical, locks, tokens, resource, request, admission, wave] = self.stages;
+        DecodePreparationRecord {
+            input_width: self.input_width,
+            prepared_width: resource_ready.map(|(_, width)| width),
+            reached_dispatch,
+            executor_to_dispatch_ns: reached_dispatch.then_some(total).flatten(),
+            executor_returned_before_dispatch_ns: (!reached_dispatch).then_some(total).flatten(),
+            executor_prefix_ns: resource_started.and_then(|end| elapsed(end, self.started)),
+            resource_prepare_ns: resource_started
+                .zip(resource_ready)
+                .and_then(|(start, (end, _))| elapsed(end, start)),
+            dispatch_tail_ns: resource_ready
+                .zip(closed)
+                .filter(|(_, (_, dispatched))| *dispatched)
+                .and_then(|((start, _), (end, _))| elapsed(end, start)),
+            canonical_participants: canonical.into_record(),
+            operation_lock_wait: locks.into_record(),
+            tokens_and_extension: tokens.into_record(),
+            resource_prepare_attempt: resource.into_record(),
+            step_request_prepare: request.into_record(),
+            step_admission: admission.into_record(),
+            submission_wave_prepare: wave.into_record(),
+        }
+    }
+}
+
+/// Reuses a live metrics timer when present. New prefix clocks are read only
+/// for a bounded decode observer; no thread-local or aggregate subtraction.
+pub(super) struct PreparationTimer<'a> {
+    existing: Option<super::super::vnext_timing::AtomicDurationTimer<'a>>,
+    started: Option<Instant>,
+    observation: Option<&'a DecodePreparation>,
+    stage: PreparationStage,
+}
+
+impl<'a> PreparationTimer<'a> {
+    pub(super) fn start(
+        observation: Option<&'a DecodePreparation>,
+        stage: PreparationStage,
+    ) -> Self {
+        Self {
+            existing: None,
+            started: observation.map(|_| Instant::now()),
+            observation,
+            stage,
+        }
+    }
+
+    pub(super) fn existing(
+        existing: Option<super::super::vnext_timing::AtomicDurationTimer<'a>>,
+        observation: Option<&'a DecodePreparation>,
+        stage: PreparationStage,
+    ) -> Self {
+        Self {
+            existing,
+            started: None,
+            observation,
+            stage,
+        }
+    }
+}
+
+impl Drop for PreparationTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self
+            .existing
+            .take()
+            .and_then(|timer| timer.finish())
+            .or_else(|| self.started.take().map(|started| started.elapsed()));
+        if !std::thread::panicking() {
+            if let (Some(observation), Some(elapsed)) = (self.observation, elapsed) {
+                observation.stages[self.stage as usize].record(elapsed);
+            }
+        }
+    }
 }
 
 pub(super) struct Ledger {
@@ -239,10 +391,22 @@ impl Ledger {
                 VNextExecutionWaveKind::Decode => "decode",
                 VNextExecutionWaveKind::Mixed => "mixed",
             },
+            preparation: None,
             attempts: Vec::with_capacity(MAXIMUM_ATTEMPTS),
             attempt_overflow: 0,
             finished: false,
         })
+    }
+
+    pub(super) fn begin_decode(
+        &self,
+        enabled: bool,
+        width: usize,
+        started: Instant,
+    ) -> Option<WaveObservation<'_>> {
+        let mut wave = self.begin(enabled, VNextExecutionWaveKind::Decode)?;
+        wave.preparation = Some(DecodePreparation::new(started, width));
+        Some(wave)
     }
 
     pub(super) fn reset(&self) {
@@ -255,7 +419,7 @@ impl Ledger {
 
     pub(super) fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
-            "collection": "host_timing_enabled_first_dispatch_waves_after_startup_reset",
+            "collection": "host_timing_enabled_bounded_decode_entries_and_other_dispatch_waves_after_startup_reset",
             "maximum_waves": self.maximum_waves,
             "maximum_attempts_per_wave": MAXIMUM_ATTEMPTS,
             "waves_started": self.next_wave.load(Ordering::Relaxed),
@@ -265,6 +429,9 @@ impl Ledger {
             "records": &*self.records.lock(),
             "scope": [
                 "submitted means dispatch returned a handle, not terminal device success",
+                "preparation is present only for the PlanRuntime decode executor entry; its wall intervals include async operation-lock waits, not engine scheduling or preceding requests",
+                "executor_prefix + resource_prepare + dispatch_tail close executor_to_dispatch only when all three boundaries were reached; prefix substages and resource sub-timers are nested, never additive to their parents",
+                "preparation stage samples accumulate maintenance retries within this exact executor call; early errors or deferrals have no dispatch interval or invented prepared width; absent fields are null",
                 "each wave owns one host_encode_submit interval including all retries; attempt intervals are nested and must not be added to it",
                 "provider_encode_submit includes core dispatch; provider_node_encode and enqueue_commands reuse their original stage scopes",
                 "missing callback or interval is null, not zero; prepare and final submission observations are separate boundaries",
@@ -275,7 +442,7 @@ impl Ledger {
                 "capture_allowed_at_entry is the backend quiescence decision, not proof of later completion",
                 "first-wave prefix only; overflow and unfinalized waves cannot be used as complete cold-path history",
                 "unwinding preserves original RAII metrics but does not finalize joint rows; snapshots during execution are not atomic",
-                "attempt observation work is inside host_encode_submit; outer ledger reservation and final serialization are outside that interval; no additional clock is read"
+                "attempt observation work is inside host_encode_submit; outer ledger reservation and final serialization are outside that interval; decode entry boundary clocks are read only for a bounded observer"
             ]
         })
     }
@@ -285,12 +452,23 @@ pub(super) struct WaveObservation<'a> {
     ledger: &'a Ledger,
     ordinal: u64,
     phase: &'static str,
+    preparation: Option<DecodePreparation>,
     attempts: Vec<AttemptRecord>,
     attempt_overflow: usize,
     finished: bool,
 }
 
 impl WaveObservation<'_> {
+    pub(super) fn preparation(&self) -> Option<&DecodePreparation> {
+        self.preparation.as_ref()
+    }
+
+    pub(super) fn close_preparation(&self, dispatched: bool) {
+        if let Some(preparation) = &self.preparation {
+            preparation.close(dispatched);
+        }
+    }
+
     pub(super) fn record_attempt<T>(
         &mut self,
         observation: AttemptObservation<'_, T>,
@@ -315,6 +493,7 @@ impl WaveObservation<'_> {
             ordinal: self.ordinal,
             phase: self.phase,
             outcome,
+            preparation: self.preparation.take().map(DecodePreparation::into_record),
             host_encode_submit_ns: host_elapsed.map(duration_ns),
             attempts: std::mem::take(&mut self.attempts),
             attempt_overflow: self.attempt_overflow,

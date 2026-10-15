@@ -161,6 +161,163 @@ fn records(snapshot: &Value) -> &[Value] {
 }
 
 #[test]
+fn reusable_cold_path_decode_preparation_boundaries_close_once_across_dispatch_retries() {
+    let ledger = Ledger::default();
+    let sink = CaptureSink::default();
+    let start = Instant::now();
+    let mut wave = ledger.begin_decode(true, 8, start).unwrap();
+    let preparation = wave.preparation().unwrap();
+    preparation
+        .resource_started
+        .set(start + Duration::from_nanos(30))
+        .unwrap();
+    preparation
+        .resource_ready
+        .set((start + Duration::from_nanos(80), 7))
+        .unwrap();
+    preparation
+        .closed
+        .set((start + Duration::from_nanos(100), true))
+        .unwrap();
+    preparation.stages[PreparationStage::CanonicalParticipants as usize].record(Duration::ZERO);
+    preparation.stages[PreparationStage::OperationLockWait as usize]
+        .record(Duration::from_nanos(10));
+    preparation.stages[PreparationStage::TokensAndExtension as usize]
+        .record(Duration::from_nanos(15));
+    for nanos in [11, 13] {
+        preparation.stages[PreparationStage::StepAdmission as usize]
+            .record(Duration::from_nanos(nanos));
+    }
+    // A second close cannot replace the actual entry-to-dispatch boundary.
+    wave.close_preparation(false);
+    for outcome in [Outcome::DefinitelyNotSubmitted, Outcome::Submitted] {
+        wave.record_attempt(
+            AttemptObservation::new(&sink, None, 1, None, None),
+            Default::default(),
+            outcome,
+            None,
+        );
+    }
+    wave.finish(Some(Duration::from_nanos(200)), Outcome::Submitted);
+    let snapshot = ledger.snapshot();
+    let row = &records(&snapshot)[0];
+    let preparation = &row["preparation"];
+    assert_eq!(preparation["input_width"], 8);
+    assert_eq!(preparation["prepared_width"], 7);
+    assert_eq!(preparation["reached_dispatch"], true);
+    assert_eq!(preparation["executor_to_dispatch_ns"], 100);
+    assert_eq!(
+        preparation["executor_prefix_ns"].as_u64().unwrap()
+            + preparation["resource_prepare_ns"].as_u64().unwrap()
+            + preparation["dispatch_tail_ns"].as_u64().unwrap(),
+        100
+    );
+    assert!(preparation["executor_returned_before_dispatch_ns"].is_null());
+    assert_eq!(
+        preparation["canonical_participants"],
+        json!({"samples":1,"total_ns":0,"overflowed":false})
+    );
+    assert_eq!(
+        preparation["step_admission"],
+        json!({"samples":2,"total_ns":24,"overflowed":false})
+    );
+    assert!(preparation["step_request_prepare"].is_null());
+    assert_eq!(row["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(row["host_encode_submit_ns"], 200);
+}
+
+#[test]
+fn reusable_cold_path_decode_preparation_early_exit_missing_and_disabled_are_distinct() {
+    let ledger = Ledger::with_capacity(3);
+    let start = Instant::now();
+    assert!(ledger.begin_decode(false, 8, start).is_none());
+    assert_eq!(ledger.snapshot()["waves_started"], 0);
+    for outcome in [Outcome::PreparationDeferred, Outcome::PreparationError] {
+        let wave = ledger.begin_decode(true, 8, start).unwrap();
+        let preparation = wave.preparation().unwrap();
+        preparation
+            .resource_started
+            .set(start + Duration::from_nanos(3))
+            .unwrap();
+        preparation
+            .closed
+            .set((start + Duration::from_nanos(7), false))
+            .unwrap();
+        preparation.stages[PreparationStage::ResourcePrepareAttempt as usize]
+            .record(Duration::ZERO);
+        wave.finish(None, outcome);
+    }
+    ledger
+        .begin(true, VNextExecutionWaveKind::Prefill)
+        .unwrap()
+        .finish(None, Outcome::Submitted);
+    assert!(ledger.begin_decode(true, 8, start).is_none());
+    let snapshot = ledger.snapshot();
+    assert_eq!(snapshot["waves_started"], 4);
+    assert_eq!(snapshot["overflow_waves"], 1);
+    for row in &records(&snapshot)[..2] {
+        let preparation = &row["preparation"];
+        assert_eq!(preparation["reached_dispatch"], false);
+        assert_eq!(preparation["executor_returned_before_dispatch_ns"], 7);
+        for missing in [
+            "prepared_width",
+            "executor_to_dispatch_ns",
+            "resource_prepare_ns",
+            "dispatch_tail_ns",
+            "tokens_and_extension",
+        ] {
+            assert!(preparation[missing].is_null(), "{missing}");
+        }
+        assert_eq!(preparation["resource_prepare_attempt"]["samples"], 1);
+        assert_eq!(preparation["resource_prepare_attempt"]["total_ns"], 0);
+        assert!(row["host_encode_submit_ns"].is_null());
+        assert!(row["attempts"].as_array().unwrap().is_empty());
+    }
+    assert!(records(&snapshot)[2]["preparation"].is_null());
+}
+
+#[test]
+fn reusable_cold_path_decode_preparation_reuses_metrics_and_preserves_unwind() {
+    let metrics = AtomicDurationMetrics::default();
+    let preparation = DecodePreparation::new(Instant::now(), 1);
+    for _ in 0..2 {
+        let _timing = PreparationTimer::existing(
+            Some(metrics.start()),
+            Some(&preparation),
+            PreparationStage::StepAdmission,
+        );
+    }
+    let record = serde_json::to_value(preparation.into_record()).unwrap();
+    assert_eq!(
+        record["step_admission"]["samples"],
+        metrics.snapshot()["samples"]
+    );
+    assert_eq!(
+        record["step_admission"]["total_ns"],
+        metrics.snapshot()["total_ns"]
+    );
+    assert_eq!(metrics.snapshot()["samples"], 2);
+    let disabled = PreparationTimer::start(None, PreparationStage::CanonicalParticipants);
+    assert!(disabled.started.is_none());
+    drop(disabled);
+
+    let ledger = Ledger::default();
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let wave = ledger.begin_decode(true, 1, Instant::now()).unwrap();
+        let _timing = PreparationTimer::existing(
+            Some(metrics.start()),
+            wave.preparation(),
+            PreparationStage::StepAdmission,
+        );
+        panic!("preparation unwinds before dispatch");
+    }))
+    .is_err());
+    assert_eq!(metrics.snapshot()["samples"], 3);
+    assert_eq!(ledger.snapshot()["unfinalized_waves"], 1);
+    assert!(records(&ledger.snapshot()).is_empty());
+}
+
+#[test]
 fn reusable_cold_path_full_identity_and_callback_association_do_not_collapse_same_shape() {
     let fixture = IdentityFixture::new();
     let base = fixture.program(1, 'b', 1);

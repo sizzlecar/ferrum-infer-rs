@@ -6881,14 +6881,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<StepResourceAdmissionDecision<R>> {
+        self.try_begin_step_for_spans_observed(batch, spans, kind, None)
+    }
+
+    fn try_begin_step_for_spans_observed(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
+        preparation: Option<&reusable_cold_path::DecodePreparation>,
+    ) -> Result<StepResourceAdmissionDecision<R>> {
         let timing_enabled = self.host_dispatch_timing_enabled();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let request = {
-            let _timing = self
-                .metrics
-                .wave_timing
-                .resource_step_request_prepare
-                .start_if(timing_enabled);
+            let _timing = reusable_cold_path::PreparationTimer::existing(
+                self.metrics
+                    .wave_timing
+                    .resource_step_request_prepare
+                    .start_if(timing_enabled),
+                preparation,
+                reusable_cold_path::PreparationStage::StepRequestPrepare,
+            );
             let _phase_timing = phase_timing
                 .resource_step_request_prepare
                 .start_if(timing_enabled);
@@ -6927,11 +6940,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         };
         {
-            let _timing = self
-                .metrics
-                .wave_timing
-                .resource_step_admission
-                .start_if(timing_enabled);
+            let _timing = reusable_cold_path::PreparationTimer::existing(
+                self.metrics
+                    .wave_timing
+                    .resource_step_admission
+                    .start_if(timing_enabled),
+                preparation,
+                reusable_cold_path::PreparationStage::StepAdmission,
+            );
             let _phase_timing = phase_timing
                 .resource_step_admission
                 .start_if(timing_enabled);
@@ -6994,6 +7010,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<Arc<StepResourceLease<R>>>> {
+        self.begin_step_for_spans_with_capacity_observed(batch, sequences, spans, kind, None)
+    }
+
+    fn begin_step_for_spans_with_capacity_observed(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        sequences: &[Arc<VNextSequence<R>>],
+        spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
+        preparation: Option<&reusable_cold_path::DecodePreparation>,
+    ) -> Result<VNextExecutionCapacityDecision<Arc<StepResourceLease<R>>>> {
         if sequences.is_empty()
             || sequences.len() != batch.sessions().len()
             || batch
@@ -7010,7 +7037,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let mut backing_attempts = 0;
         let mut maintenance_receipts = Vec::new();
         loop {
-            match self.try_begin_step_for_spans(batch, spans, kind)? {
+            match self.try_begin_step_for_spans_observed(batch, spans, kind, preparation)? {
                 StepResourceAdmissionDecision::Admitted(step) => {
                     return Ok(VNextExecutionCapacityDecision::Ready(step))
                 }
@@ -7199,6 +7226,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<PreparedStepSubmissionWave<R>>> {
+        self.prepare_wave_for_spans_with_capacity_observed(step, sequences, spans, kind, None)
+    }
+
+    fn prepare_wave_for_spans_with_capacity_observed(
+        &self,
+        step: &Arc<StepResourceLease<R>>,
+        sequences: &[Arc<VNextSequence<R>>],
+        spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
+        preparation: Option<&reusable_cold_path::DecodePreparation>,
+    ) -> Result<VNextExecutionCapacityDecision<PreparedStepSubmissionWave<R>>> {
         if sequences.len() != spans.len() {
             return Err(FerrumError::internal(
                 "vNext submission-wave maintenance participants differ from the work spans",
@@ -7207,11 +7245,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         Self::validate_step_maintenance_participants(step, sequences)?;
         let timing_enabled = self.host_dispatch_timing_enabled();
         let phase_timing = self.metrics.wave_timing_for(kind);
-        let _timing = self
-            .metrics
-            .wave_timing
-            .resource_submission_wave_prepare
-            .start_if(timing_enabled);
+        let _timing = reusable_cold_path::PreparationTimer::existing(
+            self.metrics
+                .wave_timing
+                .resource_submission_wave_prepare
+                .start_if(timing_enabled),
+            preparation,
+            reusable_cold_path::PreparationStage::SubmissionWavePrepare,
+        );
         let _phase_timing = phase_timing
             .resource_submission_wave_prepare
             .start_if(timing_enabled);
@@ -8108,6 +8149,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
     ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
+        self.execute_batch_step_observed(
+            batch,
+            sequences,
+            token_batches,
+            spans,
+            kind,
+            output_roles,
+            None,
+        )
+        .await
+    }
+
+    async fn execute_batch_step_observed(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        sequences: &[Arc<VNextSequence<R>>],
+        token_batches: &[Vec<u32>],
+        spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
+        output_roles: &[VNextParticipantOutputRole],
+        entry_observation: Option<&mut Option<reusable_cold_path::WaveObservation<'_>>>,
+    ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
@@ -8144,37 +8207,58 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // Unsupported/default plans keep the original slice and do not copy
         // full token inputs or repeat their hash calculation.
         let spans = retained_spans.as_deref().unwrap_or(spans);
+        let preparation = entry_observation
+            .as_ref()
+            .and_then(|wave| wave.as_ref())
+            .and_then(|wave| wave.preparation());
+        if let Some(preparation) = preparation {
+            preparation.begin_resource();
+        }
         let prepared = {
-            let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
+            let _timing = reusable_cold_path::PreparationTimer::existing(
+                Some(self.metrics.wave_timing.resource_prepare_attempt.start()),
+                preparation,
+                reusable_cold_path::PreparationStage::ResourcePrepareAttempt,
+            );
             let _phase_timing = self
                 .metrics
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            let step =
-                match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
-                    VNextExecutionCapacityDecision::Ready(step) => step,
-                    VNextExecutionCapacityDecision::Deferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+            let step = match self.begin_step_for_spans_with_capacity_observed(
+                batch,
+                sequences,
+                spans,
+                kind,
+                preparation,
+            )? {
+                VNextExecutionCapacityDecision::Ready(step) => step,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+                }
+                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                    return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                        deferred,
+                    ))
+                }
+            };
+            let wave_decision = match self.prepare_wave_for_spans_with_capacity_observed(
+                &step,
+                sequences,
+                spans,
+                kind,
+                preparation,
+            ) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    if let Err(cleanup_error) =
+                        self.rollback_unsubmitted_step(step, "vNext failed-wave unsubmitted step")
+                    {
+                        return Err(FerrumError::backend(format!("{error}; {cleanup_error}")));
                     }
-                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                            deferred,
-                        ))
-                    }
-                };
-            let wave_decision =
-                match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind) {
-                    Ok(decision) => decision,
-                    Err(error) => {
-                        if let Err(cleanup_error) = self
-                            .rollback_unsubmitted_step(step, "vNext failed-wave unsubmitted step")
-                        {
-                            return Err(FerrumError::backend(format!("{error}; {cleanup_error}")));
-                        }
-                        return Err(error);
-                    }
-                };
+                    return Err(error);
+                }
+            };
             let wave = match wave_decision {
                 VNextExecutionCapacityDecision::Ready(wave) => wave,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
@@ -8196,6 +8280,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             PreparedVNextPrefill { step, wave }
         };
+        if let Some(preparation) = preparation {
+            preparation.resource_ready(
+                u64::try_from(prepared.step.participant_count()).unwrap_or(u64::MAX),
+            );
+        }
         let participants = sequences
             .iter()
             .zip(token_batches)
@@ -8210,9 +8299,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 },
             )
             .collect::<Vec<_>>();
-        self.execute_prepared_participants(&participants, prepared, kind)
-            .await
-            .map(VNextExecutionCapacityDecision::Ready)
+        self.execute_prepared_participants_observed(
+            &participants,
+            prepared,
+            kind,
+            entry_observation,
+        )
+        .await
+        .map(VNextExecutionCapacityDecision::Ready)
     }
 
     async fn execute_prepared_step(
@@ -8243,6 +8337,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
+    ) -> Result<Vec<ExecutorSamplingOutput>> {
+        self.execute_prepared_participants_observed(participants, prepared, kind, None)
+            .await
+    }
+
+    async fn execute_prepared_participants_observed(
+        &self,
+        participants: &[VNextExecutionParticipant<'_, R>],
+        prepared: PreparedVNextPrefill<R>,
+        kind: VNextExecutionWaveKind,
+        entry_observation: Option<&mut Option<reusable_cold_path::WaveObservation<'_>>>,
     ) -> Result<Vec<ExecutorSamplingOutput>> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
@@ -8287,10 +8392,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
-        let mut cold_wave = self
-            .metrics
-            .reusable_cold_path
-            .begin(self.host_dispatch_timing_enabled(), kind);
+        // Some(None) means this decode entry was disabled or exceeded the
+        // bounded ledger. Do not reserve a second observation at dispatch.
+        let mut cold_wave = match entry_observation {
+            Some(wave) => wave.take(),
+            None => self
+                .metrics
+                .reusable_cold_path
+                .begin(self.host_dispatch_timing_enabled(), kind),
+        };
+        if let Some(wave) = &cold_wave {
+            wave.close_preparation(true);
+        }
         let (mut token_mask_residency, dispatch) = {
             let timing = self.metrics.wave_timing.host_encode_submit.start();
             let phase_timer = phase_timing.host_encode_submit.start();
@@ -9013,10 +9126,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         inputs: &[PlanRuntimeDecodeInput],
     ) -> Result<PlanRuntimeBatchDecodeOutcome> {
         let started = Instant::now();
+        let mut cold_wave = self.metrics.reusable_cold_path.begin_decode(
+            self.host_dispatch_timing_enabled(),
+            inputs.len(),
+            started,
+        );
+        let result = self
+            .execute_plan_runtime_decode_batch_observed(inputs, started, &mut cold_wave)
+            .await;
+        if let Some(wave) = cold_wave.take() {
+            wave.close_preparation(false);
+            let outcome = match &result {
+                Ok(PlanRuntimeBatchDecodeOutcome::Deferred(_)) => {
+                    reusable_cold_path::Outcome::PreparationDeferred
+                }
+                Ok(PlanRuntimeBatchDecodeOutcome::Completed(_)) => {
+                    reusable_cold_path::Outcome::PreparationCompletedWithoutDispatch
+                }
+                Err(_) => reusable_cold_path::Outcome::PreparationError,
+            };
+            wave.finish(None, outcome);
+        }
+        result
+    }
+
+    async fn execute_plan_runtime_decode_batch_observed(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+        started: Instant,
+        cold_wave: &mut Option<reusable_cold_path::WaveObservation<'_>>,
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
         if inputs.is_empty() {
             return Ok(PlanRuntimeBatchDecodeOutcome::Completed(Vec::new()));
         }
 
+        let canonical_timing = reusable_cold_path::PreparationTimer::start(
+            cold_wave.as_ref().and_then(|wave| wave.preparation()),
+            reusable_cold_path::PreparationStage::CanonicalParticipants,
+        );
         let mut candidates = Vec::with_capacity(inputs.len());
         for (original_index, input) in inputs.iter().enumerate() {
             let cache_id = input.kv_cache.cache_id();
@@ -9073,11 +9220,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             ));
         }
 
+        drop(canonical_timing);
+        let lock_timing = reusable_cold_path::PreparationTimer::start(
+            cold_wave.as_ref().and_then(|wave| wave.preparation()),
+            reusable_cold_path::PreparationStage::OperationLockWait,
+        );
         let mut operation_guards = Vec::with_capacity(canonical_candidates.len());
         for candidate in &canonical_candidates {
             operation_guards.push(candidate.sequence.operation.lock().await);
         }
 
+        drop(lock_timing);
+        let tokens_timing = reusable_cold_path::PreparationTimer::start(
+            cold_wave.as_ref().and_then(|wave| wave.preparation()),
+            reusable_cold_path::PreparationStage::TokensAndExtension,
+        );
         let mut token_batches = Vec::with_capacity(canonical_candidates.len());
         let mut previous_lengths = Vec::with_capacity(canonical_candidates.len());
         let mut spans = Vec::with_capacity(canonical_candidates.len());
@@ -9131,6 +9288,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             spans.push(span);
         }
 
+        drop(tokens_timing);
         let sequences = canonical_candidates
             .iter()
             .map(|candidate| Arc::clone(&candidate.sequence))
@@ -9140,13 +9298,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map(|candidate| VNextParticipantOutputRole::Decode(candidate.logits_policy.clone()))
             .collect::<Vec<_>>();
         let logits = match self
-            .execute_batch_step(
+            .execute_batch_step_observed(
                 &batch,
                 &sequences,
                 &token_batches,
                 &spans,
                 VNextExecutionWaveKind::Decode,
                 &output_roles,
+                Some(cold_wave),
             )
             .await
         {
