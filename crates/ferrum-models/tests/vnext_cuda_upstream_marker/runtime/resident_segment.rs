@@ -221,7 +221,7 @@ fn run(kind: AttentionKind, oracle: SegmentBindingOracleMode, pass: &str) {
         );
     }
     let setup_ns = started.elapsed().as_nanos();
-    let initial = if kind == AttentionKind::Causal {
+    let initial: usize = if kind == AttentionKind::Causal {
         74
     } else {
         16
