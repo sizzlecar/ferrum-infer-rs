@@ -126,9 +126,21 @@ impl CudaSegmentRange {
 
 pub(crate) struct CudaSegmentOwnerTable {
     owners: Vec<Option<CudaSegmentOwner>>,
+    physical: Vec<Arc<CudaSequencePhysicalTable>>,
 }
 
 impl CudaSegmentOwnerTable {
+    pub(crate) fn physical(tables: Vec<Arc<CudaSequencePhysicalTable>>) -> Self {
+        Self {
+            owners: Vec::new(),
+            physical: tables,
+        }
+    }
+
+    pub(crate) fn physical_tables(&self) -> &[Arc<CudaSequencePhysicalTable>] {
+        &self.physical
+    }
+
     pub(crate) fn region(
         &self,
         range: &CudaSegmentRange,
@@ -165,7 +177,10 @@ impl<'a> CudaSegmentOwnerBuilder<'a> {
         let owners = (0..sources.len()).map(|_| None).collect();
         Self {
             sources,
-            table: CudaSegmentOwnerTable { owners },
+            table: CudaSegmentOwnerTable {
+                owners,
+                physical: Vec::new(),
+            },
         }
     }
 

@@ -1741,6 +1741,23 @@ pub(crate) struct SegmentBackingContext<'w, R: DeviceRuntime> {
 }
 
 impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
+    pub(crate) fn physical_tables<S: crate::vnext::SubmissionWaveDispatchTimingSink>(
+        &self,
+        runtime: &R,
+        timing: &S,
+    ) -> Result<Option<Vec<Arc<super::SequencePhysicalBindingTable<R::Buffer>>>>, VNextError> {
+        let mut tables = Vec::with_capacity(self.snapshots.len());
+        for snapshot in &self.snapshots {
+            let Some(table) = snapshot.physical_binding_table(self.pools, runtime, timing)? else {
+                return Ok(None);
+            };
+            tables.push(table);
+        }
+        Ok(
+            super::SequencePhysicalBindingTable::current_batch(&tables, self.pools, runtime)?
+                .then_some(tables),
+        )
+    }
     pub(crate) fn sequence_shape(
         &self,
         participant: usize,

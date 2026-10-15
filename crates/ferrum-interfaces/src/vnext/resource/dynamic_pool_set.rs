@@ -201,7 +201,7 @@ where
                     pending_growth_bytes: 0,
                     next_chunk_ordinal: 1,
                     next_chunk_generation: 1,
-                    chunks: BTreeMap::new(),
+                    chunks: super::chunk_directory::ChunkDirectory::new(),
                     allocator: FreeExtentIndex::default(),
                     live_occupancy: DynamicPoolLiveOccupancyStatus::default(),
                     quarantined: Vec::new(),
@@ -2258,11 +2258,10 @@ where
             for (group_index, (increments, occupancy)) in accounting_updates.into_iter().enumerate()
             {
                 for (ordinal, increment) in increments {
-                    states[group_index]
+                    *states[group_index]
                         .chunks
-                        .get_mut(&ordinal)
-                        .expect("validated reserved dynamic chunk remains installed")
-                        .live_segments += increment;
+                        .live_segments_mut(&ordinal)
+                        .expect("validated reserved dynamic chunk remains installed") += increment;
                 }
                 states[group_index].live_occupancy = occupancy;
             }

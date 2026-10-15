@@ -56,8 +56,13 @@ mod binding_transfers;
 mod compact_upload_scatter_tests;
 mod segment_oracle;
 mod segment_owners;
+mod sequence_physical;
 use segment_owners::CudaProgramBindingRetention;
 pub(crate) use segment_owners::{CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, CudaSegmentRange};
+pub(crate) use sequence_physical::{
+    CudaBindingProgramRanges, CudaPhysicalOwnerBuilder, CudaPhysicalRowWindow,
+    CudaSequencePhysicalTable,
+};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -639,7 +644,7 @@ struct CudaBindingProgramNode {
     binding: ProgramBindingNodeBinding,
     destination: CudaBufferRegion,
     writes: Vec<CudaBindingProgramWrite>,
-    ranges: Vec<CudaSegmentRange>,
+    ranges: CudaBindingProgramRanges,
     numerical_status: Option<(Vec<u64>, u32)>,
     numerical_status_deferred: bool,
     participants: u32,
@@ -715,7 +720,7 @@ impl CudaBindingProgramSink {
             participants,
             tokens,
             writes: Vec::new(),
-            ranges: Vec::new(),
+            ranges: CudaBindingProgramRanges::Indexed(Vec::new()),
             numerical_status: None,
             numerical_status_deferred: true,
         });
@@ -774,6 +779,22 @@ impl CudaBindingProgramSink {
     pub(crate) fn end_node(
         &mut self,
         ranges: Vec<CudaSegmentRange>,
+        numerical_status: Option<(Vec<u64>, u32)>,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        self.end_ranges(CudaBindingProgramRanges::Indexed(ranges), numerical_status)
+    }
+
+    pub(crate) fn end_physical_node(
+        &mut self,
+        ranges: Vec<CudaPhysicalRowWindow>,
+        numerical_status: Option<(Vec<u64>, u32)>,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        self.end_ranges(CudaBindingProgramRanges::Physical(ranges), numerical_status)
+    }
+
+    fn end_ranges(
+        &mut self,
+        ranges: CudaBindingProgramRanges,
         numerical_status: Option<(Vec<u64>, u32)>,
     ) -> Result<(), CudaDeviceRuntimeError> {
         let node = self.nodes.last_mut().ok_or_else(|| {
@@ -879,11 +900,7 @@ impl CudaBindingProgramSink {
                 .logical_arena_bytes
                 .checked_add(node.destination.length_bytes)
                 .ok_or_else(|| invalid("compiled logical byte count overflows"))?;
-            for range in &node.ranges {
-                if owners.region(range)?.runtime_instance != runtime_instance {
-                    return Err(invalid("compiled binding owner has a foreign runtime"));
-                }
-            }
+            node.ranges.validate_runtime(&owners, runtime_instance)?;
             for (write_index, write) in node.writes.iter().enumerate() {
                 upload_plan.live_payload_bytes = upload_plan
                     .live_payload_bytes
@@ -3035,6 +3052,8 @@ pub struct CudaDeviceRuntime {
     segment_binding_oracle_audited_nodes: AtomicU64,
     segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
     segment_binding_indexed_encodes: AtomicU64,
+    physical_segment_binding_encodes: AtomicU64,
+    sequence_physical_binding_tables_compiled: AtomicU64,
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     execution_context_limit: Option<usize>,
@@ -3246,6 +3265,8 @@ impl CudaDeviceRuntime {
             segment_binding_owner_view_mode:
                 ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
             segment_binding_indexed_encodes: AtomicU64::new(0),
+            physical_segment_binding_encodes: AtomicU64::new(0),
+            sequence_physical_binding_tables_compiled: AtomicU64::new(0),
             packed_decode_prepare_gate: false,
             causal_decode_attention_grouping:
                 ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
@@ -3293,6 +3314,17 @@ impl CudaDeviceRuntime {
     /// Successful indexed host encodes, not submissions or GPU completions.
     pub fn segment_binding_indexed_encodes(&self) -> u64 {
         self.segment_binding_indexed_encodes.load(Ordering::Relaxed)
+    }
+
+    /// Successful physical-table host encodes, not submissions or GPU completions.
+    pub fn physical_segment_binding_encodes(&self) -> u64 {
+        self.physical_segment_binding_encodes
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn sequence_physical_binding_tables_compiled(&self) -> u64 {
+        self.sequence_physical_binding_tables_compiled
+            .load(Ordering::Relaxed)
     }
 
     /// Constructor-only selection for canonical packed decode preparation.
@@ -4712,6 +4744,77 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 value.checked_add(1)
             })
             .map_err(|_| CudaDeviceRuntimeError::contract("indexed segment count exhausted"))?;
+        Ok(Some(
+            ferrum_interfaces::vnext::EncodedSegmentBindingProgram {
+                nodes,
+                program_bindings: vec![command],
+                program_binding_nodes,
+            },
+        ))
+    }
+
+    fn supports_physical_segment_bindings(&self) -> bool {
+        self.segment_binding_owner_view_mode
+            == ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+            && self.program_binding_upload_strategy == ProgramBindingUploadStrategy::CompactScatter
+            && self.binding_scatter.is_some()
+    }
+
+    fn compile_sequence_physical_bindings(
+        &self,
+        table: &ferrum_interfaces::vnext::SequencePhysicalBindingTable<Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        if !self.supports_physical_segment_bindings() {
+            return Ok(None);
+        }
+        let Some(table) = CudaSequencePhysicalTable::compile(table, self.runtime_instance)? else {
+            return Ok(None);
+        };
+        self.sequence_physical_binding_tables_compiled
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| {
+                CudaDeviceRuntimeError::contract("physical table compilation count exhausted")
+            })?;
+        Ok(Some(table))
+    }
+
+    fn encode_physical_segment_bindings(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        wave: &mut ferrum_interfaces::vnext::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+    ) -> Result<
+        Option<ferrum_interfaces::vnext::EncodedSegmentBindingProgram<Self::Command>>,
+        Self::Error,
+    > {
+        if !self.supports_physical_segment_bindings() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "physical segment runtime configuration changed",
+            ));
+        }
+        let scatter = self.binding_scatter.as_ref().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("physical segment scatter module is absent")
+        })?;
+        let (nodes, sink, owners) =
+            super::vnext_ops::encode_physical_segment_bindings(program, wave)?;
+        let program_binding_nodes = sink.node_indices()?;
+        let command = sink.finish(
+            owners,
+            scatter,
+            &self.allocation_stream,
+            Arc::clone(&self.program_binding_upload_counters),
+        )?;
+        self.segment_binding_indexed_encodes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| CudaDeviceRuntimeError::contract("indexed segment count exhausted"))?;
+        self.physical_segment_binding_encodes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| CudaDeviceRuntimeError::contract("physical segment count exhausted"))?;
         Ok(Some(
             ferrum_interfaces::vnext::EncodedSegmentBindingProgram {
                 nodes,

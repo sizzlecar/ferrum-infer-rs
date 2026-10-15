@@ -3699,6 +3699,33 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Supports borrowed Sequence physical tables plus current-wave authority.
+    /// The default preserves the ordinary compiled-frame path.
+    fn supports_physical_segment_bindings(&self) -> bool {
+        false
+    }
+
+    /// Cold provider-owned physical representation. It must independently keep
+    /// `table.lifetime_keeper()` and physical retentions alive, without retaining
+    /// the table itself (which owns this payload). No current Step lease belongs
+    /// in this cache.
+    fn compile_sequence_physical_bindings(
+        &self,
+        _table: &super::SequencePhysicalBindingTable<Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Encode from fresh logical windows and linear dependencies. Returning None
+    /// permits fallback only before consuming any dependency or producing work.
+    fn encode_physical_segment_bindings(
+        &self,
+        _program: &(dyn std::any::Any + Send + Sync),
+        _wave: &mut super::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+    ) -> Result<Option<super::EncodedSegmentBindingProgram<Self::Command>>, Self::Error> {
+        Ok(None)
+    }
+
     /// Selects only the representation of this wave's freshly checked facts.
     /// Neither representation permits reusing authority from another wave.
     fn segment_binding_owner_view_mode(&self) -> super::SegmentBindingOwnerViewMode {

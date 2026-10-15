@@ -17,6 +17,7 @@ use super::{
     Weak, SEQUENCE_DISPATCH_POISONED_BIT,
 };
 use crate::vnext::CapacityAvailabilitySource;
+use std::sync::OnceLock;
 
 mod state_transfer;
 pub(crate) use state_transfer::*;
@@ -1583,6 +1584,7 @@ struct SequencePhysicalCatalog<B> {
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     resource_ids: Arc<[ResourceId]>,
     groups: Vec<super::segment_permit::SequencePhysicalGroup<B>>,
+    binding_table: OnceLock<Arc<super::SequencePhysicalBindingTable<B>>>,
 }
 
 impl<B> SequencePhysicalCatalog<B> {
@@ -1602,6 +1604,7 @@ impl<B> SequencePhysicalCatalog<B> {
             backing_slices,
             resource_ids,
             groups,
+            binding_table: OnceLock::new(),
         }
     }
 }
@@ -1775,6 +1778,55 @@ where
             ));
         }
         self.physical.groups[descriptor_index].bind(&self.physical.backing_slices)
+    }
+
+    pub(super) fn physical_binding_table<S: crate::vnext::SubmissionWaveDispatchTimingSink>(
+        &self,
+        pools: &super::DynamicPoolSet<R>,
+        runtime: &R,
+        timing: &S,
+    ) -> Result<Option<Arc<super::SequencePhysicalBindingTable<R::Buffer>>>, VNextError> {
+        if !std::ptr::eq(
+            runtime,
+            self._logical_owner._request.plan.runtime().as_ref(),
+        ) {
+            return Err(invalid_resource(
+                "physical table runtime differs from retained Plan owner",
+            ));
+        }
+        if let Some(table) = self.physical.binding_table.get() {
+            // The whole wave validates all cached tables with one lock per pool.
+            return Ok(Some(Arc::clone(table)));
+        }
+        let mut sources = Vec::new();
+        for (ordinal, resource) in self.physical.resource_ids.iter().enumerate() {
+            if self.backing_slices_for(resource).is_empty() {
+                continue;
+            }
+            sources.push((
+                ordinal,
+                resource.clone(),
+                self.segment_group(ordinal, resource)?,
+            ));
+        }
+        // No reference back to the catalog: the cache cannot form an owner cycle.
+        let lifetime: Arc<dyn Send + Sync> = Arc::new((
+            self.extension_capacity.clone(),
+            Arc::clone(&self._logical_owner),
+        ));
+        let Some(table) = super::SequencePhysicalBindingTable::build(
+            pools,
+            runtime,
+            sources,
+            self.physical.resource_ids.len(),
+            lifetime,
+            timing,
+        )?
+        else {
+            return Ok(None);
+        };
+        let _ = self.physical.binding_table.set(Arc::clone(&table));
+        Ok(Some(table))
     }
 }
 

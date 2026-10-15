@@ -415,7 +415,7 @@ pub(super) struct DynamicBackingPoolState<B> {
     pub(super) pending_growth_bytes: u64,
     pub(super) next_chunk_ordinal: u32,
     pub(super) next_chunk_generation: u64,
-    pub(super) chunks: BTreeMap<u32, ResidentChunkState<B>>,
+    pub(super) chunks: super::chunk_directory::ChunkDirectory<B>,
     pub(super) allocator: FreeExtentIndex,
     pub(super) live_occupancy: DynamicPoolLiveOccupancyStatus,
     pub(super) quarantined: Vec<QuarantinedDynamicChunk<B>>,
@@ -754,7 +754,7 @@ where
                 state.poisoned = true;
                 return;
             }
-            let Some(chunk) = state.chunks.get_mut(&segment.chunk_ordinal()) else {
+            let Some(chunk) = state.chunks.get(&segment.chunk_ordinal()) else {
                 state.poisoned = true;
                 return;
             };
@@ -768,11 +768,11 @@ where
                 state.poisoned = true;
                 return;
             }
-            let chunk = state
+            let live_segments = state
                 .chunks
-                .get_mut(&segment.chunk_ordinal())
+                .live_segments_mut(&segment.chunk_ordinal())
                 .expect("validated released chunk remains installed");
-            chunk.live_segments -= 1;
+            *live_segments -= 1;
         }
         state.live_occupancy = next_occupancy;
         drop(state);
@@ -2408,11 +2408,10 @@ where
                 state.poisoned = true;
                 return;
             }
-            state
+            *state
                 .chunks
-                .get_mut(&segment.chunk_ordinal())
-                .expect("validated prepared chunk remains installed")
-                .live_segments -= 1;
+                .live_segments_mut(&segment.chunk_ordinal())
+                .expect("validated prepared chunk remains installed") -= 1;
         }
         state.live_occupancy = next_occupancy;
         drop(state);
