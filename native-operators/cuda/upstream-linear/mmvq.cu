@@ -491,11 +491,34 @@ static __device__ __forceinline__ float iq4_xs_shared_weight_dot(
 }
 #endif
 
+#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
+// TEST-only output argument: the ordinary specialization keeps its original
+// float pointer, while the singleton epilogue explicitly owns all final-cast
+// inputs. No fusion fields or raw F32 pointer are repurposed.
+struct TestMmvqF16Output {
+    half * output;
+    const uint32_t * row_flags;
+    const uint32_t * weight_flag;
+    uint32_t stride;
+};
+template <bool Direct>
+using TestMmvqOutputArgument = typename std::conditional<Direct, TestMmvqF16Output, float *>::type;
+#endif
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
-          bool halve_iters = false, bool shared_weight_decode = false>
+          bool halve_iters = false, bool shared_weight_decode = false
+#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
+          , bool direct_f16_output = false
+#endif
+          >
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
-        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
+        TestMmvqOutputArgument<direct_f16_output> dst_ptr,
+#else
+        float * dst_ptr,
+#endif
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
@@ -504,7 +527,16 @@ static __global__ void mul_mat_vec_q(
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
+    float * GGML_CUDA_RESTRICT dst = nullptr;
+    if constexpr (!direct_f16_output) dst = dst_ptr;
+    static_assert(!direct_f16_output || (ncols_dst == 1 && !has_fusion &&
+        !halve_iters && !shared_weight_decode &&
+        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS)),
+        "direct-half epilogue is a singleton three-format MarkerV2 test");
+#else
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+#endif
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -741,6 +773,9 @@ static __global__ void mul_mat_vec_q(
         return;
     }
 
+#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
+    if constexpr (!direct_f16_output)
+#endif
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     // sum up partial sums and write back result
@@ -796,7 +831,24 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
+                if constexpr (direct_f16_output) {
+                    // The same fully reduced F32 result and MarkerV2 rule as
+                    // marker_cast. The existing entry dependency sync precedes
+                    // every flag read, and there is no early completion trigger:
+                    // the successor cannot overwrite shared row flags before
+                    // this epilogue completes. Logical N still bounds stores;
+                    // the caller's output stride is not an output-column limit.
+                    const half rounded = __float2half_rn(result);
+                    const bool bad = *dst_ptr.weight_flag || dst_ptr.row_flags[j] ||
+                        !marker_finite(result) || !marker_half_finite(rounded);
+                    dst_ptr.output[j*dst_ptr.stride + row0 + i] =
+                        bad ? __ushort_as_half(0x7e00) : rounded;
+                } else
+#endif
+                {
+                    dst[j*stride_col_dst + i] = result;
+                }
             }
         }
     }

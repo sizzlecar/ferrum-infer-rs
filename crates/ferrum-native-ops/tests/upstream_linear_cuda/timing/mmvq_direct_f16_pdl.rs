@@ -2,6 +2,10 @@
 //! Model-derived projection counts, synthetic weights, no whole-model claim.
 use super::*;
 
+#[cfg(feature = "cuda-upstream-mmvq-f16-output-pdl-tests")]
+#[path = "mmvq_direct_f16_pdl/f16_output.rs"]
+mod f16_output;
+
 unsafe extern "C" {
     fn ferrum_test_mmvq_direct_pdl_support_v1(
         p: *const UpstreamLinearPlanV1,
