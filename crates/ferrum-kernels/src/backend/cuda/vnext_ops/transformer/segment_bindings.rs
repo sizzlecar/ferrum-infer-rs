@@ -14,6 +14,12 @@ use ferrum_interfaces::vnext::{
 };
 use std::sync::Arc;
 
+mod physical;
+pub(crate) use physical::encode_program as encode_physical_program;
+pub(in crate::backend::cuda::vnext_ops) use physical::{
+    sequence_window as physical_program_window, shared_region as shared_physical_program_region,
+};
+
 #[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) struct ValidationRecipe {
     pub state: Arc<WeightValidation>,

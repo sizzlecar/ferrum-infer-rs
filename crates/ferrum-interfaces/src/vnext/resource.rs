@@ -57,6 +57,7 @@ mod program_binding;
 pub use program_binding::*;
 mod dynamic_pool;
 pub use dynamic_pool::*;
+mod chunk_directory;
 mod maintenance_boundary;
 pub use maintenance_boundary::*;
 mod lane_stable_arena;
@@ -64,7 +65,11 @@ use lane_stable_arena::*;
 mod dynamic_pool_set;
 pub use dynamic_pool_set::DynamicPoolGrowthBatchReceipt;
 use dynamic_pool_set::DynamicPoolSet;
+mod physical_binding_table;
 mod segment_permit;
+pub use physical_binding_table::{
+    SequencePhysicalBindingRegion, SequencePhysicalBindingRow, SequencePhysicalBindingTable,
+};
 pub use segment_permit::{
     SegmentBackingBatch, SegmentBackingExpectation, SegmentBackingRequest, SegmentBackingResource,
     SegmentBackingWindow, SegmentBackingWindowView, SegmentLogicalSizeRule, SegmentPhysicalRegion,

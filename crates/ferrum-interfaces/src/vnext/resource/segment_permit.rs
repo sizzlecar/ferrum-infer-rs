@@ -37,7 +37,7 @@ struct CheckedSequenceGroup<B> {
 }
 
 pub(crate) struct SegmentBackingGroup<'a, B> {
-    authorities: &'a [LogicalBackingSliceAuthority],
+    pub(super) authorities: &'a [LogicalBackingSliceAuthority],
     physical: Option<&'a SequencePhysicalGroup<B>>,
 }
 

@@ -115,6 +115,7 @@ fn compare_resident_programs(kind: AttentionKind, segment_strategy: InvocationPr
     let mut previous_frames: [Vec<Option<ExecutionFrameId>>; 2] = [vec![None; 4], vec![None; 4]];
     let mut published = [false; 2];
     let mut hot = [false; 2];
+    let mut physical_tables_seen = false;
     let mut returned_hits = 0;
     for (wave, width) in widths.into_iter().enumerate() {
         let ranges: Vec<_> = frontiers[..width].iter().map(|p| *p..*p + 1).collect();
@@ -151,6 +152,14 @@ fn compare_resident_programs(kind: AttentionKind, segment_strategy: InvocationPr
                 ._composition
                 ._runtime
                 .segment_binding_indexed_encodes();
+            let physical_before = fixture
+                ._composition
+                ._runtime
+                .physical_segment_binding_encodes();
+            let tables_before = fixture
+                ._composition
+                ._runtime
+                .sequence_physical_binding_tables_compiled();
             let uploads_before = compiled.then(|| {
                 fixture
                     ._composition
@@ -184,6 +193,38 @@ fn compare_resident_programs(kind: AttentionKind, segment_strategy: InvocationPr
                 },
                 "each compiled hit must execute the indexed binding encoder"
             );
+            assert_eq!(
+                fixture
+                    ._composition
+                    ._runtime
+                    .physical_segment_binding_encodes()
+                    - physical_before,
+                if compiled && arm == 1 {
+                    stats.segment_hits
+                } else {
+                    0
+                },
+                "compiled hits must consume physical tables, including the KV growth wave"
+            );
+            if compiled && arm == 1 && stats.segment_hits > 0 {
+                let tables_created = fixture
+                    ._composition
+                    ._runtime
+                    .sequence_physical_binding_tables_compiled()
+                    - tables_before;
+                if !physical_tables_seen || (kind == AttentionKind::Causal && wave == 11) {
+                    assert!(
+                        tables_created > 0,
+                        "new physical backing needs its own table"
+                    );
+                } else {
+                    assert_eq!(
+                        tables_created, 0,
+                        "logical growth must reuse the physical table"
+                    );
+                }
+                physical_tables_seen = true;
+            }
             let program = observation.reusable_program_id.as_ref().unwrap();
             assert_eq!(program.immediate_sequences(), width as u32);
             assert_eq!(program.immediate_pages(), 0);
@@ -296,6 +337,7 @@ fn compare_resident_programs(kind: AttentionKind, segment_strategy: InvocationPr
             .collect::<Vec<_>>()
     });
     let mut fresh_hits = 0;
+    let mut fresh_tables_seen = false;
     for position in 0..6 {
         let mut observations = Vec::new();
         for (arm, (fixture, group)) in fixtures.iter().zip(&fresh).enumerate() {
@@ -311,6 +353,14 @@ fn compare_resident_programs(kind: AttentionKind, segment_strategy: InvocationPr
                 ._composition
                 ._runtime
                 .segment_binding_indexed_encodes();
+            let physical_before = fixture
+                ._composition
+                ._runtime
+                .physical_segment_binding_encodes();
+            let tables_before = fixture
+                ._composition
+                ._runtime
+                .sequence_physical_binding_tables_compiled();
             let uploads_before = compiled.then(|| {
                 fixture
                     ._composition
@@ -347,6 +397,38 @@ fn compare_resident_programs(kind: AttentionKind, segment_strategy: InvocationPr
                 },
                 "fresh requests must use the compiled encoder with current authority"
             );
+            assert_eq!(
+                fixture
+                    ._composition
+                    ._runtime
+                    .physical_segment_binding_encodes()
+                    - physical_before,
+                if compiled && arm == 1 {
+                    stats.segment_hits
+                } else {
+                    0
+                },
+                "fresh requests must use their own physical tables and current authority"
+            );
+            if compiled && arm == 1 && stats.segment_hits > 0 {
+                let tables_created = fixture
+                    ._composition
+                    ._runtime
+                    .sequence_physical_binding_tables_compiled()
+                    - tables_before;
+                if fresh_tables_seen {
+                    assert_eq!(
+                        tables_created, 0,
+                        "unchanged fresh-request backing must reuse its table"
+                    );
+                } else {
+                    assert!(
+                        tables_created > 0,
+                        "new requests cannot reuse prior sequence tables"
+                    );
+                }
+                fresh_tables_seen = true;
+            }
             assert_eq!(stats.parts_materialized, 0);
             assert_eq!(
                 fixture

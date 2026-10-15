@@ -54,6 +54,9 @@ mod completed_boundary_tests;
 #[path = "segment_permit_tests.rs"]
 mod segment_permit_tests;
 
+#[path = "physical_binding_table_tests.rs"]
+mod physical_binding_table_tests;
+
 static NEXT_TEST_DEVICE: AtomicU64 = AtomicU64::new(1);
 const DYNAMIC_POOL_CONCURRENT_WORKERS: usize = 1;
 const MAX_DYNAMIC_POOL_TEST_WORKERS: usize = 2;
@@ -127,6 +130,7 @@ struct TestRuntime {
     timing_queries: AtomicU64,
     submitted_timing_modes: Mutex<Vec<DeviceTimingMode>>,
     encoded_copy_regions: Mutex<Vec<CopyRegion>>,
+    physical_binding_tables_enabled: AtomicBool,
 }
 
 struct TestFence {
@@ -194,6 +198,7 @@ impl TestRuntime {
             timing_queries: AtomicU64::new(0),
             submitted_timing_modes: Mutex::new(Vec::new()),
             encoded_copy_regions: Mutex::new(Vec::new()),
+            physical_binding_tables_enabled: AtomicBool::new(false),
         }
     }
 
@@ -356,6 +361,29 @@ impl DeviceRuntime for TestRuntime {
             descriptor.size_bytes += 1;
         }
         descriptor
+    }
+
+    fn immutable_buffer_metadata<'a>(
+        &'a self,
+        buffer: &'a Self::Buffer,
+    ) -> Option<crate::vnext::ImmutableBufferMetadata<'a, Self>> {
+        self.physical_binding_tables_enabled
+            .load(Ordering::Relaxed)
+            .then(|| {
+                crate::vnext::ImmutableBufferMetadata::declare(self, buffer, &buffer.descriptor)
+            })
+    }
+
+    fn compile_sequence_physical_bindings(
+        &self,
+        table: &crate::vnext::SequencePhysicalBindingTable<Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        if !self.physical_binding_tables_enabled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            physical_binding_table_tests::TestPhysicalBackend::new(table),
+        )))
     }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {

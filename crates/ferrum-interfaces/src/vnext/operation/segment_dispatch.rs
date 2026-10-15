@@ -1,5 +1,6 @@
-//! Fresh whole-wave facts for a closed resident binding recipe. Nothing in this
-//! module caches a request, frame, dynamic buffer, or dependency authority.
+//! Fresh whole-wave facts for a closed resident binding recipe. Supported
+//! runtimes may borrow independently retained Sequence physical facts; current
+//! windows, participants and dependency authority are always issued anew.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -62,7 +63,7 @@ fn checked_range(offset: u64, length: u64, bound: u64) -> Result<(), VNextError>
 
 /// Owner identities below are ephemeral dedup keys only. A fresh capability
 /// and the original getter must agree before the owner enters this table.
-fn validate_buffer<'a, R: DeviceRuntime>(
+pub(super) fn validate_buffer<'a, R: DeviceRuntime>(
     runtime: &R,
     buffer: &'a R::Buffer,
     expected: &'a BufferDescriptor,
@@ -760,6 +761,27 @@ where
         })
         .collect::<Result<Vec<_>, VNextError>>()?;
     let plan_views = wave.prepare_segment_plan_views(&plan_requests)?;
+
+    let authority_stage = if runtime.supports_physical_segment_bindings() {
+        drop(authority_stage);
+        if let Some(encoded) = super::physical_segment_dispatch::try_encode(
+            runtime,
+            resolved,
+            wave,
+            recipe,
+            program.as_ref(),
+            &plan_views,
+            timing_sink,
+        )? {
+            return Ok(Some(encoded));
+        }
+        SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::SegmentFreshAuthorityAndWindows,
+        )
+    } else {
+        authority_stage
+    };
 
     let snapshot_stage = SubmissionWaveDispatchStageTimer::start(
         timing_sink,

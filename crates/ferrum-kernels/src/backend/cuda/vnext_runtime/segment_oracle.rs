@@ -283,8 +283,8 @@ pub(super) fn compare_program(
         {
             return Err(mismatch());
         }
-        for (index, range) in node.ranges.iter().enumerate() {
-            let actual = projection.owners.region(range)?;
+        for index in 0..node.ranges.len() {
+            let actual = node.ranges.region(&projection.owners, index)?;
             let reference = patch.retention.region(index).ok_or_else(mismatch)?;
             // same_region includes allocation Arc, runtime, pointer/length,
             // type, address scope and exact opaque Core lease owners.

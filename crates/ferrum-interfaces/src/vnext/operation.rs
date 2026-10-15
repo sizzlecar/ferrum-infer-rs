@@ -23,9 +23,15 @@ pub use retained_dependency::{
     EncodedRetainedPlanDependency, RetainedPlanDependencyAuthority, RetainedPlanDependencyIdentity,
     RetainedPlanDependencySpec,
 };
+mod physical_segment;
+mod physical_segment_dispatch;
 mod segment_binding;
 pub(crate) mod segment_compile;
 mod segment_dispatch;
+pub use physical_segment::{
+    PhysicalSegmentPhysicalRegion, PhysicalSegmentRegionView, PreparedPhysicalSegmentNodeView,
+    PreparedPhysicalSegmentWave,
+};
 mod segment_oracle;
 pub use segment_binding::{
     EncodedSegmentBindingNode, EncodedSegmentBindingProgram, PreparedSegmentBindingFrame,

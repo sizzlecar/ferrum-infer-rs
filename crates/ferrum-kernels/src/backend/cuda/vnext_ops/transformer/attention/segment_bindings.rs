@@ -63,6 +63,73 @@ pub(in crate::backend::cuda::vnext_ops) fn write_program(
     sink.end_node(ranges, None).map_err(|e| e.to_string())
 }
 
+pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
+    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    recipe: &GatedDeltaRecipe,
+    owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
+    sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
+) -> Result<(), String> {
+    if node.participant_count() != recipe.participants || recipe.participants == 0 {
+        return Err("segment recurrent participant shape differs from cold geometry".into());
+    }
+    let destination = segment::shared_physical_program_region(node, 2)?;
+    let layout = StateBindingLayout::new(recipe.participants)?;
+    sink.begin_node(
+        "vnext_gated_delta_recurrent_attention_bindings",
+        node.program_binding()
+            .ok_or("segment recurrent binding slot is absent")?
+            .clone(),
+        destination,
+        u32::try_from(recipe.participants).map_err(|_| "segment participant count exceeds u32")?,
+        node.work_shape().immediate_tokens(),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut ranges = Vec::with_capacity(recipe.participants.saturating_mul(2));
+    for participant in 0..recipe.participants {
+        let conv = segment::physical_program_window(
+            node,
+            participant,
+            0,
+            recipe.conv_bytes,
+            ElementType::F16,
+            None,
+            owners,
+        )?;
+        let delta = segment::physical_program_window(
+            node,
+            participant,
+            1,
+            recipe.delta_bytes,
+            ElementType::F32,
+            None,
+            owners,
+        )?;
+        let conv_view = owners.region(&conv, 0).map_err(|e| e.to_string())?;
+        let delta_view = owners.region(&delta, 0).map_err(|e| e.to_string())?;
+        if conv_view.element_type() != ElementType::F16
+            || conv_view.length_bytes() != recipe.conv_bytes
+            || delta_view.element_type() != ElementType::F32
+            || delta_view.length_bytes() != recipe.delta_bytes
+        {
+            return Err("segment recurrent state differs from admitted geometry".into());
+        }
+        sink.write(
+            layout.offset(participant)?,
+            STATE_BINDING_SLOT_BYTES as usize,
+            |payload| {
+                payload.extend_from_slice(&conv_view.device_ptr().to_le_bytes());
+                payload.extend_from_slice(&delta_view.device_ptr().to_le_bytes());
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        ranges.push(conv);
+        ranges.push(delta);
+    }
+    sink.end_physical_node(ranges, None)
+        .map_err(|e| e.to_string())
+}
+
 pub(super) fn declare(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     validations: Vec<ValidationRecipe>,

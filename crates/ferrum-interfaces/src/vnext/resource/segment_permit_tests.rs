@@ -540,7 +540,7 @@ fn segment_permit_returns_current_arc_and_retains_it_after_unlock() {
     close_dynamic_test_root(donor.root);
 }
 
-fn sequence_catalog_permit_fixture(
+pub(super) fn sequence_catalog_permit_fixture(
     suffix: &str,
 ) -> (
     Harness,
