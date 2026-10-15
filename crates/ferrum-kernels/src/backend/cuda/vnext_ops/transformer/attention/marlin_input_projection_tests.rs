@@ -7,7 +7,7 @@ use crate::marlin_repack::{
     repack_compressed_tensors_zero_points_to_marlin, repack_gptq_to_marlin,
     repack_scales_to_marlin,
 };
-use cudarc::driver::{sys, CudaContext};
+use cudarc::driver::{sys, CudaContext, CudaSlice, DevicePtr};
 use half::f16;
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -18,6 +18,95 @@ const EPSILON: f32 = 1.0e-6;
 // Existing independent CT launcher sanity bound, from transformer/marlin_tests.rs.
 // It is not an A/B equivalence allowance: that requires every output half bit.
 const EXISTING_CT_REFERENCE_RELATIVE_L2_LIMIT: f64 = 0.05;
+const CUBLAS_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
+const CUBLAS_WORKSPACE_ALIGNMENT: usize = 256;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Comparison {
+    MergeQkvZ,
+    ExplicitBlasWorkspace,
+}
+
+impl Comparison {
+    fn name(self) -> &'static str {
+        match self {
+            Self::MergeQkvZ => "split_vs_merged_qkv_z",
+            Self::ExplicitBlasWorkspace => "split_default_vs_explicit_cublas_workspace",
+        }
+    }
+}
+
+struct BlasWorkspace {
+    storage: CudaSlice<u8>,
+    pointer: u64,
+}
+
+impl BlasWorkspace {
+    fn new(stream: &Arc<CudaStream>) -> Self {
+        let values = vec![0xa5_u8; CUBLAS_WORKSPACE_BYTES + 2 * CUBLAS_WORKSPACE_ALIGNMENT];
+        let storage = stream.clone_htod(&values).unwrap();
+        let pointer = storage.device_ptr(stream).0 + CUBLAS_WORKSPACE_ALIGNMENT as u64;
+        assert_eq!(pointer % CUBLAS_WORKSPACE_ALIGNMENT as u64, 0);
+        // The user workspace is initialized and ready before any capture.
+        stream.synchronize().unwrap();
+        Self { storage, pointer }
+    }
+
+    fn check_guards(&self, stream: &Arc<CudaStream>) {
+        stream.synchronize().unwrap();
+        let values = stream.clone_dtoh(&self.storage).unwrap();
+        assert!(values[..CUBLAS_WORKSPACE_ALIGNMENT]
+            .iter()
+            .all(|&x| x == 0xa5));
+        assert!(
+            values[CUBLAS_WORKSPACE_ALIGNMENT + CUBLAS_WORKSPACE_BYTES..]
+                .iter()
+                .all(|&x| x == 0xa5)
+        );
+    }
+}
+
+struct BlasArms {
+    // Handles are destroyed before the workspace. Graphs and the drain below
+    // are declared after this owner and therefore retire before either field.
+    handles: [Arc<CudaBlas>; 2],
+    workspace: Option<BlasWorkspace>,
+}
+
+impl BlasArms {
+    fn new(stream: &Arc<CudaStream>, comparison: Comparison) -> Self {
+        let baseline = Arc::new(CudaBlas::new(Arc::clone(stream)).unwrap());
+        if comparison == Comparison::MergeQkvZ {
+            return Self {
+                handles: [Arc::clone(&baseline), baseline],
+                workspace: None,
+            };
+        }
+        let explicit = Arc::new(CudaBlas::new(Arc::clone(stream)).unwrap());
+        let workspace = BlasWorkspace::new(stream);
+        unsafe {
+            use cudarc::cublas::sys as blas_sys;
+            // SetStream resets a user workspace. Bind it first, then set the
+            // workspace once; neither handle's stream changes during this test.
+            assert_eq!(
+                blas_sys::cublasSetStream_v2(*explicit.handle(), stream.cu_stream().cast()),
+                blas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+            );
+            assert_eq!(
+                blas_sys::cublasSetWorkspace_v2(
+                    *explicit.handle(),
+                    workspace.pointer as *mut std::ffi::c_void,
+                    CUBLAS_WORKSPACE_BYTES,
+                ),
+                blas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+            );
+        }
+        Self {
+            handles: [baseline, explicit],
+            workspace: Some(workspace),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Geometry {
@@ -650,10 +739,18 @@ fn measure(stream: &Arc<CudaStream>, graph: &Graph) -> Value {
         "gpu_ns":f64::from(start.elapsed_ms(&end).unwrap())*1e6})
 }
 
-fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -> bool {
+fn run_case(
+    context: &Arc<CudaContext>,
+    g: Geometry,
+    sets: usize,
+    timed: bool,
+    comparison: Comparison,
+) -> bool {
     let setup = Instant::now();
     let stream = context.new_stream().unwrap();
-    let blas = CudaBlas::new(Arc::clone(&stream)).unwrap();
+    let blas_setup = Instant::now();
+    let blas = BlasArms::new(&stream, comparison);
+    let blas_setup_ns = blas_setup.elapsed().as_nanos();
     let runtime = MarlinProjectionRuntime {
         multiprocessor_count: context
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
@@ -690,14 +787,23 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
     }
     let arms: [Vec<Arm>; 2] = std::array::from_fn(|arm| {
         (0..sets)
-            .map(|set| Arm::new(&stream, runtime, g, &sources[set], &packed[set], arm == 1))
+            .map(|set| {
+                Arm::new(
+                    &stream,
+                    runtime,
+                    g,
+                    &sources[set],
+                    &packed[set],
+                    comparison == Comparison::MergeQkvZ && arm == 1,
+                )
+            })
             .collect()
     });
     // Declared after all raw-pointer owners so an unwind drains before freeing them.
     let _drain = Drain(Arc::clone(&stream));
-    for arm in &arms {
+    for (index, arm) in arms.iter().enumerate() {
         for set in arm {
-            set.enqueue(&stream, &blas, runtime, &functions, g);
+            set.enqueue(&stream, &blas.handles[index], runtime, &functions, g);
         }
     }
     stream.synchronize().unwrap();
@@ -706,21 +812,43 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
     let graphs: [Graph; 2] = std::array::from_fn(|arm| {
         Graph::new(&stream, || {
             for set in &arms[arm] {
-                set.enqueue(&stream, &blas, runtime, &functions, g);
+                set.enqueue(&stream, &blas.handles[arm], runtime, &functions, g);
             }
         })
     });
     println!(
         "{}",
-        json!({"kind":"gdn_input_setup","name":g.name,"m":g.rows,"k":g.k,
+        json!({"kind":"gdn_input_setup","name":g.name,"comparison":comparison.name(),"m":g.rows,"k":g.k,
         "quant_widths":[g.qkv,g.z],"dense_widths":[g.ba,g.ba],"output_width":g.output_width(),
         "physical_sets_per_arm":sets,"quant_weight_bytes_per_arm":packed.iter().map(|p|p[2].bytes()).sum::<usize>(),
         "dense_weight_bytes_per_arm":sets*2*g.ba*g.k*2,"l2_bytes":context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE).unwrap(),
         "working_set_scope":"independent physical arms; distinct scale/zero/dense contents per rotating set; not proof of DRAM coldness",
         "repack_ns":repack_ns,"allocation_repack_eager_setup_ns":allocation_repack_eager_setup_ns,
-        "capture_upload_ns":capture.elapsed().as_nanos(),"graph_node_types_A":graphs[0].inventory,
+        "capture_upload_ns":capture.elapsed().as_nanos(),"cublas_setup_ns":blas_setup_ns,
+        "explicit_workspace_bytes_B":if blas.workspace.is_some() {CUBLAS_WORKSPACE_BYTES} else {0},
+        "explicit_workspace_alignment_B":if blas.workspace.is_some() {CUBLAS_WORKSPACE_ALIGNMENT} else {0},
+        "independent_cublas_handles":comparison==Comparison::ExplicitBlasWorkspace,
+        "graph_node_types_A":graphs[0].inventory,
         "graph_node_types_B":graphs[1].inventory,"atomic_add":false,"fp32_reduce":false})
     );
+    if comparison == Comparison::ExplicitBlasWorkspace {
+        for kind in [
+            "CU_GRAPH_NODE_TYPE_MEM_ALLOC",
+            "CU_GRAPH_NODE_TYPE_MEM_FREE",
+        ] {
+            assert_eq!(
+                graphs[1].inventory.get(kind).copied().unwrap_or(0),
+                0,
+                "explicit workspace must remove captured cuBLAS memory nodes"
+            );
+            if timed {
+                assert!(
+                    graphs[0].inventory.get(kind).copied().unwrap_or(0) > 0,
+                    "the M32 baseline must exercise captured cuBLAS memory nodes"
+                );
+            }
+        }
+    }
     let mut exact = true;
     let mut previous: [Vec<Observation>; 2] = std::array::from_fn(|_| Vec::new());
     for generation in 0..2 {
@@ -737,7 +865,7 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
             arms[arm]
                 .iter()
                 .map(|set| {
-                    set.enqueue(&stream, &blas, runtime, &functions, g);
+                    set.enqueue(&stream, &blas.handles[arm], runtime, &functions, g);
                     set.observe(&stream, g)
                 })
                 .collect()
@@ -763,6 +891,20 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
                     &eager[arm][set].normalized,
                     "graph vs eager normalized",
                 );
+                if comparison == Comparison::ExplicitBlasWorkspace {
+                    assert_bits(
+                        &observed[arm][set].projection,
+                        &eager[arm][set].projection,
+                        "graph vs eager complete quantized intermediates",
+                    );
+                    for part in 0..2 {
+                        assert_bits(
+                            &observed[arm][set].dense[part],
+                            &eager[arm][set].dense[part],
+                            "graph vs eager complete dense intermediates",
+                        );
+                    }
+                }
                 if generation > 0 {
                     assert!(
                         observed[arm][set]
@@ -779,24 +921,35 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
                 &observed[1][set].normalized,
                 "unchanged RMS between arms",
             );
-            for part in 0..2 {
-                assert_bits(
-                    &observed[0][set].dense[part],
-                    &observed[1][set].dense[part],
-                    "unchanged b/a between arms",
-                );
+            if comparison == Comparison::MergeQkvZ {
+                for part in 0..2 {
+                    assert_bits(
+                        &observed[0][set].dense[part],
+                        &observed[1][set].dense[part],
+                        "unchanged b/a between arms",
+                    );
+                }
             }
+            let dense: Vec<_> = (0..2)
+                .map(|part| {
+                    difference(&observed[0][set].dense[part], &observed[1][set].dense[part])
+                })
+                .collect();
             let projection = difference(&observed[0][set].projection, &observed[1][set].projection);
             let output = difference(&observed[0][set].output, &observed[1][set].output);
-            let equivalent = output["exact_bits"].as_bool().unwrap();
+            let equivalent = output["exact_bits"].as_bool().unwrap()
+                && projection["exact_bits"].as_bool().unwrap()
+                && dense
+                    .iter()
+                    .all(|part| part["exact_bits"].as_bool().unwrap());
             exact &= equivalent;
             let oracles: Vec<_> = (0..2)
                 .map(|arm| oracle(g, &sources[set], &inputs[set], &observed[arm][set], !timed))
                 .collect();
             println!(
                 "{}",
-                json!({"kind":"gdn_input_correctness","name":g.name,"generation":generation,
-                "physical_set":set,"projection":projection,"packed_output":output,"independent_oracles":oracles,
+                json!({"kind":"gdn_input_correctness","name":g.name,"comparison":comparison.name(),"generation":generation,
+                "physical_set":set,"projection":projection,"dense":dense,"packed_output":output,"independent_oracles":oracles,
                 "product_equivalent":equivalent,"matched_eager_full_bits":true,
                 "full_stitch_bits":true,"fresh_observable":generation>0})
             );
@@ -817,7 +970,7 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
             }
             println!(
                 "{}",
-                json!({"kind":"gdn_input_pair","name":g.name,"pair":pair,
+                json!({"kind":"gdn_input_pair","name":g.name,"comparison":comparison.name(),"pair":pair,
             "order":if order[0]==0 {"AB"} else {"BA"},"groups_per_graph":sets,
             "A":result[0],"B":result[1],"product_equivalent":exact,
             "scope":"RMSNorm + all Marlin resets/projections + two F16 b/a GEMMs + all stitches; block wall includes event record/wait; uploads/oracles/cold setup excluded"})
@@ -832,6 +985,25 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
                 &previous[arm][set].output,
                 "post-timing repeat full bits",
             );
+            if comparison == Comparison::ExplicitBlasWorkspace {
+                assert_bits(
+                    &final_state.normalized,
+                    &previous[arm][set].normalized,
+                    "post-timing normalized bits",
+                );
+                assert_bits(
+                    &final_state.projection,
+                    &previous[arm][set].projection,
+                    "post-timing quantized intermediate bits",
+                );
+                for part in 0..2 {
+                    assert_bits(
+                        &final_state.dense[part],
+                        &previous[arm][set].dense[part],
+                        "post-timing dense intermediate bits",
+                    );
+                }
+            }
             assert_bits(
                 &arms[arm][set].input.read(&stream),
                 &sources[set].input(1),
@@ -839,9 +1011,12 @@ fn run_case(context: &Arc<CudaContext>, g: Geometry, sets: usize, timed: bool) -
             );
         }
     }
+    if let Some(workspace) = &blas.workspace {
+        workspace.check_guards(&stream);
+    }
     println!(
         "{}",
-        json!({"kind":"gdn_input_result","name":g.name,"product_equivalent":exact,
+        json!({"kind":"gdn_input_result","name":g.name,"comparison":comparison.name(),"product_equivalent":exact,
         "scope":"synthetic complete input-projection diagnostic, not model quality or serving performance"})
     );
     exact
@@ -873,6 +1048,7 @@ fn marlin_ct_gdn_input_projection_complete_transaction_pairs() {
         },
         1,
         false,
+        Comparison::MergeQkvZ,
     );
     let real = run_case(
         &context,
@@ -886,10 +1062,68 @@ fn marlin_ct_gdn_input_projection_complete_transaction_pairs() {
         },
         PHYSICAL_SETS,
         true,
+        Comparison::MergeQkvZ,
     );
     println!(
         "{}",
         json!({"kind":"gdn_input_diagnostic_complete","product_equivalent":small&&real,
         "not_product_qualification":true})
+    );
+}
+
+#[test]
+#[ignore = "requires actual CUDA and pinned Marlin; diagnostic explicit cuBLAS workspace comparison"]
+fn marlin_ct_gdn_input_projection_explicit_cublas_workspace_pairs() {
+    println!(
+        "{}",
+        json!({"kind":"gdn_input_workspace_contract",
+        "comparison":Comparison::ExplicitBlasWorkspace.name(),
+        "A":"split QKV/Z with default cuBLAS workspace",
+        "B":"same split QKV/Z with independent handle and owned 4MiB aligned workspace",
+        "workspace_bytes":CUBLAS_WORKSPACE_BYTES,"workspace_alignment":CUBLAS_WORKSPACE_ALIGNMENT,
+        "stream_order":"set stream before binding workspace; no subsequent SetStream",
+        "product_equivalence":"all normalized, quantized, dense and stitched F16 bits; no numerical allowance",
+        "pairs":PAIRS,"cold_costs_separate":true,"hidden_and_output":"F16",
+        "native":"unchanged U4 asymmetric group32, atomic=false, fp32_reduce=false, automatic tiles",
+        "limitation":"production graph memory-node inventory is not yet established; observed production GraphLaunch wall largely overlaps GPU execution and is not a recoverable throughput budget",
+        "excluded":"Core dispatch, prepare/conv/recurrent/state, serving, checkpoint quality"})
+    );
+    let context = CudaContext::new(0).expect("cuBLAS workspace probe requires CUDA");
+    let small = run_case(
+        &context,
+        Geometry {
+            name: "small-unequal-full-oracle",
+            rows: 3,
+            k: 128,
+            qkv: 128,
+            z: 64,
+            ba: 7,
+        },
+        1,
+        false,
+        Comparison::ExplicitBlasWorkspace,
+    );
+    let real = run_case(
+        &context,
+        Geometry {
+            name: "ct-m32-gdn-input",
+            rows: 32,
+            k: 5120,
+            qkv: 10240,
+            z: 6144,
+            ba: 48,
+        },
+        PHYSICAL_SETS,
+        true,
+        Comparison::ExplicitBlasWorkspace,
+    );
+    println!(
+        "{}",
+        json!({"kind":"gdn_input_workspace_diagnostic_complete","product_equivalent":small&&real,
+        "not_product_qualification":true})
+    );
+    assert!(
+        small && real,
+        "explicit cuBLAS workspace changed complete transaction bits"
     );
 }
