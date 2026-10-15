@@ -130,7 +130,7 @@ struct CopySpan {
 pub(super) struct ResidentTemplate {
     nodes: Vec<ResidentNode>,
     dependencies: Vec<(u32, Vec<DependencyTemplate>)>,
-    owners: segment_owners::CudaPhysicalOwnerTable,
+    owners: Arc<segment_owners::CudaPhysicalOwnerTable>,
     controls: Vec<ControlPatch>,
     packet: Box<[u8]>,
     copies: Arc<Vec<CopySpan>>,
@@ -325,7 +325,7 @@ pub(super) fn encode(
             patch_controls(&mut packet, *offset, *values)?;
         }
     }
-    let owners = template.owners.authorize(permit.owner_retentions())?;
+    let owners = template.owners.authorize(permit.owner_frame())?;
     let mut projection_nodes = Vec::with_capacity(template.nodes.len());
     for stored in &template.nodes {
         let mut node = stored.node.clone();

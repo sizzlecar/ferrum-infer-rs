@@ -28,7 +28,7 @@ mod segment_binding;
 pub(crate) mod segment_compile;
 mod segment_dispatch;
 mod segment_oracle;
-pub use resident_segment::FreshResidentSegmentPermit;
+pub use resident_segment::{FreshResidentSegmentPermit, ResidentSegmentOwnerFrame};
 pub use segment_binding::{
     EncodedSegmentBindingNode, EncodedSegmentBindingProgram, PreparedSegmentBindingFrame,
     PreparedSegmentBindingNode, PreparedSegmentBindingNodeView, PreparedSegmentBindingPatch,

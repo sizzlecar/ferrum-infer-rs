@@ -1,7 +1,9 @@
 //! Submission-local ownership for fresh segment ranges. Indices never identify
 //! an owner outside the current core patch, and a table never grants a range.
 use super::*;
-use ferrum_interfaces::vnext::{SegmentBindingOwnerIndex, SegmentBindingOwnerView};
+use ferrum_interfaces::vnext::{
+    ResidentSegmentOwnerFrame, SegmentBindingOwnerIndex, SegmentBindingOwnerView,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct CudaRegionView<'a> {
@@ -125,7 +127,15 @@ impl CudaSegmentRange {
 }
 
 pub(crate) struct CudaSegmentOwnerTable {
-    owners: Vec<Option<CudaSegmentOwner>>,
+    owners: CudaSegmentOwners,
+}
+
+enum CudaSegmentOwners {
+    Indexed(Vec<Option<CudaSegmentOwner>>),
+    Resident {
+        physical: Arc<CudaPhysicalOwnerTable>,
+        fresh: Arc<ResidentSegmentOwnerFrame>,
+    },
 }
 
 pub(super) struct CudaPhysicalOwnerTable {
@@ -134,41 +144,31 @@ pub(super) struct CudaPhysicalOwnerTable {
 
 impl CudaPhysicalOwnerTable {
     pub(super) fn authorize(
-        &self,
-        retentions: &[DeviceBufferRetention],
+        self: &Arc<Self>,
+        fresh: &Arc<ResidentSegmentOwnerFrame>,
     ) -> Result<Arc<CudaSegmentOwnerTable>, CudaDeviceRuntimeError> {
-        if self.owners.len() != retentions.len() {
+        if self.owners.len() != fresh.retentions().len() {
             return Err(CudaDeviceRuntimeError::contract(
                 "resident owner count changed",
             ));
         }
         Ok(Arc::new(CudaSegmentOwnerTable {
-            owners: self
-                .owners
-                .iter()
-                .zip(retentions)
-                .map(|(owner, retention)| {
-                    owner
-                        .as_ref()
-                        .map(
-                            |(allocation, runtime_instance, element_type)| CudaSegmentOwner {
-                                allocation: Arc::clone(allocation),
-                                retention: retention.clone(),
-                                runtime_instance: *runtime_instance,
-                                element_type: *element_type,
-                            },
-                        )
-                })
-                .collect(),
+            owners: CudaSegmentOwners::Resident {
+                physical: Arc::clone(self),
+                fresh: Arc::clone(fresh),
+            },
         }))
     }
 }
 
 impl CudaSegmentOwnerTable {
-    pub(super) fn physical_template(&self) -> CudaPhysicalOwnerTable {
-        CudaPhysicalOwnerTable {
-            owners: self
-                .owners
+    pub(super) fn physical_template(&self) -> Arc<CudaPhysicalOwnerTable> {
+        let owners = match &self.owners {
+            CudaSegmentOwners::Indexed(owners) => owners,
+            CudaSegmentOwners::Resident { physical, .. } => return Arc::clone(physical),
+        };
+        Arc::new(CudaPhysicalOwnerTable {
+            owners: owners
                 .iter()
                 .map(|owner| {
                     owner.as_ref().map(|owner| {
@@ -180,30 +180,51 @@ impl CudaSegmentOwnerTable {
                     })
                 })
                 .collect(),
-        }
+        })
     }
     pub(crate) fn region(
         &self,
         range: &CudaSegmentRange,
     ) -> Result<CudaRegionView<'_>, CudaDeviceRuntimeError> {
-        let owner = self
-            .owners
-            .get(range.owner_index)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| CudaDeviceRuntimeError::contract("segment range owner is absent"))?;
-        let device_ptr = owner
-            .allocation
+        let absent = || CudaDeviceRuntimeError::contract("segment range owner is absent");
+        let (allocation, retention, runtime_instance, element_type) = match &self.owners {
+            CudaSegmentOwners::Indexed(owners) => {
+                let owner = owners
+                    .get(range.owner_index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(absent)?;
+                (
+                    &owner.allocation,
+                    &owner.retention,
+                    owner.runtime_instance,
+                    owner.element_type,
+                )
+            }
+            CudaSegmentOwners::Resident { physical, fresh } => {
+                let (allocation, runtime_instance, element_type) = physical
+                    .owners
+                    .get(range.owner_index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(absent)?;
+                let retention = fresh
+                    .retentions()
+                    .get(range.owner_index)
+                    .ok_or_else(absent)?;
+                (allocation, retention, *runtime_instance, *element_type)
+            }
+        };
+        let device_ptr = allocation
             .aligned_ptr
             .checked_add(range.byte_offset)
             .ok_or_else(|| CudaDeviceRuntimeError::contract("segment range address overflows"))?;
         Ok(CudaRegionView {
-            allocation: &owner.allocation,
-            retention: Some(&owner.retention),
-            runtime_instance: owner.runtime_instance,
+            allocation,
+            retention: Some(retention),
+            runtime_instance,
             device_ptr,
             length_bytes: range.length_bytes,
-            element_type: owner.element_type,
-            reusable_address_scope: owner.retention.reusable_address_scope(),
+            element_type,
+            reusable_address_scope: retention.reusable_address_scope(),
         })
     }
 }
@@ -218,7 +239,9 @@ impl<'a> CudaSegmentOwnerBuilder<'a> {
         let owners = (0..sources.len()).map(|_| None).collect();
         Self {
             sources,
-            table: CudaSegmentOwnerTable { owners },
+            table: CudaSegmentOwnerTable {
+                owners: CudaSegmentOwners::Indexed(owners),
+            },
         }
     }
 
@@ -239,9 +262,12 @@ impl<'a> CudaSegmentOwnerBuilder<'a> {
             ));
         }
         let view = buffer.borrowed_region(parent.clone(), retention)?;
-        let slot = self
-            .table
-            .owners
+        let CudaSegmentOwners::Indexed(owners) = &mut self.table.owners else {
+            return Err(CudaDeviceRuntimeError::contract(
+                "segment owner builder has a resident table",
+            ));
+        };
+        let slot = owners
             .get_mut(index.get())
             .ok_or_else(|| CudaDeviceRuntimeError::contract("segment owner slot is absent"))?;
         if slot.is_none() {

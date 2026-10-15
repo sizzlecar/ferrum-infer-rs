@@ -13,12 +13,24 @@ use crate::vnext::resource::{
 };
 use crate::vnext::*;
 
+/// Current owners for one validated wave, shared through its submitted work.
+/// A cold physical template must never retain this frame as later authority.
+pub struct ResidentSegmentOwnerFrame {
+    retentions: Box<[DeviceBufferRetention]>,
+}
+
+impl ResidentSegmentOwnerFrame {
+    pub fn retentions(&self) -> &[DeviceBufferRetention] {
+        &self.retentions
+    }
+}
+
 /// Non-cloneable, freshly checked permission for one complete segment. The
 /// runtime may retain the owners, but cannot manufacture another wave's permit.
 pub struct FreshResidentSegmentPermit<'w> {
     work_shape: &'w BatchWorkShape,
     retention: DeviceBufferRetention,
-    owner_retentions: Vec<DeviceBufferRetention>,
+    owner_frame: Arc<ResidentSegmentOwnerFrame>,
     program_bindings: Vec<Option<ProgramBindingNodeBinding>>,
     dependencies: Vec<Vec<Option<RetainedPlanDependencyAuthority>>>,
     batch_taken: bool,
@@ -33,7 +45,10 @@ impl FreshResidentSegmentPermit<'_> {
         &self.retention
     }
     pub fn owner_retentions(&self) -> &[DeviceBufferRetention] {
-        &self.owner_retentions
+        self.owner_frame.retentions()
+    }
+    pub fn owner_frame(&self) -> &Arc<ResidentSegmentOwnerFrame> {
+        &self.owner_frame
     }
     pub fn resource_view_bytes(&self) -> &[u64] {
         &self.resource_view_bytes
@@ -272,9 +287,12 @@ pub(super) fn try_encode<'w, R: DeviceRuntime, S: SubmissionWaveDispatchTimingSi
         .map(|view| view.retention.clone())
         .collect::<Vec<_>>();
     owner_retentions.extend(dynamic_owners);
+    let owner_frame = Arc::new(ResidentSegmentOwnerFrame {
+        retentions: owner_retentions.into_boxed_slice(),
+    });
     let retention = DeviceBufferRetention::lane_pair(
         wave.execution_lane_id(),
-        Arc::new(owner_retentions.clone()),
+        Arc::clone(&owner_frame),
         Arc::clone(&scope),
     );
     // prepare_segment_plan_views proved every participant uses the same exact
@@ -308,7 +326,7 @@ pub(super) fn try_encode<'w, R: DeviceRuntime, S: SubmissionWaveDispatchTimingSi
             .ok_or_else(|| invalid_operation("resident wave is empty"))?
             .work_shape(),
         retention,
-        owner_retentions,
+        owner_frame,
         program_bindings: recipe
             .nodes
             .iter()
