@@ -491,34 +491,25 @@ static __device__ __forceinline__ float iq4_xs_shared_weight_dot(
 }
 #endif
 
-#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
-// TEST-only output argument: the ordinary specialization keeps its original
+// The ordinary specialization keeps its original
 // float pointer, while the singleton epilogue explicitly owns all final-cast
 // inputs. No fusion fields or raw F32 pointer are repurposed.
-struct TestMmvqF16Output {
+struct MmvqF16Output {
     half * output;
     const uint32_t * row_flags;
     const uint32_t * weight_flag;
     uint32_t stride;
 };
 template <bool Direct>
-using TestMmvqOutputArgument = typename std::conditional<Direct, TestMmvqF16Output, float *>::type;
-#endif
+using MmvqOutputArgument = typename std::conditional<Direct, MmvqF16Output, float *>::type;
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
-          bool halve_iters = false, bool shared_weight_decode = false
-#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
-          , bool direct_f16_output = false
-#endif
-          >
+          bool halve_iters = false, bool shared_weight_decode = false,
+          bool direct_f16_output = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
-#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
-        TestMmvqOutputArgument<direct_f16_output> dst_ptr,
-#else
-        float * dst_ptr,
-#endif
+        MmvqOutputArgument<direct_f16_output> dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
@@ -527,16 +518,12 @@ static __global__ void mul_mat_vec_q(
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
     float * GGML_CUDA_RESTRICT dst = nullptr;
     if constexpr (!direct_f16_output) dst = dst_ptr;
     static_assert(!direct_f16_output || (ncols_dst == 1 && !has_fusion &&
         !halve_iters && !shared_weight_decode &&
         (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS)),
-        "direct-half epilogue is a singleton three-format MarkerV2 test");
-#else
-    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-#endif
+        "direct-half epilogue requires singleton three-format MarkerV2");
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -773,9 +760,7 @@ static __global__ void mul_mat_vec_q(
         return;
     }
 
-#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
     if constexpr (!direct_f16_output)
-#endif
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     // sum up partial sums and write back result
@@ -831,7 +816,6 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-#if defined(FERRUM_TEST_MMVQ_F16_OUTPUT)
                 if constexpr (direct_f16_output) {
                     // The same fully reduced F32 result and MarkerV2 rule as
                     // marker_cast. The existing entry dependency sync precedes
@@ -845,7 +829,6 @@ static __global__ void mul_mat_vec_q(
                     dst_ptr.output[j*dst_ptr.stride + row0 + i] =
                         bad ? __ushort_as_half(0x7e00) : rounded;
                 } else
-#endif
                 {
                     dst[j*stride_col_dst + i] = result;
                 }
@@ -865,11 +848,9 @@ static __global__ void mul_mat_vec_q(
 static __device__ __forceinline__ float mmvq_pack_load(const float * x, int64_t index) {
     return x[index];
 }
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
 static __device__ __forceinline__ float mmvq_pack_load(const half * x, int64_t index) {
     return __half2float(x[index]);
 }
-#endif
 
 // Exact ordinary row-major Q8_1 pack; differs from MMQ D4/DS4.
 // Changing the input loader must not change the reduction or MarkerV2 order.
@@ -943,7 +924,6 @@ static __global__ void quantize_q8_1(
     quantize_q8_1_body<Marker>(x_ptr, vy_ptr, ne00, s01, s02, s03, ne0, ne1, ne2, row_flags);
 }
 
-#if defined(FERRUM_TEST_DIRECT_F16_PACK)
 static __global__ void quantize_q8_1_f16_direct(
         const half * input, void * packed, int64_t inputs, int64_t input_stride,
         int64_t padded_inputs, uint32_t rows, uint3 channels, uint32_t * row_flags) {
@@ -951,7 +931,6 @@ static __global__ void quantize_q8_1_f16_direct(
         int64_t(rows)*input_stride, int64_t(rows)*input_stride,
         padded_inputs, rows, channels, row_flags);
 }
-#endif
 
 // Private ABI1. layout0=Columns(M columns, one channel), layout1=Channels
 // (one column, M channels sharing W). Both compute the same dense logical GEMM.
@@ -1642,6 +1621,148 @@ extern "C" int ferrum_upstream_mmvq_pdl_cast_v2(const FerrumUpstreamLinearPlanV1
             dim3((n.rows*n.outputs+255)/256),dim3(256),static_cast<cudaStream_t>(s),
             static_cast<const float *>(input),static_cast<half *>(output),n.rows,n.outputs,stride,
             static_cast<const uint32_t *>(rows),static_cast<const uint32_t *>(weights));
+#else
+        return -2;
+#endif
+    });
+}
+
+// Additive M1 MarkerV2 capability: clear -> direct F16/Q8_1 pack ->
+// fully reduced dot with final F16 marker epilogue. The old plan and launch
+// entrypoints remain available for unsupported hardware or other widths.
+static bool upstream_mmvq_m1_f16_pdl_valid(const FerrumUpstreamLinearPlanV1 * p,
+        TestMmvqPlan & n) {
+    return upstream_mmvq_pdl_valid(p,n) && n.rows == 1 && n.ncols == 1 &&
+        n.channels == 1 && n.layout == 0;
+}
+
+template <ggml_type T, bool Small>
+static const void * upstream_mmvq_m1_f16_pdl_kernel() {
+    return reinterpret_cast<const void *>(mul_mat_vec_q<T,1,false,Small,false,false,true>);
+}
+
+template <ggml_type T>
+static const void * upstream_mmvq_m1_f16_pdl_kernel(const TestMmvqPlan & n) {
+    return n.small_k ? upstream_mmvq_m1_f16_pdl_kernel<T,true>()
+                     : upstream_mmvq_m1_f16_pdl_kernel<T,false>();
+}
+
+static const void * upstream_mmvq_m1_f16_pdl_kernel(const TestMmvqPlan & n) {
+    switch (n.format) {
+        case GGML_TYPE_Q4_K: return upstream_mmvq_m1_f16_pdl_kernel<GGML_TYPE_Q4_K>(n);
+        case GGML_TYPE_Q5_K: return upstream_mmvq_m1_f16_pdl_kernel<GGML_TYPE_Q5_K>(n);
+        case GGML_TYPE_IQ4_XS: return upstream_mmvq_m1_f16_pdl_kernel<GGML_TYPE_IQ4_XS>(n);
+        default: return nullptr;
+    }
+}
+
+extern "C" int ferrum_upstream_mmvq_m1_f16_pdl_support_v1(
+        const FerrumUpstreamLinearPlanV1 * p, uint32_t * supported) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        if (!supported) return -1;
+        *supported = 0;
+        TestMmvqPlan n{};
+        if (!upstream_mmvq_m1_f16_pdl_valid(p,n)) return -1;
+        const auto device_status = ferrum_upstream_verify_device(p->request);
+        if (device_status) return device_status;
+#if defined(GGML_CUDA_USE_PDL) && CUDART_VERSION >= 12030
+        if (n.cc < GGML_CUDA_CC_HOPPER) return 0;
+        const void * kernels[] = {
+            reinterpret_cast<const void *>(upstream_mmvq_pdl_clear),
+            reinterpret_cast<const void *>(quantize_q8_1_f16_direct),
+            upstream_mmvq_m1_f16_pdl_kernel(n),
+        };
+        bool available = true;
+        for (const auto kernel : kernels) {
+            if (!kernel) return -2;
+            cudaFuncAttributes attributes{};
+            const auto status = cudaFuncGetAttributes(&attributes,kernel);
+            if (status != cudaSuccess) return status;
+            available &= attributes.ptxVersion >= 90;
+        }
+        *supported = available;
+#endif
+        return 0;
+    });
+}
+
+extern "C" int ferrum_upstream_mmvq_m1_f16_pdl_pack_v1(
+        const FerrumUpstreamLinearPlanV1 * p, const void * input, uint32_t stride,
+        void * packed, void * flags, void * s) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmvqPlan n{};
+        if (!upstream_mmvq_m1_f16_pdl_valid(p,n)) return -1;
+        if (!input || !packed || !flags || stride < n.inputs ||
+                uint64_t(stride)*n.rows > INT_MAX || uintptr_t(input)%2 ||
+                uintptr_t(packed)%4 || uintptr_t(flags)%4) return -5;
+#if defined(GGML_CUDA_USE_PDL)
+        if (n.cc < GGML_CUDA_CC_HOPPER) return -2;
+        const auto stream = static_cast<cudaStream_t>(s);
+        auto status = upstream_mmvq_launch_pdl(upstream_mmvq_pdl_clear,
+            dim3(1),dim3(128),stream,static_cast<uint32_t *>(flags),n.rows);
+        if (status != cudaSuccess) return status;
+        const dim3 grid((n.padded_inputs+CUDA_QUANTIZE_BLOCK_SIZE-1)/CUDA_QUANTIZE_BLOCK_SIZE,n.rows,1);
+        return upstream_mmvq_launch_pdl(quantize_q8_1_f16_direct,grid,
+            dim3(CUDA_QUANTIZE_BLOCK_SIZE),stream,static_cast<const half *>(input),
+            packed,int64_t(n.inputs),int64_t(stride),int64_t(n.padded_inputs),
+            n.rows,init_fastdiv_values(1),static_cast<uint32_t *>(flags));
+#else
+        return -2;
+#endif
+    });
+}
+
+#if defined(GGML_CUDA_USE_PDL)
+template <ggml_type T, bool Small>
+static int upstream_mmvq_m1_f16_pdl_launch(const TestMmvqPlan & n,
+        const void * weights, const void * packed, MmvqF16Output output,
+        cudaStream_t stream) {
+    const dim3 grid(n.padded_outputs/n.rows_per_block,n.channels,1), block(32,n.nwarps,1);
+    const auto one = init_fastdiv_values(1);
+    const uint32_t qstride = n.padded_inputs/32;
+    ggml_cuda_mm_fusion_args_device fusion{};
+    // Original M1 geometry and reduction. N is the logical store bound,
+    // independent of output.stride. Implicit completion protects shared flags.
+    return upstream_mmvq_launch_pdl(mul_mat_vec_q<T,1,false,Small,false,false,true>,
+        grid,block,stream,weights,packed,static_cast<const int32_t *>(nullptr),
+        fusion,output,n.inputs,make_uint3(0,0,0),n.inputs/256,qstride,n.outputs,
+        init_fastdiv_values(n.channels),n.padded_outputs*(n.inputs/256),
+        n.rows*qstride,n.rows*n.outputs,one,n.padded_outputs*(n.inputs/256),
+        n.rows*qstride,n.rows*n.outputs,uint32_t(0));
+}
+
+template <ggml_type T>
+static int upstream_mmvq_m1_f16_pdl_launch(const TestMmvqPlan & n,
+        const void * weights, const void * packed, MmvqF16Output output,
+        cudaStream_t stream) {
+    return n.small_k ? upstream_mmvq_m1_f16_pdl_launch<T,true>(n,weights,packed,output,stream)
+                     : upstream_mmvq_m1_f16_pdl_launch<T,false>(n,weights,packed,output,stream);
+}
+#endif
+
+extern "C" int ferrum_upstream_mmvq_m1_f16_pdl_dot_v1(
+        const FerrumUpstreamLinearPlanV1 * p, const void * weights,
+        const void * packed, void * output, uint32_t output_stride,
+        const void * row_flags, const void * weight_flag, void * s) noexcept {
+    return ferrum_upstream_boundary([&]() -> int {
+        TestMmvqPlan n{};
+        if (!upstream_mmvq_m1_f16_pdl_valid(p,n)) return -1;
+        if (!weights || !packed || !output || !row_flags || !weight_flag ||
+                output_stride < n.outputs || uint64_t(output_stride)*n.rows > INT_MAX ||
+                uintptr_t(weights)%4 || uintptr_t(packed)%4 || uintptr_t(output)%2 ||
+                uintptr_t(row_flags)%4 || uintptr_t(weight_flag)%4) return -5;
+#if defined(GGML_CUDA_USE_PDL)
+        if (n.cc < GGML_CUDA_CC_HOPPER) return -2;
+        const MmvqF16Output destination{static_cast<half *>(output),
+            static_cast<const uint32_t *>(row_flags),
+            static_cast<const uint32_t *>(weight_flag),output_stride};
+        const auto stream = static_cast<cudaStream_t>(s);
+        switch (n.format) {
+            case GGML_TYPE_Q4_K: return upstream_mmvq_m1_f16_pdl_launch<GGML_TYPE_Q4_K>(n,weights,packed,destination,stream);
+            case GGML_TYPE_Q5_K: return upstream_mmvq_m1_f16_pdl_launch<GGML_TYPE_Q5_K>(n,weights,packed,destination,stream);
+            case GGML_TYPE_IQ4_XS: return upstream_mmvq_m1_f16_pdl_launch<GGML_TYPE_IQ4_XS>(n,weights,packed,destination,stream);
+            default: return -1;
+        }
 #else
         return -2;
 #endif

@@ -30,23 +30,9 @@ extern "C" int ferrum_test_mmvq_direct_pdl_pack_v1(
         if (!input || !converted || !packed || !flags || stride<n.inputs ||
                 uint64_t(stride)*n.rows>INT_MAX || uintptr_t(input)%2 ||
                 uintptr_t(converted)%16 || uintptr_t(packed)%4 || uintptr_t(flags)%4) return -5;
-#if defined(GGML_CUDA_USE_PDL)
-        if (n.cc < GGML_CUDA_CC_HOPPER) return -2;
-        const auto stream = static_cast<cudaStream_t>(s);
-        auto status = upstream_mmvq_launch_pdl(upstream_mmvq_pdl_clear,
-            dim3(1),dim3(128),stream,static_cast<uint32_t *>(flags),n.rows);
-        if (status != cudaSuccess) return status;
-        const dim3 grid((n.padded_inputs+CUDA_QUANTIZE_BLOCK_SIZE-1)/CUDA_QUANTIZE_BLOCK_SIZE,n.rows,1);
-        // Same half loader, reductions, Q8 bytes/scales and MarkerV2 body as
-        // the existing direct-F16 experiment. LC/sync are inside that body.
-        // Converted is deliberately untouched; clear remains a separate kernel.
-        return upstream_mmvq_launch_pdl(quantize_q8_1_f16_direct,grid,
-            dim3(CUDA_QUANTIZE_BLOCK_SIZE),stream,static_cast<const half *>(input),
-            packed,int64_t(n.inputs),int64_t(stride),int64_t(n.padded_inputs),
-            n.rows,init_fastdiv_values(1),static_cast<uint32_t *>(flags));
-#else
-        return -2;
-#endif
+        // Retain this TEST ABI's converted-scratch validation and non-write
+        // guarantee; the actual pack is shared with the normal capability.
+        return ferrum_upstream_mmvq_m1_f16_pdl_pack_v1(p,input,stride,packed,flags,s);
     });
 }
 

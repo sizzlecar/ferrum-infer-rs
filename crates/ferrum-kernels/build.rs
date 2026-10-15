@@ -722,6 +722,21 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
         {
             println!("cargo:rustc-cfg=ferrum_native_mmvq_pdl");
         }
+        if resolved.manifest.operator == "ferrum.cuda.upstream_linear"
+            && resolved.manifest.operator_abi_version == "1"
+            && resolved.manifest.linkage == NativeOperatorLinkage::Static
+            && ferrum_native_ops::upstream_linear::UPSTREAM_MMVQ_M1_F16_PDL_EXPORTS
+                .iter()
+                .all(|required| {
+                    resolved
+                        .manifest
+                        .exports
+                        .iter()
+                        .any(|export| export.as_str() == *required)
+                })
+        {
+            println!("cargo:rustc-cfg=ferrum_native_mmvq_m1_f16_pdl");
+        }
         inventory.push(serde_json::json!({
             "schema_version": resolved.manifest.schema_version,
             "operator": resolved.manifest.operator,
@@ -1222,6 +1237,7 @@ sha256={} import_dir={}",
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(ferrum_native_mmvq_pdl)");
+    println!("cargo:rustc-check-cfg=cfg(ferrum_native_mmvq_m1_f16_pdl)");
     initialize_cuda_build_summary_receipt();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support/host.rs");

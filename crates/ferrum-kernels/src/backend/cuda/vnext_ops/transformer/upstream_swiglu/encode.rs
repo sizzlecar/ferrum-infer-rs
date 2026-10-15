@@ -265,7 +265,10 @@ pub(super) fn encode(
             if let Some(native) = &leaf.stage.native {
                 let p = native.geometry();
                 let (pack_kernels, pack_transfers) = native.pack_work_counts();
-                dispatches = add(dispatches, pack_kernels + 2 + u64::from(p.fixup != 0))?;
+                dispatches = add(
+                    dispatches,
+                    pack_kernels + native.output_work_count() + u64::from(p.fixup != 0),
+                )?;
                 transfers = add(transfers, pack_transfers)?;
             } else {
                 dispatches = add(dispatches, 1 + u64::from(leaf.part.transform.is_some()))?;

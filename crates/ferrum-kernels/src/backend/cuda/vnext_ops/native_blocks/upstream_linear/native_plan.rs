@@ -84,6 +84,42 @@ impl PreparedProjectionNative {
         }
     }
 
+    pub fn with_automatic_mmvq_boundary(self) -> Result<Self, Error> {
+        match self {
+            Self::Upstream(plan) => plan.with_automatic_mmvq_boundary().map(Self::Upstream),
+            Self::Q6F16(_) => Ok(self),
+        }
+    }
+    pub fn mmvq_boundary_kind(&self) -> crate::native_ops::upstream_linear::MmvqBoundaryKind {
+        match self {
+            Self::Upstream(plan) => plan.mmvq_boundary_kind(),
+            Self::Q6F16(_) => crate::native_ops::upstream_linear::MmvqBoundaryKind::F32Scratch,
+        }
+    }
+    pub fn output_work_count(&self) -> u64 {
+        match self {
+            Self::Upstream(plan) => plan.output_work_count(),
+            Self::Q6F16(_) => 2,
+        }
+    }
+    pub unsafe fn dot_f16(
+        &self,
+        weights: DeviceSpan,
+        packed: DeviceSpan,
+        output: DeviceSpan,
+        stride: u32,
+        rows: DeviceSpan,
+        flag: DeviceSpan,
+        stream: *mut c_void,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Upstream(plan) => unsafe {
+                plan.dot_f16(weights, packed, output, stride, rows, flag, stream)
+            },
+            Self::Q6F16(_) => Err(Error::InvalidArgument),
+        }
+    }
+
     pub fn with_q4_mmvq_weight_decode(
         self,
         mode: ferrum_types::Q4MmvqWeightDecode,

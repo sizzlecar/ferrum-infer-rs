@@ -18,6 +18,7 @@ pub use ferrum_native_ops::upstream_linear::{
 };
 use std::ffi::c_void;
 mod pdl;
+pub use ferrum_native_ops::upstream_linear::UpstreamMmvqBoundaryKind as MmvqBoundaryKind;
 pub use pdl::MmvqLaunchKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +140,7 @@ pub struct PreparedUpstreamLinear {
     q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
     mmvq_launch: MmvqLaunchKind,
+    mmvq_boundary: MmvqBoundaryKind,
 }
 impl PreparedUpstreamLinear {
     pub fn new(
@@ -178,6 +180,7 @@ impl PreparedUpstreamLinear {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
+                mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             })
         }
     }
@@ -218,6 +221,7 @@ impl PreparedUpstreamLinear {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
+                mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             })
         }
     }
@@ -257,6 +261,7 @@ impl PreparedUpstreamLinear {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
+                mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             })
         }
     }
@@ -270,6 +275,9 @@ impl PreparedUpstreamLinear {
     /// The linked archive capability is captured during cold preparation. Older
     /// archives and every other route retain their existing work accounting.
     pub fn pack_work_counts(&self) -> (u64, u64) {
+        if self.mmvq_boundary == MmvqBoundaryKind::DirectF16 {
+            return (2, 0);
+        }
         if self.mmvq_launch == MmvqLaunchKind::Programmatic {
             return (3, 0);
         }
@@ -322,6 +330,7 @@ impl PreparedUpstreamLinear {
         }
         self.q4_weight_decode = mode;
         self.mmvq_launch = MmvqLaunchKind::Ordered;
+        self.mmvq_boundary = MmvqBoundaryKind::F32Scratch;
         Ok(self)
     }
     pub fn q4_mmvq_weight_decode(&self) -> ferrum_types::Q4MmvqWeightDecode {
@@ -370,6 +379,7 @@ impl PreparedUpstreamLinear {
         }
         self.q5_weight_decode = mode;
         self.mmvq_launch = MmvqLaunchKind::Ordered;
+        self.mmvq_boundary = MmvqBoundaryKind::F32Scratch;
         Ok(self)
     }
     pub fn q5_mmvq_weight_decode(&self) -> ferrum_types::Q5MmvqWeightDecode {
@@ -379,10 +389,31 @@ impl PreparedUpstreamLinear {
     /// selected. Missing artifact capability or unsupported CC/PTX stays ordered.
     pub fn with_automatic_mmvq_launch(mut self) -> Result<Self, Error> {
         self.mmvq_launch = pdl::qualify(&self)?;
+        self.mmvq_boundary = MmvqBoundaryKind::F32Scratch;
         Ok(self)
     }
     pub fn mmvq_launch_kind(&self) -> MmvqLaunchKind {
         self.mmvq_launch
+    }
+    /// Cold selection after the ordinary/shared dot choice. Unsupported or old
+    /// archives retain their existing complete boundary.
+    pub fn with_automatic_mmvq_boundary(mut self) -> Result<Self, Error> {
+        self.mmvq_boundary = pdl::qualify_boundary(&self)?;
+        if self.mmvq_boundary == MmvqBoundaryKind::DirectF16 {
+            self.mmvq_launch = MmvqLaunchKind::Programmatic;
+        }
+        Ok(self)
+    }
+    pub fn mmvq_boundary_kind(&self) -> MmvqBoundaryKind {
+        self.mmvq_boundary
+    }
+    /// Dot plus output conversion; stream-K fixup is accounted separately.
+    pub fn output_work_count(&self) -> u64 {
+        if self.mmvq_boundary == MmvqBoundaryKind::DirectF16 {
+            1
+        } else {
+            2
+        }
     }
     pub fn q5_shared_weight_decode_eligible(&self) -> bool {
         self.shared_weight_decode_geometry(Format::Q5K, 8)
@@ -443,6 +474,14 @@ impl PreparedUpstreamLinear {
         distinct(&[input, converted, packed, row_poison])?;
         #[cfg(feature = "cuda-upstream-linear")]
         {
+            #[cfg(ferrum_native_mmvq_m1_f16_pdl)]
+            if self.mmvq_boundary == MmvqBoundaryKind::DirectF16 {
+                return Error::from_status(unsafe {
+                    ffi::ferrum_upstream_mmvq_m1_f16_pdl_pack_v1(
+                        &self.raw, x, stride, q, poison, stream,
+                    )
+                });
+            }
             #[cfg(ferrum_native_mmvq_pdl)]
             if self.mmvq_launch == MmvqLaunchKind::Programmatic {
                 return Error::from_status(unsafe {
@@ -478,6 +517,9 @@ impl PreparedUpstreamLinear {
         fixup: DeviceSpan,
         stream: *mut c_void,
     ) -> Result<(), Error> {
+        if self.mmvq_boundary == MmvqBoundaryKind::DirectF16 {
+            return Err(Error::InvalidArgument);
+        }
         let w = weights.checked(self.raw.weight_bytes, 4)?;
         let q = packed.checked(self.raw.packed_bytes, 16)?;
         let o = output.checked(self.raw.output_bytes, 4)?;
@@ -541,6 +583,44 @@ impl PreparedUpstreamLinear {
             Err(Error::Unavailable)
         }
     }
+    /// Enqueue the selected fused F16 dot/MarkerV2 output boundary.
+    /// # Safety
+    /// Packed input and row flags come from this invocation; the retained weight
+    /// flag belongs to these exact weights. All disjoint spans outlive completion.
+    pub unsafe fn dot_f16(
+        &self,
+        weights: DeviceSpan,
+        packed: DeviceSpan,
+        output: DeviceSpan,
+        stride: u32,
+        row_poison: DeviceSpan,
+        weight_poison: DeviceSpan,
+        stream: *mut c_void,
+    ) -> Result<(), Error> {
+        if self.mmvq_boundary != MmvqBoundaryKind::DirectF16 {
+            return Err(Error::InvalidArgument);
+        }
+        let r = &self.raw.request;
+        let w = weights.checked(self.raw.weight_bytes, 4)?;
+        let q = packed.checked(self.raw.packed_bytes, 16)?;
+        let o = output.checked(strided_bytes(r.rows, r.outputs, stride, 2)?, 2)?;
+        let rp = row_poison.checked(self.row_poison_bytes(), 16)?;
+        let wp = weight_poison.checked(4, 4)?;
+        distinct(&[weights, packed, output, row_poison, weight_poison])?;
+        #[cfg(all(feature = "cuda-upstream-linear", ferrum_native_mmvq_m1_f16_pdl))]
+        {
+            Error::from_status(unsafe {
+                ffi::ferrum_upstream_mmvq_m1_f16_pdl_dot_v1(
+                    &self.raw, w, q, o, stride, rp, wp, stream,
+                )
+            })
+        }
+        #[cfg(not(all(feature = "cuda-upstream-linear", ferrum_native_mmvq_m1_f16_pdl)))]
+        {
+            let _ = (w, q, o, rp, wp, stream);
+            Err(Error::Unavailable)
+        }
+    }
     /// # Safety
     /// MarkerV2 requires the real retained weight flag and row flags from this
     /// invocation, with same-stream ordering or explicit event dependencies.
@@ -554,6 +634,9 @@ impl PreparedUpstreamLinear {
         weight_poison: DeviceSpan,
         stream: *mut c_void,
     ) -> Result<(), Error> {
+        if self.mmvq_boundary == MmvqBoundaryKind::DirectF16 {
+            return Err(Error::InvalidArgument);
+        }
         let r = &self.raw.request;
         let i = input.checked(self.raw.output_bytes, 4)?;
         let o = output.checked(strided_bytes(r.rows, r.outputs, stride, 2)?, 2)?;
@@ -688,6 +771,7 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
+                mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             };
             assert_eq!(prepared.pack_work_counts(), expected,
                 "{family:?}/{arithmetic:?}/{algorithm:?}/M{rows}/capability{capability:?}/guard{guard}");
@@ -765,6 +849,7 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
+                mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             };
             assert_eq!(prepared.pack_work_counts(), expected,
                 "{family:?}/{arithmetic:?}/{algorithm:?}/M{rows}/capability{capability:?}/guard{guard}");
@@ -791,6 +876,7 @@ mod tests {
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             mmvq_launch: MmvqLaunchKind::Ordered,
+            mmvq_boundary: MmvqBoundaryKind::F32Scratch,
         };
         assert!(plan.q4_shared_weight_decode_eligible());
         let mutate = |f: fn(&mut PreparedUpstreamLinear)| {
@@ -839,6 +925,7 @@ mod tests {
             small_mmvq_pack: SmallMmvqPack::F32Memset,
             q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
             mmvq_launch: MmvqLaunchKind::Ordered,
+            mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
         };
         assert!(plan.q5_shared_weight_decode_eligible());
@@ -890,6 +977,7 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
+                mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             };
             assert!(plan.shared_weight_decode_geometry(format, 4));
             assert!(!plan.q4_shared_weight_decode_eligible());
@@ -997,6 +1085,7 @@ mod tests {
                 q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
                 q5_weight_decode: ferrum_types::Q5MmvqWeightDecode::Baseline,
                 mmvq_launch: MmvqLaunchKind::Ordered,
+                mmvq_boundary: MmvqBoundaryKind::F32Scratch,
             };
             assert_eq!(plan.operator(), family.operator());
         }

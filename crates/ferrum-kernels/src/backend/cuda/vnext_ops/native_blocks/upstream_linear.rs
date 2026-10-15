@@ -283,7 +283,9 @@ impl UpstreamPlanFactory {
         };
         let plan = plan
             .with_automatic_mmvq_launch()
-            .map_err(|error| format!("{error}; automatic MMVQ launch qualification"))?;
+            .map_err(|error| format!("{error}; automatic MMVQ launch qualification"))?
+            .with_automatic_mmvq_boundary()
+            .map_err(|error| format!("{error}; automatic MMVQ F16 boundary qualification"))?;
         let plan = Arc::new(plan);
         plans.insert(key, plan.clone());
         Ok(plan)
@@ -545,6 +547,7 @@ impl UpstreamPlanFactory {
                 plan.q4_mmvq_weight_decode().as_runtime_value().as_bytes(),
                 plan.q5_mmvq_weight_decode().as_runtime_value().as_bytes(),
                 plan.mmvq_launch_kind().as_runtime_value().as_bytes(),
+                plan.mmvq_boundary_kind().as_runtime_value().as_bytes(),
             ]),
             device_architecture: self.device.architecture,
             multiprocessors: self.device.multiprocessors,
@@ -661,6 +664,21 @@ impl PreparedUpstreamLeaf {
                     stream.cu_stream().cast(),
                 )
                 .map_err(|e| error(e.to_string()))?;
+            if native.mmvq_boundary_kind()
+                == crate::native_ops::upstream_linear::MmvqBoundaryKind::DirectF16
+            {
+                return native
+                    .dot_f16(
+                        weights,
+                        packed,
+                        output,
+                        output_stride,
+                        rows,
+                        retained_weight_flag,
+                        stream.cu_stream().cast(),
+                    )
+                    .map_err(|e| error(e.to_string()));
+            }
             native
                 .dot(weights, packed, temporary, fixup, stream.cu_stream().cast())
                 .map_err(|e| error(e.to_string()))?;

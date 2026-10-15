@@ -212,6 +212,13 @@ pub fn cuda_vnext_runtime_config(
             include_bytes!("vnext_ops/native_blocks/upstream_linear/weight_validation.rs")
                 .as_slice(),
             include_bytes!("../../native_ops/upstream_linear.rs").as_slice(),
+            include_bytes!("../../native_ops/upstream_linear/pdl.rs").as_slice(),
+            include_bytes!("../../native_ops/upstream_linear/ffi.rs").as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ferrum-native-ops/src/upstream_linear.rs"
+            ))
+            .as_slice(),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../ferrum-native-ops/src/upstream_extra_linear/prefill.rs"
