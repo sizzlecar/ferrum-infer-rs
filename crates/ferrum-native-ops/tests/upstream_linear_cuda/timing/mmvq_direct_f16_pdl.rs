@@ -178,9 +178,13 @@ impl Bank {
                 5 if i == 0 => 0xfc00,
                 6 if i == 0 => 0x7e01,
                 7 => 0x7bff,
-                _ => {
-                    f16::from_f32(((i * 17 + generation * 29) % 113) as f32 / 512.0 - 0.1).to_bits()
-                }
+                // A phase shift of periodic input can have the same dot and
+                // rounded output against these repeated synthetic weights.
+                // Use distinct exact half amplitudes instead. Every weight
+                // row has the same nonzero sum; generation 1 doubles the
+                // initial input, and later finite generations stay far below
+                // the separate overflow case. Keep the strong fresh check.
+                _ => f16::from_f32((generation + 1) as f32 / 128.0).to_bits(),
             };
         }
         words
@@ -357,13 +361,29 @@ fn boundary(stream: &Stream, format: UpstreamLinearFormat, k: usize, n: usize) {
         (9, 0),
     ] {
         b.set_input(generation, edge);
+        let eager_fresh = if edge == 0 {
+            b.enqueue(stream, 0, 0, &b.input, None);
+            stream.sync();
+            let expected = b.routes[0].validate(b.format, &b.host, b.copies);
+            assert!(
+                expected != initial,
+                "fresh fixture amplitudes collided before replay"
+            );
+            Some(expected)
+        } else {
+            None
+        };
         for g in &graphs {
             g.launch(stream);
         }
         stream.sync();
         let result = b.equal(edge <= 3);
         if edge == 0 {
-            assert_ne!(result, initial, "captured input stayed stale");
+            assert!(result != initial, "captured input stayed stale");
+            assert!(
+                Some(&result) == eager_fresh.as_ref(),
+                "fresh replay differs from matched eager output"
+            );
         }
         if (4..=6).contains(&edge) {
             assert_ne!(b.routes[1].rows.read::<u32>(1)[0], 0);
@@ -405,6 +425,13 @@ fn boundary(stream: &Stream, format: UpstreamLinearFormat, k: usize, n: usize) {
     });
     for generation in [12, 13] {
         second.write(&b.words(generation, 0));
+        b.enqueue(stream, 0, 0, &second, None);
+        stream.sync();
+        let expected_second = b.routes[0].validate(b.format, &b.host, b.copies);
+        assert!(
+            expected_second != expected,
+            "scratch-hazard fixture amplitudes collided"
+        );
         for r in &b.routes {
             r.rows.write(&[u32::MAX]);
         }
@@ -413,7 +440,11 @@ fn boundary(stream: &Stream, format: UpstreamLinearFormat, k: usize, n: usize) {
         }
         stream.sync();
         let last = b.equal(true);
-        assert_ne!(last, expected);
+        assert!(last != expected, "second captured input stayed stale");
+        assert!(
+            last == expected_second,
+            "second replay differs from matched eager output"
+        );
         for retained in &first {
             let all = retained.read::<u16>(b.n + 7);
             assert_eq!(&all[3..3 + b.n], expected.as_slice());
@@ -546,15 +577,29 @@ fn mmvq_m1_direct_f16_pdl_preserves_bits_and_complete_ring_pairs() {
         );
     }
     let stable = banks.iter().map(|b| b.equal(true)).collect::<Vec<_>>();
-    for b in &banks {
+    let mut eager_fresh = Vec::with_capacity(banks.len());
+    for (b, old) in banks.iter().zip(&stable) {
         b.set_input(21, 0);
+        b.enqueue(&stream, 0, 0, &b.input, None);
+        stream.sync();
+        let expected = b.routes[0].validate(b.format, &b.host, b.copies);
+        assert!(
+            &expected != old,
+            "ring fixture amplitudes collided before replay"
+        );
+        eager_fresh.push(expected);
     }
     for g in &graphs {
         g.launch(&stream);
     }
     stream.sync();
-    for (b, old) in banks.iter().zip(stable) {
-        assert_ne!(b.equal(true), old);
+    for ((b, old), expected) in banks.iter().zip(stable).zip(eager_fresh) {
+        let fresh = b.equal(true);
+        assert!(fresh != old, "ring captured input stayed stale");
+        assert!(
+            fresh == expected,
+            "ring replay differs from matched eager output"
+        );
     }
     println!(
         "{}",
