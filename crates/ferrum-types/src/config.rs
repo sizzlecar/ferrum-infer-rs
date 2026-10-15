@@ -426,7 +426,7 @@ impl CausalDecodePreparationMode {
     }
 }
 
-/// Representation of freshly checked decode-segment binding owners. All
+/// Representation of freshly checked decode-segment binding owners. Both
 /// modes retain the same current-wave authorization and exact physical ranges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -434,8 +434,6 @@ pub enum SegmentBindingOwnerViewMode {
     #[default]
     Legacy,
     Indexed,
-    /// Reuse an installed physical template after fresh whole-segment authorization.
-    Resident,
 }
 
 impl SegmentBindingOwnerViewMode {
@@ -443,7 +441,6 @@ impl SegmentBindingOwnerViewMode {
         match self {
             Self::Legacy => "legacy",
             Self::Indexed => "indexed",
-            Self::Resident => "resident",
         }
     }
 
@@ -451,8 +448,7 @@ impl SegmentBindingOwnerViewMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "legacy" => Ok(Self::Legacy),
             "indexed" => Ok(Self::Indexed),
-            "resident" => Ok(Self::Resident),
-            _ => Err(format!("expected legacy, indexed or resident; got {raw:?}")),
+            _ => Err(format!("expected legacy or indexed; got {raw:?}")),
         }
     }
 
@@ -1894,7 +1890,6 @@ mod tests {
             for mode in [
                 SegmentBindingOwnerViewMode::Indexed,
                 SegmentBindingOwnerViewMode::Legacy,
-                SegmentBindingOwnerViewMode::Resident,
             ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
                     key,

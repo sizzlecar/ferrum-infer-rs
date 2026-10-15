@@ -57,7 +57,6 @@ impl ProgramBindingUploadStrategyArg {
 pub enum SegmentBindingOwnerViewModeArg {
     Legacy,
     Indexed,
-    Resident,
 }
 
 impl SegmentBindingOwnerViewModeArg {
@@ -65,9 +64,6 @@ impl SegmentBindingOwnerViewModeArg {
         match self {
             Self::Legacy => ferrum_types::SegmentBindingOwnerViewMode::Legacy.as_runtime_value(),
             Self::Indexed => ferrum_types::SegmentBindingOwnerViewMode::Indexed.as_runtime_value(),
-            Self::Resident => {
-                ferrum_types::SegmentBindingOwnerViewMode::Resident.as_runtime_value()
-            }
         }
     }
 }
@@ -332,7 +328,6 @@ mod tests {
             for (value, expected) in [
                 ("legacy", SegmentBindingOwnerViewModeArg::Legacy),
                 ("indexed", SegmentBindingOwnerViewModeArg::Indexed),
-                ("resident", SegmentBindingOwnerViewModeArg::Resident),
             ] {
                 let parsed = TestCli::try_parse_from([
                     "ferrum",

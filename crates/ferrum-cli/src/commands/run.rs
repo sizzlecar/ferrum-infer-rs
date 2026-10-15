@@ -876,15 +876,14 @@ pub struct RunCommand {
 
     /// Host invocation preparation policy for native plan runtimes (default: full).
     /// Decode segments require a CUDA plan runtime; decode-segment-program also
-    /// requires indexed or resident owner views and compact-scatter binding uploads.
+    /// requires indexed owner views and compact-scatter binding uploads.
     #[arg(long, value_enum)]
     pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
     /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
 
-    /// Fresh decode-segment owner views (default: legacy). Indexed requires a CUDA plan runtime;
-    /// resident also requires decode-segment-program preparation and compact-scatter uploads.
+    /// Fresh decode-segment owner views (default: legacy). Indexed requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub segment_binding_owner_view_mode: Option<crate::commands::SegmentBindingOwnerViewModeArg>,
 
@@ -3016,12 +3015,6 @@ mod tests {
                 Some(Mode::Legacy),
                 Some(Arg::Indexed),
                 Mode::Indexed,
-                Some(RuntimeConfigSource::Cli),
-            ),
-            (
-                Some(Mode::Indexed),
-                Some(Arg::Resident),
-                Mode::Resident,
                 Some(RuntimeConfigSource::Cli),
             ),
         ] {

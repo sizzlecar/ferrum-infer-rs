@@ -377,29 +377,6 @@ impl WeightValidation {
         )
     }
 
-    /// Cold resident template: keep no Plan lease or old wave authority. The
-    /// installed provider owns the validation state; fresh Core authorization
-    /// is required before the physical command can be submitted.
-    pub(in crate::backend::cuda::vnext_ops) fn resident_command(
-        self: &Arc<Self>,
-    ) -> Result<CudaDeviceCommand, CudaDeviceRuntimeError> {
-        let state = Arc::downgrade(self);
-        CudaDeviceCommand::conditional_dependency(
-            RETAINED_WEIGHT_VALIDATION_OPERATION,
-            vec![self.weights.physical_only(), self.flag.physical_only()],
-            move |stream, _regions| {
-                state
-                    .upgrade()
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "resident weight validation provider expired",
-                        )
-                    })?
-                    .enqueue(stream)
-            },
-        )
-    }
-
     fn enqueue(&self, stream: &CudaStream) -> Result<CudaDependencyWork, CudaDeviceRuntimeError> {
         let mut publication = self.publication.lock().map_err(|_| {
             CudaDeviceRuntimeError::contract("weight validation publication poisoned")

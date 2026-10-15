@@ -530,50 +530,6 @@ pub struct DeviceBufferRetention {
     reusable_address_scope: Option<DeviceReusableAddressScope>,
 }
 
-/// Non-authorizing identity. Weak control blocks prevent owner-address ABA
-/// without making a resident cache keep a Plan root or slot lease alive.
-pub(crate) struct DeviceBufferOwnerIdentity {
-    primary: std::sync::Weak<dyn Send + Sync + 'static>,
-    secondary: Option<std::sync::Weak<dyn Send + Sync + 'static>>,
-    scope: Option<DeviceReusableAddressScope>,
-}
-
-impl DeviceBufferOwnerIdentity {
-    pub(crate) fn matches(&self, current: &DeviceBufferRetention) -> bool {
-        self.primary
-            .ptr_eq(&Arc::downgrade(&current._primary_owner))
-            && match (&self.secondary, &current._secondary_owner) {
-                (None, None) => true,
-                (Some(old), Some(current)) => old.ptr_eq(&Arc::downgrade(current)),
-                _ => false,
-            }
-            && self.scope == current.reusable_address_scope
-    }
-}
-
-#[cfg(test)]
-mod resident_owner_identity_tests {
-    use super::*;
-
-    #[test]
-    fn resident_owner_identity_is_non_owning_and_rejects_replacement() {
-        let owner = Arc::new(17u64);
-        let retention = DeviceBufferRetention::plan(Arc::clone(&owner));
-        let identity = retention.owner_identity();
-        assert_eq!(Arc::strong_count(&owner), 2);
-        assert!(identity.matches(&retention));
-        assert!(identity.matches(&retention.clone()));
-        let foreign = DeviceBufferRetention::plan(Arc::new(17u64));
-        assert!(!identity.matches(&foreign));
-        drop(retention);
-        assert_eq!(Arc::strong_count(&owner), 1);
-        let weak = Arc::downgrade(&owner);
-        drop(owner);
-        assert!(weak.upgrade().is_none());
-        assert!(!identity.matches(&DeviceBufferRetention::plan(Arc::new(17u64))));
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceReusableAddressScope {
     Plan,
@@ -581,13 +537,6 @@ pub enum DeviceReusableAddressScope {
 }
 
 impl DeviceBufferRetention {
-    pub(crate) fn owner_identity(&self) -> DeviceBufferOwnerIdentity {
-        DeviceBufferOwnerIdentity {
-            primary: Arc::downgrade(&self._primary_owner),
-            secondary: self._secondary_owner.as_ref().map(Arc::downgrade),
-            scope: self.reusable_address_scope,
-        }
-    }
     /// Compares the exact retained owners without exposing or issuing ownership.
     /// Equal allocation addresses or descriptors do not establish this identity.
     pub fn same_owners(&self, other: &Self) -> bool {
@@ -3746,26 +3695,6 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         &self,
         _program: &(dyn std::any::Any + Send + Sync),
         _frame: &mut super::PreparedSegmentBindingFrame<'_, Self::Buffer>,
-    ) -> Result<Option<super::EncodedSegmentBindingProgram<Self::Command>>, Self::Error> {
-        Ok(None)
-    }
-
-    /// Cold physical template only. The backend may retain immutable allocation
-    /// identities and write rules, but not a prior wave's leases or authorities.
-    fn prepare_resident_segment_bindings(
-        &self,
-        _program: &(dyn std::any::Any + Send + Sync),
-        _frame: &super::PreparedSegmentBindingFrame<'_, Self::Buffer>,
-    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
-        Ok(None)
-    }
-
-    /// Consume facts authorized by one fresh pool observation. The cold
-    /// template cannot authorize any submission by itself.
-    fn encode_resident_segment_bindings(
-        &self,
-        _template: &(dyn std::any::Any + Send + Sync),
-        _permit: &mut super::FreshResidentSegmentPermit<'_>,
     ) -> Result<Option<super::EncodedSegmentBindingProgram<Self::Command>>, Self::Error> {
         Ok(None)
     }

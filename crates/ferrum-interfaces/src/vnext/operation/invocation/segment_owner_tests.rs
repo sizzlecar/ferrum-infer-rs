@@ -55,9 +55,7 @@ fn segment_owner_views_preserve_ordinary_ranges_order_and_exact_owners() {
             }
             match mode {
                 SegmentBindingOwnerViewMode::Legacy => assert_eq!(trace.segment_owner_count, 0),
-                SegmentBindingOwnerViewMode::Indexed | SegmentBindingOwnerViewMode::Resident => {
-                    assert!(trace.segment_owner_count > 0)
-                }
+                SegmentBindingOwnerViewMode::Indexed => assert!(trace.segment_owner_count > 0),
             }
             trace.segment_retained_owners.clear();
             drop(trace);

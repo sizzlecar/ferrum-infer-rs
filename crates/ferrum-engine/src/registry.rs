@@ -1159,12 +1159,12 @@ fn validate_invocation_preparation_strategy(
     if config.engine_config.runtime.invocation_preparation_strategy
         == ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram
         && (config.engine_config.runtime.segment_binding_owner_view_mode
-            == ferrum_types::SegmentBindingOwnerViewMode::Legacy
+            != ferrum_types::SegmentBindingOwnerViewMode::Indexed
             || config.engine_config.runtime.program_binding_upload_strategy
                 != ferrum_types::ProgramBindingUploadStrategy::CompactScatter)
     {
         return Err(FerrumError::unsupported(
-            "decode-segment-program requires indexed or resident owner views and compact-scatter uploads",
+            "decode-segment-program requires indexed owner views and compact-scatter uploads",
         ));
     }
     Ok(())
@@ -1191,7 +1191,7 @@ fn validate_segment_binding_owner_view_mode(
     plan_runtime: bool,
 ) -> Result<()> {
     if config.engine_config.runtime.segment_binding_owner_view_mode
-        != ferrum_types::SegmentBindingOwnerViewMode::Legacy
+        == ferrum_types::SegmentBindingOwnerViewMode::Indexed
         && (!matches!(config.device, Device::CUDA(_))
             || !plan_runtime
             || !config
@@ -1200,20 +1200,8 @@ fn validate_segment_binding_owner_view_mode(
                 .invocation_preparation_strategy
                 .uses_decode_segment())
     {
-        return Err(FerrumError::unsupported(format!(
-            "{} segment binding owner views require a CUDA plan runtime with decode-segment preparation",
-            config.engine_config.runtime.segment_binding_owner_view_mode.as_runtime_value()
-        )));
-    }
-    if config.engine_config.runtime.segment_binding_owner_view_mode
-        == ferrum_types::SegmentBindingOwnerViewMode::Resident
-        && (config.engine_config.runtime.invocation_preparation_strategy
-            != ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram
-            || config.engine_config.runtime.program_binding_upload_strategy
-                != ferrum_types::ProgramBindingUploadStrategy::CompactScatter)
-    {
         return Err(FerrumError::unsupported(
-            "resident segment binding owner views require decode-segment-program preparation and compact-scatter uploads",
+            "indexed segment binding owner views require a CUDA plan runtime with decode-segment preparation",
         ));
     }
     Ok(())
@@ -2263,16 +2251,6 @@ mod tests {
                             plan_runtime
                                 && matches!(config.device, Device::CUDA(_))
                                 && preparation.uses_decode_segment()
-                        );
-                        config.engine_config.runtime.segment_binding_owner_view_mode =
-                            SegmentBindingOwnerViewMode::Resident;
-                        assert_eq!(
-                            validate_segment_binding_owner_view_mode(&config, plan_runtime).is_ok(),
-                            plan_runtime
-                                && matches!(config.device, Device::CUDA(_))
-                                && preparation
-                                    == InvocationPreparationStrategy::DecodeSegmentProgram
-                                && upload == ProgramBindingUploadStrategy::CompactScatter
                         );
                     }
                 }

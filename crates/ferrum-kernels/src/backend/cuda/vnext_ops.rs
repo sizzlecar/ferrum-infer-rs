@@ -132,13 +132,6 @@ pub(crate) fn encode_compiled_segment_bindings(
     transformer::segment_bindings::encode_program(program, frame)
 }
 
-pub(crate) fn prepare_resident_segment_bindings(
-    program: &(dyn std::any::Any + Send + Sync),
-    frame: &ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
-) -> Result<super::vnext_runtime::resident_bindings::ResidentPreparation, CudaDeviceRuntimeError> {
-    transformer::segment_bindings::prepare_resident_program(program, frame)
-}
-
 /// Typed CUDA runtime input for the currently installed vNext provider bundle.
 pub fn cuda_vnext_runtime_config(
     ordinal: usize,
@@ -154,7 +147,6 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime/segment_oracle.rs").as_bytes(),
         include_str!("vnext_runtime/segment_oracle/packet.rs").as_bytes(),
         include_str!("vnext_runtime/segment_owners.rs").as_bytes(),
-        include_str!("vnext_runtime/resident_bindings.rs").as_bytes(),
         include_str!("../program_binding_rows.rs").as_bytes(),
         include_str!("../program_binding_upload.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),

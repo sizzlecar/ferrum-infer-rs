@@ -87,18 +87,6 @@ impl<C> EncodedRetainedPlanDependency<C> {
 }
 
 impl RetainedPlanDependencyAuthority {
-    pub(super) fn from_resident_identity(
-        identity: RetainedPlanDependencyIdentity,
-        scope: &Arc<()>,
-        plan_retention: &DeviceBufferRetention,
-    ) -> Self {
-        Self {
-            scope: Arc::clone(scope),
-            identity,
-            _source_retention: plan_retention.clone(),
-            _destination_retention: plan_retention.clone(),
-        }
-    }
     /// The command must implement only the declared immutable validation and
     /// publication/wait, never read activation/state or earlier wave outputs.
     pub fn encode<C>(self, command: C) -> EncodedRetainedPlanDependency<C> {

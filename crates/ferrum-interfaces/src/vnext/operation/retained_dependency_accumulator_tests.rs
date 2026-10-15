@@ -42,49 +42,6 @@ fn with_issuer(run: impl FnOnce(&dyn Fn(&[Issue]) -> Vec<RetainedPlanDependencyA
     with_fixture_issuer(fixture_with_padded_persistent(4096), run);
 }
 
-#[test]
-fn resident_dependency_activation_uses_new_scope_and_current_plan_retention() {
-    with_issuer(|issue| {
-        let issued = issue(&[Issue::bank(0, 0), Issue::bank(0, 1)]);
-        let old_scope = Arc::clone(&issued[0].scope);
-        let current_plan = issued[0]._source_retention.clone();
-        let scope = Arc::new(());
-        let fresh = issued
-            .iter()
-            .map(|authority| {
-                RetainedPlanDependencyAuthority::from_resident_identity(
-                    authority.identity.clone(),
-                    &scope,
-                    &current_plan,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(!Arc::ptr_eq(&old_scope, &scope));
-        for (old, current) in issued.iter().zip(&fresh) {
-            assert_eq!(old.identity, current.identity);
-            assert!(Arc::ptr_eq(&scope, &current.scope));
-            assert!(current._source_retention.same_owners(&current_plan));
-            assert!(current._destination_retention.same_owners(&current_plan));
-        }
-        let mut accumulator = RetainedPlanDependencyAccumulator::default();
-        let mut commands = Vec::new();
-        let mut leases = Vec::new();
-        accumulator
-            .append(
-                &scope,
-                fresh
-                    .into_iter()
-                    .map(|authority| authority.encode(()))
-                    .collect(),
-                &mut commands,
-                &mut leases,
-            )
-            .unwrap();
-        assert_eq!(commands.len(), 2);
-        assert_eq!(leases.len(), 2);
-    });
-}
-
 fn with_fixture_issuer(
     fixture: Fixture,
     run: impl FnOnce(&dyn Fn(&[Issue]) -> Vec<RetainedPlanDependencyAuthority>),

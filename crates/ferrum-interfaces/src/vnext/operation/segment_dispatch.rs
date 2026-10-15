@@ -494,10 +494,7 @@ where
     );
     let owner_view_mode = runtime.segment_binding_owner_view_mode();
     let mut owners = Vec::new();
-    if matches!(
-        owner_view_mode,
-        SegmentBindingOwnerViewMode::Indexed | SegmentBindingOwnerViewMode::Resident
-    ) {
+    if owner_view_mode == SegmentBindingOwnerViewMode::Indexed {
         let owner_count = plan_views
             .len()
             .checked_add(backing.as_ref().map_or(0, |batch| batch.bindings().len()))
@@ -571,8 +568,7 @@ where
                                 },
                             ])
                         }
-                        SegmentBindingOwnerViewMode::Indexed
-                        | SegmentBindingOwnerViewMode::Resident => {
+                        SegmentBindingOwnerViewMode::Indexed => {
                             SegmentBindingPhysicalSource::Plan {
                                 owner_index: SegmentBindingOwnerIndex(index),
                                 buffer: plan_views[index].leased.buffer(),
@@ -604,8 +600,7 @@ where
                                         .collect(),
                                 )
                             }
-                            SegmentBindingOwnerViewMode::Indexed
-                            | SegmentBindingOwnerViewMode::Resident => {
+                            SegmentBindingOwnerViewMode::Indexed => {
                                 SegmentBindingPhysicalSource::Dynamic {
                                     window: current,
                                     owner_base: plan_views.len(),
@@ -890,59 +885,6 @@ where
         }
     }
     drop(snapshot_stage);
-    // A hit consumes one fresh whole-resource observation and bypasses every
-    // old node/window/frame projection and compiled backend frame encoder.
-    if runtime.segment_binding_owner_view_mode() == SegmentBindingOwnerViewMode::Resident
-        && participant_count == 1
-    {
-        if let Some((encoded, scope, unique_physical_buffers)) =
-            super::resident_segment::try_encode(
-                runtime,
-                recipe,
-                wave,
-                &context,
-                &plan_views,
-                &groups,
-                &expected,
-                &resources,
-                timing_sink,
-            )?
-        {
-            if encoded.nodes.len() != recipe.nodes.len()
-                || encoded
-                    .nodes
-                    .iter()
-                    .zip(&recipe.nodes)
-                    .any(|(actual, node)| actual.node_index as usize != node.node_index)
-            {
-                return Err(invalid_operation(
-                    "resident encoder returned a different node sequence",
-                ));
-            }
-            return Ok(Some((
-                SegmentEncodedProgram {
-                    nodes: encoded
-                        .nodes
-                        .into_iter()
-                        .map(|encoded| SegmentEncodedNode {
-                            node_index: encoded.node_index as usize,
-                            scope: Arc::clone(&scope),
-                            program_binding: wave
-                                .claimed_backing()
-                                .program_binding_node(encoded.node_index as usize),
-                            bindings: encoded.bindings,
-                        })
-                        .collect(),
-                    program_bindings: encoded.program_bindings,
-                    program_binding_nodes: encoded.program_binding_nodes,
-                },
-                SegmentPreparationFacts {
-                    dynamic_resource_requests: expected.len() as u64,
-                    unique_physical_buffers,
-                },
-            )));
-        }
-    }
     // Validate the entire schema before any backend encoding. Only the borrowed
     // projection is repeated below; no authority or check is deferred to submit.
     for node in &recipe.nodes {
@@ -1131,27 +1073,6 @@ where
         program_bindings,
         dependencies,
     };
-    let resident = if runtime.segment_binding_owner_view_mode()
-        == SegmentBindingOwnerViewMode::Resident
-        && participant_count == 1
-    {
-        runtime
-            .prepare_resident_segment_bindings(program.as_ref(), &frame)
-            .map_err(|error| {
-                invalid_operation(format!("resident template preparation failed: {error}"))
-            })?
-            .map(|backend| {
-                super::resident_segment::ResidentSegmentTemplate::capture(
-                    backend,
-                    &frame,
-                    &groups,
-                    seen.len() as u64,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
     drop(node_stage);
     let _backend_stage = SubmissionWaveDispatchStageTimer::start(
         timing_sink,
@@ -1180,15 +1101,6 @@ where
         return Err(invalid_operation(
             "compiled segment backend did not consume every fresh dependency",
         ));
-    }
-    if let Some(resident) = resident {
-        let retired = recipe
-            .resident_frame
-            .lock()
-            .map_err(|_| invalid_operation("resident frame cache is poisoned"))?
-            .replace(Arc::new(resident));
-        // Allocation release must not run while the cache mutex is held.
-        drop(retired);
     }
     let facts = SegmentPreparationFacts {
         dynamic_resource_requests: expected.len() as u64,

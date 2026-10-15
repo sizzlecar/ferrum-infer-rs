@@ -91,7 +91,6 @@ pub(crate) struct CompiledSegmentBindingRecipe {
     pub(super) window_rules: Vec<SegmentWindowRule>,
     pub(super) window_nodes: Vec<Range<usize>>,
     pub(crate) backend_program: Option<Arc<dyn Any + Send + Sync>>,
-    pub(super) resident_frame: std::sync::Mutex<Option<Arc<dyn Any + Send + Sync>>>,
 }
 
 impl CompiledSegmentBindingRecipe {
@@ -542,7 +541,6 @@ impl CompiledSegmentBindingRecipe {
             window_rules: Vec::new(),
             window_nodes: Vec::new(),
             backend_program: None,
-            resident_frame: std::sync::Mutex::new(None),
         })
     }
 }

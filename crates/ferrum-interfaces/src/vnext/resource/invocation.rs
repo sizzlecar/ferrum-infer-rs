@@ -1822,16 +1822,6 @@ impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
         self.pools
             .segment_backing_batch_with_window_input(groups, expected, windows, timing)
     }
-
-    pub(crate) fn authorize_resident(
-        &self,
-        template: &super::ResidentBackingTemplate<R::Buffer>,
-        groups: &[&[LogicalBackingSliceAuthority]],
-        expected: &[super::SegmentBackingExpectation],
-    ) -> Result<Option<Vec<super::DeviceBufferRetention>>, VNextError> {
-        self.pools
-            .authorize_resident_backing(template, groups, expected)
-    }
 }
 
 impl<R> PreparedStepSubmissionWave<R>
