@@ -31,6 +31,74 @@ pub struct SequencePhysicalBindingTable<B> {
 }
 
 impl<B> SequencePhysicalBindingTable<B> {
+    /// Structural append proof only. The caller must separately validate the
+    /// current pool epochs/poison and issue fresh participant/window authority.
+    /// Both tables retain their real allocations, so pointer equality cannot ABA.
+    pub(crate) fn is_append_of(&self, previous: &Self) -> bool {
+        if self.runtime_owner != previous.runtime_owner
+            || self.rows.len() != previous.rows.len()
+            || self.ordinal_rows != previous.ordinal_rows
+        {
+            return false;
+        }
+        for (current, old) in self.rows().zip(previous.rows()) {
+            let a = current.descriptor();
+            let b = old.descriptor();
+            if current.resource_ordinal() != old.resource_ordinal()
+                || current.resource_id() != old.resource_id()
+                || a.logical_size_bytes() < b.logical_size_bytes()
+                || a.capacity_size_bytes() < b.capacity_size_bytes()
+                || a.view_size_bytes() < b.view_size_bytes()
+                || a.alignment_bytes() != b.alignment_bytes()
+                || a.usage() != b.usage()
+                || a.element_type() != b.element_type()
+                || a.storage_profile() != b.storage_profile()
+            {
+                return false;
+            }
+            let mut current_regions = current.physical_regions();
+            let mut end = 0;
+            for old_region in old.physical_regions() {
+                let Some(region) = current_regions.next() else {
+                    return false;
+                };
+                let (current_buffer, current_range, _) =
+                    region.borrowed_buffer_and_physical_range();
+                let (old_buffer, old_range, _) = old_region.borrowed_buffer_and_physical_range();
+                let current_binding = &self.backing.bindings()[region.region.binding_index()];
+                let old_binding = &previous.backing.bindings()[old_region.region.binding_index()];
+                if region.logical_offset_bytes() != end
+                    || old_region.logical_offset_bytes() != end
+                    || region.length_bytes() != old_region.length_bytes()
+                    || region.descriptor() != old_region.descriptor()
+                    || !std::ptr::eq(current_buffer, old_buffer)
+                    || current_range != old_range
+                    || !Arc::ptr_eq(&current_binding.chunk, &old_binding.chunk)
+                    || current_binding.segment() != old_binding.segment()
+                {
+                    return false;
+                }
+                let Some(next) = end.checked_add(region.length_bytes()) else {
+                    return false;
+                };
+                end = next;
+            }
+            for region in current_regions {
+                if region.logical_offset_bytes() != end || region.length_bytes() == 0 {
+                    return false;
+                }
+                let Some(next) = end.checked_add(region.length_bytes()) else {
+                    return false;
+                };
+                end = next;
+            }
+            if end != a.view_size_bytes() {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn rows(&self) -> impl ExactSizeIterator<Item = SequencePhysicalBindingRow<'_, B>> {
         self.rows
             .iter()

@@ -1698,8 +1698,9 @@ impl OperationDispatch {
         let mut program_binding_resources = BTreeSet::new();
         let mut reusable_execution_binding_nodes = Vec::new();
         let mut encoded_operations = Vec::with_capacity(providers.len());
-        let use_compiled_segment = batch_identity.preparation_strategy()
-            == ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram;
+        let use_compiled_segment = batch_identity
+            .preparation_strategy()
+            .uses_decode_segment_program();
         let use_segment = batch_identity.preparation_strategy().uses_decode_segment()
             && determinism_restore.is_none()
             && completion
@@ -2689,7 +2690,7 @@ where
     Ok(command_count)
 }
 
-fn encode_submission_wave_inputs<R>(
+pub(super) fn encode_submission_wave_inputs<R>(
     runtime: &R,
     resolved: &dyn ExecutablePlanView,
     batch_identity: &BatchOperationIdentity,
@@ -2702,7 +2703,7 @@ where
 {
     struct ValidatedInputUpload<'a> {
         upload: &'a SubmissionWaveInputUpload,
-        participant: &'a BatchOperationParticipantIdentity,
+        identity: super::super::ExecutionIdentityEnvelope,
         destination: std::ops::Range<u64>,
     }
 
@@ -2734,9 +2735,6 @@ where
                     "submission input upload has no physical node identity",
                 ))
             })?;
-        let node_identity = batch_identity
-            .materialize_node(identity_node_index)
-            .map_err(SubmissionWaveDispatchError::Contract)?;
         let value = node
             .values()
             .iter()
@@ -2755,8 +2753,6 @@ where
             )));
         };
         let descriptor = completion
-            .wave()
-            .step_resources()
             .dynamic_descriptor(component.resource_id())
             .map_err(SubmissionWaveDispatchError::Contract)?;
         let participant_packed = descriptor.lifetime() == AllocationLifetime::Step
@@ -2764,16 +2760,8 @@ where
         let prepared_work_shape = if participant_packed {
             Some(
                 completion
-                    .wave()
-                    .nodes()
-                    .iter()
-                    .find(|wave_node| wave_node.node_id() == first_upload.node_id())
-                    .ok_or_else(|| {
-                        SubmissionWaveDispatchError::Contract(invalid_operation(
-                            "submission input upload has no prepared wave node",
-                        ))
-                    })?
-                    .work_shape(),
+                    .work_shape_for_node(first_upload.node_id())
+                    .map_err(SubmissionWaveDispatchError::Contract)?,
             )
         } else {
             None
@@ -2786,14 +2774,9 @@ where
                     "submission input upload participant index exceeds host address space",
                 ))
             })?;
-            let participant = node_identity
-                .participants()
-                .get(participant_index)
-                .ok_or_else(|| {
-                    SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission input upload participant is absent from its plan node",
-                    ))
-                })?;
+            let identity = batch_identity
+                .operation_identity_at(identity_node_index, participant_index)
+                .map_err(SubmissionWaveDispatchError::Contract)?;
             let byte_len = upload.source_layout().byte_len().map_err(|error| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(error.to_string()))
             })?;
@@ -2863,7 +2846,7 @@ where
             }
             validated.push(ValidatedInputUpload {
                 upload,
-                participant,
+                identity,
                 destination,
             });
         }
@@ -2890,7 +2873,7 @@ where
             if contiguous_end == validated_cursor + 1 {
                 encode_submission_wave_backing_upload(
                     runtime,
-                    first.participant.identity(),
+                    &first.identity,
                     &backing,
                     BufferUsage::Activations,
                     first.upload.source_layout().element_type(),
@@ -2917,7 +2900,7 @@ where
                 }
                 encode_submission_wave_backing_upload(
                     runtime,
-                    first.participant.identity(),
+                    &first.identity,
                     &backing,
                     BufferUsage::Activations,
                     first.upload.source_layout().element_type(),

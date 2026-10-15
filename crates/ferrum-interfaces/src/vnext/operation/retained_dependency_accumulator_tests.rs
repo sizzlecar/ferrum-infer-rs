@@ -447,3 +447,65 @@ fn retained_dependency_accumulator_cpu_paired() {
         },
     );
 }
+
+#[test]
+fn resident_dependency_closure_rejects_conflicts_and_a_different_replay_seal() {
+    with_issuer(|issue| {
+        let authorities = issue(&[Issue::bank(0, 0), Issue::bank(0, 0), Issue::bank(0, 1)]);
+        let expected = vec![
+            authorities[0].identity.clone(),
+            authorities[2].identity.clone(),
+        ];
+        let sealed = SealedResidentPlanDependencies::seal(authorities.iter(), &expected).unwrap();
+        assert_eq!(&*sealed.identities, &expected);
+        assert!(SealedResidentPlanDependencies::seal(authorities.iter(), &expected[..1]).is_err());
+        let mut conflicting = Issue::bank(0, 0);
+        conflicting.validation = "fixture.incompatible-validation.v1";
+        let authorities = issue(&[Issue::bank(0, 0), conflicting]);
+        let expected = authorities
+            .iter()
+            .map(|a| a.identity.clone())
+            .collect::<Vec<_>>();
+        assert!(SealedResidentPlanDependencies::seal(authorities.iter(), &expected).is_err());
+    });
+}
+
+#[test]
+fn resident_dependency_closure_issues_fresh_linear_scopes_and_retains_current_use() {
+    with_issuer(|issue| {
+        let authorities = issue(&[Issue::bank(0, 0)]);
+        let old_scope = Arc::downgrade(&authorities[0].scope);
+        let expected = vec![authorities[0].identity.clone()];
+        let sealed = SealedResidentPlanDependencies::seal(authorities.iter(), &expected).unwrap();
+        drop(authorities);
+        assert!(
+            old_scope.upgrade().is_none(),
+            "cold closure must not retain a past invocation scope"
+        );
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let first = sealed.issue(DeviceBufferRetention::plan(Arc::clone(&owner)));
+        let first_scope = Arc::clone(first.scope());
+        let second = sealed.issue(DeviceBufferRetention::plan(Arc::new(())));
+        let second_scope = Arc::clone(second.scope());
+        assert!(!Arc::ptr_eq(&first_scope, &second_scope));
+        drop(owner);
+        let encoded = first.encode(17_u32);
+        assert!(
+            weak.upgrade().is_some(),
+            "the encoded batch must retain the current use"
+        );
+        assert!(
+            encoded.into_command(&second_scope, &sealed).is_err(),
+            "another fresh use cannot consume this batch"
+        );
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            second
+                .encode(23_u32)
+                .into_command(&second_scope, &sealed)
+                .unwrap(),
+            23
+        );
+    });
+}

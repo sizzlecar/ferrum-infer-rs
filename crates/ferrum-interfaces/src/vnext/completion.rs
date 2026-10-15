@@ -21,8 +21,8 @@ use super::{
     DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
     DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
     HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
-    NodeId, PreparedStepSubmissionWave, RequestStateHazardTerminalDisposition, ResourceId,
-    ReusableExecutionCatalogLifetime, StreamState, VNextError,
+    NodeId, PreparedStepSubmissionWave, RequestStateHazardTerminalDisposition, ResidentDecodeUse,
+    ResourceId, ReusableExecutionCatalogLifetime, StreamState, VNextError,
 };
 
 mod terminal_readback;
@@ -752,6 +752,56 @@ pub(crate) struct ExecutionLaneEnqueue<'a, R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> ExecutionLaneEnqueue<'_, R> {
+    pub(crate) fn validate_resident_program_entry(
+        &self,
+        program: &super::DeviceReusableExecutionProgramId,
+        expected: &super::DeviceReusableExecutionEntryIdentity,
+        epoch: u64,
+    ) -> Result<bool, VNextError> {
+        if self.state.fail_closed
+            || self.lane.fail_closed.load(Ordering::Acquire)
+            || !self.lane.current_descriptor_matches_snapshot()
+        {
+            return Err(invalid_completion(
+                "resident entry validation requires a healthy current lane",
+            ));
+        }
+        if self.lane.reusable_execution_epoch() != epoch {
+            return Ok(false);
+        }
+        let checked = catch_unwind(AssertUnwindSafe(|| {
+            if self.lane.runtime.stream_state(&self.state.stream) != StreamState::Ready {
+                return Err(invalid_completion("resident lane stream is not ready"));
+            }
+            self.lane
+                .runtime
+                .reusable_execution_entry_identity(&self.state.stream, program)
+                .map_err(|e| invalid_completion(format!("resident entry lookup failed: {e}")))
+        }));
+        match checked {
+            Ok(Ok(entry)) => {
+                if !self.lane.current_descriptor_matches_snapshot()
+                    || self.lane.runtime.stream_state(&self.state.stream) != StreamState::Ready
+                {
+                    self.lane.fail_closed();
+                    return Err(invalid_completion("resident entry lookup changed the lane"));
+                }
+                Ok(self.lane.reusable_execution_epoch() == epoch
+                    && entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.same_entry(expected)))
+            }
+            Ok(Err(e)) => {
+                self.lane.fail_closed();
+                Err(e)
+            }
+            Err(_) => {
+                self.lane.fail_closed();
+                Err(invalid_completion("resident entry lookup panicked"))
+            }
+        }
+    }
+
     fn submit_via(
         &mut self,
         submit: impl FnOnce(
@@ -1444,6 +1494,7 @@ impl CompletionSweepReceipt {
 enum CompletionResourceLease<R: DeviceRuntime> {
     Invocation(InvocationResourceLease<R>),
     Wave(PreparedStepSubmissionWave<R>),
+    Resident(ResidentDecodeUse<R>),
 }
 
 impl<R: DeviceRuntime> CompletionResourceLease<R> {
@@ -1451,6 +1502,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         match self {
             Self::Invocation(invocation) => invocation.runtime(),
             Self::Wave(wave) => wave.runtime(),
+            Self::Resident(use_) => use_.runtime(),
         }
     }
 
@@ -1458,6 +1510,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         match self {
             Self::Invocation(invocation) => invocation.deferred_cleanup_domain(),
             Self::Wave(wave) => wave.deferred_cleanup_domain(),
+            Self::Resident(use_) => use_.deferred_cleanup_domain(),
         }
     }
 
@@ -1465,6 +1518,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         match self {
             Self::Invocation(invocation) => invocation.mark_submission_fence_installed(),
             Self::Wave(wave) => wave.mark_submission_fence_installed(),
+            Self::Resident(use_) => use_.mark_submission_fence_installed(),
         }
     }
 
@@ -1478,6 +1532,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
                 invocation.encode_backing_initializations(runtime, commands)
             }
             Self::Wave(wave) => wave.encode_backing_initializations(runtime, commands),
+            Self::Resident(use_) => use_.encode_backing_initializations(runtime, commands),
         }
     }
 
@@ -1485,6 +1540,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         match self {
             Self::Invocation(invocation) => invocation.mark_submission_indeterminate(),
             Self::Wave(wave) => wave.mark_submission_indeterminate(),
+            Self::Resident(use_) => use_.mark_submission_indeterminate(),
         }
     }
 
@@ -1492,6 +1548,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         match self {
             Self::Invocation(invocation) => invocation.finish_backing_initializations(succeeded),
             Self::Wave(wave) => wave.finish_backing_initializations(succeeded),
+            Self::Resident(use_) => use_.finish_backing_initializations(succeeded),
         }
     }
 
@@ -1502,6 +1559,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         match self {
             Self::Invocation(invocation) => invocation.finish_request_state_hazards(disposition),
             Self::Wave(wave) => wave.finish_request_state_hazards(disposition),
+            Self::Resident(use_) => use_.finish_request_state_hazards(disposition),
         }
     }
 
@@ -1515,6 +1573,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
             invalid_completion("completion readback participant index exceeds host address space")
         })?;
         match self {
+            Self::Resident(use_) => use_.backing_view(node_id, participant_index, resource_id),
             Self::Invocation(invocation) => {
                 if invocation.node_id() != node_id {
                     return Err(invalid_completion(
@@ -1592,6 +1651,9 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
             invalid_completion("completion readback participant index exceeds host address space")
         })?;
         let (step, work_shape) = match self {
+            Self::Resident(use_) => {
+                return use_.readback_range(node_id, participant_index, resource_id, semantic_range)
+            }
             Self::Invocation(invocation) => {
                 if invocation.node_id() != node_id {
                     return Err(invalid_completion(
@@ -1937,6 +1999,20 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         Self::reserve_resources(
             reaper,
             CompletionResourceLease::Wave(wave),
+            lane,
+            batch_identity,
+        )
+    }
+
+    pub(crate) fn reserve_resident(
+        reaper: &Arc<Self>,
+        use_: ResidentDecodeUse<R>,
+        lane: Arc<ExecutionLane<R>>,
+        batch_identity: BatchOperationIdentity,
+    ) -> Result<CompletionReservation<R>, VNextError> {
+        Self::reserve_resources(
+            reaper,
+            CompletionResourceLease::Resident(use_),
             lane,
             batch_identity,
         )
@@ -2443,6 +2519,17 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 );
             }
             if matches!(disposition, OperationCompletionDisposition::Succeeded) {
+                if let CompletionResourceLease::Resident(use_) = &resources {
+                    let seal =
+                        SuccessfulWaveCompletionSeal::from_terminal_identity(&batch_identity);
+                    if let Err(error) = use_.record_completed_boundary(&seal) {
+                        disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
+                            QuiescentCompletionContractFailure::new(format!(
+                                "resident full-plan completion boundary transition failed: {error}"
+                            )),
+                        );
+                    }
+                }
                 if let CompletionResourceLease::Wave(wave) = &resources {
                     if wave.purpose() == super::SubmissionWavePurpose::FullPlan {
                         let seal =
@@ -3652,8 +3739,8 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .expect("live completion reservation owns submission resources")
         {
             CompletionResourceLease::Invocation(invocation) => invocation,
-            CompletionResourceLease::Wave(_) => {
-                unreachable!("single-operation reservation cannot own a submission wave")
+            CompletionResourceLease::Wave(_) | CompletionResourceLease::Resident(_) => {
+                unreachable!("single-operation reservation cannot own batch resources")
             }
         }
     }
@@ -3665,9 +3752,43 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .expect("live completion reservation owns submission resources")
         {
             CompletionResourceLease::Wave(wave) => wave,
-            CompletionResourceLease::Invocation(_) => {
-                unreachable!("wave reservation cannot own single-operation resources")
+            CompletionResourceLease::Invocation(_) | CompletionResourceLease::Resident(_) => {
+                unreachable!("wave reservation cannot own other resource kinds")
             }
+        }
+    }
+
+    pub(crate) fn dynamic_descriptor(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<&super::DynamicResourceDescriptor, VNextError> {
+        match self.resources.as_ref().expect("reservation resources") {
+            CompletionResourceLease::Wave(wave) => {
+                wave.step_resources().dynamic_descriptor(resource_id)
+            }
+            CompletionResourceLease::Resident(use_) => use_.dynamic_descriptor(resource_id),
+            CompletionResourceLease::Invocation(invocation) => {
+                invocation.step_resources().dynamic_descriptor(resource_id)
+            }
+        }
+    }
+
+    pub(crate) fn work_shape_for_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<&super::BatchWorkShape, VNextError> {
+        match self.resources.as_ref().expect("reservation resources") {
+            CompletionResourceLease::Wave(wave) => wave
+                .nodes()
+                .iter()
+                .find(|node| node.node_id() == node_id)
+                .map(|node| node.work_shape())
+                .ok_or_else(|| invalid_completion("input node absent from wave")),
+            CompletionResourceLease::Resident(use_) => Ok(use_.work_shape()),
+            CompletionResourceLease::Invocation(invocation) if invocation.node_id() == node_id => {
+                Ok(invocation.work_shape())
+            }
+            _ => Err(invalid_completion("input node absent from invocation")),
         }
     }
 
@@ -3732,6 +3853,25 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             ));
         };
         let retry = wave.definitely_not_submitted()?;
+        self.finished = true;
+        Ok(retry)
+    }
+
+    pub(crate) fn definitely_not_submitted_resident(
+        mut self,
+    ) -> Result<ResidentDecodeUse<R>, VNextError> {
+        self.remove_reserved_slot();
+        self.submission_may_have_happened = false;
+        let resources = self
+            .resources
+            .take()
+            .expect("reservation owns resident resources");
+        let CompletionResourceLease::Resident(use_) = resources else {
+            return Err(invalid_completion(
+                "resident retry requested from another resource kind",
+            ));
+        };
+        let retry = use_.definitely_not_submitted()?;
         self.finished = true;
         Ok(retry)
     }

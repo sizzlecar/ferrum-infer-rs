@@ -452,3 +452,106 @@ impl RetainedPlanDependencyAccumulator {
 #[cfg(test)]
 #[path = "retained_dependency_accumulator_tests.rs"]
 mod accumulator_tests;
+
+/// Cold exact dependency closure. It retains immutable Plan ownership, never an
+/// old invocation scope. Only a newly authorized resident use can issue a batch.
+pub(super) struct SealedResidentPlanDependencies {
+    identities: Arc<[RetainedPlanDependencyIdentity]>,
+    _retentions: Vec<DeviceBufferRetention>,
+}
+
+impl SealedResidentPlanDependencies {
+    pub(super) fn seal<'a>(
+        authorities: impl IntoIterator<Item = &'a RetainedPlanDependencyAuthority>,
+        expected: &[RetainedPlanDependencyIdentity],
+    ) -> Result<Arc<Self>, VNextError> {
+        let mut accumulator = RetainedPlanDependencyAccumulator::default();
+        let mut retentions = Vec::new();
+        for authority in authorities {
+            if !accumulator.check_identity(&authority.identity)? {
+                let ordinal = accumulator.identities.len();
+                accumulator
+                    .by_resource
+                    .entry(
+                        authority
+                            .identity
+                            .destination
+                            .descriptor
+                            .resource_id
+                            .clone(),
+                    )
+                    .or_default()
+                    .push(ordinal);
+                accumulator.identities.push(authority.identity.clone());
+                retentions.push(authority._source_retention.clone());
+                retentions.push(authority._destination_retention.clone());
+            }
+        }
+        if accumulator.as_slice() != expected {
+            return Err(invalid_operation(
+                "resident dependency closure differs from the exact replay program",
+            ));
+        }
+        Ok(Arc::new(Self {
+            identities: accumulator.identities.into(),
+            _retentions: retentions,
+        }))
+    }
+
+    pub(super) fn issue(
+        self: &Arc<Self>,
+        fresh_retention: DeviceBufferRetention,
+    ) -> DeviceResidentPlanDependencyBatch {
+        DeviceResidentPlanDependencyBatch {
+            closure: Arc::clone(self),
+            scope: Arc::new(()),
+            retention: DeviceBufferRetention::pair(Arc::clone(self), Arc::new(fresh_retention)),
+        }
+    }
+}
+
+/// Linear, current-use authorization for the complete prevalidated Plan prefix.
+/// A provider cannot construct or clone it, or reuse a prior invocation scope.
+pub struct DeviceResidentPlanDependencyBatch {
+    closure: Arc<SealedResidentPlanDependencies>,
+    scope: Arc<()>,
+    retention: DeviceBufferRetention,
+}
+impl DeviceResidentPlanDependencyBatch {
+    pub fn identities(&self) -> &[RetainedPlanDependencyIdentity] {
+        &self.closure.identities
+    }
+    pub fn retention(&self) -> &DeviceBufferRetention {
+        &self.retention
+    }
+    pub fn encode<C>(self, command: C) -> EncodedResidentPlanDependency<C> {
+        EncodedResidentPlanDependency {
+            authority: self,
+            command,
+        }
+    }
+    pub(super) fn scope(&self) -> &Arc<()> {
+        &self.scope
+    }
+}
+
+pub struct EncodedResidentPlanDependency<C> {
+    authority: DeviceResidentPlanDependencyBatch,
+    command: C,
+}
+impl<C> EncodedResidentPlanDependency<C> {
+    pub(super) fn into_command(
+        self,
+        scope: &Arc<()>,
+        closure: &Arc<SealedResidentPlanDependencies>,
+    ) -> Result<C, VNextError> {
+        if !Arc::ptr_eq(scope, &self.authority.scope)
+            || !Arc::ptr_eq(closure, &self.authority.closure)
+        {
+            return Err(invalid_operation(
+                "resident dependency batch belongs to another use or program",
+            ));
+        }
+        Ok(self.command)
+    }
+}

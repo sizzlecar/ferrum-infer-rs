@@ -214,6 +214,7 @@ where
             completed_boundary: super::Mutex::new(super::StepCompletedBoundarySlot::default()),
             retained_plan_dependencies: super::Mutex::new(Vec::new()),
             finalized: false,
+            resident_bootstrap_use: None,
         })
     }
 
@@ -319,6 +320,9 @@ where
             finalize_session_frames_with_boundary(&mut holds, finalization, completed.proof())?;
         completed.consume();
         self.finalized = true;
+        if let Some(gate) = &mut self.resident_bootstrap_use {
+            gate.mark_finalized();
+        }
         Ok(dispositions)
     }
 
@@ -783,6 +787,7 @@ where
             pressure_action,
             &node_indices,
             SubmissionWavePurpose::DeterminismProbe,
+            None,
         )
     }
 
@@ -819,6 +824,30 @@ where
             pressure_action,
             &node_indices,
             SubmissionWavePurpose::FullPlan,
+            None,
+        )
+    }
+
+    pub(super) fn try_prepare_reserved_full_plan_submission_wave(
+        self: &Arc<Self>,
+        work_shape: Arc<BatchWorkShape>,
+        pressure_action: AdmissionPressureAction,
+        reserved: &ClaimedSubmissionWaveBacking,
+    ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
+        let node_count = self.participants[0]
+            .session
+            .resources()
+            .request
+            .plan
+            .nodes()
+            .len();
+        self.prepare_submission_wave(
+            work_shape,
+            AdmissionFitPolicy::ImmediateOnly,
+            pressure_action,
+            &(0..node_count).collect::<Vec<_>>(),
+            SubmissionWavePurpose::FullPlan,
+            Some(reserved),
         )
     }
 
@@ -829,6 +858,7 @@ where
         pressure_action: AdmissionPressureAction,
         node_indices: &[usize],
         purpose: SubmissionWavePurpose,
+        reserved: Option<&ClaimedSubmissionWaveBacking>,
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
         let _lifecycle = self.participants[0]
             .session
@@ -904,106 +934,118 @@ where
                 ));
             }
         };
-        let immediate_shape = work_shape.immediate_shape();
-        let fit_shape = match fit_policy {
-            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
-            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
-        };
-        let (demand, requested_slices) = plan.submission_wave_demand(
-            immediate_shape,
-            fit_shape,
-            self.reusable_execution_bucket.as_ref(),
-            fit_policy,
-            pressure_action,
-        )?;
-        let prepared_backing = match plan
-            .prepare_lane_stable_backing_slices(&self.execution_lane, requested_slices)?
-        {
-            LaneBackingPrepareDecision::Prepared(prepared) => prepared,
-            LaneBackingPrepareDecision::Deferred(deferred) => {
-                let deferred_node_work_fingerprints = prepared_nodes
-                    .iter()
-                    .map(|node| {
-                        (
-                            node.node_id().clone(),
-                            node.work_shape().fingerprint().to_owned(),
-                        )
-                    })
-                    .collect();
-                return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
-                    StepSubmissionWaveBackingDeferral::new(
-                        Arc::clone(self),
-                        deferred,
-                        deferred_node_work_fingerprints,
-                    )?,
+        let claimed_backing = if let Some(reserved) = reserved {
+            if purpose != SubmissionWavePurpose::FullPlan
+                || reserved.plan_hash() != plan.plan_hash()
+                || reserved.node_count() != plan_nodes.len()
+            {
+                return Err(invalid_resource(
+                    "reserved backing requires its complete immutable plan",
                 ));
             }
-        };
-        let logical_capacity = if demand.immediate_claim().is_empty() {
-            None
+            reserved.borrow_reserved(Arc::clone(&work_shape))?
         } else {
-            let parents = self
-                .participants
-                .iter()
-                .map(|participant| participant.session.resources().logical_lease())
-                .collect::<Vec<_>>();
-            match plan
-                .logical_admission()
-                .try_claim_for_sequences(&parents, &demand)?
+            let immediate_shape = work_shape.immediate_shape();
+            let fit_shape = match fit_policy {
+                AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+                AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
+            };
+            let (demand, requested_slices) = plan.submission_wave_demand(
+                immediate_shape,
+                fit_shape,
+                self.reusable_execution_bucket.as_ref(),
+                fit_policy,
+                pressure_action,
+            )?;
+            let prepared_backing = match plan
+                .prepare_lane_stable_backing_slices(&self.execution_lane, requested_slices)?
             {
-                BatchCapacityClaimDecision::Claimed(capacity) => {
-                    if !plan
-                        .logical_admission()
-                        .owns_batch_capacity_claim(&capacity)
-                    {
-                        return Err(invalid_resource(
-                            "submission wave admission returned foreign capacity authority",
-                        ));
-                    }
-                    Some(capacity)
-                }
-                BatchCapacityClaimDecision::Deferred(deferred) => {
-                    return Ok(StepSubmissionWaveAdmissionDecision::Deferred(deferred));
-                }
-                BatchCapacityClaimDecision::PermanentRejected(rejected) => {
-                    return Ok(StepSubmissionWaveAdmissionDecision::PermanentRejected(
-                        rejected,
+                LaneBackingPrepareDecision::Prepared(prepared) => prepared,
+                LaneBackingPrepareDecision::Deferred(deferred) => {
+                    let deferred_node_work_fingerprints = prepared_nodes
+                        .iter()
+                        .map(|node| {
+                            (
+                                node.node_id().clone(),
+                                node.work_shape().fingerprint().to_owned(),
+                            )
+                        })
+                        .collect();
+                    return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
+                        StepSubmissionWaveBackingDeferral::new(
+                            Arc::clone(self),
+                            deferred,
+                            deferred_node_work_fingerprints,
+                        )?,
                     ));
                 }
-            }
+            };
+            let logical_capacity = if demand.immediate_claim().is_empty() {
+                None
+            } else {
+                let parents = self
+                    .participants
+                    .iter()
+                    .map(|participant| participant.session.resources().logical_lease())
+                    .collect::<Vec<_>>();
+                match plan
+                    .logical_admission()
+                    .try_claim_for_sequences(&parents, &demand)?
+                {
+                    BatchCapacityClaimDecision::Claimed(capacity) => {
+                        if !plan
+                            .logical_admission()
+                            .owns_batch_capacity_claim(&capacity)
+                        {
+                            return Err(invalid_resource(
+                                "submission wave admission returned foreign capacity authority",
+                            ));
+                        }
+                        Some(capacity)
+                    }
+                    BatchCapacityClaimDecision::Deferred(deferred) => {
+                        return Ok(StepSubmissionWaveAdmissionDecision::Deferred(deferred));
+                    }
+                    BatchCapacityClaimDecision::PermanentRejected(rejected) => {
+                        return Ok(StepSubmissionWaveAdmissionDecision::PermanentRejected(
+                            rejected,
+                        ));
+                    }
+                }
+            };
+            let committed_backing = prepared_backing.commit();
+            let has_program_binding_nodes = prepared_nodes.iter().any(|node| {
+                plan_nodes[node.plan_node_index()]
+                    .binding_resource()
+                    .is_some()
+            });
+            let program_binding_layout = match (
+                self.reusable_execution_bucket.as_ref(),
+                has_program_binding_nodes,
+            ) {
+                (Some(bucket), true) => Some(
+                    plan.dynamic_pools()
+                        .program_binding_layout(bucket.bucket_id())
+                        .cloned()
+                        .ok_or_else(|| {
+                            invalid_resource(
+                                "reusable submission wave has no compiled program binding layout",
+                            )
+                        })?,
+                ),
+                _ => None,
+            };
+            ClaimedSubmissionWaveBacking::new(
+                plan.plan_hash().clone(),
+                prepared_nodes.len(),
+                plan_nodes.len(),
+                Arc::clone(&work_shape),
+                demand,
+                logical_capacity,
+                committed_backing,
+                program_binding_layout,
+            )?
         };
-        let committed_backing = prepared_backing.commit();
-        let has_program_binding_nodes = prepared_nodes.iter().any(|node| {
-            plan_nodes[node.plan_node_index()]
-                .binding_resource()
-                .is_some()
-        });
-        let program_binding_layout = match (
-            self.reusable_execution_bucket.as_ref(),
-            has_program_binding_nodes,
-        ) {
-            (Some(bucket), true) => Some(
-                plan.dynamic_pools()
-                    .program_binding_layout(bucket.bucket_id())
-                    .cloned()
-                    .ok_or_else(|| {
-                        invalid_resource(
-                            "reusable submission wave has no compiled program binding layout",
-                        )
-                    })?,
-            ),
-            _ => None,
-        };
-        let claimed_backing = ClaimedSubmissionWaveBacking::new(
-            plan.plan_hash().clone(),
-            prepared_nodes.len(),
-            plan_nodes.len(),
-            Arc::clone(&work_shape),
-            demand,
-            logical_capacity,
-            committed_backing,
-            program_binding_layout,
-        )?;
         let wave_fingerprint =
             submission_wave_fingerprint(self, &prepared_nodes, &claimed_backing, purpose)?;
         let batch_invocation_id = issue_batch_invocation_id()?;

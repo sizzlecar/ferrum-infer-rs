@@ -116,6 +116,7 @@ impl CudaSequencePhysicalTable {
 
 /// One current authorized resource window; page ownership is held once in its
 /// cold table. These windows preserve the ordinary flattened retention order.
+#[derive(Clone)]
 pub(crate) struct CudaPhysicalRowWindow {
     table_index: usize,
     resource_ordinal: usize,
@@ -125,6 +126,38 @@ pub(crate) struct CudaPhysicalRowWindow {
 }
 
 impl CudaPhysicalRowWindow {
+    /// Only a typed, Core-verified append refresh may grow this window. Page
+    /// addresses come from the new table, never from extrapolating old pointers.
+    pub(crate) fn refreshed(
+        &self,
+        tables: &[Arc<CudaSequencePhysicalTable>],
+        length_bytes: u64,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let invalid = CudaDeviceRuntimeError::contract;
+        let row = tables
+            .get(self.table_index)
+            .ok_or_else(|| invalid("refreshed physical table is absent"))?
+            .row(self.resource_ordinal)?;
+        checked_subregion_address(0, row.length_bytes, self.offset_bytes, length_bytes)?;
+        let region_count = match &row.storage {
+            CudaPhysicalStorage::Contiguous(_) if length_bytes == self.length_bytes => 1,
+            CudaPhysicalStorage::Paged { block_bytes, .. }
+                if length_bytes >= self.length_bytes
+                    && self.offset_bytes % block_bytes == 0
+                    && length_bytes % block_bytes == 0 =>
+            {
+                usize::try_from(length_bytes / block_bytes)
+                    .map_err(|_| invalid("refreshed page count exceeds usize"))?
+            }
+            _ => return Err(invalid("refreshed physical window is not append-only")),
+        };
+        Ok(Self {
+            length_bytes,
+            region_count,
+            ..self.clone()
+        })
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.region_count
     }

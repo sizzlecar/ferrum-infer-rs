@@ -20,9 +20,12 @@ mod registry;
 mod resolved_value;
 pub(crate) mod retained_dependency;
 pub use retained_dependency::{
+    DeviceResidentPlanDependencyBatch, EncodedResidentPlanDependency,
     EncodedRetainedPlanDependency, RetainedPlanDependencyAuthority, RetainedPlanDependencyIdentity,
     RetainedPlanDependencySpec,
 };
+mod resident_dispatch;
+pub use resident_dispatch::{ResidentDecodeDispatchError, ResidentDecodeProgram};
 mod physical_segment;
 mod physical_segment_dispatch;
 mod segment_binding;

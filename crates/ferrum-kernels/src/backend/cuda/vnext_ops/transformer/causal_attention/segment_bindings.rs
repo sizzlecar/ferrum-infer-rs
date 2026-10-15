@@ -20,6 +20,103 @@ impl CausalRecipe {
     }
 }
 
+/// Freeze physical page/address shape; each use still supplies its current
+/// logical frontier. Append refresh rebuilds addresses from authorized pages.
+pub(crate) fn resident_control_rules(
+    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    recipe: &CausalRecipe,
+) -> Result<
+    Option<Vec<crate::backend::cuda::vnext_runtime::ResidentControlRule>>,
+    CudaDeviceRuntimeError,
+> {
+    use crate::backend::cuda::vnext_runtime::ResidentControlRule;
+    let invalid = |reason: &str| CudaDeviceRuntimeError::contract(reason);
+    // Keep the numerical-status snapshot path unchanged for unsupported KV.
+    if recipe.shape.int8_kv || !recipe.supports_program() {
+        return Ok(None);
+    }
+    let mut rules = Vec::with_capacity(recipe.participants);
+    for (participant, token) in node
+        .work_shape()
+        .participant_token_ranges()
+        .iter()
+        .enumerate()
+    {
+        let shape = recipe.shape;
+        let source = token.source_token_range();
+        let bytes = shape
+            .physical_state_bytes_for_source_frontier(source.end, token.full_input_tokens())
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        rules.push(ResidentControlRule {
+            node_index: node.node_index(),
+            write_index: participant,
+            state_bytes: bytes,
+            values: Arc::new(move |work| {
+                let Some(token) = work.participant_token_ranges().get(participant) else {
+                    return Ok(None);
+                };
+                let source = token.source_token_range();
+                let packed = token.immediate_token_range();
+                if source.end > token.full_input_tokens()
+                    || token.full_input_tokens() > shape.maximum_context_tokens
+                {
+                    return Err(invalid("resident causal frontier exceeds admitted context"));
+                }
+                let current_entries = shape
+                    .table_entries(source.end)
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let current_bytes = shape
+                    .physical_state_bytes_for_source_frontier(source.end, token.full_input_tokens())
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let value =
+                    |v, label| checked_i32(v, label).map_err(CudaDeviceRuntimeError::contract);
+                Ok(Some((
+                    [
+                        value(current_entries, "resident table entries")?,
+                        value(source.start, "resident source position")?,
+                        value(token.immediate_tokens(), "resident token count")?,
+                        value(source.end, "resident sequence tokens")?,
+                        value(packed.start, "resident packed token start")?,
+                        0,
+                    ],
+                    current_bytes,
+                )))
+            }),
+            payload: Arc::new(move |controls, pages| {
+                let layout = shape
+                    .kv_layout()
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let maximum = shape
+                    .table_entries(shape.maximum_context_tokens)
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let entries = resident_address_prefix(layout, pages.len() as u64, maximum)
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let entries = checked_i32(entries, "resident refreshed address prefix")
+                    .map_err(CudaDeviceRuntimeError::contract)?;
+                let mut payload = Vec::new();
+                for value in controls {
+                    payload.extend_from_slice(&value.to_ne_bytes());
+                }
+                visit_binding_addresses(
+                    layout,
+                    entries,
+                    pages.len(),
+                    |index| {
+                        pages
+                            .get(index)
+                            .copied()
+                            .ok_or_else(|| "refreshed causal page absent".into())
+                    },
+                    |address| payload.extend_from_slice(&address.to_ne_bytes()),
+                )
+                .map_err(CudaDeviceRuntimeError::contract)?;
+                Ok(payload.into_boxed_slice())
+            }),
+        });
+    }
+    Ok(Some(rules))
+}
+
 pub(super) fn declare(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     shape: CausalAttentionShape,
@@ -692,6 +789,25 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
     owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
     sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
 ) -> Result<(), String> {
+    write_physical_program_inner(node, recipe, owners, sink, false)
+}
+
+pub(crate) fn write_resident_physical_program(
+    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    recipe: &CausalRecipe,
+    owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
+    sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
+) -> Result<(), String> {
+    write_physical_program_inner(node, recipe, owners, sink, true)
+}
+
+fn write_physical_program_inner(
+    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    recipe: &CausalRecipe,
+    owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
+    sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
+    resident_page_prefix: bool,
+) -> Result<(), String> {
     let shape = recipe.shape;
     if node.participant_count() != recipe.participants || recipe.participants == 0 {
         return Err("segment causal participant shape differs from cold geometry".into());
@@ -760,6 +876,15 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
         if page_count > maximum_pages || entries > maximum_entries {
             return Err("segment causal page table exceeds admitted maximum".into());
         }
+        // A resident packet may retain all addresses inside the CURRENT
+        // physical pages. Kernels still consume only the fresh control count;
+        // no future page or unallocated address is invented.
+        let payload_entries = if resident_page_prefix {
+            resident_address_prefix(kv_layout, page_count, maximum_entries)?
+        } else {
+            entries
+        };
+        let payload_table_entries = checked_i32(payload_entries, "resident address prefix")?;
         let table_entries = checked_i32(entries, "causal attention address-table entry count")?;
         let controls = [
             table_entries,
@@ -772,7 +897,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
             checked_i32(packed.start, "causal attention packed token start")?,
             0,
         ];
-        let address_count = usize::try_from(entries)
+        let address_count = usize::try_from(payload_entries)
             .map_err(|_| "segment causal entry count exceeds usize")?
             .checked_add(scale_count)
             .ok_or("segment causal address count overflows")?;
@@ -789,7 +914,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
                 }
                 visit_binding_addresses(
                     kv_layout,
-                    table_entries,
+                    payload_table_entries,
                     state_pages.len(),
                     |index| {
                         owners
@@ -837,4 +962,50 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
     };
     sink.end_physical_node(ranges, numerical_status)
         .map_err(|e| e.to_string())
+}
+
+fn resident_address_prefix(
+    layout: CausalKvLayout,
+    pages: u64,
+    maximum_entries: u64,
+) -> Result<u64, String> {
+    if pages == 0 || maximum_entries == 0 {
+        return Err("resident causal physical prefix is empty".into());
+    }
+    let available = match layout {
+        CausalKvLayout::TokenMajorPages => pages,
+        CausalKvLayout::VllmBlocks16 {
+            blocks_per_page, ..
+        } => pages
+            .checked_mul(blocks_per_page)
+            .ok_or("resident causal entry count overflows")?,
+    };
+    Ok(available.min(maximum_entries))
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+
+    #[test]
+    fn resident_causal_prefix_covers_only_current_pages_and_context() {
+        let layout = CausalKvLayout::VllmBlocks16 {
+            combined_block_bytes: 32 * 1024,
+            blocks_per_page: 2,
+        };
+        // The second logical block is already allocated in the same 64KiB
+        // physical page. A new third block must never use an invented page.
+        let entries = resident_address_prefix(layout, 1, 128).unwrap();
+        assert_eq!(entries, 2);
+        let addresses = binding_addresses(layout, entries as i32, &[0x10_0000]).unwrap();
+        assert_eq!(addresses, [0x10_0000, 0x10_0000 + 32 * 1024]);
+        assert!(binding_addresses(layout, 3, &[0x10_0000]).is_err());
+        assert_eq!(resident_address_prefix(layout, 2, 3).unwrap(), 3);
+        assert_eq!(
+            resident_address_prefix(CausalKvLayout::TokenMajorPages, 2, 8).unwrap(),
+            2
+        );
+        assert!(resident_address_prefix(layout, 0, 128).is_err());
+        assert!(resident_address_prefix(layout, u64::MAX, u64::MAX).is_err());
+    }
 }

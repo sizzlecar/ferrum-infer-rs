@@ -105,6 +105,8 @@ mod backing_initialization;
 pub(crate) use backing_initialization::{
     BackingInitializationEncodeError, PreparedBackingInitializations,
 };
+mod resident_decode;
+pub use resident_decode::*;
 mod invocation;
 pub use invocation::*;
 mod execution_session;

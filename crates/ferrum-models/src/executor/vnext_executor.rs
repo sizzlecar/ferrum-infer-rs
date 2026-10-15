@@ -63,7 +63,12 @@ use super::{
 mod backing_maintenance;
 mod composition;
 mod determinism;
+mod input_uploads;
 mod invocation_preparation;
+mod resident_decode;
+use resident_decode::{
+    PreparedDispatch, PreparedDispatchResult, PreparedRetirement, ResidentCache, ResidentMetrics,
+};
 mod mixed_batch;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
@@ -3750,8 +3755,8 @@ struct VNextSequence<R: DeviceRuntime> {
 }
 
 struct PreparedVNextPrefill<R: DeviceRuntime> {
-    step: Arc<StepResourceLease<R>>,
-    wave: PreparedStepSubmissionWave<R>,
+    retirement: PreparedRetirement<R>,
+    dispatch: PreparedDispatch<R>,
 }
 
 struct VNextExecutionParticipant<'a, R: DeviceRuntime> {
@@ -4723,6 +4728,8 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     policy: ResolvedRuntimePolicy,
     invocation_preparation_strategy: InvocationPreparationStrategy,
     completion_readback_policy: ferrum_types::CompletionReadbackPolicy,
+    resident_decode: Mutex<Option<ResidentCache<R>>>,
+    resident_metrics: ResidentMetrics,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
     submission_wave_identity: CompiledSubmissionWaveIdentity,
@@ -5285,6 +5292,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             providers,
             policy: config.runtime_policy,
             invocation_preparation_strategy: config.invocation_preparation_strategy,
+            resident_decode: Mutex::new(None),
+            resident_metrics: ResidentMetrics::default(),
             completion_readback_policy: config.completion_readback_policy,
             plan_resources,
             lane,
@@ -5995,6 +6004,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.reaper.reset_checkpoint_timings();
         // Startup waves are synthetic evidence. Forget their residency proof so
         // the first product wave establishes and accounts for its own upload.
+        self.release_resident_decode();
+        for counter in [
+            &self.resident_metrics.submitted,
+            &self.resident_metrics.bootstraps,
+            &self.resident_metrics.installations,
+            &self.resident_metrics.unavailable,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
         self.product_token_mask_residency.lock().clear();
         self.metrics.reset_after_startup();
         self.metrics
@@ -6496,6 +6514,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         request_id: RequestIdentity,
         work: ResourceWorkShape,
     ) -> Result<VNextSequenceAdmissionDecision<R>> {
+        // A new participant will change the cohort. Release idle decode claims
+        // before admitting its Request/Sequence resources or doing maintenance.
+        self.release_resident_decode();
         let binding = self
             .plan_resources
             .trusted_runtime_binding()
@@ -6768,6 +6789,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::thread::yield_now();
                 }
                 SequenceResourceExtensionDecision::Deferred(deferred) => {
+                    let retained_resident =
+                        if deferred.action() == DeferredAction::AwaitBackingGrowth {
+                            self.retain_resident_decode_for_growth()
+                        } else {
+                            self.release_resident_decode();
+                            false
+                        };
                     match self.recover_prefix_pressure(&mut prefix_maintenance, &deferred)? {
                         prefix_cache::PrefixPressureRecovery::Maintained(receipt) => {
                             if !receipt.growths().is_empty() {
@@ -6803,6 +6831,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         backing_attempts,
                         &maintenance_receipts,
                     ) {
+                        if retained_resident {
+                            self.release_resident_decode();
+                            continue;
+                        }
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6829,10 +6861,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &mut maintenance_receipts,
                         &mut prefix_maintenance,
                     )? {
+                        if retained_resident {
+                            // Retry after releasing retained claims before
+                            // exposing a pressure deferral to the scheduler.
+                            self.release_resident_decode();
+                            continue;
+                        }
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
                 }
                 SequenceResourceExtensionDecision::BackingDeferred(deferred) => {
+                    let retained_resident = self.retain_resident_decode_for_growth();
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
@@ -6841,6 +6880,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         backing_attempts,
                         &maintenance_receipts,
                     ) {
+                        if retained_resident {
+                            self.release_resident_decode();
+                            continue;
+                        }
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6866,6 +6909,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &mut maintenance_receipts,
                         &mut prefix_maintenance,
                     )? {
+                        if retained_resident {
+                            self.release_resident_decode();
+                            continue;
+                        }
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
                 }
@@ -6906,6 +6953,57 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         )
     }
 
+    fn step_request_for_spans(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
+    ) -> Result<StepResourceAdmissionRequest> {
+        let timing_enabled = self.host_dispatch_timing_enabled();
+        let phase_timing = self.metrics.wave_timing_for(kind);
+        let _timing = self
+            .metrics
+            .wave_timing
+            .resource_step_request_prepare
+            .start_if(timing_enabled);
+        let _phase_timing = phase_timing
+            .resource_step_request_prepare
+            .start_if(timing_enabled);
+        let work_shape = Arc::new(
+            batch
+                .bind_work_shape(spans.to_vec())
+                .map_err(|error| FerrumError::backend(error.to_string()))?,
+        );
+        let reusable_bucket_id = self
+            .resolved_plan
+            .execution_plan()
+            .payload()
+            .memory()
+            .reusable_execution()
+            .and_then(|plan| {
+                plan.buckets().iter().find(|resolved| {
+                    let bucket = resolved.bucket();
+                    bucket.class_id().as_str() == kind.reusable_execution_class()
+                        && bucket.capacity().covers(
+                            work_shape.immediate_sequences(),
+                            work_shape.immediate_tokens(),
+                            work_shape.immediate_pages(),
+                        )
+                })
+            })
+            .map(|resolved| resolved.bucket().bucket_id().clone());
+        let request = StepResourceAdmissionRequest::new(
+            work_shape,
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        Ok(match reusable_bucket_id {
+            Some(bucket_id) => request.with_reusable_execution_bucket(bucket_id),
+            None => request,
+        })
+    }
+
     fn try_begin_step_for_spans(
         &self,
         batch: &ExecutionBatchParticipants<R>,
@@ -6914,49 +7012,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<StepResourceAdmissionDecision<R>> {
         let timing_enabled = self.host_dispatch_timing_enabled();
         let phase_timing = self.metrics.wave_timing_for(kind);
-        let request = {
-            let _timing = self
-                .metrics
-                .wave_timing
-                .resource_step_request_prepare
-                .start_if(timing_enabled);
-            let _phase_timing = phase_timing
-                .resource_step_request_prepare
-                .start_if(timing_enabled);
-            let work_shape = Arc::new(
-                batch
-                    .bind_work_shape(spans.to_vec())
-                    .map_err(|error| FerrumError::backend(error.to_string()))?,
-            );
-            let reusable_bucket_id = self
-                .resolved_plan
-                .execution_plan()
-                .payload()
-                .memory()
-                .reusable_execution()
-                .and_then(|plan| {
-                    plan.buckets().iter().find(|resolved| {
-                        let bucket = resolved.bucket();
-                        bucket.class_id().as_str() == kind.reusable_execution_class()
-                            && bucket.capacity().covers(
-                                work_shape.immediate_sequences(),
-                                work_shape.immediate_tokens(),
-                                work_shape.immediate_pages(),
-                            )
-                    })
-                })
-                .map(|resolved| resolved.bucket().bucket_id().clone());
-            let request = StepResourceAdmissionRequest::new(
-                work_shape,
-                AdmissionFitPolicy::ImmediateOnly,
-                AdmissionPressureAction::WaitForRelease,
-            )
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match reusable_bucket_id {
-                Some(bucket_id) => request.with_reusable_execution_bucket(bucket_id),
-                None => request,
-            }
-        };
+        let request = self.step_request_for_spans(batch, spans, kind)?;
         {
             let _timing = self
                 .metrics
@@ -7451,6 +7507,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
         mut cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
+        resident_bootstrap: Option<Arc<ResidentDecodeReservation<R>>>,
+        resident_install: &mut Option<Arc<ResidentDecodeProgram<R>>>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7465,210 +7523,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let timing_enabled = self.host_dispatch_timing_enabled();
         let phase_timing = self.metrics.wave_timing_for(kind);
-        let mut uploads = match {
-            let _timing = self
-                .metrics
-                .wave_timing
-                .token_upload_prepare
-                .start_if(timing_enabled);
-            let _phase_timing = phase_timing.token_upload_prepare.start_if(timing_enabled);
-            participants
-                .iter()
-                .enumerate()
-                .map(|(participant_index, participant)| {
-                    let range = participant.span.immediate_token_range();
-                    let host_range = Range {
-                        start: usize::try_from(range.start).map_err(|_| {
-                            FerrumError::backend(
-                                "vNext token upload start exceeds host address space",
-                            )
-                        })?,
-                        end: usize::try_from(range.end).map_err(|_| {
-                            FerrumError::backend(
-                                "vNext token upload end exceeds host address space",
-                            )
-                        })?,
-                    };
-                    let host_tokens =
-                        participant.tokens.get(host_range.clone()).ok_or_else(|| {
-                            FerrumError::backend(format!(
-                                "vNext token upload range {host_range:?} exceeds host token length {}",
-                                participant.tokens.len()
-                            ))
-                        })?;
-                    let host_bytes = host_tokens
-                        .iter()
-                        .flat_map(|token| token.to_le_bytes())
-                        .collect::<Vec<_>>();
-                    let logical_offset_bytes = range
-                        .start
-                        .checked_mul(ElementType::U32.size_bytes())
-                        .ok_or_else(|| {
-                            FerrumError::backend("vNext token upload offset overflows u64")
-                        })?;
-                    let source_layout = HostTransferLayout::new(
-                        ElementType::U32,
-                        participant.span.immediate_tokens(),
-                    )
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    let participant_index = u32::try_from(participant_index).map_err(|_| {
-                        FerrumError::backend("vNext token upload participant index exceeds u32")
-                    })?;
-                    SubmissionWaveInputUpload::new(
-                        self.io.input_node_id.clone(),
-                        participant_index,
-                        self.io.input_ordinal,
-                        logical_offset_bytes,
-                        source_layout,
-                        host_bytes,
-                    )
-                    .map_err(|error| FerrumError::backend(error.to_string()))
-                })
-                .collect::<Result<Vec<_>>>()
-        } {
+        let uploads = match self.prepare_participant_uploads(
+            participants,
+            kind,
+            output_mode,
+            token_mask_plans,
+        ) {
             Ok(uploads) => uploads,
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         };
-        let token_mask_elements = match u64::try_from(self.io.output_elements) {
-            Ok(elements) => elements,
-            Err(_) => {
-                return DispatchOutcome::QuiescentFailure(
-                    "vNext token-mask length exceeds u64".to_owned(),
-                )
-            }
-        };
-        let token_mask_layout = match HostTransferLayout::new(ElementType::U8, token_mask_elements)
-        {
-            Ok(layout) => layout,
-            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
-        };
-        let token_mask_uploads = participants
-            .iter()
-            .zip(token_mask_plans)
-            .enumerate()
-            .map(|(participant_index, (_, plan))| {
-                if !plan.upload_required {
-                    return Ok(None);
-                }
-                SubmissionWaveInputUpload::new(
-                    self.io.token_mask_input_node_id.clone(),
-                    u32::try_from(participant_index).map_err(|_| {
-                        FerrumError::backend(
-                            "vNext token-mask upload participant index exceeds u32",
-                        )
-                    })?,
-                    self.io.token_mask_input_ordinal,
-                    0,
-                    token_mask_layout,
-                    plan.content.normalized(),
-                )
-                .map(Some)
-                .map_err(|error| FerrumError::backend(error.to_string()))
-            })
-            .collect::<Result<Vec<_>>>();
-        match token_mask_uploads {
-            Ok(token_mask_uploads) => uploads.extend(token_mask_uploads.into_iter().flatten()),
-            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
-        }
-        let repetition_uploads = (|| -> Result<_> {
-            let repetition_capacity = u64::try_from(self.io.repetition_capacity)
-                .map_err(|_| FerrumError::backend("vNext repetition capacity exceeds u64"))?;
-            let repetition_token_id_layout =
-                HostTransferLayout::new(ElementType::U32, repetition_capacity)
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let repetition_offset_layout = HostTransferLayout::new(ElementType::U32, 2)
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let repetition_penalty_layout = HostTransferLayout::new(ElementType::F32, 1)
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let mut token_id_uploads = Vec::with_capacity(participants.len());
-            let mut offset_uploads = Vec::with_capacity(participants.len());
-            let mut penalty_uploads = Vec::with_capacity(participants.len());
-            for (participant_index, participant) in participants.iter().enumerate() {
-                let repetition =
-                    product_repetition_input(participant.output_role.logits_policy(), output_mode);
-                if !repetition.penalty.is_finite() || repetition.penalty <= 0.0 {
-                    return Err(FerrumError::backend(
-                        "vNext sparse repetition penalty must be finite and positive",
-                    ));
-                }
-                if repetition.token_ids.len() > self.io.repetition_capacity {
-                    return Err(FerrumError::backend(format!(
-                        "vNext sparse repetition input contains {} ids, capacity is {}",
-                        repetition.token_ids.len(),
-                        self.io.repetition_capacity
-                    )));
-                }
-                if repetition.token_ids.iter().any(|token| {
-                    usize::try_from(*token).map_or(true, |token| token >= self.io.output_elements)
-                }) {
-                    return Err(FerrumError::backend(
-                        "vNext sparse repetition input contains an out-of-vocabulary token",
-                    ));
-                }
-                let participant_index = u32::try_from(participant_index).map_err(|_| {
-                    FerrumError::backend("vNext repetition participant index exceeds u32")
-                })?;
-                let repetition_count = u32::try_from(repetition.token_ids.len()).map_err(|_| {
-                    FerrumError::backend("vNext repetition token count exceeds u32")
-                })?;
-                if repetition_count != 0 {
-                    token_id_uploads.push(
-                        SubmissionWaveInputUpload::new(
-                            self.io.repetition_token_ids_input_node_id.clone(),
-                            participant_index,
-                            self.io.repetition_token_ids_input_ordinal,
-                            0,
-                            repetition_token_id_layout,
-                            padded_repetition_token_id_bytes(
-                                repetition.token_ids,
-                                self.io.repetition_capacity,
-                            )?,
-                        )
-                        .map_err(|error| FerrumError::backend(error.to_string()))?,
-                    );
-                }
-                offset_uploads.push(
-                    SubmissionWaveInputUpload::new(
-                        self.io.repetition_offsets_input_node_id.clone(),
-                        participant_index,
-                        self.io.repetition_offsets_input_ordinal,
-                        0,
-                        repetition_offset_layout,
-                        [0_u32, repetition_count]
-                            .into_iter()
-                            .flat_map(u32::to_le_bytes)
-                            .collect(),
-                    )
-                    .map_err(|error| FerrumError::backend(error.to_string()))?,
-                );
-                penalty_uploads.push(
-                    SubmissionWaveInputUpload::new(
-                        self.io.repetition_penalty_input_node_id.clone(),
-                        participant_index,
-                        self.io.repetition_penalty_input_ordinal,
-                        0,
-                        repetition_penalty_layout,
-                        repetition.penalty.to_le_bytes().to_vec(),
-                    )
-                    .map_err(|error| FerrumError::backend(error.to_string()))?,
-                );
-            }
-            Ok((token_id_uploads, offset_uploads, penalty_uploads))
-        })();
-        match repetition_uploads {
-            Ok((token_id_uploads, offset_uploads, penalty_uploads)) => {
-                uploads.extend(token_id_uploads);
-                uploads.extend(offset_uploads);
-                uploads.extend(penalty_uploads);
-            }
-            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
-        }
-        let uploaded_bytes = uploads.iter().fold(0_u64, |total, upload| {
-            total.saturating_add(upload.source_layout().byte_len().unwrap_or(0))
-        });
-        self.metrics
-            .uploaded_bytes
-            .fetch_add(uploaded_bytes, Ordering::Relaxed);
 
         let mut wave = wave;
         let mut retries = 0;
@@ -7784,6 +7647,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     None => None,
                 }
             };
+            *resident_install = None;
+            if let (Some(reservation), Some(program)) =
+                (resident_bootstrap.as_ref(), reusable_program)
+            {
+                match OperationDispatch::try_compile_resident_decode(
+                    Arc::clone(reservation),
+                    &self.resolved_plan,
+                    &wave,
+                    &self.submission_wave_identity,
+                    program,
+                    &self.lane,
+                ) {
+                    Ok(compiled) => *resident_install = compiled,
+                    Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+                }
+            }
             reusable_direct_attempted |= reusable_program.is_some();
             if reusable_program.is_none() && self.on_demand_reusable_execution_enabled() {
                 self.reusable_execution_catalog_refresh_needed
@@ -8018,17 +7897,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     async fn abort_step(
         &self,
-        step: Arc<StepResourceLease<R>>,
+        step: impl Into<PreparedRetirement<R>>,
         message: impl Into<String>,
     ) -> FerrumError {
         let message = message.into();
         self.metrics.record_failure(message.clone());
-        match step.try_abort() {
+        self.release_resident_decode();
+        match step.into().try_abort() {
             Ok(_) => FerrumError::backend(message),
-            Err(failure) => FerrumError::backend(format!(
-                "{message}; vNext step abort failed: {}",
-                failure.error()
-            )),
+            Err(failure) => {
+                FerrumError::backend(format!("{message}; vNext step abort failed: {}", failure))
+            }
         }
     }
 
@@ -8112,12 +7991,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .start();
             let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let step = self.begin_step(&batch, sequence, &span)?;
-            let wave = match self.prepare_wave(&step, sequence, &span) {
-                Ok(wave) => wave,
-                Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
-            };
-            PreparedVNextPrefill { step, wave }
+            if let Some(prepared) = self.try_prepare_resident_decode(
+                &batch,
+                std::slice::from_ref(&span),
+                VNextExecutionWaveKind::Decode,
+                matches!(logits_policy, LogitsReturnPolicy::GreedyArgmax { .. }),
+            )? {
+                prepared
+            } else {
+                let step = self.begin_step(&batch, sequence, &span)?;
+                let wave = match self.prepare_wave(&step, sequence, &span) {
+                    Ok(wave) => wave,
+                    Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+                };
+                PreparedVNextPrefill::ordinary(step, wave)
+            }
         };
         self.execute_prepared_step(
             sequence,
@@ -8182,20 +8070,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            let step =
-                match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
-                    VNextExecutionCapacityDecision::Ready(step) => step,
-                    VNextExecutionCapacityDecision::Deferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
-                    }
-                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                            deferred,
-                        ))
-                    }
-                };
-            let wave_decision =
-                match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind) {
+            if let Some(prepared) = self.try_prepare_resident_decode(
+                batch,
+                spans,
+                kind,
+                output_roles.iter().all(|role| {
+                    matches!(
+                        role.logits_policy(),
+                        Some(LogitsReturnPolicy::GreedyArgmax { .. })
+                    )
+                }),
+            )? {
+                prepared
+            } else {
+                let step =
+                    match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
+                        VNextExecutionCapacityDecision::Ready(step) => step,
+                        VNextExecutionCapacityDecision::Deferred(deferred) => {
+                            return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+                        }
+                        VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                            return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                                deferred,
+                            ))
+                        }
+                    };
+                let wave_decision = match self
+                    .prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)
+                {
                     Ok(decision) => decision,
                     Err(error) => {
                         if let Err(cleanup_error) = self
@@ -8206,26 +8108,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return Err(error);
                     }
                 };
-            let wave = match wave_decision {
-                VNextExecutionCapacityDecision::Ready(wave) => wave,
-                VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    self.rollback_unsubmitted_step(
-                        step,
-                        "vNext capacity-deferred unsubmitted step",
-                    )?;
-                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
-                }
-                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                    self.rollback_unsubmitted_step(
-                        step,
-                        "vNext readiness-deferred unsubmitted step",
-                    )?;
-                    return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                        deferred,
-                    ));
-                }
-            };
-            PreparedVNextPrefill { step, wave }
+                let wave = match wave_decision {
+                    VNextExecutionCapacityDecision::Ready(wave) => wave,
+                    VNextExecutionCapacityDecision::Deferred(deferred) => {
+                        self.rollback_unsubmitted_step(
+                            step,
+                            "vNext capacity-deferred unsubmitted step",
+                        )?;
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
+                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                        self.rollback_unsubmitted_step(
+                            step,
+                            "vNext readiness-deferred unsubmitted step",
+                        )?;
+                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                            deferred,
+                        ));
+                    }
+                };
+                PreparedVNextPrefill::ordinary(step, wave)
+            }
         };
         let participants = sequences
             .iter()
@@ -8278,7 +8181,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
-        let PreparedVNextPrefill { step, mut wave } = prepared;
+        let PreparedVNextPrefill {
+            retirement: mut step,
+            dispatch: mut wave,
+        } = prepared;
+        let mut resident_install = None;
         let capture_claim = match (kind, self.checkpoint_capture.as_ref()) {
             (VNextExecutionWaveKind::Prefill, Some(capture)) => {
                 let first = participants.first();
@@ -8330,7 +8237,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .metrics
             .reusable_cold_path
             .begin(self.host_dispatch_timing_enabled(), kind);
-        let (mut token_mask_residency, dispatch) = {
+        let (mut token_mask_residency, dispatch) = loop {
             let timing = self.metrics.wave_timing.host_encode_submit.start();
             let phase_timer = phase_timing.host_encode_submit.start();
             // Product-fixed inputs live in the lane-stable Step arena. One Step
@@ -8341,11 +8248,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let token_mask_slot_identity = self
                 .io
                 .token_mask_residency_eligible
-                .then(|| {
-                    wave.step_resources()
-                        .claimed_backing()
-                        .lane_stable_slot_identity()
-                })
+                .then(|| wave.lane_stable_slot_identity())
                 .flatten();
             let token_mask_residency = VNextProductTokenMaskResidencyTransaction::prepare(
                 &self.product_token_mask_residency,
@@ -8358,14 +8261,58 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )
                 }),
             );
-            let dispatch = self.dispatch_participant_wave(
+            let dispatch = self.dispatch_prepared_wave(
                 participants,
                 wave,
                 kind,
                 output_mode,
                 token_mask_residency.plans(),
                 cold_wave.as_mut(),
+                &mut resident_install,
             );
+            let dispatch = match dispatch {
+                PreparedDispatchResult::Outcome(dispatch) => dispatch,
+                PreparedDispatchResult::Unavailable => {
+                    let mut token_mask_residency = token_mask_residency;
+                    token_mask_residency.invalidate_before_slot_release();
+                    self.release_resident_decode();
+                    step.try_rollback_unsubmitted()
+                        .map_err(FerrumError::backend)?;
+                    let sequences = participants
+                        .iter()
+                        .map(|p| Arc::clone(p.sequence))
+                        .collect::<Vec<_>>();
+                    let spans = participants
+                        .iter()
+                        .map(|p| p.span.clone())
+                        .collect::<Vec<_>>();
+                    let batch = ExecutionBatchParticipants::new(
+                        sequences.iter().map(|s| Arc::clone(&s.session)).collect(),
+                    )
+                    .map_err(|e| FerrumError::backend(e.to_string()))?;
+                    let ordinary = self.begin_step_for_spans(&batch, &sequences, &spans)?;
+                    let mut ordinary_wave =
+                        match self.prepare_wave_for_spans(&ordinary, &sequences, &spans) {
+                            Ok(wave) => wave,
+                            Err(error) => return Err(self.abort_unsubmitted_step(ordinary, error)),
+                        };
+                    if let Some(request) = readbacks.terminal_packet_request(
+                        self.completion_readback_policy,
+                        output_mode,
+                        capture_claim.is_some(),
+                    ) {
+                        ordinary_wave
+                            .set_terminal_readbacks(request.clone())
+                            .map_err(|e| FerrumError::backend(e.to_string()))?;
+                    }
+                    step = PreparedRetirement::Ordinary(ordinary);
+                    wave = PreparedDispatch::Ordinary {
+                        wave: ordinary_wave,
+                        reservation: None,
+                    };
+                    continue;
+                }
+            };
             drop(phase_timer);
             if let Some(cold_wave) = cold_wave.take() {
                 cold_wave.finish(
@@ -8373,7 +8320,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     reusable_cold_path::Outcome::from_dispatch(&dispatch),
                 );
             }
-            (token_mask_residency, dispatch)
+            break (token_mask_residency, dispatch);
         };
         let mut execution_event_error = None;
         let (completion, attribution) = match dispatch {
@@ -8607,10 +8554,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             drop(receipt);
             if let Err(failure) = step.try_retire_normal() {
                 execution_event_error.get_or_insert_with(|| {
-                    format!(
-                        "vNext diagnostic step retirement failed: {}",
-                        failure.error()
-                    )
+                    format!("vNext diagnostic step retirement failed: {}", failure)
                 });
             }
             if let Some(error) = execution_event_error {
@@ -8856,11 +8800,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         // A stale or cancelled hint cannot fail a completed wave.
                         let _ = ready.publish(&retirement);
                     }
+                    if let Some(program) = resident_install {
+                        self.install_resident_decode(program);
+                    }
                     Ok(logits)
                 }
             }
             Err(failure) => {
-                let message = format!("vNext step retirement failed: {}", failure.error());
+                let message = format!("vNext step retirement failed: {}", failure);
                 self.metrics.record_failure(message.clone());
                 Err(FerrumError::backend(message))
             }
@@ -9030,6 +8977,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn abort_decode_candidates(&self, candidates: &[VNextDecodeCandidate<R>]) {
+        self.release_resident_decode();
         {
             let mut registry = self.sequences.lock();
             for candidate in candidates {
@@ -10180,6 +10128,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             serde_json::json!(self.invocation_preparation_strategy),
         );
         fields.insert(
+            "resident_decode".to_owned(),
+            serde_json::json!({
+                "submitted": self.resident_metrics.submitted.load(Ordering::Relaxed),
+                "bootstraps": self.resident_metrics.bootstraps.load(Ordering::Relaxed),
+                "installations": self.resident_metrics.installations.load(Ordering::Relaxed),
+                "unavailable": self.resident_metrics.unavailable.load(Ordering::Relaxed),
+            }),
+        );
+        fields.insert(
             "completion_readback_policy".to_owned(),
             serde_json::json!(self.completion_readback_policy),
         );
@@ -10816,12 +10773,14 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn release_cache(&self, cache_id: &str) {
+        self.release_resident_decode();
         if let Some(sequence) = self.sequences.lock().active.remove(cache_id) {
             sequence.abort();
         }
     }
 
     async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+        self.release_resident_decode();
         let sequence = self
             .sequences
             .lock()

@@ -1734,6 +1734,10 @@ where
         self.generation
     }
 
+    pub(super) fn shares_physical_catalog(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.physical, &other.physical)
+    }
+
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
         &self.physical.backing_slices
     }

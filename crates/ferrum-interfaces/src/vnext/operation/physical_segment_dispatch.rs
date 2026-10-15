@@ -46,15 +46,23 @@ fn unique_buffers(rows: &[&[usize]], fresh: &[usize]) -> usize {
 
 /// Called only after the ordinary exact Plan/wave/participant validation.
 /// Unsupported providers/lifetimes fall back before any dependency is issued.
-pub(super) fn try_encode<R: DeviceRuntime, S: SubmissionWaveDispatchTimingSink>(
+pub(super) fn with_prepared_physical_wave<
+    R: DeviceRuntime,
+    S: SubmissionWaveDispatchTimingSink,
+    T,
+>(
     runtime: &R,
     resolved: &dyn ExecutablePlanView,
     wave: &PreparedStepSubmissionWave<R>,
     recipe: &CompiledSegmentBindingRecipe,
-    program: &(dyn std::any::Any + Send + Sync),
     plan_views: &[SegmentPlanResourceView<'_, R::Buffer>],
     timing: &S,
-) -> Result<Option<(SegmentEncodedProgram<R::Command>, SegmentPreparationFacts)>, VNextError> {
+    encode: impl FnOnce(
+        &mut PreparedPhysicalSegmentWave<'_, R::Buffer>,
+        Vec<Arc<()>>,
+        SegmentPreparationFacts,
+    ) -> Result<Option<T>, VNextError>,
+) -> Result<Option<T>, VNextError> {
     if !runtime.supports_physical_segment_bindings() {
         return Ok(None);
     }
@@ -357,54 +365,82 @@ pub(super) fn try_encode<R: DeviceRuntime, S: SubmissionWaveDispatchTimingSink>(
         timing,
         SubmissionWaveDispatchStage::SegmentBackendEncodeAndValidate,
     );
-    let encoded = runtime
-        .encode_physical_segment_bindings(program, &mut physical)
-        .map_err(|error| invalid_operation(format!("physical segment encoding failed: {error}")))?;
-    let Some(encoded) = encoded else {
-        if physical.dependencies.iter().flatten().any(Option::is_none) {
-            return Err(invalid_operation(
-                "physical segment backend declined after consuming fresh authority",
-            ));
-        }
-        return Ok(None);
-    };
-    if encoded.nodes.len() != recipe.nodes.len()
-        || encoded
-            .nodes
-            .iter()
-            .zip(&recipe.nodes)
-            .any(|(encoded, compiled)| encoded.node_index as usize != compiled.node_index)
-    {
-        return Err(invalid_operation(
-            "physical segment backend returned a different node sequence",
-        ));
-    }
-    if physical.dependencies.iter().flatten().any(Option::is_some) {
-        return Err(invalid_operation(
-            "physical segment backend did not consume every fresh dependency",
-        ));
-    }
-    Ok(Some((
-        SegmentEncodedProgram {
-            nodes: encoded
-                .nodes
-                .into_iter()
-                .zip(scopes)
-                .map(|(encoded, scope)| SegmentEncodedNode {
-                    node_index: encoded.node_index as usize,
-                    scope,
-                    program_binding: wave
-                        .claimed_backing()
-                        .program_binding_node(encoded.node_index as usize),
-                    bindings: encoded.bindings,
-                })
-                .collect(),
-            program_bindings: encoded.program_bindings,
-            program_binding_nodes: encoded.program_binding_nodes,
-        },
+    encode(
+        &mut physical,
+        scopes,
         SegmentPreparationFacts {
             dynamic_resource_requests,
             unique_physical_buffers,
         },
-    )))
+    )
+}
+
+pub(super) fn try_encode<R: DeviceRuntime, S: SubmissionWaveDispatchTimingSink>(
+    runtime: &R,
+    resolved: &dyn ExecutablePlanView,
+    wave: &PreparedStepSubmissionWave<R>,
+    recipe: &CompiledSegmentBindingRecipe,
+    program: &(dyn std::any::Any + Send + Sync),
+    plan_views: &[SegmentPlanResourceView<'_, R::Buffer>],
+    timing: &S,
+) -> Result<Option<(SegmentEncodedProgram<R::Command>, SegmentPreparationFacts)>, VNextError> {
+    with_prepared_physical_wave(
+        runtime,
+        resolved,
+        wave,
+        recipe,
+        plan_views,
+        timing,
+        |physical, scopes, facts| {
+            let encoded = runtime
+                .encode_physical_segment_bindings(program, physical)
+                .map_err(|error| {
+                    invalid_operation(format!("physical segment encoding failed: {error}"))
+                })?;
+            let Some(encoded) = encoded else {
+                if physical.dependencies.iter().flatten().any(Option::is_none) {
+                    return Err(invalid_operation(
+                        "physical segment backend declined after consuming fresh authority",
+                    ));
+                }
+                return Ok(None);
+            };
+            if encoded.nodes.len() != recipe.nodes.len()
+                || encoded
+                    .nodes
+                    .iter()
+                    .zip(&recipe.nodes)
+                    .any(|(encoded, compiled)| encoded.node_index as usize != compiled.node_index)
+            {
+                return Err(invalid_operation(
+                    "physical segment backend returned a different node sequence",
+                ));
+            }
+            if physical.dependencies.iter().flatten().any(Option::is_some) {
+                return Err(invalid_operation(
+                    "physical segment backend did not consume every fresh dependency",
+                ));
+            }
+            Ok(Some((
+                SegmentEncodedProgram {
+                    nodes: encoded
+                        .nodes
+                        .into_iter()
+                        .zip(scopes)
+                        .map(|(encoded, scope)| SegmentEncodedNode {
+                            node_index: encoded.node_index as usize,
+                            scope,
+                            program_binding: wave
+                                .claimed_backing()
+                                .program_binding_node(encoded.node_index as usize),
+                            bindings: encoded.bindings,
+                        })
+                        .collect(),
+                    program_bindings: encoded.program_bindings,
+                    program_binding_nodes: encoded.program_binding_nodes,
+                },
+                facts,
+            )))
+        },
+    )
 }
