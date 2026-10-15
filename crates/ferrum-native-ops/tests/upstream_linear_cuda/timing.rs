@@ -52,6 +52,10 @@ mod rms_mmvq_pdl;
 #[path = "timing/mmq_pdl.rs"]
 mod mmq_pdl;
 
+#[cfg(feature = "cuda-upstream-mmvq-direct-f16-pdl-tests")]
+#[path = "timing/mmvq_direct_f16_pdl.rs"]
+mod mmvq_direct_f16_pdl;
+
 type MmvqDot = unsafe extern "C" fn(
     *const UpstreamLinearPlanV1,
     *const c_void,
