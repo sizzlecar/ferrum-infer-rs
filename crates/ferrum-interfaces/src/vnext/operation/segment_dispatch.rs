@@ -262,7 +262,7 @@ where
                             AllocationLifetime::Plan => {
                                 return Err(invalid_operation(
                                     "dynamic segment resource claims Plan lifetime",
-                                ))
+                                ));
                             }
                         }
                     };
@@ -468,7 +468,7 @@ where
         }
     }
     if let Some(backing) = &backing {
-        for binding in backing.bindings() {
+        for binding in backing.bindings().iter() {
             if !validate_buffer(runtime, binding.buffer(), binding.descriptor(), &mut seen)? {
                 identity.record_segment_miss_reason(
                     SegmentPreparationMissReason::ImmutableCapabilityUnavailable,
@@ -855,10 +855,15 @@ where
                         AllocationLifetime::Plan => {
                             return Err(invalid_operation(
                                 "dynamic segment resource claims Plan lifetime",
-                            ))
+                            ));
                         }
                     };
-                    groups.push(context.resolve(participant, &resource.resource_id, lifetime)?);
+                    groups.push(context.resolve(
+                        participant,
+                        &resource.resource_id,
+                        descriptor_index,
+                        lifetime,
+                    )?);
                     expected.push(SegmentBackingExpectation {
                         logical_bytes,
                         logical_size_rule: if lifetime == AllocationLifetime::Sequence {
@@ -966,7 +971,7 @@ where
         }
     }
     if let Some(backing) = &backing {
-        for binding in backing.bindings() {
+        for binding in backing.bindings().iter() {
             if !validate_buffer(runtime, binding.buffer(), binding.descriptor(), &mut seen)? {
                 identity.record_segment_miss_reason(
                     SegmentPreparationMissReason::ImmutableCapabilityUnavailable,

@@ -1566,7 +1566,7 @@ where
     R: DeviceRuntime,
 {
     generation: SequenceBackingGeneration,
-    backing_slices: Vec<LogicalBackingSliceAuthority>,
+    physical: Arc<SequencePhysicalCatalog<R::Buffer>>,
     // Extension capacity drops after its physical extents. Arcs let a newer
     // generation share old exact claims without exposing public Clone on a
     // linear logical capacity lease.
@@ -1575,6 +1575,35 @@ where
     // Declared last so physical extents and child capacity release before the
     // parent sequence lease, request, runtime, and pool owner.
     _logical_owner: Arc<SequenceLogicalOwner<R>>,
+}
+
+/// Physical ownership changes only when an extent is appended. Token/page
+/// progress remains on the separately captured logical snapshot above.
+struct SequencePhysicalCatalog<B> {
+    backing_slices: Vec<LogicalBackingSliceAuthority>,
+    resource_ids: Arc<[ResourceId]>,
+    groups: Vec<super::segment_permit::SequencePhysicalGroup<B>>,
+}
+
+impl<B> SequencePhysicalCatalog<B> {
+    fn new(
+        backing_slices: Vec<LogicalBackingSliceAuthority>,
+        resource_ids: Arc<[ResourceId]>,
+    ) -> Self {
+        let groups = resource_ids
+            .iter()
+            .map(|resource| {
+                let start = backing_slices.partition_point(|slice| slice.resource_id() < resource);
+                let end = backing_slices.partition_point(|slice| slice.resource_id() <= resource);
+                super::segment_permit::SequencePhysicalGroup::new(start..end)
+            })
+            .collect();
+        Self {
+            backing_slices,
+            resource_ids,
+            groups,
+        }
+    }
 }
 
 impl<R> SequenceBackingSnapshot<R>
@@ -1596,9 +1625,27 @@ where
                 "initial sequence backing must be canonical and single-sequence",
             ));
         }
+        let mut resource_ids = logical_owner
+            ._request
+            .plan
+            .dynamic_pools()
+            .domains
+            .iter()
+            .flat_map(|domain| domain.descriptors.iter())
+            .map(|descriptor| descriptor.base_resource_id().clone())
+            .collect::<Vec<_>>();
+        resource_ids.sort();
+        if resource_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid_resource(
+                "sequence physical catalog has duplicate Plan resources",
+            ));
+        }
         Ok(Self {
             generation: SequenceBackingGeneration::INITIAL,
-            backing_slices,
+            physical: Arc::new(SequencePhysicalCatalog::new(
+                backing_slices,
+                resource_ids.into(),
+            )),
             extension_capacity: Vec::new(),
             committed_shape: work_shape.immediate_shape(),
             _logical_owner: logical_owner,
@@ -1640,7 +1687,18 @@ where
                 "sequence backing extension slices must be canonical and unique",
             ));
         }
+        // An advancing logical shape is not a new physical ownership epoch.
+        if extension.backing_slices.is_empty() {
+            return Ok(Self {
+                generation,
+                physical: Arc::clone(&prior.physical),
+                extension_capacity: prior.extension_capacity.clone(),
+                committed_shape,
+                _logical_owner: Arc::clone(&prior._logical_owner),
+            });
+        }
         let mut backing_slices = prior
+            .physical
             .backing_slices
             .iter()
             .map(LogicalBackingSliceAuthority::retained)
@@ -1659,7 +1717,10 @@ where
         }
         Ok(Self {
             generation,
-            backing_slices,
+            physical: Arc::new(SequencePhysicalCatalog::new(
+                backing_slices,
+                Arc::clone(&prior.physical.resource_ids),
+            )),
             extension_capacity,
             committed_shape,
             _logical_owner: Arc::clone(&prior._logical_owner),
@@ -1671,7 +1732,7 @@ where
     }
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        &self.backing_slices
+        &self.physical.backing_slices
     }
 
     pub const fn committed_tokens(&self) -> u64 {
@@ -1691,12 +1752,29 @@ where
         resource_id: &ResourceId,
     ) -> &[LogicalBackingSliceAuthority] {
         let start = self
+            .physical
             .backing_slices
             .partition_point(|slice| slice.resource_id() < resource_id);
         let end = self
+            .physical
             .backing_slices
             .partition_point(|slice| slice.resource_id() <= resource_id);
-        &self.backing_slices[start..end]
+        &self.physical.backing_slices[start..end]
+    }
+
+    pub(super) fn segment_group(
+        &self,
+        descriptor_index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<super::segment_permit::SegmentBackingGroup<'_, R::Buffer>, VNextError> {
+        // The ordinal belongs to the exact Plan captured by this request. Do
+        // not interpret an ordinal supplied by another catalog as authority.
+        if self.physical.resource_ids.get(descriptor_index) != Some(resource_id) {
+            return Err(invalid_resource(
+                "sequence resource ordinal differs from its captured Plan",
+            ));
+        }
+        self.physical.groups[descriptor_index].bind(&self.physical.backing_slices)
     }
 }
 

@@ -5,6 +5,9 @@ use ferrum_types::{InvocationPreparationStrategy, ProgramBindingUploadStrategy};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+#[path = "decode_segment/multi_recipe.rs"]
+mod multi_recipe;
+
 #[derive(Default)]
 struct Preparation(RefCell<Vec<InvocationPreparationStats>>);
 impl InvocationPreparationSink for Preparation {
