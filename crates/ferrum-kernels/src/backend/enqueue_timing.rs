@@ -1,9 +1,12 @@
 //! Host boundaries for command enqueue; CPU time is diagnostic, never authority.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "cuda")]
+use std::time::Instant;
 
 use ferrum_interfaces::vnext::{DeviceEnqueueStage, DeviceSubmissionTimingSink};
 
+#[cfg(feature = "cuda")]
 pub(crate) fn measure<S: DeviceSubmissionTimingSink, T>(
     sink: &S,
     stage: DeviceEnqueueStage,
@@ -20,8 +23,10 @@ trait Clock {
     fn thread_cpu(&mut self) -> Option<Duration>;
 }
 
+#[cfg(feature = "cuda")]
 struct HostClock;
 
+#[cfg(feature = "cuda")]
 impl Clock for HostClock {
     type Start = Instant;
 

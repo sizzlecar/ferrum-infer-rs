@@ -90,6 +90,7 @@ impl Family {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "cuda-upstream-linear", test)), allow(dead_code))]
 enum SmallMmqPack {
     LegacyF32,
     DirectF16Memset,
@@ -111,6 +112,7 @@ impl SmallMmqPack {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "cuda-upstream-linear", test)), allow(dead_code))]
 enum SmallMmvqPack {
     F32Memset,
     F32KernelClear,
@@ -135,6 +137,7 @@ pub struct PreparedUpstreamLinear {
     arithmetic: Arithmetic,
     family: Family,
     small_mmq_pack: SmallMmqPack,
+    #[cfg_attr(not(any(feature = "cuda-upstream-linear", test)), allow(dead_code))]
     small_mmvq_pack: SmallMmvqPack,
     q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
