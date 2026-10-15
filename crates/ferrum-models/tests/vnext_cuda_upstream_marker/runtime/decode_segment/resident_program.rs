@@ -578,25 +578,55 @@ fn compare(kind: AttentionKind) {
     // must advance across genuine 16-token physical pages without a new graph.
     let lead = if kind == AttentionKind::Causal { 10 } else { 2 };
     let sinks = [Preparation::default(), Preparation::default()];
-    // Ordinary real work establishes state and allocates the reusable slots.
-    for position in 0..lead {
+    // Advance the second causal participant first. Its page transitions then
+    // occur three waves before the first participant, exercising reuse of one
+    // owner's addresses while both participants' dynamic controls advance.
+    let offsets = [0usize, if kind == AttentionKind::Causal { 3 } else { 0 }];
+    for position in 0..offsets[1] {
         let observations = fixtures
             .iter()
             .zip(&sessions)
             .enumerate()
             .map(|(arm, (f, group))| {
-                for (s, t) in group.iter().zip(&tokens) {
-                    f.extend(s, Arc::from(&t[..=position]));
-                }
+                f.extend(&group[1], Arc::from(&tokens[1][..=position]));
                 f.execute_participants_with_preparation(
                     &f.lane,
                     &f.reaper,
-                    group,
-                    &tokens,
+                    &group[1..],
+                    &tokens[1..],
                     position..position + 1,
                     Path::Warm,
                     InvocationPreparationStrategy::DecodeSegmentProgram,
                     &sinks[arm],
+                )
+            })
+            .collect::<Vec<_>>();
+        observations[0].assert_same(&observations[1]);
+    }
+    // Ordinary real work establishes state and allocates the reusable slots.
+    for position in 0..lead {
+        let ranges: Vec<_> = offsets
+            .iter()
+            .map(|offset| position + offset..position + offset + 1)
+            .collect();
+        let observations = fixtures
+            .iter()
+            .zip(&sessions)
+            .enumerate()
+            .map(|(arm, (f, group))| {
+                for ((s, t), range) in group.iter().zip(&tokens).zip(&ranges) {
+                    f.extend(s, Arc::from(&t[..range.end]));
+                }
+                f.execute_participant_ranges_with_preparation(
+                    &f.lane,
+                    &f.reaper,
+                    group,
+                    &tokens,
+                    &ranges,
+                    Path::Warm,
+                    InvocationPreparationStrategy::DecodeSegmentProgram,
+                    &sinks[arm],
+                    None,
                 )
             })
             .collect::<Vec<_>>();
@@ -607,10 +637,13 @@ fn compare(kind: AttentionKind) {
     let mut prior_frames = None;
     let mut prior_values = None;
     for position in lead..36 {
-        let ranges = vec![position..position + 1; 2];
+        let ranges: Vec<_> = offsets
+            .iter()
+            .map(|offset| position + offset..position + offset + 1)
+            .collect();
         for (f, group) in fixtures.iter().zip(&sessions) {
-            for (s, t) in group.iter().zip(&tokens) {
-                f.extend(s, Arc::from(&t[..=position]));
+            for ((s, t), range) in group.iter().zip(&tokens).zip(&ranges) {
+                f.extend(s, Arc::from(&t[..range.end]));
             }
         }
         if kind == AttentionKind::Causal && position == lead {
@@ -635,21 +668,36 @@ fn compare(kind: AttentionKind) {
             &sinks[0],
             None,
         );
-        reference.assert_same(&reference);
         let (values, hot, frames) =
             execute(&fixtures[1], &mut resident, &sessions[1], &tokens, &ranges)
                 .expect("same cohort and append-only physical growth must remain eligible");
-        if kind == AttentionKind::Causal && [16, 32].contains(&position) {
-            assert!(hot, "cross-page execution must use the resident path");
-            assert_eq!(
-                physical_pages(
-                    &fixtures[1],
-                    &sessions[1][0],
-                    Arc::from(&tokens[0][..=position]),
-                    position + 1
-                ),
-                u64::try_from(position / 16 + 1).unwrap()
+        if kind == AttentionKind::Causal && [13, 16, 29, 32].contains(&position) {
+            assert!(
+                hot,
+                "each staggered cross-page execution must use the resident path"
             );
+            let crossing: Vec<_> = ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, range)| range.start % 16 == 0)
+                .map(|(participant, _)| participant)
+                .collect();
+            assert_eq!(
+                crossing.len(),
+                1,
+                "only one participant grows at this boundary"
+            );
+            for (participant, range) in ranges.iter().enumerate() {
+                assert_eq!(
+                    physical_pages(
+                        &fixtures[1],
+                        &sessions[1][participant],
+                        Arc::from(&tokens[participant][..range.end]),
+                        range.end,
+                    ),
+                    u64::try_from(range.end.div_ceil(16)).unwrap(),
+                );
+            }
         }
         assert_eq!(
             values, reference.values,
@@ -667,7 +715,7 @@ fn compare(kind: AttentionKind) {
         println!(
             "{}",
             serde_json::json!({"kind":"resident_decode_program_correctness", "attention":format!("{kind:?}"),
-            "position":position,"participants":2,"resident_hot":hot,"full_output_state_bits_equal":true,
+            "position":position,"participant_positions":ranges.iter().map(|r|r.start).collect::<Vec<_>>(),"participants":2,"resident_hot":hot,"full_output_state_bits_equal":true,
             "resident_encodes":fixtures[1]._composition._runtime.resident_decode_program_encodes()})
         );
         if kind == AttentionKind::GatedDelta && hot_count >= 3 {

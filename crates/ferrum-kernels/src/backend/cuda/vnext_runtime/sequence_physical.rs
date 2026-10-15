@@ -126,6 +126,10 @@ pub(crate) struct CudaPhysicalRowWindow {
 }
 
 impl CudaPhysicalRowWindow {
+    pub(crate) fn table_index(&self) -> usize {
+        self.table_index
+    }
+
     /// Only a typed, Core-verified append refresh may grow this window. Page
     /// addresses come from the new table, never from extrapolating old pointers.
     pub(crate) fn refreshed(

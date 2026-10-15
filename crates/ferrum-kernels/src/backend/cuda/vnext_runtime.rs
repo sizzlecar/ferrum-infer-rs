@@ -671,6 +671,22 @@ struct CudaBindingProgramProjection {
     compact: bool,
 }
 
+/// Validated host packet and physical projection, before allocating any GPU
+/// transport or numerical-status readback. Both ordinary and resident lowering
+/// use this exact frozen representation.
+struct FrozenBindingProgram {
+    nodes: Vec<CudaBindingProgramNode>,
+    owners: Arc<CudaSegmentOwnerTable>,
+    packet: Box<[u8]>,
+    copies: Vec<(std::ops::Range<usize>, u64, usize, usize, usize)>,
+    arena_ptr: u64,
+    runtime_instance: u64,
+    participants: u32,
+    tokens: u64,
+    descriptor_count: u32,
+    upload_plan: DeviceProgramBindingUploadSnapshot,
+}
+
 /// One fresh frame writes directly into a shared byte buffer. Rules are visited
 /// in compiled node order, without constructing provider commands or patches.
 pub(crate) struct CudaBindingProgramSink {
@@ -849,13 +865,10 @@ impl CudaBindingProgramSink {
             .collect()
     }
 
-    fn finish(
+    fn freeze(
         mut self,
         owners: Arc<CudaSegmentOwnerTable>,
-        scatter: &binding_scatter::BindingScatter,
-        allocation_stream: &Arc<CudaStream>,
-        upload_counters: Arc<ProgramBindingUploadCounters>,
-    ) -> Result<CudaDeviceCommand, CudaDeviceRuntimeError> {
+    ) -> Result<FrozenBindingProgram, CudaDeviceRuntimeError> {
         let invalid = CudaDeviceRuntimeError::contract;
         let first = self
             .nodes
@@ -901,7 +914,6 @@ impl CudaBindingProgramSink {
             ..Default::default()
         };
         let mut row_indices = Vec::new();
-        let mut checks = Vec::new();
         for (node_index, node) in self.nodes.iter().enumerate() {
             let slot_offset = node.binding.slot().physical_offset_bytes();
             if arena_ptr.checked_add(slot_offset) != Some(node.destination.device_ptr) {
@@ -923,30 +935,6 @@ impl CudaBindingProgramSink {
                     .checked_add(write.destination_offset_bytes)
                     .ok_or_else(|| invalid("compiled write offset overflows"))?;
                 row_indices.push((destination, node_index, write_index));
-            }
-            if let Some((offsets, failure_mask)) = &node.numerical_status {
-                let mut host = unsafe {
-                    node.destination
-                        ._allocation
-                        ._base
-                        .context()
-                        .alloc_pinned::<u32>(offsets.len())
-                }
-                .map_err(|error| {
-                    CudaDeviceRuntimeError::driver("numerical status host allocation", error)
-                })?;
-                host.as_mut_slice()
-                    .map_err(|error| {
-                        CudaDeviceRuntimeError::driver("numerical status initialization", error)
-                    })?
-                    .fill(0);
-                checks.push(Arc::new(CudaCompletionReadback {
-                    source: node.destination.clone(),
-                    offsets: offsets.clone(),
-                    failure_mask: *failure_mask,
-                    deferred: true,
-                    host: Mutex::new(host),
-                }));
             }
         }
         // Only scalar positions are ordered; no node command is constructed or
@@ -1018,6 +1006,66 @@ impl CudaBindingProgramSink {
                 "compiled packet omitted or duplicated a live write",
             ));
         }
+        Ok(FrozenBindingProgram {
+            nodes: self.nodes,
+            owners,
+            packet: packet.into_boxed_slice(),
+            copies,
+            arena_ptr,
+            runtime_instance,
+            participants,
+            tokens,
+            descriptor_count: count,
+            upload_plan,
+        })
+    }
+
+    fn finish(
+        self,
+        owners: Arc<CudaSegmentOwnerTable>,
+        scatter: &binding_scatter::BindingScatter,
+        allocation_stream: &Arc<CudaStream>,
+        upload_counters: Arc<ProgramBindingUploadCounters>,
+    ) -> Result<CudaDeviceCommand, CudaDeviceRuntimeError> {
+        let FrozenBindingProgram {
+            nodes,
+            owners,
+            packet,
+            copies,
+            arena_ptr,
+            runtime_instance,
+            participants,
+            tokens,
+            descriptor_count: count,
+            mut upload_plan,
+        } = self.freeze(owners)?;
+        let mut checks = Vec::new();
+        for node in &nodes {
+            if let Some((offsets, failure_mask)) = &node.numerical_status {
+                let mut host = unsafe {
+                    node.destination
+                        ._allocation
+                        ._base
+                        .context()
+                        .alloc_pinned::<u32>(offsets.len())
+                }
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("numerical status host allocation", error)
+                })?;
+                host.as_mut_slice()
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("numerical status initialization", error)
+                    })?
+                    .fill(0);
+                checks.push(Arc::new(CudaCompletionReadback {
+                    source: node.destination.clone(),
+                    offsets: offsets.clone(),
+                    failure_mask: *failure_mask,
+                    deferred: true,
+                    host: Mutex::new(host),
+                }));
+            }
+        }
         let owner = scatter.prepare_encoded(allocation_stream, packet.len(), count)?;
         let compact = owner.is_some();
         upload_plan.compact_scatter_preludes = u64::from(compact);
@@ -1028,7 +1076,7 @@ impl CudaBindingProgramSink {
             upload_plan.live_payload_bytes
         };
         let projection = Arc::new(CudaBindingProgramProjection {
-            nodes: self.nodes,
+            nodes,
             owners: Arc::clone(&owners),
             descriptor_count: count,
             compact,
@@ -1040,7 +1088,7 @@ impl CudaBindingProgramSink {
             .collect();
         let executable = Arc::new(CudaCommandExecutable::static_work(
             destinations,
-            vec![packet.into_boxed_slice()],
+            vec![packet],
             Box::new(move |stream, _blas, _regions, host_storage| {
                 let [packet] = host_storage else {
                     return Err(CudaDeviceRuntimeError::contract(

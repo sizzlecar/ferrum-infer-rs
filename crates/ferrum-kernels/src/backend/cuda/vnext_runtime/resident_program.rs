@@ -41,6 +41,8 @@ struct ResidentProgramData {
     packet: Box<[u8]>,
     projection: Arc<CudaBindingProgramProjection>,
     controls: Vec<ControlPatch>,
+    // Cold node/write lookup, independent of any fresh authority or frontier.
+    control_indices: Vec<Vec<Option<usize>>>,
     dependency_count: usize,
     dependencies: Arc<[CudaDeviceCommand]>,
     upload_plan: DeviceProgramBindingUploadSnapshot,
@@ -79,36 +81,28 @@ fn seal(
     {
         return Ok(None);
     }
-    let scatter = runtime
-        .binding_scatter
-        .as_ref()
-        .ok_or_else(|| invalid("resident scatter module is absent"))?;
-    // Reuse the sink at cold installation or append refresh. Its temporary
-    // transport allocation/synchronization is real refresh cost; it is never
-    // enqueued and is dropped after freezing the immutable packet.
-    let mut command = sink.finish(
-        owners,
-        scatter,
-        &runtime.allocation_stream,
-        Arc::clone(&runtime.program_binding_upload_counters),
-    )?;
-    let projection = command
-        .binding_program
-        .take()
-        .ok_or_else(|| invalid("resident cold projection is absent"))?;
-    let mut projection = Arc::try_unwrap(projection)
-        .map_err(|_| invalid("resident cold projection unexpectedly shared"))?;
-    if !projection.compact {
-        return Ok(None);
+    if runtime.binding_scatter.is_none() {
+        return Err(invalid("resident scatter module is absent"));
     }
-    let executable = command
-        .executable
-        .as_ref()
-        .ok_or_else(|| invalid("resident cold executable is absent"))?;
-    let [packet] = executable.host_storage.as_slice() else {
-        return Err(invalid("resident cold packet count differs"));
+    // Freeze the same fully validated host representation as ordinary lowering.
+    // The real transport is allocated once by encode for the current use; cold
+    // installation and append refresh neither allocate nor synchronize a dummy.
+    let FrozenBindingProgram {
+        nodes,
+        owners,
+        packet,
+        arena_ptr: arena,
+        runtime_instance,
+        descriptor_count,
+        mut upload_plan,
+        ..
+    } = sink.freeze(owners)?;
+    let mut projection = CudaBindingProgramProjection {
+        nodes,
+        owners,
+        descriptor_count,
+        compact: true,
     };
-    let packet = packet.clone();
     let first = projection
         .nodes
         .first()
@@ -118,18 +112,20 @@ fn seal(
     }
     let participants = first.participants;
     let tokens = first.tokens;
-    let arena = first
-        .destination
-        .device_ptr
-        .checked_sub(first.binding.slot().physical_offset_bytes())
-        .ok_or_else(|| invalid("resident arena underflows"))?;
     let mut controls = Vec::with_capacity(rules.len());
+    let mut control_indices: Vec<Vec<Option<usize>>> = projection
+        .nodes
+        .iter()
+        .map(|node| vec![None; node.writes.len()])
+        .collect();
     for rule in rules {
-        let node = projection
+        let node_index = projection
             .nodes
-            .iter()
-            .find(|n| n.binding.node_index() == rule.node_index as usize)
-            .ok_or_else(|| invalid("resident control node is absent"))?;
+            .binary_search_by_key(&(rule.node_index as usize), |node| {
+                node.binding.node_index()
+            })
+            .map_err(|_| invalid("resident control node is absent"))?;
+        let node = &projection.nodes[node_index];
         let write = node
             .writes
             .get(rule.write_index)
@@ -137,24 +133,19 @@ fn seal(
         if write.payload.len() < 24 || write.payload.end > packet.len() {
             return Err(invalid("resident controls exceed the sealed packet"));
         }
+        let slot = &mut control_indices[node_index][rule.write_index];
+        if slot.replace(controls.len()).is_some() {
+            return Err(invalid("resident control row is repeated"));
+        }
         controls.push(ControlPatch {
             offset: write.payload.start,
             rule,
         });
     }
-    let mut upload_plan = DeviceProgramBindingUploadSnapshot {
-        physical_arena_bytes: first.binding.layout().physical_size_bytes(),
-        planned_upload_bytes: packet.len() as u64,
-        compact_scatter_preludes: 1,
-        ..Default::default()
-    };
+    upload_plan.planned_upload_bytes = packet.len() as u64;
+    upload_plan.compact_scatter_preludes = 1;
+    upload_plan.compact_scatter_sparse_fallback_preludes = 0;
     for node in &mut projection.nodes {
-        upload_plan.logical_arena_bytes += node.destination.length_bytes;
-        upload_plan.live_payload_bytes += node
-            .writes
-            .iter()
-            .map(|w| w.live_payload_bytes)
-            .sum::<u64>();
         // Allocation identity and ranges are cold facts. Current authority is
         // held by each new command's fresh-use retention, never this old scope.
         node.destination._core_retention = None;
@@ -162,18 +153,18 @@ fn seal(
         node.reusable_address_scope = None;
     }
     let data = ResidentProgramData {
-        runtime_instance: command.runtime_instance,
+        runtime_instance,
         participants,
         tokens,
         arena,
         packet,
         projection: Arc::new(projection),
         controls,
+        control_indices,
         dependency_count,
         dependencies,
         upload_plan,
     };
-    drop(command);
     Ok(Some(Arc::new(ResidentProgram(Arc::new(data)))))
 }
 
@@ -204,6 +195,7 @@ pub(super) fn refresh(
     // Preserve the old projection's ordinal table order. Core has proved exact
     // physical prefix identity; we only replace its owning immutable version.
     let mut tables = Vec::with_capacity(data.projection.owners.physical_tables().len());
+    let mut changed_tables = Vec::with_capacity(tables.capacity());
     for old in data.projection.owners.physical_tables() {
         let Some(index) = refresh.previous_tables().iter().position(|table| {
             table.backend_bindings().is_some_and(|backend| {
@@ -218,12 +210,13 @@ pub(super) fn refresh(
         let table = Arc::clone(backend)
             .downcast::<sequence_physical::CudaSequencePhysicalTable>()
             .map_err(|_| invalid("resident refresh has another physical provider"))?;
+        changed_tables.push(!Arc::ptr_eq(old, &table));
         tables.push(table);
     }
     let owners = Arc::new(CudaSegmentOwnerTable::physical(tables));
     let mut sink = CudaBindingProgramSink::new();
     let mut rules = Vec::with_capacity(data.controls.len());
-    for node in &data.projection.nodes {
+    for (node_index, node) in data.projection.nodes.iter().enumerate() {
         let CudaBindingProgramRanges::Physical(old_rows) = &node.ranges else {
             return Ok(None);
         };
@@ -236,36 +229,48 @@ pub(super) fn refresh(
             node.tokens,
         )?;
         for (index, write) in node.writes.iter().enumerate() {
-            let patch = data.controls.iter().find(|patch| {
-                patch.rule.node_index as usize == node.binding.node_index()
-                    && patch.rule.write_index == index
-            });
-            let payload = if let Some(patch) = patch {
+            let patch =
+                data.control_indices[node_index][index].map(|control| &data.controls[control]);
+            let replacement = if let Some(patch) = patch {
                 let Some((values, bytes)) = (patch.rule.values)(work)? else {
                     return Ok(None);
                 };
                 let row = rows
                     .get_mut(index)
                     .ok_or_else(|| invalid("resident refresh causal row is absent"))?;
-                *row = row.refreshed(owners.physical_tables(), bytes)?;
-                let addresses = (0..row.len())
-                    .map(|i| {
-                        row.region(owners.physical_tables(), i)
-                            .map(|region| region.device_ptr())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let changed = *changed_tables
+                    .get(row.table_index())
+                    .ok_or_else(|| invalid("resident refresh causal owner is absent"))?;
                 let mut rule = patch.rule.clone();
                 rule.state_bytes = bytes;
                 rules.push(rule);
-                (patch.rule.payload)(values, &addresses)?
+                // A different physical owner or live page window needs current
+                // addresses. Otherwise retain the validated address payload;
+                // encode still patches all six fresh controls for every row.
+                if changed || bytes != patch.rule.state_bytes {
+                    *row = row.refreshed(owners.physical_tables(), bytes)?;
+                    let addresses = (0..row.len())
+                        .map(|i| {
+                            row.region(owners.physical_tables(), i)
+                                .map(|region| region.device_ptr())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Some((patch.rule.payload)(values, &addresses)?)
+                } else {
+                    None
+                }
             } else {
-                data.packet
+                None
+            };
+            let payload = match &replacement {
+                Some(payload) => payload.as_ref(),
+                None => data
+                    .packet
                     .get(write.payload.clone())
-                    .ok_or_else(|| invalid("resident refresh payload is outside packet"))?
-                    .into()
+                    .ok_or_else(|| invalid("resident refresh payload is outside packet"))?,
             };
             sink.write(write.destination_offset_bytes, payload.len(), |target| {
-                target.extend_from_slice(&payload);
+                target.extend_from_slice(payload);
                 Ok(())
             })?;
         }
