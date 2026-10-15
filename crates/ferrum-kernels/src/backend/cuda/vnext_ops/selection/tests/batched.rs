@@ -127,7 +127,7 @@ impl Fixture {
             .collect()
     }
 
-    fn verify_storage(&self, stream: &cudarc::driver::CudaStream) {
+    fn verify_storage(&self, stream: &Arc<cudarc::driver::CudaStream>) {
         let scratch = stream.clone_dtoh(&self.scratch).unwrap();
         for (index, row) in self.rows.iter().enumerate() {
             assert_eq!(
