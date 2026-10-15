@@ -1,5 +1,6 @@
 //! Backend physical facts owned by a Sequence catalog, never by an old wave.
 //! The core grants a fresh logical window before these pre-sliced rows are used.
+use super::segment_owners::CudaRegionView;
 use super::*;
 use ferrum_interfaces::vnext::{DynamicStorageView, SequencePhysicalBindingTable};
 use std::collections::HashMap;
