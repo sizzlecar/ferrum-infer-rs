@@ -89,6 +89,7 @@ impl CausalDecodePreparationModeArg {
 pub enum CausalDecodeAttentionGroupingArg {
     Contiguous,
     Indexed,
+    FixedCapacity,
 }
 
 impl CausalDecodeAttentionGroupingArg {
@@ -99,6 +100,9 @@ impl CausalDecodeAttentionGroupingArg {
             }
             Self::Indexed => {
                 ferrum_types::CausalDecodeAttentionGrouping::Indexed.as_runtime_value()
+            }
+            Self::FixedCapacity => {
+                ferrum_types::CausalDecodeAttentionGrouping::FixedCapacity.as_runtime_value()
             }
         }
     }
@@ -291,6 +295,10 @@ mod tests {
             for (value, expected) in [
                 ("contiguous", CausalDecodeAttentionGroupingArg::Contiguous),
                 ("indexed", CausalDecodeAttentionGroupingArg::Indexed),
+                (
+                    "fixed-capacity",
+                    CausalDecodeAttentionGroupingArg::FixedCapacity,
+                ),
             ] {
                 let parsed = TestCli::try_parse_from([
                     "ferrum",
@@ -301,6 +309,7 @@ mod tests {
                 ])
                 .unwrap();
                 assert_eq!(parsed.causal_decode_attention_grouping(), Some(expected));
+                assert_eq!(expected.as_runtime_value(), value);
             }
             assert!(TestCli::try_parse_from([
                 "ferrum",

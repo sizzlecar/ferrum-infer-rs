@@ -114,6 +114,7 @@ const COMPUTE_VLLM_DECODE_V1_OPERATION: &str =
 const COMPUTE_VLLM_DECODE_V2_OPERATION: &str =
     "vnext.causal_attention.vllm_paged_attention_v2_addressed";
 const COMPUTE_MIXED_OPERATION: &str = "vnext.causal_attention.mixed_native_paths";
+const COMPUTE_FIXED_OPERATION: &str = "vnext.causal_attention.fixed_capacity_native_paths";
 const SCRATCH_ALIGNMENT: u64 = 16;
 const POINTER_BYTES: u64 = std::mem::size_of::<u64>() as u64;
 // table entries, source start, active tokens, sequence tokens, packed token
@@ -216,6 +217,8 @@ struct CausalAttentionFunctions {
     prepare: CudaFunction,
     gather_decode_lengths: CudaFunction,
     gather_decode_lengths_indexed: CudaFunction,
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    gather_decode_lengths_fixed_capacity: CudaFunction,
     attention: CudaFunction,
     grouped_attention: CudaFunction,
     varlen_addressed: CudaFunction,
@@ -491,6 +494,7 @@ impl CudaCausalPagedAttentionProvider {
             crate::native_ops::CUDA_NATIVE_SOURCE_BUNDLE_ID.as_bytes(),
         ]);
         provider_sources.push(attention_policy.as_runtime_value().as_bytes());
+        provider_sources.push(include_bytes!("causal_attention/batch_decode/fixed.rs"));
         provider_sources.push(semantics.fingerprint_tag());
         provider_sources.push(include_bytes!("../../../program_binding_rows.rs"));
 
@@ -741,6 +745,12 @@ impl CudaCausalPagedAttentionProvider {
                 &attention_module,
                 "vnext_causal_gather_decode_lengths_indexed",
                 "causal attention indexed decode length gather",
+            )?,
+            #[cfg(feature = "cuda-indexed-causal-attention")]
+            gather_decode_lengths_fixed_capacity: load_function(
+                &attention_module,
+                "vnext_causal_gather_decode_lengths_fixed_capacity",
+                "causal attention fixed-capacity decode length gather",
             )?,
             attention: load_function(
                 &attention_module,
@@ -1002,8 +1012,13 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
-        reusable_attention_topology(&request, self.attention_policy, self.semantics)
-            .map_err(invalid_plan)
+        reusable_attention_topology(
+            &request,
+            self.attention_policy,
+            self.semantics,
+            self.decode_attention_grouping,
+        )
+        .map_err(invalid_plan)
     }
 
     fn encode_selected(
@@ -1395,6 +1410,7 @@ fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
     attention_policy: AttentionExecutionPolicy,
     semantics: CausalAttentionSemantics,
+    grouping: CausalDecodeAttentionGrouping,
 ) -> Result<ReusableExecutionTopology, String> {
     let shape = CausalAttentionShape::from_attributes_for(request.attributes(), semantics)?;
     let ranges = request.work_shape().participant_token_ranges();
@@ -1402,6 +1418,40 @@ fn reusable_attention_topology(
         return Err("CUDA causal topology has no participant token ranges".to_owned());
     }
 
+    if grouping == CausalDecodeAttentionGrouping::FixedCapacity
+        && cfg!(feature = "cuda-indexed-causal-attention")
+        && ranges.len() > 1
+        && !shape.int8_kv
+        && request
+            .binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)
+            .map_err(|error| error.to_string())?
+        && request
+            .binding_uses_packed_batch_coordinates(ResolvedValueRole::Output, 0)
+            .map_err(|error| error.to_string())?
+    {
+        let rows = ranges
+            .iter()
+            .map(|range| {
+                let source = range.source_token_range();
+                if source.end > range.full_input_tokens()
+                    || range.full_input_tokens() > shape.maximum_context_tokens
+                {
+                    return Err(
+                        "causal topology token range exceeds its admitted context".to_owned()
+                    );
+                }
+                Ok(CausalAttentionTopologyRow {
+                    active_tokens: range.immediate_tokens(),
+                    sequence_tokens: source.end,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if let Some(topology) =
+            reusable_fixed_attention_topology_from_rows(attention_policy, shape, &rows)?
+        {
+            return Ok(topology);
+        }
+    }
     reusable_attention_topology_from_rows(
         attention_policy,
         shape,
@@ -1425,6 +1475,62 @@ fn reusable_attention_topology(
 struct CausalAttentionTopologyRow {
     active_tokens: u64,
     sequence_tokens: u64,
+}
+
+fn reusable_fixed_attention_topology_from_rows(
+    attention_policy: AttentionExecutionPolicy,
+    shape: CausalAttentionShape,
+    rows: &[CausalAttentionTopologyRow],
+) -> Result<Option<ReusableExecutionTopology>, String> {
+    if rows.len() <= 1 || shape.int8_kv {
+        return Ok(None);
+    }
+    for row in rows {
+        if row.active_tokens != 1 {
+            return Ok(None);
+        }
+        let path = CausalAttentionKernelPath::select(
+            attention_policy,
+            shape,
+            row.active_tokens,
+            row.sequence_tokens,
+        )?;
+        if !matches!(
+            path,
+            CausalAttentionKernelPath::VllmAddressedDecodeV1
+                | CausalAttentionKernelPath::VllmAddressedDecodeV2
+        ) {
+            return Ok(None);
+        }
+        CausalAttentionReplayTopology::new(shape, path, row.sequence_tokens)?;
+    }
+    let binding = BindingLayout::new(shape, rows.len())?;
+    let v1_capacity = VLLM_PARTITION_TOKENS.min(shape.maximum_context_tokens);
+    batch_decode::BatchDecode::dimensions(
+        rows.len(),
+        binding,
+        v1_capacity,
+        shape.query_heads,
+        shape.head_dim,
+    )?;
+    if shape.maximum_context_tokens > VLLM_PARTITION_TOKENS {
+        batch_decode::BatchDecode::dimensions(
+            rows.len(),
+            binding,
+            shape.maximum_context_tokens,
+            shape.query_heads,
+            shape.head_dim,
+        )?;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"ferrum.cuda.causal-attention.fixed-capacity-topology.v1\0");
+    digest.update((rows.len() as u64).to_le_bytes());
+    digest.update(v1_capacity.to_le_bytes());
+    digest.update(shape.maximum_context_tokens.to_le_bytes());
+    digest.update(binding.slot_bytes.to_le_bytes());
+    Ok(Some(ReusableExecutionTopology::Dynamic(
+        DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
+    )))
 }
 
 fn reusable_attention_topology_from_rows<I>(
@@ -2913,7 +3019,7 @@ fn encode_attention(
         .map(CausalAttentionKernelPath::operation)
         .unwrap_or(COMPUTE_MIXED_OPERATION);
     let packed_enabled = packed.is_some();
-    let batch_decode = batch_decode::BatchDecode::for_launches(
+    let batch_decode = batch_decode::PreparedBatchDecode::for_launches(
         &launches,
         packed_enabled,
         binding_layout,
@@ -2923,6 +3029,11 @@ fn encode_attention(
         independent_sequence_kv,
         decode_attention_grouping,
     )?;
+    let compute_operation = if batch_decode.as_ref().is_some_and(|batch| batch.is_fixed()) {
+        COMPUTE_FIXED_OPERATION
+    } else {
+        compute_operation
+    };
     let compute_dispatch_count = if let Some(batch) = &batch_decode {
         batch.dispatch_count(&launches, shape.output_gate, shape.post_attention_norm)
     } else {
@@ -3060,10 +3171,13 @@ fn encode_attention(
                     .u64(launch.packed_query)
                     .u64(launch.packed_context)
                     .u64(launch.tokens)
-                    .i32(launch.tokens_i32)
-                    .u64(replay_envelope.sequence_capacity_tokens)
-                    .i32(replay_envelope.table_capacity_entries)
-                    .u64(launch.path.replay_id());
+                    .i32(launch.tokens_i32);
+                if !batch_decode.as_ref().is_some_and(|batch| batch.is_fixed()) {
+                    replay_key = replay_key
+                        .u64(replay_envelope.sequence_capacity_tokens)
+                        .i32(replay_envelope.table_capacity_entries)
+                        .u64(launch.path.replay_id());
+                }
             }
             replay_key.finish()
         });
@@ -3500,7 +3614,7 @@ fn enqueue_packed_attention(
     shared: &SharedRegions,
     q8act: Option<&PreparedAttentionProjections>,
     packed: PackedCausalAttentionLaunch,
-    batch_decode: Option<&batch_decode::BatchDecode>,
+    batch_decode: Option<&batch_decode::PreparedBatchDecode>,
     launches: &[CausalAttentionLaunch],
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -5371,6 +5485,92 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::CanonicalRational;
+
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    #[test]
+    fn fixed_capacity_topology_reuses_only_qualified_decode_geometry() {
+        let shape = goal_shape(24, 4, 256, 2_048);
+        let make = |lengths: &[u64]| {
+            let rows = lengths
+                .iter()
+                .map(|&sequence_tokens| CausalAttentionTopologyRow {
+                    active_tokens: 1,
+                    sequence_tokens,
+                })
+                .collect::<Vec<_>>();
+            reusable_fixed_attention_topology_from_rows(
+                AttentionExecutionPolicy::NativeAdaptive,
+                shape,
+                &rows,
+            )
+            .unwrap()
+        };
+        assert_eq!(make(&[129, 512, 257]), make(&[513, 1_025, 2_048]));
+        assert_eq!(make(&[513, 512, 1_025]), make(&[1_025, 513, 512]));
+        assert_ne!(make(&[129, 512, 257]), make(&[129, 512, 257, 513]));
+        assert!(make(&[512]).is_none());
+        let prefill = [CausalAttentionTopologyRow {
+            active_tokens: 2,
+            sequence_tokens: 64,
+        }; 2];
+        assert!(reusable_fixed_attention_topology_from_rows(
+            AttentionExecutionPolicy::NativeAdaptive,
+            shape,
+            &prefill
+        )
+        .unwrap()
+        .is_none());
+        let decode = [CausalAttentionTopologyRow {
+            active_tokens: 1,
+            sequence_tokens: 64,
+        }; 2];
+        assert!(reusable_fixed_attention_topology_from_rows(
+            AttentionExecutionPolicy::Portable,
+            shape,
+            &decode
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    #[test]
+    fn fixed_capacity_topology_retains_capacity_and_invalid_frontier_bounds() {
+        let rows = [CausalAttentionTopologyRow {
+            active_tokens: 1,
+            sequence_tokens: 64,
+        }; 2];
+        let make = |context| {
+            reusable_fixed_attention_topology_from_rows(
+                AttentionExecutionPolicy::NativeAdaptive,
+                goal_shape(24, 4, 256, context),
+                &rows,
+            )
+            .unwrap()
+        };
+        assert_ne!(make(512), make(2_048));
+        assert_ne!(make(2_048), make(4_096));
+        let invalid = [CausalAttentionTopologyRow {
+            active_tokens: 1,
+            sequence_tokens: 0,
+        }; 2];
+        assert!(reusable_fixed_attention_topology_from_rows(
+            AttentionExecutionPolicy::NativeAdaptive,
+            goal_shape(24, 4, 256, 2_048),
+            &invalid
+        )
+        .is_err());
+        let invalid = [CausalAttentionTopologyRow {
+            active_tokens: 1,
+            sequence_tokens: 2_049,
+        }; 2];
+        assert!(reusable_fixed_attention_topology_from_rows(
+            AttentionExecutionPolicy::NativeAdaptive,
+            goal_shape(24, 4, 256, 2_048),
+            &invalid
+        )
+        .is_err());
+    }
 
     pub(super) fn attributes(output_gate: bool) -> BTreeMap<AttributeId, SemanticValue> {
         BTreeMap::from([

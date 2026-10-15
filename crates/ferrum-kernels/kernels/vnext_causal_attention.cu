@@ -78,6 +78,27 @@ extern "C" __global__ void vnext_causal_gather_decode_lengths_indexed(
   }
 }
 
+// Fixed-capacity replay uses two maps indexed by the original row. Every
+// submission overwrites all lengths and both masks before attention reads them.
+// Indexed attention returns on -1 before reading an original row or scratch.
+extern "C" __global__ void vnext_causal_gather_decode_lengths_fixed_capacity(
+    const int* __restrict__ binding_base,
+    const unsigned long long binding_slot_bytes,
+    int* __restrict__ sequence_lengths,
+    int* __restrict__ v1_rows,
+    int* __restrict__ v2_rows,
+    const int participants) {
+  const int participant = blockIdx.x * blockDim.x + threadIdx.x;
+  if (participant >= participants) {
+    return;
+  }
+  const int length =
+      vnext_participant_control(binding_base, binding_slot_bytes, participant)[3];
+  sequence_lengths[participant] = length;
+  v1_rows[participant] = length > 0 && length <= 512 ? participant : -1;
+  v2_rows[participant] = length > 512 ? participant : -1;
+}
+
 // Packed query rows are contiguous even when their owning sequences have
 // different active-token counts. Resolve a packed row with a bounded binary
 // search over the stable binding slots so grid.x can be the packed token axis;

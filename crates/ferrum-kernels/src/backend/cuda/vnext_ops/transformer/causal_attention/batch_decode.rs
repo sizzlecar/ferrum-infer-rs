@@ -696,3 +696,139 @@ pub(super) fn gather_lengths(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "cuda-indexed-causal-attention")]
+pub(super) mod fixed;
+
+pub(super) enum PreparedBatchDecode {
+    Grouped(BatchDecode),
+    #[cfg(feature = "cuda-indexed-causal-attention")]
+    Fixed(fixed::FixedBatchDecode),
+}
+
+impl PreparedBatchDecode {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn for_launches(
+        launches: &[CausalAttentionLaunch],
+        packed: bool,
+        binding: BindingLayout,
+        shape: CausalAttentionShape,
+        layout: ScratchLayout,
+        packed_prepare_gate: bool,
+        independent_sequence_kv: bool,
+        grouping: CausalDecodeAttentionGrouping,
+    ) -> Result<Option<Self>, String> {
+        if grouping == CausalDecodeAttentionGrouping::FixedCapacity {
+            #[cfg(feature = "cuda-indexed-causal-attention")]
+            return fixed::FixedBatchDecode::for_launches(
+                launches,
+                packed,
+                binding,
+                shape,
+                layout,
+                packed_prepare_gate,
+                independent_sequence_kv,
+            )
+            .map(|batch| batch.map(Self::Fixed));
+            #[cfg(not(feature = "cuda-indexed-causal-attention"))]
+            return Err("fixed causal replay requires compiled indexed attention".into());
+        }
+        BatchDecode::for_launches(
+            launches,
+            packed,
+            binding,
+            shape,
+            layout,
+            packed_prepare_gate,
+            independent_sequence_kv,
+            grouping,
+        )
+        .map(|batch| batch.map(Self::Grouped))
+    }
+
+    pub(super) fn is_fixed(&self) -> bool {
+        match self {
+            Self::Grouped(_) => false,
+            #[cfg(feature = "cuda-indexed-causal-attention")]
+            Self::Fixed(_) => true,
+        }
+    }
+
+    pub(super) fn packed_work(&self) -> Option<PackedDecodeWork> {
+        match self {
+            Self::Grouped(batch) => batch.packed_work(),
+            #[cfg(feature = "cuda-indexed-causal-attention")]
+            Self::Fixed(batch) => batch.packed_work(),
+        }
+    }
+
+    pub(super) fn dispatch_count(
+        &self,
+        launches: &[CausalAttentionLaunch],
+        output_gate: bool,
+        post_norm: bool,
+    ) -> u64 {
+        match self {
+            Self::Grouped(batch) => batch.dispatch_count(launches, output_gate, post_norm),
+            #[cfg(feature = "cuda-indexed-causal-attention")]
+            Self::Fixed(batch) => batch.dispatch_count(launches, output_gate, post_norm),
+        }
+    }
+
+    pub(super) fn bind_replay(
+        &self,
+        key: CudaCommandReplayKeyBuilder,
+    ) -> CudaCommandReplayKeyBuilder {
+        match self {
+            Self::Grouped(batch) => batch.bind_replay(key),
+            #[cfg(feature = "cuda-indexed-causal-attention")]
+            Self::Fixed(batch) => batch.bind_replay(key),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue(
+        &self,
+        stream: &CudaStream,
+        functions: &CausalAttentionFunctions,
+        launches: &[CausalAttentionLaunch],
+        binding: u64,
+        binding_layout: BindingLayout,
+        shape: CudaCausalAttentionShape,
+        layout: ScratchLayout,
+        scratch: u64,
+        query_norm: u64,
+        key_norm: u64,
+        output_gate: bool,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        match self {
+            Self::Grouped(batch) => batch.enqueue(
+                stream,
+                functions,
+                launches,
+                binding,
+                binding_layout,
+                shape,
+                layout,
+                scratch,
+                query_norm,
+                key_norm,
+                output_gate,
+            ),
+            #[cfg(feature = "cuda-indexed-causal-attention")]
+            Self::Fixed(batch) => batch.enqueue(
+                stream,
+                functions,
+                launches,
+                binding,
+                binding_layout,
+                shape,
+                layout,
+                scratch,
+                query_norm,
+                key_norm,
+                output_gate,
+            ),
+        }
+    }
+}
