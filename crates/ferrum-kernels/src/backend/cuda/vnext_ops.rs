@@ -78,7 +78,10 @@ use ferrum_interfaces::vnext::{
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
 use native_io::TokenPrecision;
-use selection::{argmax_dispatches, ArgmaxArguments, ArgmaxFunctions, ArgmaxPrecision};
+use selection::{
+    argmax_dispatches, ArgmaxArguments, ArgmaxBatchArguments, ArgmaxFunctions, ArgmaxPrecision,
+    ARGMAX_BATCH_ROWS,
+};
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
@@ -2608,9 +2611,11 @@ fn encode_last_token_masked_argmax(
         .map_err(|_| "masked argmax participant count exceeds u32".to_owned())?;
     let dispatches_per_participant = argmax_dispatches(launches[0].vocabulary_size);
     let parallel = dispatches_per_participant == 2;
+    let batched = parallel && (2..=ARGMAX_BATCH_ROWS).contains(&launches.len());
     let mut replay_key =
         CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_masked_argmax")
             .u64(dispatches_per_participant)
+            .u64(u64::from(batched))
             .u64(launches.len() as u64);
     for launch in &launches {
         replay_key = replay_key
@@ -2625,24 +2630,23 @@ fn encode_last_token_masked_argmax(
         regions,
         replay_key.finish(),
         move |stream, regions| {
-            for launch in &launches {
-                let logits = regions[launch.first_region].device_ptr();
-                let valid_mask = regions[launch.first_region + 1].device_ptr();
-                let repetition_token_ids = regions[launch.first_region + 2].device_ptr();
-                let repetition_offsets = regions[launch.first_region + 3].device_ptr();
-                let repetition_penalty = regions[launch.first_region + 4].device_ptr();
-                let output = regions[launch.first_region + 5].device_ptr();
-                let scratch = regions[scratch_region]
-                    .device_ptr()
-                    .checked_add(launch.scratch_offset_bytes)
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "vNext masked argmax scratch pointer overflows",
-                        )
-                    })?;
-                functions.launch(
-                    stream,
-                    ArgmaxArguments {
+            let arguments =
+                |launch: &MaskedArgmaxLaunch| -> Result<ArgmaxArguments, CudaDeviceRuntimeError> {
+                    let logits = regions[launch.first_region].device_ptr();
+                    let valid_mask = regions[launch.first_region + 1].device_ptr();
+                    let repetition_token_ids = regions[launch.first_region + 2].device_ptr();
+                    let repetition_offsets = regions[launch.first_region + 3].device_ptr();
+                    let repetition_penalty = regions[launch.first_region + 4].device_ptr();
+                    let output = regions[launch.first_region + 5].device_ptr();
+                    let scratch = regions[scratch_region]
+                        .device_ptr()
+                        .checked_add(launch.scratch_offset_bytes)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "vNext masked argmax scratch pointer overflows",
+                            )
+                        })?;
+                    Ok(ArgmaxArguments {
                         logits,
                         scratch,
                         valid_mask,
@@ -2652,23 +2656,42 @@ fn encode_last_token_masked_argmax(
                         output,
                         vocabulary_size: launch.vocabulary_size,
                         repetition_capacity: launch.repetition_capacity,
-                    },
-                    parallel,
-                )?;
+                    })
+                };
+            if batched {
+                let mut batch_rows = [ArgmaxArguments::default(); ARGMAX_BATCH_ROWS];
+                for (index, launch) in launches.iter().enumerate() {
+                    batch_rows[index] = arguments(launch)?;
+                }
+                let parameters = ArgmaxBatchArguments::new(&batch_rows[..launches.len()])
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract("invalid batched argmax rows")
+                    })?;
+                functions.launch_batched(stream, &parameters, participant_count)?;
+            } else {
+                for launch in &launches {
+                    functions.launch(stream, arguments(launch)?, parallel)?;
+                }
             }
             Ok(())
         },
     )
     .and_then(|command| {
         command.with_work_attribution(
-            if participant_count == 1 {
+            if batched {
+                DeviceBatchingForm::Packed
+            } else if participant_count == 1 {
                 DeviceBatchingForm::Scalar
             } else {
                 DeviceBatchingForm::ParticipantLoop
             },
             participant_count,
             u64::from(participant_count),
-            u64::from(participant_count) * dispatches_per_participant,
+            if batched {
+                2
+            } else {
+                u64::from(participant_count) * dispatches_per_participant
+            },
             0,
         )
     })

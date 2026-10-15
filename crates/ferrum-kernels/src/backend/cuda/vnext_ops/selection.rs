@@ -1,7 +1,7 @@
 //! Precision of semantic logits and their private repetition-penalty view.
 
 use super::*;
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaStream, DeviceRepr};
 use ferrum_interfaces::vnext::{
     last_token_masked_argmax_f32_contract, StandardOperationContract,
     LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
@@ -14,6 +14,7 @@ pub(super) enum ArgmaxPrecision {
 }
 
 pub(super) const ARGMAX_PARTITIONS: u32 = 32;
+pub(super) const ARGMAX_BATCH_ROWS: usize = 32;
 // Two launches are worthwhile for large vocabularies; retain the scalar path
 // for small rows, where launch overhead can dominate an active penalty.
 const PARALLEL_MIN_VOCAB: i32 = 65536;
@@ -31,9 +32,12 @@ pub(super) struct ArgmaxFunctions {
     scalar: CudaFunction,
     partitioned: CudaFunction,
     finalize: CudaFunction,
+    batched: CudaFunction,
+    batched_finalize: CudaFunction,
 }
 
-#[derive(Clone, Copy)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct ArgmaxArguments {
     pub logits: u64,
     pub scratch: u64,
@@ -44,6 +48,36 @@ pub(super) struct ArgmaxArguments {
     pub output: u64,
     pub vocabulary_size: i32,
     pub repetition_capacity: i32,
+}
+
+/// The complete table is passed by value in CUDA parameter space. This avoids
+/// an additional allocation/upload lifetime and is included in both launches.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct ArgmaxBatchArguments {
+    rows: [ArgmaxArguments; ARGMAX_BATCH_ROWS],
+}
+
+// SAFETY: repr(C), initialized integer fields only, matching VNextArgmaxBatch.
+// The pointers are integers whose actual buffer ownership remains with the
+// invocation/command. Kernel parameters do not create independent authority.
+unsafe impl DeviceRepr for ArgmaxBatchArguments {}
+
+impl ArgmaxBatchArguments {
+    pub(super) fn new(rows: &[ArgmaxArguments]) -> Option<Self> {
+        if !(2..=ARGMAX_BATCH_ROWS).contains(&rows.len())
+            || rows.iter().any(|row| {
+                argmax_dispatches(row.vocabulary_size) != 2 || row.repetition_capacity <= 0
+            })
+        {
+            return None;
+        }
+        let mut batch = Self {
+            rows: [ArgmaxArguments::default(); ARGMAX_BATCH_ROWS],
+        };
+        batch.rows[..rows.len()].copy_from_slice(rows);
+        Some(batch)
+    }
 }
 
 impl ArgmaxFunctions {
@@ -63,6 +97,8 @@ impl ArgmaxFunctions {
             scalar: load(precision.kernel())?,
             partitioned: load(&format!("{}_partitioned", precision.kernel()))?,
             finalize: load("last_token_masked_argmax_finalize")?,
+            batched: load(&format!("{}_batched", precision.kernel()))?,
+            batched_finalize: load("last_token_masked_argmax_finalize_batched")?,
         })
     }
 
@@ -120,6 +156,46 @@ impl ArgmaxFunctions {
                 CudaDeviceRuntimeError::driver("vNext masked argmax finalize", error)
             })?;
         }
+        Ok(())
+    }
+
+    pub(super) fn launch_batched(
+        &self,
+        stream: &CudaStream,
+        args: &ArgmaxBatchArguments,
+        row_count: u32,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        if !(2..=ARGMAX_BATCH_ROWS as u32).contains(&row_count)
+            || args.rows[..row_count as usize].iter().any(|row| {
+                argmax_dispatches(row.vocabulary_size) != 2 || row.repetition_capacity <= 0
+            })
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "invalid argmax batch width",
+            ));
+        }
+        let mut partitioned = stream.launch_builder(&self.batched);
+        partitioned.arg(args).arg(&row_count);
+        // Same participant scratch, policies and outputs as the scalar launch;
+        // row and partition dimensions are independent, including active penalties.
+        unsafe {
+            partitioned.launch(LaunchConfig {
+                grid_dim: (ARGMAX_PARTITIONS, row_count, 1),
+                block_dim: (THREADS_PER_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("batched masked argmax", error))?;
+        let mut finalize = stream.launch_builder(&self.batched_finalize);
+        finalize.arg(args).arg(&row_count);
+        unsafe {
+            finalize.launch(LaunchConfig {
+                grid_dim: (row_count, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("batched masked argmax finalize", error))?;
         Ok(())
     }
 }
