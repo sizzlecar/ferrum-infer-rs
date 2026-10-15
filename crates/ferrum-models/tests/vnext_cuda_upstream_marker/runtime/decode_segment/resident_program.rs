@@ -104,6 +104,7 @@ fn execute(
         })
         .collect();
     let mut installing = None;
+    let mut resident_entry_before = None;
     let hot = state.program.is_some();
     let (profiled, retire) = if let Some(program) = state.program.as_ref() {
         let (use_, retirement) = match program.try_begin_use(&batch, &request).unwrap() {
@@ -111,10 +112,11 @@ fn execute(
             ResidentDecodeDecision::Fallback => return None,
             _ => panic!("unexpected resident request-state deferral"),
         };
-        let entry_before = lane
-            .reusable_execution_entry_identity(state.replay_id.as_ref().unwrap())
-            .unwrap()
-            .unwrap();
+        resident_entry_before = Some(
+            lane.reusable_execution_entry_identity(state.replay_id.as_ref().unwrap())
+                .unwrap()
+                .unwrap(),
+        );
         let identity =
             OperationDispatch::bind_resident_decode_identity(program, active.iter(), &use_, lane)
                 .unwrap();
@@ -165,14 +167,6 @@ fn execute(
                 .segment_binding_indexed_encodes(),
             indexed_before,
             "whole resident hit must bypass the ordinary owner/frame encoder"
-        );
-        let entry_after = lane
-            .reusable_execution_entry_identity(state.replay_id.as_ref().unwrap())
-            .unwrap()
-            .unwrap();
-        assert!(
-            entry_before.same_entry(&entry_after),
-            "append refresh must retain the captured graph entry"
         );
         (profiled, Retire::Resident(retirement))
     } else {
@@ -357,6 +351,18 @@ fn execute(
     }
     if let Some(publication) = publication {
         assert!(publication.publish(&retirement).unwrap());
+    }
+    if let Some(entry_before) = resident_entry_before {
+        // Entry inspection requires a quiescent lane. Keep the identity check
+        // after successful completion and normal retirement of this use.
+        let entry_after = lane
+            .reusable_execution_entry_identity(state.replay_id.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            entry_before.same_entry(&entry_after),
+            "append refresh must retain the captured graph entry"
+        );
     }
     let mut frames = vec![None; caller.len()];
     for (canonical, participant) in retirement.participants().iter().enumerate() {
