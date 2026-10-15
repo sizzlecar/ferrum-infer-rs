@@ -54,6 +54,181 @@ fn two_pools() -> (Harness, Vec<LogicalBackingSliceAuthority>) {
     (harness, authorities)
 }
 
+#[test]
+fn resident_permit_allows_live_prefix_progress_without_retaining_old_leases() {
+    let (harness, authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let groups = authorities
+        .iter()
+        .map(std::slice::from_ref)
+        .collect::<Vec<_>>();
+    let mut expected = expectations(&groups);
+    for expected in &mut expected {
+        expected.logical_size_rule = SegmentLogicalSizeRule::AtLeast;
+        expected.logical_bytes = 32;
+    }
+    let owners_before = authorities
+        .iter()
+        .map(|authority| Arc::strong_count(&authority.segment_lease))
+        .collect::<Vec<_>>();
+    let batch = pools
+        .segment_backing_batch(&groups, &expected, &windows(&expected))
+        .unwrap();
+    let template = batch.resident_template(&groups, &expected).unwrap();
+    drop(batch);
+    assert_eq!(
+        owners_before,
+        authorities
+            .iter()
+            .map(|authority| Arc::strong_count(&authority.segment_lease))
+            .collect::<Vec<_>>()
+    );
+    for expected in &mut expected {
+        expected.logical_bytes = 48;
+    }
+    let fresh = pools
+        .authorize_resident_backing(&template, &groups, &expected)
+        .unwrap()
+        .unwrap();
+    assert!(!fresh.is_empty());
+    for pool in pools.pools.values() {
+        assert!(pool.state.try_lock().is_ok());
+    }
+    expected[0].logical_bytes = 65;
+    assert!(pools
+        .authorize_resident_backing(&template, &groups, &expected)
+        .is_err());
+    drop(fresh);
+    drop(template);
+    drop(authorities);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn resident_permit_checks_poison_and_foreign_authority_before_reporting_miss() {
+    let (harness, authorities) = two_pools();
+    let (foreign, foreign_authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let groups = authorities
+        .iter()
+        .map(std::slice::from_ref)
+        .collect::<Vec<_>>();
+    let expected = expectations(&groups);
+    let batch = pools
+        .segment_backing_batch(&groups, &expected, &windows(&expected))
+        .unwrap();
+    let template = batch.resident_template(&groups, &expected).unwrap();
+    drop(batch);
+    let second = &pools.pools[&harness.pool_ids[1]];
+    second.state.lock().unwrap().poisoned = true;
+    assert!(pools
+        .authorize_resident_backing(&template, &groups, &expected)
+        .is_err());
+    second.state.lock().unwrap().poisoned = false;
+    let foreign_groups = [std::slice::from_ref(&foreign_authorities[0]), groups[1]];
+    assert!(pools
+        .authorize_resident_backing(&template, &foreign_groups, &expected)
+        .is_err());
+    // Initialization publishes only the first live 64-byte claim. Keep it
+    // leased and add capacity for a genuinely different current allocation.
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 64)
+        .unwrap();
+    let changed = claim_size(pools, &pools.pools[&harness.pool_ids[0]], 64);
+    let changed_groups = [std::slice::from_ref(&changed), groups[1]];
+    assert!(pools
+        .authorize_resident_backing(&template, &changed_groups, &expected)
+        .unwrap()
+        .is_none());
+    second.state.lock().unwrap().poisoned = true;
+    assert!(pools
+        .authorize_resident_backing(&template, &changed_groups, &expected)
+        .is_err());
+    second.state.lock().unwrap().poisoned = false;
+    drop(changed);
+    drop(template);
+    drop(authorities);
+    drop(foreign_authorities);
+    close_dynamic_test_root(harness.root);
+    close_dynamic_test_root(foreign.root);
+}
+
+#[test]
+fn resident_permit_same_identity_replacement_misses_and_fresh_owners_survive_unlock() {
+    let (harness, authorities) = two_pools();
+    let (donor, donor_authorities) = two_pools();
+    let pools = &harness.root.dynamic_pools;
+    let pool = &pools.pools[&harness.pool_ids[0]];
+    let donor_pool = &donor.root.dynamic_pools.pools[&donor.pool_ids[0]];
+    let groups = [std::slice::from_ref(&authorities[0])];
+    let expected = expectations(&groups);
+    let batch = pools
+        .segment_backing_batch(&groups, &expected, &windows(&expected))
+        .unwrap();
+    let template = batch.resident_template(&groups, &expected).unwrap();
+    drop(batch);
+    let ordinal = authorities[0].evidence.segments[0].chunk_ordinal();
+    let original = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    let mut replacement = donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .remove(&ordinal)
+        .unwrap();
+    let donor_identity = replacement.backing.identity.clone();
+    let donor_descriptor = replacement.backing.descriptor.clone();
+    let current = Arc::get_mut(&mut replacement.backing).unwrap();
+    current.identity = original.backing.identity.clone();
+    current.descriptor = original.backing.descriptor.clone();
+    pool.state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    assert!(pools
+        .authorize_resident_backing(&template, &groups, &expected)
+        .unwrap()
+        .is_none());
+    let replacement_batch = pools
+        .segment_backing_batch(&groups, &expected, &windows(&expected))
+        .unwrap();
+    let replacement_template = replacement_batch
+        .resident_template(&groups, &expected)
+        .unwrap();
+    drop(replacement_batch);
+    let retained = pools
+        .authorize_resident_backing(&replacement_template, &groups, &expected)
+        .unwrap()
+        .unwrap();
+    pool.state.try_lock().unwrap().poisoned = true;
+    assert!(!retained.is_empty());
+    assert!(pools
+        .authorize_resident_backing(&replacement_template, &groups, &expected)
+        .is_err());
+    pool.state.lock().unwrap().poisoned = false;
+    drop(retained);
+    drop(replacement_template);
+    let mut replacement = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+    let current = Arc::get_mut(&mut replacement.backing).unwrap();
+    current.identity = donor_identity;
+    current.descriptor = donor_descriptor;
+    donor_pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .insert(ordinal, replacement);
+    pool.state.lock().unwrap().chunks.insert(ordinal, original);
+    drop(template);
+    drop(authorities);
+    drop(donor_authorities);
+    close_dynamic_test_root(harness.root);
+    close_dynamic_test_root(donor.root);
+}
+
 fn expectations(groups: &[&[LogicalBackingSliceAuthority]]) -> Vec<SegmentBackingExpectation> {
     groups
         .iter()

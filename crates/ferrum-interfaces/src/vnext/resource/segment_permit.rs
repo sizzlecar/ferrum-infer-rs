@@ -529,6 +529,9 @@ pub struct SegmentBackingBatch<B> {
     regions: Vec<WindowRegion>,
 }
 
+mod resident;
+pub(crate) use resident::ResidentBackingTemplate;
+
 impl<B> SegmentBackingBatch<B> {
     pub fn resources(&self) -> &[SegmentBackingResource] {
         &self.resources

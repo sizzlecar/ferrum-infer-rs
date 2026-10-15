@@ -2672,12 +2672,12 @@ impl FerrumConfigBuilder {
                 .unwrap_or_default();
             if !self.is_cuda_backend()
                 || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
-                || owner_mode != crate::SegmentBindingOwnerViewMode::Indexed
+                || owner_mode == crate::SegmentBindingOwnerViewMode::Legacy
                 || upload != crate::ProgramBindingUploadStrategy::CompactScatter
             {
                 return Err(AutoConfigError::InvalidOverride {
                     key: key.to_owned(),
-                    reason: "decode-segment-program requires a CUDA plan runtime, indexed owner views and compact-scatter uploads".to_owned(),
+                    reason: "decode-segment-program requires a CUDA plan runtime, indexed or resident owner views and compact-scatter uploads".to_owned(),
                 });
             }
         }
@@ -2761,7 +2761,7 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if mode == crate::SegmentBindingOwnerViewMode::Indexed {
+        if mode != crate::SegmentBindingOwnerViewMode::Legacy {
             let preparation = self
                 .entry("FERRUM_INVOCATION_PREPARATION_STRATEGY")
                 .map(|entry| {
@@ -2781,8 +2781,31 @@ impl FerrumConfigBuilder {
             {
                 return Err(AutoConfigError::InvalidOverride {
                     key: key.to_owned(),
-                    reason: "indexed segment binding owner views require a CUDA plan runtime with decode-segment preparation".to_owned(),
+                    reason: "indexed and resident segment binding owner views require a CUDA plan runtime with decode-segment preparation".to_owned(),
                 });
+            }
+            if mode == crate::SegmentBindingOwnerViewMode::Resident {
+                let upload = self
+                    .entry("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY")
+                    .map(|entry| {
+                        crate::ProgramBindingUploadStrategy::parse_runtime_value(
+                            &entry.effective_value,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|reason| AutoConfigError::InvalidOverride {
+                        key: "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY".to_owned(),
+                        reason,
+                    })?
+                    .unwrap_or_default();
+                if preparation != crate::InvocationPreparationStrategy::DecodeSegmentProgram
+                    || upload != crate::ProgramBindingUploadStrategy::CompactScatter
+                {
+                    return Err(AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason: "resident segment binding owner views require decode-segment-program preparation and compact-scatter uploads".to_owned(),
+                    });
+                }
             }
         }
         Ok(self.decision(
@@ -2790,7 +2813,7 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["legacy", "indexed"],
+            ["legacy", "indexed", "resident"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -5991,6 +6014,13 @@ mod tests {
                 true,
             ),
             (
+                "cuda",
+                ExecutionResourceAuthority::PlanRuntime,
+                "resident",
+                "compact-scatter",
+                true,
+            ),
+            (
                 "metal",
                 ExecutionResourceAuthority::PlanRuntime,
                 "indexed",
@@ -6053,6 +6083,75 @@ mod tests {
                 assert!(
                     matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn resident_segments_require_complete_preparation_and_explicit_configuration() {
+        let key = crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY;
+        for (preparation, upload, source, supported) in [
+            (
+                "decode-segment-program",
+                "compact-scatter",
+                RuntimeConfigSource::Cli,
+                true,
+            ),
+            (
+                "decode-segment-program",
+                "compact-scatter",
+                RuntimeConfigSource::ConfigFile,
+                true,
+            ),
+            (
+                "decode-segment",
+                "compact-scatter",
+                RuntimeConfigSource::Cli,
+                false,
+            ),
+            ("decode-segment", "sparse", RuntimeConfigSource::Cli, false),
+            (
+                "decode-segment-program",
+                "compact-scatter",
+                RuntimeConfigSource::Env,
+                false,
+            ),
+        ] {
+            let entries = snapshot_with_sources(&[
+                (key, "resident", source),
+                (
+                    "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                    preparation,
+                    RuntimeConfigSource::Cli,
+                ),
+                (
+                    "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                    upload,
+                    RuntimeConfigSource::Cli,
+                ),
+            ]);
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = "cuda".to_owned();
+            hardware.compiled_features.cuda = true;
+            let result = FerrumConfigBuilder::new(entries)
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .resolve();
+            if supported {
+                let resolved = result.unwrap();
+                let mut engine = crate::EngineConfig::default();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine.runtime.segment_binding_owner_view_mode,
+                    crate::SegmentBindingOwnerViewMode::Resident
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AutoConfigError::InvalidOverride { .. })
+                ));
             }
         }
     }

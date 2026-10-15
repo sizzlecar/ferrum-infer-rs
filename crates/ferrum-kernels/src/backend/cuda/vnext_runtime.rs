@@ -54,6 +54,7 @@ mod binding_scatter;
 mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
+pub(crate) mod resident_bindings;
 mod segment_oracle;
 mod segment_owners;
 use segment_owners::CudaProgramBindingRetention;
@@ -275,6 +276,13 @@ pub(crate) struct CudaPlanBackingIdentity {
 }
 
 impl CudaBufferRegion {
+    /// Physical evidence only; a fresh Core permit must supply ownership before use.
+    pub(crate) fn physical_only(&self) -> Self {
+        Self {
+            _core_retention: None,
+            ..self.clone()
+        }
+    }
     pub(crate) const fn runtime_instance(&self) -> u64 {
         self.runtime_instance
     }
@@ -437,7 +445,7 @@ pub(crate) struct CudaCommandExecutable {
     regions: Vec<CudaBufferRegion>,
     host_storage: Vec<Box<[u8]>>,
     work_declaration: CudaWorkDeclaration,
-    enqueue: Mutex<CudaEnqueueAction>,
+    enqueue: Arc<Mutex<CudaEnqueueAction>>,
 }
 
 impl CudaCommandExecutable {
@@ -450,7 +458,7 @@ impl CudaCommandExecutable {
             regions,
             host_storage,
             work_declaration: CudaWorkDeclaration::Static,
-            enqueue: Mutex::new(CudaEnqueueAction::Static(enqueue)),
+            enqueue: Arc::new(Mutex::new(CudaEnqueueAction::Static(enqueue))),
         }
     }
 }
@@ -622,12 +630,14 @@ fn coalesce_program_binding_transfers(
 
 /// Read-only logical projections of one compiled prelude. Payload ranges point
 /// into its sole host-storage packet; no per-node payload copy is retained.
+#[derive(Clone)]
 struct CudaBindingProgramWrite {
     destination_offset_bytes: u64,
     payload: Range<usize>,
     live_payload_bytes: u64,
 }
 
+#[derive(Clone)]
 struct CudaBindingProgramNode {
     runtime_instance: u64,
     operation: &'static str,
@@ -1277,10 +1287,10 @@ impl CudaDeviceCommand {
                 regions,
                 host_storage: Vec::new(),
                 work_declaration: CudaWorkDeclaration::ConditionalDependency,
-                enqueue: Mutex::new(CudaEnqueueAction::ConditionalDependency(Box::new(
-                    move |stream, _blas, regions, _storage| {
+                enqueue: Arc::new(Mutex::new(CudaEnqueueAction::ConditionalDependency(
+                    Box::new(move |stream, _blas, regions, _storage| {
                         enqueue(stream, regions).map(CudaEnqueuedWork::Dependency)
-                    },
+                    }),
                 ))),
             })),
             fence_dependencies: Vec::new(),
@@ -3035,6 +3045,8 @@ pub struct CudaDeviceRuntime {
     segment_binding_oracle_audited_nodes: AtomicU64,
     segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
     segment_binding_indexed_encodes: AtomicU64,
+    resident_segment_template_installs: AtomicU64,
+    resident_segment_binding_hits: AtomicU64,
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     execution_context_limit: Option<usize>,
@@ -3246,6 +3258,8 @@ impl CudaDeviceRuntime {
             segment_binding_owner_view_mode:
                 ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
             segment_binding_indexed_encodes: AtomicU64::new(0),
+            resident_segment_template_installs: AtomicU64::new(0),
+            resident_segment_binding_hits: AtomicU64::new(0),
             packed_decode_prepare_gate: false,
             causal_decode_attention_grouping:
                 ferrum_types::CausalDecodeAttentionGrouping::Contiguous,
@@ -3293,6 +3307,15 @@ impl CudaDeviceRuntime {
     /// Successful indexed host encodes, not submissions or GPU completions.
     pub fn segment_binding_indexed_encodes(&self) -> u64 {
         self.segment_binding_indexed_encodes.load(Ordering::Relaxed)
+    }
+
+    pub fn resident_segment_template_installs(&self) -> u64 {
+        self.resident_segment_template_installs
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn resident_segment_binding_hits(&self) -> u64 {
+        self.resident_segment_binding_hits.load(Ordering::Relaxed)
     }
 
     /// Constructor-only selection for canonical packed decode preparation.
@@ -4669,9 +4692,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         declarations: &[(u32, &ferrum_interfaces::vnext::SegmentBindingDeclaration)],
     ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
-        if self.segment_binding_owner_view_mode
-            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
-            || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
+        if !matches!(
+            self.segment_binding_owner_view_mode,
+            ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+                | ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Resident
+        ) || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
             || self.binding_scatter.is_none()
         {
             return Ok(None);
@@ -4687,9 +4712,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
         Option<ferrum_interfaces::vnext::EncodedSegmentBindingProgram<Self::Command>>,
         Self::Error,
     > {
-        if self.segment_binding_owner_view_mode
-            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
-            || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
+        if !matches!(
+            self.segment_binding_owner_view_mode,
+            ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+                | ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Resident
+        ) || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
         {
             return Err(CudaDeviceRuntimeError::contract(
                 "compiled segment runtime configuration changed",
@@ -4725,6 +4752,53 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
     ) -> ferrum_interfaces::vnext::SegmentBindingOwnerViewMode {
         self.segment_binding_owner_view_mode
+    }
+
+    fn prepare_resident_segment_bindings(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        frame: &ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        if self.segment_binding_owner_view_mode
+            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Resident
+            || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
+        {
+            return Ok(None);
+        }
+        let prepared = resident_bindings::prepare(self, program, frame)?;
+        if prepared.is_some() {
+            self.resident_segment_template_installs
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+                .map_err(|_| {
+                    CudaDeviceRuntimeError::contract("resident install count exhausted")
+                })?;
+        }
+        Ok(prepared)
+    }
+
+    fn encode_resident_segment_bindings(
+        &self,
+        template: &(dyn std::any::Any + Send + Sync),
+        permit: &mut ferrum_interfaces::vnext::FreshResidentSegmentPermit<'_>,
+    ) -> Result<
+        Option<ferrum_interfaces::vnext::EncodedSegmentBindingProgram<Self::Command>>,
+        Self::Error,
+    > {
+        if self.segment_binding_owner_view_mode
+            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Resident
+            || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "resident runtime configuration changed",
+            ));
+        }
+        let encoded = resident_bindings::encode(self, template, permit)?;
+        if encoded.is_some() {
+            self.resident_segment_binding_hits
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+                .map_err(|_| CudaDeviceRuntimeError::contract("resident hit count exhausted"))?;
+        }
+        Ok(encoded)
     }
 
     fn segment_binding_oracle_mode(&self) -> ferrum_interfaces::vnext::SegmentBindingOracleMode {

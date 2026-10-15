@@ -205,6 +205,41 @@ impl Fixture {
         binding_row_bytes: Option<usize>,
         observation: BatchObservationOptions,
     ) -> BatchObservation {
+        self.execute_participant_ranges_observed_with_timing(
+            lane,
+            reaper,
+            sessions,
+            tokens,
+            ranges,
+            path,
+            preparation_strategy,
+            preparation_sink,
+            binding_row_bytes,
+            observation,
+            &NoHostTiming,
+        )
+    }
+
+    /// The same admission, dispatch, completion and retirement path, with an
+    /// optional observer for the dispatch's existing host timing boundaries.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_participant_ranges_observed_with_timing<
+        P: InvocationPreparationSink,
+        S: SubmissionWaveDispatchTimingSink,
+    >(
+        &self,
+        lane: &Arc<ExecutionLane<Runtime>>,
+        reaper: &Arc<CompletionReaper<Runtime>>,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        ranges: &[Range<usize>],
+        path: Path,
+        preparation_strategy: InvocationPreparationStrategy,
+        preparation_sink: &P,
+        binding_row_bytes: Option<usize>,
+        observation: BatchObservationOptions,
+        timing_sink: &S,
+    ) -> BatchObservation {
         assert_eq!(sessions.len(), tokens.len());
         assert_eq!(sessions.len(), ranges.len());
         let participants = sessions.len() as u32;
@@ -580,7 +615,7 @@ impl Fixture {
                 program,
                 SubmissionExecutionPolicy::determinism_replayed(0xa5),
                 preparation_strategy,
-                &NoHostTiming,
+                timing_sink,
                 preparation_sink,
                 wave,
                 lane,
@@ -602,7 +637,7 @@ impl Fixture {
                 &uploads,
                 policy,
                 preparation_strategy,
-                &NoHostTiming,
+                timing_sink,
                 preparation_sink,
                 wave,
                 lane,

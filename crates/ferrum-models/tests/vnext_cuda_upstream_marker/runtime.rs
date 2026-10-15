@@ -26,6 +26,9 @@ mod prefill;
 mod q6_f16;
 #[path = "runtime/replay_bindings.rs"]
 mod replay_bindings;
+#[path = "runtime/resident_segment.rs"]
+#[cfg(feature = "cuda-q6-f16-linear")]
+mod resident_segment;
 #[path = "runtime/two_streams.rs"]
 mod two_streams;
 #[path = "runtime/uniform_binding_prefix.rs"]

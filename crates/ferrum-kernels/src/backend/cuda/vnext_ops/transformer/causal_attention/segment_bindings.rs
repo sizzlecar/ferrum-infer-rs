@@ -18,6 +18,37 @@ impl CausalRecipe {
     pub(in crate::backend::cuda::vnext_ops) fn supports_program(&self) -> bool {
         self.upload_strategy == ProgramBindingUploadStrategy::CompactScatter
     }
+
+    pub(in crate::backend::cuda) fn resident_controls(
+        &self,
+        work: &ferrum_interfaces::vnext::BatchWorkShape,
+    ) -> Result<Vec<[i32; 6]>, String> {
+        if work.participant_token_ranges().len() != self.participants {
+            return Err("resident causal participant shape changed".into());
+        }
+        work.participant_token_ranges()
+            .iter()
+            .map(|tokens| {
+                let source = tokens.source_token_range();
+                if source.end > tokens.full_input_tokens()
+                    || tokens.full_input_tokens() > self.shape.maximum_context_tokens
+                {
+                    return Err("resident causal token range exceeds admitted context".into());
+                }
+                Ok([
+                    checked_i32(
+                        self.shape.table_entries(source.end)?,
+                        "causal table entries",
+                    )?,
+                    checked_i32(source.start, "causal source position")?,
+                    checked_i32(tokens.immediate_tokens(), "causal token count")?,
+                    checked_i32(source.end, "causal sequence tokens")?,
+                    checked_i32(tokens.immediate_token_range().start, "causal packed start")?,
+                    0,
+                ])
+            })
+            .collect()
+    }
 }
 
 pub(super) fn declare(

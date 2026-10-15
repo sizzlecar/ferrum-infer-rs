@@ -128,7 +128,60 @@ pub(crate) struct CudaSegmentOwnerTable {
     owners: Vec<Option<CudaSegmentOwner>>,
 }
 
+pub(super) struct CudaPhysicalOwnerTable {
+    owners: Vec<Option<(Arc<CudaAllocation>, u64, ElementType)>>,
+}
+
+impl CudaPhysicalOwnerTable {
+    pub(super) fn authorize(
+        &self,
+        retentions: &[DeviceBufferRetention],
+    ) -> Result<Arc<CudaSegmentOwnerTable>, CudaDeviceRuntimeError> {
+        if self.owners.len() != retentions.len() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "resident owner count changed",
+            ));
+        }
+        Ok(Arc::new(CudaSegmentOwnerTable {
+            owners: self
+                .owners
+                .iter()
+                .zip(retentions)
+                .map(|(owner, retention)| {
+                    owner
+                        .as_ref()
+                        .map(
+                            |(allocation, runtime_instance, element_type)| CudaSegmentOwner {
+                                allocation: Arc::clone(allocation),
+                                retention: retention.clone(),
+                                runtime_instance: *runtime_instance,
+                                element_type: *element_type,
+                            },
+                        )
+                })
+                .collect(),
+        }))
+    }
+}
+
 impl CudaSegmentOwnerTable {
+    pub(super) fn physical_template(&self) -> CudaPhysicalOwnerTable {
+        CudaPhysicalOwnerTable {
+            owners: self
+                .owners
+                .iter()
+                .map(|owner| {
+                    owner.as_ref().map(|owner| {
+                        (
+                            Arc::clone(&owner.allocation),
+                            owner.runtime_instance,
+                            owner.element_type,
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
     pub(crate) fn region(
         &self,
         range: &CudaSegmentRange,
