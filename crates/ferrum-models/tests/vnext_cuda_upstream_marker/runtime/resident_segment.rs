@@ -203,7 +203,10 @@ fn run(kind: AttentionKind, oracle: SegmentBindingOracleMode, pass: &str) {
             kind,
             true,
             2,
-            Family::q6_f16(kind),
+            // This existing mixed Q4/Q5/IQ4 family has real MarkerV2 Plan
+            // dependencies at M1. The all-Q6 family selects its native route
+            // only at M4..32 and cannot test singleton dependency activation.
+            Family::new(kind).with_maximum_tokens(128),
             ProgramBindingUploadStrategy::CompactScatter,
             oracle,
             owner,
@@ -464,13 +467,13 @@ fn compare(kind: AttentionKind) {
 }
 
 #[test]
-#[ignore = "requires actual CUDA Q6 provider family and resident segment backend"]
+#[ignore = "requires actual CUDA MarkerV2 provider family and resident segment backend"]
 fn resident_gdn_joined_ffn_matches_indexed_across_fresh_frames_and_requests() {
     compare(AttentionKind::GatedDelta);
 }
 
 #[test]
-#[ignore = "requires actual CUDA Q6 provider family, resident backend and physical KV growth"]
+#[ignore = "requires actual CUDA MarkerV2 provider family, resident backend and physical KV growth"]
 fn resident_causal_joined_ffn_matches_indexed_across_kv_growth_and_widths() {
     compare(AttentionKind::Causal);
 }
