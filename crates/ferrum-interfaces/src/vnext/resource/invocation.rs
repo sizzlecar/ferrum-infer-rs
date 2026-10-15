@@ -1767,8 +1767,9 @@ impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
         &self,
         participant_index: usize,
         resource: &ResourceId,
+        descriptor_index: usize,
         lifetime: AllocationLifetime,
-    ) -> Result<&'w [LogicalBackingSliceAuthority], VNextError> {
+    ) -> Result<super::segment_permit::SegmentBackingGroup<'w, R::Buffer>, VNextError> {
         let participant = self
             .wave
             .nodes
@@ -1788,8 +1789,7 @@ impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
                 .map(std::slice::from_ref),
             AllocationLifetime::Sequence => {
                 // The map was built in this exact prepared participant order.
-                let authorities = self.snapshots[participant_index].backing_slices_for(resource);
-                (!authorities.is_empty()).then_some(authorities)
+                return self.snapshots[participant_index].segment_group(descriptor_index, resource);
             }
             AllocationLifetime::Step => self
                 .wave
@@ -1807,20 +1807,22 @@ impl<'w, R: DeviceRuntime> SegmentBackingContext<'w, R> {
                 .map(std::slice::from_ref),
             AllocationLifetime::Plan => None,
         };
-        authorities.ok_or_else(|| {
-            invalid_resource("segment resource has no exact current captured authority")
-        })
+        authorities
+            .map(super::segment_permit::SegmentBackingGroup::fresh)
+            .ok_or_else(|| {
+                invalid_resource("segment resource has no exact current captured authority")
+            })
     }
 
     pub(crate) fn prepare<S: crate::vnext::SubmissionWaveDispatchTimingSink>(
         &self,
-        groups: &[&[LogicalBackingSliceAuthority]],
+        groups: &[super::segment_permit::SegmentBackingGroup<'_, R::Buffer>],
         expected: &[super::SegmentBackingExpectation],
         windows: super::SegmentBackingWindowInput<'_>,
         timing: &S,
     ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError> {
         self.pools
-            .segment_backing_batch_with_window_input(groups, expected, windows, timing)
+            .segment_backing_catalog_batch(groups, expected, windows, timing)
     }
 }
 

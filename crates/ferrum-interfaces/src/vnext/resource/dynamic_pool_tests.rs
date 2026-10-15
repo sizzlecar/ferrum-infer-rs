@@ -5224,6 +5224,80 @@ fn step_backing_deferral_retains_exact_participant_session_until_retry() {
 }
 
 #[test]
+fn sequence_physical_catalog_shares_without_extent_growth_and_retains_logical_owner() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let sequence = admitted_sequence_with_ceiling(&harness.root, "physical-catalog", 2);
+    let initial = sequence.backing_snapshot().unwrap();
+    let session = sequence.open_session().unwrap();
+    let advanced = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("logical token progress must publish a new snapshot"),
+    };
+    assert_ne!(initial.generation(), advanced.generation());
+    assert_eq!(initial.committed_tokens(), 1);
+    assert_eq!(advanced.committed_tokens(), 2);
+    assert!(std::ptr::eq(
+        initial.backing_slices(),
+        advanced.backing_slices()
+    ));
+    let resource = initial.backing_slices()[0].resource_id();
+    assert!(initial.segment_group(0, resource).is_ok());
+    assert!(advanced.segment_group(0, resource).is_ok());
+    assert!(advanced.segment_group(1, resource).is_err());
+    let foreign = ResourceId::new("foreign/catalog-resource").unwrap();
+    assert!(advanced.segment_group(0, &foreign).is_err());
+    session.request_cancel().unwrap();
+    session.try_abort().unwrap();
+    drop(session);
+    drop(sequence);
+    drop(advanced);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .snapshot()
+            .unwrap()
+            .active_sequences(),
+        1
+    );
+    drop(initial);
+    let released = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert_eq!(released.active_sequences(), 0);
+    assert_eq!(released.active_requests(), 0);
+    assert!(released
+        .domains()
+        .iter()
+        .all(|domain| domain.used().get() == 0));
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn sequence_backing_extension_publishes_atomically_between_frames() {
     let catalog = pool_catalog_with_options(
         paged_profile(),
@@ -5305,6 +5379,10 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     assert_eq!(extended.generation().get(), 2);
     assert_eq!(extended.committed_tokens(), 2);
     assert_eq!(extended.backing_slices().len(), 2);
+    assert_ne!(
+        initial.backing_slices().as_ptr(),
+        extended.backing_slices().as_ptr()
+    );
     assert!(Arc::ptr_eq(
         extended.backing_slices()[0].initialization_cell().unwrap(),
         &initial_cell

@@ -11,9 +11,112 @@ use super::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::vnext::{SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink};
+
+/// This cell belongs to one immutable Sequence physical catalog, never a Step
+/// slot. A checked value proves only immutable lease/projection relationships.
+/// Every use still observes the current pool and its actual chunk owners.
+pub(super) struct SequencePhysicalGroup<B> {
+    range: Range<usize>,
+    checked: OnceLock<Arc<CheckedSequenceGroup<B>>>,
+}
+
+struct CheckedSequenceGroup<B> {
+    // The containing cell and this slice are owned by the same immutable
+    // catalog. Its borrow keeps both alive, so this address cannot suffer ABA.
+    // It selects already-proved facts; it never proves current pool validity.
+    authority_start: usize,
+    authority_len: usize,
+    pool_instance_id: u64,
+    logical: u64,
+    capacity: u64,
+    bindings: Arc<[LogicalBackingSegmentBinding<B>]>,
+}
+
+pub(crate) struct SegmentBackingGroup<'a, B> {
+    authorities: &'a [LogicalBackingSliceAuthority],
+    physical: Option<&'a SequencePhysicalGroup<B>>,
+}
+
+impl<'a, B> SegmentBackingGroup<'a, B> {
+    pub(super) fn fresh(authorities: &'a [LogicalBackingSliceAuthority]) -> Self {
+        Self {
+            authorities,
+            physical: None,
+        }
+    }
+}
+
+impl<B> SequencePhysicalGroup<B> {
+    pub(super) fn new(range: Range<usize>) -> Self {
+        Self {
+            range,
+            checked: OnceLock::new(),
+        }
+    }
+
+    pub(super) fn bind<'a>(
+        &'a self,
+        authorities: &'a [LogicalBackingSliceAuthority],
+    ) -> Result<SegmentBackingGroup<'a, B>, VNextError> {
+        let authorities = authorities
+            .get(self.range.clone())
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| {
+                invalid_resource("segment resource has no exact current captured authority")
+            })?;
+        if authorities.iter().any(|a| a.reusable_lane.is_some()) {
+            return Err(invalid_resource(
+                "sequence physical catalog cannot hold a lane authority",
+            ));
+        }
+        Ok(SegmentBackingGroup {
+            authorities,
+            physical: Some(self),
+        })
+    }
+}
+
+/// One Arc per physical resource group, rather than cloning every segment's
+/// chunk and two retention owners again. Flat indices preserve the existing
+/// owner/window ordering consumed by the backend.
+pub(crate) struct SegmentBindingStorage<B> {
+    groups: Vec<Arc<[LogicalBackingSegmentBinding<B>]>>,
+    indices: Vec<(usize, usize)>,
+}
+
+impl<B> SegmentBindingStorage<B> {
+    fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+    fn push_group(&mut self, group: Arc<[LogicalBackingSegmentBinding<B>]>) -> Range<usize> {
+        let start = self.indices.len();
+        self.indices
+            .extend((0..group.len()).map(|i| (self.groups.len(), i)));
+        self.groups.push(group);
+        start..self.indices.len()
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.indices.len()
+    }
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = &LogicalBackingSegmentBinding<B>> {
+        self.indices.iter().map(|&(g, i)| &self.groups[g][i])
+    }
+}
+
+impl<B> std::ops::Index<usize> for SegmentBindingStorage<B> {
+    type Output = LogicalBackingSegmentBinding<B>;
+    fn index(&self, index: usize) -> &Self::Output {
+        let (group, index) = self.indices[index];
+        &self.groups[group][index]
+    }
+}
 
 /// Durations only while pool guards exist. Declare this before retained results
 /// and guards: ordinary errors flush after both have dropped, while unwinding
@@ -524,7 +627,7 @@ struct WindowRegion {
 /// submit. The existing submission/fence ownership must retain these regions.
 pub struct SegmentBackingBatch<B> {
     resources: Vec<SegmentBackingResource>,
-    bindings: Vec<LogicalBackingSegmentBinding<B>>,
+    bindings: SegmentBindingStorage<B>,
     windows: Vec<Range<usize>>,
     regions: Vec<WindowRegion>,
 }
@@ -546,7 +649,7 @@ impl<B> SegmentBackingBatch<B> {
     }
     /// The operation layer uses each actual buffer once for its explicit
     /// immutable-metadata capability. This never calls a runtime under a lock.
-    pub(crate) fn bindings(&self) -> &[LogicalBackingSegmentBinding<B>] {
+    pub(crate) fn bindings(&self) -> &SegmentBindingStorage<B> {
         &self.bindings
     }
 }
@@ -658,8 +761,22 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         windows: SegmentBackingWindowInput<'_>,
         timing_sink: &S,
     ) -> Result<SegmentBackingBatch<R::Buffer>, VNextError> {
+        let groups = groups
+            .iter()
+            .map(|g| SegmentBackingGroup::fresh(g))
+            .collect::<Vec<_>>();
+        self.segment_backing_catalog_batch(&groups, expected, windows, timing_sink)
+    }
+
+    pub(super) fn segment_backing_catalog_batch<S: SubmissionWaveDispatchTimingSink>(
+        &self,
+        source_groups: &[SegmentBackingGroup<'_, R::Buffer>],
+        expected: &[SegmentBackingExpectation],
+        windows: SegmentBackingWindowInput<'_>,
+        timing_sink: &S,
+    ) -> Result<SegmentBackingBatch<R::Buffer>, VNextError> {
         let mut timings = SegmentBackingTimings::new(timing_sink);
-        if groups.len() != expected.len() || groups.is_empty() {
+        if source_groups.len() != expected.len() || source_groups.is_empty() {
             return Err(invalid_resource(
                 "segment resources require matching nonempty expectations",
             ));
@@ -668,7 +785,7 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         // before guards, so panic/error unwinding unlocks before owner Drop.
         let mut result = SegmentBackingBatch {
             resources: Vec::new(),
-            bindings: Vec::new(),
+            bindings: SegmentBindingStorage::new(),
             windows: Vec::new(),
             regions: Vec::new(),
         };
@@ -677,21 +794,23 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         let mut group_indices = Vec::new();
         let mut unique_groups = Vec::new();
         let mut segment_count = 0usize;
-        for group in groups {
+        for source in source_groups {
+            let group = source.authorities;
             let first = group
                 .first()
                 .ok_or_else(|| invalid_resource("segment resource has no authority"))?;
             ids.insert(first.evidence.pool_id.clone());
-            // Pointer identity is only a dedup key. Every unique slice is still
-            // fully validated below against its exact pool and segment lease.
+            // Pointer identity is only a dedup key. Every unique slice still
+            // needs current pool/chunk validation below; only catalog-owned
+            // immutable lease/projection facts may have a prior proof.
             let key = (group.as_ptr(), group.len());
             let index = match unique.get(&key) {
                 Some(index) => *index,
                 None => {
                     let index = unique_groups.len();
-                    unique_groups.push(*group);
+                    unique_groups.push(source);
                     unique.insert(key, index);
-                    for authority in *group {
+                    for authority in group {
                         segment_count = segment_count
                             .checked_add(authority.evidence.segments.len())
                             .ok_or_else(|| {
@@ -705,23 +824,32 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         }
         let region_capacity = windows.iter().try_fold(0usize, |total, window| {
             let window = window?;
-            let group = groups
+            let group = source_groups
                 .get(window.resource_index)
                 .ok_or_else(|| invalid_resource("segment window references an unknown resource"))?;
-            group.iter().try_fold(total, |total, authority| {
-                total
-                    .checked_add(authority.evidence.segments.len())
-                    .ok_or_else(|| invalid_resource("segment window capacity overflows usize"))
-            })
+            group
+                .authorities
+                .iter()
+                .try_fold(total, |total, authority| {
+                    total
+                        .checked_add(authority.evidence.segments.len())
+                        .ok_or_else(|| invalid_resource("segment window capacity overflows usize"))
+                })
         })?;
         result
             .resources
-            .try_reserve_exact(groups.len())
+            .try_reserve_exact(source_groups.len())
             .map_err(|_| invalid_resource("segment resource allocation failed"))?;
         result
             .bindings
+            .indices
             .try_reserve_exact(segment_count)
             .map_err(|_| invalid_resource("segment binding allocation failed"))?;
+        result
+            .bindings
+            .groups
+            .try_reserve_exact(unique_groups.len())
+            .map_err(|_| invalid_resource("segment binding group allocation failed"))?;
         result
             .windows
             .try_reserve_exact(windows.len())
@@ -734,6 +862,10 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         summaries
             .try_reserve_exact(unique_groups.len())
             .map_err(|_| invalid_resource("segment summary allocation failed"))?;
+        // Temporary ownership and new cache publications must drop only after
+        // pool guards, including ordinary errors and unwinding.
+        let mut pending = Vec::new();
+        let mut group_bindings = Vec::new();
         let pools = ids
             .into_iter()
             .map(|id| {
@@ -754,7 +886,8 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
             .collect::<Result<Vec<_>, _>>()?;
         timings.next();
         let checked = (|| {
-            for group in &unique_groups {
+            for source in &unique_groups {
+                let group = source.authorities;
                 let first = &group[0];
                 let pool_index = pools
                     .binary_search_by(|(id, _)| id.cmp(&first.evidence.pool_id))
@@ -764,7 +897,41 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                 if state.poisoned {
                     return Err(invalid_resource("dynamic backing pool is fail-closed"));
                 }
-                let start = result.bindings.len();
+                if let Some(cached) = source.physical.and_then(|physical| physical.checked.get()) {
+                    if cached.authority_start != group.as_ptr() as usize
+                        || cached.authority_len != group.len()
+                        || cached.pool_instance_id != pool.instance_id
+                    {
+                        return Err(invalid_resource(
+                            "sequence physical proof belongs to another authority",
+                        ));
+                    }
+                    // A same-identity replacement is legal on the ordinary
+                    // path. It misses this immutable proof and is freshly
+                    // materialized below; old owners never authorize it.
+                    let current = cached.bindings.iter().all(|binding| {
+                        state
+                            .chunks
+                            .get(&binding.segment.chunk_ordinal())
+                            .is_some_and(|chunk| {
+                                Arc::ptr_eq(&chunk.backing, &binding.chunk)
+                                    && chunk.backing.identity == *binding.segment.chunk()
+                                    && binding
+                                        .segment
+                                        .offset_bytes()
+                                        .checked_add(binding.segment.length_bytes())
+                                        .is_some_and(|end| {
+                                            end <= chunk.backing.descriptor.size_bytes
+                                        })
+                            })
+                    });
+                    if current {
+                        let bindings = result.bindings.push_group(Arc::clone(&cached.bindings));
+                        summaries.push((cached.logical, cached.capacity, bindings));
+                        continue;
+                    }
+                }
+                group_bindings.clear();
                 let mut logical = 0u64;
                 let mut capacity = 0u64;
                 for (index, authority) in group.iter().enumerate() {
@@ -826,17 +993,35 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
                                 Arc::clone(&chunk.backing),
                             ),
                         };
-                        result.bindings.push(LogicalBackingSegmentBinding {
+                        group_bindings.push(LogicalBackingSegmentBinding {
                             segment: segment.clone(),
                             chunk: Arc::clone(&chunk.backing),
                             retention,
                         });
                     }
                 }
-                summaries.push((logical, capacity, start..result.bindings.len()));
+                let bindings: Arc<[_]> = std::mem::take(&mut group_bindings).into();
+                let range = result.bindings.push_group(Arc::clone(&bindings));
+                if let Some(physical) = source
+                    .physical
+                    .filter(|physical| physical.checked.get().is_none())
+                {
+                    pending.push((
+                        physical,
+                        Arc::new(CheckedSequenceGroup {
+                            authority_start: group.as_ptr() as usize,
+                            authority_len: group.len(),
+                            pool_instance_id: pool.instance_id,
+                            logical,
+                            capacity,
+                            bindings,
+                        }),
+                    ));
+                }
+                summaries.push((logical, capacity, range));
             }
             for (index, requirement) in expected.iter().enumerate() {
-                let first = &groups[index][0].evidence;
+                let first = &source_groups[index].authorities[0].evidence;
                 let (logical, capacity, bindings) = &summaries[group_indices[index]];
                 let size_matches = match requirement.logical_size_rule {
                     SegmentLogicalSizeRule::Exact => *logical == requirement.logical_bytes,
@@ -944,6 +1129,11 @@ impl<R: DeviceRuntime> DynamicPoolSet<R> {
         timings.finish();
         drop(guards);
         checked?;
+        for (physical, checked) in pending {
+            // Competing valid observations may both finish; a losing value is
+            // dropped after unlock. Publication never grants current validity.
+            let _ = physical.checked.set(checked);
+        }
         Ok(result)
     }
 }
