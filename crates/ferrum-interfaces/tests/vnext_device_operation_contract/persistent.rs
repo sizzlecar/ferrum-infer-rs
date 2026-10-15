@@ -189,17 +189,26 @@ pub(crate) fn fixture_with_retained_dependencies(
     bytes: u64,
     dependency_mode: DependencyMode,
 ) -> Fixture {
-    fixture_with_retained_dependencies_and_chain_nodes(bytes, dependency_mode, None)
+    fixture_with_retained_dependencies_options(bytes, dependency_mode, None, None)
 }
 
 pub(crate) fn fixture_with_padded_persistent_nodes(bytes: u64, nodes: usize) -> Fixture {
-    fixture_with_retained_dependencies_and_chain_nodes(bytes, DependencyMode::None, Some(nodes))
+    fixture_with_retained_dependencies_options(bytes, DependencyMode::None, Some(nodes), None)
 }
 
-fn fixture_with_retained_dependencies_and_chain_nodes(
+pub(crate) fn fixture_with_retained_dependencies_and_bucket(
+    bytes: u64,
+    dependency_mode: DependencyMode,
+    bucket: Option<ReusableExecutionBucketSpec>,
+) -> Fixture {
+    fixture_with_retained_dependencies_options(bytes, dependency_mode, None, bucket)
+}
+
+fn fixture_with_retained_dependencies_options(
     bytes: u64,
     dependency_mode: DependencyMode,
     chain_nodes: Option<usize>,
+    bucket: Option<ReusableExecutionBucketSpec>,
 ) -> Fixture {
     let original = catalog();
     let mut operation = operation();
@@ -258,6 +267,9 @@ fn fixture_with_retained_dependencies_and_chain_nodes(
     let (runtime_policy, reusable_execution_bucket) =
         if matches!(dependency_mode, DependencyMode::None) {
             (policy(), None)
+        } else if let Some(bucket) = bucket {
+            let reusable = ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap();
+            (policy_with_reusable_execution(Some(reusable)), Some(bucket))
         } else {
             let (policy, bucket) = reusable_policy();
             (policy, Some(bucket))
