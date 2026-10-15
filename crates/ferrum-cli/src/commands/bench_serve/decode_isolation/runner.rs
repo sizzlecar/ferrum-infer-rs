@@ -1117,6 +1117,7 @@ mod tests {
         RequestRecord {
             benchmark_correlation: None,
             server_request_id: Some("chatcmpl-test".to_string()),
+            client_execution_span: None,
             success: true,
             ttft_ms: 1.0,
             e2e_ms: 2.0,

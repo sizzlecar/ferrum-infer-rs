@@ -364,6 +364,7 @@ mod tests {
             .map(|(success, ttft, e2e, in_tok, out_tok)| RequestRecord {
                 benchmark_correlation: None,
                 server_request_id: None,
+                client_execution_span: None,
                 success,
                 ttft_ms: ttft,
                 e2e_ms: e2e,

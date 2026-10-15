@@ -396,6 +396,7 @@ fn failed_bench_record(quality_issues: QualityIssueCounts) -> RequestRecord {
     RequestRecord {
         benchmark_correlation: None,
         server_request_id: None,
+        client_execution_span: None,
         success: false,
         ttft_ms: 0.0,
         e2e_ms: 0.0,
@@ -524,6 +525,7 @@ async fn collect_stream(
     Ok(RequestRecord {
         benchmark_correlation: None,
         server_request_id: None,
+        client_execution_span: None,
         success,
         ttft_ms,
         e2e_ms,

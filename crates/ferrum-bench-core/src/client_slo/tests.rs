@@ -6,6 +6,7 @@ fn request(ttft: f64, gaps: &[f64], usage: Option<u32>, coalesced: u32) -> Reque
     RequestRecord {
         benchmark_correlation: None,
         server_request_id: None,
+        client_execution_span: None,
         success: true,
         ttft_ms: ttft,
         e2e_ms: ttft + gaps.iter().sum::<f64>() + 1000.0,

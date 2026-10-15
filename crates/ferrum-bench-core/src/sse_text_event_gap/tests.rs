@@ -13,6 +13,7 @@ fn sse(
     RequestRecord {
         benchmark_correlation: None,
         server_request_id: None,
+        client_execution_span: None,
         success,
         ttft_ms: 10.0,
         e2e_ms: 100.0 + gaps.iter().sum::<f64>(),

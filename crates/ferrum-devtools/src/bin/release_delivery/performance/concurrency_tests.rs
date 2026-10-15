@@ -40,6 +40,7 @@ fn report(run_id: &str, reverse: bool) -> BenchReport {
                         .unwrap(),
                         server_request_id: None,
                         timing: None,
+                        client_execution_span: None,
                     })
                     .collect();
                 let lengths =

@@ -588,6 +588,7 @@ mod tests {
                     .map(|_| RequestRecord {
                         benchmark_correlation: None,
                         server_request_id: None,
+                        client_execution_span: None,
                         success: true,
                         ttft_ms: 10.0 * factor,
                         e2e_ms: 24.0 * factor,

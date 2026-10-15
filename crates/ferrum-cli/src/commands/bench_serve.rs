@@ -22,10 +22,11 @@ use ferrum_bench_core::client_slo::{ClientSloConfig, ClientSloReport, ClientSloS
 use ferrum_bench_core::env::HttpRequestSampling;
 use ferrum_bench_core::{
     arrivals::poisson_arrival_times, compute_metrics, BenchReport, BenchmarkPhase,
-    BenchmarkRequestCorrelation, Env, ItlEvidenceSource, OutputTokenCountSource,
-    QualityIssueCounts, RequestItlEvidence, RequestRecord, RunRecord, Scenario, Slo,
-    TokenLengthStats, WarmupSummary, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
-    BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
+    BenchmarkRequestCorrelation, ClientExecutionSpan, Env, ItlEvidenceSource,
+    OutputTokenCountSource, QualityIssueCounts, RequestItlEvidence, RequestRecord, RunRecord,
+    Scenario, Slo, TokenLengthStats, WarmupSummary, BENCHMARK_CELL_ID_HEADER,
+    BENCHMARK_PHASE_HEADER, BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER,
+    BENCHMARK_RUN_ID_HEADER,
 };
 use ferrum_server::chat_template::ReasoningEffort;
 use ferrum_types::Result;
@@ -41,6 +42,8 @@ use uuid::Uuid;
 
 use crate::config::CliConfig;
 
+#[cfg(test)]
+mod client_execution_tests;
 mod decode_isolation;
 mod sampling;
 mod sharegpt;
@@ -397,6 +400,20 @@ pub(super) struct ObservedRequest {
     pub output_event_times: Vec<Instant>,
 }
 
+fn finish_measured_request(observed: ObservedRequest, phase_origin: Instant) -> RequestRecord {
+    let ObservedRequest {
+        mut record,
+        started_at,
+        output_event_times,
+    } = observed;
+    drop(output_event_times);
+    // Sample inside the request task after local cleanup, not when its join
+    // handle is collected (which may happen much later and in input order).
+    record.client_execution_span =
+        ClientExecutionSpan::from_instants(phase_origin, started_at, Instant::now());
+    record
+}
+
 async fn stream_one_observed(
     client: &reqwest::Client,
     base_url: &str,
@@ -681,6 +698,7 @@ fn failed_record(
     RequestRecord {
         benchmark_correlation: Some(benchmark_correlation),
         server_request_id: None,
+        client_execution_span: None,
         success: false,
         ttft_ms: 0.0,
         e2e_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -703,6 +721,7 @@ fn join_failed_record(
     RequestRecord {
         benchmark_correlation: Some(benchmark_correlation),
         server_request_id: None,
+        client_execution_span: None,
         success: false,
         ttft_ms: 0.0,
         e2e_ms: 0.0,
@@ -927,6 +946,7 @@ impl StreamState {
         RequestRecord {
             benchmark_correlation: self.benchmark_correlation,
             server_request_id: self.server_request_id,
+            client_execution_span: None,
             success,
             ttft_ms,
             e2e_ms,
@@ -1425,7 +1445,7 @@ async fn run_closed_loop(
             correlation.clone(),
             tokio::spawn(async move {
                 let _g = permit;
-                stream_one(
+                let observed = stream_one_observed(
                     &ctx_c.client,
                     &ctx_c.base_url,
                     &ctx_c.model,
@@ -1437,8 +1457,11 @@ async fn run_closed_loop(
                     ctx_c.sampling,
                     ctx_c.timeout_s,
                     correlation,
+                    None,
                 )
-                .await
+                .await;
+                drop(ctx_c);
+                finish_measured_request(observed, start)
             }),
         ));
     }
@@ -1521,7 +1544,7 @@ async fn run_open_loop(
             input_tokens,
             correlation.clone(),
             tokio::spawn(async move {
-                stream_one(
+                let observed = stream_one_observed(
                     &ctx_c.client,
                     &ctx_c.base_url,
                     &ctx_c.model,
@@ -1533,8 +1556,11 @@ async fn run_open_loop(
                     ctx_c.sampling,
                     ctx_c.timeout_s,
                     correlation,
+                    None,
                 )
-                .await
+                .await;
+                drop(ctx_c);
+                finish_measured_request(observed, start)
             }),
         ));
     }
@@ -2752,6 +2778,7 @@ mod tests {
             RequestRecord {
                 benchmark_correlation: Some(good_record_correlation),
                 server_request_id: None,
+                client_execution_span: None,
                 success: true,
                 ttft_ms: 1.0,
                 e2e_ms: 2.0,
@@ -2781,6 +2808,7 @@ mod tests {
         assert!(!records[1].success);
         assert_eq!(records[1].input_tokens, 11);
         assert_eq!(records[1].quality_issues.panic, 1);
+        assert_eq!(records[1].client_execution_span, None);
         assert_eq!(
             records[1].output_token_count_source,
             OutputTokenCountSource::None
@@ -2999,6 +3027,7 @@ mod tests {
             records.push(RequestRecord {
                 benchmark_correlation: None,
                 server_request_id: None,
+                client_execution_span: None,
                 success: true,
                 ttft_ms: 10.0,
                 e2e_ms: 30.0,
@@ -3017,6 +3046,7 @@ mod tests {
             records.push(RequestRecord {
                 benchmark_correlation: None,
                 server_request_id: None,
+                client_execution_span: None,
                 success: false,
                 ttft_ms: 0.0,
                 e2e_ms: 30.0,
@@ -3138,6 +3168,7 @@ mod tests {
                 RequestRecord {
                     benchmark_correlation: None,
                     server_request_id: None,
+                    client_execution_span: None,
                     success: true,
                     ttft_ms: 10.0,
                     e2e_ms: 30.0,
@@ -3152,6 +3183,7 @@ mod tests {
                 RequestRecord {
                     benchmark_correlation: None,
                     server_request_id: None,
+                    client_execution_span: None,
                     success: false,
                     ttft_ms: 0.0,
                     e2e_ms: 50.0,
@@ -3256,6 +3288,7 @@ mod tests {
                 records: vec![RequestRecord {
                     benchmark_correlation: None,
                     server_request_id: None,
+                    client_execution_span: None,
                     success: true,
                     ttft_ms: 10.0,
                     e2e_ms: 30.0,

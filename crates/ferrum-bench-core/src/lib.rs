@@ -23,6 +23,7 @@
 //! - CI95 fields are suppressed when `n_repeats < 3` (degenerate).
 
 pub mod arrivals;
+mod client_execution_span;
 pub mod client_slo;
 pub mod dataset;
 pub mod decode_isolation;
@@ -35,6 +36,7 @@ pub mod sse_text_event_gap;
 pub mod stats;
 pub mod trace;
 
+pub use client_execution_span::ClientExecutionSpan;
 pub use env::{Env, EnvHash};
 pub use jsonl_journal::{
     normalize_jsonl_path, write_jsonl_records, JsonlJournal, JsonlJournalConfig, JsonlJournalError,
@@ -176,6 +178,9 @@ pub struct BenchmarkRequestRecord {
     /// Raw client observations. Older reports omit this evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<client_slo::RequestTiming>,
+    /// Optional client-task interval on this repeat's measured-phase clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_execution_span: Option<ClientExecutionSpan>,
 }
 
 /// Locked enum of bench scenarios shared by all benchmark producers.
@@ -385,6 +390,8 @@ pub struct TokenLengthStats {
 pub struct RequestRecord {
     pub benchmark_correlation: Option<BenchmarkRequestCorrelation>,
     pub server_request_id: Option<String>,
+    /// Absent when the producer has no shared phase clock or no actual start.
+    pub client_execution_span: Option<ClientExecutionSpan>,
     pub success: bool,
     pub ttft_ms: f64,
     pub e2e_ms: f64,
@@ -1217,6 +1224,7 @@ pub fn compute_metrics(
                             .expect("correlation presence checked above"),
                         server_request_id: record.server_request_id.clone(),
                         timing: Some(client_slo::RequestTiming::from_record(record)),
+                        client_execution_span: record.client_execution_span,
                     })
                     .collect::<Vec<_>>()
             })
@@ -1327,6 +1335,7 @@ mod tests {
         RequestRecord {
             benchmark_correlation: None,
             server_request_id: None,
+            client_execution_span: None,
             success,
             ttft_ms: ttft,
             e2e_ms: e2e,
@@ -1350,6 +1359,7 @@ mod tests {
         RequestRecord {
             benchmark_correlation: None,
             server_request_id: None,
+            client_execution_span: None,
             success: true,
             ttft_ms: ttft,
             e2e_ms: e2e,
@@ -1976,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn report_preserves_measured_request_join_keys() {
+    fn report_preserves_measured_request_join_keys_and_client_execution_span() {
         let mut request = req(true, 10.0, 20.0, 8, 4);
         request.benchmark_correlation = Some(
             BenchmarkRequestCorrelation::new(
@@ -1989,12 +1999,45 @@ mod tests {
             .unwrap(),
         );
         request.server_request_id = Some("chatcmpl-123".to_string());
-        let report = compute_one(make_run(vec![request], 1.0), 0, Slo::default());
+        request.client_execution_span = Some(ClientExecutionSpan {
+            start_ns: 10,
+            end_ns: 20_000_010,
+        });
+        let mut failed = req(false, 0.0, 20.0, 8, 0);
+        failed.benchmark_correlation = request.benchmark_correlation.clone();
+        failed.benchmark_correlation.as_mut().unwrap().request_index = 1;
+        failed.client_execution_span = Some(ClientExecutionSpan {
+            start_ns: 20,
+            end_ns: 20_000_020,
+        });
+        let mut missing = failed.clone();
+        missing
+            .benchmark_correlation
+            .as_mut()
+            .unwrap()
+            .request_index = 2;
+        missing.client_execution_span = None;
+        let report = compute_one(
+            make_run(vec![request.clone(), failed.clone(), missing], 1.0),
+            0,
+            Slo::default(),
+        );
         assert_eq!(report.benchmark_run_id.as_deref(), Some("bench-123"));
         assert_eq!(report.cell_id.as_deref(), Some("cell-0-closed-c1"));
         let record = &report.request_records.as_ref().unwrap()[0][0];
         assert_eq!(record.correlation.request_index, 0);
         assert_eq!(record.server_request_id.as_deref(), Some("chatcmpl-123"));
+        let records = &report.request_records.as_ref().unwrap()[0];
+        assert_eq!(
+            records[0].client_execution_span,
+            request.client_execution_span
+        );
+        assert_eq!(
+            records[1].client_execution_span,
+            failed.client_execution_span
+        );
+        assert!(!records[1].timing.as_ref().unwrap().success);
+        assert_eq!(records[2].client_execution_span, None);
     }
 }
 
