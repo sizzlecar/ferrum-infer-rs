@@ -262,7 +262,15 @@ fn batched_argmax_m32_complete_terminal_transaction_diagnostic() {
     let stream = context.new_stream().unwrap();
     for precision in [ArgmaxPrecision::F16, ArgmaxPrecision::F32] {
         let functions = ArgmaxFunctions::load(&context, precision).unwrap();
-        let fixture = Fixture::new(&stream, precision, 32, 248320);
+        let mut fixture = Fixture::new(&stream, precision, 32, 248320);
+        // Match the primary CT greedy workload. Mixed row policies remain in
+        // the correctness test, not in this throughput diagnostic.
+        for row in &mut fixture.rows {
+            row.penalty_value = 1.0;
+            stream
+                .memcpy_htod(&[row.penalty_value], &mut row.penalty)
+                .unwrap();
+        }
         let arguments = fixture.arguments(&stream);
         let expected = fixture.expected();
         let original = captured::Captured::new(&stream, || {
@@ -300,7 +308,7 @@ fn batched_argmax_m32_complete_terminal_transaction_diagnostic() {
                     if round >= 2 {
                         println!(
                             "{}",
-                            serde_json::json!({"probe":"batched_argmax_terminal_transaction","precision":if matches!(precision,ArgmaxPrecision::F16){"f16"}else{"f32"},"width":32,"vocabulary":248320,"batched":batched,"graph_replay":replay,"round":round-2,"transaction_wall_ns":wall_ns,"separate_graph_gpu_ns":gpu_ns,"captured_nodes":graph.node_count,"explicit_parameter_htod":0,"scalar_token_dtoh_calls":32,"setup_excluded":"shared input/scratch allocation and graph capture/upload; no extra device allocation in candidate","wall_scope":"enqueue including direct parameter packing or graph replay, 32 per-output sync/4B DtoH, host result assembly; excludes Core authorization/model execution"})
+                            serde_json::json!({"probe":"batched_argmax_terminal_transaction","policy":"no_repetition_penalty_primary","precision":if matches!(precision,ArgmaxPrecision::F16){"f16"}else{"f32"},"width":32,"vocabulary":248320,"batched":batched,"graph_replay":replay,"round":round-2,"transaction_wall_ns":wall_ns,"separate_graph_gpu_ns":gpu_ns,"captured_nodes":graph.node_count,"explicit_parameter_htod":0,"scalar_token_dtoh_calls":32,"setup_excluded":"shared input/scratch allocation and graph capture/upload; no extra device allocation in candidate","wall_scope":"enqueue including direct parameter packing or graph replay, 32 per-output sync/4B DtoH, host result assembly; excludes Core authorization/model execution"})
                         );
                     }
                 }
