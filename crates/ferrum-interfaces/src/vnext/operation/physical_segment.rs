@@ -42,6 +42,20 @@ impl<'w, B> PreparedPhysicalSegmentWave<'w, B> {
         }
         Ok(PreparedPhysicalSegmentNodeView { wave: self, index })
     }
+    pub fn dependency_count(&self, node: usize) -> Option<usize> {
+        self.dependencies.get(node).map(Vec::len)
+    }
+    pub fn dependency_identity(
+        &self,
+        node: usize,
+        dependency: usize,
+    ) -> Option<&RetainedPlanDependencyIdentity> {
+        self.dependencies
+            .get(node)?
+            .get(dependency)?
+            .as_ref()
+            .map(|authority| &authority.identity)
+    }
     pub fn take_dependency(
         &mut self,
         node: usize,

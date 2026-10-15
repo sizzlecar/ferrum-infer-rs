@@ -190,6 +190,18 @@ impl PreparedBackingInitializations {
         )
     }
 
+    pub(super) fn prepare_resident<'a>(
+        participants: impl IntoIterator<
+            Item = (
+                BatchParticipantAuthority,
+                &'a [LogicalBackingSliceAuthority],
+            ),
+        >,
+        wave_fingerprint: &str,
+    ) -> Result<Self, VNextError> {
+        Self::prepare_slices(participants, wave_fingerprint, None)
+    }
+
     fn prepare_slices<'a>(
         participants: impl IntoIterator<
             Item = (
@@ -366,7 +378,7 @@ impl PreparedBackingInitializations {
         )
     }
 
-    fn encode_in_pools<R: DeviceRuntime>(
+    pub(super) fn encode_in_pools<R: DeviceRuntime>(
         &self,
         pools: &DynamicPoolSet<R>,
         runtime: &R,

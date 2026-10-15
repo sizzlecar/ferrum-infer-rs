@@ -1156,16 +1156,24 @@ fn validate_invocation_preparation_strategy(
             "decode-segment invocation preparation requires a CUDA plan runtime",
         ));
     }
-    if config.engine_config.runtime.invocation_preparation_strategy
-        == ferrum_types::InvocationPreparationStrategy::DecodeSegmentProgram
+    if config
+        .engine_config
+        .runtime
+        .invocation_preparation_strategy
+        .uses_decode_segment_program()
         && (config.engine_config.runtime.segment_binding_owner_view_mode
             != ferrum_types::SegmentBindingOwnerViewMode::Indexed
             || config.engine_config.runtime.program_binding_upload_strategy
                 != ferrum_types::ProgramBindingUploadStrategy::CompactScatter)
     {
-        return Err(FerrumError::unsupported(
-            "decode-segment-program requires indexed owner views and compact-scatter uploads",
-        ));
+        return Err(FerrumError::unsupported(format!(
+            "{} requires indexed owner views and compact-scatter uploads",
+            config
+                .engine_config
+                .runtime
+                .invocation_preparation_strategy
+                .as_runtime_value()
+        )));
     }
     Ok(())
 }
@@ -2234,6 +2242,7 @@ mod tests {
                     InvocationPreparationStrategy::IdentityProjection,
                     InvocationPreparationStrategy::DecodeSegment,
                     InvocationPreparationStrategy::DecodeSegmentProgram,
+                    InvocationPreparationStrategy::ResidentDecodeProgram,
                 ] {
                     config.engine_config.runtime.invocation_preparation_strategy = preparation;
                     for upload in [

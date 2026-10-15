@@ -24,6 +24,41 @@ impl<R> ExecutionBatchParticipants<R>
 where
     R: DeviceRuntime,
 {
+    pub(super) fn prepare_reserved_step(
+        &self,
+        lane: &Arc<ExecutionLane<R>>,
+        bucket: Option<crate::vnext::ReusableExecutionBucketSpec>,
+        claimed_backing: ClaimedBackingTransaction,
+        session_use: super::resident_decode::ResidentUseGate,
+    ) -> Result<Arc<StepResourceLease<R>>, VNextError> {
+        let batch_step_id = issue_batch_step_id()?;
+        let captured = acquire_session_frames_with_backing(
+            &session_frame_capture_candidates(&self.sessions),
+            batch_step_id,
+            claimed_backing.work_shape(),
+        )?;
+        let participants = self
+            .sessions
+            .iter()
+            .cloned()
+            .zip(captured)
+            .map(|(session, captured)| AdmittedStepParticipant {
+                frame: captured.hold,
+                backing_snapshot: captured.backing_snapshot,
+                session,
+            })
+            .collect();
+        let mut step = StepResourceLease::new(
+            participants,
+            Arc::clone(lane),
+            bucket,
+            batch_step_id,
+            claimed_backing,
+        )?;
+        step.resident_bootstrap_use = Some(session_use);
+        Ok(Arc::new(step))
+    }
+
     pub fn try_begin_step(
         &self,
         request: StepResourceAdmissionRequest,

@@ -36,6 +36,7 @@ where
     pub(super) finalized: bool,
     pub(super) retained_plan_dependencies:
         Mutex<Vec<crate::vnext::RetainedPlanDependencyAuthority>>,
+    pub(super) resident_bootstrap_use: Option<super::resident_decode::ResidentUseGate>,
 }
 
 /// Canonical non-empty set selected by the scheduler for one continuous
@@ -1595,16 +1596,23 @@ impl StepParticipantRetirement {
 /// fingerprint through dispatch and fence ownership.
 #[must_use = "claimed backing must remain owned through its device fence"]
 pub struct ClaimedBackingTransaction {
-    // Physical extents release before the logical capacity claim.
-    backing_slices: Vec<LogicalBackingSliceAuthority>,
-    logical_capacity: Option<LogicalBatchCapacityLease>,
+    certificate_fingerprint: String,
     work_shape: Arc<BatchWorkShape>,
     demand: AdmissionDemand,
     fingerprint: String,
     physical_claim_count: usize,
     has_shared_physical_claims: bool,
-    // Occupancy releases after every physical/logical claim field above.
-    _lane_slot_lease: Option<LaneStableArenaSlotLease>,
+    // Last: metadata dies before slot occupancy.
+    owner: Arc<ClaimedBackingOwner>,
+}
+
+// Only immutable physical ownership is shared. Work authority, frame and flight
+// identities stay on each fresh transaction. Physical claims drop before capacity,
+// and slot occupancy is the last part of this owner to be released.
+struct ClaimedBackingOwner {
+    backing_slices: Vec<LogicalBackingSliceAuthority>,
+    logical_capacity: Option<LogicalBatchCapacityLease>,
+    lane_slot_lease: Option<LaneStableArenaSlotLease>,
 }
 
 fn logical_capacity_matches(
@@ -1631,6 +1639,61 @@ fn logical_capacity_matches(
 }
 
 impl ClaimedBackingTransaction {
+    pub(super) fn same_reserved_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+    }
+    pub(super) fn borrow_reserved(
+        &self,
+        work_shape: Arc<BatchWorkShape>,
+    ) -> Result<Self, VNextError> {
+        if work_shape.participants() != self.work_shape.participants()
+            || work_shape.immediate_shape() != self.work_shape.immediate_shape()
+        {
+            return Err(invalid_resource(
+                "reserved backing cannot authorize different participants or demand shape",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            work_fingerprint: &'a str,
+            demand: &'a AdmissionDemand,
+            backing_certificate_fingerprint: &'a str,
+            capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
+        }
+        let input = FingerprintInput {
+            domain: "ferrum.runtime-vnext.claimed-backing.v5",
+            work_fingerprint: work_shape.fingerprint(),
+            demand: &self.demand,
+            backing_certificate_fingerprint: &self.certificate_fingerprint,
+            capacity_parents: self
+                .owner
+                .logical_capacity
+                .as_ref()
+                .map(|capacity| {
+                    capacity
+                        .parents()
+                        .iter()
+                        .map(|parent| (parent.sequence(), parent.request()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let bytes = serde_json::to_vec(&input).map_err(|error| {
+            invalid_resource(format!(
+                "claimed backing fingerprint encode failed: {error}"
+            ))
+        })?;
+        Ok(Self {
+            owner: Arc::clone(&self.owner),
+            certificate_fingerprint: self.certificate_fingerprint.clone(),
+            work_shape,
+            demand: self.demand.clone(),
+            fingerprint: format!("{:x}", Sha256::digest(bytes)),
+            physical_claim_count: self.physical_claim_count,
+            has_shared_physical_claims: self.has_shared_physical_claims,
+        })
+    }
     pub(super) fn new(
         work_shape: Arc<BatchWorkShape>,
         demand: AdmissionDemand,
@@ -1716,14 +1779,17 @@ impl ClaimedBackingTransaction {
             ))
         })?;
         Ok(Self {
-            backing_slices,
-            logical_capacity,
+            owner: Arc::new(ClaimedBackingOwner {
+                backing_slices,
+                logical_capacity,
+                lane_slot_lease,
+            }),
+            certificate_fingerprint: bound_certificate.fingerprint().to_owned(),
             work_shape,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
             physical_claim_count: bound_certificate.physical_claim_count(),
             has_shared_physical_claims: bound_certificate.has_shared_physical_claims(),
-            _lane_slot_lease: lane_slot_lease,
         })
     }
 
@@ -1736,11 +1802,11 @@ impl ClaimedBackingTransaction {
     }
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        &self.backing_slices
+        &self.owner.backing_slices
     }
 
     pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {
-        self.logical_capacity.as_ref()
+        self.owner.logical_capacity.as_ref()
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -1760,7 +1826,8 @@ impl ClaimedBackingTransaction {
     }
 
     pub fn lane_stable_slot_identity(&self) -> Option<LaneStableArenaSlotIdentity> {
-        self._lane_slot_lease
+        self.owner
+            .lane_slot_lease
             .as_ref()
             .map(LaneStableArenaSlotLease::identity)
     }
@@ -1771,9 +1838,7 @@ impl ClaimedBackingTransaction {
 /// the liveness-derived peak and retained until the wave's terminal fence.
 #[must_use = "submission wave backing must remain owned through its device fence"]
 pub struct ClaimedSubmissionWaveBacking {
-    // Physical extents release before the logical capacity claim.
-    backing_slices: Vec<LogicalBackingSliceAuthority>,
-    logical_capacity: Option<LogicalBatchCapacityLease>,
+    certificate_fingerprint: String,
     plan_hash: PlanHash,
     node_count: usize,
     plan_node_count: usize,
@@ -1782,11 +1847,75 @@ pub struct ClaimedSubmissionWaveBacking {
     fingerprint: String,
     physical_claim_count: usize,
     program_binding: Option<Arc<ProgramBindingExecutionBinding>>,
-    // Occupancy releases only after terminal completion readback drops this claim.
-    _lane_slot_lease: Option<LaneStableArenaSlotLease>,
+    // Last: compiled bindings die before their slot occupancy owner.
+    owner: Arc<ClaimedBackingOwner>,
 }
 
 impl ClaimedSubmissionWaveBacking {
+    pub(super) fn same_reserved_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+    }
+    pub(super) fn borrow_reserved(
+        &self,
+        work_shape: Arc<BatchWorkShape>,
+    ) -> Result<Self, VNextError> {
+        if work_shape.participants() != self.work_shape.participants()
+            || work_shape.immediate_shape() != self.work_shape.immediate_shape()
+        {
+            return Err(invalid_resource(
+                "reserved backing cannot authorize different participants or demand shape",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            plan_hash: &'a PlanHash,
+            node_count: usize,
+            plan_node_count: usize,
+            work_fingerprint: &'a str,
+            demand: &'a AdmissionDemand,
+            backing_certificate_fingerprint: &'a str,
+            capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
+        }
+        let input = FingerprintInput {
+            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v5",
+            plan_hash: &self.plan_hash,
+            node_count: self.node_count,
+            plan_node_count: self.plan_node_count,
+            work_fingerprint: work_shape.fingerprint(),
+            demand: &self.demand,
+            backing_certificate_fingerprint: &self.certificate_fingerprint,
+            capacity_parents: self
+                .owner
+                .logical_capacity
+                .as_ref()
+                .map(|capacity| {
+                    capacity
+                        .parents()
+                        .iter()
+                        .map(|parent| (parent.sequence(), parent.request()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let bytes = serde_json::to_vec(&input).map_err(|error| {
+            invalid_resource(format!(
+                "submission wave backing fingerprint encode failed: {error}"
+            ))
+        })?;
+        Ok(Self {
+            owner: Arc::clone(&self.owner),
+            certificate_fingerprint: self.certificate_fingerprint.clone(),
+            work_shape,
+            demand: self.demand.clone(),
+            fingerprint: format!("{:x}", Sha256::digest(bytes)),
+            physical_claim_count: self.physical_claim_count,
+            plan_hash: self.plan_hash.clone(),
+            node_count: self.node_count,
+            plan_node_count: self.plan_node_count,
+            program_binding: self.program_binding.clone(),
+        })
+    }
     pub(super) fn new(
         plan_hash: PlanHash,
         node_count: usize,
@@ -1873,8 +2002,12 @@ impl ClaimedSubmissionWaveBacking {
             ))
         })?;
         Ok(Self {
-            backing_slices,
-            logical_capacity,
+            owner: Arc::new(ClaimedBackingOwner {
+                backing_slices,
+                logical_capacity,
+                lane_slot_lease,
+            }),
+            certificate_fingerprint: bound_certificate.fingerprint().to_owned(),
             plan_hash,
             node_count,
             plan_node_count,
@@ -1883,16 +2016,15 @@ impl ClaimedSubmissionWaveBacking {
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
             physical_claim_count: bound_certificate.physical_claim_count(),
             program_binding,
-            _lane_slot_lease: lane_slot_lease,
         })
     }
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        &self.backing_slices
+        &self.owner.backing_slices
     }
 
     pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {
-        self.logical_capacity.as_ref()
+        self.owner.logical_capacity.as_ref()
     }
 
     pub fn plan_hash(&self) -> &PlanHash {
@@ -1941,7 +2073,8 @@ impl ClaimedSubmissionWaveBacking {
         self.program_binding_layout()
             .map(ProgramBindingLayout::reusable_execution_bucket_id)
             .or_else(|| {
-                self.backing_slices
+                self.owner
+                    .backing_slices
                     .iter()
                     .find_map(|slice| slice.evidence().reusable_execution_bucket_id())
             })

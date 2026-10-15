@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 #[path = "decode_segment/multi_recipe.rs"]
 mod multi_recipe;
+#[path = "decode_segment/resident_program.rs"]
+mod resident_program;
 
 #[derive(Default)]
 struct Preparation(RefCell<Vec<InvocationPreparationStats>>);

@@ -54,10 +54,12 @@ mod binding_scatter;
 mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
+mod resident_program;
 mod segment_oracle;
 mod segment_owners;
 mod sequence_physical;
 mod terminal_readback;
+pub(crate) use resident_program::{ResidentColdParts, ResidentControlRule};
 use segment_owners::CudaProgramBindingRetention;
 pub(crate) use segment_owners::{CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, CudaSegmentRange};
 pub(crate) use sequence_physical::{
@@ -397,6 +399,11 @@ type EnqueueAction = Box<
 pub(crate) enum CudaDependencyWork {
     ScanAndWait,
     Wait,
+    Batch {
+        compute: u64,
+        transfer: u64,
+        waits: u64,
+    },
 }
 
 impl CudaDependencyWork {
@@ -404,6 +411,11 @@ impl CudaDependencyWork {
         match self {
             Self::ScanAndWait => (1, 1, 1),
             Self::Wait => (0, 0, 1),
+            Self::Batch {
+                compute,
+                transfer,
+                waits,
+            } => (compute, transfer, waits),
         }
     }
 }
@@ -2317,6 +2329,13 @@ impl CudaDeviceCommand {
             CudaEnqueuedWork::Dependency(CudaDependencyWork::Wait) => {
                 DeviceExecutionIntervalKind::Dependency
             }
+            CudaEnqueuedWork::Dependency(CudaDependencyWork::Batch { compute, .. }) => {
+                if compute > 0 {
+                    DeviceExecutionIntervalKind::Compute
+                } else {
+                    DeviceExecutionIntervalKind::Dependency
+                }
+            }
             CudaEnqueuedWork::Static if self.compute_dispatch_count > 0 => {
                 DeviceExecutionIntervalKind::Compute
             }
@@ -3055,6 +3074,7 @@ pub struct CudaDeviceRuntime {
     segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
     segment_binding_indexed_encodes: AtomicU64,
     physical_segment_binding_encodes: AtomicU64,
+    resident_decode_program_encodes: AtomicU64,
     sequence_physical_binding_tables_compiled: AtomicU64,
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
@@ -3268,6 +3288,7 @@ impl CudaDeviceRuntime {
                 ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
             segment_binding_indexed_encodes: AtomicU64::new(0),
             physical_segment_binding_encodes: AtomicU64::new(0),
+            resident_decode_program_encodes: AtomicU64::new(0),
             sequence_physical_binding_tables_compiled: AtomicU64::new(0),
             packed_decode_prepare_gate: false,
             causal_decode_attention_grouping:
@@ -3322,6 +3343,10 @@ impl CudaDeviceRuntime {
     pub fn physical_segment_binding_encodes(&self) -> u64 {
         self.physical_segment_binding_encodes
             .load(Ordering::Relaxed)
+    }
+
+    pub fn resident_decode_program_encodes(&self) -> u64 {
+        self.resident_decode_program_encodes.load(Ordering::Relaxed)
     }
 
     pub fn sequence_physical_binding_tables_compiled(&self) -> u64 {
@@ -4761,6 +4786,40 @@ impl DeviceRuntime for CudaDeviceRuntime {
             == ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
             && self.program_binding_upload_strategy == ProgramBindingUploadStrategy::CompactScatter
             && self.binding_scatter.is_some()
+    }
+
+    fn compile_resident_decode_program(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        wave: &ferrum_interfaces::vnext::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        if !self.supports_physical_segment_bindings() {
+            return Ok(None);
+        }
+        let Some(parts) = super::vnext_ops::compile_resident_decode_parts(program, wave)? else {
+            return Ok(None);
+        };
+        resident_program::compile(self, parts)
+    }
+
+    fn encode_resident_decode_program(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        request: &mut ferrum_interfaces::vnext::DeviceResidentDecodeRequest<'_>,
+    ) -> Result<
+        Option<ferrum_interfaces::vnext::DeviceEncodedResidentDecode<Self::Command>>,
+        Self::Error,
+    > {
+        if !self.supports_physical_segment_bindings() {
+            return Ok(None);
+        }
+        let encoded = resident_program::encode(self, program, request)?;
+        if encoded.is_some() {
+            self.resident_decode_program_encodes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| CudaDeviceRuntimeError::contract("resident encode count exhausted"))?;
+        }
+        Ok(encoded)
     }
 
     fn compile_sequence_physical_bindings(
@@ -6705,6 +6764,24 @@ mod tests {
             (
                 CudaDependencyWork::Wait,
                 (0, 0, 1),
+                DeviceExecutionIntervalKind::Dependency,
+            ),
+            (
+                CudaDependencyWork::Batch {
+                    compute: 2,
+                    transfer: 2,
+                    waits: 5,
+                },
+                (2, 2, 5),
+                DeviceExecutionIntervalKind::Compute,
+            ),
+            (
+                CudaDependencyWork::Batch {
+                    compute: 0,
+                    transfer: 0,
+                    waits: 5,
+                },
+                (0, 0, 5),
                 DeviceExecutionIntervalKind::Dependency,
             ),
         ] {

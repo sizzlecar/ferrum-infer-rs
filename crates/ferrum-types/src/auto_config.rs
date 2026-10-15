@@ -2660,7 +2660,7 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if strategy == crate::InvocationPreparationStrategy::DecodeSegmentProgram {
+        if strategy.uses_decode_segment_program() {
             let owner_mode = self
                 .entry(crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY)
                 .map(crate::SegmentBindingOwnerViewMode::parse_config_entry)
@@ -2688,7 +2688,10 @@ impl FerrumConfigBuilder {
             {
                 return Err(AutoConfigError::InvalidOverride {
                     key: key.to_owned(),
-                    reason: "decode-segment-program requires a CUDA plan runtime, indexed owner views and compact-scatter uploads".to_owned(),
+                    reason: format!(
+                        "{} requires a CUDA plan runtime, indexed owner views and compact-scatter uploads",
+                        strategy.as_runtime_value()
+                    ),
                 });
             }
         }
@@ -2702,6 +2705,7 @@ impl FerrumConfigBuilder {
                 "identity-projection",
                 "decode-segment",
                 "decode-segment-program",
+                "resident-decode-program",
             ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
@@ -6023,77 +6027,79 @@ mod tests {
     #[test]
     fn compiled_segments_require_cuda_plan_and_checked_compact_transport() {
         let key = "FERRUM_INVOCATION_PREPARATION_STRATEGY";
-        for (backend, authority, owner, upload, supported) in [
-            (
-                "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
-                "indexed",
-                "compact-scatter",
-                true,
-            ),
-            (
-                "metal",
-                ExecutionResourceAuthority::PlanRuntime,
-                "indexed",
-                "compact-scatter",
-                false,
-            ),
-            (
-                "cuda",
-                ExecutionResourceAuthority::LegacyEngine,
-                "indexed",
-                "compact-scatter",
-                false,
-            ),
-            (
-                "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
-                "legacy",
-                "compact-scatter",
-                false,
-            ),
-            (
-                "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
-                "indexed",
-                "sparse",
-                false,
-            ),
+        for strategy in [
+            crate::InvocationPreparationStrategy::DecodeSegmentProgram,
+            crate::InvocationPreparationStrategy::ResidentDecodeProgram,
         ] {
-            let entries = snapshot_with_sources(&[
-                (key, "decode-segment-program", RuntimeConfigSource::Cli),
+            for (backend, authority, owner, upload, supported) in [
                 (
-                    crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
-                    owner,
-                    RuntimeConfigSource::Cli,
+                    "cuda",
+                    ExecutionResourceAuthority::PlanRuntime,
+                    "indexed",
+                    "compact-scatter",
+                    true,
                 ),
                 (
-                    "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
-                    upload,
-                    RuntimeConfigSource::Cli,
+                    "metal",
+                    ExecutionResourceAuthority::PlanRuntime,
+                    "indexed",
+                    "compact-scatter",
+                    false,
                 ),
-            ]);
-            let mut hardware = HardwareCapabilities::unknown();
-            hardware.backend = backend.to_owned();
-            hardware.compiled_features.cuda = backend == "cuda";
-            let result = FerrumConfigBuilder::new(entries)
-                .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority)
-                .resolve();
-            if supported {
-                let resolved = result.unwrap();
-                let mut engine = crate::EngineConfig::default();
-                engine
-                    .apply_runtime_config_snapshot(&resolved.runtime_config)
-                    .unwrap();
-                assert_eq!(
-                    engine.runtime.invocation_preparation_strategy,
-                    crate::InvocationPreparationStrategy::DecodeSegmentProgram
-                );
-            } else {
-                assert!(
-                    matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
-                );
+                (
+                    "cuda",
+                    ExecutionResourceAuthority::LegacyEngine,
+                    "indexed",
+                    "compact-scatter",
+                    false,
+                ),
+                (
+                    "cuda",
+                    ExecutionResourceAuthority::PlanRuntime,
+                    "legacy",
+                    "compact-scatter",
+                    false,
+                ),
+                (
+                    "cuda",
+                    ExecutionResourceAuthority::PlanRuntime,
+                    "indexed",
+                    "sparse",
+                    false,
+                ),
+            ] {
+                let entries = snapshot_with_sources(&[
+                    (key, strategy.as_runtime_value(), RuntimeConfigSource::Cli),
+                    (
+                        crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+                        owner,
+                        RuntimeConfigSource::Cli,
+                    ),
+                    (
+                        "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                        upload,
+                        RuntimeConfigSource::Cli,
+                    ),
+                ]);
+                let mut hardware = HardwareCapabilities::unknown();
+                hardware.backend = backend.to_owned();
+                hardware.compiled_features.cuda = backend == "cuda";
+                let result = FerrumConfigBuilder::new(entries)
+                    .with_hardware_capabilities(hardware)
+                    .with_execution_resource_authority(authority)
+                    .resolve();
+                if supported {
+                    let resolved = result.unwrap();
+                    let mut engine = crate::EngineConfig::default();
+                    engine
+                        .apply_runtime_config_snapshot(&resolved.runtime_config)
+                        .unwrap();
+                    assert_eq!(engine.runtime.invocation_preparation_strategy, strategy);
+                } else {
+                    assert!(
+                        matches!(result, Err(AutoConfigError::InvalidOverride { key: actual, .. }) if actual == key)
+                    );
+                }
             }
         }
     }

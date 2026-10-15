@@ -353,9 +353,31 @@ fn validate_completed_wave<R: DeviceRuntime>(
             ));
         }
     }
+    validate_completed_participants(
+        plan.plan_hash(),
+        step.batch_step_id(),
+        wave.batch_invocation_id(),
+        step.work_shape(),
+        &step.participants,
+    )
+}
+
+/// Shared successful-boundary proof; callers separately prove exact full-plan
+/// coverage. These current session/frame/snapshot checks are never cached.
+pub(in crate::vnext::resource) fn validate_completed_participants<R: DeviceRuntime>(
+    plan_hash: &PlanHash,
+    batch_step_id: BatchStepId,
+    batch_invocation_id: BatchInvocationId,
+    work: &crate::vnext::BatchWorkShape,
+    admitted: &[crate::vnext::resource::AdmittedStepParticipant<R>],
+) -> Result<StepCompletedBoundaryProof, VNextError> {
+    if admitted.is_empty() || admitted.len() != work.participant_work().len() {
+        return Err(invalid_resource(
+            "completed resident/wave participant cardinality differs from fresh work",
+        ));
+    }
     // Same canonical participant ordering as frame admission/finalization.
-    let states = step
-        .participants
+    let states = admitted
         .iter()
         .map(|participant| {
             participant
@@ -366,12 +388,9 @@ fn validate_completed_wave<R: DeviceRuntime>(
                 .map_err(|_| invalid_resource("sequence session state mutex is poisoned"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut participants = Vec::with_capacity(step.participants.len());
-    for ((participant, state), token_span) in step
-        .participants
-        .iter()
-        .zip(&states)
-        .zip(step.work_shape().participant_work())
+    let mut participants = Vec::with_capacity(admitted.len());
+    for ((participant, state), token_span) in
+        admitted.iter().zip(&states).zip(work.participant_work())
     {
         let SequenceSessionSlotState::Active(active) = &**state else {
             return Err(invalid_resource(
@@ -399,15 +418,15 @@ fn validate_completed_wave<R: DeviceRuntime>(
         participants.push(boundary_from_span(
             active,
             token_span.token_span(),
-            plan.plan_hash(),
-            wave.batch_step_id(),
-            wave.batch_invocation_id(),
+            plan_hash,
+            batch_step_id,
+            batch_invocation_id,
             participant.frame.frame_id,
             backing.current.generation(),
         )?);
     }
     Ok(StepCompletedBoundaryProof {
-        batch_step_id: step.batch_step_id(),
+        batch_step_id,
         participants,
     })
 }

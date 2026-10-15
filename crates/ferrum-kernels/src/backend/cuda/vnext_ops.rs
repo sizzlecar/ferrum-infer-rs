@@ -118,6 +118,13 @@ pub(crate) fn compile_segment_binding_program(
     transformer::segment_bindings::compile_program(declarations)
 }
 
+pub(crate) fn compile_resident_decode_parts(
+    program: &(dyn std::any::Any + Send + Sync),
+    wave: &ferrum_interfaces::vnext::PreparedPhysicalSegmentWave<'_, CudaDeviceBuffer>,
+) -> Result<Option<super::vnext_runtime::ResidentColdParts>, CudaDeviceRuntimeError> {
+    transformer::segment_bindings::compile_resident_program(program, wave)
+}
+
 pub(crate) fn encode_compiled_segment_bindings(
     program: &(dyn std::any::Any + Send + Sync),
     frame: &mut ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
@@ -163,6 +170,8 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime/segment_owners.rs").as_bytes(),
         include_str!("vnext_runtime/sequence_physical.rs").as_bytes(),
         include_str!("vnext_runtime/terminal_readback.rs").as_bytes(),
+        include_str!("vnext_runtime/resident_program.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/segment_bindings/resident.rs").as_bytes(),
         include_str!("vnext_ops/transformer/segment_bindings/physical.rs").as_bytes(),
         include_str!("../program_binding_rows.rs").as_bytes(),
         include_str!("../program_binding_upload.rs").as_bytes(),

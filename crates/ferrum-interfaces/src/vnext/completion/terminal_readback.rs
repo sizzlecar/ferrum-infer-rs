@@ -15,6 +15,9 @@ impl<E> From<VNextError> for TerminalReadbackPrepareError<E> {
 impl<R: DeviceRuntime> CompletionResourceLease<R> {
     pub(super) fn prepared_terminal_request(&self) -> Option<&CompletionReadbackBatchRequest> {
         match self {
+            Self::Resident(use_) if use_.has_prepared_terminal_readbacks() => {
+                use_.terminal_readback_request()
+            }
             Self::Wave(wave) if wave.has_prepared_terminal_readbacks() => {
                 wave.terminal_readback_request()
             }
@@ -30,6 +33,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
     )> {
         match self {
             Self::Wave(wave) => wave.take_terminal_readbacks(),
+            Self::Resident(use_) => use_.take_terminal_readbacks(),
             Self::Invocation(_) => None,
         }
     }
@@ -47,10 +51,12 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .resources
             .as_ref()
             .expect("live reservation owns resources");
-        let CompletionResourceLease::Wave(wave) = resources else {
-            return Ok(());
+        let request = match resources {
+            CompletionResourceLease::Wave(wave) => wave.terminal_readback_request(),
+            CompletionResourceLease::Resident(use_) => use_.terminal_readback_request(),
+            CompletionResourceLease::Invocation(_) => None,
         };
-        let Some(request) = wave.terminal_readback_request() else {
+        let Some(request) = request else {
             return Ok(());
         };
         request.validate_for(self.batch_identity.as_ref().expect("reservation identity"))?;
@@ -167,12 +173,13 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         };
         let (command, payload) = prepared.into_parts();
         commands.set_terminal_readback(command)?;
-        let CompletionResourceLease::Wave(wave) =
-            self.resources.as_mut().expect("reservation resources")
-        else {
-            unreachable!()
-        };
-        wave.install_terminal_readback_payload(payload);
+        match self.resources.as_mut().expect("reservation resources") {
+            CompletionResourceLease::Wave(wave) => wave.install_terminal_readback_payload(payload),
+            CompletionResourceLease::Resident(use_) => {
+                use_.install_terminal_readback_payload(payload)
+            }
+            CompletionResourceLease::Invocation(_) => unreachable!(),
+        }
         Ok(())
     }
 }

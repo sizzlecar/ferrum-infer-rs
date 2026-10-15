@@ -549,7 +549,9 @@ impl BatchOperationIdentity {
                 self.data.deferred_recipe.as_ref().map_or(0, |recipe| {
                     recipe
                         .node_identities
-                        .iter()
+                        .get()
+                        .into_iter()
+                        .flat_map(|slots| slots.iter())
                         .filter(|identity| identity.get().is_some())
                         .count()
                 })
@@ -637,6 +639,49 @@ impl BatchOperationIdentity {
             .node_index(node_id)
     }
 
+    pub(crate) fn operation_identity_at(
+        &self,
+        node_index: usize,
+        participant: usize,
+    ) -> Result<ExecutionIdentityEnvelope, VNextError> {
+        if self.preparation_strategy() != InvocationPreparationStrategy::ResidentDecodeProgram {
+            return self
+                .materialize_node(node_index)?
+                .participants()
+                .get(participant)
+                .map(|p| p.identity().clone())
+                .ok_or_else(|| invalid_operation("operation identity participant is absent"));
+        }
+        let recipe = self
+            .data
+            .deferred_recipe
+            .as_ref()
+            .ok_or_else(|| invalid_operation("resident identity recipe is absent"))?;
+        let ParticipantIdentitySeeds::Projected(seeds) = &recipe.participant_seeds else {
+            return Err(invalid_operation(
+                "resident identity lacks projected participants",
+            ));
+        };
+        let seed = seeds
+            .get(participant)
+            .ok_or_else(|| invalid_operation("resident identity participant is absent"))?;
+        let counts = recipe
+            .projection_counts
+            .as_ref()
+            .expect("resident projected counters");
+        let identity = seed
+            .projected_identity(
+                seeds,
+                participant,
+                &recipe.topology,
+                node_index,
+                &counts.materializations,
+            )
+            .ok_or_else(|| invalid_operation("resident identity node is absent"))?;
+        counts.projected_identities.fetch_add(1, Ordering::Relaxed);
+        Ok(identity)
+    }
+
     pub(crate) fn materialize_node(
         &self,
         node_index: usize,
@@ -649,7 +694,13 @@ impl BatchOperationIdentity {
         let recipe = self.data.deferred_recipe.as_ref().ok_or_else(|| {
             invalid_operation("physical batch has neither materialized nodes nor a compiled recipe")
         })?;
-        let slot = recipe.node_identities.get(node_index).ok_or_else(|| {
+        let slots = recipe.node_identities.get_or_init(|| {
+            std::iter::repeat_with(OnceLock::new)
+                .take(recipe.topology.node_count())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        let slot = slots.get(node_index).ok_or_else(|| {
             invalid_operation("compiled physical batch node index is out of bounds")
         })?;
         if let Some(identity) = slot.get() {
@@ -838,7 +889,7 @@ struct DeferredBatchOperationIdentityRecipe {
     work_shape_fingerprint: String,
     participant_seeds: ParticipantIdentitySeeds,
     projection_counts: Option<IdentityProjectionCounts>,
-    node_identities: Box<[OnceLock<BatchOperationNodeIdentity>]>,
+    node_identities: OnceLock<Box<[OnceLock<BatchOperationNodeIdentity>]>>,
 }
 
 #[derive(Debug)]
@@ -1018,10 +1069,15 @@ impl BatchOperationIdentity {
                 })?;
             }
         }
-        let node_identities = std::iter::repeat_with(OnceLock::new)
-            .take(topology.node_count())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let node_identities = OnceLock::new();
+        if strategy != InvocationPreparationStrategy::ResidentDecodeProgram {
+            let _ = node_identities.set(
+                std::iter::repeat_with(OnceLock::new)
+                    .take(topology.node_count())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+        }
         let plan_id = topology.plan_id().clone();
         let plan_hash = topology.plan_hash().clone();
         let device_id = topology.device_id().clone();
@@ -1047,7 +1103,8 @@ impl BatchOperationIdentity {
                     }
                     InvocationPreparationStrategy::IdentityProjection
                     | InvocationPreparationStrategy::DecodeSegment
-                    | InvocationPreparationStrategy::DecodeSegmentProgram => {
+                    | InvocationPreparationStrategy::DecodeSegmentProgram
+                    | InvocationPreparationStrategy::ResidentDecodeProgram => {
                         ParticipantIdentitySeeds::Projected(participant_seeds.into())
                     }
                 },
@@ -1105,6 +1162,107 @@ impl BatchOperationIdentity {
                 node,
             )],
             active,
+        )
+    }
+
+    // Uses real fresh resident authority; only the provider-catalog identity
+    // fixture is abbreviated. Success still comes from the tracked runtime fence.
+    pub(crate) fn test_only_for_resident<R: crate::vnext::DeviceRuntime>(
+        use_: &crate::vnext::ResidentDecodeUse<R>,
+        plan_nodes: &[crate::vnext::PlanNode],
+        active: &[crate::vnext::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        use crate::vnext::{
+            ExecutionIdentityParts, NodeInvocationId, SpanId, EXECUTION_IDENTITY_VERSION,
+        };
+        if plan_nodes.len() != use_.node_count() || plan_nodes.is_empty() {
+            return Err(invalid_operation("test resident plan nodes differ"));
+        }
+        let plan = use_.plan_evidence();
+        let frames = use_.participant_frames();
+        let mut nodes = Vec::new();
+        let mut participant_index = 0_u32;
+        for (index, node) in plan_nodes.iter().enumerate() {
+            if active.len() != frames.len() {
+                return Err(invalid_operation("test resident participants differ"));
+            }
+            let mut participants = Vec::new();
+            for (binding, frame) in active.iter().zip(frames.iter().copied()) {
+                if binding.sequence_authority() != frame.participant().sequence_authority()
+                    || binding.plan().plan_hash() != plan.plan_hash()
+                {
+                    return Err(invalid_operation("test wave active binding differs"));
+                }
+                let invocation = NodeInvocationId::try_from(index as u64 + 1)?;
+                let identity = ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+                    version: EXECUTION_IDENTITY_VERSION,
+                    run_id: binding.run_id().clone(),
+                    request_id: binding.request_id().clone(),
+                    sequence: u64::from(participant_index) + 1,
+                    plan_id: Some(plan.plan_id().clone()),
+                    plan_hash: Some(plan.plan_hash().clone()),
+                    frame_id: Some(frame.frame_id()),
+                    node_invocation_id: Some(invocation),
+                    node_id: Some(node.id().clone()),
+                    operation_id: Some(node.operation_id().clone()),
+                    provider_id: Some(node.selection().selected_provider().clone()),
+                    device_id: Some(plan.device_id().clone()),
+                    resource_pool_id: None,
+                    resource_pool_identity_fingerprint: None,
+                    provisioning_run_id: None,
+                    provisioning_request_id: None,
+                    transaction_id: None,
+                    active_sequence_slot: Some(binding.sequence_authority().sparse_id()),
+                    admission_generation: Some(binding.sequence_authority().generation()),
+                    activation_epoch: Some(binding.activation_epoch()),
+                    runtime_implementation_fingerprint: Some(
+                        plan.runtime_implementation_fingerprint().to_owned(),
+                    ),
+                    active_sequence_fingerprint: Some(binding.fingerprint().to_owned()),
+                    completed_sequence_fingerprint: None,
+                    aborted_sequence_fingerprint: None,
+                    resource_id: None,
+                    resource_generation: None,
+                    resource_batch_fingerprint: None,
+                    span_id: SpanId::new(format!(
+                        "test/completion/{}/{participant_index}",
+                        use_.batch_invocation_id().get()
+                    ))?,
+                    parent_span_id: None,
+                    async_links: Vec::new(),
+                })?;
+                participants.push(BatchOperationParticipantIdentity::new(
+                    participant_index,
+                    ParticipantNodeKey::new(
+                        frame.participant(),
+                        frame.frame_id(),
+                        node.id().clone(),
+                    ),
+                    identity,
+                ));
+                participant_index += 1;
+            }
+            nodes.push(BatchOperationNodeIdentity::from_validated(
+                index as u32,
+                node.id().clone(),
+                node.operation_id().clone(),
+                node.selection().selected_provider().clone(),
+                node.provider_implementation_fingerprint().to_owned(),
+                node.provider_execution_semantics(),
+                use_.work_shape().fingerprint().to_owned(),
+                participants,
+            )?);
+        }
+        Self::from_validated(
+            use_.batch_step_id(),
+            use_.batch_invocation_id(),
+            plan.plan_id().clone(),
+            plan.plan_hash().clone(),
+            plan.device_id().clone(),
+            plan.runtime_implementation_fingerprint().to_owned(),
+            use_.execution_lane_id(),
+            use_.fingerprint().to_owned(),
+            nodes,
         )
     }
 

@@ -15,10 +15,12 @@ use ferrum_interfaces::vnext::{
 use std::sync::Arc;
 
 mod physical;
+mod resident;
 pub(crate) use physical::encode_program as encode_physical_program;
 pub(in crate::backend::cuda::vnext_ops) use physical::{
     sequence_window as physical_program_window, shared_region as shared_physical_program_region,
 };
+pub(crate) use resident::compile as compile_resident_program;
 
 #[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) struct ValidationRecipe {
