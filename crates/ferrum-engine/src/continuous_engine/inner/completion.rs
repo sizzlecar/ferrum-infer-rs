@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum StreamYieldPolicy {
+    Immediate,
+    AfterDecodeCohort,
+}
+
 impl SequencePhysicalResources {
     pub(super) fn is_empty(&self) -> bool {
         self.legacy_kv_allocation.is_none()
@@ -292,12 +298,39 @@ impl EngineInner {
         self.send_stream_text(request_id, Some(token), None).await;
     }
 
+    /// Return whether a successful enqueue still needs its cohort handoff.
+    pub(super) async fn send_stream_update_with_yield_policy(
+        &self,
+        request_id: &RequestId,
+        token: TokenId,
+        yield_policy: StreamYieldPolicy,
+    ) -> bool {
+        self.send_stream_text_with_yield_policy(request_id, Some(token), None, yield_policy)
+            .await
+    }
+
     async fn send_stream_text(
         &self,
         request_id: &RequestId,
         token: Option<TokenId>,
         terminal: Option<FinishReason>,
     ) {
+        self.send_stream_text_with_yield_policy(
+            request_id,
+            token,
+            terminal,
+            StreamYieldPolicy::Immediate,
+        )
+        .await;
+    }
+
+    async fn send_stream_text_with_yield_policy(
+        &self,
+        request_id: &RequestId,
+        token: Option<TokenId>,
+        terminal: Option<FinishReason>,
+        yield_policy: StreamYieldPolicy,
+    ) -> bool {
         // Decode the full generated-token history (skip_special=true matches
         // the final-response decode in `complete_request`) and emit only
         // the delta that hasn't been streamed yet. Per-token decode is
@@ -316,25 +349,25 @@ impl EngineInner {
         let (sender, delta, ttft_s, itl_s, first_emit_prof) = {
             let mut sequences = self.sequences.write();
             let Some(seq) = sequences.get_mut(request_id) else {
-                return;
+                return false;
             };
             let sender = seq.stream_sender.clone();
             let Ok(mut full) = self.tokenizer.decode(&seq.generated_tokens, true) else {
-                return;
+                return false;
             };
             let incomplete_utf8 = full.ends_with('\u{FFFD}');
             if incomplete_utf8 && terminal.is_none() {
                 // Partial multi-byte UTF-8 at the tail; wait for the next
                 // token. Do NOT advance streamed_text_len so the bytes get
                 // re-considered once the sequence completes.
-                return;
+                return false;
             }
             if !incomplete_utf8 {
                 seq.decoded_text_len = full.len();
             }
             let visible = if terminal.is_some() {
                 let Ok(text) = seq.decoded_output_text(self.tokenizer.as_ref(), terminal) else {
-                    return;
+                    return false;
                 };
                 text
             } else {
@@ -343,10 +376,10 @@ impl EngineInner {
                 full
             };
             if visible.ends_with('\u{FFFD}') {
-                return;
+                return false;
             }
             let Some(delta) = visible.get(seq.streamed_text_len..) else {
-                return;
+                return false;
             };
             let delta = delta.to_string();
             seq.streamed_text_len = visible.len();
@@ -417,7 +450,7 @@ impl EngineInner {
 
         if let Some(tx) = sender {
             if delta.is_empty() {
-                return;
+                return false;
             }
             let chunk = StreamChunk {
                 request_id: request_id.clone(),
@@ -434,11 +467,16 @@ impl EngineInner {
                 // A bounded channel send often completes immediately, so a
                 // hot decode loop can keep running without giving the CLI /
                 // HTTP stream receiver a chance to flush visible output. Yield
-                // after successful streaming sends to preserve token-level UX;
-                // non-streaming requests do not enter this branch.
-                tokio::task::yield_now().await;
+                // after successful streaming sends to preserve token-level UX.
+                // A decode cohort still enqueues each delta immediately, but
+                // shares this explicit handoff after all its ordinary rows.
+                match yield_policy {
+                    StreamYieldPolicy::Immediate => tokio::task::yield_now().await,
+                    StreamYieldPolicy::AfterDecodeCohort => return true,
+                }
             }
         }
+        false
     }
 
     // ── completion ─────────────────────────────────────────────────────

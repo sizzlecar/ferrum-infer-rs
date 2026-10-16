@@ -1,3 +1,4 @@
+use super::completion::StreamYieldPolicy;
 use super::*;
 
 #[derive(Debug)]
@@ -175,62 +176,79 @@ impl EngineInner {
         outputs: Vec<ferrum_interfaces::model_executor::PlanRuntimeDecodeOutput>,
         postprocess_started_at: Option<Instant>,
     ) -> Result<()> {
-        for (rid, output) in rids.iter().zip(outputs) {
-            let next_token_result = {
-                let mut sequences = self.sequences.write();
-                sequences.get_mut(rid).map(|sequence| {
-                    let token = match output.sampling_output {
-                        ExecutorSamplingOutput::GreedyToken(token) => {
-                            sequence.validate_and_commit_model_greedy_argmax_token(
-                                Some(self.tokenizer.as_ref()),
-                                token,
-                            )?;
-                            token
-                        }
-                        ExecutorSamplingOutput::FullLogits(mut logits) => sequence
-                            .sample_and_commit_with_processors_and_tokenizer(
-                                &mut logits,
-                                Some(self.tokenizer.as_ref()),
-                            )?,
-                    };
-                    sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
-                    sequence.record_generated_token_commit_with_decode_postprocess(
-                        postprocess_started_at,
-                    );
-                    Ok::<TokenId, FerrumError>(token)
-                })
-            };
-            let Some(next_token_result) = next_token_result else {
-                continue;
-            };
-            let next_token = match next_token_result {
-                Ok(token) => token,
-                Err(error) => {
-                    warn!("PlanRuntime batch decode post-process failed for {rid}: {error}");
-                    self.complete_request_with_error(rid, error).await?;
+        let mut handoff_pending = false;
+        // Keep the handoff outside the fallible loop so terminal cleanup errors
+        // cannot strand deltas already enqueued by earlier cohort members.
+        let result: Result<()> = async {
+            for (rid, output) in rids.iter().zip(outputs) {
+                let next_token_result = {
+                    let mut sequences = self.sequences.write();
+                    sequences.get_mut(rid).map(|sequence| {
+                        let token = match output.sampling_output {
+                            ExecutorSamplingOutput::GreedyToken(token) => {
+                                sequence.validate_and_commit_model_greedy_argmax_token(
+                                    Some(self.tokenizer.as_ref()),
+                                    token,
+                                )?;
+                                token
+                            }
+                            ExecutorSamplingOutput::FullLogits(mut logits) => sequence
+                                .sample_and_commit_with_processors_and_tokenizer(
+                                    &mut logits,
+                                    Some(self.tokenizer.as_ref()),
+                                )?,
+                        };
+                        sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
+                        sequence.record_generated_token_commit_with_decode_postprocess(
+                            postprocess_started_at,
+                        );
+                        Ok::<TokenId, FerrumError>(token)
+                    })
+                };
+                let Some(next_token_result) = next_token_result else {
                     continue;
+                };
+                let next_token = match next_token_result {
+                    Ok(token) => token,
+                    Err(error) => {
+                        warn!("PlanRuntime batch decode post-process failed for {rid}: {error}");
+                        self.complete_request_with_error(rid, error).await?;
+                        continue;
+                    }
+                };
+
+                let generated_count = self
+                    .sequences
+                    .read()
+                    .get(rid)
+                    .map(|sequence| sequence.generated_tokens.len())
+                    .unwrap_or(0);
+                self.scheduler.update_decode_progress(rid, generated_count);
+                self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+                counter!("ferrum.engine.decode_tokens_total").increment(1);
+
+                let stop_reason = self.stop_reason_for_request(rid);
+                if self.should_stream_generated_token(rid, next_token, stop_reason) {
+                    let yield_policy = if rids.len() > 1 && stop_reason.is_none() {
+                        StreamYieldPolicy::AfterDecodeCohort
+                    } else {
+                        StreamYieldPolicy::Immediate
+                    };
+                    handoff_pending |= self
+                        .send_stream_update_with_yield_policy(rid, next_token, yield_policy)
+                        .await;
                 }
-            };
-
-            let generated_count = self
-                .sequences
-                .read()
-                .get(rid)
-                .map(|sequence| sequence.generated_tokens.len())
-                .unwrap_or(0);
-            self.scheduler.update_decode_progress(rid, generated_count);
-            self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
-            counter!("ferrum.engine.decode_tokens_total").increment(1);
-
-            let stop_reason = self.stop_reason_for_request(rid);
-            if self.should_stream_generated_token(rid, next_token, stop_reason) {
-                self.send_stream_update(rid, next_token).await;
+                if let Some(reason) = stop_reason {
+                    self.complete_request(rid, reason).await?;
+                }
             }
-            if let Some(reason) = stop_reason {
-                self.complete_request(rid, reason).await?;
-            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        if handoff_pending {
+            tokio::task::yield_now().await;
+        }
+        result
     }
 
     pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode_adaptive(

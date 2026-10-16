@@ -30,6 +30,9 @@ use std::time::Duration;
 #[path = "stop_boundary_tests.rs"]
 mod stop_boundary_tests;
 
+#[path = "cohort_stream_handoff_tests.rs"]
+mod cohort_stream_handoff_tests;
+
 #[path = "prefix_rendezvous_tests.rs"]
 mod prefix_rendezvous_tests;
 #[path = "prefix_restore_deferred_tests.rs"]
