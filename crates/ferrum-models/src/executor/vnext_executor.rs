@@ -84,7 +84,7 @@ pub use determinism::{
     MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 use request::{terminalize_unsubmitted_session, VNextRequestRoot};
-use sampling_readback::ProductReadbackModes;
+use sampling_readback::{ProductReadbackModes, ReadbackDecision};
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
 const POLICY_VERSION: ContractVersion = ContractVersion::new(3, 0);
@@ -8032,6 +8032,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // The Step retains its original work Arc. Adding evidence only to a
         // later wave would leave the completed-state proof without tokens.
         let span = self.retain_checkpoint_token_evidence(span, tokens)?;
+        let output_role = VNextParticipantOutputRole::Decode(logits_policy.clone());
         let prepared = {
             let started = self
                 .basic_metrics_only
@@ -8051,7 +8052,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &batch,
                 std::slice::from_ref(&span),
                 VNextExecutionWaveKind::Decode,
-                matches!(logits_policy, LogitsReturnPolicy::GreedyArgmax { .. }),
+                std::iter::once(&output_role),
                 observation.as_mut(),
             )? {
                 prepared
@@ -8075,7 +8076,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             span,
             prepared,
             VNextExecutionWaveKind::Decode,
-            VNextParticipantOutputRole::Decode(logits_policy.clone()),
+            output_role,
         )
         .await
     }
@@ -8141,12 +8142,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 batch,
                 spans,
                 kind,
-                output_roles.iter().all(|role| {
-                    matches!(
-                        role.logits_policy(),
-                        Some(LogitsReturnPolicy::GreedyArgmax { .. })
-                    )
-                }),
+                output_roles.iter(),
                 observation.as_mut(),
             )? {
                 prepared

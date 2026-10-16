@@ -15,6 +15,70 @@ pub(super) enum ProductReadbackModes {
     Participant(Vec<VNextProductOutputMode>),
 }
 
+/// Classify borrowed roles before resource preparation without allocating the
+/// per-participant modes that are resolved after diagnostic capture admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadbackDecision {
+    Uniform(VNextProductOutputMode),
+    Participant,
+}
+
+fn participant_greedy_eligible(role: &VNextParticipantOutputRole, vocabulary_size: usize) -> bool {
+    matches!(role, VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax { token_mask, .. })
+        if token_mask.as_ref().is_none_or(|mask| mask.valid_token_mask.iter().take(vocabulary_size).any(|flag| *flag != 0)))
+        // Keep host repetition arithmetic for newly separated scalar rows.
+        // Existing homogeneous device sampling remains unchanged.
+        && !product_repetition_input(role.logits_policy(), VNextProductOutputMode::GreedyToken).is_active()
+}
+
+impl ReadbackDecision {
+    pub(super) fn classify<'a>(
+        strategy: SamplingReadbackMode,
+        kind: VNextExecutionWaveKind,
+        logits_type: ElementType,
+        vocabulary_size: usize,
+        diagnostic_capture: bool,
+        teacher_forced: bool,
+        roles: impl ExactSizeIterator<Item = &'a VNextParticipantOutputRole> + Clone,
+    ) -> Self {
+        let uniform = if teacher_forced {
+            VNextProductOutputMode::FullLogits
+        } else {
+            product_output_mode_for_roles(kind, roles.clone())
+        };
+        let fallback = Self::Uniform(uniform);
+        if strategy != SamplingReadbackMode::Participant
+            || kind != VNextExecutionWaveKind::Decode
+            || diagnostic_capture
+            || teacher_forced
+            || !matches!(logits_type, ElementType::F32 | ElementType::F16)
+            || uniform != VNextProductOutputMode::FullLogits
+        {
+            return fallback;
+        }
+        if !roles
+            .clone()
+            .any(|role| participant_greedy_eligible(role, vocabulary_size))
+        {
+            return fallback;
+        }
+        Self::Participant
+    }
+
+    pub(super) fn allows_resident(
+        self,
+        kind: VNextExecutionWaveKind,
+        diagnostic_capture: bool,
+    ) -> bool {
+        kind == VNextExecutionWaveKind::Decode
+            && !diagnostic_capture
+            && matches!(
+                self,
+                Self::Uniform(VNextProductOutputMode::GreedyToken) | Self::Participant
+            )
+    }
+}
+
 impl ProductReadbackModes {
     pub(super) fn resolve<'a>(
         strategy: SamplingReadbackMode,
@@ -25,46 +89,38 @@ impl ProductReadbackModes {
         teacher_forced: bool,
         roles: impl ExactSizeIterator<Item = &'a VNextParticipantOutputRole> + Clone,
     ) -> Self {
-        let participant_count = roles.len();
-        let uniform = if teacher_forced {
-            VNextProductOutputMode::FullLogits
-        } else {
-            product_output_mode_for_roles(kind, roles.clone())
-        };
-        let fallback = Self::Uniform {
-            mode: uniform,
-            participant_count,
-        };
-        if strategy != SamplingReadbackMode::Participant
-            || kind != VNextExecutionWaveKind::Decode
-            || diagnostic_capture
-            || teacher_forced
-            || !matches!(logits_type, ElementType::F32 | ElementType::F16)
-            || uniform != VNextProductOutputMode::FullLogits
-        {
-            return fallback;
+        match ReadbackDecision::classify(
+            strategy,
+            kind,
+            logits_type,
+            vocabulary_size,
+            diagnostic_capture,
+            teacher_forced,
+            roles.clone(),
+        ) {
+            ReadbackDecision::Uniform(mode) => Self::Uniform {
+                mode,
+                participant_count: roles.len(),
+            },
+            ReadbackDecision::Participant => Self::Participant(
+                roles
+                    .map(|role| {
+                        if participant_greedy_eligible(role, vocabulary_size) {
+                            VNextProductOutputMode::GreedyToken
+                        } else {
+                            VNextProductOutputMode::FullLogits
+                        }
+                    })
+                    .collect(),
+            ),
         }
-        let eligible = |role: &VNextParticipantOutputRole| {
-            matches!(role, VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax { token_mask, .. })
-                if token_mask.as_ref().is_none_or(|mask| mask.valid_token_mask.iter().take(vocabulary_size).any(|flag| *flag != 0)))
-                // Do not introduce a new GPU/host repetition arithmetic choice
-                // near ties. Existing homogeneous device sampling is unchanged.
-                && !product_repetition_input(role.logits_policy(), VNextProductOutputMode::GreedyToken).is_active()
-        };
-        if !roles.clone().any(eligible) {
-            return fallback;
+    }
+
+    pub(super) fn decision(&self) -> ReadbackDecision {
+        match self {
+            Self::Uniform { mode, .. } => ReadbackDecision::Uniform(*mode),
+            Self::Participant(_) => ReadbackDecision::Participant,
         }
-        Self::Participant(
-            roles
-                .map(|role| {
-                    if eligible(role) {
-                        VNextProductOutputMode::GreedyToken
-                    } else {
-                        VNextProductOutputMode::FullLogits
-                    }
-                })
-                .collect(),
-        )
     }
 
     pub(super) fn len(&self) -> usize {
@@ -138,6 +194,17 @@ mod tests {
             greedy(),
         ];
         for logits_type in [ElementType::F32, ElementType::F16] {
+            let decision = ReadbackDecision::classify(
+                SamplingReadbackMode::Participant,
+                VNextExecutionWaveKind::Decode,
+                logits_type,
+                3,
+                false,
+                false,
+                roles.iter(),
+            );
+            assert_eq!(decision, ReadbackDecision::Participant);
+            assert!(decision.allows_resident(VNextExecutionWaveKind::Decode, false));
             let modes = ProductReadbackModes::resolve(
                 SamplingReadbackMode::Participant,
                 VNextExecutionWaveKind::Decode,
@@ -147,6 +214,7 @@ mod tests {
                 false,
                 roles.iter(),
             );
+            assert_eq!(modes.decision(), decision);
             assert_eq!(
                 modes.iter().collect::<Vec<_>>(),
                 [
@@ -220,6 +288,20 @@ mod tests {
                 true,
             ),
         ] {
+            let decision = ReadbackDecision::classify(
+                strategy,
+                kind,
+                dtype,
+                3,
+                capture,
+                teacher,
+                roles.iter(),
+            );
+            assert_eq!(
+                decision,
+                ReadbackDecision::Uniform(VNextProductOutputMode::FullLogits)
+            );
+            assert!(!decision.allows_resident(kind, capture));
             let modes = ProductReadbackModes::resolve(
                 strategy,
                 kind,
@@ -230,6 +312,7 @@ mod tests {
                 roles.iter(),
             );
             assert_eq!(modes.uniform(), Some(VNextProductOutputMode::FullLogits));
+            assert_eq!(modes.decision(), decision);
         }
     }
 
@@ -261,6 +344,9 @@ mod tests {
                 VNextProductOutputMode::FullLogits
             ]
         );
+        assert!(modes
+            .decision()
+            .allows_resident(VNextExecutionWaveKind::Decode, false));
         let homogeneous = [greedy(), repetition];
         let modes = ProductReadbackModes::resolve(
             SamplingReadbackMode::Participant,
@@ -299,6 +385,128 @@ mod tests {
                 roles.iter(),
             );
             assert_eq!(modes.at(1), Some(VNextProductOutputMode::FullLogits));
+            assert_eq!(modes.decision(), ReadbackDecision::Participant);
+        }
+    }
+
+    #[test]
+    fn resident_readback_rejects_mixed_without_an_eligible_scalar_row() {
+        let mut ineligible = [vec![], vec![0, 0, 0], vec![0, 0, 0, 1]]
+            .into_iter()
+            .map(|mask| {
+                VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax {
+                    token_mask: Some(TokenSelectionMask::new(mask)),
+                    repetition_penalty: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        ineligible.push(VNextParticipantOutputRole::Decode(
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: None,
+                repetition_penalty: Some(GreedyRepetitionPenalty::new(1.1, vec![1, 2])),
+            },
+        ));
+        for role in ineligible {
+            let roles = [
+                role,
+                VNextParticipantOutputRole::Decode(LogitsReturnPolicy::FullLogits),
+            ];
+            for dtype in [ElementType::F16, ElementType::F32] {
+                let decision = ReadbackDecision::classify(
+                    SamplingReadbackMode::Participant,
+                    VNextExecutionWaveKind::Decode,
+                    dtype,
+                    3,
+                    false,
+                    false,
+                    roles.iter(),
+                );
+                assert_eq!(
+                    decision,
+                    ReadbackDecision::Uniform(VNextProductOutputMode::FullLogits)
+                );
+                assert!(!decision.allows_resident(VNextExecutionWaveKind::Decode, false));
+                let modes = ProductReadbackModes::resolve(
+                    SamplingReadbackMode::Participant,
+                    VNextExecutionWaveKind::Decode,
+                    dtype,
+                    3,
+                    false,
+                    false,
+                    roles.iter(),
+                );
+                assert_eq!(
+                    modes.iter().collect::<Vec<_>>(),
+                    [VNextProductOutputMode::FullLogits; 2]
+                );
+                assert_eq!(modes.decision(), decision);
+            }
+        }
+        let empty = ReadbackDecision::classify(
+            SamplingReadbackMode::Participant,
+            VNextExecutionWaveKind::Decode,
+            ElementType::F16,
+            3,
+            false,
+            false,
+            std::iter::empty(),
+        );
+        assert_eq!(
+            empty,
+            ReadbackDecision::Uniform(VNextProductOutputMode::FullLogits)
+        );
+        assert!(!empty.allows_resident(VNextExecutionWaveKind::Decode, false));
+    }
+
+    #[test]
+    fn resident_readback_preserves_uniform_greedy_but_excludes_capture_and_teacher() {
+        let roles = [
+            greedy(),
+            VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(TokenSelectionMask::new(vec![])),
+                repetition_penalty: Some(GreedyRepetitionPenalty::new(1.1, vec![1, 2])),
+            }),
+        ];
+        for strategy in [
+            SamplingReadbackMode::Uniform,
+            SamplingReadbackMode::Participant,
+        ] {
+            for dtype in [ElementType::F16, ElementType::F32, ElementType::Bf16] {
+                for (capture, teacher) in [(false, false), (true, false), (true, true)] {
+                    let decision = ReadbackDecision::classify(
+                        strategy,
+                        VNextExecutionWaveKind::Decode,
+                        dtype,
+                        3,
+                        capture,
+                        teacher,
+                        roles.iter(),
+                    );
+                    let expected = if teacher {
+                        VNextProductOutputMode::FullLogits
+                    } else {
+                        VNextProductOutputMode::GreedyToken
+                    };
+                    assert_eq!(decision, ReadbackDecision::Uniform(expected));
+                    assert_eq!(
+                        decision.allows_resident(VNextExecutionWaveKind::Decode, capture),
+                        !capture && !teacher
+                    );
+                    assert!(!decision.allows_resident(VNextExecutionWaveKind::Prefill, capture));
+                    assert!(!decision.allows_resident(VNextExecutionWaveKind::Mixed, capture));
+                    let modes = ProductReadbackModes::resolve(
+                        strategy,
+                        VNextExecutionWaveKind::Decode,
+                        dtype,
+                        3,
+                        capture,
+                        teacher,
+                        roles.iter(),
+                    );
+                    assert_eq!(modes.uniform(), Some(expected));
+                    assert_eq!(modes.decision(), decision);
+                }
+            }
         }
     }
 }

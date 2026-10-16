@@ -160,12 +160,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         false
     }
 
-    pub(super) fn try_prepare_resident_decode(
+    pub(super) fn try_prepare_resident_decode<'a>(
         &self,
         batch: &ExecutionBatchParticipants<R>,
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
-        greedy: bool,
+        output_roles: impl ExactSizeIterator<Item = &'a VNextParticipantOutputRole> + Clone,
         observation: Option<&mut reusable_cold_path::DecodePreparationObservation>,
     ) -> Result<Option<PreparedVNextPrefill<R>>> {
         if self.invocation_preparation_strategy
@@ -174,7 +174,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             return Ok(None);
         }
         if kind != VNextExecutionWaveKind::Decode
-            || !greedy
             || self.checkpoint_capture.is_some()
             || self.checkpoint_token_evidence_enabled()
             || !self
@@ -182,6 +181,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .direct_reusable_execution_allowed()
             || spans.iter().any(|span| span.immediate_tokens() != 1)
         {
+            self.release_resident_decode();
+            return Ok(None);
+        }
+        // A teacher-forced decision requires checkpoint_capture. Its absence
+        // above makes this early classification identical to final resolution.
+        let readbacks = ReadbackDecision::classify(
+            self.sampling_readback_mode,
+            kind,
+            self.io.output_layout.element_type(),
+            self.io.output_elements,
+            false,
+            false,
+            output_roles,
+        );
+        if !readbacks.allows_resident(kind, false) {
             self.release_resident_decode();
             return Ok(None);
         }
@@ -295,9 +309,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         };
-        if output_modes.uniform() != Some(VNextProductOutputMode::GreedyToken) {
+        if !output_modes
+            .decision()
+            .allows_resident(kind, self.checkpoint_capture.is_some())
+        {
             return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(
-                "resident decode requires uniform greedy readbacks".to_owned(),
+                "resident decode requires uncaptured greedy or participant readbacks".to_owned(),
             ));
         }
         let uploads =
