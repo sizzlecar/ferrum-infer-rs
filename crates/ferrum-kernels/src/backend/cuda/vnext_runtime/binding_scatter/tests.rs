@@ -261,6 +261,16 @@ fn binding_scatter_fresh_owners_fences_and_capacity() {
 #[test]
 #[ignore = "real H2D partial failure retains compact scratch in runtime quarantine until drain; exclusive GPU"]
 fn binding_scatter_partial_upload_quarantine_retains_budget() {
+    partial_upload_quarantine_retains_budget(false);
+}
+
+#[test]
+#[ignore = "real addressed input H2D failure retains production scratch until quarantine drain; exclusive GPU"]
+fn addressed_input_scatter_partial_upload_quarantine_retains_budget() {
+    partial_upload_quarantine_retains_budget(true);
+}
+
+fn partial_upload_quarantine_retains_budget(addressed: bool) {
     let runtime = Arc::new(
         CudaDeviceRuntime::new(
             crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config(
@@ -280,16 +290,31 @@ fn binding_scatter_partial_upload_quarantine_retains_budget() {
     };
     let arena = canary_arena(&stream.stream);
     let input = transfers(48, 73);
-    let bytes = packet_bytes(&input);
+    let payload = if addressed {
+        let mut payload = Vec::new();
+        for field in [24_u64, arena.device_ptr(&stream.stream).0 + 4, 4] {
+            payload.extend_from_slice(&field.to_le_bytes());
+        }
+        payload.extend_from_slice(&[73, 74, 75, 76]);
+        payload.into_boxed_slice()
+    } else {
+        Packet::prepare(&input, ARENA_BYTES as u64, usize::MAX)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .into_boxed_slice()
+    };
+    let bytes = payload.len();
     let mut scatter = BindingScatter::load(&runtime.context).unwrap();
     small_budget(&mut scatter, bytes, bytes);
-    let PreparedScatter {
-        bytes: payload,
-        owner,
-    } = scatter
-        .prepare(&runtime.allocation_stream, &input, ARENA_BYTES as u64)
-        .unwrap()
-        .unwrap();
+    let prepare = || {
+        if addressed {
+            scatter.prepare_addressed(&runtime.allocation_stream, bytes, 1)
+        } else {
+            scatter.prepare_encoded(&runtime.allocation_stream, bytes, input.len() as u32)
+        }
+    };
+    let owner = prepare().unwrap().unwrap();
     let retained_arena = Arc::clone(&arena);
     let mut command = super::super::tests::command("test.compact_binding_partial_upload");
     command.runtime_instance = runtime.runtime_instance;
@@ -316,10 +341,7 @@ fn binding_scatter_partial_upload_quarantine_retains_budget() {
     drop((pending, shared_executable));
     assert_eq!(runtime.quarantined().len(), 1);
     assert_eq!(scatter.budget.live.load(Ordering::Acquire), bytes);
-    assert!(scatter
-        .prepare(&runtime.allocation_stream, &input, ARENA_BYTES as u64)
-        .unwrap()
-        .is_none());
+    assert!(prepare().unwrap().is_none());
     runtime.synchronize(&mut stream).unwrap();
     assert!(runtime.quarantined().is_empty());
     assert_eq!(scatter.budget.live.load(Ordering::Acquire), 0);
@@ -329,13 +351,10 @@ fn binding_scatter_partial_upload_quarantine_retains_budget() {
     );
     // Draining releases ownership but does not turn a failed execution lane
     // healthy. A future fresh allocation can nevertheless recover its budget.
-    let next = scatter
-        .prepare(&runtime.allocation_stream, &input, ARENA_BYTES as u64)
-        .unwrap()
-        .unwrap();
+    let next = prepare().unwrap().unwrap();
     assert_eq!(scatter.budget.live.load(Ordering::Acquire), bytes);
     drop(next);
     runtime.allocation_stream.synchronize().unwrap();
     assert_eq!(scatter.budget.live.load(Ordering::Acquire), 0);
-    println!("compact binding partial H2D: host-injected error, shared executable handle lifetime, quarantine holds budget until successful drain; no real driver fault injected");
+    println!("scatter partial H2D (addressed={addressed}): host-injected error, shared executable handle lifetime, quarantine holds budget until successful drain; no real driver fault injected");
 }

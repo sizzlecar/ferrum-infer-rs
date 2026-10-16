@@ -62,8 +62,10 @@ impl Drop for ScratchReservation {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct BindingScatter {
     function: CudaFunction,
+    addressed_function: CudaFunction,
     budget: Arc<ScratchBudget>,
 }
 
@@ -93,8 +95,14 @@ impl BindingScatter {
         let function = module.load_function(FUNCTION).map_err(|error| {
             CudaDeviceRuntimeError::driver("binding scatter function load", error)
         })?;
+        let addressed_function = module
+            .load_function("ferrum_addressed_input_scatter_v1")
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("addressed input scatter function load", error)
+            })?;
         Ok(Self {
             function,
+            addressed_function,
             budget: Arc::new(ScratchBudget {
                 limits: ScratchLimits::default(),
                 live: AtomicUsize::new(0),
@@ -141,6 +149,51 @@ impl BindingScatter {
                 "encoded binding packet has no payload",
             ));
         }
+        self.prepare_storage(allocation_stream, bytes, count, &self.function)
+    }
+
+    /// Independent destinations use their own descriptor ABI; they are never
+    /// treated as offsets in an invented common arena. Budget is shared with
+    /// program-binding packets and remains charged through the same fence.
+    pub(super) fn prepare_addressed(
+        &self,
+        allocation_stream: &Arc<CudaStream>,
+        bytes: usize,
+        count: u32,
+    ) -> Result<Option<ScatterOwner>> {
+        if count == 0
+            || (count as usize)
+                .checked_mul(24)
+                .is_none_or(|header| header >= bytes)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "addressed input packet has no payload",
+            ));
+        }
+        self.prepare_storage(allocation_stream, bytes, count, &self.addressed_function)
+    }
+
+    pub(super) fn packet_limit(&self) -> usize {
+        self.budget.limits.packet_bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn live_bytes_for_test(&self) -> usize {
+        self.budget.live.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_test_budget(&self) -> Option<impl Drop> {
+        self.budget.reserve(self.budget.limits.packet_bytes)
+    }
+
+    fn prepare_storage(
+        &self,
+        allocation_stream: &Arc<CudaStream>,
+        bytes: usize,
+        count: u32,
+        function: &CudaFunction,
+    ) -> Result<Option<ScatterOwner>> {
         let Some(reservation) = self.budget.reserve(bytes) else {
             return Ok(None);
         };
@@ -161,7 +214,7 @@ impl BindingScatter {
         let owner = ScatterOwner {
             device,
             _reservation: reservation,
-            function: self.function.clone(),
+            function: function.clone(),
             count,
             submitted: AtomicBool::new(false),
         };
@@ -213,6 +266,21 @@ impl ScatterOwner {
         .map_err(|error| {
             CudaDeviceRuntimeError::driver("compact program binding scatter", error)
         })?;
+        Ok(())
+    }
+
+    pub(super) fn scatter_addressed(&self, stream: &CudaStream) -> Result<()> {
+        let packet = self.device.device_ptr(stream).0;
+        let mut launch = stream.launch_builder(&self.function);
+        launch.arg(&packet).arg(&self.count);
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (self.count, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("addressed input scatter", error))?;
         Ok(())
     }
 }

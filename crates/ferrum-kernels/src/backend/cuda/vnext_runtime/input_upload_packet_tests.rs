@@ -18,6 +18,7 @@ const HEADER: usize = 24;
 enum Route {
     OriginalUploads,
     FreshAddressedPacket,
+    ProductPacket,
 }
 
 struct Write {
@@ -330,6 +331,30 @@ impl Fixture {
                 commands.push(command);
                 bytes
             }
+            Route::ProductPacket => {
+                assert!(!fail_after_h2d);
+                let entries = writes
+                    .iter()
+                    .map(|write| {
+                        runtime
+                            .encode_upload(
+                                &write.bytes,
+                                write.layout,
+                                &self.targets[write.target],
+                                write.offset,
+                            )
+                            .map(|command| (DeviceCommandPhase::DynamicBinding, None, command))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let entries = input_upload_packet::coalesce(runtime, entries)?;
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].2.compute_dispatch_count, 1);
+                assert_eq!(entries[0].2.transfer_command_count, 1);
+                assert!(entries[0].2.replay_key.is_none());
+                assert!(runtime.input_upload_scatter.live_bytes_for_test() > 0);
+                commands.extend(entries.into_iter().map(|(_, _, command)| command));
+                payload_bytes + writes.len() * HEADER
+            }
         };
         // Correctness-only successor observes every byte, including old holes.
         // Measurement runs omit it; no hidden D2D copies enter upload timings.
@@ -407,7 +432,7 @@ impl Fixture {
         drop(receipt);
         drop(pending);
         drop(start);
-        if matches!(route, Route::FreshAddressedPacket) {
+        if !matches!(route, Route::OriginalUploads) {
             // Includes completion of the fresh scratch's queued deallocation.
             runtime
                 .allocation_stream
@@ -423,6 +448,9 @@ impl Fixture {
             weak_targets.iter().all(|w| w.upgrade().is_none()),
             "caller-free target owner outlived all commands"
         );
+        if matches!(route, Route::ProductPacket) {
+            assert_eq!(runtime.input_upload_scatter.live_bytes_for_test(), 0);
+        }
         // Full byte oracle and readback are outside the measured transaction.
         for write in self.writes(generation) {
             let offset = write.offset as usize;
@@ -434,7 +462,7 @@ impl Fixture {
             json!({"route":format!("{route:?}"),"participants":self.width,"generation":generation,
             "uploads":self.width*2,"payload_bytes":payload_bytes,"uploaded_bytes":upload_bytes,
             "h2d_calls":if matches!(route,Route::OriginalUploads){self.width*2}else{1},
-            "scatter_dispatches":usize::from(matches!(route,Route::FreshAddressedPacket)),
+            "scatter_dispatches":usize::from(!matches!(route,Route::OriginalUploads)),
             "prepare_ns":prepared_ns,"enqueue_api_ns":enqueue_ns,"through_terminal_ns":terminal_ns,
             "retirement_ns":total_ns-terminal_ns,"total_ns":total_ns,"stream_interval_ns":stream_interval_ns,
             "successor_copies":if successor{self.width*2}else{0},"caller_targets_dropped_before_enqueue":detach_targets}),
@@ -577,4 +605,148 @@ fn input_upload_packet_preserves_independent_targets_and_complete_cost() {
             "real_h2d_then_injected_failure_quarantined_until_drain":true,"real_driver_fault":false})
         );
     }
+}
+
+#[test]
+#[ignore = "CUDA product input packet: actual coalescer, independent owners, fresh values and fences"]
+fn input_upload_product_preserves_bytes_lifetimes_and_fallbacks() {
+    let runtime = CudaDeviceRuntime::new(
+        super::super::vnext_ops::cuda_vnext_runtime_config(
+            0,
+            DeviceId::new("device.test.input-upload-product").unwrap(),
+            AttentionExecutionPolicy::Portable,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Fixture's diagnostic function is unused by ProductPacket. The product
+    // path loads and invokes the embedded addressed-scatter implementation.
+    let ptx = compile_ptx(include_str!("input_upload_packet_tests/scatter.cu")).unwrap();
+    let module = runtime.context.load_module(ptx).unwrap();
+    let function = module
+        .load_function("ferrum_test_input_upload_scatter")
+        .unwrap();
+    for width in [4, 8, 32] {
+        let mut fixture = Fixture::new(&runtime, &function, width).unwrap();
+        for generation in 1..=4 {
+            fixture
+                .run(
+                    &runtime,
+                    Route::ProductPacket,
+                    generation,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+        }
+        fixture
+            .run(&runtime, Route::ProductPacket, 19, true, true, false)
+            .unwrap();
+    }
+
+    let fixture = Fixture::new(&runtime, &function, 8).unwrap();
+    let writes = fixture.writes(23);
+    let entries = || {
+        writes
+            .iter()
+            .map(|write| {
+                (
+                    DeviceCommandPhase::DynamicBinding,
+                    None,
+                    runtime
+                        .encode_upload(
+                            &write.bytes,
+                            write.layout,
+                            &fixture.targets[write.target],
+                            write.offset,
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let snapshot = |commands: &[(DeviceCommandPhase, Option<u32>, CudaDeviceCommand)]| {
+        commands
+            .iter()
+            .map(|(phase, node, command)| {
+                let executable = command.executable.as_ref().unwrap();
+                (
+                    *phase,
+                    *node,
+                    executable.regions[0].device_ptr,
+                    executable.host_storage[0].to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // Capacity refusal must retain every command, source byte and order.
+    let mut held = Vec::new();
+    while let Some(reservation) = runtime.input_upload_scatter.hold_test_budget() {
+        held.push(reservation);
+    }
+    let original = entries();
+    let expected = snapshot(&original);
+    let fallback = input_upload_packet::coalesce(&runtime, original).unwrap();
+    assert_eq!(snapshot(&fallback), expected);
+    drop((fallback, held));
+    assert_eq!(runtime.input_upload_scatter.live_bytes_for_test(), 0);
+
+    // A repeated real destination forces the complete run back to ordered
+    // copies. A packet may never race two overlapping logical uploads.
+    let mut original = entries();
+    let first = &writes[0];
+    original.push((
+        DeviceCommandPhase::DynamicBinding,
+        None,
+        runtime
+            .encode_upload(
+                &first.bytes,
+                first.layout,
+                &fixture.targets[first.target],
+                first.offset,
+            )
+            .unwrap(),
+    ));
+    let expected = snapshot(&original);
+    let fallback = input_upload_packet::coalesce(&runtime, original).unwrap();
+    assert_eq!(snapshot(&fallback), expected);
+    assert_eq!(runtime.input_upload_scatter.live_bytes_for_test(), 0);
+    drop(fallback);
+
+    // A node-attributed command is a boundary even if it is also a host copy.
+    let mut original = entries();
+    original[8].1 = Some(17);
+    let grouped = input_upload_packet::coalesce(&runtime, original).unwrap();
+    assert_eq!(grouped.len(), 9); // eight merged; boundary and seven direct
+    assert_eq!(grouped[0].2.compute_dispatch_count, 1);
+    assert_eq!(grouped[1].1, Some(17));
+    assert_eq!(grouped[1].2.compute_dispatch_count, 0);
+    drop(grouped);
+    runtime.allocation_stream.synchronize().unwrap();
+    assert_eq!(runtime.input_upload_scatter.live_bytes_for_test(), 0);
+
+    // The typed marker cannot authorize a foreign buffer, wrong element type,
+    // or an out-of-range destination; original encode_upload refuses them.
+    let target = &fixture.targets[0];
+    assert!(runtime
+        .encode_upload(
+            &[0; 4],
+            HostTransferLayout::new(ElementType::F32, 1).unwrap(),
+            target,
+            0
+        )
+        .is_err());
+    assert!(runtime
+        .encode_upload(
+            &[0; 8],
+            HostTransferLayout::new(ElementType::U32, 2).unwrap(),
+            target,
+            BYTES as u64 - 4
+        )
+        .is_err());
+    let mut foreign = entries();
+    foreign[0].2.runtime_instance = runtime.runtime_instance + 1;
+    assert!(input_upload_packet::coalesce(&runtime, foreign).is_err());
+    println!("product input packet: byte-exact fresh independent allocations, same-stream successor, caller-owner release, shared capacity/overlap fallback, attributed boundary and typed rejection verified");
 }

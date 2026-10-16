@@ -68,3 +68,23 @@ extern "C" __global__ void ferrum_program_binding_scatter_v1(
             packet[src_offset + linear];
     }
 }
+
+// Fresh, non-replayable typed input transport across independent allocations.
+// ABI v1: src_offset (within packet), absolute dst_address, byte_length.
+// Host validates all real owned destination ranges and rejects overlaps before
+// launch. Each destination allocation is retained through the submission fence.
+extern "C" __global__ void ferrum_addressed_input_scatter_v1(
+    const unsigned char* packet, unsigned int count) {
+    if (blockIdx.x >= count) {
+        return;
+    }
+    const unsigned char* descriptor =
+        packet + static_cast<ScatterU64>(blockIdx.x) * 24;
+    const ScatterU64 src_offset = scatter_read_u64_le(descriptor);
+    auto* destination = reinterpret_cast<unsigned char*>(
+        scatter_read_u64_le(descriptor + 8));
+    const ScatterU64 byte_length = scatter_read_u64_le(descriptor + 16);
+    for (ScatterU64 byte = threadIdx.x; byte < byte_length; byte += blockDim.x) {
+        destination[byte] = packet[src_offset + byte];
+    }
+}
