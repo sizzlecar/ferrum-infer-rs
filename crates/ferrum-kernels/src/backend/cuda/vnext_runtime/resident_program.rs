@@ -10,7 +10,10 @@ use ferrum_interfaces::vnext::{
 pub(crate) struct ResidentControlRule {
     pub node_index: u32,
     pub write_index: usize,
+    // Owned physical capacity sealed into this version, not the current
+    // logical source frontier. The values closure retains topology checks.
     pub state_bytes: u64,
+    pub maximum_state_bytes: u64,
     pub values: Arc<
         dyn Fn(&BatchWorkShape) -> Result<Option<([i32; 6], u64)>, CudaDeviceRuntimeError>
             + Send
@@ -247,7 +250,14 @@ pub(super) fn refresh(
                 let row = rows
                     .get_mut(index)
                     .ok_or_else(|| invalid("resident refresh causal row is absent"))?;
-                *row = row.refreshed(owners.physical_tables(), bytes)?;
+                let capacity = row.refreshed_capacity(owners.physical_tables())?;
+                if bytes == 0
+                    || bytes > capacity.length_bytes()
+                    || capacity.length_bytes() > patch.rule.maximum_state_bytes
+                {
+                    return Ok(None);
+                }
+                *row = capacity;
                 let addresses = (0..row.len())
                     .map(|i| {
                         row.region(owners.physical_tables(), i)
@@ -255,7 +265,7 @@ pub(super) fn refresh(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut rule = patch.rule.clone();
-                rule.state_bytes = bytes;
+                rule.state_bytes = row.length_bytes();
                 rules.push(rule);
                 (patch.rule.payload)(values, &addresses)?
             } else {
@@ -319,12 +329,14 @@ pub(super) fn encode(
         let Some((values, bytes)) = (patch.rule.values)(work)? else {
             return Ok(None);
         };
-        if bytes != patch.rule.state_bytes {
+        if !patch_current_controls(
+            &mut packet,
+            patch.offset,
+            patch.rule.state_bytes,
+            bytes,
+            values,
+        )? {
             return Ok(None);
-        }
-        for (index, value) in values.into_iter().enumerate() {
-            let begin = patch.offset + index * 4;
-            packet[begin..begin + 4].copy_from_slice(&value.to_ne_bytes());
         }
     }
     let scatter = runtime
@@ -439,4 +451,69 @@ pub(super) fn encode(
         dependencies.encode((data.dependency_count != 0).then_some(prefix)),
         bindings,
     )))
+}
+
+fn patch_current_controls(
+    packet: &mut [u8],
+    offset: usize,
+    sealed_capacity: u64,
+    current_required: u64,
+    values: [i32; 6],
+) -> Result<bool, CudaDeviceRuntimeError> {
+    if current_required == 0 || current_required > sealed_capacity {
+        return Ok(false);
+    }
+    let end = offset
+        .checked_add(6 * std::mem::size_of::<i32>())
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("resident controls offset overflows"))?;
+    let controls = packet
+        .get_mut(offset..end)
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("resident controls exceed packet"))?;
+    for (target, value) in controls.chunks_exact_mut(4).zip(values) {
+        target.copy_from_slice(&value.to_ne_bytes());
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn resident_capacity_controls_preserve_addresses_and_exact_frontier() {
+        const PAGE: u64 = 64 * 1024;
+        let mut packet = vec![0xa5; 8 + 24];
+        for address in [0x100000_u64, 0x200000, 0x300000, 0x400000] {
+            packet.extend_from_slice(&address.to_ne_bytes());
+        }
+        let address_bytes = packet[32..].to_vec();
+        for required_pages in 1..=4 {
+            let current_entries = required_pages as i32;
+            let values = [current_entries, 65, 1, 66, 0, 0];
+            assert!(patch_current_controls(
+                &mut packet,
+                8,
+                4 * PAGE,
+                required_pages * PAGE,
+                values,
+            )
+            .unwrap());
+            assert_eq!(&packet[..8], &[0xa5; 8]);
+            assert_eq!(&packet[32..], address_bytes);
+            for (index, value) in values.into_iter().enumerate() {
+                assert_eq!(&packet[8 + index * 4..12 + index * 4], &value.to_ne_bytes());
+            }
+        }
+        let sealed = packet.clone();
+        assert!(!patch_current_controls(&mut packet, 8, 4 * PAGE, 5 * PAGE, [9; 6]).unwrap());
+        assert_eq!(packet, sealed);
+        assert!(!patch_current_controls(&mut packet, 8, 4 * PAGE, 0, [9; 6]).unwrap());
+        assert_eq!(packet, sealed);
+        // Exact allocation policy keeps its original boundary.
+        assert!(!patch_current_controls(&mut packet, 8, PAGE, 2 * PAGE, [9; 6]).unwrap());
+        assert_eq!(packet, sealed);
+        assert!(patch_current_controls(&mut packet, usize::MAX, PAGE, PAGE, [9; 6]).is_err());
+        assert!(patch_current_controls(&mut packet, sealed.len(), PAGE, PAGE, [9; 6]).is_err());
+        assert_eq!(packet, sealed);
+    }
 }

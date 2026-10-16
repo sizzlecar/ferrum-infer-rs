@@ -145,6 +145,19 @@ const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFit
     }
 }
 
+fn resolved_sequence_backing_growth(
+    policy: ferrum_types::SequenceBackingGrowth,
+) -> SequenceBackingGrowthPolicy {
+    match policy {
+        ferrum_types::SequenceBackingGrowth::Exact => SequenceBackingGrowthPolicy::Exact,
+        ferrum_types::SequenceBackingGrowth::PagedGroup4 => {
+            SequenceBackingGrowthPolicy::PagedGroup(
+                std::num::NonZeroU32::new(4).expect("four pages is a positive reservation group"),
+            )
+        }
+    }
+}
+
 fn resolve_runtime_attention_authority(
     requested: AttentionExecutionPolicy,
     native_adaptive_supported: bool,
@@ -770,6 +783,9 @@ impl VNextExecutorConfig {
                 maximum_scheduled_tokens,
                 sequence_fit_policy: resolved_sequence_fit_policy(
                     engine.scheduler.sequence_fit_policy,
+                ),
+                sequence_backing_growth: resolved_sequence_backing_growth(
+                    engine.runtime.sequence_backing_growth,
                 ),
                 allow_defer: true,
                 cancellation_check_interval_steps: DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS,
@@ -6770,6 +6786,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 AdmissionPressureAction::WaitForRelease,
             )
             .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let request = match self.policy.admission().sequence_backing_growth {
+                SequenceBackingGrowthPolicy::Exact => request,
+                SequenceBackingGrowthPolicy::PagedGroup(pages) => {
+                    request.with_paged_growth_group(pages)
+                }
+            };
             match sequence
                 .session
                 .try_ensure_backing_covers(request)

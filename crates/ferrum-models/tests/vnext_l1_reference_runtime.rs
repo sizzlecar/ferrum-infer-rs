@@ -267,6 +267,7 @@ fn runtime_policy<R: DeviceRuntime>(runtime: &R) -> ResolvedRuntimePolicy {
             maximum_queue_depth: 4,
             maximum_scheduled_tokens: 16,
             sequence_fit_policy: AdmissionFitPolicy::ImmediateOnly,
+            sequence_backing_growth: Default::default(),
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },

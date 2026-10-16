@@ -2,6 +2,18 @@
 //! original completion/readbacks and explicit retirement. No synthetic fence.
 use super::*;
 
+#[path = "resident_program/headroom.rs"]
+mod headroom;
+
+#[derive(Default)]
+struct ExecuteDiagnostics {
+    prepare_and_submit_ns: u128,
+    completion_readback_ns: u128,
+    retirement_ns: u128,
+    binding_rows: BTreeMap<u32, Vec<u8>>,
+    raw_kv: BTreeMap<u32, Vec<u8>>,
+}
+
 #[derive(Default)]
 struct Resident {
     reservation: Option<Arc<ResidentDecodeReservation<Runtime>>>,
@@ -63,6 +75,22 @@ fn execute(
     bool,
     Vec<ExecutionFrameId>,
 )> {
+    execute_observed(fixture, state, sessions, tokens, ranges, None)
+}
+
+fn execute_observed(
+    fixture: &Fixture,
+    state: &mut Resident,
+    sessions: &[Arc<SequenceSession<Runtime>>],
+    tokens: &[Arc<[u32]>],
+    ranges: &[Range<usize>],
+    mut diagnostic: Option<&mut ExecuteDiagnostics>,
+) -> Option<(
+    BTreeMap<(u32, String), Vec<u8>>,
+    bool,
+    Vec<ExecutionFrameId>,
+)> {
+    let prepare_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
     let batch = ExecutionBatchParticipants::new(sessions.to_vec()).unwrap();
     let caller: Vec<_> = batch
         .sessions()
@@ -282,6 +310,9 @@ fn execute(
         .unwrap();
         (profiled, Retire::Bootstrap(step))
     };
+    if let Some(diagnostic) = diagnostic.as_mut() {
+        diagnostic.prepare_and_submit_ns = prepare_started.unwrap().elapsed().as_nanos();
+    }
     let (handle, attribution) = profiled.into_parts();
     let bootstrap_step = match &retire {
         Retire::Bootstrap(step) => Some(Arc::downgrade(step)),
@@ -289,10 +320,14 @@ fn execute(
     };
     let publication = handle.take_segment_binding_publication();
     let (readbacks, names) = readbacks(fixture, &ranges);
+    let readback_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
     let receipt = match handle.wait_with_readback_collection(readbacks).unwrap() {
         CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
         other => panic!("resident full-state readback did not terminate: {other:?}"),
     };
+    if let Some(diagnostic) = diagnostic.as_mut() {
+        diagnostic.completion_readback_ns = readback_started.unwrap().elapsed().as_nanos();
+    }
     let publication = publication.and_then(|ticket| ticket.bind_completion(receipt.completion()));
     let mut values = BTreeMap::new();
     for disposition in receipt.dispositions() {
@@ -303,6 +338,11 @@ fn execute(
         let canonical = result.request().participant_index() as usize;
         if name == "binding_parameters" {
             let row = result.bytes();
+            if let Some(diagnostic) = diagnostic.as_mut() {
+                diagnostic
+                    .binding_rows
+                    .insert(caller[canonical] as u32, row.to_vec());
+            }
             if fixture
                 .states
                 .iter()
@@ -336,6 +376,11 @@ fn execute(
             continue;
         }
         let bytes = if name == "state.kv" {
+            if let Some(diagnostic) = diagnostic.as_mut() {
+                diagnostic
+                    .raw_kv
+                    .insert(caller[canonical] as u32, result.bytes().to_vec());
+            }
             valid_kv(
                 result.bytes(),
                 ranges[canonical].end,
@@ -355,6 +400,7 @@ fn execute(
             .is_none());
     }
     assert_eq!(values.len(), sessions.len() * (names.len() - 1));
+    let retirement_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
     drop((receipt, handle, attribution, active));
     let retirement = match retire {
         Retire::Bootstrap(step) => step.try_retire_normal().unwrap(),
@@ -392,6 +438,9 @@ fn execute(
         state.reservation.as_ref().unwrap().is_idle(),
         "retirement must release the fresh use"
     );
+    if let Some(diagnostic) = diagnostic.as_mut() {
+        diagnostic.retirement_ns = retirement_started.unwrap().elapsed().as_nanos();
+    }
     Some((
         values,
         hot,
@@ -737,6 +786,10 @@ fn resident_decode_program_causal_refreshes_sixteen_token_pages_without_recaptur
 /// Crossing it must release the unsubmitted frame and let ordinary execution
 /// capture the new native graph before any resident replay can resume.
 fn compare_native_partition_boundary(boundary: usize) {
+    compare_native_partition_boundary_with_headroom(boundary, false);
+}
+
+fn compare_native_partition_boundary_with_headroom(boundary: usize, grouped: bool) {
     let fixtures = [0, 1].map(|_| {
         Fixture::for_family_with_decode_attention_grouping(
             AttentionKind::Causal,
@@ -756,6 +809,11 @@ fn compare_native_partition_boundary(boundary: usize) {
     let tokens: Vec<Arc<[u32]>> = vec![(0..boundary + 8)
         .map(|t| ((t * 7 + 1) % 32) as u32)
         .collect()];
+    if grouped {
+        for fixture in &fixtures {
+            headroom::reserve_and_release_capacity(fixture, 1, boundary + 32);
+        }
+    }
     let sessions = fixtures.each_ref().map(|fixture| {
         vec![fixture.admit_with_ceiling(
             "resident-native-partition",
@@ -764,6 +822,7 @@ fn compare_native_partition_boundary(boundary: usize) {
         )]
     });
     let sinks = [Preparation::default(), Preparation::default()];
+    let mut grouped_spare_observed = false;
     let prefix_end = boundary - 8;
     // Use genuine executed prefixes, in chunks that fit this fixture's four
     // token reusable bucket. The final four ordinary decode waves establish
@@ -778,7 +837,18 @@ fn compare_native_partition_boundary(boundary: usize) {
             .zip(&sessions)
             .enumerate()
             .map(|(arm, (fixture, group))| {
-                fixture.extend(&group[0], Arc::from(&tokens[0][..range.end]));
+                if grouped && arm == 1 {
+                    let backing = headroom::extend(
+                        fixture,
+                        &group[0],
+                        Arc::from(&tokens[0][..range.end]),
+                        true,
+                    );
+                    grouped_spare_observed |=
+                        headroom::has_spare_capacity(fixture, &backing, range.end);
+                } else {
+                    fixture.extend(&group[0], Arc::from(&tokens[0][..range.end]));
+                }
                 fixture.execute_participant_ranges_with_preparation(
                     &fixture.lane,
                     &fixture.reaper,
@@ -794,6 +864,10 @@ fn compare_native_partition_boundary(boundary: usize) {
             .collect::<Vec<_>>();
         observations[0].assert_same(&observations[1]);
     }
+    assert!(
+        !grouped || grouped_spare_observed,
+        "grouped native-boundary fixture must own capacity beyond its actual prefix"
+    );
 
     let mut resident = Resident::default();
     let mut hot_before = 0;
@@ -803,8 +877,17 @@ fn compare_native_partition_boundary(boundary: usize) {
     let mut prior_frames = None;
     for position in boundary - 4..boundary + 7 {
         let ranges = [position..position + 1];
-        for (fixture, group) in fixtures.iter().zip(&sessions) {
-            fixture.extend(&group[0], Arc::from(&tokens[0][..position + 1]));
+        for (arm, (fixture, group)) in fixtures.iter().zip(&sessions).enumerate() {
+            if grouped && arm == 1 {
+                headroom::extend(
+                    fixture,
+                    &group[0],
+                    Arc::from(&tokens[0][..position + 1]),
+                    true,
+                );
+            } else {
+                fixture.extend(&group[0], Arc::from(&tokens[0][..position + 1]));
+            }
         }
         let reference = fixtures[0].execute_participant_ranges_with_preparation(
             &fixtures[0].lane,
@@ -861,6 +944,7 @@ fn compare_native_partition_boundary(boundary: usize) {
             "{}",
             serde_json::json!({"kind":"resident_native_partition_correctness",
                 "boundary":boundary,"position":position,"participants":1,
+                "candidate_four_page_headroom":grouped,
                 "resident_hot":hot,"full_output_state_bits_equal":true})
         );
     }

@@ -17,6 +17,7 @@ use super::{
     Weak, SEQUENCE_DISPATCH_POISONED_BIT,
 };
 use crate::vnext::CapacityAvailabilitySource;
+use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
 mod state_transfer;
@@ -1080,6 +1081,26 @@ where
         self: &Arc<Self>,
         request: SequenceResourceExtensionRequest,
     ) -> Result<SequenceResourceExtensionDecision<R>, VNextError> {
+        if request.growth_policy != SequenceBackingGrowthPolicy::Exact {
+            match self.try_ensure_backing_covers_once(&request, request.growth_policy)? {
+                SequenceResourceExtensionDecision::Deferred(_)
+                | SequenceResourceExtensionDecision::BackingDeferred(_)
+                | SequenceResourceExtensionDecision::PermanentRejected(_) => {
+                    // Surplus is opportunistic. Drop its uncommitted claims
+                    // before retrying required work, and never expose optional
+                    // pressure to a caller that could evict or grow a pool.
+                }
+                decision => return Ok(decision),
+            }
+        }
+        self.try_ensure_backing_covers_once(&request, SequenceBackingGrowthPolicy::Exact)
+    }
+
+    fn try_ensure_backing_covers_once(
+        self: &Arc<Self>,
+        request: &SequenceResourceExtensionRequest,
+        growth_policy: SequenceBackingGrowthPolicy,
+    ) -> Result<SequenceResourceExtensionDecision<R>, VNextError> {
         let _lifecycle = self
             .resources
             .request
@@ -1153,9 +1174,12 @@ where
         };
 
         let plan = &self.resources.request.plan;
-        let (demand, requested_slices) = plan.sequence_extension_demand(
+        let (demand, requested_slices) = plan.sequence_extension_demand_with_coverage(
             expected.committed_shape(),
             target,
+            self.resources.request.work_shape().fit_shape(),
+            &expected.physical.owned_bytes,
+            growth_policy,
             request.pressure_action,
         )?;
         let extension = if demand.immediate_claim().is_empty() {
@@ -1582,6 +1606,8 @@ where
 /// progress remains on the separately captured logical snapshot above.
 struct SequencePhysicalCatalog<B> {
     backing_slices: Vec<LogicalBackingSliceAuthority>,
+    // Physical coverage is independent of actual committed token progress.
+    owned_bytes: BTreeMap<ResourceId, u64>,
     resource_ids: Arc<[ResourceId]>,
     groups: Vec<super::segment_permit::SequencePhysicalGroup<B>>,
     binding_table: OnceLock<Arc<super::SequencePhysicalBindingTable<B>>>,
@@ -1591,7 +1617,14 @@ impl<B> SequencePhysicalCatalog<B> {
     fn new(
         backing_slices: Vec<LogicalBackingSliceAuthority>,
         resource_ids: Arc<[ResourceId]>,
-    ) -> Self {
+    ) -> Result<Self, VNextError> {
+        let mut owned_bytes = BTreeMap::<ResourceId, u64>::new();
+        for slice in &backing_slices {
+            let bytes = owned_bytes.entry(slice.resource_id().clone()).or_default();
+            *bytes = bytes
+                .checked_add(slice.size_bytes())
+                .ok_or_else(|| invalid_resource("sequence owned capacity overflows u64"))?;
+        }
         let groups = resource_ids
             .iter()
             .map(|resource| {
@@ -1600,12 +1633,13 @@ impl<B> SequencePhysicalCatalog<B> {
                 super::segment_permit::SequencePhysicalGroup::new(start..end)
             })
             .collect();
-        Self {
+        Ok(Self {
             backing_slices,
+            owned_bytes,
             resource_ids,
             groups,
             binding_table: OnceLock::new(),
-        }
+        })
     }
 }
 
@@ -1648,7 +1682,7 @@ where
             physical: Arc::new(SequencePhysicalCatalog::new(
                 backing_slices,
                 resource_ids.into(),
-            )),
+            )?),
             extension_capacity: Vec::new(),
             committed_shape: work_shape.immediate_shape(),
             _logical_owner: logical_owner,
@@ -1723,7 +1757,7 @@ where
             physical: Arc::new(SequencePhysicalCatalog::new(
                 backing_slices,
                 Arc::clone(&prior.physical.resource_ids),
-            )),
+            )?),
             extension_capacity,
             committed_shape,
             _logical_owner: Arc::clone(&prior._logical_owner),
@@ -1841,10 +1875,27 @@ where
     pub(super) current: Arc<SequenceBackingSnapshot<R>>,
 }
 
+/// Optional physical headroom, independent of actual token work. Surplus never
+/// causes maintenance or replaces the exact required-capacity fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SequenceBackingGrowthPolicy {
+    #[default]
+    Exact,
+    PagedGroup(NonZeroU32),
+}
+
+impl SequenceBackingGrowthPolicy {
+    pub const fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceResourceExtensionRequest {
     target_work: ResourceWorkShape,
     pressure_action: AdmissionPressureAction,
+    growth_policy: SequenceBackingGrowthPolicy,
 }
 
 impl SequenceResourceExtensionRequest {
@@ -1860,7 +1911,13 @@ impl SequenceResourceExtensionRequest {
         Ok(Self {
             target_work,
             pressure_action,
+            growth_policy: SequenceBackingGrowthPolicy::Exact,
         })
+    }
+
+    pub fn with_paged_growth_group(mut self, pages: NonZeroU32) -> Self {
+        self.growth_policy = SequenceBackingGrowthPolicy::PagedGroup(pages);
+        self
     }
 }
 

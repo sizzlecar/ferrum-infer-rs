@@ -271,6 +271,9 @@ pub struct RuntimeCliConfig {
     /// Reuse K/V loads for eligible native causal decode query heads (default: none).
     #[serde(default)]
     pub causal_decode_kv_reuse: Option<ferrum_types::CausalDecodeKvReuse>,
+    /// Opportunistic Sequence page reservation (default: exact).
+    #[serde(default)]
+    pub sequence_backing_growth: Option<ferrum_types::SequenceBackingGrowth>,
     /// Weight decode implementation for eligible Q4_K MarkerV2 MMVQ M8 leaves.
     #[serde(default)]
     pub q4_mmvq_weight_decode: Option<ferrum_types::Q4MmvqWeightDecode>,
@@ -546,6 +549,12 @@ impl RuntimeCliConfig {
             ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY,
             self.causal_decode_kv_reuse
                 .map(ferrum_types::CausalDecodeKvReuse::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY,
+            self.sequence_backing_growth
+                .map(ferrum_types::SequenceBackingGrowth::as_runtime_value),
         );
         push_string_entry(
             &mut entries,
@@ -1735,5 +1744,26 @@ mod tests {
             toml::from_str::<CliConfig>("[runtime]\ncausal_decode_kv_reuse = \"automatic\"\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sequence_backing_growth_config_file_has_typed_values() {
+        let parsed: CliConfig =
+            toml::from_str("[runtime]\nsequence_backing_growth = \"paged-group4\"\n").unwrap();
+        assert_eq!(
+            parsed.runtime.sequence_backing_growth,
+            Some(ferrum_types::SequenceBackingGrowth::PagedGroup4)
+        );
+        let entries = parsed.runtime.runtime_config_entries();
+        let entry = entries
+            .iter()
+            .find(|e| e.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY)
+            .unwrap();
+        assert_eq!(entry.effective_value, "paged-group4");
+        assert_eq!(entry.source, ferrum_types::RuntimeConfigSource::ConfigFile);
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nsequence_backing_growth = \"automatic\"\n"
+        )
+        .is_err());
     }
 }

@@ -60,6 +60,9 @@ mod physical_binding_table_tests;
 #[path = "resident_decode/tests.rs"]
 mod resident_decode_tests;
 
+#[path = "sequence/growth_tests.rs"]
+mod sequence_growth_tests;
+
 static NEXT_TEST_DEVICE: AtomicU64 = AtomicU64::new(1);
 const DYNAMIC_POOL_CONCURRENT_WORKERS: usize = 1;
 const MAX_DYNAMIC_POOL_TEST_WORKERS: usize = 2;

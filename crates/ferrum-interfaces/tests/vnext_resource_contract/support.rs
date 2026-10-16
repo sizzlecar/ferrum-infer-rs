@@ -468,6 +468,7 @@ pub(crate) fn policy_with_memory_id(
             maximum_queue_depth: 8,
             maximum_scheduled_tokens: 4096,
             sequence_fit_policy: AdmissionFitPolicy::ImmediateOnly,
+            sequence_backing_growth: Default::default(),
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
