@@ -367,7 +367,7 @@ extern "C" __global__ void last_token_masked_argmax_preserving_logits_f32_partit
         repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
 }
 
-extern "C" __global__ void last_token_masked_argmax_finalize(
+__device__ void vnext_masked_argmax_finalize(
     const VNextArgmaxPartial* __restrict__ parts,
     const unsigned int* __restrict__ repetition_offsets,
     const float* __restrict__ repetition_penalty, int repetition_capacity,
@@ -390,3 +390,87 @@ extern "C" __global__ void last_token_masked_argmax_finalize(
     }
     out_idx[0] = selected;
 }
+
+extern "C" __global__ void last_token_masked_argmax_finalize(
+    const VNextArgmaxPartial* __restrict__ parts,
+    const unsigned int* __restrict__ repetition_offsets,
+    const float* __restrict__ repetition_penalty, int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_finalize(parts, repetition_offsets, repetition_penalty,
+        repetition_capacity, out_idx);
+}
+
+// A bounded launch-parameter table fits below CUDA's traditional 4 KiB
+// parameter limit. Pointers still refer to separately authorized participant
+// regions; neither shared logits nor adjacent outputs are assumed.
+struct VNextArgmaxRow {
+    unsigned long long logits;
+    unsigned long long scratch;
+    unsigned long long valid_mask;
+    unsigned long long repetition_offsets;
+    unsigned long long repetition_token_ids;
+    unsigned long long repetition_penalty;
+    unsigned long long output;
+    int vocabulary_size;
+    int repetition_capacity;
+};
+struct VNextArgmaxBatch {
+    VNextArgmaxRow rows[32];
+};
+static_assert(sizeof(VNextArgmaxRow) == 64, "argmax row ABI");
+static_assert(sizeof(VNextArgmaxBatch) == 2048, "argmax batch ABI");
+static_assert(alignof(VNextArgmaxRow) == 8, "argmax row alignment");
+static_assert(alignof(VNextArgmaxBatch) == 8, "argmax batch alignment");
+
+// On supported targets the dynamically indexed parameter table must remain
+// in parameter space rather than acquiring a private 2 KiB thread-local copy.
+#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#define VNEXT_ARGMAX_GRID_CONSTANT __grid_constant__
+#else
+#define VNEXT_ARGMAX_GRID_CONSTANT
+#endif
+
+template<typename Logit>
+__device__ void vnext_masked_argmax_batched_row(const VNextArgmaxRow row) {
+    vnext_masked_argmax_preserving_logits<Logit, true>(
+        reinterpret_cast<const Logit*>(row.logits),
+        reinterpret_cast<Logit*>(row.scratch), row.vocabulary_size,
+        reinterpret_cast<const signed char*>(row.valid_mask), row.vocabulary_size,
+        reinterpret_cast<const unsigned int*>(row.repetition_offsets),
+        reinterpret_cast<const unsigned int*>(row.repetition_token_ids),
+        reinterpret_cast<const float*>(row.repetition_penalty), row.repetition_capacity,
+        reinterpret_cast<int*>(row.output));
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16_batched(
+    const VNEXT_ARGMAX_GRID_CONSTANT VNextArgmaxBatch batch, unsigned int row_count
+) {
+    if (blockIdx.y < row_count) {
+        vnext_masked_argmax_batched_row<__half>(batch.rows[blockIdx.y]);
+    }
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_f32_batched(
+    const VNEXT_ARGMAX_GRID_CONSTANT VNextArgmaxBatch batch, unsigned int row_count
+) {
+    if (blockIdx.y < row_count) {
+        vnext_masked_argmax_batched_row<float>(batch.rows[blockIdx.y]);
+    }
+}
+
+extern "C" __global__ void last_token_masked_argmax_finalize_batched(
+    const VNEXT_ARGMAX_GRID_CONSTANT VNextArgmaxBatch batch, unsigned int row_count
+) {
+    if (blockIdx.x >= row_count) {
+        return;
+    }
+    const VNextArgmaxRow row = batch.rows[blockIdx.x];
+    vnext_masked_argmax_finalize(
+        reinterpret_cast<const VNextArgmaxPartial*>(row.scratch),
+        reinterpret_cast<const unsigned int*>(row.repetition_offsets),
+        reinterpret_cast<const float*>(row.repetition_penalty), row.repetition_capacity,
+        reinterpret_cast<int*>(row.output));
+}
+
+#undef VNEXT_ARGMAX_GRID_CONSTANT

@@ -2,7 +2,7 @@ use super::*;
 use cudarc::driver::{sys::CUevent_flags, DevicePtr};
 use std::time::Instant;
 
-fn bytes(case: &Case, precision: ArgmaxPrecision) -> Vec<u8> {
+pub(super) fn bytes(case: &Case, precision: ArgmaxPrecision) -> Vec<u8> {
     case.logits
         .iter()
         .flat_map(|&value| match precision {
@@ -12,7 +12,7 @@ fn bytes(case: &Case, precision: ArgmaxPrecision) -> Vec<u8> {
         .collect()
 }
 
-fn large_cases(n: usize) -> Vec<Case> {
+pub(super) fn large_cases(n: usize) -> Vec<Case> {
     let mut tied = vec![-8.0; n];
     tied[255] = 4.0;
     tied[256] = 4.0;
