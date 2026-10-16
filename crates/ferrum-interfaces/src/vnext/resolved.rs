@@ -1029,7 +1029,11 @@ mod sequence_backing_growth_tests {
                 capacity_bytes: 4096,
                 reserve_bytes: 256,
                 maximum_active_sequences: 1,
-                dynamic_storage_profile_order: vec![DynamicStorageProfile::contiguous()],
+                dynamic_storage_profile_order: vec![DynamicStorageProfile::new(
+                    crate::vnext::DynamicStorageAllocator::LinearArena,
+                    crate::vnext::DynamicStorageView::Contiguous,
+                )
+                .unwrap()],
                 checkpoint_capacity: None,
             },
             AdmissionPolicy {
