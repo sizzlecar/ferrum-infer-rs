@@ -3075,6 +3075,7 @@ pub struct CudaDeviceRuntime {
     segment_binding_indexed_encodes: AtomicU64,
     physical_segment_binding_encodes: AtomicU64,
     resident_decode_program_encodes: AtomicU64,
+    resident_decode_program_refreshes: AtomicU64,
     sequence_physical_binding_tables_compiled: AtomicU64,
     packed_decode_prepare_gate: bool,
     causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
@@ -3289,6 +3290,7 @@ impl CudaDeviceRuntime {
             segment_binding_indexed_encodes: AtomicU64::new(0),
             physical_segment_binding_encodes: AtomicU64::new(0),
             resident_decode_program_encodes: AtomicU64::new(0),
+            resident_decode_program_refreshes: AtomicU64::new(0),
             sequence_physical_binding_tables_compiled: AtomicU64::new(0),
             packed_decode_prepare_gate: false,
             causal_decode_attention_grouping:
@@ -3347,6 +3349,12 @@ impl CudaDeviceRuntime {
 
     pub fn resident_decode_program_encodes(&self) -> u64 {
         self.resident_decode_program_encodes.load(Ordering::Relaxed)
+    }
+
+    /// Successful host append refreshes, not submissions or GPU completions.
+    pub fn resident_decode_program_refreshes(&self) -> u64 {
+        self.resident_decode_program_refreshes
+            .load(Ordering::Relaxed)
     }
 
     pub fn sequence_physical_binding_tables_compiled(&self) -> u64 {
@@ -4810,7 +4818,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if !self.supports_physical_segment_bindings() {
             return Ok(None);
         }
-        resident_program::refresh(self, previous, refresh)
+        let refreshed = resident_program::refresh(self, previous, refresh)?;
+        if refreshed.is_some() {
+            self.resident_decode_program_refreshes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| {
+                    CudaDeviceRuntimeError::contract("resident refresh count exhausted")
+                })?;
+        }
+        Ok(refreshed)
     }
 
     fn encode_resident_decode_program(

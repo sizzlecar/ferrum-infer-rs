@@ -1322,6 +1322,38 @@ where
         target: DynamicResourceShape,
         pressure_action: AdmissionPressureAction,
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
+        let mut owned = std::collections::BTreeMap::new();
+        for descriptor in self
+            .dynamic_pools()
+            .domains
+            .iter()
+            .flat_map(|domain| &domain.descriptors)
+            .filter(|descriptor| descriptor.lifetime() == AllocationLifetime::Sequence)
+        {
+            owned.insert(
+                descriptor.base_resource_id().clone(),
+                descriptor.evaluate_request_bytes_for_shape(committed)?,
+            );
+        }
+        self.sequence_extension_demand_with_coverage(
+            committed,
+            target,
+            target,
+            &owned,
+            super::SequenceBackingGrowthPolicy::Exact,
+            pressure_action,
+        )
+    }
+
+    pub(super) fn sequence_extension_demand_with_coverage(
+        &self,
+        committed: DynamicResourceShape,
+        target: DynamicResourceShape,
+        parent_ceiling: DynamicResourceShape,
+        owned: &std::collections::BTreeMap<super::ResourceId, u64>,
+        growth_policy: super::SequenceBackingGrowthPolicy,
+        pressure_action: AdmissionPressureAction,
+    ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
         if committed.sequences() != 1
             || target.sequences() != 1
             || target.tokens() < committed.tokens()
@@ -1342,9 +1374,39 @@ where
                 }
                 let committed_bytes = descriptor.evaluate_request_bytes_for_shape(committed)?;
                 let target_bytes = descriptor.evaluate_request_bytes_for_shape(target)?;
-                let delta_bytes = target_bytes.checked_sub(committed_bytes).ok_or_else(|| {
-                    invalid_resource("sequence extension descriptor capacity regressed")
-                })?;
+                let owned_bytes = owned
+                    .get(descriptor.base_resource_id())
+                    .copied()
+                    .unwrap_or(0);
+                if owned_bytes < committed_bytes || target_bytes < committed_bytes {
+                    return Err(invalid_resource(
+                        "sequence extension descriptor coverage regressed",
+                    ));
+                }
+                let desired_bytes = match (growth_policy, descriptor.storage().profile().view()) {
+                    (
+                        super::SequenceBackingGrowthPolicy::PagedGroup(pages),
+                        super::DynamicStorageView::PagedRegions { block_bytes },
+                    ) => {
+                        let ceiling =
+                            descriptor.evaluate_request_bytes_for_shape(parent_ceiling)?;
+                        if target_bytes > ceiling {
+                            return Err(invalid_resource(
+                                "sequence extension exceeds its parent physical ceiling",
+                            ));
+                        }
+                        let group = block_bytes
+                            .checked_mul(u64::from(pages.get()))
+                            .ok_or_else(|| invalid_resource("sequence page group overflows u64"))?;
+                        target_bytes
+                            .div_ceil(group)
+                            .checked_mul(group)
+                            .unwrap_or(ceiling)
+                            .min(ceiling)
+                    }
+                    _ => target_bytes,
+                };
+                let delta_bytes = desired_bytes.saturating_sub(owned_bytes);
                 if delta_bytes == 0 {
                     continue;
                 }

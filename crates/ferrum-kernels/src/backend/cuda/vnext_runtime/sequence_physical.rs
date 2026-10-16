@@ -126,6 +126,29 @@ pub(crate) struct CudaPhysicalRowWindow {
 }
 
 impl CudaPhysicalRowWindow {
+    /// Called only with the current tables of a Core-issued append refresh.
+    /// The table owns every page; no capacity is inferred from device pointers.
+    pub(crate) fn refreshed_capacity(
+        &self,
+        tables: &[Arc<CudaSequencePhysicalTable>],
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let invalid = CudaDeviceRuntimeError::contract;
+        let row = tables
+            .get(self.table_index)
+            .ok_or_else(|| invalid("refreshed capacity table is absent"))?
+            .row(self.resource_ordinal)?;
+        if self.offset_bytes != 0 || !matches!(&row.storage, CudaPhysicalStorage::Paged { .. }) {
+            return Err(invalid(
+                "resident capacity refresh requires a whole paged row",
+            ));
+        }
+        self.refreshed(tables, row.length_bytes)
+    }
+
+    pub(crate) fn length_bytes(&self) -> u64 {
+        self.length_bytes
+    }
+
     /// Only a typed, Core-verified append refresh may grow this window. Page
     /// addresses come from the new table, never from extrapolating old pointers.
     pub(crate) fn refreshed(

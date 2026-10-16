@@ -22,8 +22,8 @@ impl CausalRecipe {
     }
 }
 
-/// Freeze physical page/address shape; each use still supplies its current
-/// logical frontier. Append refresh rebuilds addresses from authorized pages.
+/// Freeze all Core-authorized physical capacity; each use still supplies its
+/// exact logical frontier. A true append refresh seals the new owned capacity.
 pub(crate) fn resident_control_rules(
     node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
@@ -50,13 +50,30 @@ pub(crate) fn resident_control_rules(
             return Err(invalid("resident causal replay row is absent"));
         };
         let source = token.source_token_range();
-        let bytes = shape
+        let required = shape
             .physical_state_bytes_for_source_frontier(source.end, token.full_input_tokens())
             .map_err(CudaDeviceRuntimeError::contract)?;
+        let capacity = node
+            .resident_sequence_capacity_region(participant, 0)
+            .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
+        let bytes = capacity.length_bytes();
+        let maximum_state_bytes = shape
+            .maximum_pages()
+            .map_err(CudaDeviceRuntimeError::contract)?
+            .checked_mul(VNEXT_KV_PAGE_BYTES)
+            .ok_or_else(|| invalid("resident maximum state capacity overflows"))?;
+        if required == 0
+            || bytes < required
+            || bytes > maximum_state_bytes
+            || !bytes.is_multiple_of(VNEXT_KV_PAGE_BYTES)
+        {
+            return Ok(None);
+        }
         rules.push(ResidentControlRule {
             node_index: node.node_index(),
             write_index: participant,
             state_bytes: bytes,
+            maximum_state_bytes,
             values: Arc::new(move |work| {
                 let Some(token) = work.participant_token_ranges().get(participant) else {
                     return Ok(None);
@@ -877,18 +894,31 @@ fn write_physical_program_inner(
         {
             return Err("segment causal token range exceeds admitted context".into());
         }
-        let state_pages = segment::physical_program_window(
-            node,
-            participant,
-            0,
-            shape.physical_state_bytes_for_source_frontier(
-                source.end,
-                token_range.full_input_tokens(),
-            )?,
-            shape.kv_element_type(),
-            Some(VNEXT_KV_PAGE_BYTES),
-            owners,
+        let required_state_bytes = shape.physical_state_bytes_for_source_frontier(
+            source.end,
+            token_range.full_input_tokens(),
         )?;
+        let state_pages = if resident_page_prefix {
+            segment::resident_capacity_program_window(
+                node,
+                participant,
+                0,
+                required_state_bytes,
+                shape.kv_element_type(),
+                VNEXT_KV_PAGE_BYTES,
+                owners,
+            )?
+        } else {
+            segment::physical_program_window(
+                node,
+                participant,
+                0,
+                required_state_bytes,
+                shape.kv_element_type(),
+                Some(VNEXT_KV_PAGE_BYTES),
+                owners,
+            )?
+        };
         let scale_pages = if shape.int8_kv {
             Some(segment::physical_program_window(
                 node,
@@ -909,9 +939,8 @@ fn write_physical_program_inner(
         if page_count > maximum_pages || entries > maximum_entries {
             return Err("segment causal page table exceeds admitted maximum".into());
         }
-        // A resident packet may retain all addresses inside the CURRENT
-        // physical pages. Kernels still consume only the fresh control count;
-        // no future page or unallocated address is invented.
+        // The resident-only capacity view owns all these pages, including
+        // headroom. Kernels consume only the fresh logical control count.
         let payload_entries = if resident_page_prefix {
             resident_address_prefix(kv_layout, page_count, maximum_entries)?
         } else {

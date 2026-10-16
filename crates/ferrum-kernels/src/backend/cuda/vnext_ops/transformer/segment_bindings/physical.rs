@@ -159,3 +159,60 @@ pub(in crate::backend::cuda::vnext_ops) fn sequence_window(
         )
         .map_err(|e| e.to_string())
 }
+
+/// Resident packets may retain the whole paged capacity only through the
+/// separate Core-issued view. Ordinary operation windows remain exact.
+pub(in crate::backend::cuda::vnext_ops) fn resident_sequence_capacity_window(
+    node: &PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    participant: usize,
+    declaration: usize,
+    expected: u64,
+    element: ElementType,
+    page_bytes: u64,
+    owners: &mut CudaPhysicalOwnerBuilder,
+) -> Result<CudaPhysicalRowWindow, String> {
+    let current = node
+        .region(participant, declaration)
+        .map_err(|e| e.to_string())?;
+    let capacity = node
+        .resident_sequence_capacity_region(participant, declaration)
+        .map_err(|e| e.to_string())?;
+    let table = current
+        .sequence_table()
+        .ok_or("resident current Sequence table is absent")?;
+    let capacity_table = capacity
+        .sequence_table()
+        .ok_or("resident capacity Sequence table is absent")?;
+    let ordinal = current
+        .resource_ordinal()
+        .ok_or("resident Sequence resource ordinal is absent")?;
+    if current.storage_kind() != OperationBufferStorageKind::DynamicPaged
+        || capacity.storage_kind() != OperationBufferStorageKind::DynamicPaged
+        || current.descriptor().element_type != element
+        || capacity.descriptor().element_type != element
+        || current.descriptor().resource_id != capacity.descriptor().resource_id
+        || current.descriptor().usage != capacity.descriptor().usage
+        || current.descriptor().alignment_bytes != capacity.descriptor().alignment_bytes
+        || current.length_bytes() != expected
+        || expected == 0
+        || !Arc::ptr_eq(table, capacity_table)
+        || capacity.resource_ordinal() != Some(ordinal)
+        || current.offset_bytes() != 0
+        || capacity.offset_bytes() != 0
+        || capacity.length_bytes() < expected
+        || page_bytes == 0
+        || !expected.is_multiple_of(page_bytes)
+        || !capacity.length_bytes().is_multiple_of(page_bytes)
+    {
+        return Err("resident capacity differs from its current authorized paged window".into());
+    }
+    owners
+        .window(
+            capacity_table,
+            ordinal,
+            capacity.offset_bytes(),
+            capacity.length_bytes(),
+            Some(page_bytes),
+        )
+        .map_err(|e| e.to_string())
+}

@@ -194,6 +194,59 @@ impl<'f, 'w, B> PreparedPhysicalSegmentNodeView<'f, 'w, B> {
             length,
         })
     }
+
+    /// Retained physical capacity for a resident program's paged Sequence state.
+    ///
+    /// This is separate from `region`, whose exact current logical window is
+    /// unchanged. Only a whole-resource state declaration can retain its owned
+    /// spare pages. The backend must still derive valid entries from fresh work;
+    /// capacity does not certify that any future token has executed.
+    pub fn resident_sequence_capacity_region(
+        &self,
+        participant: usize,
+        declaration: usize,
+    ) -> Result<PhysicalSegmentRegionView<'f, B>, VNextError> {
+        let current = self.region(participant, declaration)?;
+        let rule = &self.wave.recipe.nodes[self.index].regions[declaration];
+        if rule.request.extent != SegmentBindingRegionExtent::CurrentResource
+            || current.offset != 0
+            || current.descriptor.usage != BufferUsage::State
+            || current.storage != OperationBufferStorageKind::DynamicPaged
+        {
+            return Err(invalid_operation(
+                "resident capacity requires a whole paged Sequence state declaration",
+            ));
+        }
+        let PhysicalRegionSource::Sequence { table, ordinal } = current.source else {
+            return Err(invalid_operation(
+                "resident capacity requires retained Sequence ownership",
+            ));
+        };
+        let row = table
+            .resource(ordinal)
+            .ok_or_else(|| invalid_operation("resident capacity Sequence row is absent"))?;
+        let capacity = row.descriptor().logical_size_bytes();
+        if capacity < current.length
+            || row.resource_id() != current.descriptor.resource_id
+            || rule
+                .component_length
+                .is_some_and(|maximum| capacity > maximum)
+        {
+            return Err(invalid_operation(
+                "resident capacity exceeds its owned resource declaration",
+            ));
+        }
+        Ok(PhysicalSegmentRegionView {
+            descriptor: SegmentBindingDescriptorView {
+                size_bytes: capacity,
+                ..current.descriptor
+            },
+            storage: current.storage,
+            source: PhysicalRegionSource::Sequence { table, ordinal },
+            offset: 0,
+            length: capacity,
+        })
+    }
 }
 
 fn storage_kind(profile: DynamicStorageProfile) -> OperationBufferStorageKind {
