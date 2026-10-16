@@ -72,6 +72,7 @@ pub enum ResidentDecodeDecision<R: DeviceRuntime> {
 pub struct ResidentDecodeReservation<R: DeviceRuntime> {
     step_backing: ClaimedBackingTransaction,
     wave_backing: ClaimedSubmissionWaveBacking,
+    backing_lookup: ResidentBackingLookup,
     used_pools: Vec<Arc<DynamicBackingPool<R>>>,
     pool_proofs: Vec<ReservedPoolProof<R::Buffer>>,
     // Only immutable physical append history, never fresh frame authority.
@@ -86,6 +87,44 @@ pub struct ResidentDecodeReservation<R: DeviceRuntime> {
     state: Arc<AtomicU8>,
     full_nodes: Vec<usize>,
 }
+
+// Positions only: each fresh use still materializes and validates the current
+// authority through the pool. No view, buffer address or participant is cached.
+struct ResidentBackingLookup {
+    nodes: BTreeSet<NodeId>,
+    shared: BTreeMap<ResourceId, ResidentSharedBackingLocation>,
+}
+
+#[derive(Clone, Copy)]
+enum ResidentSharedBackingLocation {
+    Wave(usize),
+    Step(usize),
+}
+
+impl ResidentBackingLookup {
+    fn new(
+        nodes: &[PlanNode],
+        wave: &[LogicalBackingSliceAuthority],
+        step: &[LogicalBackingSliceAuthority],
+    ) -> Self {
+        let mut shared = BTreeMap::new();
+        for (index, slice) in wave.iter().enumerate() {
+            shared
+                .entry(slice.resource_id().clone())
+                .or_insert(ResidentSharedBackingLocation::Wave(index));
+        }
+        for (index, slice) in step.iter().enumerate() {
+            shared
+                .entry(slice.resource_id().clone())
+                .or_insert(ResidentSharedBackingLocation::Step(index));
+        }
+        Self {
+            nodes: nodes.iter().map(|node| node.id().clone()).collect(),
+            shared,
+        }
+    }
+}
+
 struct ReservedPoolProof<B> {
     epoch: AtomicU64,
     chunks: Vec<(u32, Arc<ResidentChunkBacking<B>>)>,
@@ -263,11 +302,17 @@ impl<R: DeviceRuntime> ExecutionBatchParticipants<R> {
             // The participant constructor performs its own lifecycle check;
             // never recursively acquire a read lock while a writer may wait.
             drop(_lifecycle);
+            let backing_lookup = ResidentBackingLookup::new(
+                plan.nodes(),
+                wave_backing.backing_slices(),
+                step.backing_slices(),
+            );
             Ok(Some(Arc::new(ResidentDecodeReservation {
                 step_backing: step
                     .claimed_backing()
                     .borrow_reserved(Arc::clone(&request.work_shape))?,
                 wave_backing,
+                backing_lookup,
                 used_pools,
                 pool_proofs,
                 participants: ExecutionBatchParticipants::new(self.sessions.clone())?,

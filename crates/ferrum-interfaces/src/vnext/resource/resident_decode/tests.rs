@@ -1,12 +1,25 @@
 //! Real admission, reserved allocations and fresh frame ownership. No test
 //! claims GPU completion merely by preparing or dropping a resident use.
 use super::*;
-use crate::vnext::{CompletionObservation, CompletionReaper, OperationCompletionDisposition};
+use crate::vnext::{
+    CompletionObservation, CompletionReaper, DynamicStorageContract, MemoryPlan,
+    OperationCompletionDisposition,
+};
 
 #[path = "completion_tests.rs"]
 mod completion_tests;
 
 pub(super) fn setup() -> (
+    Harness,
+    Arc<ExecutionLane<TestRuntime>>,
+    ReusableExecutionBucketSpec,
+) {
+    setup_with_request_backing(false)
+}
+
+fn setup_with_request_backing(
+    include_request: bool,
+) -> (
     Harness,
     Arc<ExecutionLane<TestRuntime>>,
     ReusableExecutionBucketSpec,
@@ -27,20 +40,68 @@ pub(super) fn setup() -> (
         256,
         TestDemand::Tokens,
     );
-    let (memory, bucket) = reusable_step_memory_plan(step.pool_id.clone());
-    let catalog = combine_catalogs(&[step, sequence]);
-    let runtime = new_runtime(&catalog, 512);
+    let (mut memory, bucket) = reusable_step_memory_plan(step.pool_id.clone());
+    let mut node = PlanNode::resource_test_node(NodeId::new("node/resident-decode").unwrap());
+    let step_pool_id = step.pool_id.clone();
+    let mut catalogs = vec![step, sequence];
+    if include_request {
+        catalogs.push(pool_catalog(
+            linear_profile(),
+            AllocationLifetime::Request,
+            '9',
+            1,
+            256,
+            TestDemand::Tokens,
+        ));
+        let binding = DynamicResourceDescriptor::resource_test_binding(
+            ResourceId::new("resource/resident-binding").unwrap(),
+            DynamicResourceDemand::fixed(64).unwrap(),
+            16,
+            node.id().clone(),
+            DynamicStorageContract::resource_test_contract(linear_profile(), "a".repeat(64))
+                .unwrap(),
+            4,
+        )
+        .unwrap();
+        node = PlanNode::resource_test_node_with_binding(
+            node.id().clone(),
+            binding.base_resource_id().clone(),
+        );
+        let binding_pool_id = binding.pool_id().clone();
+        let descriptors = vec![binding];
+        let pools =
+            MemoryPlan::derive_dynamic_pools(&descriptors, std::slice::from_ref(&node), 256)
+                .unwrap();
+        catalogs.push(PoolCatalog {
+            pools,
+            descriptors,
+            pool_id: binding_pool_id.clone(),
+            profile: linear_profile(),
+        });
+        let mut budgets = vec![
+            ReusablePoolWorkspaceBudget::new(step_pool_id, 256, 0).unwrap(),
+            ReusablePoolWorkspaceBudget::new(binding_pool_id, 0, 64).unwrap(),
+        ];
+        budgets.sort_by(|left, right| left.pool_id().cmp(right.pool_id()));
+        memory = ReusableExecutionMemoryPlan::new(
+            1,
+            1,
+            vec![ResolvedReusableExecutionBucket::new(bucket.clone(), budgets).unwrap()],
+        )
+        .unwrap();
+    }
+    let budget = 256 * catalogs.len() as u64;
+    let catalog = combine_catalogs(&catalogs);
+    let runtime = new_runtime(&catalog, budget);
     runtime
         .physical_binding_tables_enabled
         .store(true, Ordering::Relaxed);
     let harness = harness_with_nodes_and_reusable(
         runtime,
         catalog,
-        512,
+        budget,
         false,
-        Arc::from(vec![PlanNode::resource_test_node(
-            NodeId::new("node/resident-decode").unwrap(),
-        )]),
+        Arc::from(vec![node]),
         Some(memory),
     );
     for pool in &harness.pool_ids {
@@ -89,6 +150,86 @@ pub(super) fn ready(
 fn close_session(session: &Arc<SequenceSession<TestRuntime>>) {
     session.request_cancel().unwrap();
     session.try_abort().unwrap();
+}
+
+#[test]
+fn resident_backing_lookup_keeps_current_authority_checks_and_scope_fallbacks() {
+    let (harness, lane, bucket) = setup_with_request_backing(true);
+    let sequence = admitted_sequence_with_ceiling(&harness.root, "resident-lookup", 4);
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let req = request(&batch, &bucket, 3);
+    let reservation = batch
+        .try_reserve_resident_decode(&req, &lane)
+        .unwrap()
+        .unwrap();
+    let (use_, retirement) = ready(&reservation, &batch, &req);
+    let node = &harness.root.dynamic_pools.nodes[0].id().clone();
+    let pools = &harness.root.dynamic_pools;
+    let snapshot = use_.backing_snapshots().next().unwrap();
+    let request = &session.resources().request;
+    assert!(!use_.step_backing().backing_slices().is_empty());
+    assert!(!use_.claimed_backing().backing_slices().is_empty());
+    assert!(!snapshot.backing_slices().is_empty());
+    assert!(!request.backing_slices().is_empty());
+    for authorities in [
+        use_.claimed_backing().backing_slices(),
+        use_.step_backing().backing_slices(),
+        snapshot.backing_slices(),
+        request.backing_slices(),
+    ] {
+        for authority in authorities {
+            let actual = use_.backing_view(node, 0, authority.resource_id()).unwrap();
+            let expected = pools.view(authority).unwrap();
+            assert_eq!(actual.size_bytes(), expected.size_bytes());
+            assert_eq!(actual.capacity_size_bytes(), expected.capacity_size_bytes());
+            assert_eq!(actual.usage(), expected.usage());
+            assert_eq!(actual.element_type(), expected.element_type());
+            assert_eq!(
+                actual.segment_bindings().len(),
+                expected.segment_bindings().len()
+            );
+            for (actual, expected) in actual
+                .segment_bindings()
+                .iter()
+                .zip(expected.segment_bindings())
+            {
+                assert_eq!(actual.segment(), expected.segment());
+                assert!(actual.retention_ref().same_owners(expected.retention_ref()));
+            }
+            drop(actual);
+            drop(expected);
+
+            // A lookup hit is not a cached authorization: failures introduced
+            // after this frame was issued must still be detected on every view.
+            let pool = &pools.pools[authority.evidence().pool_id()];
+            pool.state.lock().unwrap().poisoned = true;
+            assert!(use_.backing_view(node, 0, authority.resource_id()).is_err());
+            pool.state.lock().unwrap().poisoned = false;
+            let ordinal = authority.evidence().segments()[0].chunk_ordinal();
+            let chunk = pool.state.lock().unwrap().chunks.remove(&ordinal).unwrap();
+            assert!(use_.backing_view(node, 0, authority.resource_id()).is_err());
+            pool.state.lock().unwrap().chunks.insert(ordinal, chunk);
+            assert!(use_.backing_view(node, 0, authority.resource_id()).is_ok());
+        }
+    }
+    let shared = use_.step_backing().backing_slices()[0].resource_id();
+    assert!(use_.backing_view(node, 1, shared).is_err());
+    assert!(use_
+        .backing_view(&NodeId::new("node/unknown").unwrap(), 0, shared)
+        .is_err());
+    assert!(use_
+        .backing_view(node, 0, &ResourceId::new("resource/unknown").unwrap())
+        .is_err());
+    drop(use_);
+    retirement.try_rollback_unsubmitted().unwrap();
+    drop(reservation);
+    close_session(&session);
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -251,6 +392,15 @@ fn resident_decode_append_refresh_keeps_slots_and_rejects_stale_authority() {
 
     let (first, first_retirement) = ready(&reservation, &batch, &req);
     let old_snapshot = Arc::clone(first.backing_snapshots().next().unwrap());
+    let sequence_resource = old_snapshot.backing_slices()[0].resource_id().clone();
+    let node = NodeId::new("node/resident-decode").unwrap();
+    assert_eq!(
+        first
+            .backing_view(&node, 0, &sequence_resource)
+            .unwrap()
+            .size_bytes(),
+        64
+    );
     let old_table = Arc::clone(&first.sequence_physical_tables()[0]);
     let old_table_weak = Arc::downgrade(&old_table);
     let old_backend = Arc::clone(old_table.backend_bindings().unwrap());
@@ -286,6 +436,13 @@ fn resident_decode_append_refresh_keeps_slots_and_rejects_stale_authority() {
     assert_ne!(snapshot.generation(), old_snapshot.generation());
     let fresh_request = request(&batch, &bucket, 9);
     let (fresh, retirement) = ready(&reservation, &batch, &fresh_request);
+    assert_eq!(
+        fresh
+            .backing_view(&node, 0, &sequence_resource)
+            .unwrap()
+            .size_bytes(),
+        128
+    );
     let current_table = Arc::clone(&fresh.sequence_physical_tables()[0]);
     assert!(!Arc::ptr_eq(&old_table, &current_table));
     assert!(current_table.is_append_of(&old_table));

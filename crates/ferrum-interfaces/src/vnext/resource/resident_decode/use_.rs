@@ -139,9 +139,8 @@ impl<R: DeviceRuntime> ResidentDecodeUse<R> {
         Ok(value)
     }
     fn validate_readback_node(&self, node: &NodeId, participant: usize) -> Result<(), VNextError> {
-        let plan = &self.frame.participants[0].session.resources().request.plan;
         if participant >= self.frame.participants.len()
-            || !plan.nodes().iter().any(|n| n.id() == node)
+            || !self.frame.reservation.backing_lookup.nodes.contains(node)
         {
             return Err(invalid_resource(
                 "resident readback node/participant is absent",
@@ -162,13 +161,15 @@ impl<R: DeviceRuntime> ResidentDecodeUse<R> {
             .request
             .plan
             .dynamic_pools();
-        if let Some(slice) = self
-            .claimed_backing()
-            .backing_slices()
-            .iter()
-            .chain(self.step_backing().backing_slices())
-            .find(|s| s.resource_id() == resource)
-        {
+        if let Some(location) = self.frame.reservation.backing_lookup.shared.get(resource) {
+            let slice = match *location {
+                ResidentSharedBackingLocation::Wave(index) => {
+                    &self.claimed_backing().backing_slices()[index]
+                }
+                ResidentSharedBackingLocation::Step(index) => {
+                    &self.step_backing().backing_slices()[index]
+                }
+            };
             return pools.view(slice);
         }
         let p = &self.frame.participants[participant];
