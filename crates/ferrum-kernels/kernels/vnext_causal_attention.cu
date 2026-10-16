@@ -99,6 +99,24 @@ extern "C" __global__ void vnext_causal_gather_decode_lengths_fixed_capacity(
   v2_rows[participant] = length > 512 ? participant : -1;
 }
 
+// Unified partitioned decode uses the same original row numbering. Rewrite
+// every length and map entry on every replay; zero-length slots stay inactive.
+extern "C" __global__ void vnext_causal_gather_decode_lengths_unified_v2(
+    const int* __restrict__ binding_base,
+    const unsigned long long binding_slot_bytes,
+    int* __restrict__ sequence_lengths,
+    int* __restrict__ active_rows,
+    int* __restrict__ unused_rows,
+    const int participants) {
+  const int participant = blockIdx.x * blockDim.x + threadIdx.x;
+  if (participant >= participants) return;
+  const int length =
+      vnext_participant_control(binding_base, binding_slot_bytes, participant)[3];
+  sequence_lengths[participant] = length;
+  active_rows[participant] = length > 0 ? participant : -1;
+  unused_rows[participant] = -1;
+}
+
 // Packed query rows are contiguous even when their owning sequences have
 // different active-token counts. Resolve a packed row with a bounded binary
 // search over the stable binding slots so grid.x can be the packed token axis;

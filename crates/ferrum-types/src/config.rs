@@ -368,6 +368,9 @@ pub enum CausalDecodeKvReuse {
     #[default]
     None,
     PairedQueryHeads,
+    /// Use paired-query V2 for every positive row in an eligible fixed batch.
+    /// Unsupported geometries retain their existing attention path.
+    PairedQueryHeadsUnifiedV2,
 }
 
 impl CausalDecodeKvReuse {
@@ -375,6 +378,7 @@ impl CausalDecodeKvReuse {
         match self {
             Self::None => "none",
             Self::PairedQueryHeads => "paired-query-heads",
+            Self::PairedQueryHeadsUnifiedV2 => "paired-query-heads-unified-v2",
         }
     }
 
@@ -382,7 +386,10 @@ impl CausalDecodeKvReuse {
         match raw.trim().to_ascii_lowercase().as_str() {
             "none" => Ok(Self::None),
             "paired-query-heads" => Ok(Self::PairedQueryHeads),
-            _ => Err(format!("expected none or paired-query-heads; got {raw:?}")),
+            "paired-query-heads-unified-v2" => Ok(Self::PairedQueryHeadsUnifiedV2),
+            _ => Err(format!(
+                "expected none, paired-query-heads or paired-query-heads-unified-v2; got {raw:?}"
+            )),
         }
     }
 
@@ -2764,6 +2771,7 @@ mod tests {
         for source in [RuntimeConfigSource::Cli, RuntimeConfigSource::ConfigFile] {
             for mode in [
                 CausalDecodeKvReuse::PairedQueryHeads,
+                CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2,
                 CausalDecodeKvReuse::None,
             ] {
                 engine
@@ -2773,10 +2781,18 @@ mod tests {
                     .unwrap();
                 assert_eq!(engine.runtime.causal_decode_kv_reuse, mode);
                 assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                assert_eq!(
+                    serde_json::from_value::<CausalDecodeKvReuse>(
+                        serde_json::to_value(mode).unwrap()
+                    )
+                    .unwrap(),
+                    mode
+                );
             }
         }
         for (value, source) in [
             ("paired-query-heads", RuntimeConfigSource::Env),
+            ("paired-query-heads-unified-v2", RuntimeConfigSource::Env),
             ("none", RuntimeConfigSource::Env),
             ("auto", RuntimeConfigSource::Cli),
         ] {

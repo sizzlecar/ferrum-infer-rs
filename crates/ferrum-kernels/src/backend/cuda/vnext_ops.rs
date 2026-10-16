@@ -1379,7 +1379,11 @@ impl CudaVNextComposition {
                 "indexed causal decode attention grouping requires compiled indexed native attention",
             ));
         }
-        if causal_decode_kv_reuse == ferrum_types::CausalDecodeKvReuse::PairedQueryHeads {
+        if matches!(
+            causal_decode_kv_reuse,
+            ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
+                | ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
+        ) {
             if causal_decode_attention_grouping
                 != ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
                 || causal_decode_preparation != ferrum_types::CausalDecodePreparationMode::Packed

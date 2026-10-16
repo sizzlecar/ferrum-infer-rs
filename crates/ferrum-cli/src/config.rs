@@ -1714,7 +1714,11 @@ mod tests {
 
     #[test]
     fn causal_decode_kv_reuse_config_file_parses_explicit_mode() {
-        for value in ["none", "paired-query-heads"] {
+        for value in [
+            "none",
+            "paired-query-heads",
+            "paired-query-heads-unified-v2",
+        ] {
             let config: CliConfig = toml::from_str(&format!(
                 "[runtime]\ncausal_decode_kv_reuse = \"{value}\"\n"
             ))

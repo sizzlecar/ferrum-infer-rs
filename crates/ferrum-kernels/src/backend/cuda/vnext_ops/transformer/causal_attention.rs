@@ -221,6 +221,8 @@ struct CausalAttentionFunctions {
     gather_decode_lengths_indexed: CudaFunction,
     #[cfg(feature = "cuda-indexed-causal-attention")]
     gather_decode_lengths_fixed_capacity: CudaFunction,
+    #[cfg(feature = "cuda-causal-gqa2")]
+    gather_decode_lengths_unified_v2: CudaFunction,
     attention: CudaFunction,
     grouped_attention: CudaFunction,
     varlen_addressed: CudaFunction,
@@ -805,6 +807,12 @@ impl CudaCausalPagedAttentionProvider {
                 &attention_module,
                 "vnext_causal_gather_decode_lengths_fixed_capacity",
                 "causal attention fixed-capacity decode length gather",
+            )?,
+            #[cfg(feature = "cuda-causal-gqa2")]
+            gather_decode_lengths_unified_v2: load_function(
+                &attention_module,
+                "vnext_causal_gather_decode_lengths_unified_v2",
+                "causal attention unified V2 decode length gather",
             )?,
             attention: load_function(
                 &attention_module,
