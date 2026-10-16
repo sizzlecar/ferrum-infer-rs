@@ -3048,7 +3048,10 @@ impl FerrumConfigBuilder {
                 || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
                 || preparation != crate::InvocationPreparationStrategy::ResidentDecodeProgram
             {
-                return Err(invalid("paged-group4 requires a CUDA plan runtime and resident-decode-program preparation".into()));
+                return Err(invalid(format!(
+                    "{} requires a CUDA plan runtime and resident-decode-program preparation",
+                    mode.as_runtime_value()
+                )));
             }
         }
         Ok(self.decision(
@@ -3056,7 +3059,7 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["exact", "paged-group4"],
+            ["exact", "paged-group4", "paged-group4-grow-only"],
             Vec::new(),
             vec![
                 RuntimeConfigEffect::Performance,
@@ -7942,10 +7945,46 @@ mod tests {
     #[test]
     fn sequence_backing_growth_requires_explicit_cuda_resident_execution() {
         let key = crate::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
-        for (backend, preparation, mode, supported) in [
-            ("cpu", "full", "exact", true),
-            ("cuda", "resident-decode-program", "paged-group4", true),
-            ("cuda", "full", "paged-group4", false),
+        use ExecutionResourceAuthority::{LegacyEngine, PlanRuntime};
+        for (backend, authority, preparation, mode, supported) in [
+            ("cpu", PlanRuntime, "full", "exact", true),
+            (
+                "cuda",
+                PlanRuntime,
+                "resident-decode-program",
+                "paged-group4",
+                true,
+            ),
+            ("cuda", PlanRuntime, "full", "paged-group4", false),
+            (
+                "cuda",
+                PlanRuntime,
+                "resident-decode-program",
+                "paged-group4-grow-only",
+                true,
+            ),
+            ("cuda", PlanRuntime, "full", "paged-group4-grow-only", false),
+            (
+                "cpu",
+                PlanRuntime,
+                "resident-decode-program",
+                "paged-group4-grow-only",
+                false,
+            ),
+            (
+                "metal",
+                PlanRuntime,
+                "resident-decode-program",
+                "paged-group4-grow-only",
+                false,
+            ),
+            (
+                "cuda",
+                LegacyEngine,
+                "resident-decode-program",
+                "paged-group4-grow-only",
+                false,
+            ),
         ] {
             let mut values = vec![
                 (key, mode, RuntimeConfigSource::Cli),
@@ -7973,10 +8012,14 @@ mod tests {
             let mut hardware = HardwareCapabilities::unknown();
             hardware.backend = backend.to_owned();
             hardware.compiled_features.cuda = backend == "cuda";
-            let result = FerrumConfigBuilder::new(entries)
+            let builder = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
-                .resolve();
+                .with_execution_resource_authority(authority);
+            assert_eq!(
+                builder.sequence_backing_growth_decision().is_ok(),
+                supported
+            );
+            let result = builder.resolve();
             assert_eq!(result.is_ok(), supported, "{result:?}");
             if let Ok(resolved) = result {
                 let entry = resolved
@@ -7993,6 +8036,10 @@ mod tests {
                     .find(|d| d.selection == "sequence_backing_growth")
                     .unwrap();
                 assert!(decision.affects.contains(&RuntimeConfigEffect::Memory));
+                assert!(decision
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate == mode));
             }
         }
     }

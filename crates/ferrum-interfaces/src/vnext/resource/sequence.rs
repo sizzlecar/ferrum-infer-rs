@@ -1085,8 +1085,10 @@ where
             let optional = self.try_ensure_backing_covers_once(&request, request.growth_policy)?;
             let optional = match optional {
                 SequenceResourceExtensionDecision::BackingDeferred(deferred)
-                    if request.surplus_pool_growth
-                        == SequenceSurplusPoolGrowthPolicy::GrowWithinBudget =>
+                    if matches!(
+                        request.growth_policy,
+                        SequenceBackingGrowthPolicy::PagedGroupGrowOnly(_)
+                    ) =>
                 {
                     // The deferral is a live, exact owner capability. Never
                     // route optional surplus through ordinary maintenance,
@@ -1897,14 +1899,17 @@ where
     pub(super) current: Arc<SequenceBackingSnapshot<R>>,
 }
 
-/// Optional physical headroom, independent of actual token work. This policy
-/// alone never grows a pool or replaces the exact required-capacity fallback.
+/// Optional physical headroom, independent of actual token work. Surplus never
+/// replaces the exact required-capacity fallback or permits reclaiming owners.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SequenceBackingGrowthPolicy {
     #[default]
     Exact,
+    /// Reserve surplus only from capacity already available in the pool.
     PagedGroup(NonZeroU32),
+    /// Also permit one budgeted pool growth attempt for paged surplus.
+    PagedGroupGrowOnly(NonZeroU32),
 }
 
 impl SequenceBackingGrowthPolicy {
@@ -1913,19 +1918,11 @@ impl SequenceBackingGrowthPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum SequenceSurplusPoolGrowthPolicy {
-    #[default]
-    ResidentOnly,
-    GrowWithinBudget,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceResourceExtensionRequest {
     target_work: ResourceWorkShape,
     pressure_action: AdmissionPressureAction,
     growth_policy: SequenceBackingGrowthPolicy,
-    surplus_pool_growth: SequenceSurplusPoolGrowthPolicy,
 }
 
 impl SequenceResourceExtensionRequest {
@@ -1942,13 +1939,11 @@ impl SequenceResourceExtensionRequest {
             target_work,
             pressure_action,
             growth_policy: SequenceBackingGrowthPolicy::Exact,
-            surplus_pool_growth: SequenceSurplusPoolGrowthPolicy::ResidentOnly,
         })
     }
 
     pub fn with_paged_growth_group(mut self, pages: NonZeroU32) -> Self {
         self.growth_policy = SequenceBackingGrowthPolicy::PagedGroup(pages);
-        self.surplus_pool_growth = SequenceSurplusPoolGrowthPolicy::ResidentOnly;
         self
     }
 
@@ -1956,8 +1951,7 @@ impl SequenceResourceExtensionRequest {
     /// another allocation, waiting, or changing the actual committed work.
     /// Capacity denial falls back to the exact required extension.
     pub fn with_paged_growth_group_grow_only(mut self, pages: NonZeroU32) -> Self {
-        self.growth_policy = SequenceBackingGrowthPolicy::PagedGroup(pages);
-        self.surplus_pool_growth = SequenceSurplusPoolGrowthPolicy::GrowWithinBudget;
+        self.growth_policy = SequenceBackingGrowthPolicy::PagedGroupGrowOnly(pages);
         self
     }
 }

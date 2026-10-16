@@ -181,6 +181,8 @@ pub enum SequenceBackingGrowthArg {
     Exact,
     #[value(name = "paged-group4")]
     PagedGroup4,
+    #[value(name = "paged-group4-grow-only")]
+    PagedGroup4GrowOnly,
 }
 
 impl SequenceBackingGrowthArg {
@@ -189,6 +191,9 @@ impl SequenceBackingGrowthArg {
             Self::Exact => ferrum_types::SequenceBackingGrowth::Exact.as_runtime_value(),
             Self::PagedGroup4 => {
                 ferrum_types::SequenceBackingGrowth::PagedGroup4.as_runtime_value()
+            }
+            Self::PagedGroup4GrowOnly => {
+                ferrum_types::SequenceBackingGrowth::PagedGroup4GrowOnly.as_runtime_value()
             }
         }
     }
@@ -904,6 +909,10 @@ mod tests {
             for (value, expected) in [
                 ("exact", SequenceBackingGrowthArg::Exact),
                 ("paged-group4", SequenceBackingGrowthArg::PagedGroup4),
+                (
+                    "paged-group4-grow-only",
+                    SequenceBackingGrowthArg::PagedGroup4GrowOnly,
+                ),
             ] {
                 let parsed = TestCli::try_parse_from([
                     "ferrum",

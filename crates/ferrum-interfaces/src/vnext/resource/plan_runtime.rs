@@ -1385,7 +1385,8 @@ where
                 }
                 let desired_bytes = match (growth_policy, descriptor.storage().profile().view()) {
                     (
-                        super::SequenceBackingGrowthPolicy::PagedGroup(pages),
+                        super::SequenceBackingGrowthPolicy::PagedGroup(pages)
+                        | super::SequenceBackingGrowthPolicy::PagedGroupGrowOnly(pages),
                         super::DynamicStorageView::PagedRegions { block_bytes },
                     ) => {
                         let ceiling =

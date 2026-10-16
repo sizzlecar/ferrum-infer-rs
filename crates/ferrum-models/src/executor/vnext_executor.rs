@@ -157,6 +157,11 @@ fn resolved_sequence_backing_growth(
                 std::num::NonZeroU32::new(4).expect("four pages is a positive reservation group"),
             )
         }
+        ferrum_types::SequenceBackingGrowth::PagedGroup4GrowOnly => {
+            SequenceBackingGrowthPolicy::PagedGroupGrowOnly(
+                std::num::NonZeroU32::new(4).expect("four pages is a positive reservation group"),
+            )
+        }
     }
 }
 
@@ -6807,6 +6812,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 SequenceBackingGrowthPolicy::Exact => request,
                 SequenceBackingGrowthPolicy::PagedGroup(pages) => {
                     request.with_paged_growth_group(pages)
+                }
+                SequenceBackingGrowthPolicy::PagedGroupGrowOnly(pages) => {
+                    request.with_paged_growth_group_grow_only(pages)
                 }
             };
             match sequence

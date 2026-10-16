@@ -1780,19 +1780,25 @@ mod tests {
 
     #[test]
     fn sequence_backing_growth_config_file_has_typed_values() {
-        let parsed: CliConfig =
-            toml::from_str("[runtime]\nsequence_backing_growth = \"paged-group4\"\n").unwrap();
-        assert_eq!(
-            parsed.runtime.sequence_backing_growth,
-            Some(ferrum_types::SequenceBackingGrowth::PagedGroup4)
-        );
-        let entries = parsed.runtime.runtime_config_entries();
-        let entry = entries
-            .iter()
-            .find(|e| e.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY)
+        for mode in [
+            ferrum_types::SequenceBackingGrowth::Exact,
+            ferrum_types::SequenceBackingGrowth::PagedGroup4,
+            ferrum_types::SequenceBackingGrowth::PagedGroup4GrowOnly,
+        ] {
+            let value = mode.as_runtime_value();
+            let parsed: CliConfig = toml::from_str(&format!(
+                "[runtime]\nsequence_backing_growth = \"{value}\"\n"
+            ))
             .unwrap();
-        assert_eq!(entry.effective_value, "paged-group4");
-        assert_eq!(entry.source, ferrum_types::RuntimeConfigSource::ConfigFile);
+            assert_eq!(parsed.runtime.sequence_backing_growth, Some(mode));
+            let entries = parsed.runtime.runtime_config_entries();
+            let entry = entries
+                .iter()
+                .find(|e| e.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, ferrum_types::RuntimeConfigSource::ConfigFile);
+        }
         assert!(toml::from_str::<CliConfig>(
             "[runtime]\nsequence_backing_growth = \"automatic\"\n"
         )
