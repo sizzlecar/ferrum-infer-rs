@@ -54,6 +54,8 @@ mod binding_scatter;
 mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
+#[cfg(test)]
+mod input_upload_packet_tests;
 mod resident_program;
 mod segment_oracle;
 mod segment_owners;
