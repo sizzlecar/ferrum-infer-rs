@@ -2,8 +2,10 @@ use super::*;
 use cudarc::driver::{CudaContext, DevicePtrMut};
 use half::f16;
 
+mod batched;
 mod partitioned;
 
+#[derive(Clone)]
 struct Case {
     logits: Vec<f32>,
     valid: Vec<u8>,

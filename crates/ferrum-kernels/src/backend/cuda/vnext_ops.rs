@@ -78,7 +78,10 @@ use ferrum_interfaces::vnext::{
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
 use native_io::TokenPrecision;
-use selection::{argmax_dispatches, ArgmaxArguments, ArgmaxFunctions, ArgmaxPrecision};
+use selection::{
+    argmax_dispatches, ArgmaxArguments, ArgmaxBatchArguments, ArgmaxFunctions, ArgmaxPrecision,
+    ARGMAX_BATCH_ROWS,
+};
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
@@ -2618,9 +2621,20 @@ fn encode_last_token_masked_argmax(
         .map_err(|_| "masked argmax participant count exceeds u32".to_owned())?;
     let dispatches_per_participant = argmax_dispatches(launches[0].vocabulary_size);
     let parallel = dispatches_per_participant == 2;
+    let batched = parallel
+        && (2..=ARGMAX_BATCH_ROWS).contains(&launches.len())
+        && masked_argmax_batch_ranges_are_independent(
+            &regions
+                .iter()
+                .map(|region| (region.device_ptr(), region.length_bytes()))
+                .collect::<Vec<_>>(),
+            launches.iter().map(|launch| launch.first_region + 5),
+            scratch_region,
+        );
     let mut replay_key =
         CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_masked_argmax")
             .u64(dispatches_per_participant)
+            .u64(u64::from(batched))
             .u64(launches.len() as u64);
     for launch in &launches {
         replay_key = replay_key
@@ -2635,24 +2649,23 @@ fn encode_last_token_masked_argmax(
         regions,
         replay_key.finish(),
         move |stream, regions| {
-            for launch in &launches {
-                let logits = regions[launch.first_region].device_ptr();
-                let valid_mask = regions[launch.first_region + 1].device_ptr();
-                let repetition_token_ids = regions[launch.first_region + 2].device_ptr();
-                let repetition_offsets = regions[launch.first_region + 3].device_ptr();
-                let repetition_penalty = regions[launch.first_region + 4].device_ptr();
-                let output = regions[launch.first_region + 5].device_ptr();
-                let scratch = regions[scratch_region]
-                    .device_ptr()
-                    .checked_add(launch.scratch_offset_bytes)
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "vNext masked argmax scratch pointer overflows",
-                        )
-                    })?;
-                functions.launch(
-                    stream,
-                    ArgmaxArguments {
+            let arguments =
+                |launch: &MaskedArgmaxLaunch| -> Result<ArgmaxArguments, CudaDeviceRuntimeError> {
+                    let logits = regions[launch.first_region].device_ptr();
+                    let valid_mask = regions[launch.first_region + 1].device_ptr();
+                    let repetition_token_ids = regions[launch.first_region + 2].device_ptr();
+                    let repetition_offsets = regions[launch.first_region + 3].device_ptr();
+                    let repetition_penalty = regions[launch.first_region + 4].device_ptr();
+                    let output = regions[launch.first_region + 5].device_ptr();
+                    let scratch = regions[scratch_region]
+                        .device_ptr()
+                        .checked_add(launch.scratch_offset_bytes)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "vNext masked argmax scratch pointer overflows",
+                            )
+                        })?;
+                    Ok(ArgmaxArguments {
                         logits,
                         scratch,
                         valid_mask,
@@ -2662,27 +2675,104 @@ fn encode_last_token_masked_argmax(
                         output,
                         vocabulary_size: launch.vocabulary_size,
                         repetition_capacity: launch.repetition_capacity,
-                    },
-                    parallel,
-                )?;
+                    })
+                };
+            if batched {
+                let mut batch_rows = [ArgmaxArguments::default(); ARGMAX_BATCH_ROWS];
+                for (index, launch) in launches.iter().enumerate() {
+                    batch_rows[index] = arguments(launch)?;
+                }
+                let parameters = ArgmaxBatchArguments::new(&batch_rows[..launches.len()])
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract("invalid batched argmax rows")
+                    })?;
+                functions.launch_batched(stream, &parameters, participant_count)?;
+            } else {
+                for launch in &launches {
+                    functions.launch(stream, arguments(launch)?, parallel)?;
+                }
             }
             Ok(())
         },
     )
     .and_then(|command| {
         command.with_work_attribution(
-            if participant_count == 1 {
+            if batched {
+                DeviceBatchingForm::Packed
+            } else if participant_count == 1 {
                 DeviceBatchingForm::Scalar
             } else {
                 DeviceBatchingForm::ParticipantLoop
             },
             participant_count,
             u64::from(participant_count),
-            u64::from(participant_count) * dispatches_per_participant,
+            if batched {
+                2
+            } else {
+                u64::from(participant_count) * dispatches_per_participant
+            },
             0,
         )
     })
     .map_err(|error| error.to_string())
+}
+
+// The participant-loop path permits ordered aliases. Parallel rows may share
+// read-only policy/logits, but outputs and scratch must remain independent.
+fn masked_argmax_batch_ranges_are_independent(
+    ranges: &[(u64, u64)],
+    output_indices: impl Iterator<Item = usize>,
+    scratch_index: usize,
+) -> bool {
+    output_indices
+        .chain(std::iter::once(scratch_index))
+        .all(|write_index| {
+            let Some(&(write_start, write_length)) = ranges.get(write_index) else {
+                return false;
+            };
+            let Some(write_end) = write_start.checked_add(write_length) else {
+                return false;
+            };
+            write_length != 0
+                && ranges.iter().enumerate().all(|(index, &(start, length))| {
+                    let Some(end) = start.checked_add(length) else {
+                        return false;
+                    };
+                    length != 0
+                        && (index == write_index || write_end <= start || end <= write_start)
+                })
+        })
+}
+
+#[cfg(test)]
+mod masked_argmax_batch_alias_tests {
+    use super::masked_argmax_batch_ranges_are_independent;
+
+    #[test]
+    fn parallel_rows_share_reads_but_fall_back_for_ordered_writes() {
+        let independent = [(100, 8), (100, 8), (108, 4), (112, 4), (116, 256)];
+        assert!(masked_argmax_batch_ranges_are_independent(
+            &independent,
+            [2, 3].into_iter(),
+            4,
+        ));
+        for (index, alias) in [(3, (108, 4)), (2, (104, 4)), (4, (100, 256))] {
+            let mut ranges = independent;
+            ranges[index] = alias;
+            assert!(!masked_argmax_batch_ranges_are_independent(
+                &ranges,
+                [2, 3].into_iter(),
+                4,
+            ));
+        }
+        let mut overflowing = independent;
+        overflowing[0] = (u64::MAX, 8);
+        assert!(!masked_argmax_batch_ranges_are_independent(
+            &overflowing,
+            [2, 3].into_iter(),
+            4,
+        ));
+    }
 }
 
 fn masked_argmax_scratch_stride(
