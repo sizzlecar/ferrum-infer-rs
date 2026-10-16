@@ -1,6 +1,8 @@
 //! Exercise the vNext wrapper as well as the shared native matrix entrypoint.
 use super::test_support::Guarded;
 use super::*;
+
+mod packed_gate_up;
 use crate::marlin_repack::{
     fixtures::{build_host_fixture, cpu_reference, FIXTURES, GROUP_SIZE},
     repack_compressed_tensors_zero_points_to_marlin, repack_gptq_to_marlin,
