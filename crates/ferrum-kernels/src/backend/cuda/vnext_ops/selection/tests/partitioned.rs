@@ -35,7 +35,18 @@ pub(super) fn large_cases(n: usize) -> Vec<Case> {
     negative[256] = -0.0;
     negative[n - 1] = 0.0;
     negative[1] = f32::from_bits(0x80000001);
+    let mut zero_partitions = signed_zero_case(n, 255, 256, false);
+    zero_partitions.logits[512] = 0.0;
+    // Keep the partitioned path active for every tested penalty value.
+    zero_partitions.offsets = [0, 0];
     vec![
+        zero_partitions,
+        Case {
+            logits: vec![f32::NAN; n],
+            valid: vec![1; n],
+            repetition: vec![0],
+            offsets: [0, 0],
+        },
         Case {
             logits: base.logits.clone(),
             valid: vec![0; n],

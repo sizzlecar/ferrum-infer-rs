@@ -1174,6 +1174,13 @@ impl FerrumConfigBuilder {
                 RuntimeConfigSource::Default,
             );
         }
+        if self.entry("FERRUM_SAMPLING_READBACK_MODE").is_none() {
+            runtime_config.upsert(
+                "FERRUM_SAMPLING_READBACK_MODE",
+                crate::SamplingReadbackMode::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
         if self.entry("FERRUM_PREFILL_DECODE_EXECUTION").is_none() {
             runtime_config.upsert(
                 "FERRUM_PREFILL_DECODE_EXECUTION",
@@ -1357,6 +1364,7 @@ impl FerrumConfigBuilder {
         )?);
         decisions.push(self.prefill_decode_execution_decision()?);
         decisions.push(self.invocation_preparation_strategy_decision()?);
+        decisions.push(self.sampling_readback_mode_decision()?);
         decisions.push(self.program_binding_upload_strategy_decision()?);
         decisions.push(self.completion_readback_policy_decision()?);
         decisions.push(self.segment_binding_owner_view_mode_decision()?);
@@ -2750,6 +2758,48 @@ impl FerrumConfigBuilder {
             ["synchronous", "batched-u32"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn sampling_readback_mode_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = "FERRUM_SAMPLING_READBACK_MODE";
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::SamplingReadbackMode::parse_runtime_value(&entry.effective_value).map_err(
+                    |reason| AutoConfigError::InvalidOverride {
+                        key: key.to_owned(),
+                        reason,
+                    },
+                )?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::SamplingReadbackMode::default(),
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::SamplingReadbackMode::Participant
+            && self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+        {
+            return Err(AutoConfigError::InvalidOverride {
+                key: key.to_owned(),
+                reason: "participant sampling readback requires a plan runtime".to_owned(),
+            });
+        }
+        Ok(self.decision(
+            "sampling_readback_mode",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["uniform", "participant"],
+            Vec::new(),
+            vec![
+                RuntimeConfigEffect::Correctness,
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Memory,
+            ],
         ))
     }
 
@@ -5919,6 +5969,93 @@ mod tests {
         assert!(
             matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
         );
+    }
+
+    #[test]
+    fn sampling_readback_records_default_sources_and_keeps_sampling_path_independent() {
+        let key = "FERRUM_SAMPLING_READBACK_MODE";
+        let baseline = scheduler_resolution(
+            "cpu",
+            ExecutionResourceAuthority::PlanRuntime,
+            4,
+            RuntimeConfigSnapshot::default(),
+        );
+        let baseline_path = baseline
+            .decisions
+            .iter()
+            .find(|d| d.selection == "sampling_readback_path")
+            .unwrap();
+        for (value, runtime_source, source) in [
+            (
+                None,
+                RuntimeConfigSource::Default,
+                AutoConfigSource::Default,
+            ),
+            (
+                Some("participant"),
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            (
+                Some("participant"),
+                RuntimeConfigSource::Env,
+                AutoConfigSource::Env,
+            ),
+            (
+                Some("uniform"),
+                RuntimeConfigSource::Cli,
+                AutoConfigSource::Cli,
+            ),
+        ] {
+            let snapshot = value
+                .map(|v| snapshot_with_sources(&[(key, v, runtime_source)]))
+                .unwrap_or_default();
+            let resolved =
+                scheduler_resolution("cpu", ExecutionResourceAuthority::PlanRuntime, 4, snapshot);
+            let expected = value.unwrap_or("uniform");
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, expected);
+            assert_eq!(entry.source, runtime_source);
+            let decision = resolved
+                .decisions
+                .iter()
+                .find(|d| d.selection == "sampling_readback_mode")
+                .unwrap();
+            assert_eq!(decision.selected, expected);
+            assert_eq!(decision.source, source);
+            assert_eq!(decision.source_key.as_deref(), value.map(|_| key));
+            let path = resolved
+                .decisions
+                .iter()
+                .find(|d| d.selection == "sampling_readback_path")
+                .unwrap();
+            assert_eq!(path.selected, baseline_path.selected);
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.runtime.sampling_readback_mode.as_runtime_value(),
+                expected
+            );
+        }
+        for (value, authority) in [
+            ("automatic", ExecutionResourceAuthority::PlanRuntime),
+            ("participant", ExecutionResourceAuthority::LegacyEngine),
+        ] {
+            let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+            assert!(
+                matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
+            );
+        }
     }
 
     #[test]

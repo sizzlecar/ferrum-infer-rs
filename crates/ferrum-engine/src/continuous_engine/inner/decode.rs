@@ -192,6 +192,11 @@ impl EngineInner {
                                 &mut logits,
                                 Some(self.tokenizer.as_ref()),
                             )?,
+                        ExecutorSamplingOutput::NoSelectableFiniteLogit => {
+                            return Err(FerrumError::model(
+                                "engine sampling policies have no finite token",
+                            ));
+                        }
                     };
                     sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
                     sequence.record_generated_token_commit_with_decode_postprocess(

@@ -132,6 +132,10 @@ pub struct ServeCommand {
     /// programs also require indexed owner views and compact-scatter uploads.
     #[arg(long, value_enum)]
     pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
+    /// Sampling readback: uniform (default) or eligible per-participant pure decode.
+    /// Participant requires a plan runtime and retains uniform fallbacks.
+    #[arg(long, value_enum)]
+    pub sampling_readback_mode: Option<crate::commands::SamplingReadbackModeArg>,
     /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
@@ -454,6 +458,7 @@ async fn execute_with_compatibility(
         max_num_batched_tokens,
         prefill_decode_execution,
         invocation_preparation_strategy,
+        sampling_readback_mode,
         program_binding_upload_strategy,
         completion_readback_policy,
         segment_binding_owner_view_mode,
@@ -918,6 +923,7 @@ async fn execute_with_compatibility(
         &mut startup_cli_runtime_entries,
         invocation_preparation_strategy,
     );
+    push_sampling_readback_mode_cli_entry(&mut startup_cli_runtime_entries, sampling_readback_mode);
     push_program_binding_upload_strategy_cli_entry(
         &mut startup_cli_runtime_entries,
         program_binding_upload_strategy,
@@ -1663,6 +1669,17 @@ fn push_invocation_preparation_strategy_cli_entry(
         entries,
         "FERRUM_INVOCATION_PREPARATION_STRATEGY",
         strategy.map(crate::commands::InvocationPreparationStrategyArg::as_runtime_value),
+    );
+}
+
+fn push_sampling_readback_mode_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    mode: Option<crate::commands::SamplingReadbackModeArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        "FERRUM_SAMPLING_READBACK_MODE",
+        mode.map(crate::commands::SamplingReadbackModeArg::as_runtime_value),
     );
 }
 
@@ -2923,6 +2940,61 @@ mod tests {
             );
             let entry = snapshot.entries.iter().find(|entry| entry.key == KEY);
             assert_eq!(entry.map(|entry| entry.source), source);
+        }
+    }
+
+    #[test]
+    fn sampling_readback_serve_preserves_config_and_applies_cli_priority() {
+        use crate::commands::SamplingReadbackModeArg;
+        use ferrum_types::SamplingReadbackMode;
+        let config_entries = crate::config::RuntimeCliConfig {
+            sampling_readback_mode: Some(SamplingReadbackMode::Participant),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for (option, env, expected, source) in [
+            (
+                None,
+                None,
+                SamplingReadbackMode::Participant,
+                RuntimeConfigSource::ConfigFile,
+            ),
+            (
+                None,
+                Some("uniform"),
+                SamplingReadbackMode::Uniform,
+                RuntimeConfigSource::Env,
+            ),
+            (
+                Some(SamplingReadbackModeArg::Uniform),
+                Some("participant"),
+                SamplingReadbackMode::Uniform,
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                Some(SamplingReadbackModeArg::Participant),
+                Some("uniform"),
+                SamplingReadbackMode::Participant,
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            let mut cli = Vec::new();
+            push_sampling_readback_mode_cli_entry(&mut cli, option);
+            let environment = env
+                .map(|value| {
+                    RuntimeConfigSnapshot::from_env_vars([("FERRUM_SAMPLING_READBACK_MODE", value)])
+                })
+                .unwrap_or_default();
+            let snapshot = merge_runtime_config_sources(config_entries.clone(), environment, cli);
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.sampling_readback_mode, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|e| e.key == "FERRUM_SAMPLING_READBACK_MODE")
+                .unwrap();
+            assert_eq!(entry.source, source);
         }
     }
 

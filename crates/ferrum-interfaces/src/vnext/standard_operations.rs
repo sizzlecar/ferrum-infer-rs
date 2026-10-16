@@ -458,6 +458,9 @@ fn last_token_dense_linear_contract_with_activation(
 /// penalty. Selection policy is carried by typed inputs so it remains visible
 /// to planning and cannot be hidden in backend flags. Semantic logits remain
 /// immutable; providers use invocation-scoped scratch for any penalized view.
+/// Only finite masked values are eligible. Selection uses IEEE total order
+/// (`-0.0` precedes `+0.0`), with the lowest token id for equal values. An empty
+/// eligible set returns `u32::MAX`.
 ///
 /// The repetition token ids are unique and occupy
 /// `offsets[0]..offsets[1]` within the fixed-capacity input. A penalty of `1.0`

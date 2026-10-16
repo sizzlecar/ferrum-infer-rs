@@ -201,7 +201,7 @@ pub(super) fn masked_argmax(
                 value = half::f16::from_f32(value).to_f32();
             }
         }
-        if value.is_finite() && (best == u32::MAX || value > maximum) {
+        if value.is_finite() && (best == u32::MAX || value.total_cmp(&maximum).is_gt()) {
             maximum = value;
             best = token as u32;
         }

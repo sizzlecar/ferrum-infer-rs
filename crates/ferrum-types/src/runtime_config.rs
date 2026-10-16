@@ -231,6 +231,13 @@ pub fn parse_tri_state_env_value(raw: Option<&str>) -> Result<EnvTriState, Strin
 }
 
 fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
+    if key == "FERRUM_SAMPLING_READBACK_MODE" {
+        return vec![
+            RuntimeConfigEffect::Correctness,
+            RuntimeConfigEffect::Performance,
+            RuntimeConfigEffect::Memory,
+        ];
+    }
     let mut effects = Vec::new();
 
     if key.contains("DIAG")
@@ -300,6 +307,18 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_readback_records_correctness_performance_and_host_memory_implications() {
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([(
+            "FERRUM_SAMPLING_READBACK_MODE",
+            "participant",
+        )]);
+        let entry = snapshot.entries.first().unwrap();
+        assert!(entry.affects.contains(&RuntimeConfigEffect::Correctness));
+        assert!(entry.affects.contains(&RuntimeConfigEffect::Performance));
+        assert!(entry.affects.contains(&RuntimeConfigEffect::Memory));
+    }
 
     #[test]
     fn parses_boolean_values() {

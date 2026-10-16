@@ -40,7 +40,7 @@ use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
     InvocationPreparationStrategy, ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint,
     RequestId, Result, ReusableExecutionCaptureConfig, ReusableExecutionPreparationMode,
-    SchedulingPolicy, SequenceFitPolicy, TokenId, VNextDiagnosticFault,
+    SamplingReadbackMode, SchedulingPolicy, SequenceFitPolicy, TokenId, VNextDiagnosticFault,
     MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH,
 };
 use parking_lot::{Mutex, RwLock};
@@ -76,6 +76,7 @@ mod program_binding_upload;
 mod request;
 mod reusable_catalog;
 mod reusable_cold_path;
+mod sampling_readback;
 mod state_memory;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -83,6 +84,7 @@ pub use determinism::{
     MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 use request::{terminalize_unsubmitted_session, VNextRequestRoot};
+use sampling_readback::ProductReadbackModes;
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
 const POLICY_VERSION: ContractVersion = ContractVersion::new(3, 0);
@@ -554,6 +556,7 @@ pub struct VNextExecutorConfig {
     pub runtime_policy: ResolvedRuntimePolicy,
     pub invocation_preparation_strategy: InvocationPreparationStrategy,
     pub completion_readback_policy: ferrum_types::CompletionReadbackPolicy,
+    pub sampling_readback_mode: SamplingReadbackMode,
     pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
@@ -821,6 +824,7 @@ impl VNextExecutorConfig {
             runtime_policy,
             invocation_preparation_strategy: engine.runtime.invocation_preparation_strategy,
             completion_readback_policy: engine.runtime.completion_readback_policy,
+            sampling_readback_mode: engine.runtime.sampling_readback_mode,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
@@ -1459,6 +1463,11 @@ struct VNextExecutorMetrics {
     readback_bytes: AtomicU64,
     full_logits_readback_waves: AtomicU64,
     greedy_token_readback_waves: AtomicU64,
+    hybrid_readback_waves: AtomicU64,
+    full_logits_readback_participants: AtomicU64,
+    greedy_token_readback_participants: AtomicU64,
+    no_selectable_finite_logit_participants: AtomicU64,
+    product_readback_bytes: AtomicU64,
     greedy_policy_fallback_waves: AtomicU64,
     token_mask_upload_participants: AtomicU64,
     token_mask_cache_hit_participants: AtomicU64,
@@ -2057,6 +2066,7 @@ fn decode_output_width(output_elements: usize, vocabulary_size: usize) -> Result
 enum VNextTerminalReadbacks {
     Batch(CompletionReadbackBatchRequest),
     Collection(CompletionReadbackCollectionRequest),
+    Selection(CompletionReadbackSelectionRequest),
 }
 
 impl VNextTerminalReadbacks {
@@ -3032,6 +3042,11 @@ impl VNextExecutorMetrics {
             &self.readback_bytes,
             &self.full_logits_readback_waves,
             &self.greedy_token_readback_waves,
+            &self.hybrid_readback_waves,
+            &self.full_logits_readback_participants,
+            &self.greedy_token_readback_participants,
+            &self.no_selectable_finite_logit_participants,
+            &self.product_readback_bytes,
             &self.greedy_policy_fallback_waves,
             &self.token_mask_upload_participants,
             &self.token_mask_cache_hit_participants,
@@ -4746,6 +4761,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     completion_readback_policy: ferrum_types::CompletionReadbackPolicy,
     resident_decode: Mutex<Option<ResidentCache<R>>>,
     resident_metrics: ResidentMetrics,
+    sampling_readback_mode: SamplingReadbackMode,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
     submission_wave_identity: CompiledSubmissionWaveIdentity,
@@ -5311,6 +5327,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             resident_decode: Mutex::new(None),
             resident_metrics: ResidentMetrics::default(),
             completion_readback_policy: config.completion_readback_policy,
+            sampling_readback_mode: config.sampling_readback_mode,
             plan_resources,
             lane,
             submission_wave_identity,
@@ -7463,18 +7480,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn product_output_mode(
-        participants: &[VNextExecutionParticipant<'_, R>],
-        kind: VNextExecutionWaveKind,
-    ) -> VNextProductOutputMode {
-        product_output_mode_for_roles(
-            kind,
-            participants
-                .iter()
-                .map(|participant| participant.output_role),
-        )
-    }
-
     fn startup_reusable_descriptor(
         participants: &[VNextExecutionParticipant<'_, R>],
         kind: VNextExecutionWaveKind,
@@ -7526,13 +7531,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         wave: PreparedStepSubmissionWave<R>,
         kind: VNextExecutionWaveKind,
-        output_mode: VNextProductOutputMode,
+        output_modes: &ProductReadbackModes,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
         mut cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
         resident_bootstrap: Option<Arc<ResidentDecodeReservation<R>>>,
         resident_install: &mut Option<Arc<ResidentDecodeProgram<R>>>,
     ) -> DispatchOutcome<R> {
-        if participants.is_empty() || participants.len() != token_mask_plans.len() {
+        if participants.is_empty()
+            || participants.len() != token_mask_plans.len()
+            || participants.len() != output_modes.len()
+        {
             return DispatchOutcome::QuiescentFailure(
                 "vNext submission wave requires matching participants and token-mask decisions"
                     .to_owned(),
@@ -7548,7 +7556,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let uploads = match self.prepare_participant_uploads(
             participants,
             kind,
-            output_mode,
+            output_modes,
             token_mask_plans,
         ) {
             Ok(uploads) => uploads,
@@ -8240,18 +8248,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             (Some(claim), Some(capture)) => capture.teacher_forced_decision(claim)?,
             _ => None,
         };
-        let output_mode = if teacher_forced_decision.is_some() {
-            VNextProductOutputMode::FullLogits
-        } else {
-            Self::product_output_mode(participants, kind)
-        };
+        let output_modes = ProductReadbackModes::resolve(
+            self.sampling_readback_mode,
+            kind,
+            self.io.output_layout.element_type(),
+            self.io.output_elements,
+            self.checkpoint_capture.is_some(),
+            teacher_forced_decision.is_some(),
+            participants
+                .iter()
+                .map(|participant| participant.output_role),
+        );
         let readbacks =
-            self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
-        if let Some(request) = readbacks.terminal_packet_request(
-            self.completion_readback_policy,
-            output_mode,
-            capture_claim.is_some(),
-        ) {
+            self.prepare_terminal_readbacks(participants, capture_claim, &output_modes)?;
+        if let Some(request) = output_modes.uniform().and_then(|mode| {
+            readbacks.terminal_packet_request(
+                self.completion_readback_policy,
+                mode,
+                capture_claim.is_some(),
+            )
+        }) {
             wave.set_terminal_readbacks(request.clone())
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
         }
@@ -8275,19 +8291,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let token_mask_residency = VNextProductTokenMaskResidencyTransaction::prepare(
                 &self.product_token_mask_residency,
                 token_mask_slot_identity,
-                participants.iter().map(|participant| {
-                    VNextProductTokenMaskContent::from_policy(
-                        participant.output_role.logits_policy(),
-                        output_mode,
-                        self.io.output_elements,
-                    )
-                }),
+                participants
+                    .iter()
+                    .zip(output_modes.iter())
+                    .map(|(participant, output_mode)| {
+                        VNextProductTokenMaskContent::from_policy(
+                            participant.output_role.logits_policy(),
+                            output_mode,
+                            self.io.output_elements,
+                        )
+                    }),
             );
             let dispatch = self.dispatch_prepared_wave(
                 participants,
                 wave,
                 kind,
-                output_mode,
+                &output_modes,
                 token_mask_residency.plans(),
                 cold_wave.as_mut(),
                 &mut resident_install,
@@ -8318,11 +8337,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             Ok(wave) => wave,
                             Err(error) => return Err(self.abort_unsubmitted_step(ordinary, error)),
                         };
-                    if let Some(request) = readbacks.terminal_packet_request(
-                        self.completion_readback_policy,
-                        output_mode,
-                        capture_claim.is_some(),
-                    ) {
+                    if let Some(request) = output_modes.uniform().and_then(|mode| {
+                        readbacks.terminal_packet_request(
+                            self.completion_readback_policy,
+                            mode,
+                            capture_claim.is_some(),
+                        )
+                    }) {
                         ordinary_wave
                             .set_terminal_readbacks(request.clone())
                             .map_err(|e| FerrumError::backend(e.to_string()))?;
@@ -8481,6 +8502,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextTerminalReadbacks::Collection(request) => {
                             completion.wait_with_readback_collection(request)
                         }
+                        VNextTerminalReadbacks::Selection(request) => {
+                            completion.wait_with_readback_selection(request)
+                        }
                     };
                     drop(reaper);
                     observation
@@ -8598,11 +8622,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let processed = (|| -> Result<(
             Vec<ExecutorSamplingOutput>,
             u64,
+            u64,
             Vec<VNextCheckpointArtifactRecord>,
             Vec<VNextCheckpointProductOutputRecord>,
         )> {
             let mut logits = vec![None; participants.len()];
             let mut readback_bytes = 0_u64;
+            let mut product_readback_bytes = 0_u64;
             let mut checkpoint_records = Vec::new();
             let mut product_output_records = Vec::new();
             for disposition in receipt.dispositions() {
@@ -8611,9 +8637,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         "vNext terminal readback failed: {disposition:?}"
                     )));
                 };
-                readback_bytes = readback_bytes
-                    .saturating_add(output.request().output_layout().byte_len().unwrap_or(0));
                 let request = output.request();
+                let output_bytes = request.output_layout().byte_len()
+                    .map_err(|error| FerrumError::backend(error.to_string()))?;
+                readback_bytes = readback_bytes.saturating_add(output_bytes);
+                let participant_index = usize::try_from(request.participant_index())
+                    .map_err(|_| FerrumError::internal("vNext readback participant index exceeds usize"))?;
+                let output_mode = output_modes.at(participant_index).ok_or_else(|| {
+                    FerrumError::internal("vNext readback participant index exceeds submitted participants")
+                })?;
                 let is_product_output = match output_mode {
                     VNextProductOutputMode::FullLogits => {
                         request.node_id() == &self.io.output_node_id
@@ -8640,6 +8672,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )));
                 }
                 if is_product_output {
+                    product_readback_bytes = product_readback_bytes.saturating_add(output_bytes);
                     let participant_index =
                         usize::try_from(request.participant_index()).map_err(|_| {
                             FerrumError::internal(
@@ -8656,7 +8689,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             "vNext terminal readback returned duplicate participant output",
                         ));
                     }
-                    *slot = Some(self.decode_product_output(output.bytes(), output_mode)?);
+                    *slot = Some(if output_modes.uniform().is_none()
+                        && output_mode == VNextProductOutputMode::GreedyToken
+                        && output.bytes() == u32::MAX.to_le_bytes()
+                    {
+                        // The scalar sentinel describes this request's sampling
+                        // result. Preserve the previous mixed host path's error
+                        // isolation instead of aborting other completed rows.
+                        ExecutorSamplingOutput::NoSelectableFiniteLogit
+                    } else {
+                        self.decode_product_output(output.bytes(), output_mode)?
+                    });
                     if let (Some(capture_claim), Some(capture)) =
                         (capture_claim, self.checkpoint_capture.as_ref())
                     {
@@ -8714,18 +8757,24 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ok((
                 logits,
                 readback_bytes,
+                product_readback_bytes,
                 checkpoint_records,
                 product_output_records,
             ))
         })();
-        let (mut logits, readback_bytes, checkpoint_records, product_output_records) =
-            match processed {
-                Ok(processed) => processed,
-                Err(error) => {
-                    drop(receipt);
-                    return Err(self.abort_step(step, error.to_string()).await);
-                }
-            };
+        let (
+            mut logits,
+            readback_bytes,
+            product_readback_bytes,
+            checkpoint_records,
+            product_output_records,
+        ) = match processed {
+            Ok(processed) => processed,
+            Err(error) => {
+                drop(receipt);
+                return Err(self.abort_step(step, error.to_string()).await);
+            }
+        };
         if let (Some(capture_claim), Some(capture)) =
             (capture_claim, self.checkpoint_capture.as_ref())
         {
@@ -8750,6 +8799,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.metrics
             .readback_bytes
             .fetch_add(readback_bytes, Ordering::Relaxed);
+        self.metrics
+            .no_selectable_finite_logit_participants
+            .fetch_add(
+                logits
+                    .iter()
+                    .filter(|output| {
+                        matches!(output, ExecutorSamplingOutput::NoSelectableFiniteLogit)
+                    })
+                    .count() as u64,
+                Ordering::Relaxed,
+            );
         for plan in token_mask_residency.plans() {
             if plan.upload_required {
                 self.metrics
@@ -8763,7 +8823,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         let (sparse_repetition_participants, sparse_repetition_token_ids) = participants
             .iter()
-            .map(|participant| {
+            .zip(output_modes.iter())
+            .map(|(participant, output_mode)| {
                 product_repetition_input(participant.output_role.logits_policy(), output_mode)
             })
             .filter(|input| input.is_active())
@@ -8784,29 +8845,49 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .sparse_repetition_token_ids_uploaded
                 .fetch_add(sparse_repetition_token_ids, Ordering::Relaxed);
         }
-        match output_mode {
-            VNextProductOutputMode::FullLogits => {
+        let full_participants = output_modes.full_participants() as u64;
+        let greedy_participants = participants.len() as u64 - full_participants;
+        self.metrics
+            .full_logits_readback_participants
+            .fetch_add(full_participants, Ordering::Relaxed);
+        self.metrics
+            .greedy_token_readback_participants
+            .fetch_add(greedy_participants, Ordering::Relaxed);
+        self.metrics
+            .product_readback_bytes
+            .fetch_add(product_readback_bytes, Ordering::Relaxed);
+        match output_modes.uniform() {
+            Some(VNextProductOutputMode::FullLogits) => {
                 self.metrics
                     .full_logits_readback_waves
                     .fetch_add(1, Ordering::Relaxed);
-                if kind != VNextExecutionWaveKind::Prefill
-                    && participants.iter().any(|participant| {
-                        matches!(
-                            participant.output_role.logits_policy(),
-                            Some(LogitsReturnPolicy::GreedyArgmax { .. })
-                        )
-                    })
-                {
-                    self.metrics
-                        .greedy_policy_fallback_waves
-                        .fetch_add(1, Ordering::Relaxed);
-                }
             }
-            VNextProductOutputMode::GreedyToken => {
+            Some(VNextProductOutputMode::GreedyToken) => {
                 self.metrics
                     .greedy_token_readback_waves
                     .fetch_add(1, Ordering::Relaxed);
             }
+            None => {
+                self.metrics
+                    .hybrid_readback_waves
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if kind != VNextExecutionWaveKind::Prefill
+            && participants
+                .iter()
+                .zip(output_modes.iter())
+                .any(|(participant, mode)| {
+                    mode == VNextProductOutputMode::FullLogits
+                        && matches!(
+                            participant.output_role.logits_policy(),
+                            Some(LogitsReturnPolicy::GreedyArgmax { .. })
+                        )
+                })
+        {
+            self.metrics
+                .greedy_policy_fallback_waves
+                .fetch_add(1, Ordering::Relaxed);
         }
         drop(receipt);
         match step.try_retire_normal() {
@@ -8840,41 +8921,38 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
         capture_claim: Option<VNextCheckpointClaim>,
-        output_mode: VNextProductOutputMode,
+        output_modes: &ProductReadbackModes,
     ) -> Result<VNextTerminalReadbacks> {
-        let (output_node_id, output_resource_id, output_offset_bytes, output_layout) =
-            match output_mode {
-                VNextProductOutputMode::FullLogits => (
-                    &self.io.output_node_id,
-                    &self.io.output_resource_id,
-                    self.io.output_offset_bytes,
-                    self.io.output_layout,
-                ),
-                VNextProductOutputMode::GreedyToken => (
-                    &self.io.greedy_token_output_node_id,
-                    &self.io.greedy_token_output_resource_id,
-                    self.io.greedy_token_output_offset_bytes,
-                    self.io.greedy_token_output_layout,
-                ),
-            };
-        let product_readbacks = participants
-            .iter()
-            .enumerate()
-            .map(|(participant_index, _)| {
-                CompletionReadbackRequest::new(
-                    output_node_id.clone(),
-                    u32::try_from(participant_index).map_err(|_| {
-                        FerrumError::backend("vNext readback participant index exceeds u32")
-                    })?,
-                    output_resource_id.clone(),
-                    output_offset_bytes,
-                    output_layout,
-                )
-                .map_err(|error| FerrumError::backend(error.to_string()))
-            })
+        if output_modes.len() != participants.len() {
+            return Err(FerrumError::internal(
+                "vNext readback decisions must cover every submitted participant",
+            ));
+        }
+        let Some(output_mode) = output_modes.uniform() else {
+            if capture_claim.is_some() {
+                return Err(FerrumError::internal(
+                    "vNext participant readbacks cannot replace checkpoint capture",
+                ));
+            }
+            let alternatives = [
+                VNextProductOutputMode::FullLogits,
+                VNextProductOutputMode::GreedyToken,
+            ]
+            .into_iter()
+            .map(|mode| self.product_readback_batch(participants.len(), mode))
             .collect::<Result<Vec<_>>>()?;
-        let product_readbacks = CompletionReadbackBatchRequest::new(product_readbacks)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let selected = output_modes
+                .iter()
+                .map(|mode| match mode {
+                    VNextProductOutputMode::FullLogits => 0,
+                    VNextProductOutputMode::GreedyToken => 1,
+                })
+                .collect();
+            return CompletionReadbackSelectionRequest::new(alternatives, selected)
+                .map(VNextTerminalReadbacks::Selection)
+                .map_err(|error| FerrumError::backend(error.to_string()));
+        };
+        let product_readbacks = self.product_readback_batch(participants.len(), output_mode)?;
         let mut readback_batches = vec![product_readbacks.clone()];
         if capture_claim.is_some() {
             let capture = self.checkpoint_capture.as_ref().ok_or_else(|| {
@@ -8912,6 +8990,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         CompletionReadbackCollectionRequest::new(readback_batches)
             .map(VNextTerminalReadbacks::Collection)
+            .map_err(|error| FerrumError::backend(error.to_string()))
+    }
+
+    fn product_readback_batch(
+        &self,
+        participant_count: usize,
+        output_mode: VNextProductOutputMode,
+    ) -> Result<CompletionReadbackBatchRequest> {
+        let (output_node_id, output_resource_id, output_offset_bytes, output_layout) =
+            match output_mode {
+                VNextProductOutputMode::FullLogits => (
+                    &self.io.output_node_id,
+                    &self.io.output_resource_id,
+                    self.io.output_offset_bytes,
+                    self.io.output_layout,
+                ),
+                VNextProductOutputMode::GreedyToken => (
+                    &self.io.greedy_token_output_node_id,
+                    &self.io.greedy_token_output_resource_id,
+                    self.io.greedy_token_output_offset_bytes,
+                    self.io.greedy_token_output_layout,
+                ),
+            };
+        let product_readbacks = (0..participant_count)
+            .map(|participant_index| {
+                CompletionReadbackRequest::new(
+                    output_node_id.clone(),
+                    u32::try_from(participant_index).map_err(|_| {
+                        FerrumError::backend("vNext readback participant index exceeds u32")
+                    })?,
+                    output_resource_id.clone(),
+                    output_offset_bytes,
+                    output_layout,
+                )
+                .map_err(|error| FerrumError::backend(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        CompletionReadbackBatchRequest::new(product_readbacks)
             .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
@@ -9272,6 +9388,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             ExecutorSamplingOutput::FullLogits(logits) => logits,
                             ExecutorSamplingOutput::GreedyToken(token) => {
                                 vec![token.get() as f32]
+                            }
+                            ExecutorSamplingOutput::NoSelectableFiniteLogit => {
+                                return Err(FerrumError::backend(
+                                    "No finite logits available for sampling",
+                                ));
                             }
                         };
                         let logits = self.decode_tensor(legacy_values)?;
@@ -10039,8 +10160,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             (ready, sequences.active.len(), maintenance, executing)
         };
         let product_readback = serde_json::json!({
+            "mode": self.sampling_readback_mode,
             "full_logits_waves": self.metrics.full_logits_readback_waves.load(Ordering::Relaxed),
             "greedy_token_waves": self.metrics.greedy_token_readback_waves.load(Ordering::Relaxed),
+            "hybrid_waves": self.metrics.hybrid_readback_waves.load(Ordering::Relaxed),
+            "full_logits_participants": self.metrics.full_logits_readback_participants.load(Ordering::Relaxed),
+            "greedy_token_participants": self.metrics.greedy_token_readback_participants.load(Ordering::Relaxed),
+            "no_selectable_finite_logit_participants": self.metrics.no_selectable_finite_logit_participants.load(Ordering::Relaxed),
+            "product_bytes": self.metrics.product_readback_bytes.load(Ordering::Relaxed),
             "greedy_policy_fallback_waves": self.metrics.greedy_policy_fallback_waves.load(Ordering::Relaxed),
             "token_mask_residency_eligible": self.io.token_mask_residency_eligible,
             "token_mask_upload_participants": self.metrics.token_mask_upload_participants.load(Ordering::Relaxed),
@@ -10161,6 +10288,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         fields.insert(
             "completion_readback_policy".to_owned(),
             serde_json::json!(self.completion_readback_policy),
+        );
+        fields.insert(
+            "sampling_readback_mode".to_owned(),
+            serde_json::json!(self.sampling_readback_mode),
         );
         fields.insert(
             "attention_execution_policy".to_owned(),
@@ -10735,6 +10866,11 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let legacy_values = match sampling_output {
             ExecutorSamplingOutput::FullLogits(logits) => logits,
             ExecutorSamplingOutput::GreedyToken(token) => vec![token.get() as f32],
+            ExecutorSamplingOutput::NoSelectableFiniteLogit => {
+                return Err(FerrumError::backend(
+                    "No finite logits available for sampling",
+                ));
+            }
         };
         let logits = self.decode_tensor(legacy_values)?;
         let cache = self.cache_handle(&sequence, previous_len + 1);
@@ -12011,7 +12147,8 @@ mod tests {
         use super::{ElementType, VNextTerminalReadbacks};
         use ferrum_interfaces::vnext::{
             CompletionReadbackBatchRequest, CompletionReadbackCollectionRequest,
-            CompletionReadbackRequest, HostTransferLayout, NodeId, ResourceId,
+            CompletionReadbackRequest, CompletionReadbackSelectionRequest, HostTransferLayout,
+            NodeId, ResourceId,
         };
         use ferrum_types::CompletionReadbackPolicy::{BatchedU32, Synchronous};
         let batch = |count: u32, element, elements| {
@@ -12065,6 +12202,14 @@ mod tests {
             CompletionReadbackCollectionRequest::new(vec![batch(2, ElementType::U32, 1)]).unwrap();
         assert!(VNextTerminalReadbacks::Collection(collection)
             .terminal_packet_request(BatchedU32, VNextProductOutputMode::GreedyToken, false,)
+            .is_none());
+        let selection = CompletionReadbackSelectionRequest::new(
+            vec![batch(2, ElementType::F16, 4), batch(2, ElementType::U32, 1)],
+            vec![0, 1],
+        )
+        .unwrap();
+        assert!(VNextTerminalReadbacks::Selection(selection)
+            .terminal_packet_request(BatchedU32, VNextProductOutputMode::GreedyToken, false)
             .is_none());
     }
 

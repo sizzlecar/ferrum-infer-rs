@@ -879,6 +879,10 @@ pub struct RunCommand {
     /// programs also require indexed owner views and compact-scatter uploads.
     #[arg(long, value_enum)]
     pub invocation_preparation_strategy: Option<crate::commands::InvocationPreparationStrategyArg>,
+    /// Sampling readback: uniform (default) or eligible per-participant pure decode.
+    /// Participant requires a plan runtime and retains uniform fallbacks.
+    #[arg(long, value_enum)]
+    pub sampling_readback_mode: Option<crate::commands::SamplingReadbackModeArg>,
     /// CUDA binding uploads: sparse or per-node current-batch maximum live prefixes (default: sparse).
     #[arg(long, value_enum)]
     pub program_binding_upload_strategy: Option<crate::commands::ProgramBindingUploadStrategyArg>,
@@ -2758,6 +2762,12 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        "FERRUM_SAMPLING_READBACK_MODE",
+        cmd.sampling_readback_mode
+            .map(crate::commands::SamplingReadbackModeArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
         cmd.program_binding_upload_strategy
             .map(crate::commands::ProgramBindingUploadStrategyArg::as_runtime_value),
@@ -3204,6 +3214,65 @@ mod tests {
     }
 
     #[test]
+    fn sampling_readback_run_preserves_config_and_applies_cli_priority() {
+        use crate::commands::SamplingReadbackModeArg;
+        use ferrum_types::SamplingReadbackMode;
+        let config_entries = crate::config::RuntimeCliConfig {
+            sampling_readback_mode: Some(SamplingReadbackMode::Participant),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let mut command = test_run_cmd();
+        for (option, env, expected, source) in [
+            (
+                None,
+                None,
+                SamplingReadbackMode::Participant,
+                RuntimeConfigSource::ConfigFile,
+            ),
+            (
+                None,
+                Some("uniform"),
+                SamplingReadbackMode::Uniform,
+                RuntimeConfigSource::Env,
+            ),
+            (
+                Some(SamplingReadbackModeArg::Uniform),
+                Some("participant"),
+                SamplingReadbackMode::Uniform,
+                RuntimeConfigSource::Cli,
+            ),
+            (
+                Some(SamplingReadbackModeArg::Participant),
+                Some("uniform"),
+                SamplingReadbackMode::Participant,
+                RuntimeConfigSource::Cli,
+            ),
+        ] {
+            command.sampling_readback_mode = option;
+            let environment = env
+                .map(|value| {
+                    RuntimeConfigSnapshot::from_env_vars([("FERRUM_SAMPLING_READBACK_MODE", value)])
+                })
+                .unwrap_or_default();
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                config_entries.clone(),
+                environment,
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.sampling_readback_mode, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|e| e.key == "FERRUM_SAMPLING_READBACK_MODE")
+                .unwrap();
+            assert_eq!(entry.source, source);
+        }
+    }
+
+    #[test]
     fn invocation_preparation_run_override_reaches_engine_config() {
         use crate::commands::InvocationPreparationStrategyArg;
         use ferrum_types::InvocationPreparationStrategy;
@@ -3287,6 +3356,7 @@ mod tests {
             max_num_batched_tokens: None,
             prefill_decode_execution: None,
             invocation_preparation_strategy: None,
+            sampling_readback_mode: None,
             program_binding_upload_strategy: None,
             completion_readback_policy: None,
             segment_binding_owner_view_mode: None,

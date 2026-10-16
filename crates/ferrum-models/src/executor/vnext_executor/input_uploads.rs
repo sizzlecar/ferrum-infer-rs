@@ -7,10 +7,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
         kind: VNextExecutionWaveKind,
-        output_mode: VNextProductOutputMode,
+        output_modes: &ProductReadbackModes,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
     ) -> Result<Vec<SubmissionWaveInputUpload>> {
-        if participants.is_empty() || participants.len() != token_mask_plans.len() {
+        if participants.is_empty()
+            || participants.len() != token_mask_plans.len()
+            || participants.len() != output_modes.len()
+        {
             return Err(FerrumError::backend(
                 "vNext submission wave requires matching participants and token-mask decisions",
             ));
@@ -120,7 +123,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let mut token_id_uploads = Vec::with_capacity(participants.len());
             let mut offset_uploads = Vec::with_capacity(participants.len());
             let mut penalty_uploads = Vec::with_capacity(participants.len());
-            for (participant_index, participant) in participants.iter().enumerate() {
+            for (participant_index, (participant, output_mode)) in
+                participants.iter().zip(output_modes.iter()).enumerate()
+            {
                 let repetition =
                     product_repetition_input(participant.output_role.logits_policy(), output_mode);
                 if !repetition.penalty.is_finite() || repetition.penalty <= 0.0 {
