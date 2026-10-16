@@ -2,6 +2,10 @@
 //! A successful test does not imply that merging Marlin projections is bit equivalent.
 use super::super::test_support::Guarded;
 use super::*;
+use crate::backend::cuda::vllm_marlin::{
+    launch_marlin_mm_f16_weight_with_diagnostic_tile, MarlinDiagnosticTile, MarlinMmBuffers,
+    MarlinMmExecution, MarlinMmF16WeightRequest, MarlinMmProblem,
+};
 use crate::marlin_repack::{
     fixtures::{build_host_fixture, Fixture, HostFixture, GROUP_SIZE},
     repack_compressed_tensors_zero_points_to_marlin, repack_gptq_to_marlin,
@@ -16,7 +20,7 @@ const PAIRS: usize = 8;
 const PHYSICAL_SETS: usize = 3;
 const EPSILON: f32 = 1.0e-6;
 // Existing independent CT launcher sanity bound, from transformer/marlin_tests.rs.
-// It is not an A/B equivalence allowance: that requires every output half bit.
+// It is not an A/B equivalence allowance or a numerical-variant quality contract.
 const EXISTING_CT_REFERENCE_RELATIVE_L2_LIMIT: f64 = 0.05;
 const CUBLAS_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
 const CUBLAS_WORKSPACE_ALIGNMENT: usize = 256;
@@ -25,6 +29,7 @@ const CUBLAS_WORKSPACE_ALIGNMENT: usize = 256;
 enum Comparison {
     MergeQkvZ,
     ExplicitBlasWorkspace,
+    ExplicitMarlinTile,
 }
 
 impl Comparison {
@@ -32,7 +37,12 @@ impl Comparison {
         match self {
             Self::MergeQkvZ => "split_vs_merged_qkv_z",
             Self::ExplicitBlasWorkspace => "split_default_vs_explicit_cublas_workspace",
+            Self::ExplicitMarlinTile => "split_automatic_vs_explicit_marlin_k64_n128",
         }
+    }
+
+    fn product_equivalence(self, bits_equal: bool) -> Option<bool> {
+        (self != Self::ExplicitMarlinTile).then_some(bits_equal)
     }
 }
 
@@ -79,6 +89,15 @@ impl BlasArms {
         if comparison == Comparison::MergeQkvZ {
             return Self {
                 handles: [Arc::clone(&baseline), baseline],
+                workspace: None,
+            };
+        }
+        if comparison == Comparison::ExplicitMarlinTile {
+            return Self {
+                handles: [
+                    baseline,
+                    Arc::new(CudaBlas::new(Arc::clone(stream)).unwrap()),
+                ],
                 workspace: None,
             };
         }
@@ -291,6 +310,7 @@ struct Arm {
     quant: Vec<QuantProjection>,
     dense: [DenseProjection; 2],
     output: HalfBuffer,
+    diagnostic_tile: Option<MarlinDiagnosticTile>,
 }
 
 impl Arm {
@@ -301,6 +321,7 @@ impl Arm {
         source: &Source,
         packed: &[Repacked; 3],
         merged: bool,
+        diagnostic_tile: Option<MarlinDiagnosticTile>,
     ) -> Self {
         let workspace_bytes = runtime.workspace_bytes().unwrap() as usize;
         let workspace = Guarded::new(stream, &vec![73_i32; workspace_bytes / 4], -117_i32);
@@ -346,6 +367,7 @@ impl Arm {
                 output: HalfBuffer::output(stream, g.rows * g.ba),
             }),
             output: HalfBuffer::output(stream, g.rows * g.output_width()),
+            diagnostic_tile,
         }
     }
 
@@ -369,24 +391,78 @@ impl Arm {
         )
         .unwrap();
         for part in &self.quant {
-            runtime
-                .launch(
-                    MarlinF16WeightType::U4,
-                    stream,
-                    self.normalized.pointer,
-                    part.pointers[0],
-                    part.pointers[1],
-                    Some(part.pointers[2]),
-                    part.output.pointer,
-                    self.workspace_pointer,
-                    self.workspace_bytes as u64,
-                    g.rows as i32,
-                    part.width as i32,
-                    g.k as i32,
-                    GROUP_SIZE as i32,
-                    "GDN input Marlin diagnostic",
-                )
-                .unwrap();
+            if let Some(tile) = self.diagnostic_tile {
+                // Match the production wrapper's full admitted-workspace reset.
+                // The explicit tile's N/128 <= SMs restriction preserves this
+                // original lock allocation even though its grid has two CTAs/SM.
+                let required_workspace = runtime.workspace_bytes().unwrap();
+                assert!(self.workspace_bytes as u64 >= required_workspace);
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        self.workspace_pointer,
+                        0,
+                        usize::try_from(required_workspace).unwrap(),
+                        stream.cu_stream(),
+                    )
+                    .unwrap();
+                    launch_marlin_mm_f16_weight_with_diagnostic_tile(
+                        MarlinMmF16WeightRequest {
+                            weight_type: MarlinF16WeightType::U4,
+                            buffers: MarlinMmBuffers {
+                                a: self.normalized.pointer as *const _,
+                                b: part.pointers[0] as *const _,
+                                c: part.output.pointer as *mut _,
+                                c_tmp: std::ptr::null_mut(),
+                                a_scales: std::ptr::null_mut(),
+                                b_scales: part.pointers[1] as *mut _,
+                                zero_points: part.pointers[2] as *mut _,
+                                group_index: std::ptr::null_mut(),
+                                permutation: std::ptr::null_mut(),
+                                a_tmp: std::ptr::null_mut(),
+                                workspace: self.workspace_pointer as *mut _,
+                            },
+                            problem: MarlinMmProblem {
+                                m: g.rows as i32,
+                                n: part.width as i32,
+                                k: g.k as i32,
+                                lda: g.k as i32,
+                                num_groups: (g.k / GROUP_SIZE) as i32,
+                                group_size: GROUP_SIZE as i32,
+                            },
+                            execution: MarlinMmExecution {
+                                device: runtime.device_ordinal,
+                                stream: stream.cu_stream(),
+                                sms: runtime.multiprocessor_count,
+                                has_act_order: false,
+                                is_k_full: true,
+                                use_atomic_add: false,
+                                use_fp32_reduce: false,
+                            },
+                        },
+                        tile,
+                    )
+                    .unwrap();
+                }
+            } else {
+                runtime
+                    .launch(
+                        MarlinF16WeightType::U4,
+                        stream,
+                        self.normalized.pointer,
+                        part.pointers[0],
+                        part.pointers[1],
+                        Some(part.pointers[2]),
+                        part.output.pointer,
+                        self.workspace_pointer,
+                        self.workspace_bytes as u64,
+                        g.rows as i32,
+                        part.width as i32,
+                        g.k as i32,
+                        GROUP_SIZE as i32,
+                        "GDN input Marlin diagnostic",
+                    )
+                    .unwrap();
+            }
             launch_projection_stitch(
                 stream,
                 &functions.stitch,
@@ -557,7 +633,14 @@ fn quant_reference(
         .sum()
 }
 
-fn oracle(g: Geometry, source: &Source, input: &[f16], actual: &Observation, full: bool) -> Value {
+fn oracle(
+    g: Geometry,
+    source: &Source,
+    input: &[f16],
+    actual: &Observation,
+    full: bool,
+    comparison: Comparison,
+) -> Value {
     let mut norm_max = 0.0f64;
     for row in 0..g.rows {
         let x = &input[row * g.k..][..g.k];
@@ -586,12 +669,18 @@ fn oracle(g: Geometry, source: &Source, input: &[f16], actual: &Observation, ful
     let mut reference_sq = 0.0f64;
     let mut error_sq = 0.0f64;
     let mut quant_max = 0.0f64;
+    let mut part_error = [(0usize, 0.0f64, 0.0f64, 0.0f64); 2];
     for &(row, col) in &points {
         let reference = quant_reference(g, source, &actual.normalized, row, col);
         let error = actual.projection[row * g.quant_width() + col].to_f64() - reference;
         reference_sq += reference * reference;
         error_sq += error * error;
         quant_max = quant_max.max(error.abs());
+        let part = &mut part_error[usize::from(col >= g.qkv)];
+        part.0 += 1;
+        part.1 += reference * reference;
+        part.2 += error * error;
+        part.3 = part.3.max(error.abs());
     }
     let relative_l2 = (error_sq / reference_sq.max(f64::MIN_POSITIVE)).sqrt();
     assert!(
@@ -629,9 +718,16 @@ fn oracle(g: Geometry, source: &Source, input: &[f16], actual: &Observation, ful
     }
     json!({"full_projection_oracle":full,"quant_f64_points":points.len(),
         "quant_reference_relative_l2":relative_l2,"quant_reference_max_absolute":quant_max,
+        "quant_reference_parts":[0,1].map(|part| json!({
+            "name":if part==0 {"qkv"} else {"z"},"points":part_error[part].0,
+            "relative_l2":(part_error[part].2/part_error[part].1.max(f64::MIN_POSITIVE)).sqrt(),
+            "max_absolute":part_error[part].3})),
         "dense_f64_points":2*dense_points.len(),"dense_reference_max_absolute":dense_max,
         "norm_full_f64_max_absolute":norm_max,"norm_reference_scope":"observational; unchanged production RMSNorm, independently matched between arms",
-        "oracle_input":"each arm actual half-rounded normalized input","product_equivalence_bound":"none; requires complete A/B bit equality"})
+        "oracle_input":"each arm actual half-rounded normalized input",
+        "product_equivalence_bound":if comparison==Comparison::ExplicitMarlinTile {
+            "none; numerical-variant diagnostic, existing operator sanity is not a product quality bound"
+        } else {"none; requires complete A/B bit equality"}})
 }
 
 fn ok(result: sys::CUresult) {
@@ -795,6 +891,8 @@ fn run_case(
                     &sources[set],
                     &packed[set],
                     comparison == Comparison::MergeQkvZ && arm == 1,
+                    (comparison == Comparison::ExplicitMarlinTile && arm == 1)
+                        .then_some(MarlinDiagnosticTile::K64N128),
                 )
             })
             .collect()
@@ -827,7 +925,8 @@ fn run_case(
         "capture_upload_ns":capture.elapsed().as_nanos(),"cublas_setup_ns":blas_setup_ns,
         "explicit_workspace_bytes_B":if blas.workspace.is_some() {CUBLAS_WORKSPACE_BYTES} else {0},
         "explicit_workspace_alignment_B":if blas.workspace.is_some() {CUBLAS_WORKSPACE_ALIGNMENT} else {0},
-        "independent_cublas_handles":comparison==Comparison::ExplicitBlasWorkspace,
+        "independent_cublas_handles":comparison!=Comparison::MergeQkvZ,
+        "marlin_tile_A":"automatic","marlin_tile_B":if comparison==Comparison::ExplicitMarlinTile {"explicit_K64_N128"} else {"automatic"},
         "graph_node_types_A":graphs[0].inventory,
         "graph_node_types_B":graphs[1].inventory,"atomic_add":false,"fp32_reduce":false})
     );
@@ -891,7 +990,7 @@ fn run_case(
                     &eager[arm][set].normalized,
                     "graph vs eager normalized",
                 );
-                if comparison == Comparison::ExplicitBlasWorkspace {
+                if comparison != Comparison::MergeQkvZ {
                     assert_bits(
                         &observed[arm][set].projection,
                         &eager[arm][set].projection,
@@ -921,7 +1020,7 @@ fn run_case(
                 &observed[1][set].normalized,
                 "unchanged RMS between arms",
             );
-            if comparison == Comparison::MergeQkvZ {
+            if comparison != Comparison::ExplicitBlasWorkspace {
                 for part in 0..2 {
                     assert_bits(
                         &observed[0][set].dense[part],
@@ -936,6 +1035,22 @@ fn run_case(
                 })
                 .collect();
             let projection = difference(&observed[0][set].projection, &observed[1][set].projection);
+            let projection_parts: Vec<_> = [(0, g.qkv), (g.qkv, g.z)]
+                .into_iter()
+                .map(|(offset, width)| {
+                    let values: [Vec<f16>; 2] = std::array::from_fn(|arm| {
+                        (0..g.rows)
+                            .flat_map(|row| {
+                                observed[arm][set].projection[row * g.quant_width() + offset..]
+                                    [..width]
+                                    .iter()
+                                    .copied()
+                            })
+                            .collect()
+                    });
+                    difference(&values[0], &values[1])
+                })
+                .collect();
             let output = difference(&observed[0][set].output, &observed[1][set].output);
             let equivalent = output["exact_bits"].as_bool().unwrap()
                 && projection["exact_bits"].as_bool().unwrap()
@@ -944,13 +1059,22 @@ fn run_case(
                     .all(|part| part["exact_bits"].as_bool().unwrap());
             exact &= equivalent;
             let oracles: Vec<_> = (0..2)
-                .map(|arm| oracle(g, &sources[set], &inputs[set], &observed[arm][set], !timed))
+                .map(|arm| {
+                    oracle(
+                        g,
+                        &sources[set],
+                        &inputs[set],
+                        &observed[arm][set],
+                        !timed,
+                        comparison,
+                    )
+                })
                 .collect();
             println!(
                 "{}",
                 json!({"kind":"gdn_input_correctness","name":g.name,"comparison":comparison.name(),"generation":generation,
-                "physical_set":set,"projection":projection,"dense":dense,"packed_output":output,"independent_oracles":oracles,
-                "product_equivalent":equivalent,"matched_eager_full_bits":true,
+                "physical_set":set,"projection":projection,"qkv_z_projection_differences":projection_parts,"dense":dense,"packed_output":output,"independent_oracles":oracles,
+                "product_equivalent":comparison.product_equivalence(equivalent),"a_b_bits_equal":equivalent,"matched_eager_full_bits":true,
                 "full_stitch_bits":true,"fresh_observable":generation>0})
             );
         }
@@ -972,7 +1096,7 @@ fn run_case(
                 "{}",
                 json!({"kind":"gdn_input_pair","name":g.name,"comparison":comparison.name(),"pair":pair,
             "order":if order[0]==0 {"AB"} else {"BA"},"groups_per_graph":sets,
-            "A":result[0],"B":result[1],"product_equivalent":exact,
+            "A":result[0],"B":result[1],"product_equivalent":comparison.product_equivalence(exact),"a_b_bits_equal":exact,
             "scope":"RMSNorm + all Marlin resets/projections + two F16 b/a GEMMs + all stitches; block wall includes event record/wait; uploads/oracles/cold setup excluded"})
             );
         }
@@ -985,7 +1109,7 @@ fn run_case(
                 &previous[arm][set].output,
                 "post-timing repeat full bits",
             );
-            if comparison == Comparison::ExplicitBlasWorkspace {
+            if comparison != Comparison::MergeQkvZ {
                 assert_bits(
                     &final_state.normalized,
                     &previous[arm][set].normalized,
@@ -1016,7 +1140,7 @@ fn run_case(
     }
     println!(
         "{}",
-        json!({"kind":"gdn_input_result","name":g.name,"comparison":comparison.name(),"product_equivalent":exact,
+        json!({"kind":"gdn_input_result","name":g.name,"comparison":comparison.name(),"product_equivalent":comparison.product_equivalence(exact),"a_b_bits_equal":exact,
         "scope":"synthetic complete input-projection diagnostic, not model quality or serving performance"})
     );
     exact
@@ -1125,5 +1249,49 @@ fn marlin_ct_gdn_input_projection_explicit_cublas_workspace_pairs() {
     assert!(
         small && real,
         "explicit cuBLAS workspace changed complete transaction bits"
+    );
+}
+
+#[test]
+#[ignore = "requires actual CUDA and diagnostic Marlin tile artifact; numerical variant, not product qualification"]
+fn marlin_ct_gdn_input_projection_explicit_tile_pairs() {
+    println!(
+        "{}",
+        json!({"kind":"gdn_input_tile_contract",
+        "comparison":Comparison::ExplicitMarlinTile.name(),
+        "A":"split QKV/Z with automatic Marlin tile",
+        "B":"same split QKV/Z with explicit K64/N128 diagnostic tile",
+        "expected_native_selection_B":"128 threads, two CTAs per SM; verify actual native artifact and launch resources separately",
+        "cublas":"independent handles, identical default workspace configuration",
+        "native":"F16/U4 asymmetric group32, full K, atomic=false, fp32_reduce=false; reserved and other ABI flags unchanged",
+        "numerical_scope":"tile/grid changes K partition and F16 partial reduction boundaries; A/B bit differences are reported, not an assertion failure",
+        "required_equalities":"each arm eager/graph and post-replay full intermediates/output; cross-arm normalized and dense b/a bits; all stitches and canaries",
+        "reference_scope":"each arm F64 reference at declared quantized/dense sample points; full normalized-input reference; not a whole-matrix F64 oracle",
+        "operator_sanity":"existing CT relative-L2 sanity only; not a new product quality tolerance",
+        "product_equivalent":null,"product_quality_status":"not assessed",
+        "pairs":PAIRS,"physical_sets_per_arm":PHYSICAL_SETS,"fresh_input_generations":2,
+        "cold_costs_separate":true,
+        "excluded":"Core dispatch, prepare/conv/recurrent/state, serving, checkpoint quality"})
+    );
+    let context = CudaContext::new(0).expect("Marlin explicit tile diagnostic requires CUDA");
+    let equal_bits = run_case(
+        &context,
+        Geometry {
+            name: "ct-m32-gdn-input",
+            rows: 32,
+            k: 5120,
+            qkv: 10240,
+            z: 6144,
+            ba: 48,
+        },
+        PHYSICAL_SETS,
+        true,
+        Comparison::ExplicitMarlinTile,
+    );
+    println!(
+        "{}",
+        json!({"kind":"gdn_input_tile_diagnostic_complete","a_b_bits_equal":equal_bits,
+        "product_equivalent":null,"product_quality_status":"not assessed",
+        "not_product_qualification":true})
     );
 }

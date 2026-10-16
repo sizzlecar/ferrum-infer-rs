@@ -384,6 +384,61 @@ pub unsafe fn launch_marlin_mm_f16_weight(request: MarlinMmF16WeightRequest) {
     ferrum_marlin_mm(&launch);
 }
 
+/// Explicit native experiment selection; this is not a product math profile.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MarlinDiagnosticTile {
+    K64N128,
+}
+
+#[cfg(test)]
+impl MarlinDiagnosticTile {
+    fn launch(self, request: MarlinMmF16WeightRequest) -> Result<FerrumMarlinLaunch, String> {
+        let p = request.problem;
+        let e = request.execution;
+        if request.weight_type != MarlinF16WeightType::U4
+            || p.m != 32
+            || p.k <= 0
+            || p.k % 64 != 0
+            || p.n <= 0
+            || p.n % 128 != 0
+            || p.lda != p.k
+            || p.group_size != 32
+            || p.num_groups != p.k / 32
+            || e.sms <= 0
+            || p.n / 128 > e.sms
+            || e.has_act_order
+            || !e.is_k_full
+            || e.use_atomic_add
+            || e.use_fp32_reduce
+            || request.buffers.zero_points.is_null()
+            || request.buffers.workspace.is_null()
+        {
+            return Err("diagnostic Marlin K64/N128 requires M32 U4/G32 full-K, integer zero points, N/128 <= SMs, and the original non-atomic F16 reduction".to_owned());
+        }
+        let mut launch = request.into_ffi();
+        launch.thread_k_init = 64;
+        launch.thread_n_init = 128;
+        Ok(launch)
+    }
+}
+
+/// Launch the explicit tile through the unchanged ABI and execution flags.
+///
+/// # Safety
+/// The pointer, stream, and allocation requirements of
+/// [`launch_marlin_mm_f16_weight`] still apply. The caller must reset the
+/// workspace and use the diagnostic native artifact supporting this tile.
+#[cfg(test)]
+pub(crate) unsafe fn launch_marlin_mm_f16_weight_with_diagnostic_tile(
+    request: MarlinMmF16WeightRequest,
+    tile: MarlinDiagnosticTile,
+) -> Result<(), String> {
+    let launch = tile.launch(request)?;
+    ferrum_marlin_mm(&launch);
+    Ok(())
+}
+
 /// Compatibility helper for the existing GPTQ U4B8 call sites.
 ///
 /// # Safety
@@ -857,6 +912,75 @@ mod tests {
         FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4, FERRUM_MARLIN_SCALAR_U4B8,
         FERRUM_MARLIN_USE_ATOMIC_ADD, FERRUM_MARLIN_USE_FP32_REDUCE,
     };
+
+    #[test]
+    fn diagnostic_tile_preserves_native_flags_and_rejects_unsupported_reductions() {
+        let request = MarlinMmF16WeightRequest {
+            weight_type: MarlinF16WeightType::U4,
+            buffers: MarlinMmBuffers {
+                a: 1_usize as *const _,
+                b: 2_usize as *const _,
+                c: 3_usize as *mut _,
+                c_tmp: std::ptr::null_mut(),
+                a_scales: std::ptr::null_mut(),
+                b_scales: 4_usize as *mut _,
+                zero_points: 5_usize as *mut _,
+                group_index: std::ptr::null_mut(),
+                permutation: std::ptr::null_mut(),
+                a_tmp: std::ptr::null_mut(),
+                workspace: 6_usize as *mut _,
+            },
+            problem: MarlinMmProblem {
+                m: 32,
+                n: 10240,
+                k: 5120,
+                lda: 5120,
+                num_groups: 160,
+                group_size: 32,
+            },
+            execution: MarlinMmExecution {
+                device: 0,
+                stream: 7_usize as _,
+                sms: 80,
+                has_act_order: false,
+                is_k_full: true,
+                use_atomic_add: false,
+                use_fp32_reduce: false,
+            },
+        };
+        let automatic = request.into_ffi();
+        let explicit = super::MarlinDiagnosticTile::K64N128
+            .launch(request)
+            .unwrap();
+        assert_eq!((automatic.thread_k_init, automatic.thread_n_init), (-1, -1));
+        assert_eq!((explicit.thread_k_init, explicit.thread_n_init), (64, 128));
+        assert_eq!(explicit.flags, automatic.flags);
+        assert_eq!(explicit.reserved, automatic.reserved);
+        assert_eq!(explicit.sms, automatic.sms);
+        assert_eq!(explicit.workspace, automatic.workspace);
+        assert_eq!(explicit.c_tmp, automatic.c_tmp);
+
+        let mut invalid = request;
+        invalid.execution.sms = 79;
+        assert!(super::MarlinDiagnosticTile::K64N128
+            .launch(invalid)
+            .is_err());
+        invalid = request;
+        invalid.execution.use_fp32_reduce = true;
+        assert!(super::MarlinDiagnosticTile::K64N128
+            .launch(invalid)
+            .is_err());
+        invalid = request;
+        invalid.problem.m = 3;
+        assert!(super::MarlinDiagnosticTile::K64N128
+            .launch(invalid)
+            .is_err());
+        invalid = request;
+        invalid.problem.num_groups -= 1;
+        assert!(super::MarlinDiagnosticTile::K64N128
+            .launch(invalid)
+            .is_err());
+    }
 
     #[test]
     fn marlin_launch_ffi_layout_and_weight_types_are_stable() {
