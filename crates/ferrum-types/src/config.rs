@@ -397,6 +397,7 @@ pub enum SequenceBackingGrowth {
     #[default]
     Exact,
     PagedGroup4,
+    PagedGroup4GrowOnly,
 }
 
 impl SequenceBackingGrowth {
@@ -404,6 +405,7 @@ impl SequenceBackingGrowth {
         match self {
             Self::Exact => "exact",
             Self::PagedGroup4 => "paged-group4",
+            Self::PagedGroup4GrowOnly => "paged-group4-grow-only",
         }
     }
 
@@ -411,7 +413,10 @@ impl SequenceBackingGrowth {
         match raw.trim().to_ascii_lowercase().as_str() {
             "exact" => Ok(Self::Exact),
             "paged-group4" => Ok(Self::PagedGroup4),
-            _ => Err(format!("expected exact or paged-group4; got {raw:?}")),
+            "paged-group4-grow-only" => Ok(Self::PagedGroup4GrowOnly),
+            _ => Err(format!(
+                "expected exact, paged-group4, or paged-group4-grow-only; got {raw:?}"
+            )),
         }
     }
 
@@ -3001,6 +3006,7 @@ mod tests {
             for mode in [
                 SequenceBackingGrowth::Exact,
                 SequenceBackingGrowth::PagedGroup4,
+                SequenceBackingGrowth::PagedGroup4GrowOnly,
             ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
                     key,
@@ -3010,11 +3016,19 @@ mod tests {
                 engine.apply_runtime_config_snapshot(&snapshot).unwrap();
                 assert_eq!(engine.runtime.sequence_backing_growth, mode);
                 assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+                assert_eq!(
+                    serde_json::from_value::<SequenceBackingGrowth>(
+                        serde_json::to_value(mode).unwrap()
+                    )
+                    .unwrap(),
+                    mode
+                );
             }
         }
         for (value, source) in [
             ("automatic", RuntimeConfigSource::Cli),
             ("paged-group4", RuntimeConfigSource::Env),
+            ("paged-group4-grow-only", RuntimeConfigSource::Env),
         ] {
             assert!(engine
                 .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([

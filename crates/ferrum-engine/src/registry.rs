@@ -1153,9 +1153,10 @@ fn validate_invocation_preparation_strategy(
             || config.engine_config.runtime.invocation_preparation_strategy
                 != ferrum_types::InvocationPreparationStrategy::ResidentDecodeProgram)
     {
-        return Err(FerrumError::unsupported(
-            "paged-group4 Sequence backing growth requires a CUDA plan runtime and resident-decode-program preparation",
-        ));
+        return Err(FerrumError::unsupported(format!(
+            "{} Sequence backing growth requires a CUDA plan runtime and resident-decode-program preparation",
+            config.engine_config.runtime.sequence_backing_growth.as_runtime_value(),
+        )));
     }
     if config
         .engine_config
@@ -2205,25 +2206,32 @@ mod tests {
 
     #[test]
     fn sequence_backing_growth_direct_factories_reject_unsupported_execution() {
-        let mut engine = EngineConfig::default();
-        engine.runtime.sequence_backing_growth = ferrum_types::SequenceBackingGrowth::PagedGroup4;
-        let mut config = ComponentConfig::from_engine_config(&engine);
-        config.device = Device::CPU;
-        let error = tokio_test::block_on(LlmExecutorFactory.create(&config))
-            .err()
-            .expect("direct CPU factory must reject optional CUDA resident growth before loading");
-        assert!(error.to_string().contains("paged-group4"));
+        for growth in [
+            ferrum_types::SequenceBackingGrowth::PagedGroup4,
+            ferrum_types::SequenceBackingGrowth::PagedGroup4GrowOnly,
+        ] {
+            let mut engine = EngineConfig::default();
+            engine.runtime.sequence_backing_growth = growth;
+            let mut config = ComponentConfig::from_engine_config(&engine);
+            config.device = Device::CPU;
+            let error = tokio_test::block_on(LlmExecutorFactory.create(&config))
+                .err()
+                .expect(
+                    "direct CPU factory must reject optional CUDA resident growth before loading",
+                );
+            assert!(error.to_string().contains(growth.as_runtime_value()));
 
-        config.device = Device::CUDA(0);
-        assert!(validate_invocation_preparation_strategy(&config, true).is_err());
-        config.engine_config.runtime.invocation_preparation_strategy =
-            ferrum_types::InvocationPreparationStrategy::ResidentDecodeProgram;
-        config.engine_config.runtime.segment_binding_owner_view_mode =
-            ferrum_types::SegmentBindingOwnerViewMode::Indexed;
-        config.engine_config.runtime.program_binding_upload_strategy =
-            ferrum_types::ProgramBindingUploadStrategy::CompactScatter;
-        validate_invocation_preparation_strategy(&config, true).unwrap();
-        assert!(validate_invocation_preparation_strategy(&config, false).is_err());
+            config.device = Device::CUDA(0);
+            assert!(validate_invocation_preparation_strategy(&config, true).is_err());
+            config.engine_config.runtime.invocation_preparation_strategy =
+                ferrum_types::InvocationPreparationStrategy::ResidentDecodeProgram;
+            config.engine_config.runtime.segment_binding_owner_view_mode =
+                ferrum_types::SegmentBindingOwnerViewMode::Indexed;
+            config.engine_config.runtime.program_binding_upload_strategy =
+                ferrum_types::ProgramBindingUploadStrategy::CompactScatter;
+            validate_invocation_preparation_strategy(&config, true).unwrap();
+            assert!(validate_invocation_preparation_strategy(&config, false).is_err());
+        }
     }
 
     #[test]

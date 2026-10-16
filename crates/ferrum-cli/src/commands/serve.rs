@@ -160,7 +160,8 @@ pub struct ServeCommand {
     /// Unified V2 includes short rows in eligible fixed batches; other geometries retain their existing path.
     #[arg(long, value_enum)]
     pub causal_decode_kv_reuse: Option<crate::commands::CausalDecodeKvReuseArg>,
-    /// Opportunistic paged Sequence backing growth (default: exact). Group4 requires a CUDA resident plan runtime.
+    /// Paged Sequence backing growth (default: exact). Grouped modes require a CUDA resident plan runtime.
+    /// Paged-group4 uses free backing; paged-group4-grow-only may also grow pools without reclaiming.
     #[arg(long, value_enum)]
     pub sequence_backing_growth: Option<crate::commands::SequenceBackingGrowthArg>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
@@ -4800,16 +4801,40 @@ mod tests {
     #[test]
     fn sequence_backing_growth_serve_preserves_config_and_cli_precedence() {
         use ferrum_types::{RuntimeConfigSource as Source, SequenceBackingGrowth as Mode};
-        for (cli, expected, source) in [
-            (None, Mode::PagedGroup4, Source::ConfigFile),
+        for (config, cli, expected, source) in [
             (
+                Mode::PagedGroup4,
+                None,
+                Mode::PagedGroup4,
+                Source::ConfigFile,
+            ),
+            (
+                Mode::PagedGroup4,
                 Some(crate::commands::SequenceBackingGrowthArg::Exact),
                 Mode::Exact,
                 Source::Cli,
             ),
+            (
+                Mode::PagedGroup4GrowOnly,
+                None,
+                Mode::PagedGroup4GrowOnly,
+                Source::ConfigFile,
+            ),
+            (
+                Mode::PagedGroup4GrowOnly,
+                Some(crate::commands::SequenceBackingGrowthArg::Exact),
+                Mode::Exact,
+                Source::Cli,
+            ),
+            (
+                Mode::PagedGroup4,
+                Some(crate::commands::SequenceBackingGrowthArg::PagedGroup4GrowOnly),
+                Mode::PagedGroup4GrowOnly,
+                Source::Cli,
+            ),
         ] {
             let entries = crate::config::RuntimeCliConfig {
-                sequence_backing_growth: Some(Mode::PagedGroup4),
+                sequence_backing_growth: Some(config),
                 ..Default::default()
             }
             .runtime_config_entries();
@@ -4823,6 +4848,10 @@ mod tests {
             let mut engine = ferrum_types::EngineConfig::default();
             engine.apply_runtime_config_snapshot(&snapshot).unwrap();
             assert_eq!(engine.runtime.sequence_backing_growth, expected);
+            assert_eq!(
+                serde_json::to_value(&engine.runtime).unwrap()["sequence_backing_growth"],
+                expected.as_runtime_value()
+            );
             assert_eq!(
                 snapshot
                     .entries

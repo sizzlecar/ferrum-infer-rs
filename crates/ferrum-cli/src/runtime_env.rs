@@ -332,22 +332,20 @@ mod tests {
     fn sequence_backing_growth_provenance_is_never_environment() {
         let key = ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
         let original = std::env::var_os(key);
-        for source in [
-            RuntimeConfigSource::Default,
-            RuntimeConfigSource::ConfigFile,
-            RuntimeConfigSource::Cli,
-        ] {
-            let current = snapshot(&[(key, "paged-group4", source)]);
-            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
-            assert!(materialize_runtime_env_effective(&current).is_empty());
-            assert_eq!(std::env::var_os(key), original);
+        for value in ["paged-group4", "paged-group4-grow-only"] {
+            for source in [
+                RuntimeConfigSource::Default,
+                RuntimeConfigSource::ConfigFile,
+                RuntimeConfigSource::Cli,
+            ] {
+                let current = snapshot(&[(key, value, source)]);
+                assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+                assert!(materialize_runtime_env_effective(&current).is_empty());
+                assert_eq!(std::env::var_os(key), original);
+            }
+            assert!(ferrum_types::EngineConfig::default()
+                .apply_runtime_config_snapshot(&snapshot(&[(key, value, RuntimeConfigSource::Env)]))
+                .is_err());
         }
-        assert!(ferrum_types::EngineConfig::default()
-            .apply_runtime_config_snapshot(&snapshot(&[(
-                key,
-                "paged-group4",
-                RuntimeConfigSource::Env
-            )]))
-            .is_err());
     }
 }

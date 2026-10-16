@@ -1066,9 +1066,37 @@ mod sequence_backing_growth_tests {
         assert_ne!(grouped.fingerprint_str(), exact.fingerprint_str());
         let grouped_wire = serde_json::to_value(&grouped).unwrap();
         assert_eq!(
+            grouped_wire["admission"]["sequence_backing_growth"],
+            serde_json::json!({ "paged-group": 4 })
+        );
+        assert_eq!(
             serde_json::from_value::<ResolvedRuntimePolicy>(grouped_wire).unwrap(),
             grouped
         );
+    }
+
+    #[test]
+    fn sequence_backing_growth_grow_only_identity_cannot_reuse_opportunistic_authority() {
+        let pages = std::num::NonZeroU32::new(4).unwrap();
+        let grouped = policy(SequenceBackingGrowthPolicy::PagedGroup(pages));
+        let grow_only = policy(SequenceBackingGrowthPolicy::PagedGroupGrowOnly(pages));
+        assert_ne!(grow_only.fingerprint_str(), grouped.fingerprint_str());
+        assert_ne!(
+            grow_only.fingerprint_str(),
+            policy(SequenceBackingGrowthPolicy::Exact).fingerprint_str()
+        );
+        let mut wire = serde_json::to_value(&grow_only).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ResolvedRuntimePolicy>(wire.clone()).unwrap(),
+            grow_only
+        );
+        wire["admission"]["sequence_backing_growth"] = serde_json::json!({ "paged-group": 4 });
+        assert!(serde_json::from_value::<ResolvedRuntimePolicy>(wire).is_err());
+
+        let mut wire = serde_json::to_value(&grouped).unwrap();
+        wire["admission"]["sequence_backing_growth"] =
+            serde_json::json!({ "paged-group-grow-only": 4 });
+        assert!(serde_json::from_value::<ResolvedRuntimePolicy>(wire).is_err());
     }
 }
 

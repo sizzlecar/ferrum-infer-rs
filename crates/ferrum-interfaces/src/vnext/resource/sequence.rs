@@ -1082,13 +1082,37 @@ where
         request: SequenceResourceExtensionRequest,
     ) -> Result<SequenceResourceExtensionDecision<R>, VNextError> {
         if request.growth_policy != SequenceBackingGrowthPolicy::Exact {
-            match self.try_ensure_backing_covers_once(&request, request.growth_policy)? {
+            let optional = self.try_ensure_backing_covers_once(&request, request.growth_policy)?;
+            let optional = match optional {
+                SequenceResourceExtensionDecision::BackingDeferred(deferred)
+                    if matches!(
+                        request.growth_policy,
+                        SequenceBackingGrowthPolicy::PagedGroupGrowOnly(_)
+                    ) =>
+                {
+                    // The deferral is a live, exact owner capability. Never
+                    // route optional surplus through ordinary maintenance,
+                    // which can reclaim idle lane slots or resident chunks.
+                    let retry_grouped = deferred.try_grow_paged_surplus()?;
+                    drop(deferred);
+                    if retry_grouped {
+                        self.try_ensure_backing_covers_once(&request, request.growth_policy)?
+                    } else {
+                        return self.try_ensure_backing_covers_once(
+                            &request,
+                            SequenceBackingGrowthPolicy::Exact,
+                        );
+                    }
+                }
+                decision => decision,
+            };
+            match optional {
                 SequenceResourceExtensionDecision::Deferred(_)
                 | SequenceResourceExtensionDecision::BackingDeferred(_)
                 | SequenceResourceExtensionDecision::PermanentRejected(_) => {
-                    // Surplus is opportunistic. Drop its uncommitted claims
-                    // before retrying required work, and never expose optional
-                    // pressure to a caller that could evict or grow a pool.
+                    // Drop all optional uncommitted claims before retrying
+                    // required work. Optional pressure never escapes to a
+                    // caller that could evict or wait for the surplus.
                 }
                 decision => return Ok(decision),
             }
@@ -1876,13 +1900,16 @@ where
 }
 
 /// Optional physical headroom, independent of actual token work. Surplus never
-/// causes maintenance or replaces the exact required-capacity fallback.
+/// replaces the exact required-capacity fallback or permits reclaiming owners.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SequenceBackingGrowthPolicy {
     #[default]
     Exact,
+    /// Reserve surplus only from capacity already available in the pool.
     PagedGroup(NonZeroU32),
+    /// Also permit one budgeted pool growth attempt for paged surplus.
+    PagedGroupGrowOnly(NonZeroU32),
 }
 
 impl SequenceBackingGrowthPolicy {
@@ -1917,6 +1944,14 @@ impl SequenceResourceExtensionRequest {
 
     pub fn with_paged_growth_group(mut self, pages: NonZeroU32) -> Self {
         self.growth_policy = SequenceBackingGrowthPolicy::PagedGroup(pages);
+        self
+    }
+
+    /// Allows one budgeted growth attempt for paged surplus, without reclaiming
+    /// another allocation, waiting, or changing the actual committed work.
+    /// Capacity denial falls back to the exact required extension.
+    pub fn with_paged_growth_group_grow_only(mut self, pages: NonZeroU32) -> Self {
+        self.growth_policy = SequenceBackingGrowthPolicy::PagedGroupGrowOnly(pages);
         self
     }
 }
@@ -1960,6 +1995,77 @@ where
 
     pub fn target_fingerprint(&self) -> &str {
         &self.target_fingerprint
+    }
+
+    pub(super) fn try_grow_paged_surplus(&self) -> Result<bool, VNextError> {
+        let resources = &self.session.resources.request.plan.resources;
+        let _lifecycle = resources.read_lifecycle("grow optional sequence page group")?;
+        self.session.ensure_open_identity()?;
+        if self
+            .session
+            .resources
+            .lock_backing_state()?
+            .current
+            .generation()
+            != self.expected_generation
+        {
+            return Ok(false);
+        }
+        let pools = &resources.dynamic_pools;
+        let evidence = self.backing.evidence();
+        let coordinator = pools.logical_admission.id();
+        if evidence.epochs().coordinator_id() != coordinator
+            || evidence.wait_condition().coordinator_id() != coordinator
+            || evidence.scope() != DynamicBackingClaimScope::Sequence
+            || evidence.blockers().is_empty()
+        {
+            return Err(invalid_resource(
+                "optional sequence growth deferral has another authority or no blocker",
+            ));
+        }
+        if pools.logical_admission.snapshot()?.poisoned() {
+            return Err(invalid_resource("logical admission is fail-closed"));
+        }
+        for blocker in evidence.blockers() {
+            let domain = pools
+                .domains
+                .iter()
+                .find(|domain| domain.pool_id() == blocker.pool_id())
+                .ok_or_else(|| invalid_resource("optional sequence growth has an unknown pool"))?;
+            if domain.domain_id != blocker.domain_id() {
+                return Err(invalid_resource(
+                    "optional sequence growth deferral has another capacity domain",
+                ));
+            }
+            if blocker.reason() != super::DynamicBackingDeferralReason::GrowthRequired
+                || blocker.contiguous_claim_bytes_descending().is_some()
+                || !matches!(
+                    domain.pool.compatibility().profile().view(),
+                    super::DynamicStorageView::PagedRegions { .. }
+                )
+            {
+                return Ok(false);
+            }
+        }
+        // This primitive revalidates free capacity under the pool maintenance
+        // locks and reserves the complete growth batch before publication. It
+        // performs no lane eviction or chunk rebalance. A later grouped retry
+        // revalidates the session and generation again before committing.
+        let mut capacity_blocked = None;
+        match pools.maintain_pools_observed(
+            evidence
+                .blockers()
+                .iter()
+                .cloned()
+                .map(super::DynamicPoolGrowthIntent::RevalidatedDeferral)
+                .collect(),
+            &mut capacity_blocked,
+        ) {
+            Ok(_) => Ok(true),
+            Err(VNextError::DeviceCapacityUnavailable(_))
+            | Err(VNextError::DynamicPoolResidentUnavailable(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
