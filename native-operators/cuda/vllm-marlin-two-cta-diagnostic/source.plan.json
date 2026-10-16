@@ -3,7 +3,7 @@
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package": {
     "kind": "ferrum-native-source-overlay",
-    "revision": "ferrum-vllm-marlin-two-cta-diagnostic-v1+sha256.4121dabdafd59e96032b763e97624f4b938307545bb575c863b264c7d9a65a12",
+    "revision": "ferrum-vllm-marlin-two-cta-diagnostic-v1+sha256.2d463d91e2e326262cc97480423d0c283617609394e6156e26c72edd3c4b4b60",
     "sha256": "204f5b85ace1acf90b1a1e8dea9aeeb573a3a65de73b2826701c18ad4cefadba"
   },
   "upstream_sources": [

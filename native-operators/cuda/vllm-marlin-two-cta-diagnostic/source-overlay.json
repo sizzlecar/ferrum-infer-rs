@@ -18,24 +18,12 @@
       "base_sha256": "c85a77adec392e4ece35dbef7f16f6a5ea66a29342371f5d448a56c4de4303bf"
     },
     {
-      "path": "vllm_marlin/kernel_selector.h",
-      "base_sha256": "130eac057e1f861ed87329f79be057978f403584e0961205dd41243b6485c48a"
-    },
-    {
       "path": "vllm_marlin/kernel.h",
       "base_sha256": "e751106b918252c9f191fd46f959164d4db0716e9374ef92bdc79c7b7d74ec1c"
     },
     {
-      "path": "vllm_marlin/marlin_dtypes.cuh",
-      "base_sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
-    },
-    {
-      "path": "vllm_marlin/marlin_mma.h",
-      "base_sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
-    },
-    {
-      "path": "vllm_marlin/marlin_template.h",
-      "base_sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
+      "path": "vllm_marlin/kernel_selector.h",
+      "base_sha256": "130eac057e1f861ed87329f79be057978f403584e0961205dd41243b6485c48a"
     },
     {
       "path": "vllm_marlin/marlin.cu",
@@ -48,6 +36,18 @@
     {
       "path": "vllm_marlin/marlin.cuh",
       "base_sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
+    },
+    {
+      "path": "vllm_marlin/marlin_dtypes.cuh",
+      "base_sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
+    },
+    {
+      "path": "vllm_marlin/marlin_mma.h",
+      "base_sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b"
+    },
+    {
+      "path": "vllm_marlin/marlin_template.h",
+      "base_sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
     },
     {
       "path": "vllm_marlin/scalar_type.hpp",

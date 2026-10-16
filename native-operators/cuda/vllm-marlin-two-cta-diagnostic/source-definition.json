@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package_kind": "ferrum-native-source-overlay",
-  "source_package_revision": "ferrum-vllm-marlin-two-cta-diagnostic-v1+sha256.4121dabdafd59e96032b763e97624f4b938307545bb575c863b264c7d9a65a12",
+  "source_package_revision": "ferrum-vllm-marlin-two-cta-diagnostic-v1+sha256.2d463d91e2e326262cc97480423d0c283617609394e6156e26c72edd3c4b4b60",
   "upstream_sources": [
     {
       "repository": "https://github.com/vllm-project/vllm.git",
