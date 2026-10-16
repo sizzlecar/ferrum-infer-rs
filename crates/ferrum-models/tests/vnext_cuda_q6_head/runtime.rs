@@ -64,6 +64,7 @@ impl Fixture {
                 maximum_queue_depth: participants,
                 maximum_scheduled_tokens: u64::from(participants) * MAX_TOKENS,
                 sequence_fit_policy: AdmissionFitPolicy::ImmediateOnly,
+                sequence_backing_growth: Default::default(),
                 allow_defer: true,
                 cancellation_check_interval_steps: 1,
             },

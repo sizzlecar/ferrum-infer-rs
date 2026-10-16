@@ -1232,6 +1232,16 @@ impl FerrumConfigBuilder {
             );
         }
         if self
+            .entry(crate::SEQUENCE_BACKING_GROWTH_CONFIG_KEY)
+            .is_none()
+        {
+            runtime_config.upsert(
+                crate::SEQUENCE_BACKING_GROWTH_CONFIG_KEY,
+                crate::SequenceBackingGrowth::default().as_runtime_value(),
+                RuntimeConfigSource::Default,
+            );
+        }
+        if self
             .entry(crate::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY)
             .is_none()
         {
@@ -1357,6 +1367,7 @@ impl FerrumConfigBuilder {
             plan_attention.as_ref().map(|(_, compiled)| compiled.value),
         )?);
         decisions.push(self.causal_decode_kv_reuse_decision()?);
+        decisions.push(self.sequence_backing_growth_decision()?);
         decisions.push(self.sampling_decision(greedy));
         decisions.push(self.q4_mmvq_weight_decode_decision()?);
         decisions.push(self.q5_mmvq_weight_decode_decision()?);
@@ -2951,6 +2962,56 @@ impl FerrumConfigBuilder {
             ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
+        ))
+    }
+
+    fn sequence_backing_growth_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
+        let invalid = |reason| AutoConfigError::InvalidOverride {
+            key: key.to_owned(),
+            reason,
+        };
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::SequenceBackingGrowth::parse_config_entry(entry).map_err(invalid)?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::SequenceBackingGrowth::Exact,
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode != crate::SequenceBackingGrowth::Exact {
+            let preparation = self
+                .entry("FERRUM_INVOCATION_PREPARATION_STRATEGY")
+                .map(|entry| {
+                    crate::InvocationPreparationStrategy::parse_runtime_value(
+                        &entry.effective_value,
+                    )
+                })
+                .transpose()
+                .map_err(invalid)?
+                .unwrap_or_default();
+            if !self.is_cuda_backend()
+                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || preparation != crate::InvocationPreparationStrategy::ResidentDecodeProgram
+            {
+                return Err(invalid("paged-group4 requires a CUDA plan runtime and resident-decode-program preparation".into()));
+            }
+        }
+        Ok(self.decision(
+            "sequence_backing_growth",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["exact", "paged-group4"],
+            Vec::new(),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Memory,
+            ],
         ))
     }
 
@@ -7738,6 +7799,64 @@ mod tests {
                 engine.runtime.q5_mmvq_weight_decode,
                 crate::Q5MmvqWeightDecode::Baseline
             );
+        }
+    }
+
+    #[test]
+    fn sequence_backing_growth_requires_explicit_cuda_resident_execution() {
+        let key = crate::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
+        for (backend, preparation, mode, supported) in [
+            ("cpu", "full", "exact", true),
+            ("cuda", "resident-decode-program", "paged-group4", true),
+            ("cuda", "full", "paged-group4", false),
+        ] {
+            let mut values = vec![
+                (key, mode, RuntimeConfigSource::Cli),
+                (
+                    "FERRUM_INVOCATION_PREPARATION_STRATEGY",
+                    preparation,
+                    RuntimeConfigSource::Cli,
+                ),
+            ];
+            if backend == "cuda" {
+                values.extend([
+                    (
+                        crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY,
+                        "indexed",
+                        RuntimeConfigSource::Cli,
+                    ),
+                    (
+                        "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
+                        "compact-scatter",
+                        RuntimeConfigSource::Cli,
+                    ),
+                ]);
+            }
+            let entries = snapshot_with_sources(&values);
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = backend.to_owned();
+            hardware.compiled_features.cuda = backend == "cuda";
+            let result = FerrumConfigBuilder::new(entries)
+                .with_hardware_capabilities(hardware)
+                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .resolve();
+            assert_eq!(result.is_ok(), supported, "{result:?}");
+            if let Ok(resolved) = result {
+                let entry = resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .find(|e| e.key == key)
+                    .unwrap();
+                assert_eq!(entry.effective_value, mode);
+                assert_eq!(entry.source, RuntimeConfigSource::Cli);
+                let decision = resolved
+                    .decisions
+                    .iter()
+                    .find(|d| d.selection == "sequence_backing_growth")
+                    .unwrap();
+                assert!(decision.affects.contains(&RuntimeConfigEffect::Memory));
+            }
         }
     }
 }

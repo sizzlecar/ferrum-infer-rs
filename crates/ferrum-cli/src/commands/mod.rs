@@ -162,6 +162,24 @@ pub enum SequenceFitPolicyArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SequenceBackingGrowthArg {
+    Exact,
+    #[value(name = "paged-group4")]
+    PagedGroup4,
+}
+
+impl SequenceBackingGrowthArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Exact => ferrum_types::SequenceBackingGrowth::Exact.as_runtime_value(),
+            Self::PagedGroup4 => {
+                ferrum_types::SequenceBackingGrowth::PagedGroup4.as_runtime_value()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Q4MmvqWeightDecodeArg {
     Baseline,
     SharedM8,
@@ -316,6 +334,13 @@ mod tests {
             match self.command {
                 TestCommand::Run(command) => command.causal_decode_kv_reuse,
                 TestCommand::Serve(command) => command.causal_decode_kv_reuse,
+            }
+        }
+
+        fn sequence_backing_growth(self) -> Option<SequenceBackingGrowthArg> {
+            match self.command {
+                TestCommand::Run(command) => command.sequence_backing_growth,
+                TestCommand::Serve(command) => command.sequence_backing_growth,
             }
         }
 
@@ -806,6 +831,41 @@ mod tests {
                 "test-model",
                 "--causal-decode-kv-reuse",
                 "automatic",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn sequence_backing_growth_cli_values_match_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .sequence_backing_growth(),
+                None
+            );
+            for (value, expected) in [
+                ("exact", SequenceBackingGrowthArg::Exact),
+                ("paged-group4", SequenceBackingGrowthArg::PagedGroup4),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--sequence-backing-growth",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.sequence_backing_growth(), Some(expected));
+                assert_eq!(expected.as_runtime_value(), value);
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--sequence-backing-growth",
+                "automatic"
             ])
             .is_err());
         }

@@ -1006,8 +1006,66 @@ pub struct AdmissionPolicy {
     pub maximum_queue_depth: u32,
     pub maximum_scheduled_tokens: u64,
     pub sequence_fit_policy: AdmissionFitPolicy,
+    #[serde(
+        default,
+        skip_serializing_if = "super::SequenceBackingGrowthPolicy::is_exact"
+    )]
+    pub sequence_backing_growth: super::SequenceBackingGrowthPolicy,
     pub allow_defer: bool,
     pub cancellation_check_interval_steps: u32,
+}
+
+#[cfg(test)]
+mod sequence_backing_growth_tests {
+    use super::*;
+    use crate::vnext::SequenceBackingGrowthPolicy;
+
+    fn policy(growth: SequenceBackingGrowthPolicy) -> ResolvedRuntimePolicy {
+        ResolvedRuntimePolicy::new(
+            "policy.sequence-growth",
+            ContractVersion::new(1, 0),
+            SchedulingDiscipline::FirstReady,
+            RuntimeMemoryPolicy {
+                capacity_bytes: 4096,
+                reserve_bytes: 256,
+                maximum_active_sequences: 1,
+                dynamic_storage_profile_order: vec![DynamicStorageProfile::contiguous()],
+                checkpoint_capacity: None,
+            },
+            AdmissionPolicy {
+                maximum_queue_depth: 1,
+                maximum_scheduled_tokens: 128,
+                sequence_fit_policy: AdmissionFitPolicy::ImmediateOnly,
+                sequence_backing_growth: growth,
+                allow_defer: true,
+                cancellation_check_interval_steps: 1,
+            },
+            AttentionExecutionPolicy::Portable,
+            ExecutionDeterminismRequirement::BitwiseSameRuntime,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sequence_backing_growth_policy_preserves_exact_wire_and_binds_group_identity() {
+        let exact = policy(SequenceBackingGrowthPolicy::Exact);
+        let exact_wire = serde_json::to_value(&exact).unwrap();
+        assert!(exact_wire["admission"]
+            .get("sequence_backing_growth")
+            .is_none());
+        let restored: ResolvedRuntimePolicy = serde_json::from_value(exact_wire).unwrap();
+        assert_eq!(restored, exact);
+        let grouped = policy(SequenceBackingGrowthPolicy::PagedGroup(
+            std::num::NonZeroU32::new(4).unwrap(),
+        ));
+        assert_ne!(grouped.fingerprint_str(), exact.fingerprint_str());
+        let grouped_wire = serde_json::to_value(&grouped).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ResolvedRuntimePolicy>(grouped_wire).unwrap(),
+            grouped
+        );
+    }
 }
 
 #[derive(Serialize)]

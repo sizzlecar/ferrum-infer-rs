@@ -84,6 +84,62 @@ fn owned_pages(backing: &SequenceBackingSnapshot<Runtime>, resource: &ResourceId
     bytes / 65_536
 }
 
+pub(super) fn has_spare_capacity(
+    fixture: &Fixture,
+    backing: &SequenceBackingSnapshot<Runtime>,
+    actual_tokens: usize,
+) -> bool {
+    assert_eq!(backing.committed_tokens(), actual_tokens as u64);
+    owned_pages(backing, &kv_resource(fixture)) > actual_tokens.div_ceil(16) as u64
+}
+
+pub(super) fn reserve_and_release_capacity(
+    fixture: &Fixture,
+    participants: usize,
+    capacity_tokens: usize,
+) {
+    // This is a real, temporary admission, not the frontier of a tested
+    // session. Optional headroom can consume existing free residency only.
+    let tokens: Arc<[u32]> = (0..capacity_tokens).map(|t| (t % 32) as u32).collect();
+    let temporary: Vec<_> = (0..participants)
+        .map(|participant| {
+            fixture.admit_with_ceiling(
+                &format!("headroom-capacity-reservation-{participant}"),
+                Arc::clone(&tokens),
+                capacity_tokens,
+            )
+        })
+        .collect();
+    for session in &temporary {
+        // No execution was submitted, so use the legal quiescent abort;
+        // completion would incorrectly claim a retired execution frame.
+        session.try_abort_if_quiescent().unwrap();
+    }
+    drop(temporary);
+
+    let resource = kv_resource(fixture);
+    let status = fixture.resources.dynamic_pool_status().unwrap();
+    let pool = status
+        .pools()
+        .iter()
+        .find(|pool| {
+            pool.contract()
+                .resources()
+                .iter()
+                .any(|entry| entry.resource_id() == &resource)
+        })
+        .unwrap();
+    let required_pages = participants as u64 * capacity_tokens.div_ceil(16) as u64;
+    assert!(pool.free_bytes() >= required_pages * 65_536);
+    println!(
+        "{}",
+        serde_json::json!({"kind":"resident_headroom_capacity_setup",
+            "participants":participants,"temporary_actual_tokens":capacity_tokens,
+            "required_free_pages":required_pages,"resident_bytes":pool.resident_bytes(),
+            "free_bytes":pool.free_bytes(),"temporary_sessions_aborted_before_execution":true})
+    );
+}
+
 fn check_preserved_bytes(previous: &[u8], current: &[u8], position: usize) {
     assert!(current.len() >= previous.len());
     // Paged F16 K and V layouts from the real causal state: [2, 8, 128]
@@ -138,6 +194,7 @@ fn resident_decode_program_causal_four_page_headroom_matches_exact_through_exhau
             .unwrap();
         assert_eq!(state.tensor.dimensions, [2, 8, 128]);
         assert_eq!(state.tensor.byte_len().unwrap(), 4096);
+        reserve_and_release_capacity(fixture, 2, 128);
     }
     let sessions = fixtures.each_ref().map(|fixture| {
         tokens

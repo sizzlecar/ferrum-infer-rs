@@ -42,6 +42,7 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
+            || entry.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
@@ -63,6 +64,7 @@ pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Ve
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
+            || entry.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY
             || entry.key == ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY
             || entry.key == ferrum_types::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY
@@ -323,6 +325,29 @@ mod tests {
         let environment = snapshot(&[(key, "paired-query-heads", RuntimeConfigSource::Env)]);
         assert!(ferrum_types::EngineConfig::default()
             .apply_runtime_config_snapshot(&environment)
+            .is_err());
+    }
+
+    #[test]
+    fn sequence_backing_growth_provenance_is_never_environment() {
+        let key = ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
+        let original = std::env::var_os(key);
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+        ] {
+            let current = snapshot(&[(key, "paged-group4", source)]);
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            assert_eq!(std::env::var_os(key), original);
+        }
+        assert!(ferrum_types::EngineConfig::default()
+            .apply_runtime_config_snapshot(&snapshot(&[(
+                key,
+                "paged-group4",
+                RuntimeConfigSource::Env
+            )]))
             .is_err());
     }
 }

@@ -156,6 +156,9 @@ pub struct ServeCommand {
     /// Unified V2 includes short rows in eligible fixed batches; other geometries retain their existing path.
     #[arg(long, value_enum)]
     pub causal_decode_kv_reuse: Option<crate::commands::CausalDecodeKvReuseArg>,
+    /// Opportunistic paged Sequence backing growth (default: exact). Group4 requires a CUDA resident plan runtime.
+    #[arg(long, value_enum)]
+    pub sequence_backing_growth: Option<crate::commands::SequenceBackingGrowthArg>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
     #[arg(long, value_enum)]
     pub q4_mmvq_weight_decode: Option<crate::commands::Q4MmvqWeightDecodeArg>,
@@ -457,6 +460,7 @@ async fn execute_with_compatibility(
         causal_decode_preparation_mode,
         causal_decode_attention_grouping,
         causal_decode_kv_reuse,
+        sequence_backing_growth,
         q4_mmvq_weight_decode,
         q5_mmvq_weight_decode,
         q8_projection_weight_preparation,
@@ -935,6 +939,10 @@ async fn execute_with_compatibility(
         causal_decode_attention_grouping,
     );
     push_causal_decode_kv_reuse_cli_entry(&mut startup_cli_runtime_entries, causal_decode_kv_reuse);
+    push_sequence_backing_growth_cli_entry(
+        &mut startup_cli_runtime_entries,
+        sequence_backing_growth,
+    );
     push_q4_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q4_mmvq_weight_decode);
     push_q5_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q5_mmvq_weight_decode);
     push_q8_projection_weight_preparation_cli_entry(
@@ -1977,6 +1985,17 @@ fn push_sequence_fit_policy_cli_entry(
         entries,
         "FERRUM_SEQUENCE_FIT_POLICY",
         policy.map(crate::commands::SequenceFitPolicyArg::as_runtime_value),
+    );
+}
+
+fn push_sequence_backing_growth_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    policy: Option<crate::commands::SequenceBackingGrowthArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY,
+        policy.map(crate::commands::SequenceBackingGrowthArg::as_runtime_value),
     );
 }
 
@@ -4701,6 +4720,44 @@ mod tests {
                     .iter()
                     .find(|entry| entry.key == KEY)
                     .map(|entry| entry.source),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_backing_growth_serve_preserves_config_and_cli_precedence() {
+        use ferrum_types::{RuntimeConfigSource as Source, SequenceBackingGrowth as Mode};
+        for (cli, expected, source) in [
+            (None, Mode::PagedGroup4, Source::ConfigFile),
+            (
+                Some(crate::commands::SequenceBackingGrowthArg::Exact),
+                Mode::Exact,
+                Source::Cli,
+            ),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                sequence_backing_growth: Some(Mode::PagedGroup4),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_sequence_backing_growth_cli_entry(&mut cli_entries, cli);
+            let snapshot = merge_runtime_config_sources(
+                entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.sequence_backing_growth, expected);
+            assert_eq!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|e| e.key == ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY)
+                    .unwrap()
+                    .source,
                 source
             );
         }

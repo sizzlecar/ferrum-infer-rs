@@ -361,6 +361,45 @@ impl Q8ProjectionWeightPreparation {
 /// Configuration provenance key; this policy is selected through CLI or config.
 pub const CAUSAL_DECODE_KV_REUSE_CONFIG_KEY: &str = "FERRUM_CAUSAL_DECODE_KV_REUSE";
 
+/// Provenance key for the explicit CLI/config Sequence reservation policy.
+pub const SEQUENCE_BACKING_GROWTH_CONFIG_KEY: &str = "FERRUM_SEQUENCE_BACKING_GROWTH";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SequenceBackingGrowth {
+    #[default]
+    Exact,
+    PagedGroup4,
+}
+
+impl SequenceBackingGrowth {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::PagedGroup4 => "paged-group4",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "exact" => Ok(Self::Exact),
+            "paged-group4" => Ok(Self::PagedGroup4),
+            _ => Err(format!("expected exact or paged-group4; got {raw:?}")),
+        }
+    }
+
+    pub(crate) fn parse_config_entry(
+        entry: &crate::RuntimeConfigEntry,
+    ) -> std::result::Result<Self, String> {
+        if entry.source == crate::RuntimeConfigSource::Env {
+            return Err(
+                "select Sequence backing growth through CLI or config, not environment".into(),
+            );
+        }
+        Self::parse_runtime_value(&entry.effective_value)
+    }
+}
+
 /// Reuse KV loads across query heads without changing each head's arithmetic.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -671,6 +710,9 @@ pub struct RuntimeKnobs {
     /// Eligible fixed-capacity CUDA V2 attention may share KV loads across two heads.
     #[serde(default)]
     pub causal_decode_kv_reuse: CausalDecodeKvReuse,
+    /// Opportunistic paged Sequence capacity reservation; Exact is default.
+    #[serde(default)]
+    pub sequence_backing_growth: SequenceBackingGrowth,
     /// Shared weight decoding affects only eligible Q4_K MarkerV2 MMVQ M8 leaves.
     #[serde(default)]
     pub q4_mmvq_weight_decode: Q4MmvqWeightDecode,
@@ -876,6 +918,14 @@ impl EngineConfig {
         {
             self.runtime.causal_decode_kv_reuse = CausalDecodeKvReuse::parse_config_entry(entry)
                 .map_err(|reason| format!("{CAUSAL_DECODE_KV_REUSE_CONFIG_KEY}: {reason}"))?;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == SEQUENCE_BACKING_GROWTH_CONFIG_KEY)
+        {
+            self.runtime.sequence_backing_growth = SequenceBackingGrowth::parse_config_entry(entry)
+                .map_err(|reason| format!("{SEQUENCE_BACKING_GROWTH_CONFIG_KEY}: {reason}"))?;
         }
         if let Some(entry) = snapshot
             .entries
@@ -2850,6 +2900,52 @@ mod tests {
             assert!(engine
                 .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
                     RuntimeConfigEntry::new(key, value, source),
+                ]))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn sequence_backing_growth_preserves_defaults_and_explicit_sources() {
+        use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+        let key = SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
+        let mut engine = EngineConfig::default();
+        assert_eq!(
+            engine.runtime.sequence_backing_growth,
+            SequenceBackingGrowth::Exact
+        );
+        let mut old = serde_json::to_value(&engine.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("sequence_backing_growth");
+        assert_eq!(
+            serde_json::from_value::<RuntimeKnobs>(old)
+                .unwrap()
+                .sequence_backing_growth,
+            SequenceBackingGrowth::Exact
+        );
+        for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
+            for mode in [
+                SequenceBackingGrowth::Exact,
+                SequenceBackingGrowth::PagedGroup4,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    key,
+                    mode.as_runtime_value(),
+                    source,
+                )]);
+                engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+                assert_eq!(engine.runtime.sequence_backing_growth, mode);
+                assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_runtime_value());
+            }
+        }
+        for (value, source) in [
+            ("automatic", RuntimeConfigSource::Cli),
+            ("paged-group4", RuntimeConfigSource::Env),
+        ] {
+            assert!(engine
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, value, source)
                 ]))
                 .is_err());
         }

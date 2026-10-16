@@ -1145,6 +1145,17 @@ fn validate_invocation_preparation_strategy(
     config: &ComponentConfig,
     plan_runtime: bool,
 ) -> Result<()> {
+    if config.engine_config.runtime.sequence_backing_growth
+        != ferrum_types::SequenceBackingGrowth::Exact
+        && (!matches!(config.device, Device::CUDA(_))
+            || !plan_runtime
+            || config.engine_config.runtime.invocation_preparation_strategy
+                != ferrum_types::InvocationPreparationStrategy::ResidentDecodeProgram)
+    {
+        return Err(FerrumError::unsupported(
+            "paged-group4 Sequence backing growth requires a CUDA plan runtime and resident-decode-program preparation",
+        ));
+    }
     if config
         .engine_config
         .runtime
@@ -2175,6 +2186,29 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     mod mixed_batch_tests;
+
+    #[test]
+    fn sequence_backing_growth_direct_factories_reject_unsupported_execution() {
+        let mut engine = EngineConfig::default();
+        engine.runtime.sequence_backing_growth = ferrum_types::SequenceBackingGrowth::PagedGroup4;
+        let mut config = ComponentConfig::from_engine_config(&engine);
+        config.device = Device::CPU;
+        let error = tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .expect("direct CPU factory must reject optional CUDA resident growth before loading");
+        assert!(error.to_string().contains("paged-group4"));
+
+        config.device = Device::CUDA(0);
+        assert!(validate_invocation_preparation_strategy(&config, true).is_err());
+        config.engine_config.runtime.invocation_preparation_strategy =
+            ferrum_types::InvocationPreparationStrategy::ResidentDecodeProgram;
+        config.engine_config.runtime.segment_binding_owner_view_mode =
+            ferrum_types::SegmentBindingOwnerViewMode::Indexed;
+        config.engine_config.runtime.program_binding_upload_strategy =
+            ferrum_types::ProgramBindingUploadStrategy::CompactScatter;
+        validate_invocation_preparation_strategy(&config, true).unwrap();
+        assert!(validate_invocation_preparation_strategy(&config, false).is_err());
+    }
 
     #[test]
     fn invocation_preparation_decode_segment_requires_cuda_plan_runtime() {

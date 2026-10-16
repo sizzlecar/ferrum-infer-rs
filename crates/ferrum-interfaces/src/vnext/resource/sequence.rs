@@ -1877,11 +1877,18 @@ where
 
 /// Optional physical headroom, independent of actual token work. Surplus never
 /// causes maintenance or replaces the exact required-capacity fallback.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SequenceBackingGrowthPolicy {
     #[default]
     Exact,
     PagedGroup(NonZeroU32),
+}
+
+impl SequenceBackingGrowthPolicy {
+    pub const fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

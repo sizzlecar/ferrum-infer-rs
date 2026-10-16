@@ -809,6 +809,11 @@ fn compare_native_partition_boundary_with_headroom(boundary: usize, grouped: boo
     let tokens: Vec<Arc<[u32]>> = vec![(0..boundary + 8)
         .map(|t| ((t * 7 + 1) % 32) as u32)
         .collect()];
+    if grouped {
+        for fixture in &fixtures {
+            headroom::reserve_and_release_capacity(fixture, 1, boundary + 32);
+        }
+    }
     let sessions = fixtures.each_ref().map(|fixture| {
         vec![fixture.admit_with_ceiling(
             "resident-native-partition",
@@ -817,6 +822,7 @@ fn compare_native_partition_boundary_with_headroom(boundary: usize, grouped: boo
         )]
     });
     let sinks = [Preparation::default(), Preparation::default()];
+    let mut grouped_spare_observed = false;
     let prefix_end = boundary - 8;
     // Use genuine executed prefixes, in chunks that fit this fixture's four
     // token reusable bucket. The final four ordinary decode waves establish
@@ -832,7 +838,14 @@ fn compare_native_partition_boundary_with_headroom(boundary: usize, grouped: boo
             .enumerate()
             .map(|(arm, (fixture, group))| {
                 if grouped && arm == 1 {
-                    headroom::extend(fixture, &group[0], Arc::from(&tokens[0][..range.end]), true);
+                    let backing = headroom::extend(
+                        fixture,
+                        &group[0],
+                        Arc::from(&tokens[0][..range.end]),
+                        true,
+                    );
+                    grouped_spare_observed |=
+                        headroom::has_spare_capacity(fixture, &backing, range.end);
                 } else {
                     fixture.extend(&group[0], Arc::from(&tokens[0][..range.end]));
                 }
@@ -851,6 +864,10 @@ fn compare_native_partition_boundary_with_headroom(boundary: usize, grouped: boo
             .collect::<Vec<_>>();
         observations[0].assert_same(&observations[1]);
     }
+    assert!(
+        !grouped || grouped_spare_observed,
+        "grouped native-boundary fixture must own capacity beyond its actual prefix"
+    );
 
     let mut resident = Resident::default();
     let mut hot_before = 0;
