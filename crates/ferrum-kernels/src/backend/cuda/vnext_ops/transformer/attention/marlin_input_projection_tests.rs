@@ -718,10 +718,10 @@ fn oracle(
     }
     json!({"full_projection_oracle":full,"quant_f64_points":points.len(),
         "quant_reference_relative_l2":relative_l2,"quant_reference_max_absolute":quant_max,
-        "quant_reference_parts":[0,1].map(|part| json!({
+        "quant_reference_parts":([0,1].map(|part| json!({
             "name":if part==0 {"qkv"} else {"z"},"points":part_error[part].0,
             "relative_l2":(part_error[part].2/part_error[part].1.max(f64::MIN_POSITIVE)).sqrt(),
-            "max_absolute":part_error[part].3})),
+            "max_absolute":part_error[part].3}))),
         "dense_f64_points":2*dense_points.len(),"dense_reference_max_absolute":dense_max,
         "norm_full_f64_max_absolute":norm_max,"norm_reference_scope":"observational; unchanged production RMSNorm, independently matched between arms",
         "oracle_input":"each arm actual half-rounded normalized input",
