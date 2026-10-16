@@ -9,6 +9,8 @@ use crate::marlin_repack::{
 use cudarc::driver::CudaContext;
 use half::f16;
 
+mod packed_gate_up;
+
 #[test]
 #[ignore = "requires an actual CUDA device and the Marlin operator artifact"]
 fn marlin_runtime_resets_reused_workspace_and_preserves_matrix_guards_on_cuda() {
