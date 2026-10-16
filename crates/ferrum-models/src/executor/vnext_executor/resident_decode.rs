@@ -152,15 +152,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         batch: &ExecutionBatchParticipants<R>,
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
-        greedy: bool,
     ) -> Result<Option<PreparedVNextPrefill<R>>> {
         if self.invocation_preparation_strategy
             != InvocationPreparationStrategy::ResidentDecodeProgram
         {
             return Ok(None);
         }
+        // Both product outputs belong to the same complete plan. Full-logits
+        // consumption uses the ordinary terminal readback through the fresh
+        // resident lease; it does not invalidate the captured computation.
         if kind != VNextExecutionWaveKind::Decode
-            || !greedy
             || self.checkpoint_capture.is_some()
             || self.checkpoint_token_evidence_enabled()
             || !self

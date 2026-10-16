@@ -7995,7 +7995,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &batch,
                 std::slice::from_ref(&span),
                 VNextExecutionWaveKind::Decode,
-                matches!(logits_policy, LogitsReturnPolicy::GreedyArgmax { .. }),
             )? {
                 prepared
             } else {
@@ -8070,17 +8069,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            if let Some(prepared) = self.try_prepare_resident_decode(
-                batch,
-                spans,
-                kind,
-                output_roles.iter().all(|role| {
-                    matches!(
-                        role.logits_policy(),
-                        Some(LogitsReturnPolicy::GreedyArgmax { .. })
-                    )
-                }),
-            )? {
+            if let Some(prepared) = self.try_prepare_resident_decode(batch, spans, kind)? {
                 prepared
             } else {
                 let step =
@@ -12124,6 +12113,67 @@ mod tests {
         assert!(neutral.token_ids.is_empty());
         assert_eq!(neutral.penalty, 1.0);
         assert!(!neutral.is_active());
+    }
+
+    #[test]
+    fn product_policy_round_trip_restores_masks_and_repetition_in_same_slot() {
+        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
+        let greedy = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: Some(TokenSelectionMask::new(vec![1, 0, 1])),
+            repetition_penalty: Some(GreedyRepetitionPenalty::new(1.25, vec![0, 2])),
+        };
+        let other = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: Some(TokenSelectionMask::new(vec![0, 1, 1])),
+            repetition_penalty: Some(GreedyRepetitionPenalty::new(1.5, vec![1])),
+        };
+        let full = LogitsReturnPolicy::FullLogits;
+
+        // Exercise the same physical slot, including a prior cache hit. One
+        // participant's full-logits policy neutralizes the whole wave, so the
+        // following greedy wave must restore both masks and penalty inputs.
+        for (policies, expected_mode, upload_required) in [
+            ([&greedy, &other], VNextProductOutputMode::GreedyToken, true),
+            (
+                [&greedy, &other],
+                VNextProductOutputMode::GreedyToken,
+                false,
+            ),
+            ([&greedy, &full], VNextProductOutputMode::FullLogits, true),
+            ([&greedy, &other], VNextProductOutputMode::GreedyToken, true),
+        ] {
+            let roles = policies.map(|policy| VNextParticipantOutputRole::Decode(policy.clone()));
+            let mode = product_output_mode_for_roles(VNextExecutionWaveKind::Decode, &roles);
+            assert_eq!(mode, expected_mode);
+            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(7),
+                policies
+                    .map(|policy| VNextProductTokenMaskContent::from_policy(Some(policy), mode, 5)),
+            );
+            assert_eq!(transaction.plans().len(), 2);
+            for (index, plan) in transaction.plans().iter().enumerate() {
+                assert_eq!(plan.upload_required, upload_required);
+                let repetition = product_repetition_input(Some(policies[index]), mode);
+                if mode == VNextProductOutputMode::FullLogits {
+                    assert_eq!(plan.content.normalized(), [1, 1, 1, 1, 1]);
+                    assert!(repetition.token_ids.is_empty());
+                    assert_eq!(repetition.penalty, 1.0);
+                    assert!(!repetition.is_active());
+                } else {
+                    let (mask, tokens, penalty): ([u8; 5], &[u32], f32) = match index {
+                        0 => ([1, 0, 1, 0, 0], &[0, 2], 1.25),
+                        1 => ([0, 1, 1, 0, 0], &[1], 1.5),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(plan.content.normalized(), mask);
+                    assert_eq!(repetition.token_ids, tokens);
+                    assert_eq!(repetition.penalty, penalty);
+                    assert!(repetition.is_active());
+                }
+            }
+            transaction.publish();
+            transaction.settle_success();
+        }
     }
 
     #[test]
