@@ -250,6 +250,69 @@ impl FixedBatchDecode {
             VnextAddressedPagedAttentionKernel,
         ) -> Result<(), CudaDeviceRuntimeError>,
     {
+        self.enqueue_with_gathered_attention(
+            stream,
+            functions,
+            launches,
+            binding,
+            binding_layout,
+            shape,
+            layout,
+            scratch,
+            query_norm,
+            key_norm,
+            output_gate,
+            |lengths, v1_rows, v2_rows| {
+                let mut gather =
+                    stream.launch_builder(&functions.gather_decode_lengths_fixed_capacity);
+                gather
+                    .arg(&binding)
+                    .arg(&binding_layout.slot_bytes)
+                    .arg(&lengths)
+                    .arg(&v1_rows)
+                    .arg(&v2_rows)
+                    .arg(&self.participants);
+                unsafe { gather.launch(LaunchConfig::for_num_elems(self.participants as u32)) }
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("causal fixed-capacity decode gather", error)
+                    })?;
+                for (group, rows, expected) in
+                    std::iter::once((&self.v1, v1_rows, VnextAddressedPagedAttentionKernel::V1))
+                        .chain(
+                            self.v2.as_ref().map(|group| {
+                                (group, v2_rows, VnextAddressedPagedAttentionKernel::V2)
+                            }),
+                        )
+                {
+                    attention(*group, lengths, rows, expected)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    // Shared preparation/gate sequence. Production supplies the unchanged
+    // adaptive gather and launches above; diagnostics may replace that entire
+    // middle transaction, including its device-side fresh-map construction.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_with_gathered_attention<F>(
+        &self,
+        stream: &CudaStream,
+        functions: &CausalAttentionFunctions,
+        launches: &[CausalAttentionLaunch],
+        binding: u64,
+        _binding_layout: BindingLayout,
+        shape: CudaCausalAttentionShape,
+        layout: ScratchLayout,
+        scratch: u64,
+        query_norm: u64,
+        key_norm: u64,
+        output_gate: bool,
+        mut gathered_attention: F,
+    ) -> Result<(), CudaDeviceRuntimeError>
+    where
+        F: FnMut(u64, u64, u64) -> Result<(), CudaDeviceRuntimeError>,
+    {
         if launches.len() != self.participants as usize {
             return Err(CudaDeviceRuntimeError::contract(
                 "fixed causal participant count changed",
@@ -299,26 +362,7 @@ impl FixedBatchDecode {
         let lengths = scratch_pointer(scratch, partition.sequence_lengths)?;
         let v1_rows = scratch_pointer(scratch, partition.row_indices)?;
         let v2_rows = scratch_pointer(v1_rows, self.participants as u64 * 4)?;
-        let mut gather = stream.launch_builder(&functions.gather_decode_lengths_fixed_capacity);
-        gather
-            .arg(&binding)
-            .arg(&binding_layout.slot_bytes)
-            .arg(&lengths)
-            .arg(&v1_rows)
-            .arg(&v2_rows)
-            .arg(&self.participants);
-        unsafe { gather.launch(LaunchConfig::for_num_elems(self.participants as u32)) }.map_err(
-            |error| CudaDeviceRuntimeError::driver("causal fixed-capacity decode gather", error),
-        )?;
-        for (group, rows, expected) in
-            std::iter::once((&self.v1, v1_rows, VnextAddressedPagedAttentionKernel::V1)).chain(
-                self.v2
-                    .as_ref()
-                    .map(|group| (group, v2_rows, VnextAddressedPagedAttentionKernel::V2)),
-            )
-        {
-            attention(*group, lengths, rows, expected)?;
-        }
+        gathered_attention(lengths, v1_rows, v2_rows)?;
         if output_gate {
             if let Some(tokens) = self.packed_work.and_then(PackedDecodeWork::gate_tokens) {
                 launch_attention_gate(
