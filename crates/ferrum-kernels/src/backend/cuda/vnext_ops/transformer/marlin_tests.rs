@@ -9,6 +9,9 @@ use crate::marlin_repack::{
 use cudarc::driver::CudaContext;
 use half::f16;
 
+#[path = "../native_blocks/tests/captured.rs"]
+mod captured;
+
 #[test]
 #[ignore = "requires an actual CUDA device and the Marlin operator artifact"]
 fn marlin_runtime_resets_reused_workspace_and_preserves_matrix_guards_on_cuda() {
@@ -108,5 +111,212 @@ fn marlin_runtime_resets_reused_workspace_and_preserves_matrix_guards_on_cuda() 
         w.assert_unchanged(&stream);
         s.assert_unchanged(&stream);
         z.assert_unchanged(&stream);
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device and the Marlin operator artifact"]
+fn marlin_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on_cuda() {
+    use crate::marlin_repack::fixtures::Fixture;
+    use std::sync::Arc;
+
+    struct Matrix {
+        shape: Fixture,
+        input: Guarded<f16>,
+        weight: Guarded<i32>,
+        scales: Guarded<f16>,
+        zeros: Guarded<i32>,
+        output: Guarded<f16>,
+    }
+
+    impl Matrix {
+        fn new(stream: &Arc<CudaStream>, shape: Fixture) -> Self {
+            let host = build_host_fixture(shape);
+            let k = shape.input_features;
+            let n = shape.output_features;
+            Self {
+                shape,
+                input: Guarded::new(stream, &host.input, f16::from_f32(-117.0)),
+                weight: Guarded::new(
+                    stream,
+                    &repack_gptq_to_marlin(&host.qweight_gptq, k, n),
+                    0x5a5a1234,
+                ),
+                scales: Guarded::new(
+                    stream,
+                    &repack_scales_to_marlin(&host.scales_grouped, k, n, GROUP_SIZE),
+                    f16::from_f32(-117.0),
+                ),
+                zeros: Guarded::new(
+                    stream,
+                    &repack_compressed_tensors_zero_points_to_marlin(
+                        &host.zero_points_compressed_tensors,
+                        k / GROUP_SIZE,
+                        n,
+                    ),
+                    0x5a5a1234,
+                ),
+                output: Guarded::new(
+                    stream,
+                    &vec![f16::NAN; shape.rows * n],
+                    f16::from_f32(-117.0),
+                ),
+            }
+        }
+
+        fn enqueue(
+            &self,
+            workspace: &MarlinInvocationWorkspace<'_>,
+            stream: &Arc<CudaStream>,
+            weight_type: MarlinF16WeightType,
+        ) {
+            workspace
+                .launch(
+                    weight_type,
+                    self.input.pointer(stream),
+                    self.weight.pointer(stream),
+                    self.scales.pointer(stream),
+                    if weight_type == MarlinF16WeightType::U4 {
+                        Some(self.zeros.pointer(stream))
+                    } else {
+                        None
+                    },
+                    self.output.pointer(stream),
+                    self.shape.rows as i32,
+                    self.shape.output_features as i32,
+                    self.shape.input_features as i32,
+                    GROUP_SIZE as i32,
+                    "Marlin invocation workspace conformance",
+                )
+                .unwrap();
+        }
+
+        fn bits(&self, stream: &Arc<CudaStream>) -> Vec<u16> {
+            self.input.assert_unchanged(stream);
+            self.weight.assert_unchanged(stream);
+            self.scales.assert_unchanged(stream);
+            self.zeros.assert_unchanged(stream);
+            self.output
+                .read(stream)
+                .into_iter()
+                .map(|value| {
+                    assert!(value.is_finite());
+                    value.to_bits()
+                })
+                .collect()
+        }
+    }
+
+    let context = CudaContext::new(0).expect("Marlin workspace conformance requires CUDA");
+    let stream = context.new_stream().unwrap();
+    let runtime = MarlinProjectionRuntime {
+        multiprocessor_count: context
+            .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .unwrap(),
+        device_ordinal: 0,
+    };
+    let bytes = runtime.workspace_bytes().unwrap();
+    // Different M/N/K shapes exercise untouched locks and split-K reductions.
+    let matrices = FIXTURES
+        .into_iter()
+        .chain([
+            Fixture {
+                name: "decode-split-k",
+                rows: 32,
+                input_features: 4096,
+                output_features: 256,
+            },
+            Fixture {
+                name: "prefill-m-split",
+                rows: 65,
+                input_features: 512,
+                output_features: 128,
+            },
+        ])
+        .map(|shape| Matrix::new(&stream, shape))
+        .collect::<Vec<_>>();
+    let dirty = |workspace: &Guarded<i32>| {
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                workspace.pointer(&stream),
+                73,
+                bytes as usize,
+                stream.cu_stream(),
+            )
+        }
+        .unwrap();
+    };
+    let check = |workspace: &Guarded<i32>, expected: &[Vec<u16>]| {
+        assert!(workspace.read(&stream).iter().all(|lock| *lock == 0));
+        for (matrix, bits) in matrices.iter().zip(expected) {
+            assert_eq!(matrix.bits(&stream), *bits, "{}", matrix.shape.name);
+        }
+    };
+
+    for weight_type in [MarlinF16WeightType::U4, MarlinF16WeightType::U4B8] {
+        let baseline = Guarded::new(&stream, &vec![73_i32; bytes as usize / 4], -117);
+        let expected = matrices
+            .iter()
+            .map(|matrix| {
+                dirty(&baseline);
+                // Keep the original public wrapper as the exact-bit oracle.
+                runtime
+                    .launch(
+                        weight_type,
+                        &stream,
+                        matrix.input.pointer(&stream),
+                        matrix.weight.pointer(&stream),
+                        matrix.scales.pointer(&stream),
+                        if weight_type == MarlinF16WeightType::U4 {
+                            Some(matrix.zeros.pointer(&stream))
+                        } else {
+                            None
+                        },
+                        matrix.output.pointer(&stream),
+                        baseline.pointer(&stream),
+                        bytes,
+                        matrix.shape.rows as i32,
+                        matrix.shape.output_features as i32,
+                        matrix.shape.input_features as i32,
+                        GROUP_SIZE as i32,
+                        "Marlin original per-projection reset oracle",
+                    )
+                    .unwrap();
+                assert!(baseline.read(&stream).iter().all(|lock| *lock == 0));
+                matrix.bits(&stream)
+            })
+            .collect::<Vec<_>>();
+
+        // A new allocation and a newly captured graph must never inherit the
+        // previous invocation's host-side initialized flag or scratch contents.
+        for _fresh_allocation in 0..2 {
+            let workspace = Guarded::new(&stream, &vec![73_i32; bytes as usize / 4], -117);
+            let enqueue = || {
+                let scope = MarlinInvocationWorkspace {
+                    runtime,
+                    stream: &stream,
+                    pointer: workspace.pointer(&stream),
+                    length_bytes: bytes,
+                    initialized: std::cell::Cell::new(false),
+                    _region: None,
+                };
+                for matrix in &matrices {
+                    matrix.enqueue(&scope, &stream, weight_type);
+                }
+            };
+            for _invocation in 0..2 {
+                dirty(&workspace);
+                enqueue();
+                check(&workspace, &expected);
+            }
+            let graph = captured::Captured::new(&stream, enqueue);
+            for _replay in 0..3 {
+                // This write is outside the graph. Every replay must execute
+                // the first captured reset before consuming the dirty locks.
+                dirty(&workspace);
+                graph.launch();
+                check(&workspace, &expected);
+            }
+        }
     }
 }
