@@ -138,6 +138,7 @@ impl CausalDecodeAttentionGroupingArg {
 pub enum CausalDecodeKvReuseArg {
     None,
     PairedQueryHeads,
+    PairedQueryHeadsUnifiedV2,
 }
 
 impl CausalDecodeKvReuseArg {
@@ -146,6 +147,9 @@ impl CausalDecodeKvReuseArg {
             Self::None => ferrum_types::CausalDecodeKvReuse::None.as_runtime_value(),
             Self::PairedQueryHeads => {
                 ferrum_types::CausalDecodeKvReuse::PairedQueryHeads.as_runtime_value()
+            }
+            Self::PairedQueryHeadsUnifiedV2 => {
+                ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2.as_runtime_value()
             }
         }
     }
@@ -779,6 +783,10 @@ mod tests {
                 (
                     "paired-query-heads",
                     CausalDecodeKvReuseArg::PairedQueryHeads,
+                ),
+                (
+                    "paired-query-heads-unified-v2",
+                    CausalDecodeKvReuseArg::PairedQueryHeadsUnifiedV2,
                 ),
             ] {
                 let parsed = TestCli::try_parse_from([

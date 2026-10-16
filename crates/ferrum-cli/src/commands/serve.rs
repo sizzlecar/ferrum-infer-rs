@@ -152,7 +152,8 @@ pub struct ServeCommand {
     /// Fixed-execution-capacity also uses the declared --max-model-len bound.
     #[arg(long, value_enum)]
     pub causal_decode_attention_grouping: Option<crate::commands::CausalDecodeAttentionGroupingArg>,
-    /// Causal decode K/V load reuse (default: none). Paired query heads requires native CUDA GQA2 support.
+    /// Causal decode K/V load reuse (default: none). Paired modes require native CUDA GQA2 support.
+    /// Unified V2 includes short rows in eligible fixed batches; other geometries retain their existing path.
     #[arg(long, value_enum)]
     pub causal_decode_kv_reuse: Option<crate::commands::CausalDecodeKvReuseArg>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
@@ -4645,6 +4646,30 @@ mod tests {
                 Some(Mode::None),
                 Some(Arg::PairedQueryHeads),
                 Mode::PairedQueryHeads,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::PairedQueryHeadsUnifiedV2),
+                None,
+                Mode::PairedQueryHeadsUnifiedV2,
+                Some(RuntimeConfigSource::ConfigFile),
+            ),
+            (
+                Some(Mode::PairedQueryHeads),
+                Some(Arg::PairedQueryHeadsUnifiedV2),
+                Mode::PairedQueryHeadsUnifiedV2,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::PairedQueryHeadsUnifiedV2),
+                Some(Arg::PairedQueryHeads),
+                Mode::PairedQueryHeads,
+                Some(RuntimeConfigSource::Cli),
+            ),
+            (
+                Some(Mode::PairedQueryHeadsUnifiedV2),
+                Some(Arg::None),
+                Mode::None,
                 Some(RuntimeConfigSource::Cli),
             ),
         ] {

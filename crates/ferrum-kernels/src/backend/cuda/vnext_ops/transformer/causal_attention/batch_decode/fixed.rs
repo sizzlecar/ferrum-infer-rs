@@ -1,6 +1,6 @@
 //! Fixed-capacity Indexed replay. Each original row has one slot in
-//! both maps; fresh device lengths choose exactly one of its existing V1/V2
-//! algorithms. No CPU row permutation or sequence frontier enters the closure.
+//! both maps; fresh device lengths choose the configured adaptive V1/V2 or
+//! unified paired V2 path. No CPU row permutation or frontier enters the closure.
 use super::*;
 use crate::backend::cuda::vllm_paged_attn::dispatch_vnext_addressed_paged_attention_fixed_masked_batch_raw;
 
@@ -11,6 +11,7 @@ pub(super) struct FixedBatchDecode {
     v1: BatchGeometry,
     v2: Option<BatchGeometry>,
     paired_query_heads: bool,
+    unified_v2: bool,
 }
 
 impl FixedBatchDecode {
@@ -35,7 +36,13 @@ impl FixedBatchDecode {
                 launches.len() as u64
             }
             + 1
-            + if self.v2.is_some() { 3 } else { 1 }
+            + if self.unified_v2 {
+                2
+            } else if self.v2.is_some() {
+                3
+            } else {
+                1
+            }
             + if !output_gate {
                 0
             } else if self
@@ -105,6 +112,7 @@ impl FixedBatchDecode {
         };
         Ok(Some(Self {
             paired_query_heads: false,
+            unified_v2: false,
             participants: validated.participants,
             packed_work: validated.packed_work,
             v1: dimensions(VLLM_PARTITION_TOKENS.min(shape.maximum_context_tokens))?,
@@ -119,6 +127,11 @@ impl FixedBatchDecode {
         self.paired_query_heads
     }
 
+    #[cfg(test)]
+    pub(super) fn uses_unified_v2(&self) -> bool {
+        self.unified_v2
+    }
+
     pub(super) fn with_kv_reuse(
         mut self,
         mode: ferrum_types::CausalDecodeKvReuse,
@@ -126,6 +139,8 @@ impl FixedBatchDecode {
         shape: CausalAttentionShape,
     ) -> Self {
         self.paired_query_heads = paired_query_heads_eligible(mode, grouping, shape);
+        self.unified_v2 = self.paired_query_heads
+            && mode == ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2;
         self
     }
 
@@ -137,7 +152,8 @@ impl FixedBatchDecode {
             .bytes(b"ferrum.cuda.causal-fixed-capacity.v1")
             .i32(self.participants)
             .boolean(self.v2.is_some())
-            .boolean(self.paired_query_heads);
+            .boolean(self.paired_query_heads)
+            .boolean(self.unified_v2);
         for group in std::iter::once(&self.v1).chain(self.v2.iter()) {
             key = key
                 .i32(group.sequences)
@@ -162,6 +178,42 @@ impl FixedBatchDecode {
         key_norm: u64,
         output_gate: bool,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        #[cfg(feature = "cuda-causal-gqa2")]
+        if self.unified_v2 {
+            let group = self.v2.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("unified causal V2 capacity absent")
+            })?;
+            let partition = layout.vllm.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("unified causal V2 scratch absent")
+            })?;
+            return self.enqueue_with_gathered_attention(
+                stream, functions, launches, binding, binding_layout, shape, layout,
+                scratch, query_norm, key_norm, output_gate,
+                |lengths, rows, unused_rows| {
+                    let mut gather = stream.launch_builder(&functions.gather_decode_lengths_unified_v2);
+                    gather.arg(&binding).arg(&binding_layout.slot_bytes).arg(&lengths)
+                        .arg(&rows).arg(&unused_rows).arg(&self.participants);
+                    unsafe { gather.launch(LaunchConfig::for_num_elems(self.participants as u32)) }
+                        .map_err(|e| CudaDeviceRuntimeError::driver("causal unified V2 decode gather", e))?;
+                    // The fresh gather supplies i for every positive length,
+                    // including short rows, and -1 for inactive slots. Current
+                    // bindings retain the admitted pages and capacity scratch.
+                    unsafe {
+                        crate::backend::cuda::vllm_paged_attn::dispatch_vnext_addressed_paged_attention_gqa2_unified_batch_raw(
+                            stream, scratch_pointer(scratch, layout.context)?,
+                            scratch_pointer(scratch, layout.query)?,
+                            scratch_pointer(binding, BINDING_CONTROL_BYTES)?,
+                            lengths, rows, group.maximum_sequence,
+                            Some(scratch_pointer(scratch, partition.exp_sums)?),
+                            Some(scratch_pointer(scratch, partition.max_logits)?),
+                            Some(scratch_pointer(scratch, partition.temporary_output)?),
+                            group.sequences, self.participants, shape.query_heads,
+                            shape.key_value_heads, shape.head_dim, group.table_stride,
+                        )
+                    }.map(|_| ()).map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))
+                },
+            );
+        }
         self.enqueue_with_attention(
             stream,
             functions,
@@ -291,9 +343,8 @@ impl FixedBatchDecode {
         )
     }
 
-    // Shared preparation/gate sequence. Production supplies the unchanged
-    // adaptive gather and launches above; diagnostics may replace that entire
-    // middle transaction, including its device-side fresh-map construction.
+    // Shared preparation/gate sequence for the adaptive and unified product
+    // paths, including each path's device-side fresh-map construction.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_with_gathered_attention<F>(
         &self,
@@ -397,7 +448,11 @@ pub(super) fn paired_query_heads_eligible(
     shape: CausalAttentionShape,
 ) -> bool {
     cfg!(feature = "cuda-causal-gqa2")
-        && mode == ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
+        && matches!(
+            mode,
+            ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
+                | ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
+        )
         && grouping == CausalDecodeAttentionGrouping::FixedExecutionCapacity
         && !shape.int8_kv
         && shape.head_dim == 256

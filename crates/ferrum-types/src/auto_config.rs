@@ -2972,7 +2972,7 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if mode == crate::CausalDecodeKvReuse::PairedQueryHeads {
+        if mode != crate::CausalDecodeKvReuse::None {
             let grouping = self
                 .entry(crate::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY)
                 .map(crate::CausalDecodeAttentionGrouping::parse_config_entry)
@@ -2992,7 +2992,11 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["none", "paired-query-heads"],
+            [
+                "none",
+                "paired-query-heads",
+                "paired-query-heads-unified-v2",
+            ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -6368,6 +6372,19 @@ mod tests {
             ),
             ("paired-query-heads", true, "indexed", false),
             ("paired-query-heads", true, "fixed-execution-capacity", true),
+            (
+                "paired-query-heads-unified-v2",
+                false,
+                "fixed-execution-capacity",
+                false,
+            ),
+            ("paired-query-heads-unified-v2", true, "indexed", false),
+            (
+                "paired-query-heads-unified-v2",
+                true,
+                "fixed-execution-capacity",
+                true,
+            ),
         ] {
             let entries = snapshot_with_sources(&[
                 (key, mode, RuntimeConfigSource::Cli),

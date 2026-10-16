@@ -1,9 +1,8 @@
-//! Diagnostic only: current adaptive V1/production GQA2 versus the same
-//! production GQA2 ABI for every positive row. No provider/default route changes.
+//! Complete backend comparison of the two explicit production KV-reuse modes.
+//! Synthetic values and reconstructed logical lengths are not serving evidence.
 use super::*;
-use cudarc::nvrtc::Ptx;
 use serde_json::json;
-use std::{ffi::c_void, time::Instant};
+use std::time::Instant;
 
 // Reconstructed logical order of current-workload cohort 914 (27 short/5 long).
 // The original CUDA row permutation is unavailable; Q/K/V values are synthetic.
@@ -12,39 +11,10 @@ const COHORT_LENGTHS: [u64; 32] = [
     96, 325, 98, 89, 89, 166, 74, 61, 76, 81, 59, 35, 21,
 ];
 
-// This is the existing production archive, not the separate GQA2 test archive.
-// Calling the fixed_masked Rust wrapper for short V2 rows would violate that
-// wrapper's stronger adaptive-path safety contract, so this fixture establishes
-// the native ABI's positive-length/map/bounds contract explicitly instead.
-unsafe extern "C" {
-    fn ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_gqa2_indexed_v1(
-        out: *mut c_void,
-        exp_sums: *mut f32,
-        max_logits: *mut f32,
-        tmp_out: *mut c_void,
-        query: *const c_void,
-        num_kv_heads: i32,
-        scale: f32,
-        block_addresses: *const u64,
-        seq_lens: *const i32,
-        row_map: *const i32,
-        num_seqs: i32,
-        original_num_seqs: i32,
-        num_heads: i32,
-        max_num_blocks_per_seq: i32,
-        q_stride: i32,
-        kv_block_stride: i32,
-        kv_head_stride: i32,
-        max_seq_len: i32,
-        stream: *mut c_void,
-    ) -> i32;
-}
-
 struct Execution<'a> {
     stream: Arc<CudaStream>,
     functions: &'a CausalAttentionFunctions,
-    unified_gather: CudaFunction,
-    batch: FixedBatchDecode,
+    batches: [FixedBatchDecode; 2],
     launches: Vec<CausalAttentionLaunch>,
     shape: CausalAttentionShape,
     binding: BindingLayout,
@@ -53,93 +23,21 @@ struct Execution<'a> {
 
 impl Execution<'_> {
     fn enqueue(&self, layer: &Layer, arm: usize) {
-        let s = self.shape.cuda_shape().unwrap();
-        let binding = layer.arms[arm].binding_pointer(&self.stream);
-        let scratch = layer.arms[arm].scratch_pointer(&self.stream);
-        let query_norm = layer.query_norm.pointer(&self.stream);
-        let key_norm = layer.key_norm.pointer(&self.stream);
-        if arm == 0 {
-            assert!(self.batch.uses_paired_query_heads());
-            self.batch
-                .enqueue(
-                    &self.stream,
-                    self.functions,
-                    &self.launches,
-                    binding,
-                    self.binding,
-                    s,
-                    self.layout,
-                    scratch,
-                    query_norm,
-                    key_norm,
-                    true,
-                )
-                .unwrap();
-            return;
-        }
-        let p = self.layout.vllm.unwrap();
-        let rows = self.launches.len() as i32;
-        let geometry =
-            BatchDecode::dimensions(self.launches.len(), self.binding, 2048, 24, 256).unwrap();
-        self.batch
-            .enqueue_with_gathered_attention(
+        assert!(self.batches[arm].uses_paired_query_heads());
+        assert_eq!(self.batches[arm].uses_unified_v2(), arm == 1);
+        self.batches[arm]
+            .enqueue(
                 &self.stream,
                 self.functions,
                 &self.launches,
-                binding,
+                layer.arms[arm].binding_pointer(&self.stream),
                 self.binding,
-                s,
+                self.shape.cuda_shape().unwrap(),
                 self.layout,
-                scratch,
-                query_norm,
-                key_norm,
+                layer.arms[arm].scratch_pointer(&self.stream),
+                layer.query_norm.pointer(&self.stream),
+                layer.key_norm.pointer(&self.stream),
                 true,
-                |lengths, row_map, unused_map| {
-                    let mut gather = self.stream.launch_builder(&self.unified_gather);
-                    gather
-                        .arg(&binding)
-                        .arg(&self.binding.slot_bytes)
-                        .arg(&lengths)
-                        .arg(&row_map)
-                        .arg(&unused_map)
-                        .arg(&rows);
-                    unsafe { gather.launch(LaunchConfig::for_num_elems(rows as u32)) }.map_err(
-                        |e| CudaDeviceRuntimeError::driver("test unified fresh gather", e),
-                    )?;
-                    // Host fixture proves every positive length <=2048 and retains
-                    // the complete addressed pages and M*24*4 partition scratch.
-                    // Same-stream gather writes i or -1 for EVERY row on each replay.
-                    // Zero rows are -1 before native main/reduce inspect any page.
-                    let status = unsafe {
-                        ferrum_vnext_vllm_paged_attention_v2_f16_h256_b16_gqa2_indexed_v1(
-                            scratch_pointer(scratch, self.layout.context)? as *mut c_void,
-                            scratch_pointer(scratch, p.exp_sums)? as *mut f32,
-                            scratch_pointer(scratch, p.max_logits)? as *mut f32,
-                            scratch_pointer(scratch, p.temporary_output)? as *mut c_void,
-                            scratch_pointer(scratch, self.layout.query)? as *const c_void,
-                            4,
-                            0.0625,
-                            scratch_pointer(binding, BINDING_CONTROL_BYTES)? as *const u64,
-                            lengths as *const i32,
-                            row_map as *const i32,
-                            rows,
-                            rows,
-                            24,
-                            geometry.table_stride,
-                            24 * 256,
-                            4 * 256 * 16,
-                            256 * 16,
-                            2048,
-                            self.stream.cu_stream() as *mut c_void,
-                        )
-                    };
-                    if status != 0 {
-                        return Err(CudaDeviceRuntimeError::contract(format!(
-                            "test unified production GQA2 launch returned {status}"
-                        )));
-                    }
-                    Ok(())
-                },
             )
             .unwrap();
     }
@@ -389,6 +287,13 @@ fn attention_shape() -> CausalAttentionShape {
 #[test]
 #[ignore = "requires CUDA and production GQA2; complete adaptive/unified V2 diagnostic"]
 fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
+    complete_case(&COHORT_LENGTHS, true);
+    // Deterministic stratified subset, not a measured physical-M8 cohort.
+    complete_case(&[59, 81, 98, 168, 252, 325, 497, 593], false);
+}
+
+fn complete_case(initial_lengths: &[u64], measure: bool) {
+    let participants = initial_lengths.len();
     let cold_start = Instant::now();
     let runtime = CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(
@@ -403,21 +308,17 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
         CudaCausalPagedAttentionProvider::new(&runtime, AttentionExecutionPolicy::NativeAdaptive)
             .unwrap();
     let stream = runtime.context().new_stream().unwrap();
-    let module = runtime
-        .context()
-        .load_module(Ptx::from_src(crate::ptx::VNEXT_CAUSAL_ATTENTION))
-        .unwrap();
     let shape = attention_shape();
-    let binding = BindingLayout::new(shape, 32).unwrap();
+    let binding = BindingLayout::new(shape, participants).unwrap();
     let layout = ScratchLayout::for_participants(
         shape,
-        32,
-        32,
+        participants as u64,
+        participants,
         CausalProjection::F16,
         AttentionExecutionPolicy::NativeAdaptive,
     )
     .unwrap();
-    let capacity_lengths = vec![2048; 32];
+    let capacity_lengths = vec![2048; participants];
     let launches = build_launches(shape, binding, layout, &capacity_lengths);
     let batch = FixedBatchDecode::for_launches(&launches, true, binding, shape, layout, true, true)
         .unwrap()
@@ -432,39 +333,50 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
         "A must use current production paired-query V2"
     );
     assert!(batch.packed_work().unwrap().prepare().is_some());
-    assert_eq!(batch.packed_work().unwrap().gate_tokens(), Some(32));
+    assert_eq!(
+        batch.packed_work().unwrap().gate_tokens(),
+        Some(participants as u64)
+    );
+    let candidate = batch.clone().with_kv_reuse(
+        ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2,
+        CausalDecodeAttentionGrouping::FixedExecutionCapacity,
+        shape,
+    );
+    assert!(candidate.uses_unified_v2());
+    assert!(!batch.uses_unified_v2());
+    assert_eq!(
+        batch.dispatch_count(&launches, true, false),
+        candidate.dispatch_count(&launches, true, false) + 1
+    );
     let exec = Execution {
         stream,
         functions: &provider.functions,
-        unified_gather: module
-            .load_function("vnext_causal_gather_decode_lengths_unified_v2_test")
-            .unwrap(),
-        batch,
+        batches: [batch, candidate],
         launches,
         shape,
         binding,
         layout,
     };
-    let requests = (0..32).collect::<Vec<_>>();
+    let requests = (0..participants).collect::<Vec<_>>();
     let mut correctness = vec![layer(
         &exec.stream,
         shape,
         binding,
         layout,
-        &COHORT_LENGTHS,
+        initial_lengths,
         0,
     )];
     let graphs = [exec.capture(&correctness, 0), exec.capture(&correctness, 1)];
     println!(
         "{}",
-        json!({"diagnostic":"unified_v2_complete", "record":"setup", "M":32,
+        json!({"diagnostic":"unified_v2_complete", "record":"setup", "M":participants,
         "query_heads":24,"kv_heads":4,"head_dim":256,"capacity":2048,"block_tokens":16,
         "rope_dim":64,"rope_frequency_denominator":64,"rope_pair_offset":32,
         "rope_interleaved":false,"rope_theta":10000000,"epsilon":1e-6,
-        "actual_derived_logical_lengths":COHORT_LENGTHS,"physical_row_order_reconstructed":true,
+        "logical_lengths":initial_lengths, "length_source":if measure { "actual-derived M32 cohort914" } else { "synthetic stratified M8 subset" },"physical_row_order_reconstructed":true,
         "qkv_values":"synthetic", "A":"adaptive V1 + production paired-query V2 + reduce",
         "B":"fresh unified map + single production paired-query V2 + reduce",
-        "includes_prepare_gather_attention_reduce_gate":true, "product_dispatch_changed":false,
+        "includes_prepare_gather_attention_reduce_gate":true, "production_modes_exercised":true,
         "cold_setup_ns":cold_start.elapsed().as_nanos().to_string()})
     );
     for generation in 0..4 {
@@ -474,7 +386,7 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
         }
         if generation == 3 {
             for arm in &mut correctness[0].arms {
-                for row in 0..32 {
+                for row in 0..participants {
                     let mut request = RequestPages {
                         pages: Vec::new(),
                         previous: Vec::new(),
@@ -483,19 +395,19 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
                     request.grow_to(&exec.stream, shape, 1);
                     arm.requests.push(request);
                 }
-                arm.share_allocation_with_disjoint_first_pages(&exec.stream, 32);
+                arm.share_allocation_with_disjoint_first_pages(&exec.stream, participants);
             }
-            current_requests = (0..32).map(|r| 32 + (r ^ 1)).collect();
+            current_requests = (0..participants).map(|r| participants + (r ^ 1)).collect();
         }
         let lengths = match generation {
-            0 => COHORT_LENGTHS.to_vec(),
-            1 => (0..32)
+            0 => initial_lengths.to_vec(),
+            1 => (0..participants)
                 .map(|r| [0, 1, 16, 511, 512, 513, 1024, 1025][r % 8])
                 .collect(),
-            2 => (0..32)
+            2 => (0..participants)
                 .map(|r| [513, 0, 17, 512, 513, 512, 1025, 2048][r % 8])
                 .collect(),
-            _ => COHORT_LENGTHS.to_vec(),
+            _ => initial_lengths.to_vec(),
         };
         let inputs = exec.refill(
             &mut correctness,
@@ -540,18 +452,27 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
     }
     drop(graphs);
     drop(correctness);
+    if !measure {
+        println!(
+            "{}",
+            json!({"diagnostic":"unified_v2_complete","record":"complete","M":participants,
+            "all_output_state_input_guards":true,"timed":false,
+            "scope":"production backend correctness, not model/serving qualification"})
+        );
+        return;
+    }
 
     let cold_start = Instant::now();
     let mut layers = (0..16)
-        .map(|i| layer(&exec.stream, shape, binding, layout, &COHORT_LENGTHS, i))
+        .map(|i| layer(&exec.stream, shape, binding, layout, initial_lengths, i))
         .collect::<Vec<_>>();
-    let inputs = exec.refill(&mut layers, &COHORT_LENGTHS, &requests, 61);
+    let inputs = exec.refill(&mut layers, initial_lengths, &requests, 61);
     let graphs = [exec.capture(&layers, 0), exec.capture(&layers, 1)];
     println!(
         "{}",
         json!({"diagnostic":"unified_v2_complete","record":"timing_setup",
         "layers":16,"cold_setup_capture_ns":cold_start.elapsed().as_nanos().to_string(),
-        "lengths":COHORT_LENGTHS,"excludes_binding_upload_capture_readback":true,
+        "lengths":initial_lengths,"excludes_binding_upload_capture_readback":true,
         "includes_prepare_fresh_map_attention_reduce_gate":true,"warm_replays_per_arm":8})
     );
     for graph in &graphs {
@@ -561,8 +482,8 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
     }
     exec.stream.synchronize().unwrap();
     for (layer, input) in layers.iter_mut().zip(&inputs) {
-        exec.check_scratch(layer, &COHORT_LENGTHS, input);
-        exec.check_pages(layer, &requests, &COHORT_LENGTHS, true);
+        exec.check_scratch(layer, initial_lengths, input);
+        exec.check_pages(layer, &requests, initial_lengths, true);
     }
     for quad in 0..8 {
         let order = if quad % 2 == 0 {
@@ -588,16 +509,16 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
                 "{}",
                 json!({"diagnostic":"unified_v2_complete","record":"timing",
                 "quad":quad,"position":position,"arm":arm,"order":order,
-                "M":32,"layers":16,"gpu_ms":gpu_ms,"submit_wait_ns":wall_ns.to_string()})
+                "M":participants,"layers":16,"gpu_ms":gpu_ms,"submit_wait_ns":wall_ns.to_string()})
             );
         }
     }
     for (layer, input) in layers.iter_mut().zip(&inputs) {
-        exec.check_scratch(layer, &COHORT_LENGTHS, input);
-        exec.check_pages(layer, &requests, &COHORT_LENGTHS, false);
+        exec.check_scratch(layer, initial_lengths, input);
+        exec.check_pages(layer, &requests, initial_lengths, false);
         for arm in &layer.arms {
             let expected =
-                arm.binding_words(&exec.stream, shape, binding, &requests, &COHORT_LENGTHS);
+                arm.binding_words(&exec.stream, shape, binding, &requests, initial_lengths);
             assert_eq!(
                 exec.stream.clone_dtoh(&arm.binding).unwrap(),
                 expected,
@@ -609,6 +530,6 @@ fn unified_v2_complete_m32_bits_freshness_and_paired_on_cuda() {
     println!(
         "{}",
         json!({"diagnostic":"unified_v2_complete","record":"complete",
-        "all_output_state_input_guards":true,"scope":"raw backend mechanism, not model/serving qualification"})
+        "all_output_state_input_guards":true,"scope":"production backend mechanism, not model/serving qualification"})
     );
 }

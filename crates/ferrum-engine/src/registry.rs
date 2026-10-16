@@ -1223,7 +1223,7 @@ fn validate_causal_decode_preparation_mode(
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
     validate_q8_projection_weight_preparation(config, plan_runtime)?;
     if config.engine_config.runtime.causal_decode_kv_reuse
-        == ferrum_types::CausalDecodeKvReuse::PairedQueryHeads
+        != ferrum_types::CausalDecodeKvReuse::None
         && (!cfg!(feature = "cuda-causal-gqa2")
             || config
                 .engine_config
@@ -3476,22 +3476,28 @@ mod tests {
 
     #[test]
     fn causal_decode_kv_reuse_rejects_direct_config_without_fixed_native_execution() {
-        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
-        config.engine_config.runtime.causal_decode_kv_reuse =
-            ferrum_types::CausalDecodeKvReuse::PairedQueryHeads;
-        for device in [Device::CPU, Device::CUDA(0)] {
-            config.device = device;
-            for plan_runtime in [false, true] {
-                assert!(validate_causal_decode_preparation_mode(&config, plan_runtime).is_err());
+        for mode in [
+            ferrum_types::CausalDecodeKvReuse::PairedQueryHeads,
+            ferrum_types::CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2,
+        ] {
+            let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+            config.engine_config.runtime.causal_decode_kv_reuse = mode;
+            for device in [Device::CPU, Device::CUDA(0)] {
+                config.device = device;
+                for plan_runtime in [false, true] {
+                    assert!(
+                        validate_causal_decode_preparation_mode(&config, plan_runtime).is_err()
+                    );
+                }
             }
+            config
+                .engine_config
+                .runtime
+                .causal_decode_attention_grouping =
+                ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity;
+            // Fixed grouping alone must not bypass the required packed preparation.
+            assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
         }
-        config
-            .engine_config
-            .runtime
-            .causal_decode_attention_grouping =
-            ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity;
-        // Fixed grouping alone must not bypass the required packed preparation.
-        assert!(validate_causal_decode_preparation_mode(&config, true).is_err());
     }
 
     #[test]

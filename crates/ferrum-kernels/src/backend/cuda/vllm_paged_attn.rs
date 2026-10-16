@@ -677,7 +677,69 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_gqa2_fixed_masked_
     }
 }
 
-// Both closed callers establish their own device-map contract. This common
+/// Unified fixed-capacity paired-query V2, including positive rows <=512.
+///
+/// # Safety
+/// Every entry i of the map must be i for a current positive length or -1 for
+/// an inactive row. A same-stream fresh gather must overwrite all lengths and
+/// map entries before every replay. Positive lengths must not exceed the
+/// declared sequence_length capacity, which must be in 513..=2048. The caller
+/// owns and retains every addressed KV range, query/output row and the complete
+/// M*heads*ceil(capacity/512) scratch through terminal completion. Query/KV are
+/// F16/H256/B16 with even GQA. In particular a zero length must NOT have an
+/// identity map: the native reducer's zero-partition case is not a no-op.
+/// Unlike the adaptive wrapper, this contract deliberately permits short V2
+/// rows; their single partition is copied by the unchanged native reducer.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda-causal-gqa2")]
+pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_gqa2_unified_batch_raw(
+    stream: &CudaStream,
+    out: u64,
+    query: u64,
+    block_addresses: u64,
+    sequence_length_device: u64,
+    row_map: u64,
+    sequence_length: u64,
+    exp_sums: Option<u64>,
+    max_logits: Option<u64>,
+    temporary_output: Option<u64>,
+    num_group_rows: i32,
+    num_original_rows: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    max_num_blocks_per_seq: i32,
+) -> Result<VnextAddressedPagedAttentionKernel> {
+    if num_group_rows != num_original_rows {
+        return Err(FerrumError::model(
+            "fixed-capacity causal mask must contain every original row",
+        ));
+    }
+    unsafe {
+        dispatch_vnext_addressed_paged_attention_indexed_impl(
+            stream,
+            out,
+            query,
+            block_addresses,
+            sequence_length_device,
+            row_map,
+            sequence_length,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            num_group_rows,
+            num_original_rows,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_num_blocks_per_seq,
+            VnextAddressedPagedAttentionKernel::V2,
+            true,
+        )
+    }
+}
+
+// Closed callers establish their own adaptive or unified device-map contract. This common
 // implementation preserves all scalar bounds and the unchanged native launch.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda-indexed-causal-attention")]

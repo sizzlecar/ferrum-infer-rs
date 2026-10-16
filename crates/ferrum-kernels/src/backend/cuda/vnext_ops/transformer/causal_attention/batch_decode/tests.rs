@@ -663,3 +663,98 @@ fn paired_query_heads_selects_only_supported_fixed_execution_shapes() {
     .unwrap()
     .is_none());
 }
+
+#[test]
+#[cfg(feature = "cuda-indexed-causal-attention")]
+fn unified_v2_effective_topology_counts_identity_and_fallbacks() {
+    use ferrum_types::CausalDecodeKvReuse::{PairedQueryHeads, PairedQueryHeadsUnifiedV2};
+    let grouping = CausalDecodeAttentionGrouping::FixedExecutionCapacity;
+    for (head_dim, capacity) in [(256, 2048), (128, 2048), (256, 512), (256, 2049)] {
+        let mut s = shape(head_dim);
+        s.maximum_context_tokens = capacity;
+        let binding = BindingLayout::new(s, 4).unwrap();
+        let layout = ScratchLayout::for_participants(
+            s,
+            4,
+            4,
+            CausalProjection::F16,
+            AttentionExecutionPolicy::NativeAdaptive,
+        )
+        .unwrap();
+        let launches = build_launches(s, binding, layout, &[capacity; 4]);
+        let base =
+            fixed::FixedBatchDecode::for_launches(&launches, true, binding, s, layout, true, true)
+                .unwrap()
+                .unwrap();
+        let a = base.clone().with_kv_reuse(PairedQueryHeads, grouping, s);
+        let b = base.with_kv_reuse(PairedQueryHeadsUnifiedV2, grouping, s);
+        let enabled = cfg!(feature = "cuda-causal-gqa2") && head_dim == 256 && capacity == 2048;
+        assert_eq!(b.uses_unified_v2(), enabled);
+        assert_eq!(a.uses_paired_query_heads(), b.uses_paired_query_heads());
+        assert!(!a.uses_unified_v2());
+        assert_eq!(
+            a.dispatch_count(&launches, false, false),
+            b.dispatch_count(&launches, false, false) + u64::from(enabled)
+        );
+        let key = |batch: &fixed::FixedBatchDecode| {
+            batch
+                .bind_replay(CudaCommandReplayKeyBuilder::new(
+                    "test.unified-v2",
+                    "fixed-causal",
+                ))
+                .finish()
+                .bind_runtime_payload("causal", std::iter::empty(), &[])
+        };
+        assert_eq!(
+            key(&a) == key(&b),
+            !enabled,
+            "effective topology must distinguish unified and adaptive graphs"
+        );
+    }
+    let mut unsupported = shape(256);
+    unsupported.query_heads = 6; // GQA3 cannot pair within every KV head.
+    assert!(!fixed::paired_query_heads_eligible(
+        PairedQueryHeadsUnifiedV2,
+        grouping,
+        unsupported
+    ));
+    unsupported = shape(256);
+    unsupported.int8_kv = true;
+    assert!(!fixed::paired_query_heads_eligible(
+        PairedQueryHeadsUnifiedV2,
+        grouping,
+        unsupported
+    ));
+    assert!(!fixed::paired_query_heads_eligible(
+        PairedQueryHeadsUnifiedV2,
+        CausalDecodeAttentionGrouping::FixedCapacity,
+        shape(256)
+    ));
+    let s = shape(256);
+    let binding = BindingLayout::new(s, 1).unwrap();
+    let layout = ScratchLayout::for_participants(
+        s,
+        1,
+        1,
+        CausalProjection::F16,
+        AttentionExecutionPolicy::NativeAdaptive,
+    )
+    .unwrap();
+    let launches = build_launches(s, binding, layout, &[1024]);
+    assert!(
+        PreparedBatchDecode::for_launches(
+            &launches,
+            true,
+            binding,
+            s,
+            layout,
+            true,
+            true,
+            grouping,
+            PairedQueryHeadsUnifiedV2
+        )
+        .unwrap()
+        .is_none(),
+        "M1 retains the original per-participant route"
+    );
+}

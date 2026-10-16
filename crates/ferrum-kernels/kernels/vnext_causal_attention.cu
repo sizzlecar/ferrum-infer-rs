@@ -99,10 +99,9 @@ extern "C" __global__ void vnext_causal_gather_decode_lengths_fixed_capacity(
   v2_rows[participant] = length > 512 ? participant : -1;
 }
 
-// Diagnostic-only entrypoint: the production provider does not load this
-// function. Keep the fresh binding read and complete map writes inside the
-// measured bundle when comparing adaptive V1/V2 with unified partitioned V2.
-extern "C" __global__ void vnext_causal_gather_decode_lengths_unified_v2_test(
+// Unified partitioned decode uses the same original row numbering. Rewrite
+// every length and map entry on every replay; zero-length slots stay inactive.
+extern "C" __global__ void vnext_causal_gather_decode_lengths_unified_v2(
     const int* __restrict__ binding_base,
     const unsigned long long binding_slot_bytes,
     int* __restrict__ sequence_lengths,
