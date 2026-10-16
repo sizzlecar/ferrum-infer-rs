@@ -125,6 +125,63 @@ struct AttemptRecord {
     repeated_callback: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PreparationPath {
+    Ordinary,
+    Bootstrap,
+    Resident,
+}
+
+/// Basic metrics-only observation; owns no execution authority or request data.
+#[derive(Default, Serialize)]
+pub(super) struct DecodePreparationObservation {
+    prepare_excluding_bootstrap_ns: Option<u64>,
+    pub(super) bootstrap_ns: Option<u64>,
+    pub(super) bootstrap_prepared: Option<bool>,
+    prepared_path: Option<PreparationPath>,
+    readback_mode: Option<&'static str>,
+    greedy_participants: Option<usize>,
+    full_participants: Option<usize>,
+    pub(super) final_dispatch_path: Option<PreparationPath>,
+    pub(super) resident_unavailable_fallbacks: u64,
+    pub(super) fallback_prepare_ns: Option<u64>,
+    cold_compile_ns: Option<u64>,
+    cold_compile_attempts: u64,
+    cold_compile_candidates: u64,
+    cold_compile_errors: u64,
+    resident_submitted: bool,
+}
+
+impl DecodePreparationObservation {
+    pub(super) fn finish_prepare(&mut self, elapsed: Duration, path: PreparationPath) {
+        self.prepare_excluding_bootstrap_ns =
+            duration_ns(elapsed).checked_sub(self.bootstrap_ns.unwrap_or(0));
+        self.prepared_path = Some(path);
+    }
+
+    pub(super) fn resolve_readback(&mut self, modes: &ProductReadbackModes) {
+        self.readback_mode = Some(match modes.uniform() {
+            Some(VNextProductOutputMode::GreedyToken) => "uniform_greedy",
+            Some(VNextProductOutputMode::FullLogits) => "uniform_full",
+            None => "participant",
+        });
+        self.full_participants = Some(modes.full_participants());
+        self.greedy_participants = Some(modes.len() - modes.full_participants());
+    }
+
+    pub(super) fn record_compile(&mut self, elapsed: Duration, candidate: bool, error: bool) {
+        self.cold_compile_ns = Some(
+            self.cold_compile_ns
+                .unwrap_or(0)
+                .saturating_add(duration_ns(elapsed)),
+        );
+        self.cold_compile_attempts += 1;
+        self.cold_compile_candidates += u64::from(candidate);
+        self.cold_compile_errors += u64::from(error);
+    }
+}
+
 #[derive(Serialize)]
 struct WaveRecord {
     ordinal: u64,
@@ -133,6 +190,7 @@ struct WaveRecord {
     host_encode_submit_ns: Option<u64>,
     attempts: Vec<AttemptRecord>,
     attempt_overflow: usize,
+    decode_preparation: Option<DecodePreparationObservation>,
 }
 
 pub(super) struct Ledger {
@@ -188,6 +246,7 @@ impl Ledger {
             },
             attempts: Vec::with_capacity(MAXIMUM_ATTEMPTS),
             attempt_overflow: 0,
+            decode_preparation: None,
             finished: false,
         })
     }
@@ -212,7 +271,7 @@ impl Ledger {
             "records": &*self.records.lock(),
             "scope": [
                 "submitted means dispatch returned a handle, not terminal device success",
-                "each wave owns one host_encode_submit interval including all retries; attempt intervals are nested and must not be added to it",
+                "host_encode_submit covers the final outer dispatch iteration including its internal retries; attempt intervals are nested and must not be added to it",
                 "provider_encode_submit includes core dispatch; provider_node_encode and enqueue_commands reuse their original stage scopes",
                 "missing callback or interval is null, not zero; prepare and final submission observations are separate boundaries",
                 "program_gaps counts actual node gaps by reason before on-demand tombstone removal; segment counters have a different denominator",
@@ -220,7 +279,12 @@ impl Ledger {
                 "capture_allowed_at_entry is the backend quiescence decision, not proof of later completion",
                 "first-wave prefix only; overflow and unfinalized waves cannot be used as complete cold-path history",
                 "unwinding preserves original RAII metrics but does not finalize joint rows; snapshots during execution are not atomic",
-                "attempt observation work is inside host_encode_submit; outer ledger reservation and final serialization are outside that interval; no additional clock is read"
+                "attempt observation work is inside host_encode_submit; outer ledger reservation and final serialization are outside that interval",
+                "decode_preparation is Basic metrics-only for successfully prepared Decode calls; earlier deferrals/errors have no joined row; null is missing or not entered, not zero",
+                "prepare_excluding_bootstrap and bootstrap are disjoint before dispatch; fallback_prepare and cold_compile are later intervals nested in host dispatch and must not be added to host_encode_submit",
+                "decode preparation times are host elapsed including instrumentation, locks and synchronization, not pure CPU or removable time; cold_compile precedes provider_encode_submit",
+                "readback mode is the actual resolver result; participant counts are logical rows, not physical GPU width; compile candidates are not installations and submitted is not terminal completion",
+                "after resident unavailable fallback the legacy host_encode_submit row covers the final dispatch iteration only; aggregate timing includes earlier iterations; no cohort-causal attribution is inferred"
             ]
         })
     }
@@ -232,6 +296,7 @@ pub(super) struct WaveObservation<'a> {
     phase: &'static str,
     attempts: Vec<AttemptRecord>,
     attempt_overflow: usize,
+    pub(super) decode_preparation: Option<DecodePreparationObservation>,
     finished: bool,
 }
 
@@ -256,6 +321,10 @@ impl WaveObservation<'_> {
     }
 
     pub(super) fn finish(mut self, host_elapsed: Option<Duration>, outcome: Outcome) {
+        if let Some(preparation) = self.decode_preparation.as_mut() {
+            preparation.resident_submitted = outcome == Outcome::Submitted
+                && preparation.final_dispatch_path == Some(PreparationPath::Resident);
+        }
         let record = WaveRecord {
             ordinal: self.ordinal,
             phase: self.phase,
@@ -263,6 +332,7 @@ impl WaveObservation<'_> {
             host_encode_submit_ns: host_elapsed.map(duration_ns),
             attempts: std::mem::take(&mut self.attempts),
             attempt_overflow: self.attempt_overflow,
+            decode_preparation: self.decode_preparation.take(),
         };
         self.ledger.records.lock().push(record);
         self.finished = true;
@@ -277,7 +347,7 @@ impl Drop for WaveObservation<'_> {
     }
 }
 
-fn duration_ns(elapsed: Duration) -> u64 {
+pub(super) fn duration_ns(elapsed: Duration) -> u64 {
     elapsed.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 

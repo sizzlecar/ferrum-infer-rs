@@ -3788,6 +3788,7 @@ struct VNextSequence<R: DeviceRuntime> {
 struct PreparedVNextPrefill<R: DeviceRuntime> {
     retirement: PreparedRetirement<R>,
     dispatch: PreparedDispatch<R>,
+    decode_preparation: Option<reusable_cold_path::DecodePreparationObservation>,
 }
 
 struct VNextExecutionParticipant<'a, R: DeviceRuntime> {
@@ -4793,6 +4794,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
+    basic_metrics_only: AtomicBool,
     diagnostic_fault: Option<VNextDiagnosticFault>,
     diagnostic_fault_armed: AtomicBool,
     metrics: VNextExecutorMetrics,
@@ -5357,6 +5359,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
+            basic_metrics_only: AtomicBool::new(false),
             diagnostic_fault: config.diagnostic_fault,
             diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
             metrics,
@@ -7681,14 +7684,31 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             if let (Some(reservation), Some(program)) =
                 (resident_bootstrap.as_ref(), reusable_program)
             {
-                match OperationDispatch::try_compile_resident_decode(
+                let started = cold_wave
+                    .as_ref()
+                    .and_then(|wave| wave.decode_preparation.as_ref())
+                    .map(|_| Instant::now());
+                let compiled = OperationDispatch::try_compile_resident_decode(
                     Arc::clone(reservation),
                     &self.resolved_plan,
                     &wave,
                     &self.submission_wave_identity,
                     program,
                     &self.lane,
+                );
+                if let (Some(started), Some(observation)) = (
+                    started,
+                    cold_wave
+                        .as_mut()
+                        .and_then(|wave| wave.decode_preparation.as_mut()),
                 ) {
+                    observation.record_compile(
+                        started.elapsed(),
+                        matches!(&compiled, Ok(Some(_))),
+                        compiled.is_err(),
+                    );
+                }
+                match compiled {
                     Ok(compiled) => *resident_install = compiled,
                     Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
                 }
@@ -8013,6 +8033,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // later wave would leave the completed-state proof without tokens.
         let span = self.retain_checkpoint_token_evidence(span, tokens)?;
         let prepared = {
+            let started = self
+                .basic_metrics_only
+                .load(Ordering::Acquire)
+                .then(Instant::now);
+            let mut observation =
+                started.map(|_| reusable_cold_path::DecodePreparationObservation::default());
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
             let _phase_timing = self
                 .metrics
@@ -8021,11 +8047,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .start();
             let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-            if let Some(prepared) = self.try_prepare_resident_decode(
+            let mut prepared = if let Some(prepared) = self.try_prepare_resident_decode(
                 &batch,
                 std::slice::from_ref(&span),
                 VNextExecutionWaveKind::Decode,
                 matches!(logits_policy, LogitsReturnPolicy::GreedyArgmax { .. }),
+                observation.as_mut(),
             )? {
                 prepared
             } else {
@@ -8035,7 +8062,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
                 };
                 PreparedVNextPrefill::ordinary(step, wave)
+            };
+            if let (Some(started), Some(observation)) = (started, observation.as_mut()) {
+                observation.finish_prepare(started.elapsed(), prepared.dispatch.preparation_path());
             }
+            prepared.decode_preparation = observation;
+            prepared
         };
         self.execute_prepared_step(
             sequence,
@@ -8094,13 +8126,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // full token inputs or repeat their hash calculation.
         let spans = retained_spans.as_deref().unwrap_or(spans);
         let prepared = {
+            let started = (kind == VNextExecutionWaveKind::Decode
+                && self.basic_metrics_only.load(Ordering::Acquire))
+            .then(Instant::now);
+            let mut observation =
+                started.map(|_| reusable_cold_path::DecodePreparationObservation::default());
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
             let _phase_timing = self
                 .metrics
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            if let Some(prepared) = self.try_prepare_resident_decode(
+            let mut prepared = if let Some(prepared) = self.try_prepare_resident_decode(
                 batch,
                 spans,
                 kind,
@@ -8110,6 +8147,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         Some(LogitsReturnPolicy::GreedyArgmax { .. })
                     )
                 }),
+                observation.as_mut(),
             )? {
                 prepared
             } else {
@@ -8158,7 +8196,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     }
                 };
                 PreparedVNextPrefill::ordinary(step, wave)
+            };
+            if let (Some(started), Some(observation)) = (started, observation.as_mut()) {
+                observation.finish_prepare(started.elapsed(), prepared.dispatch.preparation_path());
             }
+            prepared.decode_preparation = observation;
+            prepared
         };
         let participants = sequences
             .iter()
@@ -8214,6 +8257,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let PreparedVNextPrefill {
             retirement: mut step,
             dispatch: mut wave,
+            mut decode_preparation,
         } = prepared;
         let mut resident_install = None;
         let capture_claim = match (kind, self.checkpoint_capture.as_ref()) {
@@ -8261,6 +8305,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         );
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, &output_modes)?;
+        if let Some(observation) = decode_preparation.as_mut() {
+            observation.resolve_readback(&output_modes);
+        }
         if let Some(request) = output_modes.uniform().and_then(|mode| {
             readbacks.terminal_packet_request(
                 self.completion_readback_policy,
@@ -8275,6 +8322,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .metrics
             .reusable_cold_path
             .begin(self.host_dispatch_timing_enabled(), kind);
+        if let Some(cold_wave) = cold_wave.as_mut() {
+            cold_wave.decode_preparation = decode_preparation;
+        }
         let (mut token_mask_residency, dispatch) = loop {
             let timing = self.metrics.wave_timing.host_encode_submit.start();
             let phase_timer = phase_timing.host_encode_submit.start();
@@ -8302,6 +8352,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )
                     }),
             );
+            if let Some(observation) = cold_wave
+                .as_mut()
+                .and_then(|wave| wave.decode_preparation.as_mut())
+            {
+                observation.final_dispatch_path = Some(wave.preparation_path());
+            }
             let dispatch = self.dispatch_prepared_wave(
                 participants,
                 wave,
@@ -8314,6 +8370,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let dispatch = match dispatch {
                 PreparedDispatchResult::Outcome(dispatch) => dispatch,
                 PreparedDispatchResult::Unavailable => {
+                    let fallback_started = cold_wave
+                        .as_mut()
+                        .and_then(|wave| wave.decode_preparation.as_mut())
+                        .map(|observation| {
+                            observation.resident_unavailable_fallbacks += 1;
+                            Instant::now()
+                        });
                     let mut token_mask_residency = token_mask_residency;
                     token_mask_residency.invalidate_before_slot_release();
                     self.release_resident_decode();
@@ -8353,6 +8416,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         wave: ordinary_wave,
                         reservation: None,
                     };
+                    if let (Some(started), Some(observation)) = (
+                        fallback_started,
+                        cold_wave
+                            .as_mut()
+                            .and_then(|wave| wave.decode_preparation.as_mut()),
+                    ) {
+                        observation.fallback_prepare_ns =
+                            Some(reusable_cold_path::duration_ns(started.elapsed()));
+                    }
                     continue;
                 }
             };
@@ -10465,6 +10537,12 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        self.basic_metrics_only.store(
+            sink.device_timing_mode() == DeviceTimingMode::Completion
+                && sink.enablement()
+                    == ferrum_interfaces::vnext::ExecutionEventSinkEnablement::None,
+            Ordering::Release,
+        );
         self.device_timing_mode
             .store(sink.device_timing_mode() as u8, Ordering::Release);
         *self.event_sink.write() = Some(sink);

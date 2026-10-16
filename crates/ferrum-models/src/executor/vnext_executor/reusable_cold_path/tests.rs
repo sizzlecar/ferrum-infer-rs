@@ -569,3 +569,108 @@ fn reusable_cold_path_disabled_observation_and_enabled_records_retain_no_lane_ow
     assert!(runtime.upgrade().is_none());
     assert_eq!(records(&ledger.snapshot()).len(), 1);
 }
+
+#[test]
+fn decode_preparation_observation_uses_resolved_modes_and_keeps_unentered_time_missing() {
+    let roles = [
+        VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: None,
+        }),
+        VNextParticipantOutputRole::Decode(LogitsReturnPolicy::FullLogits),
+    ];
+    let ledger = Ledger::default();
+    for dtype in [ElementType::F16, ElementType::Bf16] {
+        let modes = ProductReadbackModes::resolve(
+            SamplingReadbackMode::Participant,
+            VNextExecutionWaveKind::Decode,
+            dtype,
+            3,
+            false,
+            false,
+            roles.iter(),
+        );
+        let mut observation = DecodePreparationObservation::default();
+        observation.finish_prepare(Duration::from_nanos(100), PreparationPath::Ordinary);
+        observation.resolve_readback(&modes);
+        observation.final_dispatch_path = Some(PreparationPath::Ordinary);
+        let mut wave = ledger.begin(true, VNextExecutionWaveKind::Decode).unwrap();
+        wave.decode_preparation = Some(observation);
+        wave.finish(Some(Duration::from_nanos(200)), Outcome::Submitted);
+    }
+    let snapshot = ledger.snapshot();
+    for (index, (mode, full)) in [("participant", 1), ("uniform_full", 2)]
+        .into_iter()
+        .enumerate()
+    {
+        let row = &records(&snapshot)[index]["decode_preparation"];
+        assert_eq!(row["readback_mode"], mode);
+        assert_eq!(row["full_participants"], full);
+        assert_eq!(row["greedy_participants"], 2 - full);
+        assert_eq!(row["prepare_excluding_bootstrap_ns"], 100);
+        assert!(row["bootstrap_ns"].is_null());
+        assert!(row["cold_compile_ns"].is_null());
+        assert!(!row["resident_submitted"].as_bool().unwrap());
+    }
+}
+
+#[test]
+fn decode_preparation_observation_partitions_bootstrap_and_does_not_promote_candidates_or_fallbacks(
+) {
+    let ledger = Ledger::default();
+    let mut observation = DecodePreparationObservation {
+        bootstrap_ns: Some(25),
+        bootstrap_prepared: Some(true),
+        final_dispatch_path: Some(PreparationPath::Bootstrap),
+        ..Default::default()
+    };
+    observation.finish_prepare(Duration::from_nanos(100), PreparationPath::Bootstrap);
+    observation.record_compile(Duration::from_nanos(17), true, false);
+    observation.record_compile(Duration::from_nanos(23), false, true);
+    let mut wave = ledger.begin(true, VNextExecutionWaveKind::Decode).unwrap();
+    wave.decode_preparation = Some(observation);
+    wave.finish(Some(Duration::from_nanos(300)), Outcome::QuiescentFailure);
+    for (final_path, outcome, expected_submit) in [
+        (PreparationPath::Ordinary, Outcome::Submitted, false),
+        (
+            PreparationPath::Resident,
+            Outcome::SubmissionIndeterminate,
+            false,
+        ),
+        (PreparationPath::Resident, Outcome::Submitted, true),
+    ] {
+        let mut observation = DecodePreparationObservation::default();
+        observation.finish_prepare(Duration::from_nanos(50), PreparationPath::Resident);
+        observation.final_dispatch_path = Some(final_path);
+        observation.resident_unavailable_fallbacks =
+            u64::from(final_path == PreparationPath::Ordinary);
+        let mut wave = ledger.begin(true, VNextExecutionWaveKind::Decode).unwrap();
+        wave.decode_preparation = Some(observation);
+        wave.finish(None, outcome);
+        assert_eq!(
+            records(&ledger.snapshot()).last().unwrap()["decode_preparation"]["resident_submitted"],
+            expected_submit
+        );
+    }
+    let snapshot = ledger.snapshot();
+    let first = &records(&snapshot)[0]["decode_preparation"];
+    assert_eq!(first["prepare_excluding_bootstrap_ns"], 75);
+    assert_eq!(first["bootstrap_ns"], 25);
+    assert_eq!(first["cold_compile_ns"], 40);
+    assert_eq!(first["cold_compile_attempts"], 2);
+    assert_eq!(first["cold_compile_candidates"], 1);
+    assert_eq!(first["cold_compile_errors"], 1);
+    assert_eq!(first["resident_submitted"], false);
+    assert!(first.get("installed").is_none());
+    let fallback = &records(&snapshot)[1]["decode_preparation"];
+    assert_eq!(fallback["prepared_path"], "resident");
+    assert_eq!(fallback["final_dispatch_path"], "ordinary");
+    assert_eq!(fallback["resident_unavailable_fallbacks"], 1);
+    // Inconsistent duration evidence stays missing, never a fabricated zero.
+    let mut invalid = DecodePreparationObservation {
+        bootstrap_ns: Some(101),
+        ..Default::default()
+    };
+    invalid.finish_prepare(Duration::from_nanos(100), PreparationPath::Bootstrap);
+    assert!(invalid.prepare_excluding_bootstrap_ns.is_none());
+}

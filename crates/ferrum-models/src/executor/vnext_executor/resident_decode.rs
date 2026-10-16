@@ -80,6 +80,7 @@ impl<R: DeviceRuntime> PreparedVNextPrefill<R> {
         wave: PreparedStepSubmissionWave<R>,
     ) -> Self {
         Self {
+            decode_preparation: None,
             retirement: PreparedRetirement::Ordinary(step),
             dispatch: PreparedDispatch::Ordinary {
                 wave,
@@ -90,6 +91,18 @@ impl<R: DeviceRuntime> PreparedVNextPrefill<R> {
 }
 
 impl<R: DeviceRuntime> PreparedDispatch<R> {
+    pub(super) fn preparation_path(&self) -> reusable_cold_path::PreparationPath {
+        use reusable_cold_path::PreparationPath;
+        match self {
+            Self::Resident { .. } => PreparationPath::Resident,
+            Self::Ordinary {
+                reservation: Some(_),
+                ..
+            } => PreparationPath::Bootstrap,
+            Self::Ordinary { .. } => PreparationPath::Ordinary,
+        }
+    }
+
     pub(super) fn lane_stable_slot_identity(&self) -> Option<LaneStableArenaSlotIdentity> {
         match self {
             Self::Ordinary { wave, .. } => wave
@@ -153,6 +166,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
         greedy: bool,
+        observation: Option<&mut reusable_cold_path::DecodePreparationObservation>,
     ) -> Result<Option<PreparedVNextPrefill<R>>> {
         if self.invocation_preparation_strategy
             != InvocationPreparationStrategy::ResidentDecodeProgram
@@ -186,6 +200,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 *self.resident_decode.lock() =
                                     Some(ResidentCache::Ready(Arc::clone(&program)));
                                 return Ok(Some(PreparedVNextPrefill {
+                                    decode_preparation: None,
                                     retirement: PreparedRetirement::Resident(retirement),
                                     dispatch: PreparedDispatch::Resident { program, use_ },
                                 }));
@@ -209,10 +224,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 None => return Ok(None),
             },
         };
-        match reservation
-            .prepare_bootstrap(&request)
-            .map_err(|e| FerrumError::backend(e.to_string()))?
-        {
+        let started = observation.as_ref().map(|_| Instant::now());
+        let bootstrap = reservation.prepare_bootstrap(&request);
+        if let (Some(observation), Some(started)) = (observation, started) {
+            observation.bootstrap_ns = Some(reusable_cold_path::duration_ns(started.elapsed()));
+            observation.bootstrap_prepared = Some(matches!(
+                &bootstrap,
+                Ok(ResidentBootstrapDecision::Prepared { .. })
+            ));
+        }
+        match bootstrap.map_err(|e| FerrumError::backend(e.to_string()))? {
             ResidentBootstrapDecision::Prepared { step, wave } => {
                 self.resident_metrics
                     .bootstraps
@@ -220,6 +241,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 *self.resident_decode.lock() =
                     Some(ResidentCache::Bootstrap(Arc::clone(&reservation)));
                 Ok(Some(PreparedVNextPrefill {
+                    decode_preparation: None,
                     retirement: PreparedRetirement::Ordinary(step),
                     dispatch: PreparedDispatch::Ordinary {
                         wave,
