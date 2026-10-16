@@ -161,7 +161,7 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub causal_decode_kv_reuse: Option<crate::commands::CausalDecodeKvReuseArg>,
     /// Paged Sequence backing growth (default: exact). Grouped modes require a CUDA resident plan runtime.
-    /// Paged-group4 uses free backing; paged-group4-grow-only may also grow pools without reclaiming.
+    /// Paged-group4 uses free backing; grow-only groups of 4 or 8 pages may grow pools without reclaiming.
     #[arg(long, value_enum)]
     pub sequence_backing_growth: Option<crate::commands::SequenceBackingGrowthArg>,
     /// Q4_K MMVQ weight decode (default: baseline). Shared M8 requires a CUDA plan runtime.
@@ -4828,6 +4828,30 @@ mod tests {
             ),
             (
                 Mode::PagedGroup4,
+                Some(crate::commands::SequenceBackingGrowthArg::PagedGroup4GrowOnly),
+                Mode::PagedGroup4GrowOnly,
+                Source::Cli,
+            ),
+            (
+                Mode::PagedGroup8GrowOnly,
+                None,
+                Mode::PagedGroup8GrowOnly,
+                Source::ConfigFile,
+            ),
+            (
+                Mode::PagedGroup8GrowOnly,
+                Some(crate::commands::SequenceBackingGrowthArg::Exact),
+                Mode::Exact,
+                Source::Cli,
+            ),
+            (
+                Mode::PagedGroup4GrowOnly,
+                Some(crate::commands::SequenceBackingGrowthArg::PagedGroup8GrowOnly),
+                Mode::PagedGroup8GrowOnly,
+                Source::Cli,
+            ),
+            (
+                Mode::PagedGroup8GrowOnly,
                 Some(crate::commands::SequenceBackingGrowthArg::PagedGroup4GrowOnly),
                 Mode::PagedGroup4GrowOnly,
                 Source::Cli,

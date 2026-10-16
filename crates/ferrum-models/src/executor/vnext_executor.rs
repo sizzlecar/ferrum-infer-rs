@@ -162,6 +162,11 @@ fn resolved_sequence_backing_growth(
                 std::num::NonZeroU32::new(4).expect("four pages is a positive reservation group"),
             )
         }
+        ferrum_types::SequenceBackingGrowth::PagedGroup8GrowOnly => {
+            SequenceBackingGrowthPolicy::PagedGroupGrowOnly(
+                std::num::NonZeroU32::new(8).expect("eight pages is a positive reservation group"),
+            )
+        }
     }
 }
 

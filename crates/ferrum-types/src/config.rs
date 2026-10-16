@@ -398,6 +398,7 @@ pub enum SequenceBackingGrowth {
     Exact,
     PagedGroup4,
     PagedGroup4GrowOnly,
+    PagedGroup8GrowOnly,
 }
 
 impl SequenceBackingGrowth {
@@ -406,6 +407,7 @@ impl SequenceBackingGrowth {
             Self::Exact => "exact",
             Self::PagedGroup4 => "paged-group4",
             Self::PagedGroup4GrowOnly => "paged-group4-grow-only",
+            Self::PagedGroup8GrowOnly => "paged-group8-grow-only",
         }
     }
 
@@ -414,8 +416,9 @@ impl SequenceBackingGrowth {
             "exact" => Ok(Self::Exact),
             "paged-group4" => Ok(Self::PagedGroup4),
             "paged-group4-grow-only" => Ok(Self::PagedGroup4GrowOnly),
+            "paged-group8-grow-only" => Ok(Self::PagedGroup8GrowOnly),
             _ => Err(format!(
-                "expected exact, paged-group4, or paged-group4-grow-only; got {raw:?}"
+                "expected exact, paged-group4, paged-group4-grow-only, or paged-group8-grow-only; got {raw:?}"
             )),
         }
     }
@@ -3007,6 +3010,7 @@ mod tests {
                 SequenceBackingGrowth::Exact,
                 SequenceBackingGrowth::PagedGroup4,
                 SequenceBackingGrowth::PagedGroup4GrowOnly,
+                SequenceBackingGrowth::PagedGroup8GrowOnly,
             ] {
                 let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
                     key,
@@ -3029,6 +3033,7 @@ mod tests {
             ("automatic", RuntimeConfigSource::Cli),
             ("paged-group4", RuntimeConfigSource::Env),
             ("paged-group4-grow-only", RuntimeConfigSource::Env),
+            ("paged-group8-grow-only", RuntimeConfigSource::Env),
         ] {
             assert!(engine
                 .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([

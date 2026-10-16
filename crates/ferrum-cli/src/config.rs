@@ -1784,6 +1784,7 @@ mod tests {
             ferrum_types::SequenceBackingGrowth::Exact,
             ferrum_types::SequenceBackingGrowth::PagedGroup4,
             ferrum_types::SequenceBackingGrowth::PagedGroup4GrowOnly,
+            ferrum_types::SequenceBackingGrowth::PagedGroup8GrowOnly,
         ] {
             let value = mode.as_runtime_value();
             let parsed: CliConfig = toml::from_str(&format!(

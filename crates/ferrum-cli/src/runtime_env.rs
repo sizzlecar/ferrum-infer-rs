@@ -332,7 +332,11 @@ mod tests {
     fn sequence_backing_growth_provenance_is_never_environment() {
         let key = ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
         let original = std::env::var_os(key);
-        for value in ["paged-group4", "paged-group4-grow-only"] {
+        for value in [
+            "paged-group4",
+            "paged-group4-grow-only",
+            "paged-group8-grow-only",
+        ] {
             for source in [
                 RuntimeConfigSource::Default,
                 RuntimeConfigSource::ConfigFile,

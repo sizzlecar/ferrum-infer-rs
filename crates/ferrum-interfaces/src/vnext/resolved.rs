@@ -1097,6 +1097,23 @@ mod sequence_backing_growth_tests {
         wire["admission"]["sequence_backing_growth"] =
             serde_json::json!({ "paged-group-grow-only": 4 });
         assert!(serde_json::from_value::<ResolvedRuntimePolicy>(wire).is_err());
+
+        let group8 = policy(SequenceBackingGrowthPolicy::PagedGroupGrowOnly(
+            std::num::NonZeroU32::new(8).unwrap(),
+        ));
+        assert_ne!(group8.fingerprint_str(), grow_only.fingerprint_str());
+        let mut wire = serde_json::to_value(&group8).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ResolvedRuntimePolicy>(wire.clone()).unwrap(),
+            group8
+        );
+        wire["admission"]["sequence_backing_growth"] =
+            serde_json::json!({ "paged-group-grow-only": 4 });
+        assert!(serde_json::from_value::<ResolvedRuntimePolicy>(wire).is_err());
+        let mut wire = serde_json::to_value(&grow_only).unwrap();
+        wire["admission"]["sequence_backing_growth"] =
+            serde_json::json!({ "paged-group-grow-only": 8 });
+        assert!(serde_json::from_value::<ResolvedRuntimePolicy>(wire).is_err());
     }
 }
 

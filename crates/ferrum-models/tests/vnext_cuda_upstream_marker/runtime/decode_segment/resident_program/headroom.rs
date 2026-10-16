@@ -87,10 +87,11 @@ fn extend_request(
     }
 }
 
-fn extend_cold_group4(
+fn extend_cold_grouped(
     fixture: &Fixture,
     session: &Arc<SequenceSession<Runtime>>,
     tokens: Arc<[u32]>,
+    pages: NonZeroU32,
     grow_only: bool,
     diagnostic: &mut ExtensionDiagnostics,
 ) -> Arc<SequenceBackingSnapshot<Runtime>> {
@@ -98,7 +99,6 @@ fn extend_cold_group4(
     let request =
         SequenceResourceExtensionRequest::new(work, AdmissionPressureAction::WaitForRelease)
             .unwrap();
-    let pages = NonZeroU32::new(4).unwrap();
     let request = if grow_only {
         request.with_paged_growth_group_grow_only(pages)
     } else {
@@ -155,6 +155,7 @@ fn kv_pool_bytes(fixture: &Fixture, resource: &ResourceId) -> (u64, u64) {
 }
 
 fn print_cold_growth(
+    kind: &str,
     arm: &str,
     start_arm: usize,
     position: usize,
@@ -170,7 +171,7 @@ fn print_cold_growth(
 ) {
     println!(
         "{}",
-        serde_json::json!({"kind":"resident_cold_group4_wave","arm":arm,
+        serde_json::json!({"kind":kind,"arm":arm,
             "pair":start_arm,"initial_arm_order":[start_arm,1-start_arm],
             "position":position,"tokens":position+1,"participants":2,"resident_hot":hot,
             "owned_pages":pages,"kv_pool_resident_before":pool_before.0,
@@ -283,15 +284,92 @@ fn resident_decode_program_causal_cold_group4_grow_only_preserves_outputs_and_tr
     compare_headroom(true, 1);
 }
 
+#[test]
+#[ignore = "requires exclusive CUDA and real cold-pool group4/group8 growth"]
+fn resident_decode_program_causal_cold_group8_grow_only_preserves_outputs_through_exhaustion() {
+    compare_headroom_variant(HeadroomComparison::ColdGroup4VsGroup8GrowOnly, 0);
+    compare_headroom_variant(HeadroomComparison::ColdGroup4VsGroup8GrowOnly, 1);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadroomComparison {
+    PrewarmedExactVsGroup4,
+    ColdOpportunisticVsGroup4GrowOnly,
+    ColdGroup4VsGroup8GrowOnly,
+}
+
+impl HeadroomComparison {
+    fn cold(self) -> bool {
+        self != Self::PrewarmedExactVsGroup4
+    }
+
+    fn group8(self) -> bool {
+        self == Self::ColdGroup4VsGroup8GrowOnly
+    }
+
+    fn tokens(self) -> usize {
+        if self.group8() {
+            132
+        } else {
+            68
+        }
+    }
+
+    fn ceiling(self) -> usize {
+        if self.group8() {
+            256
+        } else {
+            128
+        }
+    }
+
+    fn group_pages(self, arm: usize) -> usize {
+        if self.group8() && arm == 1 {
+            8
+        } else {
+            4
+        }
+    }
+
+    fn arm_name(self, arm: usize) -> &'static str {
+        match (self, arm) {
+            (Self::PrewarmedExactVsGroup4, 0) => "exact",
+            (Self::PrewarmedExactVsGroup4, _) => "group4",
+            (Self::ColdOpportunisticVsGroup4GrowOnly, 0) => "cold_opportunistic_group4",
+            (_, 0) | (Self::ColdOpportunisticVsGroup4GrowOnly, _) => "cold_grow_only_group4",
+            (Self::ColdGroup4VsGroup8GrowOnly, _) => "cold_grow_only_group8",
+        }
+    }
+}
+
 fn compare_headroom(cold_grouped: bool, start_arm: usize) {
+    compare_headroom_variant(
+        if cold_grouped {
+            HeadroomComparison::ColdOpportunisticVsGroup4GrowOnly
+        } else {
+            HeadroomComparison::PrewarmedExactVsGroup4
+        },
+        start_arm,
+    );
+}
+
+fn compare_headroom_variant(comparison: HeadroomComparison, start_arm: usize) {
     assert!(start_arm < 2);
+    let cold_grouped = comparison.cold();
+    let token_count = comparison.tokens();
+    let ceiling = comparison.ceiling();
+    let cold_wave_kind = if comparison.group8() {
+        "resident_cold_group8_wave"
+    } else {
+        "resident_cold_group4_wave"
+    };
     let fixtures = [0, 1].map(|_| {
         Fixture::for_family_with_causal_decode_preparation(
             AttentionKind::Causal,
             true,
             2,
             Family::new(AttentionKind::Causal)
-                .with_maximum_tokens(128)
+                .with_maximum_tokens(ceiling as u64)
                 .with_causal_sixteen_token_pages(),
             ProgramBindingUploadStrategy::CompactScatter,
             SegmentBindingOracleMode::Disabled,
@@ -301,7 +379,11 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
         )
     });
     let tokens: Vec<Arc<[u32]>> = (0..2)
-        .map(|p| (0..68).map(|t| ((t * 7 + p * 3 + 1) % 32) as u32).collect())
+        .map(|p| {
+            (0..token_count)
+                .map(|t| ((t * 7 + p * 3 + 1) % 32) as u32)
+                .collect()
+        })
         .collect();
     for fixture in &fixtures {
         let state = fixture
@@ -314,7 +396,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
         if cold_grouped {
             assert_eq!(kv_pool_bytes(fixture, &kv_resource(fixture)), (0, 0));
         } else {
-            reserve_and_release_capacity(fixture, 2, 128);
+            reserve_and_release_capacity(fixture, 2, ceiling);
         }
     }
     let sessions = fixtures.each_ref().map(|fixture| {
@@ -322,7 +404,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
             .iter()
             .enumerate()
             .map(|(p, t)| {
-                fixture.admit_with_ceiling(&format!("headroom-{p}"), Arc::from(&t[..1]), 128)
+                fixture.admit_with_ceiling(&format!("headroom-{p}"), Arc::from(&t[..1]), ceiling)
             })
             .collect::<Vec<_>>()
     });
@@ -339,7 +421,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
     let mut all_extension_ns = [0_u128; 2];
     let mut all_ensure_ns = [0_u128; 2];
     let mut all_maintenance_ns = [0_u128; 2];
-    let mut cold_grow_only_spare_observed = false;
+    let mut grow_only_spare_observed = [false; 2];
     let mut sealed_page_addresses: [Option<Vec<Vec<u64>>>; 2] = [None, None];
     let initial_tables = fixtures.each_ref().map(|f| {
         f._composition
@@ -350,7 +432,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
         .each_ref()
         .map(|f| f._composition._runtime.resident_decode_program_refreshes());
 
-    for position in 0..68 {
+    for position in 0..token_count {
         let ranges = vec![position..position + 1; 2];
         let mut observations = [None, None];
         let mut wave_hot = [false; 2];
@@ -363,12 +445,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
         };
         for arm in order {
             let arm_started = cold_grouped.then(Instant::now);
-            let arm_name = match (cold_grouped, arm) {
-                (true, 0) => "cold_opportunistic_group4",
-                (true, _) => "cold_grow_only_group4",
-                (false, 0) => "exact",
-                (false, _) => "group4",
-            };
+            let arm_name = comparison.arm_name(arm);
             let fixture = &fixtures[arm];
             let runtime = &fixture._composition._runtime;
             let before_tables = runtime.sequence_physical_binding_tables_compiled();
@@ -381,11 +458,12 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
                 .zip(&tokens)
                 .map(|(session, tokens)| {
                     if cold_grouped {
-                        extend_cold_group4(
+                        extend_cold_grouped(
                             fixture,
                             session,
                             Arc::from(&tokens[..=position]),
-                            arm == 1,
+                            NonZeroU32::new(comparison.group_pages(arm) as u32).unwrap(),
+                            comparison.group8() || arm == 1,
                             &mut extension_diagnostic,
                         )
                     } else {
@@ -415,9 +493,10 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
             let expected_pages = if (!cold_grouped && arm == 0) || position == 0 {
                 (position + 1).div_ceil(16) as u64
             } else {
-                ((position + 1).div_ceil(64) * 4) as u64
+                let group_pages = comparison.group_pages(arm);
+                ((position + 1).div_ceil(16 * group_pages) * group_pages) as u64
             };
-            if !cold_grouped || arm == 1 || position == 0 {
+            if !cold_grouped || comparison.group8() || arm == 1 || position == 0 {
                 assert_eq!(
                     pages,
                     vec![expected_pages; 2],
@@ -428,8 +507,10 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
                     .iter()
                     .all(|&pages| { pages >= (position + 1).div_ceil(16) as u64 && pages <= 8 }));
             }
-            if cold_grouped && arm == 1 && position == 1 {
-                cold_grow_only_spare_observed = pages.iter().all(|&pages| pages == 4);
+            if cold_grouped && (comparison.group8() || arm == 1) && position == 1 {
+                grow_only_spare_observed[arm] = pages
+                    .iter()
+                    .all(|&pages| pages == comparison.group_pages(arm) as u64);
             }
             for (&old, &new) in previous_pages[arm].iter().zip(&pages) {
                 assert!(new >= old);
@@ -455,6 +536,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
                     let wall_ns = started.elapsed().as_nanos();
                     complete_wall_ns[arm] += wall_ns;
                     print_cold_growth(
+                        cold_wave_kind,
                         arm_name,
                         start_arm,
                         position,
@@ -487,7 +569,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
             if let Some(wall_ns) = arm_wall_ns {
                 complete_wall_ns[arm] += wall_ns;
             }
-            if [16, 32, 48, 64].contains(&position) {
+            if position % 16 == 0 {
                 assert!(
                     hot,
                     "all physical page boundaries must use a real resident hit"
@@ -522,6 +604,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
             }
             // A bootstrap may seal the resident packet without submitting it.
             // Its ordinary binding command guarantees only the live prefix.
+            // KV readback likewise authorizes live pages, not unentered spare bytes.
             let addresses: Vec<Vec<u64>> = diagnostic
                 .binding_rows
                 .iter()
@@ -576,6 +659,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
             wave_net_ns[arm] = net_ns;
             if let Some(wall_ns) = arm_wall_ns {
                 print_cold_growth(
+                    cold_wave_kind,
                     arm_name,
                     start_arm,
                     position,
@@ -610,7 +694,7 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
         }
         assert_eq!(
             observations[0], observations[1],
-            "complete exact/group4 output and valid KV bits"
+            "complete comparison-arm output and valid KV bits"
         );
         if wave_hot.iter().all(|hot| *hot) {
             for arm in 0..2 {
@@ -629,24 +713,28 @@ fn compare_headroom(cold_grouped: bool, start_arm: usize) {
         .each_ref()
         .map(|f| f._composition._runtime.resident_decode_program_refreshes());
     if cold_grouped {
-        assert!(cold_grow_only_spare_observed);
-        println!(
-            "{}",
-            serde_json::json!({"kind":"resident_cold_group4_complete",
+        assert!(grow_only_spare_observed[1]);
+        if comparison.group8() {
+            assert!(grow_only_spare_observed[0]);
+        }
+        let mut report = serde_json::json!({"kind":if comparison.group8() {
+                    "resident_cold_group8_complete"
+                } else {"resident_cold_group4_complete"},
                 "pair":start_arm,"initial_arm_order":[start_arm,1-start_arm],
-                "arms":["cold_opportunistic_group4","cold_grow_only_group4"],
-                "tokens":68,"ceiling":128,"participants":2,"initial_kv_pool_resident_bytes":[0,0],
+                "arms":[comparison.arm_name(0),comparison.arm_name(1)],
+                "tokens":token_count,"ceiling":ceiling,"participants":2,"initial_kv_pool_resident_bytes":[0,0],
                 "temporary_capacity_reservations":false,"complete_output_valid_kv_bits_equal":true,
                 "preserved_nonwritten_existing_kv_bytes":true,"physical_appends":physical_appends,
                 "physical_table_compilations":[tables[0]-initial_tables[0],tables[1]-initial_tables[1]],
                 "backend_refreshes":[refreshes[0]-initial_refreshes[0],refreshes[1]-initial_refreshes[1]],
-                "all_68_wave_wall_ns":complete_wall_ns,"all_68_extension_ns":all_extension_ns,
                 "ensure_call_ns_including_internal_growth":all_ensure_ns,
                 "external_maintenance_ns":all_maintenance_ns,
                 "paired_hot_waves":hot_waves,"paired_hot_host_transaction_ns":hot_net_ns,
-                "timing_scope":"all 68 waves include cold extension and complete execution/readback/retirement, pool observations and existing fixture checks/logging; post-execution output comparison and new JSON logging excluded; extension and ensure/maintenance are nested, not additive; hot subset is explanatory only",
-                "performance_conclusion":"none; no timing threshold and no Off serving claim"})
-        );
+                "timing_scope":format!("all {token_count} waves include cold extension and complete execution/readback/retirement, pool observations and existing fixture checks/logging; post-execution output comparison and new JSON logging excluded; extension and ensure/maintenance are nested, not additive; hot subset is explanatory only"),
+                "performance_conclusion":"none; no timing threshold and no Off serving claim"});
+        report[format!("all_{token_count}_wave_wall_ns")] = serde_json::json!(complete_wall_ns);
+        report[format!("all_{token_count}_extension_ns")] = serde_json::json!(all_extension_ns);
+        println!("{report}");
     } else {
         assert!(physical_appends[1] < physical_appends[0]);
         assert!(refreshes[1] - initial_refreshes[1] < refreshes[0] - initial_refreshes[0]);

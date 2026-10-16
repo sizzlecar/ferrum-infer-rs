@@ -2209,6 +2209,7 @@ mod tests {
         for growth in [
             ferrum_types::SequenceBackingGrowth::PagedGroup4,
             ferrum_types::SequenceBackingGrowth::PagedGroup4GrowOnly,
+            ferrum_types::SequenceBackingGrowth::PagedGroup8GrowOnly,
         ] {
             let mut engine = EngineConfig::default();
             engine.runtime.sequence_backing_growth = growth;
