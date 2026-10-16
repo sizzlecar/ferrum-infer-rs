@@ -164,6 +164,7 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
 #[derive(Clone, Copy)]
 enum PlanRuntimeBatchDecodeBehavior {
     Exact,
+    NoFiniteFirst { selected: bool },
     Short,
     WrongFirstCache,
     DeferUntilPeerCacheRelease,
@@ -725,7 +726,8 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         }
         let mut outputs = self.inner.batch_decode(inputs).await?;
         match self.behavior {
-            PlanRuntimeBatchDecodeBehavior::Exact => {}
+            PlanRuntimeBatchDecodeBehavior::Exact
+            | PlanRuntimeBatchDecodeBehavior::NoFiniteFirst { .. } => {}
             PlanRuntimeBatchDecodeBehavior::Short => {
                 outputs.pop();
             }
@@ -846,6 +848,24 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
                 })
                 .collect::<Vec<_>>();
             match self.behavior {
+                PlanRuntimeBatchDecodeBehavior::NoFiniteFirst { selected } => {
+                    if let Some(output) = outputs.first_mut() {
+                        output.sampling_output = if selected {
+                            ExecutorSamplingOutput::NoSelectableFiniteLogit
+                        } else {
+                            ExecutorSamplingOutput::FullLogits(vec![
+                                f32::NAN;
+                                self.info().vocab_size
+                            ])
+                        };
+                    }
+                    if selected {
+                        for output in outputs.iter_mut().skip(1) {
+                            output.sampling_output =
+                                ExecutorSamplingOutput::GreedyToken(TokenId::new(6));
+                        }
+                    }
+                }
                 PlanRuntimeBatchDecodeBehavior::Short => {
                     outputs.pop();
                 }
@@ -13768,3 +13788,54 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
 }
 
 mod auto_tools_json;
+
+#[tokio::test]
+async fn plan_runtime_no_finite_logit_failure_is_request_local_and_preserves_later_commit() {
+    for selected in [false, true] {
+        let (engine, scheduler, executor, tokenizer) =
+            plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::NoFiniteFirst {
+                selected,
+            });
+        let (request_ids, initial_tokens, cache_ids) =
+            install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+        engine
+            .inner
+            .sequences
+            .write()
+            .get_mut(&request_ids[0])
+            .unwrap()
+            .response_sender = Some(response_sender);
+
+        engine
+            .inner
+            .run_plan_runtime_batch_decode(&request_ids)
+            .await
+            .expect("sampling failure must not fail the entire execution wave");
+        let error = response_receiver
+            .await
+            .expect("failed request must receive its terminal response")
+            .expect_err("a row without finite logits must fail sampling");
+        let FerrumError::Model { message } = &error else {
+            panic!("sampling failure must preserve the host model error: {error:?}");
+        };
+        assert_eq!(message, "engine sampling policies have no finite token");
+
+        let sequences = engine.inner.sequences.read();
+        assert!(!sequences.contains_key(&request_ids[0]));
+        let healthy = sequences
+            .get(&request_ids[1])
+            .expect("later healthy participant must remain active");
+        assert_eq!(
+            healthy.generated_tokens,
+            vec![initial_tokens[1], TokenId::new(6)]
+        );
+        assert_eq!(healthy.model_cache_id(), Some(cache_ids[1].as_str()));
+        assert_eq!(healthy.tokens_this_iteration, 1);
+        assert_eq!(healthy.phase, RequestPhase::Decoding);
+        drop(sequences);
+        assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
+        assert_eq!(engine.inner.total_decode_tokens.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.trace_snapshot().active_len, 1);
+    }
+}

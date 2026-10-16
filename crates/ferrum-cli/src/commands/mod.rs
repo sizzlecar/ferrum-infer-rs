@@ -39,6 +39,21 @@ impl InvocationPreparationStrategyArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SamplingReadbackModeArg {
+    Uniform,
+    Participant,
+}
+
+impl SamplingReadbackModeArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Uniform => ferrum_types::SamplingReadbackMode::Uniform.as_runtime_value(),
+            Self::Participant => ferrum_types::SamplingReadbackMode::Participant.as_runtime_value(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProgramBindingUploadStrategyArg {
     Sparse,
     UniformLivePrefix,
@@ -365,6 +380,13 @@ mod tests {
             }
         }
 
+        fn sampling_readback_mode(self) -> Option<SamplingReadbackModeArg> {
+            match self.command {
+                TestCommand::Run(command) => command.sampling_readback_mode,
+                TestCommand::Serve(command) => command.sampling_readback_mode,
+            }
+        }
+
         fn execution(self) -> Option<PrefillDecodeExecutionArg> {
             match self.command {
                 TestCommand::Run(command) => command.prefill_decode_execution,
@@ -567,6 +589,40 @@ mod tests {
             .is_err());
         }
     }
+    #[test]
+    fn sampling_readback_cli_accepts_only_explicit_values_for_both_entrypoints() {
+        for command in ["run", "serve"] {
+            assert_eq!(
+                TestCli::try_parse_from(["ferrum", command, "test-model"])
+                    .unwrap()
+                    .sampling_readback_mode(),
+                None
+            );
+            for (value, expected) in [
+                ("uniform", SamplingReadbackModeArg::Uniform),
+                ("participant", SamplingReadbackModeArg::Participant),
+            ] {
+                let parsed = TestCli::try_parse_from([
+                    "ferrum",
+                    command,
+                    "test-model",
+                    "--sampling-readback-mode",
+                    value,
+                ])
+                .unwrap();
+                assert_eq!(parsed.sampling_readback_mode(), Some(expected));
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--sampling-readback-mode",
+                "automatic",
+            ])
+            .is_err());
+        }
+    }
+
     #[test]
     fn invocation_preparation_cli_values_and_default_match_for_run_and_serve() {
         for command in ["run", "serve"] {

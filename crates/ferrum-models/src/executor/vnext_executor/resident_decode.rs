@@ -253,7 +253,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         wave: PreparedDispatch<R>,
         kind: VNextExecutionWaveKind,
-        output_mode: VNextProductOutputMode,
+        output_modes: &ProductReadbackModes,
         mask_plans: &[VNextProductTokenMaskSubmissionPlan],
         cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
         pending_install: &mut Option<Arc<ResidentDecodeProgram<R>>>,
@@ -265,7 +265,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     participants,
                     wave,
                     kind,
-                    output_mode,
+                    output_modes,
                     mask_plans,
                     cold_wave,
                     reservation,
@@ -273,8 +273,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         };
+        if output_modes.uniform() != Some(VNextProductOutputMode::GreedyToken) {
+            return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(
+                "resident decode requires uniform greedy readbacks".to_owned(),
+            ));
+        }
         let uploads =
-            match self.prepare_participant_uploads(participants, kind, output_mode, mask_plans) {
+            match self.prepare_participant_uploads(participants, kind, output_modes, mask_plans) {
                 Ok(uploads) => uploads,
                 Err(error) => {
                     return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(

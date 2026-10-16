@@ -12,6 +12,28 @@ struct ArgmaxPartial {
     uint index;
 };
 
+// Finite IEEE total order matches the host sampler, including -0 < +0.
+inline uint vnext_argmax_order_key(float value) {
+    const uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) != 0 ? ~bits : (bits ^ 0x80000000u);
+}
+
+inline bool vnext_argmax_is_finite(float value) {
+    return (as_type<uint>(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+inline float vnext_argmax_from_order_key(uint key) {
+    const uint bits = (key & 0x80000000u) != 0 ? (key ^ 0x80000000u) : ~key;
+    return as_type<float>(bits);
+}
+
+inline bool vnext_argmax_better(float value, uint index, float maximum, uint selected) {
+    const uint order = vnext_argmax_order_key(value);
+    const uint selected_order = vnext_argmax_order_key(maximum);
+    return index != 0xffffffffu && (selected == 0xffffffffu ||
+        order > selected_order || (order == selected_order && index < selected));
+}
+
 struct EmbeddingParams {
     uint token_count;
     uint hidden_size;
@@ -342,20 +364,24 @@ kernel void vnext_last_token_masked_argmax_f16(
             continue;
         }
         const float value = float(apply_penalty ? scratch[token] : logits[token]);
-        if (!isfinite(value)) {
+        if (!vnext_argmax_is_finite(value)) {
             continue;
         }
-        if (local_index < 0 || value > local_maximum ||
-            (value == local_maximum && int(token) < local_index)) {
+        if (vnext_argmax_better(value, token, local_maximum, uint(local_index))) {
             local_maximum = value;
             local_index = int(token);
         }
     }
 
-    const float simd_maximum = simd_max(local_maximum);
-    const int simd_index = simd_min(
-        local_index >= 0 && local_maximum == simd_maximum ? local_index : 0x7fffffff
+    const uint simd_order = simd_max(
+        local_index >= 0 ? vnext_argmax_order_key(local_maximum) : 0u
     );
+    const int simd_index = simd_min(
+        local_index >= 0 && vnext_argmax_order_key(local_maximum) == simd_order
+            ? local_index : 0x7fffffff
+    );
+    const float simd_maximum = simd_index == 0x7fffffff
+        ? -INFINITY : vnext_argmax_from_order_key(simd_order);
     threadgroup float partial_maximum[THREADS_PER_GROUP / 32];
     threadgroup int partial_index[THREADS_PER_GROUP / 32];
     if (simd_lane == 0) {
@@ -371,8 +397,8 @@ kernel void vnext_last_token_masked_argmax_f16(
             const float candidate_maximum = partial_maximum[group];
             const int candidate_index = partial_index[group];
             if (candidate_index != 0x7fffffff &&
-                (index == 0x7fffffff || candidate_maximum > maximum ||
-                 (candidate_maximum == maximum && candidate_index < index))) {
+                vnext_argmax_better(candidate_maximum, uint(candidate_index), maximum,
+                    index == 0x7fffffff ? 0xffffffffu : uint(index))) {
                 maximum = candidate_maximum;
                 index = candidate_index;
             }
@@ -618,20 +644,24 @@ kernel void vnext_last_token_masked_argmax_f32(
             continue;
         }
         const float value = apply_penalty ? scratch[token] : logits[token];
-        if (!isfinite(value)) {
+        if (!vnext_argmax_is_finite(value)) {
             continue;
         }
-        if (local_index < 0 || value > local_maximum ||
-            (value == local_maximum && int(token) < local_index)) {
+        if (vnext_argmax_better(value, token, local_maximum, uint(local_index))) {
             local_maximum = value;
             local_index = int(token);
         }
     }
 
-    const float simd_maximum = simd_max(local_maximum);
-    const int simd_index = simd_min(
-        local_index >= 0 && local_maximum == simd_maximum ? local_index : 0x7fffffff
+    const uint simd_order = simd_max(
+        local_index >= 0 ? vnext_argmax_order_key(local_maximum) : 0u
     );
+    const int simd_index = simd_min(
+        local_index >= 0 && vnext_argmax_order_key(local_maximum) == simd_order
+            ? local_index : 0x7fffffff
+    );
+    const float simd_maximum = simd_index == 0x7fffffff
+        ? -INFINITY : vnext_argmax_from_order_key(simd_order);
     threadgroup float partial_maximum[THREADS_PER_GROUP / 32];
     threadgroup int partial_index[THREADS_PER_GROUP / 32];
     if (simd_lane == 0) {
@@ -647,8 +677,8 @@ kernel void vnext_last_token_masked_argmax_f32(
             const float candidate_maximum = partial_maximum[group];
             const int candidate_index = partial_index[group];
             if (candidate_index != 0x7fffffff &&
-                (index == 0x7fffffff || candidate_maximum > maximum ||
-                 (candidate_maximum == maximum && candidate_index < index))) {
+                vnext_argmax_better(candidate_maximum, uint(candidate_index), maximum,
+                    index == 0x7fffffff ? 0xffffffffu : uint(index))) {
                 maximum = candidate_maximum;
                 index = candidate_index;
             }
@@ -679,9 +709,7 @@ kernel void vnext_masked_argmax_finalize(
     uint selected = 0xffffffffu;
     for (uint group = 0; group < ARGMAX_PARTITIONS; ++group) {
         const ArgmaxPartial part = parts[group];
-        if (part.index != 0xffffffffu && (selected == 0xffffffffu ||
-            part.maximum > maximum ||
-            (part.maximum == maximum && part.index < selected))) {
+        if (vnext_argmax_better(part.maximum, part.index, maximum, selected)) {
             maximum = part.maximum;
             selected = part.index;
         }

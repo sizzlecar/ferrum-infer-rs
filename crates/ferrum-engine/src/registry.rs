@@ -902,6 +902,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
         validate_invocation_preparation_strategy(config, false)?;
+        validate_sampling_readback_mode(config, false)?;
         let vocab_size = config
             .engine_config
             .model
@@ -1189,6 +1190,18 @@ fn validate_invocation_preparation_strategy(
     Ok(())
 }
 
+fn validate_sampling_readback_mode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
+    if config.engine_config.runtime.sampling_readback_mode
+        == ferrum_types::SamplingReadbackMode::Participant
+        && !plan_runtime
+    {
+        return Err(FerrumError::unsupported(
+            "participant sampling readback requires a plan runtime",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_program_binding_upload_strategy(
     config: &ComponentConfig,
     plan_runtime: bool,
@@ -1416,6 +1429,7 @@ fn create_registered_vnext_executor(
     validate_segment_binding_owner_view_mode(config, true)?;
     validate_program_binding_upload_strategy(config, true)?;
     validate_invocation_preparation_strategy(config, true)?;
+    validate_sampling_readback_mode(config, true)?;
     validate_registered_vnext_backend(
         registration.execution_kind(),
         &config.device,
@@ -1624,6 +1638,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         validate_segment_binding_owner_view_mode(config, true)?;
         validate_program_binding_upload_strategy(config, true)?;
         validate_invocation_preparation_strategy(config, true)?;
+        validate_sampling_readback_mode(config, true)?;
         // Try to load model from path
         let checkpoint_capture_enabled = config
             .engine_config
@@ -1711,6 +1726,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
         validate_invocation_preparation_strategy(config, false)?;
+        validate_sampling_readback_mode(config, false)?;
         if checkpoint_capture_enabled {
             return Err(FerrumError::unsupported(
                 "vNext checkpoint capture requires a registered vNext model package",
@@ -2208,6 +2224,32 @@ mod tests {
             ferrum_types::ProgramBindingUploadStrategy::CompactScatter;
         validate_invocation_preparation_strategy(&config, true).unwrap();
         assert!(validate_invocation_preparation_strategy(&config, false).is_err());
+    }
+
+    #[test]
+    fn sampling_readback_participant_requires_a_plan_factory_before_loading() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        validate_sampling_readback_mode(&config, false).unwrap();
+        config.engine_config.runtime.sampling_readback_mode =
+            ferrum_types::SamplingReadbackMode::Participant;
+        validate_sampling_readback_mode(&config, true).unwrap();
+        assert!(validate_sampling_readback_mode(&config, false).is_err());
+        for device in [Device::CPU, Device::CUDA(0)] {
+            config.device = device;
+            let error = tokio_test::block_on(StubExecutorFactory.create(&config))
+                .err()
+                .unwrap();
+            assert!(error
+                .to_string()
+                .contains("participant sampling readback requires a plan runtime"));
+        }
+        config.device = Device::CPU;
+        let error = tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("participant sampling readback requires a plan runtime"));
     }
 
     #[test]

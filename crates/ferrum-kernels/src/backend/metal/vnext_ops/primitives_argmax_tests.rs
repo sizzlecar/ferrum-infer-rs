@@ -126,8 +126,29 @@ impl Fixture {
             // F16 repetition processing must round before the argmax tie.
             logits[300] = round(1.0 / 1.1);
         }
+        if case >= 8 {
+            logits.fill(-2.0);
+            let (negative, positive) = match case {
+                8 => (31, 32),    // across SIMD groups
+                9 => (0, 256),    // across iterations of one scalar thread
+                10 => (255, 256), // across partition finalization
+                11 => (32, 31),   // earlier positive zero remains selected
+                12 => (31, 32),   // positive zero is excluded by its mask
+                _ => unreachable!(),
+            };
+            logits[negative] = -0.0;
+            logits[positive] = 0.0;
+            if case == 10 {
+                logits[vocab - 1] = 0.0;
+            }
+            if case == 12 {
+                mask[positive] = 0;
+            }
+        }
         let ids = [255_u32, 256, (vocab - 1) as u32, u32::MAX];
-        let penalty = if case == 7 {
+        let penalty = if case >= 8 {
+            1.0_f32
+        } else if case == 7 {
             1.1_f32
         } else if case >= 3 {
             4.0_f32
@@ -155,14 +176,15 @@ impl Fixture {
                 }
             }
         }
-        let mut expected = u32::MAX;
-        let mut maximum = f32::NEG_INFINITY;
-        for (token, (&value, &valid)) in processed.iter().zip(&mask).enumerate() {
-            if valid != 0 && value.is_finite() && (expected == u32::MAX || value > maximum) {
-                expected = token as u32;
-                maximum = value;
-            }
-        }
+        let expected = processed
+            .iter()
+            .zip(&mask)
+            .enumerate()
+            .filter(|(_, (value, valid))| **valid != 0 && value.is_finite())
+            .max_by(|(left_id, (left, _)), (right_id, (right, _))| {
+                left.total_cmp(right).then_with(|| right_id.cmp(left_id))
+            })
+            .map_or(u32::MAX, |(id, _)| id as u32);
         let encoded = if dtype == ElementType::F16 {
             logits
                 .iter()
@@ -309,7 +331,7 @@ fn parallel_argmax_preserves_masks_ties_nonfinite_penalties_and_regions_on_metal
     let queue = runtime.device().new_command_queue();
     for dtype in [ElementType::F16, ElementType::F32] {
         for vocab in [8191, 8192, 8193, 248320] {
-            for case in 0..8 {
+            for case in 0..13 {
                 let fixture = Fixture::new(runtime, vocab, dtype, case);
                 fixture.run(&pipelines, &queue, false, 1);
                 fixture.run(&pipelines, &queue, true, 1);

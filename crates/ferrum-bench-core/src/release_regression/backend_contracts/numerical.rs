@@ -158,6 +158,8 @@ fn names(backend: Backend) -> Vec<String> {
                 "token_io_bounds_preserve_nonzero_spans_and_native_launch_capacity",
             ]),
             ("selection::tests", &["masked_selection_matches_scalar_semantics_and_preserves_logits_on_cuda"]),
+            ("selection::tests::partitioned", &["partitioned_argmax_matches_scalar_and_old_kernel_with_guarded_windows_on_cuda"]),
+            ("selection::tests::batched", &["batched_argmax_matches_individual_rows_and_captured_graph_on_cuda"]),
             ("transformer::native_swiglu::tests", &[
                 "native_swiglu_mixed_matrices_match_stage_oracles_on_cuda",
                 "native_swiglu_scratch_accounts_only_for_bounded_activations",

@@ -201,6 +201,22 @@ struct VNextArgmaxPartial {
 
 static constexpr int VNEXT_ARGMAX_PARTITIONS = 32;
 
+// Finite IEEE total order matches the host sampler, including -0 < +0.
+// Candidate values have already passed the finite gate in the row scan.
+__device__ __forceinline__ unsigned int vnext_argmax_order_key(float value) {
+    const unsigned int bits = __float_as_uint(value);
+    return (bits & 0x80000000u) != 0 ? ~bits : (bits ^ 0x80000000u);
+}
+
+__device__ __forceinline__ bool vnext_argmax_better(
+    float value, int index, float maximum, int selected
+) {
+    const unsigned int order = vnext_argmax_order_key(value);
+    const unsigned int selected_order = vnext_argmax_order_key(maximum);
+    return index >= 0 && (selected < 0 || order > selected_order ||
+        (order == selected_order && index < selected));
+}
+
 template<typename Logit, bool Partitioned = false>
 __device__ void vnext_masked_argmax_preserving_logits(
     const Logit* __restrict__ logits,
@@ -260,7 +276,7 @@ __device__ void vnext_masked_argmax_preserving_logits(
         if (!isfinite(value)) {
             continue;
         }
-        if (local_idx < 0 || value > local_max || (value == local_max && token < local_idx)) {
+        if (vnext_argmax_better(value, token, local_max, local_idx)) {
             local_max = value;
             local_idx = token;
         }
@@ -270,8 +286,7 @@ __device__ void vnext_masked_argmax_preserving_logits(
     for (int offset = 16; offset > 0; offset /= 2) {
         const float other_max = __shfl_xor_sync(mask, local_max, offset);
         const int other_idx = __shfl_xor_sync(mask, local_idx, offset);
-        if (other_idx >= 0 && (local_idx < 0 || other_max > local_max ||
-                              (other_max == local_max && other_idx < local_idx))) {
+        if (vnext_argmax_better(other_max, other_idx, local_max, local_idx)) {
             local_max = other_max;
             local_idx = other_idx;
         }
@@ -294,8 +309,7 @@ __device__ void vnext_masked_argmax_preserving_logits(
         for (int offset = 16; offset > 0; offset /= 2) {
             const float other_max = __shfl_xor_sync(mask, local_max, offset);
             const int other_idx = __shfl_xor_sync(mask, local_idx, offset);
-            if (other_idx >= 0 && (local_idx < 0 || other_max > local_max ||
-                                  (other_max == local_max && other_idx < local_idx))) {
+            if (vnext_argmax_better(other_max, other_idx, local_max, local_idx)) {
                 local_max = other_max;
                 local_idx = other_idx;
             }
@@ -382,8 +396,7 @@ __device__ void vnext_masked_argmax_finalize(
     int selected = -1;
     for (int group = 0; group < VNEXT_ARGMAX_PARTITIONS; ++group) {
         const VNextArgmaxPartial part = parts[group];
-        if (part.index >= 0 && (selected < 0 || part.maximum > maximum ||
-            (part.maximum == maximum && part.index < selected))) {
+        if (vnext_argmax_better(part.maximum, part.index, maximum, selected)) {
             maximum = part.maximum;
             selected = part.index;
         }
