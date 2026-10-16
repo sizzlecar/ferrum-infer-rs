@@ -17,6 +17,7 @@ pub struct HuggingFaceTokenizer {
     info: TokenizerInfo,
     id_to_token: Vec<Option<String>>,
     byte_level_decoder: bool,
+    byte_level_decode_vocab: Option<ByteLevelDecodeVocabulary>,
     /// Semantic-marker token ids mapped to the canonical text emitted in
     /// their place. Some vocabs mark protocol controls `special: true`
     /// (Magistral's `[THINK]`/`[/THINK]`), so a skip-special decode would
@@ -138,6 +139,7 @@ impl HuggingFaceTokenizer {
 
         let semantic_markers = probe_semantic_markers(&tokenizer);
         let byte_level_decoder = tokenizer.get_decoder().is_some_and(decoder_uses_byte_level);
+        let byte_level_decode_vocab = ByteLevelDecodeVocabulary::new(&tokenizer, id_to_token.len());
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -145,9 +147,19 @@ impl HuggingFaceTokenizer {
             info,
             id_to_token,
             byte_level_decoder,
+            byte_level_decode_vocab,
             semantic_markers,
             decode_cache: RwLock::new(DecodeCache::new(1000)),
         })
+    }
+
+    fn decode_segment(&self, token_ids: &[u32], skip_special: bool) -> Result<String> {
+        if let Some(vocab) = &self.byte_level_decode_vocab {
+            return Ok(vocab.decode(token_ids, skip_special));
+        }
+        self.tokenizer
+            .decode(token_ids, skip_special)
+            .map_err(|e| ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e)))
     }
 
     /// Create from file path. Special tokens are resolved from the sibling
@@ -259,9 +271,7 @@ impl Tokenizer for HuggingFaceTokenizer {
                     self.semantic_markers.iter().find(|(mid, _)| mid == id)
                 {
                     if !segment.is_empty() {
-                        out.push_str(&self.tokenizer.decode(&segment, true).map_err(|e| {
-                            ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e))
-                        })?);
+                        out.push_str(&self.decode_segment(&segment, true)?);
                         segment.clear();
                     }
                     out.push_str(canonical);
@@ -270,19 +280,12 @@ impl Tokenizer for HuggingFaceTokenizer {
                 }
             }
             if !segment.is_empty() {
-                out.push_str(&self.tokenizer.decode(&segment, true).map_err(|e| {
-                    ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e))
-                })?);
+                out.push_str(&self.decode_segment(&segment, true)?);
             }
             return Ok(out);
         }
 
-        let text = self
-            .tokenizer
-            .decode(&token_ids, skip_special)
-            .map_err(|e| ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e)))?;
-
-        Ok(text)
+        self.decode_segment(&token_ids, skip_special)
     }
 
     fn decode_incremental(&self, prev: &[TokenId], next: TokenId) -> Result<String> {
@@ -465,6 +468,67 @@ impl TokenizerFactory for HuggingFaceTokenizerFactory {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+struct ByteLevelDecodeToken {
+    bytes: Box<[u8]>,
+    special: bool,
+}
+
+/// Immutable vocabulary facts for a direct HF ByteLevel decoder. Decode still
+/// consumes the complete token history and performs UTF-8 replacement once per
+/// segment, so fragments spanning tokens and semantic-marker flushes are intact.
+struct ByteLevelDecodeVocabulary {
+    tokens: Vec<Option<ByteLevelDecodeToken>>,
+}
+
+impl ByteLevelDecodeVocabulary {
+    fn new(tokenizer: &HfTokenizer, existing_id_slots: usize) -> Option<Self> {
+        // A Sequence containing ByteLevel may apply additional text transforms.
+        if !matches!(tokenizer.get_decoder(), Some(DecoderWrapper::ByteLevel(_))) {
+            return None;
+        }
+        let model_vocab = tokenizer.get_vocab(false);
+        let added = tokenizer.get_added_vocabulary();
+        let max_id = model_vocab
+            .values()
+            .chain(added.get_added_tokens_decoder().keys())
+            .copied()
+            .max();
+        // Added vocabulary can hide a model token's much larger ID from
+        // get_vocab(true). Never expand the existing dense reverse table's
+        // domain for this optimization; HF still decodes such IDs exactly.
+        if max_id.is_some_and(|id| id as u64 >= existing_id_slots as u64) {
+            return None;
+        }
+        let tokens = max_id
+            .map(|max_id| {
+                (0..=max_id)
+                    .map(|id| {
+                        // Preserve added-vocabulary precedence, including an
+                        // added token shadowing a model token with the same ID.
+                        tokenizer.id_to_token(id).map(|token| ByteLevelDecodeToken {
+                            special: added.is_special_token(&token),
+                            bytes: byte_level_token_bytes(&token).into_boxed_slice(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self { tokens })
+    }
+
+    fn decode(&self, token_ids: &[u32], skip_special: bool) -> String {
+        let mut bytes = Vec::with_capacity(token_ids.len());
+        for &id in token_ids {
+            if let Some(Some(token)) = self.tokens.get(id as usize) {
+                if !skip_special || !token.special {
+                    bytes.extend_from_slice(&token.bytes);
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
 
 fn build_id_to_token(tokenizer: &HfTokenizer) -> Vec<Option<String>> {
     let vocab = tokenizer.get_vocab(true);
@@ -690,6 +754,10 @@ fn token_from_config_value(
     };
     tokenizer.token_to_id(text).map(TokenId::new)
 }
+
+#[cfg(test)]
+#[path = "huggingface/byte_level_decode_tests.rs"]
+mod byte_level_decode_tests;
 
 #[cfg(test)]
 mod tests {
