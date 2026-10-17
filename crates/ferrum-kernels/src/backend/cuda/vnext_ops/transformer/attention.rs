@@ -1641,8 +1641,7 @@ fn attention_transfers_per_launch(
     let qkvzba = qkvzba.marlin_workspace_zero_count()?;
     let output = output.marlin_workspace_zero_count()?;
     2_u64
-        .checked_add(qkvzba)
-        .and_then(|count| count.checked_add(output))
+        .checked_add(u64::from(qkvzba != 0 || output != 0))
         .ok_or_else(|| "attention transfer attribution overflows".to_owned())
 }
 
@@ -2379,6 +2378,17 @@ fn enqueue_attention(
             "recurrent attention scratch is smaller than its admitted estimate",
         ));
     }
+    #[cfg(feature = "vllm-marlin")]
+    let marlin_workspace = match projection {
+        AttentionProjection::MarlinFp8 { runtime, .. }
+        | AttentionProjection::CompressedTensorsMarlin { runtime } => {
+            let offset = layout.projection_workspace.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("attention lacks its Marlin workspace")
+            })?;
+            Some(runtime.invocation_workspace(stream, scratch, offset)?)
+        }
+        _ => None,
+    };
     let binding = &regions[shared.binding];
     let state_binding = scratch_pointer(binding.device_ptr(), launch.state_binding_offset)?;
     let scratch_base = scratch.device_ptr();
@@ -2468,6 +2478,8 @@ fn enqueue_attention(
         normalized,
         qkvzba,
         scratch,
+        #[cfg(feature = "vllm-marlin")]
+        marlin_workspace.as_ref(),
         layout,
         regions,
         launch.tokens_i32,
@@ -2577,6 +2589,8 @@ fn enqueue_attention(
         z,
         projected,
         scratch,
+        #[cfg(feature = "vllm-marlin")]
+        marlin_workspace.as_ref(),
         layout,
         regions,
         launch.tokens_i32,
@@ -2610,6 +2624,7 @@ fn launch_attention_projection(
     input: u64,
     output: u64,
     scratch: &CudaBufferRegion,
+    #[cfg(feature = "vllm-marlin")] marlin_workspace: Option<&super::MarlinInvocationWorkspace<'_>>,
     layout: ScratchLayout,
     regions: &[CudaBufferRegion],
     rows: i32,
@@ -2752,22 +2767,23 @@ fn launch_attention_projection(
                     "{operation} Marlin FP8 workspace exceeds attention scratch"
                 )));
             }
-            runtime.launch(
-                crate::backend::cuda::vllm_marlin::MarlinF16WeightType::E4M3Fn,
-                stream,
-                input,
-                regions[packed_region].device_ptr(),
-                regions[scales_region].device_ptr(),
-                None,
-                output,
-                scratch_pointer(scratch.device_ptr(), workspace_offset)?,
-                workspace_bytes,
-                rows,
-                output_features,
-                input_features,
-                group_size,
-                operation,
-            )
+            marlin_workspace
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("missing invocation Marlin workspace")
+                })?
+                .launch(
+                    crate::backend::cuda::vllm_marlin::MarlinF16WeightType::E4M3Fn,
+                    input,
+                    regions[packed_region].device_ptr(),
+                    regions[scales_region].device_ptr(),
+                    None,
+                    output,
+                    rows,
+                    output_features,
+                    input_features,
+                    group_size,
+                    operation,
+                )
         }
         #[cfg(feature = "vllm-marlin")]
         SharedProjectionWeight::SegmentedMarlin { parts, part_count } => {
@@ -2808,7 +2824,6 @@ fn launch_attention_projection(
                     "{operation} segmented Marlin workspace exceeds attention scratch"
                 )));
             }
-            let workspace = scratch_pointer(scratch.device_ptr(), workspace_offset)?;
             let direct = part_count == 1;
             let (staging_base, staging_capacity) = if direct {
                 (0, 0)
@@ -2916,22 +2931,25 @@ fn launch_attention_projection(
                                 "{operation} contains an FP8 segment under another Marlin ABI"
                             )));
                         }
-                        runtime.launch(
-                            MarlinF16WeightType::E4M3Fn,
-                            stream,
-                            input,
-                            regions[packed_region].device_ptr(),
-                            regions[scales_region].device_ptr(),
-                            None,
-                            destination,
-                            workspace,
-                            workspace_bytes,
-                            rows,
-                            part_output_features,
-                            input_features,
-                            group_size,
-                            operation,
-                        )?;
+                        marlin_workspace
+                            .ok_or_else(|| {
+                                CudaDeviceRuntimeError::contract(
+                                    "missing invocation Marlin workspace",
+                                )
+                            })?
+                            .launch(
+                                MarlinF16WeightType::E4M3Fn,
+                                input,
+                                regions[packed_region].device_ptr(),
+                                regions[scales_region].device_ptr(),
+                                None,
+                                destination,
+                                rows,
+                                part_output_features,
+                                input_features,
+                                group_size,
+                                operation,
+                            )?;
                     }
                     SegmentedProjectionPart::CompressedTensorsMarlin {
                         packed_region,
@@ -2948,22 +2966,25 @@ fn launch_attention_projection(
                                 "{operation} contains a compressed-tensors segment under another Marlin ABI"
                             )));
                         }
-                        runtime.launch(
-                            MarlinF16WeightType::U4,
-                            stream,
-                            input,
-                            regions[packed_region].device_ptr(),
-                            regions[scales_region].device_ptr(),
-                            Some(regions[zero_points_region].device_ptr()),
-                            destination,
-                            workspace,
-                            workspace_bytes,
-                            rows,
-                            part_output_features,
-                            input_features,
-                            group_size,
-                            operation,
-                        )?;
+                        marlin_workspace
+                            .ok_or_else(|| {
+                                CudaDeviceRuntimeError::contract(
+                                    "missing invocation Marlin workspace",
+                                )
+                            })?
+                            .launch(
+                                MarlinF16WeightType::U4,
+                                input,
+                                regions[packed_region].device_ptr(),
+                                regions[scales_region].device_ptr(),
+                                Some(regions[zero_points_region].device_ptr()),
+                                destination,
+                                rows,
+                                part_output_features,
+                                input_features,
+                                group_size,
+                                operation,
+                            )?;
                     }
                 }
                 if !direct {
@@ -4524,7 +4545,7 @@ mod tests {
         );
         assert_eq!(qkvzba.marlin_workspace_zero_count().unwrap(), 2);
         assert_eq!(output.marlin_workspace_zero_count().unwrap(), 1);
-        assert_eq!(attention_transfers_per_launch(&qkvzba, &output).unwrap(), 5);
+        assert_eq!(attention_transfers_per_launch(&qkvzba, &output).unwrap(), 3);
 
         let canonical = qkvzba
             .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))
