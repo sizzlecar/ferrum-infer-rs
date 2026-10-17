@@ -387,7 +387,7 @@ fn marlin_fp8_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on
             // real channelwise preparer and exact group128 scale-grid helper,
             // with distinct nonzero scales across K groups and output blocks.
             let scales = if group_size == -1 {
-                prepared.scales
+                prepared.scales().to_vec()
             } else {
                 let inverse_scales = (0..(n / 128) * (k / 128))
                     .flat_map(|index| {
@@ -398,7 +398,7 @@ fn marlin_fp8_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on
             };
             // i32 guards keep the actual Marlin tile pointer 16-byte aligned.
             let packed = prepared
-                .packed_values
+                .packed_values()
                 .chunks_exact(4)
                 .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>();
