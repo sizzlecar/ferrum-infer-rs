@@ -12,11 +12,17 @@ Rust 编写的本地大模型推理引擎，一个二进制提供终端对话和
 
 核心目标是在满足延迟 SLO 的前提下，最大化输出吞吐：
 
-$$
-\max\;\text{输出 token/s}\quad\text{s.t.}\quad Q_{p_x}(x)\le S_x,\quad x\in\{\mathrm{TTFT},\mathrm{TPOT},\mathrm{ITL}\}
-$$
+固定硬件、模型及负载口径（请求集与输出策略），在预设 SLO 下优化执行策略 $\pi$。
 
-其中 TTFT 是首字延迟，TPOT 是平均输出 token 间隔，ITL 是相邻可见文本更新的间隔；分位数和阈值按负载预先约定。这是项目目标，当前结果尚未全部达成。
+$$
+\begin{gathered}
+\max_{\pi}\;\frac{\text{输出 token 总数}(\pi)}{\text{墙钟秒数}(\pi)} \\
+\text{s.t.} \\
+Q_{p_{\mathrm{TTFT}}}(\mathrm{TTFT}_{\pi})\le S_{\mathrm{TTFT}} \\
+Q_{p_{\mathrm{TPOT}}}(\mathrm{TPOT}_{\pi})\le S_{\mathrm{TPOT}} \\
+Q_{p_{\mathrm{ITL}}}(\mathrm{ITL}_{\pi})\le S_{\mathrm{ITL}}
+\end{gathered}
+$$
 
 ## 安装与使用
 

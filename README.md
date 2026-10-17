@@ -12,13 +12,17 @@ Rust LLM inference and an OpenAI-compatible server in one binary, without a Pyth
 
 **Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.**
 
-$$
-\max\;\frac{\text{output tokens}}{\text{elapsed seconds}}
-\quad\text{subject to}\quad
-Q_p(TTFT)\le S_{TTFT},\;Q_p(TPOT)\le S_{TPOT},\;Q_p(ITL)\le S_{ITL}.
-$$
+For fixed hardware, model, requests and output policy, optimize execution policy $\pi$ under predeclared SLOs.
 
-TTFT: time to first visible text. TPOT: time per output token. ITL: interval between non-empty visible text updates. Set percentile $p$ and limits $S$ before measuring. SLO compliance remains a goal.
+$$
+\begin{gathered}
+\max_{\pi}\;\frac{\text{total output tokens}(\pi)}{\text{wall-clock seconds}(\pi)} \\
+\text{s.t.} \\
+Q_{p_{\mathrm{TTFT}}}(\mathrm{TTFT}_{\pi})\le S_{\mathrm{TTFT}} \\
+Q_{p_{\mathrm{TPOT}}}(\mathrm{TPOT}_{\pi})\le S_{\mathrm{TPOT}} \\
+Q_{p_{\mathrm{ITL}}}(\mathrm{ITL}_{\pi})\le S_{\mathrm{ITL}}
+\end{gathered}
+$$
 
 ## Install and run
 
