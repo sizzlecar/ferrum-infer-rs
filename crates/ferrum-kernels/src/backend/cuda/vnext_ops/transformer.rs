@@ -2033,6 +2033,19 @@ pub(super) struct MarlinProjectionRuntime {
     device_ordinal: i32,
 }
 
+/// One ordered invocation's lock workspace. Construct this inside the enqueue
+/// closure so every capture records its own first reset. Successful Marlin
+/// kernels restore their locks; scratch contents outside this scope are unknown.
+#[cfg(feature = "vllm-marlin")]
+struct MarlinInvocationWorkspace<'a> {
+    runtime: MarlinProjectionRuntime,
+    stream: &'a CudaStream,
+    pointer: u64,
+    length_bytes: u64,
+    initialized: std::cell::Cell<bool>,
+    _region: Option<&'a CudaBufferRegion>,
+}
+
 #[cfg(feature = "vllm-marlin")]
 fn marlin_num_groups(
     input_features: i32,
@@ -2093,6 +2106,36 @@ impl MarlinProjectionRuntime {
             .ok_or_else(|| "CUDA Marlin FP8 workspace size overflows".to_owned())
     }
 
+    fn invocation_workspace<'a>(
+        self,
+        stream: &'a CudaStream,
+        region: &'a CudaBufferRegion,
+        offset: u64,
+    ) -> Result<MarlinInvocationWorkspace<'a>, CudaDeviceRuntimeError> {
+        let length_bytes = self
+            .workspace_bytes()
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        let end = offset.checked_add(length_bytes).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("Marlin invocation workspace range overflows")
+        })?;
+        if end > region.length_bytes() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "Marlin invocation workspace exceeds its retained scratch region",
+            ));
+        }
+        let pointer = region.device_ptr().checked_add(offset).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("Marlin invocation workspace pointer overflows")
+        })?;
+        Ok(MarlinInvocationWorkspace {
+            runtime: self,
+            stream,
+            pointer,
+            length_bytes,
+            initialized: std::cell::Cell::new(false),
+            _region: Some(region),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn launch(
         self,
@@ -2111,6 +2154,50 @@ impl MarlinProjectionRuntime {
         group_size: i32,
         operation: &'static str,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        // The standalone interface continues to accept dirty scratch on every call.
+        MarlinInvocationWorkspace {
+            runtime: self,
+            stream,
+            pointer: workspace,
+            length_bytes: workspace_length_bytes,
+            initialized: std::cell::Cell::new(false),
+            _region: None,
+        }
+        .launch(
+            weight_type,
+            input,
+            packed_weight,
+            scales,
+            zero_points,
+            output,
+            rows,
+            output_features,
+            input_features,
+            group_size,
+            operation,
+        )
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+impl MarlinInvocationWorkspace<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        weight_type: MarlinF16WeightType,
+        input: u64,
+        packed_weight: u64,
+        scales: u64,
+        zero_points: Option<u64>,
+        output: u64,
+        rows: i32,
+        output_features: i32,
+        input_features: i32,
+        group_size: i32,
+        operation: &'static str,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let stream = self.stream;
+        let workspace = self.pointer;
         if weight_type == MarlinF16WeightType::E4M3Fn {
             let output_features = usize::try_from(output_features).map_err(|_| {
                 CudaDeviceRuntimeError::contract(format!(
@@ -2130,9 +2217,10 @@ impl MarlinProjectionRuntime {
         }
         let num_groups = marlin_num_groups(input_features, group_size, operation)?;
         let required_workspace = self
+            .runtime
             .workspace_bytes()
             .map_err(CudaDeviceRuntimeError::contract)?;
-        if workspace_length_bytes < required_workspace {
+        if self.length_bytes < required_workspace {
             return Err(CudaDeviceRuntimeError::contract(format!(
                 "{operation} workspace differs from its admitted estimate"
             )));
@@ -2140,15 +2228,18 @@ impl MarlinProjectionRuntime {
         let workspace_bytes = usize::try_from(required_workspace).map_err(|_| {
             CudaDeviceRuntimeError::contract(format!("{operation} workspace exceeds usize"))
         })?;
-        unsafe {
-            cudarc::driver::result::memset_d8_async(
-                workspace,
-                0,
-                workspace_bytes,
-                stream.cu_stream(),
-            )
+        if !self.initialized.get() {
+            unsafe {
+                cudarc::driver::result::memset_d8_async(
+                    workspace,
+                    0,
+                    workspace_bytes,
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|error| CudaDeviceRuntimeError::driver(operation, error))?;
+            self.initialized.set(true);
         }
-        .map_err(|error| CudaDeviceRuntimeError::driver(operation, error))?;
         unsafe {
             launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
                 weight_type,
@@ -2175,9 +2266,9 @@ impl MarlinProjectionRuntime {
                     group_size,
                 },
                 execution: MarlinMmExecution {
-                    device: self.device_ordinal,
+                    device: self.runtime.device_ordinal,
                     stream: stream.cu_stream(),
-                    sms: self.multiprocessor_count,
+                    sms: self.runtime.multiprocessor_count,
                     has_act_order: false,
                     is_k_full: true,
                     use_atomic_add: false,
@@ -2940,7 +3031,7 @@ fn encode_compressed_tensors_dense_swiglu(
         activation_elements,
         activation_bytes,
         workspace_offset,
-        workspace_bytes,
+        workspace_bytes: _,
         required_bytes: required_scratch_bytes,
     } = marlin_swiglu_scratch_layout(
         tokens,
@@ -3028,14 +3119,8 @@ fn encode_compressed_tensors_dense_swiglu(
             let activation = up_output.checked_add(activation_bytes).ok_or_else(|| {
                 CudaDeviceRuntimeError::contract("compressed-tensors activation pointer overflows")
             })?;
-            let workspace = scratch
-                .device_ptr()
-                .checked_add(workspace_offset)
-                .ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract(
-                        "compressed-tensors workspace pointer overflows",
-                    )
-                })?;
+            let workspace =
+                projection_runtime.invocation_workspace(stream, scratch, workspace_offset)?;
             for (weight, output, output_features, input_features, input) in [
                 (
                     gate,
@@ -3052,16 +3137,13 @@ fn encode_compressed_tensors_dense_swiglu(
                     regions[input_region].device_ptr(),
                 ),
             ] {
-                projection_runtime.launch(
+                workspace.launch(
                     MarlinF16WeightType::U4,
-                    stream,
                     input,
                     regions[weight.packed_region].device_ptr(),
                     regions[weight.scales_region].device_ptr(),
                     Some(regions[weight.zero_points_region].device_ptr()),
                     output,
-                    workspace,
-                    workspace_bytes,
                     rows,
                     output_features,
                     input_features,
@@ -3077,16 +3159,13 @@ fn encode_compressed_tensors_dense_swiglu(
                 activation,
                 activation_elements,
             )?;
-            projection_runtime.launch(
+            workspace.launch(
                 MarlinF16WeightType::U4,
-                stream,
                 activation,
                 regions[down.packed_region].device_ptr(),
                 regions[down.scales_region].device_ptr(),
                 Some(regions[down.zero_points_region].device_ptr()),
                 regions[output_region].device_ptr(),
-                workspace,
-                workspace_bytes,
                 rows,
                 hidden,
                 intermediate,
@@ -3098,7 +3177,7 @@ fn encode_compressed_tensors_dense_swiglu(
         },
     )
     .and_then(|command| {
-        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 0)
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 1)
     })
     .map_err(|error| error.to_string())
 }
@@ -3136,7 +3215,7 @@ fn encode_marlin_fp8_dense_swiglu(
         activation_elements,
         activation_bytes,
         workspace_offset,
-        workspace_bytes,
+        workspace_bytes: _,
         required_bytes: required_scratch_bytes,
     } = marlin_swiglu_scratch_layout(
         tokens,
@@ -3223,25 +3302,16 @@ fn encode_marlin_fp8_dense_swiglu(
             let activation = up_output.checked_add(activation_bytes).ok_or_else(|| {
                 CudaDeviceRuntimeError::contract("Marlin FP8 SwiGLU activation pointer overflows")
             })?;
-            let workspace = scratch
-                .device_ptr()
-                .checked_add(workspace_offset)
-                .ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract(
-                        "Marlin FP8 SwiGLU workspace pointer overflows",
-                    )
-                })?;
+            let workspace =
+                projection_runtime.invocation_workspace(stream, scratch, workspace_offset)?;
             for (weight, output) in [(gate, gate_output), (up, up_output)] {
-                projection_runtime.launch(
+                workspace.launch(
                     MarlinF16WeightType::E4M3Fn,
-                    stream,
                     regions[input_region].device_ptr(),
                     regions[weight.packed_region].device_ptr(),
                     regions[weight.scales_region].device_ptr(),
                     None,
                     output,
-                    workspace,
-                    workspace_bytes,
                     rows,
                     intermediate,
                     hidden,
@@ -3257,16 +3327,13 @@ fn encode_marlin_fp8_dense_swiglu(
                 activation,
                 activation_elements,
             )?;
-            projection_runtime.launch(
+            workspace.launch(
                 MarlinF16WeightType::E4M3Fn,
-                stream,
                 activation,
                 regions[down.packed_region].device_ptr(),
                 regions[down.scales_region].device_ptr(),
                 None,
                 regions[output_region].device_ptr(),
-                workspace,
-                workspace_bytes,
                 rows,
                 hidden,
                 intermediate,
@@ -3277,7 +3344,7 @@ fn encode_marlin_fp8_dense_swiglu(
         },
     )
     .and_then(|command| {
-        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 0)
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 1)
     })
     .map_err(|error| error.to_string())
 }
@@ -3604,25 +3671,19 @@ fn encode_compressed_tensors_symmetric_dense_geglu(
                         "symmetric compressed-tensors GeGLU activation pointer overflows",
                     )
                 })?;
-            let workspace = scratch
-                .device_ptr()
-                .checked_add(scratch_layout.workspace_offset)
-                .ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract(
-                        "symmetric compressed-tensors GeGLU workspace pointer overflows",
-                    )
-                })?;
+            let workspace = projection_runtime.invocation_workspace(
+                stream,
+                scratch,
+                scratch_layout.workspace_offset,
+            )?;
             for (weight, output) in [(gate, gate_output), (up, up_output)] {
-                projection_runtime.launch(
+                workspace.launch(
                     MarlinF16WeightType::U4B8,
-                    stream,
                     regions[input_region].device_ptr(),
                     regions[weight.packed_region].device_ptr(),
                     regions[weight.scales_region].device_ptr(),
                     None,
                     output,
-                    workspace,
-                    scratch_layout.workspace_bytes,
                     rows,
                     intermediate,
                     hidden,
@@ -3638,16 +3699,13 @@ fn encode_compressed_tensors_symmetric_dense_geglu(
                 activation,
                 scratch_layout.activation_elements,
             )?;
-            projection_runtime.launch(
+            workspace.launch(
                 MarlinF16WeightType::U4B8,
-                stream,
                 activation,
                 regions[down.packed_region].device_ptr(),
                 regions[down.scales_region].device_ptr(),
                 None,
                 regions[output_region].device_ptr(),
-                workspace,
-                scratch_layout.workspace_bytes,
                 rows,
                 hidden,
                 intermediate,
@@ -3658,7 +3716,7 @@ fn encode_compressed_tensors_symmetric_dense_geglu(
         },
     )
     .and_then(|command| {
-        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 0)
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 1)
     })
     .map_err(|error| error.to_string())
 }

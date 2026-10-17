@@ -3368,6 +3368,20 @@ fn encode_attention(
             replay_key.finish()
         });
 
+    let marlin_workspace_resets = if projection.workspace_bytes()? != 0 {
+        if packed_enabled {
+            1
+        } else {
+            launches.len() as u64
+        }
+    } else {
+        0
+    };
+    let transfer_commands = upstream_work
+        .1
+        .checked_add(marlin_workspace_resets)
+        .ok_or("causal workspace transfer count overflows")?;
+
     let functions = functions.clone();
     let enqueue_compute =
         move |stream: &CudaStream, blas: &CudaBlas, regions: &[CudaBufferRegion]| {
@@ -3449,11 +3463,7 @@ fn encode_attention(
             participant_count,
             total_tokens,
             compute_dispatch_count,
-            {
-                {
-                    upstream_work.1
-                }
-            },
+            transfer_commands,
         )
     })
     .map_err(|error| error.to_string())?;
@@ -3791,6 +3801,26 @@ fn enqueue_bindings(
     Ok(())
 }
 
+#[cfg(feature = "vllm-marlin")]
+fn marlin_workspace_for_invocation<'a>(
+    projection: CausalProjection,
+    stream: &'a CudaStream,
+    scratch: &'a CudaBufferRegion,
+    layout: ScratchLayout,
+) -> Result<Option<super::MarlinInvocationWorkspace<'a>>, CudaDeviceRuntimeError> {
+    match projection {
+        CausalProjection::MarlinFp8 { runtime } | CausalProjection::MarlinInt4 { runtime } => {
+            let offset = layout.projection_workspace.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("causal attention lacks its Marlin workspace")
+            })?;
+            runtime
+                .invocation_workspace(stream, scratch, offset)
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enqueue_packed_attention(
     stream: &CudaStream,
@@ -3809,6 +3839,8 @@ fn enqueue_packed_attention(
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
     let scratch = &regions[shared.scratch];
+    #[cfg(feature = "vllm-marlin")]
+    let marlin_workspace = marlin_workspace_for_invocation(projection, stream, scratch, layout)?;
     if scratch.length_bytes() < layout.required_bytes {
         return Err(CudaDeviceRuntimeError::contract(
             "packed causal attention scratch is smaller than its admitted estimate",
@@ -3845,6 +3877,8 @@ fn enqueue_packed_attention(
         normalized,
         [query_raw, key_raw, value_raw],
         scratch,
+        #[cfg(feature = "vllm-marlin")]
+        marlin_workspace.as_ref(),
         layout,
         regions,
         packed.tokens_i32,
@@ -3979,6 +4013,8 @@ fn enqueue_packed_attention(
         context,
         projected,
         scratch,
+        #[cfg(feature = "vllm-marlin")]
+        marlin_workspace.as_ref(),
         layout,
         regions,
         packed.tokens_i32,
@@ -4038,6 +4074,8 @@ fn enqueue_attention(
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
     let scratch = &regions[shared.scratch];
+    #[cfg(feature = "vllm-marlin")]
+    let marlin_workspace = marlin_workspace_for_invocation(projection, stream, scratch, layout)?;
     if scratch.length_bytes() < layout.required_bytes {
         return Err(CudaDeviceRuntimeError::contract(
             "causal attention scratch is smaller than its admitted estimate",
@@ -4080,6 +4118,8 @@ fn enqueue_attention(
         normalized,
         [query_raw, key_raw, value_raw],
         scratch,
+        #[cfg(feature = "vllm-marlin")]
+        marlin_workspace.as_ref(),
         layout,
         regions,
         launch.tokens_i32,
@@ -4133,6 +4173,8 @@ fn enqueue_attention(
         context,
         projected,
         scratch,
+        #[cfg(feature = "vllm-marlin")]
+        marlin_workspace.as_ref(),
         layout,
         regions,
         launch.tokens_i32,
@@ -4188,6 +4230,7 @@ fn launch_causal_qkv(
     input: u64,
     outputs: [u64; 3],
     scratch: &CudaBufferRegion,
+    #[cfg(feature = "vllm-marlin")] marlin_workspace: Option<&super::MarlinInvocationWorkspace<'_>>,
     layout: ScratchLayout,
     regions: &[CudaBufferRegion],
     rows: i32,
@@ -4226,6 +4269,8 @@ fn launch_causal_qkv(
                 input,
                 outputs[index],
                 scratch,
+                #[cfg(feature = "vllm-marlin")]
+                marlin_workspace,
                 layout,
                 regions,
                 rows,
@@ -4271,6 +4316,7 @@ fn launch_causal_projection(
     input: u64,
     output: u64,
     scratch: &CudaBufferRegion,
+    #[cfg(feature = "vllm-marlin")] marlin_workspace: Option<&super::MarlinInvocationWorkspace<'_>>,
     layout: ScratchLayout,
     regions: &[CudaBufferRegion],
     rows: i32,
@@ -4435,22 +4481,23 @@ fn launch_causal_projection(
                     "{operation} Marlin workspace exceeds causal-attention scratch"
                 )));
             }
-            runtime.launch(
-                weight_type,
-                stream,
-                input,
-                regions[packed_region].device_ptr(),
-                regions[scales_region].device_ptr(),
-                zero_points_region.map(|region| regions[region].device_ptr()),
-                output,
-                scratch_pointer(scratch.device_ptr(), workspace_offset)?,
-                workspace_bytes,
-                rows,
-                output_features,
-                input_features,
-                group_size,
-                operation,
-            )
+            marlin_workspace
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("missing invocation Marlin workspace")
+                })?
+                .launch(
+                    weight_type,
+                    input,
+                    regions[packed_region].device_ptr(),
+                    regions[scales_region].device_ptr(),
+                    zero_points_region.map(|region| regions[region].device_ptr()),
+                    output,
+                    rows,
+                    output_features,
+                    input_features,
+                    group_size,
+                    operation,
+                )
         }
     }
 }
