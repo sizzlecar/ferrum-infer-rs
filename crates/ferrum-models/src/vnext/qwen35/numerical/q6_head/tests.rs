@@ -26,7 +26,7 @@ fn id() -> NumericalProfileId {
 }
 
 #[test]
-fn q6_head_profile_require_changes_only_head_and_keeps_auto_body_and_kv_exact() {
+fn q6_head_profile_require_changes_only_head_and_keeps_body_and_kv_exact() {
     let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
     let config = source();
     let definition = registration
@@ -46,7 +46,14 @@ fn q6_head_profile_require_changes_only_head_and_keeps_auto_body_and_kv_exact() 
         catalog
             .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
             .unwrap(),
-        [catalog.resolve(&strict_id).unwrap()]
+        [
+            catalog
+                .resolve(&NumericalProfileId::new(
+                    F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1_NUMERICAL_PROFILE_ID,
+                ).unwrap())
+                .unwrap(),
+            catalog.resolve(&strict_id).unwrap(),
+        ]
     );
     assert!(catalog
         .candidates(

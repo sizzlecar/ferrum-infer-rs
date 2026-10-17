@@ -114,6 +114,14 @@ pub(super) fn profiles(
         RecurrentWeightAbi::NegativeRateInterleaved if native => vec![f32.id.clone()],
         _ => Vec::new(),
     };
+    // Source qualification is necessary but not sufficient: product
+    // composition checks the actual CUDA device and complete native
+    // capabilities before accepting this candidate. Strict F32 stays next.
+    if native {
+        if let Some(profile) = &q6_f16 {
+            automatic.insert(0, profile.id.clone());
+        }
+    }
     let mut profiles = vec![f16, f32];
     // Activation-rotation execution is qualified separately from KV encoding.
     // Until their combination has been validated, offer only F16 KV profiles
@@ -129,7 +137,7 @@ pub(super) fn profiles(
         }
         profiles.extend([f16, f32]);
     }
-    // Explicit opt-in: Auto retains its existing numerical policy.
+    // Other specialized profiles remain explicit opt-ins.
     profiles.extend(rn_fragment);
     profiles.extend(q8act);
     profiles.extend(q8act_attention);
@@ -141,7 +149,7 @@ pub(super) fn profiles(
     profiles.extend(upstream_extra_all_rows);
     profiles.extend(q6_head);
     profiles.extend(q6_f16);
-    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 2), profiles, automatic)
+    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 3), profiles, automatic)
 }
 
 pub(super) fn q8act_attention_eligible(

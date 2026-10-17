@@ -101,6 +101,17 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         .map_err(|error| FerrumError::config(error.to_string()))?;
     let mut rejected = Vec::new();
     for profile in candidates {
+        if let Some(rejection) = auto_numerical_profile_rejection(
+            &engine.numerical_execution,
+            profile,
+            &engine.backend.device,
+            composition.runtime().descriptor().ordinal,
+            &composition.runtime().descriptor().capabilities,
+            probe_auto_cuda_attributes,
+        ) {
+            rejected.push(rejection);
+            continue;
+        }
         if engine.runtime.q8_projection_weight_preparation
             == ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32
             && !profile.operations.iter().any(|operation| {
@@ -323,6 +334,105 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             .collect::<Vec<_>>()
             .join("; ")
     )))
+}
+
+fn probe_auto_cuda_attributes(
+    ordinal: usize,
+) -> std::result::Result<ferrum_kernels::backend::CudaDeviceAttributes, String> {
+    #[cfg(feature = "cuda")]
+    {
+        ferrum_kernels::backend::probe_cuda_device_attributes(ordinal)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinal;
+        Err("CUDA device attribute discovery is unavailable in this build".into())
+    }
+}
+
+/// Default qualification is narrower than explicit operator availability.
+/// Keep the runtime catalog intact: compiled native artifacts still require
+/// their complete live provider bindings, including nonselected providers.
+fn auto_numerical_profile_rejection(
+    requested: &ferrum_types::NumericalExecutionPolicy,
+    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
+    device: &ferrum_types::Device,
+    runtime_ordinal: u32,
+    capabilities: &BTreeSet<ferrum_interfaces::vnext::CapabilityId>,
+    probe: impl FnOnce(
+        usize,
+    )
+        -> std::result::Result<ferrum_kernels::backend::CudaDeviceAttributes, String>,
+) -> Option<NumericalProfileRejection> {
+    use ferrum_interfaces::vnext::{
+        UpstreamMarkerV2Profile as Profile, LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
+    };
+    if !matches!(requested, ferrum_types::NumericalExecutionPolicy::Auto) {
+        return None;
+    }
+    let required = [
+        Profile::SwiGluQ6F16,
+        Profile::GatedDeltaQ6F16,
+        Profile::CausalQ6F16,
+    ]
+    .into_iter()
+    .filter(|kind| {
+        profile
+            .operations
+            .iter()
+            .any(|operation| operation.operation_id.as_str() == kind.operation_id())
+    })
+    .map(Profile::capability_id)
+    .collect::<Vec<_>>();
+    if required.is_empty() {
+        return None;
+    }
+    let qualification = (|| {
+        let ferrum_types::Device::CUDA(ordinal) = device else {
+            return Err("Q6 F16 Auto qualification requires a CUDA device".to_owned());
+        };
+        if u32::try_from(*ordinal).ok() != Some(runtime_ordinal) {
+            return Err(
+                "Q6 F16 Auto requested device differs from the actual runtime ordinal".to_owned(),
+            );
+        }
+        // These capabilities are advertised only by providers whose compiled
+        // native feature, static ABI and complete exports have been checked.
+        // The usual composition binding and program checks remain authoritative.
+        for required in required
+            .into_iter()
+            .chain([LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID])
+        {
+            if !capabilities
+                .iter()
+                .any(|capability| capability.as_str() == required)
+            {
+                return Err(format!("Q6 F16 Auto requires native capability {required}"));
+            }
+        }
+        let actual = probe(*ordinal)
+            .map_err(|error| format!("Q6 F16 Auto device qualification unavailable: {error}"))?;
+        // This is the currently validated architecture scope, not a GPU-name
+        // or build-toolchain guess. Other architectures retain strict Auto.
+        if actual.compute_capability_major != 12
+            || actual.compute_capability_minor != 0
+            || actual.multiprocessor_count == 0
+        {
+            return Err(format!(
+                "Q6 F16 Auto is not qualified for CUDA compute capability {}.{} with {} multiprocessors",
+                actual.compute_capability_major,
+                actual.compute_capability_minor,
+                actual.multiprocessor_count,
+            ));
+        }
+        Ok(())
+    })();
+    qualification.err().map(|reason| NumericalProfileRejection {
+        profile_id: profile.id.clone(),
+        stage: NumericalProfileRejectionStage::ProgramCompilation,
+        reason,
+    })
 }
 
 fn composite_supports_q8_preparation(
@@ -849,6 +959,216 @@ const fn decision_source_name(source: ResolutionDecisionSource) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn q6_auto_profile() -> ferrum_interfaces::vnext::NumericalExecutionProfile {
+        use ferrum_interfaces::vnext::{
+            ElementType, ModelFamilyId, NumericalExecutionProfile, NumericalOperationContract,
+            NumericalProfileId, OperationId, ProgramValueId, Q6MmqF32Policy,
+            UpstreamMarkerV2Profile as Profile, LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID,
+        };
+        let mut operations = [
+            Profile::SwiGluQ6F16,
+            Profile::GatedDeltaQ6F16,
+            Profile::CausalQ6F16,
+        ]
+        .into_iter()
+        .map(|kind| NumericalOperationContract {
+            operation_id: OperationId::new(kind.operation_id()).unwrap(),
+            version: ContractVersion::new(1, 0),
+            multiplication_type: None,
+            accumulation_type: None,
+            staged_arithmetic: None,
+            composite_arithmetic: Some(kind.arithmetic()),
+        })
+        .collect::<Vec<_>>();
+        operations.push(NumericalOperationContract {
+            operation_id: OperationId::new(LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID)
+                .unwrap(),
+            version: ContractVersion::new(1, 0),
+            multiplication_type: None,
+            accumulation_type: None,
+            staged_arithmetic: Some(Q6MmqF32Policy::new().staged()),
+            composite_arithmetic: None,
+        });
+        let activation = ProgramValueId::new("value.activation").unwrap();
+        let profile = NumericalExecutionProfile {
+            id: NumericalProfileId::new("numerical.test.q6").unwrap(),
+            version: ContractVersion::new(1, 0),
+            family_id: ModelFamilyId::new("family.test").unwrap(),
+            primary_activation: activation.clone(),
+            boundaries: [(activation, ElementType::F32)].into_iter().collect(),
+            states: Vec::new(),
+            kv_storage: Vec::new(),
+            operations,
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
+    fn q6_auto_capabilities() -> BTreeSet<ferrum_interfaces::vnext::CapabilityId> {
+        use ferrum_interfaces::vnext::{
+            CapabilityId, UpstreamMarkerV2Profile as Profile,
+            LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
+        };
+        [
+            Profile::SwiGluQ6F16.capability_id(),
+            Profile::GatedDeltaQ6F16.capability_id(),
+            Profile::CausalQ6F16.capability_id(),
+            LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
+        ]
+        .into_iter()
+        .map(|id| CapabilityId::new(id).unwrap())
+        .collect()
+    }
+
+    fn qualified_q6_device() -> ferrum_kernels::backend::CudaDeviceAttributes {
+        ferrum_kernels::backend::CudaDeviceAttributes {
+            compute_capability_major: 12,
+            compute_capability_minor: 0,
+            multiprocessor_count: 32,
+        }
+    }
+
+    #[test]
+    fn q6_auto_requires_all_native_capabilities_and_selected_device_attributes() {
+        let profile = q6_auto_profile();
+        let capabilities = q6_auto_capabilities();
+        assert!(auto_numerical_profile_rejection(
+            &ferrum_types::NumericalExecutionPolicy::Auto,
+            &profile,
+            &ferrum_types::Device::CUDA(3),
+            3,
+            &capabilities,
+            |ordinal| {
+                assert_eq!(ordinal, 3);
+                Ok(qualified_q6_device())
+            },
+        )
+        .is_none());
+        assert!(auto_numerical_profile_rejection(
+            &ferrum_types::NumericalExecutionPolicy::Auto,
+            &profile,
+            &ferrum_types::Device::CUDA(3),
+            0,
+            &capabilities,
+            |_| panic!("qualification must not probe a device other than the runtime owner"),
+        )
+        .is_some());
+        for missing in &capabilities {
+            let mut incomplete = capabilities.clone();
+            incomplete.remove(missing);
+            let rejection = auto_numerical_profile_rejection(
+                &ferrum_types::NumericalExecutionPolicy::Auto,
+                &profile,
+                &ferrum_types::Device::CUDA(0),
+                0,
+                &incomplete,
+                |_| panic!("missing native capability must reject before device discovery"),
+            )
+            .unwrap();
+            assert_eq!(rejection.profile_id, profile.id);
+            assert_eq!(
+                rejection.stage,
+                NumericalProfileRejectionStage::ProgramCompilation
+            );
+            assert!(rejection.reason.contains(missing.as_str()));
+        }
+        assert_eq!(
+            capabilities,
+            q6_auto_capabilities(),
+            "qualification does not remove catalog capabilities"
+        );
+    }
+
+    #[test]
+    fn q6_auto_rejects_unknown_unqualified_or_non_cuda_devices() {
+        let profile = q6_auto_profile();
+        let capabilities = q6_auto_capabilities();
+        for (major, minor, count) in [(8, 9, 32), (12, 1, 32), (12, 0, 0)] {
+            assert!(auto_numerical_profile_rejection(
+                &ferrum_types::NumericalExecutionPolicy::Auto,
+                &profile,
+                &ferrum_types::Device::CUDA(0),
+                0,
+                &capabilities,
+                |_| Ok(ferrum_kernels::backend::CudaDeviceAttributes {
+                    compute_capability_major: major,
+                    compute_capability_minor: minor,
+                    multiprocessor_count: count,
+                }),
+            )
+            .is_some());
+        }
+        let failure = auto_numerical_profile_rejection(
+            &ferrum_types::NumericalExecutionPolicy::Auto,
+            &profile,
+            &ferrum_types::Device::CUDA(0),
+            0,
+            &capabilities,
+            |_| Err("driver attribute read failed".into()),
+        )
+        .unwrap();
+        assert_eq!(failure.profile_id, profile.id);
+        assert_eq!(
+            failure.stage,
+            NumericalProfileRejectionStage::ProgramCompilation
+        );
+        assert!(failure.reason.contains("driver attribute read failed"));
+        let devices = [
+            ferrum_types::Device::CPU,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ferrum_types::Device::Metal,
+        ];
+        for device in devices {
+            assert!(auto_numerical_profile_rejection(
+                &ferrum_types::NumericalExecutionPolicy::Auto,
+                &profile,
+                &device,
+                0,
+                &capabilities,
+                |_| panic!("non-CUDA profiles must not query the CUDA driver"),
+            )
+            .is_some());
+        }
+    }
+
+    #[test]
+    fn q6_auto_preserves_explicit_requests_and_other_profiles() {
+        let profile = q6_auto_profile();
+        assert!(auto_numerical_profile_rejection(
+            &ferrum_types::NumericalExecutionPolicy::Require(profile.id.clone()),
+            &profile,
+            &ferrum_types::Device::CPU,
+            0,
+            &BTreeSet::new(),
+            |_| panic!("explicit numerical requests keep existing provider validation"),
+        )
+        .is_none());
+        let mut strict = profile;
+        strict.id =
+            ferrum_interfaces::vnext::NumericalProfileId::new("numerical.test.strict").unwrap();
+        strict
+            .operations
+            .retain(|operation| operation.composite_arithmetic.is_none());
+        let head = &mut strict.operations[0];
+        head.operation_id = ferrum_interfaces::vnext::OperationId::new(
+            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+        )
+        .unwrap();
+        head.staged_arithmetic = None;
+        head.multiplication_type = Some(ferrum_interfaces::vnext::ElementType::F32);
+        head.accumulation_type = Some(ferrum_interfaces::vnext::ElementType::F32);
+        strict.validate().unwrap();
+        assert!(auto_numerical_profile_rejection(
+            &ferrum_types::NumericalExecutionPolicy::Auto,
+            &strict,
+            &ferrum_types::Device::CPU,
+            0,
+            &BTreeSet::new(),
+            |_| panic!("strict fallback does not need CUDA qualification"),
+        )
+        .is_none());
+    }
 
     #[test]
     fn q8_projection_weight_preparation_requires_wired_attention_numerics() {
