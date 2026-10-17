@@ -556,8 +556,8 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "c9501f0361ef373705422f887509719bc5e550e8d68b8a8039b4b31aa332749e",
-      "after_sha256": "aadcbed4aa65f223c367adb6b3058b0ef258c7fa27c544f5cd192341cf12693c",
+      "before_sha256": "aadcbed4aa65f223c367adb6b3058b0ef258c7fa27c544f5cd192341cf12693c",
+      "after_sha256": "0c949ec0302e55e4b548ff957017258f9b548621c6f827daeb4cfc58fc8bcd6b",
       "areas": [
         "build",
         "backend_submission",
@@ -567,12 +567,12 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the Bonsai Metal quick start, automatic capacity wording and Orchestral demo: pinned PQ2_0 sources, matching metadata and simple run/serve commands retain existing model and precision limits. Native serve now requests prefix-state caching by default, subject to compiled-plan checkpoint support; retained state shares the runtime memory budget and pressure eviction. Explicit CLI/environment/config/preset values retain precedence and run keeps its prior default. Retain scheduler and KV capacity/lifecycle obligations alongside build, device submission, template, termination and tool checks. Demo evidence is one Rust task with a compiler-feedback repair, not general coding quality or concurrency evidence. Full 27B CUDA, INT8, unsupported formats, vision and complete CPU inference remain uncertified. This content review is not execution, performance or public-installation evidence."
+      "rationale": "Reviewed v0.12.2-to-candidate changes: reordered model/app examples retain Bonsai's pinned sources and Metal/CUDA/INT8 limitations. Ordinary run/serve select CUDA defaults from actual device, operator, format and capacity capabilities; explicit settings take precedence. Qualified SM120 GGUF Auto may use Q6-F16 with 8-bit activations/integer dots; explicit qwen3_5.f32-master remains a mixed-precision reference without cross-batch token-identity guarantees. Linux/WSL selects SM89/CUDA12.4 or SM120/CUDA12.8 from all visible GPUs, preserves documented CPU fallback/explicit-CUDA errors, and fails when matching assets are absent. Windows/Homebrew remain SM89; cuda-production requires a matching native lock. English additionally documents opt-in scheduler-slo and a scoped 9B static reproducer, not defaults or SLO assurance. Retain declared build, submission, protocol, scheduler/KV, exact-asset installation and default run/serve obligations. Numerical/device/quality checks remain owned by source/model analysis. This content review certifies neither those checks nor performance, SLO compliance, installation or previously unvalidated model capabilities."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "c6c64a6ca07688202e6bdb3da044cc10a800133894eb04c213a95e0a52a7f0a6",
-      "after_sha256": "9144f9d34b378d0e73440d16aaab7a6f01eb49f8df8050854a1248a41d1abcdc",
+      "before_sha256": "9144f9d34b378d0e73440d16aaab7a6f01eb49f8df8050854a1248a41d1abcdc",
+      "after_sha256": "349f97eeaa6fab89ac5bc94c47c22672e62cbd8cedb81c7e6b5aff9998afd26f",
       "areas": [
         "build",
         "backend_submission",
@@ -582,7 +582,7 @@
         "scheduler",
         "kv"
       ],
-      "rationale": "Reviewed the Bonsai Metal quick start, automatic capacity wording and Orchestral demo: pinned PQ2_0 sources, matching metadata and simple run/serve commands retain existing model and precision limits. Native serve now requests prefix-state caching by default, subject to compiled-plan checkpoint support; retained state shares the runtime memory budget and pressure eviction. Explicit CLI/environment/config/preset values retain precedence and run keeps its prior default. Retain scheduler and KV capacity/lifecycle obligations alongside build, device submission, template, termination and tool checks. Demo evidence is one Rust task with a compiler-feedback repair, not general coding quality or concurrency evidence. Full 27B CUDA, INT8, unsupported formats, vision and complete CPU inference remain uncertified. This content review is not execution, performance or public-installation evidence."
+      "rationale": "Reviewed v0.12.2-to-candidate changes: reordered model/app examples retain Bonsai's pinned sources and Metal/CUDA/INT8 limitations. Ordinary run/serve select CUDA defaults from actual device, operator, format and capacity capabilities; explicit settings take precedence. Qualified SM120 GGUF Auto may use Q6-F16 with 8-bit activations/integer dots; explicit qwen3_5.f32-master remains a mixed-precision reference without cross-batch token-identity guarantees. Linux/WSL selects SM89/CUDA12.4 or SM120/CUDA12.8 from all visible GPUs, preserves documented CPU fallback/explicit-CUDA errors, and fails when matching assets are absent. Windows/Homebrew remain SM89; cuda-production requires a matching native lock. The Chinese translation adds neither the English-only scheduler-slo nor static 9B reproduction sections; no such promises are inferred. Retain declared build, submission, protocol, scheduler/KV, exact-asset installation and default run/serve obligations. Numerical/device/quality checks remain owned by source/model analysis. This content review certifies neither those checks nor performance, SLO compliance, installation or previously unvalidated model capabilities."
     }
   ],
   "release_profile_ids": [
