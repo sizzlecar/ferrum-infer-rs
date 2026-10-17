@@ -190,6 +190,22 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
+          if [ "$version" = 0.13.0 ]; then
+            cat >> "$RUNNER_TEMP/release-notes.md" <<'NOTES_013'
+
+          ## CUDA execution defaults and measured scope
+
+          Ordinary `ferrum run` and `ferrum serve` now select compatible execution optimizations from device, operator, format and capacity capabilities; explicit settings retain priority. Qualified SM120 GGUF execution can select `qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`, including 8-bit activation quantization and integer dot products. This changes numerical behavior. The existing mixed-precision reference remains available with `--numerical-profile qwen3_5.f32-master`; it is not an all-F32 or cross-batch token-identity guarantee.
+
+          Accepted RTX 5090 measurements cover Qwen3.8-27B, the same GGUF against llama.cpp and the same compressed-tensors INT4/group32 asymmetric checkpoint against vLLM. At C4/C8/C16/C32, with fixed capacity 32, context and batch 2048, and two 200-request repetitions plus eight warmups each, pooled output throughput is respectively 105.36/122.23/141.89/152.96% of llama.cpp and 90.09/83.73/89.12/80.84% of vLLM. All comparisons completed with zero protocol errors; cache-off and ignore-EOS settings were benchmark controls. vLLM retains BF16 activations and automatic KV dtype (BF16 inferred from the pinned implementation; KV tensors were not directly inspected), versus Ferrum's F16 path. Its C32 second repetition is 78.91%, below 80%; the pooled result does not establish that threshold for every repetition. See the [accepted benchmark summary](https://github.com/sizzlecar/ferrum-infer-rs/pull/419).
+
+          Preregistered paired 1,500-question reference/fast noninferiority checks passed for 27B and 9B. Ordinary default run/serve behavior and descriptive output samples were also checked. This evidence is limited to the tested implementations and configurations; final package and public-install checks are separate, not a fresh performance matrix for every distributed binary.
+
+          This release prioritizes throughput. Measured TTFT, TPOT and visible SSE text-event ITL SLO failures remain disclosed; joint SLO optimization is planned for the next version. Long-answer repetition and output differences across batch layouts remain known limitations. Results do not certify every supported model, precision or backend.
+
+          Linux/WSL gains an automatically selected SM120 package built with CUDA 12.8 and the production feature set. The SM89 package uses CUDA 12.4; both require compatible driver/runtime libraries. Windows and Homebrew CUDA coverage remains SM89.
+          NOTES_013
+          fi
           printf '\n## CPU compatibility scope\n\nRequired load and basic run/serve representatives:\n' >> "$RUNNER_TEMP/release-notes.md"
           jq -r '.model_tasks.runs[] | select(.profile.target.backend == "cpu") | "- " + .profile.id + ": " + .profile.model' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
           printf '\nCPU is a compatibility backend, not the primary model-regression target. Per-format load/basic inference, protocol, numerical, safety and installation checks remain required. Extended CPU model semantics are not run and are not certified.\n' >> "$RUNNER_TEMP/release-notes.md"
