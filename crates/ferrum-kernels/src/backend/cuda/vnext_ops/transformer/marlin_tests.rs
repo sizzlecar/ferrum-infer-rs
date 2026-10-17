@@ -167,21 +167,21 @@ fn marlin_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on_cud
         fn enqueue(
             &self,
             workspace: &MarlinInvocationWorkspace<'_>,
-            stream: &Arc<CudaStream>,
+            pointers: &[u64; 5],
             weight_type: MarlinF16WeightType,
         ) {
             workspace
                 .launch(
                     weight_type,
-                    self.input.pointer(stream),
-                    self.weight.pointer(stream),
-                    self.scales.pointer(stream),
+                    pointers[0],
+                    pointers[1],
+                    pointers[2],
                     if weight_type == MarlinF16WeightType::U4 {
-                        Some(self.zeros.pointer(stream))
+                        Some(pointers[3])
                     } else {
                         None
                     },
-                    self.output.pointer(stream),
+                    pointers[4],
                     self.shape.rows as i32,
                     self.shape.output_features as i32,
                     self.shape.input_features as i32,
@@ -234,6 +234,21 @@ fn marlin_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on_cud
             },
         ])
         .map(|shape| Matrix::new(&stream, shape))
+        .collect::<Vec<_>>();
+    // Resolve cudarc's tracked pointers before raw graph capture. DevicePtr
+    // access can wait/record events through its temporary guard. The matrices
+    // retain these fixed allocations until every captured graph has dropped.
+    let matrix_pointers = matrices
+        .iter()
+        .map(|matrix| {
+            [
+                matrix.input.pointer(&stream),
+                matrix.weight.pointer(&stream),
+                matrix.scales.pointer(&stream),
+                matrix.zeros.pointer(&stream),
+                matrix.output.pointer(&stream),
+            ]
+        })
         .collect::<Vec<_>>();
     let dirty = |workspace: &Guarded<i32>| {
         unsafe {
@@ -291,21 +306,38 @@ fn marlin_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on_cud
         // previous invocation's host-side initialized flag or scratch contents.
         for _fresh_allocation in 0..2 {
             let workspace = Guarded::new(&stream, &vec![73_i32; bytes as usize / 4], -117);
+            let workspace_pointer = workspace.pointer(&stream);
+            let prepare = || {
+                dirty(&workspace);
+                // Every eager execution and replay must write fresh outputs,
+                // rather than passing by retaining the baseline oracle bytes.
+                for (matrix, pointers) in matrices.iter().zip(&matrix_pointers) {
+                    unsafe {
+                        cudarc::driver::result::memset_d8_async(
+                            pointers[4],
+                            0xff,
+                            matrix.shape.rows * matrix.shape.output_features * 2,
+                            stream.cu_stream(),
+                        )
+                    }
+                    .unwrap();
+                }
+            };
             let enqueue = || {
                 let scope = MarlinInvocationWorkspace {
                     runtime,
                     stream: &stream,
-                    pointer: workspace.pointer(&stream),
+                    pointer: workspace_pointer,
                     length_bytes: bytes,
                     initialized: std::cell::Cell::new(false),
                     _region: None,
                 };
-                for matrix in &matrices {
-                    matrix.enqueue(&scope, &stream, weight_type);
+                for (matrix, pointers) in matrices.iter().zip(&matrix_pointers) {
+                    matrix.enqueue(&scope, pointers, weight_type);
                 }
             };
             for _invocation in 0..2 {
-                dirty(&workspace);
+                prepare();
                 enqueue();
                 check(&workspace, &expected);
             }
@@ -313,10 +345,253 @@ fn marlin_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on_cud
             for _replay in 0..3 {
                 // This write is outside the graph. Every replay must execute
                 // the first captured reset before consuming the dirty locks.
-                dirty(&workspace);
+                prepare();
                 graph.launch();
                 check(&workspace, &expected);
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires actual CUDA and Marlin FP8 channelwise/group128 kernels"]
+fn marlin_fp8_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on_cuda() {
+    use crate::marlin_repack::{
+        block_fp8_group128_scales_to_marlin_f16_reference, fixtures::Fixture,
+        prepare_f16_weight_for_fp8_marlin,
+    };
+    use half::bf16;
+    use std::sync::Arc;
+
+    struct Matrix {
+        shape: Fixture,
+        group_size: i32,
+        input: Guarded<f16>,
+        weight: Guarded<i32>,
+        scales: Guarded<f16>,
+        output: Guarded<f16>,
+    }
+
+    impl Matrix {
+        fn new(stream: &Arc<CudaStream>, shape: Fixture, group_size: i32) -> Self {
+            let n = shape.output_features;
+            let k = shape.input_features;
+            let source = (0..n * k)
+                .flat_map(|index| {
+                    let value = ((index * 17 + index / 11) % 127) as i32 - 63;
+                    f16::from_f32(value as f32 / 128.0).to_le_bytes()
+                })
+                .collect::<Vec<_>>();
+            let prepared = prepare_f16_weight_for_fp8_marlin(&source, n, k).unwrap();
+            // The FP8 tile packing is independent of scale grouping. Use the
+            // real channelwise preparer and exact group128 scale-grid helper,
+            // with distinct nonzero scales across K groups and output blocks.
+            let scales = if group_size == -1 {
+                prepared.scales
+            } else {
+                let inverse_scales = (0..(n / 128) * (k / 128))
+                    .flat_map(|index| {
+                        bf16::from_f32(0.001 + (index * 7 % 9) as f32 * 0.000125).to_le_bytes()
+                    })
+                    .collect::<Vec<_>>();
+                block_fp8_group128_scales_to_marlin_f16_reference(&inverse_scales, n, k).unwrap()
+            };
+            // i32 guards keep the actual Marlin tile pointer 16-byte aligned.
+            let packed = prepared
+                .packed_values
+                .chunks_exact(4)
+                .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            Self {
+                shape,
+                group_size,
+                input: Guarded::new(
+                    stream,
+                    &build_host_fixture(shape).input,
+                    f16::from_f32(-117.0),
+                ),
+                weight: Guarded::new(stream, &packed, 0x5a5a1234),
+                scales: Guarded::new(stream, &scales, f16::from_f32(-117.0)),
+                output: Guarded::new(
+                    stream,
+                    &vec![f16::NAN; shape.rows * n],
+                    f16::from_f32(-117.0),
+                ),
+            }
+        }
+
+        fn bits(&self, stream: &Arc<CudaStream>) -> Vec<u16> {
+            self.input.assert_unchanged(stream);
+            self.weight.assert_unchanged(stream);
+            self.scales.assert_unchanged(stream);
+            self.output
+                .read(stream)
+                .into_iter()
+                .map(|value| {
+                    assert!(
+                        value.is_finite(),
+                        "{} group={}",
+                        self.shape.name,
+                        self.group_size
+                    );
+                    value.to_bits()
+                })
+                .collect()
+        }
+    }
+
+    let context = CudaContext::new(0).expect("FP8 invocation workspace test requires CUDA");
+    let stream = context.new_stream().unwrap();
+    let runtime = MarlinProjectionRuntime {
+        multiprocessor_count: context
+            .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .unwrap(),
+        device_ordinal: 0,
+    };
+    let bytes = runtime.workspace_bytes().unwrap();
+    let matrices = [
+        Fixture {
+            name: "fp8-single-group",
+            rows: 1,
+            input_features: 128,
+            output_features: 128,
+        },
+        Fixture {
+            name: "fp8-decode-split-k",
+            rows: 32,
+            input_features: 4096,
+            output_features: 256,
+        },
+        Fixture {
+            name: "fp8-prefill-m-split",
+            rows: 65,
+            input_features: 512,
+            output_features: 128,
+        },
+    ]
+    .into_iter()
+    .flat_map(|shape| [-1, 128].map(|group| Matrix::new(&stream, shape, group)))
+    .collect::<Vec<_>>();
+    // Keep cudarc pointer tracking outside the raw capture, as in the U4 test.
+    // The owning matrices outlive all graph executions and graph destruction.
+    let matrix_pointers = matrices
+        .iter()
+        .map(|matrix| {
+            [
+                matrix.input.pointer(&stream),
+                matrix.weight.pointer(&stream),
+                matrix.scales.pointer(&stream),
+                matrix.output.pointer(&stream),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let dirty = |workspace: &Guarded<i32>| {
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                workspace.pointer(&stream),
+                73,
+                bytes as usize,
+                stream.cu_stream(),
+            )
+        }
+        .unwrap();
+    };
+    let baseline = Guarded::new(&stream, &vec![73_i32; bytes as usize / 4], -117);
+    let expected = matrices
+        .iter()
+        .map(|matrix| {
+            dirty(&baseline);
+            runtime
+                .launch(
+                    MarlinF16WeightType::E4M3Fn,
+                    &stream,
+                    matrix.input.pointer(&stream),
+                    matrix.weight.pointer(&stream),
+                    matrix.scales.pointer(&stream),
+                    None,
+                    matrix.output.pointer(&stream),
+                    baseline.pointer(&stream),
+                    bytes,
+                    matrix.shape.rows as i32,
+                    matrix.shape.output_features as i32,
+                    matrix.shape.input_features as i32,
+                    matrix.group_size,
+                    "FP8 original per-projection reset oracle",
+                )
+                .unwrap();
+            assert!(baseline.read(&stream).iter().all(|lock| *lock == 0));
+            matrix.bits(&stream)
+        })
+        .collect::<Vec<_>>();
+
+    for _fresh_allocation in 0..2 {
+        let workspace = Guarded::new(&stream, &vec![73_i32; bytes as usize / 4], -117);
+        let workspace_pointer = workspace.pointer(&stream);
+        let prepare = || {
+            dirty(&workspace);
+            // Eliminate stale oracle outputs: every eager execution and graph
+            // replay must replace NaNs, not merely preserve earlier results.
+            for matrix in &matrices {
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        matrix.output.pointer(&stream),
+                        0xff,
+                        matrix.shape.rows * matrix.shape.output_features * 2,
+                        stream.cu_stream(),
+                    )
+                }
+                .unwrap();
+            }
+        };
+        let enqueue = || {
+            let scope = MarlinInvocationWorkspace {
+                runtime,
+                stream: &stream,
+                pointer: workspace_pointer,
+                length_bytes: bytes,
+                initialized: std::cell::Cell::new(false),
+                _region: None,
+            };
+            for (matrix, pointers) in matrices.iter().zip(&matrix_pointers) {
+                scope
+                    .launch(
+                        MarlinF16WeightType::E4M3Fn,
+                        pointers[0],
+                        pointers[1],
+                        pointers[2],
+                        None,
+                        pointers[3],
+                        matrix.shape.rows as i32,
+                        matrix.shape.output_features as i32,
+                        matrix.shape.input_features as i32,
+                        matrix.group_size,
+                        "FP8 invocation workspace conformance",
+                    )
+                    .unwrap();
+            }
+        };
+        let check = || {
+            assert!(workspace.read(&stream).iter().all(|lock| *lock == 0));
+            for (matrix, bits) in matrices.iter().zip(&expected) {
+                assert_eq!(
+                    matrix.bits(&stream),
+                    *bits,
+                    "{} group={}",
+                    matrix.shape.name,
+                    matrix.group_size
+                );
+            }
+        };
+        for _invocation in 0..2 {
+            prepare();
+            enqueue();
+            check();
+        }
+        let graph = captured::Captured::new(&stream, enqueue);
+        for _replay in 0..3 {
+            prepare();
+            graph.launch();
+            check();
         }
     }
 }
