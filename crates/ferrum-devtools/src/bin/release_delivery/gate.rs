@@ -1,6 +1,7 @@
 //! Concrete release evidence gate. Plans and saved summaries are not execution.
 use super::{
-    installation, AcceptedAsset, AcceptedRelease, Sm120RuntimeCoverage, Sm120RuntimeOutcome,
+    installation, AcceptedAsset, AcceptedRelease, Sm120CiObservation, Sm120RuntimeCoverage,
+    Sm120RuntimeOutcome,
 };
 use clap::Args;
 use ferrum_bench_core::{
@@ -44,6 +45,14 @@ use cuda_assets::{CudaVariant, Sm120RuntimePolicy};
 #[path = "windows_assets.rs"]
 pub(super) mod windows_assets;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sm120RuntimeSource {
+    #[default]
+    Ci,
+    Manual,
+}
+
 #[derive(Debug, Args)]
 pub struct GateArgs {
     #[arg(long)]
@@ -73,6 +82,9 @@ pub struct GateArgs {
     pub repo: String,
     #[arg(long)]
     pub ci_run_id: u64,
+    /// Manual uses the same required model/device/archive evidence; it does not claim CI success.
+    #[arg(long, value_enum, default_value = "ci")]
+    pub sm120_runtime_source: Sm120RuntimeSource,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +146,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         cuda_assets::candidate_delivery_capability(&workspace, &candidate).await?;
     let sm120_runtime = &cuda_capability.sm120_runtime;
     let sm120_runtime_required = cuda_capability.sm120_asset_required && sm120_runtime.required();
+    validate_sm120_runtime_source(sm120_runtime_required, args.sm120_runtime_source)?;
     {
         let catalog = Command::new("git")
             .arg("-C")
@@ -266,6 +279,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         windows.attempts,
         cuda_policy,
         sm120_runtime_required,
+        args.sm120_runtime_source,
     )
     .await?;
     let ci_evidence = ci_evidence::load(
@@ -282,20 +296,27 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     .await?;
     verify_obligations_with(&plan, &ci_evidence)?;
     // A rerun that began while artifacts were inspected must not reuse old Quality.
-    verify_ci(
+    let sm120_ci = verify_ci(
         &args.repo,
         args.ci_run_id,
         &candidate,
         windows.attempts,
         cuda_policy,
         sm120_runtime_required,
+        args.sm120_runtime_source,
     )
     .await?;
     let mut notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
     if notes.trim().is_empty() {
         return Err("release notes are empty".into());
     }
-    let sm120_runtime = sm120_runtime_coverage(&distributions, sm120_runtime, &mut notes);
+    let sm120_runtime = sm120_runtime_coverage(
+        &distributions,
+        sm120_runtime,
+        args.sm120_runtime_source,
+        sm120_ci,
+        &mut notes,
+    )?;
     let mut assets: Vec<_> = distributions
         .into_values()
         .flat_map(|distribution| distribution.assets)
@@ -908,13 +929,25 @@ fn verify_installations(
 fn sm120_runtime_coverage(
     distributions: &Distributions,
     policy: &Sm120RuntimePolicy,
+    source: Sm120RuntimeSource,
+    ci_job: Option<Sm120CiObservation>,
     notes: &mut String,
-) -> Option<Sm120RuntimeCoverage> {
-    let asset = distributions
+) -> Result<Option<Sm120RuntimeCoverage>, String> {
+    let Some(asset) = distributions
         .values()
-        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))?;
+        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
+    else {
+        return Ok(None);
+    };
     let outcome = match policy {
-        Sm120RuntimePolicy::Required => Sm120RuntimeOutcome::Passed,
+        Sm120RuntimePolicy::Required => {
+            let ci_job =
+                ci_job.ok_or("SM120 required runtime scope is missing its observed CI state")?;
+            if source == Sm120RuntimeSource::Manual {
+                notes.push_str(&format!("\n\nSM120 required model execution, CUDA 12.0 device evidence and extracted-archive runtime inspection were validated **manually**, using the exact release archive. CI workflow {} SM120 job status: {}; conclusion: {}. This manual evidence does not claim CI job success.\n", ci_job.workflow_run_id, ci_job.status, ci_job.conclusion.as_deref().unwrap_or("none")));
+            }
+            Sm120RuntimeOutcome::Passed { source, ci_job }
+        }
         Sm120RuntimePolicy::NotRunHardwareUnavailable { reason } => {
             notes.push_str(&format!("\n\nSM120 model execution and extracted-archive runtime inspection: **not_run**. {reason} Package identity, ABI and extraction were checked; SM89 runtime evidence does not validate SM120.\n"));
             Sm120RuntimeOutcome::NotRun {
@@ -922,12 +955,19 @@ fn sm120_runtime_coverage(
             }
         }
     };
-    Some(Sm120RuntimeCoverage {
+    Ok(Some(Sm120RuntimeCoverage {
         asset_name: asset.name.clone(),
         asset_sha256: asset.sha256.clone(),
         binary_sha256: asset.binary_sha256.clone(),
         outcome,
-    })
+    }))
+}
+
+fn validate_sm120_runtime_source(required: bool, source: Sm120RuntimeSource) -> Result<(), String> {
+    if source == Sm120RuntimeSource::Manual && !required {
+        return Err("manual SM120 execution requires a candidate that declares required SM120 runtime validation".into());
+    }
+    Ok(())
 }
 
 fn descriptors_cover(obligation: &Obligation, descriptors: &[CheckDescriptor]) -> bool {
@@ -1112,7 +1152,8 @@ async fn verify_ci(
     windows_attempt: windows_assets::WindowsAttempts,
     cuda_policy: &ReleaseCudaPolicy,
     sm120_runtime_required: bool,
-) -> Result<(), String> {
+    sm120_runtime_source: Sm120RuntimeSource,
+) -> Result<Option<Sm120CiObservation>, String> {
     let client = reqwest::Client::builder()
         .user_agent("ferrum-release-delivery")
         .timeout(Duration::from_secs(30))
@@ -1129,6 +1170,7 @@ async fn verify_ci(
         Some(windows_attempt),
         Some(cuda_policy),
         sm120_runtime_required,
+        sm120_runtime_source,
     )
     .await
 }
@@ -1142,9 +1184,19 @@ async fn ci_at(
     token: Option<&str>,
 ) -> Result<(), String> {
     ci_at_with_windows(
-        client, base, repo, run_id, candidate, token, None, None, false,
+        client,
+        base,
+        repo,
+        run_id,
+        candidate,
+        token,
+        None,
+        None,
+        false,
+        Sm120RuntimeSource::Ci,
     )
     .await
+    .map(|_| ())
 }
 async fn ci_at_with_windows(
     client: &reqwest::Client,
@@ -1156,7 +1208,9 @@ async fn ci_at_with_windows(
     windows_attempt: Option<windows_assets::WindowsAttempts>,
     cuda_policy: Option<&ReleaseCudaPolicy>,
     sm120_runtime_required: bool,
-) -> Result<(), String> {
+    sm120_runtime_source: Sm120RuntimeSource,
+) -> Result<Option<Sm120CiObservation>, String> {
+    validate_sm120_runtime_source(sm120_runtime_required, sm120_runtime_source)?;
     if run_id == 0 {
         return Err("CI run id must be explicit and nonzero".into());
     }
@@ -1287,7 +1341,7 @@ async fn ci_at_with_windows(
         return Err("CI returned an incomplete job inventory".into());
     }
     if let Some(policy) = cuda_policy {
-        if sm120_runtime_required {
+        if sm120_runtime_required && sm120_runtime_source == Sm120RuntimeSource::Ci {
             cuda_gate::verify_sm120_job(&sm120_cuda_occurrences)?;
         }
         cuda_gate::verify_jobs(
@@ -1323,7 +1377,39 @@ async fn ci_at_with_windows(
         "Verified Quality / CI required job {} from attempt {} of run {} (current run attempt {}).",
         required["id"], job_attempt, run_id, attempt
     );
-    Ok(())
+    if sm120_runtime_required {
+        let latest = sm120_cuda_occurrences.last_key_value();
+        let (job_id, run_attempt, status, conclusion, failed_steps) = match latest {
+            Some((attempt, job)) => (
+                job["id"].as_u64(),
+                Some(*attempt),
+                job["status"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or("SM120 CI job omits actual status")?
+                    .to_owned(),
+                job["conclusion"].as_str().map(str::to_owned),
+                job["steps"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|step| step["conclusion"] == "failure")
+                    .filter_map(|step| step["name"].as_str().map(str::to_owned))
+                    .collect(),
+            ),
+            None => (None, None, "not_observed".into(), None, Vec::new()),
+        };
+        Ok(Some(Sm120CiObservation {
+            workflow_run_id: run_id,
+            job_id,
+            run_attempt,
+            status,
+            conclusion,
+            failed_steps,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

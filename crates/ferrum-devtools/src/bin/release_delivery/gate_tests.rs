@@ -444,8 +444,15 @@ fn unavailable_sm120_still_requires_exact_archive_inspection_without_runtime_cla
 fn accepted_sm120_scope_and_notes_preserve_explicit_not_run() {
     let (distributions, _) = cuda_pair();
     let mut notes = "Candidate release.".to_owned();
-    let coverage =
-        sm120_runtime_coverage(&distributions, &unavailable_sm120_policy(), &mut notes).unwrap();
+    let coverage = sm120_runtime_coverage(
+        &distributions,
+        &unavailable_sm120_policy(),
+        Sm120RuntimeSource::Ci,
+        None,
+        &mut notes,
+    )
+    .unwrap()
+    .unwrap();
     let serialized = serde_json::to_value(coverage).unwrap();
     assert_eq!(serialized["status"], "not_run");
     assert_eq!(serialized["reason"], "No approved SM120 executor.");
@@ -462,8 +469,18 @@ fn accepted_sm120_scope_and_notes_preserve_explicit_not_run() {
     let coverage = sm120_runtime_coverage(
         &distributions,
         &Sm120RuntimePolicy::Required,
+        Sm120RuntimeSource::Ci,
+        Some(Sm120CiObservation {
+            workflow_run_id: 17,
+            job_id: Some(33),
+            run_attempt: Some(2),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            failed_steps: vec![],
+        }),
         &mut required_notes,
     )
+    .unwrap()
     .unwrap();
     assert_eq!(serde_json::to_value(coverage).unwrap()["status"], "passed");
     assert_eq!(required_notes, "Candidate release.");
@@ -1070,6 +1087,29 @@ async fn ci_fixture_with_capability(
     cuda_policy: Option<&ReleaseCudaPolicy>,
     sm120_required: bool,
 ) -> Result<(), String> {
+    ci_fixture_with_runtime_source(
+        run,
+        jobs,
+        status,
+        expect_jobs,
+        windows_attempt,
+        cuda_policy,
+        sm120_required,
+        Sm120RuntimeSource::Ci,
+    )
+    .await
+    .map(|_| ())
+}
+async fn ci_fixture_with_runtime_source(
+    run: Value,
+    jobs: Vec<Value>,
+    status: u16,
+    expect_jobs: bool,
+    windows_attempt: Option<windows_assets::WindowsAttempts>,
+    cuda_policy: Option<&ReleaseCudaPolicy>,
+    sm120_required: bool,
+    source: Sm120RuntimeSource,
+) -> Result<Option<Sm120CiObservation>, String> {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
@@ -1132,10 +1172,13 @@ async fn ci_fixture_with_capability(
                 attempt,
                 policy,
                 sm120_required,
+                source,
             )
             .await
         }
-        _ => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None).await,
+        _ => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None)
+            .await
+            .map(|_| None),
     };
     tokio::time::timeout(Duration::from_secs(3), worker)
         .await
@@ -1239,6 +1282,132 @@ async fn sm120_job_cannot_be_missing_foreign_or_superseded_by_failure() {
         sm120["conclusion"] = json!(conclusion);
         assert!(verify(vec![old.clone(), sm120.clone()]).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn manual_sm120_preserves_actual_ci_failure_and_all_other_job_requirements() {
+    let mut local = ci_job();
+    local["id"] = json!(31);
+    local["name"] = json!("cuda-models");
+    let mut cloud = ci_job();
+    cloud["id"] = json!(32);
+    cloud["name"] = json!("cuda-models-cloud");
+    cloud["conclusion"] = json!("skipped");
+    let mut sm120 = ci_job();
+    sm120["id"] = json!(33);
+    sm120["name"] = json!("cuda-models-sm120");
+    sm120["conclusion"] = json!("failure");
+    sm120["steps"] = json!([{ "name": "Set up job", "conclusion": "failure" }]);
+    let policy = ReleaseCudaPolicy {
+        model_limitations: Vec::new(),
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec!["small".into()],
+        extended_cloud_profile_ids: vec!["large".into()],
+        reason: "Required actual CUDA runtime validation".into(),
+    };
+    let verify = |jobs| {
+        ci_fixture_with_runtime_source(
+            ci_run(),
+            jobs,
+            200,
+            true,
+            None,
+            Some(&policy),
+            true,
+            Sm120RuntimeSource::Manual,
+        )
+    };
+    let jobs = vec![ci_job(), local.clone(), cloud.clone(), sm120.clone()];
+    let observed = verify(jobs.clone()).await.unwrap().unwrap();
+    assert_eq!(observed.job_id, Some(33));
+    assert_eq!(observed.run_attempt, Some(2));
+    assert_eq!(observed.status, "completed");
+    assert_eq!(observed.conclusion.as_deref(), Some("failure"));
+    assert_eq!(observed.failed_steps, ["Set up job"]);
+    let (distributions, _) = cuda_pair();
+    let mut notes = "Candidate release.".to_owned();
+    let coverage = sm120_runtime_coverage(
+        &distributions,
+        &Sm120RuntimePolicy::Required,
+        Sm120RuntimeSource::Manual,
+        Some(observed),
+        &mut notes,
+    )
+    .unwrap()
+    .unwrap();
+    let coverage = serde_json::to_value(coverage).unwrap();
+    assert_eq!(coverage["status"], "passed");
+    assert_eq!(coverage["source"], "manual");
+    assert_eq!(coverage["ci_job"]["conclusion"], "failure");
+    assert_eq!(coverage["ci_job"]["failed_steps"], json!(["Set up job"]));
+    assert!(notes.contains("**manually**"));
+    assert!(notes.contains("conclusion: failure"));
+    assert!(notes.contains("does not claim CI job success"));
+    assert!(ci_fixture_with_capability(
+        ci_run(),
+        jobs.clone(),
+        200,
+        true,
+        None,
+        Some(&policy),
+        true
+    )
+    .await
+    .is_err());
+    for index in [0, 1] {
+        let mut invalid = jobs.clone();
+        invalid[index]["conclusion"] = json!("failure");
+        assert!(verify(invalid).await.is_err());
+    }
+    let mut invalid = jobs.clone();
+    invalid[3]["head_sha"] = json!("c".repeat(40));
+    assert!(verify(invalid).await.is_err());
+    let mut invalid = jobs;
+    invalid[2]["conclusion"] = json!("success");
+    assert!(verify(invalid).await.is_err());
+    let absent = verify(vec![ci_job(), local, cloud]).await.unwrap().unwrap();
+    assert_eq!(absent.status, "not_observed");
+    assert!(absent.job_id.is_none());
+    assert!(absent.conclusion.is_none());
+}
+
+#[test]
+fn manual_sm120_does_not_downgrade_required_models_device_or_archive() {
+    validate_sm120_runtime_source(true, Sm120RuntimeSource::Manual).unwrap();
+    assert!(validate_sm120_runtime_source(false, Sm120RuntimeSource::Manual).is_err());
+    let (distributions, tasks) = cuda_pair();
+    let reports: Vec<_> = tasks.iter().map(model_report).collect();
+    assert!(VerifiedModels::new(&tasks, &reports[..1]).is_err());
+    let models = VerifiedModels::new(&tasks, &reports).unwrap();
+    assert!(
+        verify_sm120_model_device(&distributions, &models, &Sm120RuntimePolicy::Required).is_err()
+    );
+    let sm89 = extract_only();
+    let asset = distributions
+        .values()
+        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
+        .unwrap();
+    let mut sm120 = sm89.clone();
+    sm120.asset_name = asset.name.clone();
+    sm120.asset_sha256 = asset.sha256.clone();
+    sm120.binary_sha256 = asset.binary_sha256.clone();
+    assert!(verify_installations(
+        &distributions,
+        &[sm89, sm120],
+        &models,
+        "2.3.4",
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
+    assert!(sm120_runtime_coverage(
+        &distributions,
+        &Sm120RuntimePolicy::Required,
+        Sm120RuntimeSource::Manual,
+        None,
+        &mut String::new()
+    )
+    .is_err());
 }
 
 fn windows_ci_job() -> Value {
