@@ -106,6 +106,17 @@ interactive = [] # Enable interactive mode
 accelerate = ["ferrum-engine/accelerate"]  # Use Apple Accelerate BLAS (matches PyTorch precision)
 metal = ["ferrum-engine/metal", "ferrum-kernels/metal", "ferrum-quantization/metal"]  # Apple GPU
 cuda = ["ferrum-engine/cuda", "ferrum-kernels/cuda", "ferrum-quantization/cuda"]    # NVIDIA CUDA
+# Full production capability set; requires a matching native operator-set lock.
+cuda-production = [
+    "cuda-upstream-q6-f32-linear",
+    "vllm-moe-marlin",
+    "vllm-paged-attn-v2",
+    "cuda-indexed-causal-attention",
+    "cuda-q4-shared-weight-decode",
+    "cuda-q5-shared-weight-decode",
+    "cuda-causal-gqa2",
+    "cuda-q6-f16-linear",
+]
 cuda-upstream-linear = ["cuda", "ferrum-kernels/cuda-upstream-linear"] # Explicit locked upstream quantized projection artifact.
 cuda-upstream-extra-linear = ["cuda-upstream-linear", "ferrum-kernels/cuda-upstream-extra-linear"] # Independent locked extra-format artifact.
 cuda-upstream-q6-f32-linear = ["cuda-upstream-extra-linear", "ferrum-kernels/cuda-upstream-q6-f32-linear"] # Independent locked Q6 F32 head artifact.
