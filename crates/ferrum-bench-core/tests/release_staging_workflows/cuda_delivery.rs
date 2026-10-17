@@ -1,6 +1,8 @@
 //! Delivery wiring for a second CUDA architecture. Runtime evidence remains
 //! independent even when both archives implement the same model profile IDs.
-use super::{key, Value};
+#[cfg(unix)]
+use super::key;
+use super::Value;
 use std::{fs, path::Path};
 
 fn workflow(name: &str) -> Value {
