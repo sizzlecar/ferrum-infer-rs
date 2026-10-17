@@ -490,6 +490,90 @@ fn resume_manual_inputs_are_paired_and_only_publication_checkpoint_is_optional()
 
 #[cfg(unix)]
 #[test]
+fn resume_distribution_selection_ignores_logs_but_rejects_ambiguous_packages() {
+    use std::{collections::BTreeSet, process::Command};
+    let resume = workflow("release-resume.yml");
+    let source = script(&resume["jobs"]["publish"], "artifact_id() {");
+    let start = source
+        .find("jq -e --arg run \"$SOURCE_RUN\" --arg candidate \"$candidate\" '")
+        .unwrap();
+    let end = start + source[start..].find("\nunix_ids=").unwrap();
+    let command = &source[start..end];
+    let dir = tempfile::tempdir().unwrap();
+    let candidate = "a".repeat(40);
+    let artifact = |name: &str, attempt: u32, run: &str, sha: &str| serde_json::json!({"name": format!("{name}-run-{run}-{attempt}-{sha}")});
+    let packages = vec![
+        artifact("ferrum-linux-x86_64", 2, "123", &candidate),
+        artifact("ferrum-linux-x86_64-cuda-sm89", 2, "123", &candidate),
+        artifact("ferrum-linux-x86_64-cuda-sm120", 2, "123", &candidate),
+        artifact("ferrum-macos-aarch64", 2, "123", &candidate),
+        artifact("ferrum-windows-x86_64-cpu", 2, "123", &candidate),
+        artifact("ferrum-windows-x86_64-cuda", 3, "123", &candidate),
+    ];
+    let logs = vec![
+        artifact("ferrum-windows-cuda-build-evidence", 2, "123", &candidate),
+        artifact("ferrum-windows-cuda-build-evidence", 3, "123", &candidate),
+    ];
+    let foreign = vec![
+        artifact("ferrum-windows-x86_64-cuda", 3, "124", &candidate),
+        artifact("ferrum-windows-x86_64-cuda", 3, "123", &"b".repeat(40)),
+    ];
+    let run = |artifacts: &[serde_json::Value]| {
+        fs::write(
+            dir.path().join("source-artifacts.json"),
+            serde_json::to_vec(artifacts).unwrap(),
+        )
+        .unwrap();
+        let output = Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                command,
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("RUNNER_TEMP", dir.path())
+            .env("SOURCE_RUN", "123")
+            .env("candidate", &candidate)
+            .output()
+            .unwrap();
+        let selected = output.status.success().then(|| {
+            serde_json::from_slice::<Vec<serde_json::Value>>(
+                &fs::read(dir.path().join("staged-artifacts.json")).unwrap(),
+            )
+            .unwrap()
+        });
+        (output, selected)
+    };
+    let names = |artifacts: &[serde_json::Value]| {
+        artifacts
+            .iter()
+            .map(|artifact| artifact["name"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let mut inventory = packages.clone();
+    inventory.extend(logs.iter().cloned());
+    inventory.extend(foreign.iter().cloned());
+    let (output, selected) = run(&inventory);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(names(&selected.unwrap()), names(&packages));
+    inventory.push(artifact("ferrum-windows-x86_64-cuda", 2, "123", &candidate));
+    assert!(!run(&inventory).0.status.success());
+    for missing_packages in [vec![], logs, foreign] {
+        assert!(!run(&missing_packages).0.status.success());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn resume_manual_archive_preserves_raw_bytes_and_rejects_bad_hash_links_and_missing_evidence() {
     use sha2::{Digest, Sha256};
     use std::{
