@@ -156,7 +156,8 @@ not require disabling caches, ignoring EOS, or disabling thinking.
 With `--numerical-profile auto` (the default), qualified CUDA `sm120` GGUF
 combinations can select `qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`, including
 its declared 8-bit activation quantization and integer dot products. This changes
-the numerical path. Select `--numerical-profile qwen3_5.f32-master` to retain the
+the numerical path and does not guarantee identical greedy output across batch
+sizes or request layouts. Select `--numerical-profile qwen3_5.f32-master` to retain the
 original mixed-precision reference profile. Other formats, devices, and backends
 are not implicitly qualified; see [numerical profiles](docs/numerical-execution.zh.md).
 

@@ -39,6 +39,7 @@ Qwen3.5 声明 `qwen3_5.f16` 和 `qwen3_5.f32-master`。F32-master 保持混合�
 CUDA `sm120` 设备均满足资格时，可优先选择
 `qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`。该 profile 包含8位激活量化和
 整数点积，并保留其声明的 F16/F32 阶段边界；它与原参考路径不保证逐位相同。
+固定该 profile 也不保证不同批大小或请求布局下的贪心输出逐 token 相同。
 资格或规划容量不满足时，`Auto` 尝试其他完整候选；显式指定
 `--numerical-profile qwen3_5.f32-master` 可保留原有混合精度参考路径。
 这不表示所有 GGUF、SafeTensors 或 CUDA 架构都已支持；Metal 和其他未满足资格的

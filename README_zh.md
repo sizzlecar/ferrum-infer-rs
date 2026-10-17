@@ -141,7 +141,8 @@ orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
 
 默认数值策略 `auto` 可为已通过资格的 CUDA `sm120` GGUF 组合选择
 `qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`，包含该 profile 声明的8位激活量化
-和整数点积，因此数值路径会发生变化。显式指定 `--numerical-profile qwen3_5.f32-master`
+和整数点积，因此数值路径会发生变化，也不保证不同批大小或请求布局下的贪心输出一致。
+显式指定 `--numerical-profile qwen3_5.f32-master`
 可保留原有混合精度参考路径。其他格式、设备和后端不因此获得支持，详见
 [数值执行策略](docs/numerical-execution.zh.md)。
 
