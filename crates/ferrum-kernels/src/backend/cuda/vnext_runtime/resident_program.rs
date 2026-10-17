@@ -405,6 +405,7 @@ pub(super) fn encode(
         executable: Some(Arc::new(CudaCommandExecutable {
             regions: Vec::new(),
             host_storage: Vec::new(),
+            host_upload_layout: None,
             work_declaration: CudaWorkDeclaration::ConditionalDependency,
             enqueue: Mutex::new(CudaEnqueueAction::ConditionalDependency(Box::new(
                 move |stream, blas, _regions, _storage| {

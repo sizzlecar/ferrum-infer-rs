@@ -54,6 +54,9 @@ mod binding_scatter;
 mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
+mod input_upload_packet;
+#[cfg(test)]
+mod input_upload_packet_tests;
 mod resident_program;
 mod segment_oracle;
 mod segment_owners;
@@ -454,6 +457,8 @@ enum CudaEnqueueAction {
 pub(crate) struct CudaCommandExecutable {
     regions: Vec<CudaBufferRegion>,
     host_storage: Vec<Box<[u8]>>,
+    // Only encode_upload grants this marker, after validating the typed copy.
+    host_upload_layout: Option<HostTransferLayout>,
     work_declaration: CudaWorkDeclaration,
     enqueue: Mutex<CudaEnqueueAction>,
 }
@@ -467,6 +472,7 @@ impl CudaCommandExecutable {
         Self {
             regions,
             host_storage,
+            host_upload_layout: None,
             work_declaration: CudaWorkDeclaration::Static,
             enqueue: Mutex::new(CudaEnqueueAction::Static(enqueue)),
         }
@@ -1306,6 +1312,7 @@ impl CudaDeviceCommand {
             executable: Some(Arc::new(CudaCommandExecutable {
                 regions,
                 host_storage: Vec::new(),
+                host_upload_layout: None,
                 work_declaration: CudaWorkDeclaration::ConditionalDependency,
                 enqueue: Mutex::new(CudaEnqueueAction::ConditionalDependency(Box::new(
                     move |stream, _blas, regions, _storage| {
@@ -3069,6 +3076,7 @@ pub struct CudaDeviceRuntime {
     program_binding_upload_strategy: ProgramBindingUploadStrategy,
     program_binding_upload_counters: Arc<ProgramBindingUploadCounters>,
     binding_scatter: Option<binding_scatter::BindingScatter>,
+    input_upload_scatter: binding_scatter::BindingScatter,
     segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
     segment_binding_oracle_audited_nodes: AtomicU64,
     segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
@@ -3244,9 +3252,10 @@ impl CudaDeviceRuntime {
         let allocation_stream = context
             .new_stream()
             .map_err(|error| CudaDeviceRuntimeError::driver("allocation stream creation", error))?;
+        let input_upload_scatter = binding_scatter::BindingScatter::load(&context)?;
         let binding_scatter =
             if program_binding_upload_strategy == ProgramBindingUploadStrategy::CompactScatter {
-                Some(binding_scatter::BindingScatter::load(&context)?)
+                Some(input_upload_scatter.clone())
             } else {
                 None
             };
@@ -3283,6 +3292,7 @@ impl CudaDeviceRuntime {
             program_binding_upload_strategy,
             program_binding_upload_counters: Arc::new(ProgramBindingUploadCounters::default()),
             binding_scatter,
+            input_upload_scatter,
             segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
             segment_binding_oracle_audited_nodes: AtomicU64::new(0),
             segment_binding_owner_view_mode:
@@ -5080,7 +5090,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         )?;
         let destination_region = destination.region(destination_offset_bytes..destination_end)?;
         let host_storage = vec![source.to_vec().into_boxed_slice()];
-        Ok(CudaDeviceCommand::transfer(
+        let mut command = CudaDeviceCommand::transfer(
             self.runtime_instance,
             HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
             vec![destination_region],
@@ -5095,7 +5105,16 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 .map_err(|error| CudaDeviceRuntimeError::driver("host upload", error))
             }),
-        ))
+        );
+        Arc::get_mut(
+            command
+                .executable
+                .as_mut()
+                .expect("fresh CUDA upload executable"),
+        )
+        .expect("fresh CUDA upload has one owner")
+        .host_upload_layout = Some(source_layout);
+        Ok(command)
     }
 
     fn encode_zero(
@@ -5224,6 +5243,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
             })
             .collect::<Result<Vec<_>, CudaDeviceRuntimeError>>()
             .map_err(DefinitelyNotSubmitted::new)?;
+        // Core has already validated every input's authority and typed range.
+        // Compact only fresh eager uploads, before physical command indices,
+        // timing spans, or replay candidates are derived from these entries.
+        let entries =
+            input_upload_packet::coalesce(self, entries).map_err(DefinitelyNotSubmitted::new)?;
         let declaration_shape_matches = match compute_path_requirement {
             DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => {
                 !declared_eager_compute_node_indices.is_empty()
