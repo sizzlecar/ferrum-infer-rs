@@ -7,6 +7,16 @@ on:
         description: "Completed Deliver formal release run whose candidate and frozen evidence will be reused"
         required: true
         type: string
+      manual_sm120_evidence_asset_id:
+        description: "Optional same-repository release asset containing original manually executed SM120 evidence; requires its SHA-256"
+        required: false
+        default: ''
+        type: string
+      manual_sm120_evidence_sha256:
+        description: "SHA-256 of the manual SM120 evidence tar.gz; does not replace any model, device or package validation"
+        required: false
+        default: ''
+        type: string
       preupload_asset:
         description: "Optional diagnostic: upload exactly one accepted missing draft asset using gh api before normal publication"
         required: false
@@ -41,6 +51,15 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
+      - name: Validate optional manual SM120 evidence inputs
+        env:
+          MANUAL_SM120_ASSET_ID: ${{ inputs.manual_sm120_evidence_asset_id }}
+          MANUAL_SM120_SHA256: ${{ inputs.manual_sm120_evidence_sha256 }}
+        run: |
+          if [ -n "$MANUAL_SM120_ASSET_ID" ] || [ -n "$MANUAL_SM120_SHA256" ]; then
+            [[ "$MANUAL_SM120_ASSET_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$MANUAL_SM120_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          fi
       - uses: actions/checkout@v4
         with:
           path: tools
@@ -70,7 +89,9 @@ jobs:
             "$RUNNER_TEMP/source-artifact-pages.json" > "$RUNNER_TEMP/source-artifacts.json"
           artifact_id() {
             jq -er --arg name "$1" '[.[] | select(.name == $name)] |
-              if length == 1 then .[0].id else error("missing or ambiguous named source artifact: " + $name) end' \
+              if length == 1 then .[0].id
+              elif $name == "publication-state" and length == 0 then ""
+              else error("missing or ambiguous named source artifact: " + $name) end' \
               "$RUNNER_TEMP/source-artifacts.json"
           }
           for name in release-plan release-tasks contract-checks installation-linux installation-macos-cpu publication-state; do
@@ -162,6 +183,64 @@ jobs:
           puts "sm120_runtime_policy=#{policy}"
           puts "sm120_runtime_reason=#{reason}"
           RUBY_YAML
+      - name: Download and verify original manual SM120 evidence
+        if: inputs.manual_sm120_evidence_asset_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          MANUAL_SM120_ASSET_ID: ${{ inputs.manual_sm120_evidence_asset_id }}
+          MANUAL_SM120_SHA256: ${{ inputs.manual_sm120_evidence_sha256 }}
+          SM120_RUNTIME_REQUIRED: ${{ steps.cuda-capability.outputs.sm120_runtime_required }}
+          SOURCE_RUN: ${{ inputs.source_run_id }}
+          SOURCE_CANDIDATE: ${{ steps.source.outputs.candidate }}
+        run: |
+          test "$SM120_RUNTIME_REQUIRED" = true
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$MANUAL_SM120_ASSET_ID" > "$RUNNER_TEMP/manual-sm120-asset.json"
+          jq -e --argjson id "$MANUAL_SM120_ASSET_ID" --arg repo "$GITHUB_REPOSITORY" --arg sha "$MANUAL_SM120_SHA256" '
+            .id == $id and .state == "uploaded" and .size > 0 and
+            .url == ("https://api.github.com/repos/" + $repo + "/releases/assets/" + ($id | tostring)) and
+            (.digest == null or .digest == ("sha256:" + $sha))' "$RUNNER_TEMP/manual-sm120-asset.json"
+          gh api --header 'Accept: application/octet-stream' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$MANUAL_SM120_ASSET_ID" > "$RUNNER_TEMP/manual-sm120-evidence.tar.gz"
+          ruby -rdigest -rzlib -rrubygems/package -rfileutils - \
+            "$RUNNER_TEMP/manual-sm120-evidence.tar.gz" "$RUNNER_TEMP/manual-sm120-evidence" "$MANUAL_SM120_SHA256" <<'RUBY_EVIDENCE'
+          archive, destination, expected = ARGV
+          raise 'manual evidence SHA-256 mismatch' unless Digest::SHA256.file(archive).hexdigest == expected
+          raise 'manual evidence destination already exists' if File.exist?(destination)
+          Dir.mkdir(destination)
+          seen = {}
+          Zlib::GzipReader.open(archive) do |gzip|
+            Gem::Package::TarReader.new(gzip) do |tar|
+              tar.each do |entry|
+                name = entry.full_name
+                parts = name.split('/')
+                raise 'unsafe manual evidence member' if name.empty? || name.start_with?('/') || name.include?('\\') || name.match?(/[\x00-\x1f\x7f]/) || parts.any? { |part| part.empty? || part == '.' || part == '..' }
+                raise 'unsupported manual evidence root' unless %w[tasks model-cuda-sm120 installation-cuda-sm120.json sm120-staged-origin.json].include?(parts.first)
+                raise 'manual evidence permits only regular files and directories' unless entry.file? || entry.directory?
+                raise 'duplicate manual evidence member' if seen[parts.join('/')]
+                seen[parts.join('/')] = true
+                target = File.join(destination, *parts)
+                if entry.directory?
+                  FileUtils.mkdir_p(target)
+                else
+                  FileUtils.mkdir_p(File.dirname(target))
+                  File.open(target, File::WRONLY | File::CREAT | File::EXCL, 0600) do |output|
+                    while (chunk = entry.read(65536)) && !chunk.empty?
+                      output.write(chunk)
+                    end
+                  end
+                end
+              end
+            end
+          end
+          %w[tasks/tasks.json installation-cuda-sm120.json].each do |name|
+            raise "missing manual evidence #{name}" unless File.file?(File.join(destination, name))
+          end
+          raise 'missing original manual model reports' if Dir.glob(File.join(destination, 'model-cuda-sm120/**/report.json')).empty?
+          RUBY_EVIDENCE
+          jq -n --arg run "$SOURCE_RUN" --arg candidate "$SOURCE_CANDIDATE" --arg sha "$MANUAL_SM120_SHA256" \
+            --slurpfile asset "$RUNNER_TEMP/manual-sm120-asset.json" \
+            '{source_run_id:$run,candidate_sha:$candidate,archive_sha256:$sha,asset:$asset[0],evidence_source:"manual",scope:"transport identity only; required model, device and package checks remain in release_delivery"}' \
+            > "$RUNNER_TEMP/manual-sm120-transport.json"
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -225,6 +304,7 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/installation
       - uses: actions/download-artifact@v4
+        if: steps.source.outputs.publication_state != ''
         with:
           run-id: ${{ inputs.source_run_id }}
           github-token: ${{ github.token }}
@@ -241,6 +321,7 @@ jobs:
           PREUPLOAD_ASSET: ${{ inputs.preupload_asset }}
           PREUPLOAD_TIMEOUT_MINUTES: ${{ inputs.preupload_timeout_minutes }}
           SM120_RUNTIME_REQUIRED: ${{ steps.cuda-capability.outputs.sm120_runtime_required }}
+          MANUAL_SM120_ASSET_ID: ${{ inputs.manual_sm120_evidence_asset_id }}
         run: |
           version=$(cargo metadata --manifest-path candidate/Cargo.toml --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
           gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
@@ -253,16 +334,29 @@ jobs:
           done
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-cuda-evidence/installation-cuda.json"
             --installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
+          sm120_evidence="$RUNNER_TEMP/evidence/release-cuda-sm120-evidence"
+          if [ -n "$MANUAL_SM120_ASSET_ID" ]; then
+            test "$SM120_RUNTIME_REQUIRED" = true
+            sm120_evidence="$RUNNER_TEMP/manual-sm120-evidence"
+            gate_args+=(--sm120-runtime-source manual)
+          fi
           case "$SM120_RUNTIME_REQUIRED" in
             true)
-              gate_args+=(--tasks "$RUNNER_TEMP/evidence/release-cuda-sm120-evidence/tasks/tasks.json"
-                --installation "$RUNNER_TEMP/evidence/release-cuda-sm120-evidence/installation-cuda-sm120.json")
+              gate_args+=(--tasks "$sm120_evidence/tasks/tasks.json"
+                --installation "$sm120_evidence/installation-cuda-sm120.json")
               ;;
             false) ;;
             *) echo 'Missing candidate SM120 runtime policy result' >&2; exit 1 ;;
           esac
-          while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
-            < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
+          if [ -n "$MANUAL_SM120_ASSET_ID" ]; then
+            while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
+              < <(find "$RUNNER_TEMP/evidence" -path "$RUNNER_TEMP/evidence/release-cuda-sm120-evidence" -prune -o -name report.json -type f -print0)
+            while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
+              < <(find "$sm120_evidence/model-cuda-sm120" -name report.json -type f -print0)
+          else
+            while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
+              < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
+          fi
           if [ -n "$PREUPLOAD_ASSET" ]; then
             [[ "$PREUPLOAD_ASSET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
             [[ "$PREUPLOAD_TIMEOUT_MINUTES" =~ ^([1-9]|[1-5][0-9]|60)$ ]]
@@ -340,8 +434,22 @@ jobs:
           fi
           "$GITHUB_WORKSPACE/tools/target/debug/release_delivery" publish "${gate_args[@]}" \
             --state-dir "$RUNNER_TEMP/publication" --tap-repo sizzlecar/homebrew-ferrum
-          printf 'Candidate publication resumed from run %s. Public installations remain pending; run Deliver formal release with verify_published_version=%s.\n' \
-            "$SOURCE_RUN" "$version" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$MANUAL_SM120_ASSET_ID" ]; then
+            printf 'Candidate publication resumed from run %s with original manually executed SM120 evidence. Public installation/startup verification remains pending; retain manual SM120 results and verify the remaining approved-fleet channels.\n' "$SOURCE_RUN" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Candidate publication resumed from run %s. Public installations remain pending; run Deliver formal release with verify_published_version=%s.\n' \
+              "$SOURCE_RUN" "$version" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.manual_sm120_evidence_asset_id != ''
+        with:
+          name: manual-sm120-publication-input
+          path: |
+            ${{ runner.temp }}/manual-sm120-evidence.tar.gz
+            ${{ runner.temp }}/manual-sm120-asset.json
+            ${{ runner.temp }}/manual-sm120-transport.json
+          if-no-files-found: warn
+          retention-days: 30
       - uses: actions/upload-artifact@v4
         if: always() && inputs.preupload_asset != ''
         with:

@@ -358,11 +358,11 @@ fn resume_keeps_required_sm120_task_and_installation_evidence() {
     use std::process::Command;
     let resume = workflow("release-resume.yml");
     let accept = script(&resume["jobs"]["publish"], "gate_args=(");
-    let start = accept.find("case \"$SM120_RUNTIME_REQUIRED\" in").unwrap();
+    let start = accept.find("sm120_evidence=\"").unwrap();
     let end = start + accept[start..].find("esac").unwrap() + "esac".len();
     let condition = &accept[start..end];
     let command = format!("gate_args=(--tasks original/tasks.json)\n{condition}\nprintf '%s\\n' \"${{gate_args[@]}}\"");
-    let run = |required: &str| {
+    let run = |required: &str, manual_asset: &str| {
         Command::new("bash")
             .args([
                 "--noprofile",
@@ -376,21 +376,227 @@ fn resume_keeps_required_sm120_task_and_installation_evidence() {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("SM120_RUNTIME_REQUIRED", required)
+            .env("MANUAL_SM120_ASSET_ID", manual_asset)
             .env("RUNNER_TEMP", "/release-fixture")
             .output()
             .unwrap()
     };
-    let not_run = run("false");
+    let not_run = run("false", "");
     assert!(not_run.status.success());
     assert_eq!(
         String::from_utf8(not_run.stdout).unwrap(),
         "--tasks\noriginal/tasks.json\n"
     );
-    let required = run("true");
+    let required = run("true", "");
     assert!(required.status.success());
     assert_eq!(String::from_utf8(required.stdout).unwrap(), "--tasks\noriginal/tasks.json\n--tasks\n/release-fixture/evidence/release-cuda-sm120-evidence/tasks/tasks.json\n--installation\n/release-fixture/evidence/release-cuda-sm120-evidence/installation-cuda-sm120.json\n");
-    assert!(!run("").status.success());
-    assert!(!run("unknown").status.success());
+    let manual = run("true", "123");
+    assert!(manual.status.success());
+    assert_eq!(String::from_utf8(manual.stdout).unwrap(), "--tasks\noriginal/tasks.json\n--sm120-runtime-source\nmanual\n--tasks\n/release-fixture/manual-sm120-evidence/tasks/tasks.json\n--installation\n/release-fixture/manual-sm120-evidence/installation-cuda-sm120.json\n");
+    assert!(!run("false", "123").status.success());
+    assert!(!run("", "").status.success());
+    assert!(!run("unknown", "").status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_manual_inputs_are_paired_and_only_publication_checkpoint_is_optional() {
+    use std::process::Command;
+    let resume = workflow("release-resume.yml");
+    let job = &resume["jobs"]["publish"];
+    let input = script(job, "if [ -n \"$MANUAL_SM120_ASSET_ID\" ] ||");
+    let run_input = |id: &str, sha: &str| {
+        Command::new("bash")
+            .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", input])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("MANUAL_SM120_ASSET_ID", id)
+            .env("MANUAL_SM120_SHA256", sha)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(run_input("", ""));
+    assert!(run_input("123", &"a".repeat(64)));
+    for (id, sha) in [
+        ("123", ""),
+        ("", "a"),
+        ("0", "a"),
+        ("1;exit 0", "a"),
+        ("123", "not-a-digest"),
+    ] {
+        assert!(!run_input(id, sha));
+    }
+    let source = script(job, "artifact_id() {");
+    let start = source.find("artifact_id() {").unwrap();
+    let end = start + source[start..].find("\nfor name ").unwrap();
+    let command = format!(
+        "{}\nartifact_id \"$REQUESTED_ARTIFACT\"",
+        &source[start..end]
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let run_lookup = |artifacts: &str, name: &str| {
+        fs::write(dir.path().join("source-artifacts.json"), artifacts).unwrap();
+        Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                &command,
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("RUNNER_TEMP", dir.path())
+            .env("REQUESTED_ARTIFACT", name)
+            .output()
+            .unwrap()
+    };
+    let missing = run_lookup("[]", "publication-state");
+    assert!(missing.status.success());
+    assert!(String::from_utf8(missing.stdout).unwrap().trim().is_empty());
+    assert!(!run_lookup("[]", "release-tasks").status.success());
+    assert!(!run_lookup(
+        r#"[{"name":"publication-state","id":1},{"name":"publication-state","id":2}]"#,
+        "publication-state"
+    )
+    .status
+    .success());
+    let existing = run_lookup(
+        r#"[{"name":"publication-state","id":17}]"#,
+        "publication-state",
+    );
+    assert!(existing.status.success());
+    assert_eq!(String::from_utf8(existing.stdout).unwrap().trim(), "17");
+    for step in steps(job) {
+        if let Some(ids) = step["with"]["artifact-ids"].as_str() {
+            if ids.contains("outputs.publication_state") {
+                assert_eq!(
+                    step["if"].as_str(),
+                    Some("steps.source.outputs.publication_state != ''")
+                );
+            } else {
+                assert!(
+                    step["if"].is_null(),
+                    "required evidence cannot depend on a publication checkpoint"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_manual_archive_preserves_raw_bytes_and_rejects_bad_hash_links_and_missing_evidence() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let resume = workflow("release-resume.yml");
+    let download = script(&resume["jobs"]["publish"], "<<'RUBY_EVIDENCE'");
+    let ruby = download
+        .split_once("<<'RUBY_EVIDENCE'\n")
+        .unwrap()
+        .1
+        .split_once("\nRUBY_EVIDENCE")
+        .unwrap()
+        .0;
+    assert!(
+        !ruby.contains("${{"),
+        "Actions must pass the verifier as literal Ruby"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(source.join("tasks")).unwrap();
+    fs::create_dir_all(source.join("model-cuda-sm120/task-0")).unwrap();
+    fs::write(
+        source.join("tasks/tasks.json"),
+        b"{\"original_tasks\":true}\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("installation-cuda-sm120.json"),
+        b"{\"original_installation\":true}\n",
+    )
+    .unwrap();
+    let raw = b"{\"original_report\":\"transport does not assert semantic success\"}\n";
+    fs::write(source.join("model-cuda-sm120/task-0/report.json"), raw).unwrap();
+    let archive = dir.path().join("evidence.tar.gz");
+    let pack = || {
+        let result = Command::new("tar")
+            .args(["--format=ustar", "-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .args(["tasks", "installation-cuda-sm120.json", "model-cuda-sm120"])
+            .env("COPYFILE_DISABLE", "1")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()))
+    };
+    let extract = |sha: &str, name: &str| {
+        let mut child = Command::new("ruby")
+            .args([
+                "-rdigest",
+                "-rzlib",
+                "-rrubygems/package",
+                "-rfileutils",
+                "-",
+            ])
+            .arg(&archive)
+            .arg(dir.path().join(name))
+            .arg(sha)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(ruby.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let sha = pack();
+    let valid = extract(&sha, "accepted");
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert_eq!(
+        fs::read(
+            dir.path()
+                .join("accepted/model-cuda-sm120/task-0/report.json")
+        )
+        .unwrap(),
+        raw
+    );
+    assert!(!extract(&"0".repeat(64), "wrong-hash").status.success());
+    assert!(
+        !dir.path().join("wrong-hash").exists(),
+        "SHA must be checked before extraction"
+    );
+    std::os::unix::fs::symlink("../../outside", source.join("model-cuda-sm120/link")).unwrap();
+    let linked = pack();
+    assert!(!extract(&linked, "linked").status.success());
+    assert!(!dir.path().join("outside").exists());
+    fs::remove_file(source.join("model-cuda-sm120/link")).unwrap();
+    fs::remove_file(source.join("tasks/tasks.json")).unwrap();
+    let missing = pack();
+    assert!(!extract(&missing, "missing").status.success());
 }
 
 #[cfg(unix)]
