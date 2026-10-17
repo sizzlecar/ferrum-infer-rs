@@ -1,5 +1,7 @@
 //! Concrete release evidence gate. Plans and saved summaries are not execution.
-use super::{installation, AcceptedAsset, AcceptedRelease};
+use super::{
+    installation, AcceptedAsset, AcceptedRelease, Sm120RuntimeCoverage, Sm120RuntimeOutcome,
+};
 use clap::Args;
 use ferrum_bench_core::{
     release_candidate::staging::{self, AbiInput, CandidateInput},
@@ -37,7 +39,7 @@ mod cuda_gate;
 
 #[path = "cuda_assets.rs"]
 mod cuda_assets;
-use cuda_assets::CudaVariant;
+use cuda_assets::{CudaVariant, Sm120RuntimePolicy};
 
 #[path = "windows_assets.rs"]
 pub(super) mod windows_assets;
@@ -128,7 +130,10 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != candidate {
         return Err("workspace HEAD does not match the plan candidate".into());
     }
-    let sm120_required = cuda_assets::candidate_requires_sm120(&workspace, &candidate).await?;
+    let cuda_capability =
+        cuda_assets::candidate_delivery_capability(&workspace, &candidate).await?;
+    let sm120_runtime = &cuda_capability.sm120_runtime;
+    let sm120_runtime_required = cuda_capability.sm120_asset_required && sm120_runtime.required();
     {
         let catalog = Command::new("git")
             .arg("-C")
@@ -201,7 +206,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
             Some(CudaVariant::Sm89),
         ),
     ]);
-    if sm120_required {
+    if cuda_capability.sm120_asset_required {
         required_distributions.insert((
             Backend::Cuda,
             "x86_64-unknown-linux-gnu".into(),
@@ -219,14 +224,21 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         .map(|path| read::<PreparedTasks>(path))
         .collect::<Result<Vec<_>, _>>()?;
     let tasks = combine_tasks(&plan, &schedule, envelopes)?;
-    validate_tasks(&plan, &schedule, &tasks, &distributions, &args.version)?;
+    validate_tasks(
+        &plan,
+        &schedule,
+        &tasks,
+        &distributions,
+        &args.version,
+        sm120_runtime,
+    )?;
     let reports = args
         .report
         .iter()
         .map(|path| read::<Value>(path))
         .collect::<Result<Vec<_>, _>>()?;
     let models = VerifiedModels::new(&tasks.expectations, &reports)?;
-    verify_sm120_model_device(&distributions, &models)?;
+    verify_sm120_model_device(&distributions, &models, sm120_runtime)?;
     let installations = args
         .installation
         .iter()
@@ -238,6 +250,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &models,
         &args.version,
         &candidate,
+        sm120_runtime,
     )?;
     let contracts: ContractReport = read(&args.contracts)?;
     verify_contract_report(&contract_groups(), &contracts)
@@ -252,7 +265,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &candidate,
         windows.attempts,
         cuda_policy,
-        sm120_required,
+        sm120_runtime_required,
     )
     .await?;
     let ci_evidence = ci_evidence::load(
@@ -275,13 +288,14 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &candidate,
         windows.attempts,
         cuda_policy,
-        sm120_required,
+        sm120_runtime_required,
     )
     .await?;
-    let notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
+    let mut notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
     if notes.trim().is_empty() {
         return Err("release notes are empty".into());
     }
+    let sm120_runtime = sm120_runtime_coverage(&distributions, sm120_runtime, &mut notes);
     let mut assets: Vec<_> = distributions
         .into_values()
         .flat_map(|distribution| distribution.assets)
@@ -298,6 +312,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         workspace,
         notes,
         assets,
+        sm120_runtime,
     })
 }
 
@@ -617,6 +632,7 @@ fn validate_tasks(
     tasks: &PreparedTasks,
     distributions: &Distributions,
     version: &str,
+    sm120_runtime: &Sm120RuntimePolicy,
 ) -> Result<(), String> {
     if tasks.schema_version != 1
         || tasks.remaining_plan_gaps != plan.gaps
@@ -651,6 +667,12 @@ fn validate_tasks(
                     && distribution.binary_sha256 == expected.binary_sha256
             })
             .ok_or("model task has no matching staged bytes for its backend")?;
+        if binary.cuda_variant == Some(CudaVariant::Sm120) && !sm120_runtime.required() {
+            return Err(
+                "SM120 model tasks contradict the candidate's explicit not_run runtime policy"
+                    .into(),
+            );
+        }
         if binary.cuda_variant == Some(CudaVariant::Sm120)
             && run.cuda_lane != Some(CudaModelLane::Local)
         {
@@ -688,7 +710,11 @@ fn validate_tasks(
         if run.cuda_lane == Some(CudaModelLane::Local) {
             let required: BTreeSet<_> = distributions
                 .values()
-                .filter(|asset| asset.backend == Backend::Cuda)
+                .filter(|asset| {
+                    asset.backend == Backend::Cuda
+                        && (asset.cuda_variant != Some(CudaVariant::Sm120)
+                            || sm120_runtime.required())
+                })
                 .map(|asset| asset.binary_sha256.as_str())
                 .collect();
             let actual: BTreeSet<_> = matching
@@ -697,7 +723,7 @@ fn validate_tasks(
                 .collect();
             if required.is_empty() || actual != required {
                 return Err(format!(
-                    "local CUDA profile {} needs separate model tasks for every CUDA asset",
+                    "local CUDA profile {} needs separate model tasks for every runtime-required CUDA asset",
                     run.profile.id
                 ));
             }
@@ -749,6 +775,7 @@ impl<'a> VerifiedModels<'a> {
 fn verify_sm120_model_device(
     distributions: &Distributions,
     models: &VerifiedModels<'_>,
+    sm120_runtime: &Sm120RuntimePolicy,
 ) -> Result<(), String> {
     for asset in distributions
         .values()
@@ -759,6 +786,12 @@ fn verify_sm120_model_device(
             .iter()
             .filter(|report| report["binary_sha256"] == asset.binary_sha256)
             .collect();
+        if !sm120_runtime.required() {
+            if !reports.is_empty() {
+                return Err("SM120 model reports contradict the candidate's explicit not_run runtime policy".into());
+            }
+            continue;
+        }
         let mut observed = false;
         for report in reports {
             for case in report["cases"]
@@ -789,6 +822,7 @@ fn verify_installations(
     models: &VerifiedModels<'_>,
     version: &str,
     candidate: &str,
+    sm120_runtime: &Sm120RuntimePolicy,
 ) -> Result<(), String> {
     let mut seen = BTreeSet::new();
     for report in installations {
@@ -813,6 +847,16 @@ fn verify_installations(
             return Err(
                 "installation report is duplicate, stale or bound to another archive".into(),
             );
+        }
+        if expected.cuda_variant == Some(CudaVariant::Sm120) && !sm120_runtime.required() {
+            if report.status != "not_run"
+                || report.schema_version != 1
+                || report.error.is_some()
+                || !report.observations.is_empty()
+            {
+                return Err("SM120 hardware-unavailable policy requires an exact extract-only not_run report without execution claims".into());
+            }
+            continue;
         }
         if backend == Backend::Cuda && report.status == "not_run" {
             if expected.cuda_variant == Some(CudaVariant::Sm120) {
@@ -859,6 +903,31 @@ fn verify_installations(
         return Err("a declared distribution is missing installation evidence".into());
     }
     Ok(())
+}
+
+fn sm120_runtime_coverage(
+    distributions: &Distributions,
+    policy: &Sm120RuntimePolicy,
+    notes: &mut String,
+) -> Option<Sm120RuntimeCoverage> {
+    let asset = distributions
+        .values()
+        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))?;
+    let outcome = match policy {
+        Sm120RuntimePolicy::Required => Sm120RuntimeOutcome::Passed,
+        Sm120RuntimePolicy::NotRunHardwareUnavailable { reason } => {
+            notes.push_str(&format!("\n\nSM120 model execution and extracted-archive runtime inspection: **not_run**. {reason} Package identity, ABI and extraction were checked; SM89 runtime evidence does not validate SM120.\n"));
+            Sm120RuntimeOutcome::NotRun {
+                reason: reason.clone(),
+            }
+        }
+    };
+    Some(Sm120RuntimeCoverage {
+        asset_name: asset.name.clone(),
+        asset_sha256: asset.sha256.clone(),
+        binary_sha256: asset.binary_sha256.clone(),
+        outcome,
+    })
 }
 
 fn descriptors_cover(obligation: &Obligation, descriptors: &[CheckDescriptor]) -> bool {
@@ -1042,7 +1111,7 @@ async fn verify_ci(
     candidate: &str,
     windows_attempt: windows_assets::WindowsAttempts,
     cuda_policy: &ReleaseCudaPolicy,
-    sm120_required: bool,
+    sm120_runtime_required: bool,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("ferrum-release-delivery")
@@ -1059,7 +1128,7 @@ async fn verify_ci(
         token.as_deref(),
         Some(windows_attempt),
         Some(cuda_policy),
-        sm120_required,
+        sm120_runtime_required,
     )
     .await
 }
@@ -1086,7 +1155,7 @@ async fn ci_at_with_windows(
     token: Option<&str>,
     windows_attempt: Option<windows_assets::WindowsAttempts>,
     cuda_policy: Option<&ReleaseCudaPolicy>,
-    sm120_required: bool,
+    sm120_runtime_required: bool,
 ) -> Result<(), String> {
     if run_id == 0 {
         return Err("CI run id must be explicit and nonzero".into());
@@ -1178,7 +1247,9 @@ async fn ci_at_with_windows(
             if job["name"] != "Quality / CI required"
                 && !(windows_attempt.is_some() && (windows_job || windows_cpu_job))
                 && !(cuda_policy.is_some()
-                    && (local_cuda_job || (sm120_required && sm120_cuda_job) || cloud_cuda_job))
+                    && (local_cuda_job
+                        || (sm120_runtime_required && sm120_cuda_job)
+                        || cloud_cuda_job))
             {
                 continue;
             }
@@ -1216,7 +1287,7 @@ async fn ci_at_with_windows(
         return Err("CI returned an incomplete job inventory".into());
     }
     if let Some(policy) = cuda_policy {
-        if sm120_required {
+        if sm120_runtime_required {
             cuda_gate::verify_sm120_job(&sm120_cuda_occurrences)?;
         }
         cuda_gate::verify_jobs(

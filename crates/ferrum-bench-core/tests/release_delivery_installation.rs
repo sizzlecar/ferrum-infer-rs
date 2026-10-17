@@ -8,7 +8,6 @@ const INSTALLERS: &[&str] = &[
     "install-cargo",
     "install-homebrew",
     "install-bootstrap-unix",
-    "install-bootstrap-sm120",
     "install-bootstrap-windows",
 ];
 
@@ -40,6 +39,9 @@ struct State {
     active: &'static str,
     verify_only: &'static str,
     sm120_required: &'static str,
+    sm120_runtime_required: &'static str,
+    sm120_runtime_policy: &'static str,
+    sm120_runtime_reason: &'static str,
     results: BTreeMap<String, ResultState>,
 }
 
@@ -51,6 +53,9 @@ impl State {
             active,
             verify_only,
             sm120_required: "true",
+            sm120_runtime_required: "false",
+            sm120_runtime_policy: "not_run_hardware_unavailable",
+            sm120_runtime_reason: "No approved SM120 runtime hardware is available.",
             results: BTreeMap::from([
                 ("prepare".into(), ResultState::Success),
                 (
@@ -70,6 +75,9 @@ impl State {
             "needs.prepare.outputs.active" => self.active,
             "needs.prepare.outputs.verify_only" => self.verify_only,
             "needs.prepare.outputs.sm120_required" => self.sm120_required,
+            "needs.prepare.outputs.sm120_runtime_required" => self.sm120_runtime_required,
+            "needs.prepare.outputs.sm120_runtime_policy" => self.sm120_runtime_policy,
+            "needs.prepare.outputs.sm120_runtime_reason" => self.sm120_runtime_reason,
             "needs.prepare.outputs.cloud_cuda" => "false",
             "needs.prepare.outputs.version" => "0.10.0",
             _ => {
@@ -186,9 +194,8 @@ fn scheduled(expr: &Expr, state: &State) -> Result<bool, String> {
     Ok(condition && (explicit_status || state.ancestors_succeeded))
 }
 
-fn expected_install(state: &State, sm120: bool) -> bool {
+fn expected_install(state: &State) -> bool {
     !state.cancelled
-        && (!sm120 || state.sm120_required == "true")
         && state.results["prepare"] == ResultState::Success
         && matches!(
             (state.active, state.verify_only, state.results["publish"]),
@@ -196,7 +203,7 @@ fn expected_install(state: &State, sm120: bool) -> bool {
         )
 }
 
-fn verify_installer(job: &Value, sm120: bool) -> Result<(), String> {
+fn verify_installer(job: &Value) -> Result<(), String> {
     let guard = expression(
         job["if"]
             .as_str()
@@ -215,7 +222,7 @@ fn verify_installer(job: &Value, sm120: bool) -> Result<(), String> {
                             state.results.insert("publish".into(), publish);
                             for required in ["", "false", "true", "unknown"] {
                                 state.sm120_required = required;
-                                if scheduled(&guard, &state)? != expected_install(&state, sm120) {
+                                if scheduled(&guard, &state)? != expected_install(&state) {
                                     return Err(format!(
                                         "installation outcome mismatch: {state:?}"
                                     ));
@@ -235,8 +242,7 @@ fn public_installation_guards_handle_optional_skip_and_both_delivery_modes() {
     let workflow = workflow();
     for name in INSTALLERS {
         let job = &workflow["jobs"][*name];
-        verify_installer(job, *name == "install-bootstrap-sm120")
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        verify_installer(job).unwrap_or_else(|error| panic!("{name}: {error}"));
         let needs = dependencies(job);
         assert!(needs.contains(&"prepare".into()) && needs.contains(&"publish".into()));
         let checkout = job["steps"]
@@ -262,7 +268,7 @@ fn installation_regressions_cannot_hide_behind_implicit_success_or_weakened_guar
     let source = original["if"].as_str().unwrap();
     let mut equivalent = original.clone();
     equivalent["if"] = Value::String(format!("({source}) && always()"));
-    verify_installer(&equivalent, false).unwrap();
+    verify_installer(&equivalent).unwrap();
     for changed in [
         source
             .replace("always()", "true")
@@ -275,7 +281,7 @@ fn installation_regressions_cannot_hide_behind_implicit_success_or_weakened_guar
         let mut job = original.clone();
         job["if"] = Value::String(changed.clone());
         assert!(
-            verify_installer(&job, false).is_err(),
+            verify_installer(&job).is_err(),
             "accepted weakened guard: {changed}"
         );
     }
@@ -294,14 +300,6 @@ fn installation_regressions_cannot_hide_behind_implicit_success_or_weakened_guar
             .and_then(|expr| scheduled(&expr, &formal))
             .is_err()
     );
-    let mut sm120 = workflow()["jobs"]["install-bootstrap-sm120"].clone();
-    sm120["if"] = Value::String(
-        sm120["if"]
-            .as_str()
-            .unwrap()
-            .replace("needs.prepare.outputs.sm120_required == 'true'", "true"),
-    );
-    assert!(verify_installer(&sm120, true).is_err());
 }
 
 fn dependencies(job: &Value) -> Vec<String> {
@@ -323,6 +321,10 @@ fn verification_only_cannot_schedule_staging_models_cloud_or_publication() {
     for required in ["true", "false"] {
         let mut state = State::new("false", "true");
         state.sm120_required = required;
+        if required == "false" {
+            state.sm120_runtime_policy = "required";
+            state.sm120_runtime_reason = "";
+        }
         state.results.remove("publish");
         let mut pending: BTreeSet<String> = jobs
             .keys()
@@ -361,14 +363,11 @@ fn verification_only_cannot_schedule_staging_models_cloud_or_publication() {
         }
         assert_eq!(state.results["publish"], ResultState::Skipped);
         for name in INSTALLERS {
-            assert_eq!(
-                scheduled(
-                    &expression(jobs[*name]["if"].as_str().unwrap()).unwrap(),
-                    &state
-                )
-                .unwrap(),
-                *name != "install-bootstrap-sm120" || required == "true"
-            );
+            assert!(scheduled(
+                &expression(jobs[*name]["if"].as_str().unwrap()).unwrap(),
+                &state
+            )
+            .unwrap());
         }
     }
 }
@@ -428,15 +427,14 @@ fn complete_requires_the_correct_publication_mode_and_every_public_installation(
     ] {
         let mut state = State::new(active, verify_only);
         state.sm120_required = required;
+        if required == "false" {
+            state.sm120_runtime_policy = "required";
+            state.sm120_runtime_reason = "";
+        }
         for installer in INSTALLERS {
             state
                 .results
                 .insert((*installer).into(), ResultState::Success);
-        }
-        if required == "false" {
-            state
-                .results
-                .insert("install-bootstrap-sm120".into(), ResultState::Skipped);
         }
         assert!(complete_accepts(&workflow, &state), "{state:?}");
         for name in std::iter::once("prepare")
@@ -477,15 +475,36 @@ fn complete_requires_the_correct_publication_mode_and_every_public_installation(
                 .results
                 .insert((*installer).into(), ResultState::Success);
         }
-        for result in ResultState::ALL {
+        assert!(
+            !complete_accepts(&workflow, &invalid),
+            "invalid requirement: {invalid:?}"
+        );
+    }
+    // A successful build/install on the approved fleet cannot be promoted to
+    // SM120 runtime success, including a legacy candidate that requires it.
+    for (runtime_required, policy, reason) in [
+        ("true", "required", ""),
+        ("false", "required", ""),
+        ("", "not_run_hardware_unavailable", "No approved hardware."),
+        (
+            "unknown",
+            "not_run_hardware_unavailable",
+            "No approved hardware.",
+        ),
+        ("false", "not_run_hardware_unavailable", ""),
+        ("false", "", "No approved hardware."),
+        ("false", "unknown", "No approved hardware."),
+    ] {
+        let mut invalid = State::new("true", "false");
+        invalid.sm120_runtime_required = runtime_required;
+        invalid.sm120_runtime_policy = policy;
+        invalid.sm120_runtime_reason = reason;
+        for installer in INSTALLERS {
             invalid
                 .results
-                .insert("install-bootstrap-sm120".into(), result);
-            assert!(
-                !complete_accepts(&workflow, &invalid),
-                "invalid requirement: {invalid:?}"
-            );
+                .insert((*installer).into(), ResultState::Success);
         }
+        assert!(!complete_accepts(&workflow, &invalid), "{invalid:?}");
     }
     for active in ["", "false", "true"] {
         for verify_only in ["", "false", "true"] {

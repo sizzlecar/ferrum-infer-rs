@@ -5,11 +5,32 @@ use tokio::process::Command;
 
 const WORKFLOW_PATH: &str = ".github/workflows/release-cuda.yml";
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) enum Sm120RuntimePolicy {
+    #[default]
+    Required,
+    NotRunHardwareUnavailable {
+        reason: String,
+    },
+}
+
+impl Sm120RuntimePolicy {
+    pub(super) fn required(&self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct CudaDeliveryCapability {
+    pub(super) sm120_asset_required: bool,
+    pub(super) sm120_runtime: Sm120RuntimePolicy,
+}
+
 /// Read the immutable candidate blob, never the tool's checkout or available assets.
-pub(super) async fn candidate_requires_sm120(
+pub(super) async fn candidate_delivery_capability(
     workspace: &Path,
     candidate: &str,
-) -> Result<bool, String> {
+) -> Result<CudaDeliveryCapability, String> {
     if !matches!(candidate.len(), 40 | 64)
         || !candidate
             .bytes()
@@ -41,13 +62,13 @@ pub(super) async fn candidate_requires_sm120(
     )
     .await?;
     if tree.is_empty() {
-        return Ok(false);
+        return Ok(CudaDeliveryCapability::default());
     }
     let spec = format!("{candidate}:{WORKFLOW_PATH}");
-    workflow_requires_sm120(&git(workspace, &["cat-file", "blob", &spec]).await?)
+    workflow_delivery_capability(&git(workspace, &["cat-file", "blob", &spec]).await?)
 }
 
-pub(super) fn workflow_requires_sm120(bytes: &[u8]) -> Result<bool, String> {
+pub(super) fn workflow_delivery_capability(bytes: &[u8]) -> Result<CudaDeliveryCapability, String> {
     use serde_yaml::{Mapping, Value};
     fn mapping<'a>(value: &'a Value, field: &str) -> Result<&'a Mapping, String> {
         let mapping = value
@@ -61,18 +82,40 @@ pub(super) fn workflow_requires_sm120(bytes: &[u8]) -> Result<bool, String> {
     fn get<'a>(map: &'a Mapping, key: &str) -> Option<&'a Value> {
         map.get(Value::String(key.into()))
     }
+    fn literal<'a>(outputs: &'a Mapping, name: &str) -> Result<Option<&'a str>, String> {
+        let Some(declaration) = get(outputs, name) else {
+            return Ok(None);
+        };
+        let value = get(mapping(declaration, name)?, "value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{name} requires a literal string value"))?;
+        if value.is_empty()
+            || value.trim() != value
+            || value.contains("${{")
+            || value.chars().any(|character| character.is_ascii_control())
+        {
+            return Err(format!("{name} requires a nonempty literal without expressions, surrounding whitespace or ASCII controls"));
+        }
+        Ok(Some(value))
+    }
     let workflow: Value = serde_yaml::from_slice(bytes)
         .map_err(|error| format!("invalid candidate CUDA workflow YAML: {error}"))?;
     let root = mapping(&workflow, "workflow")?;
     let on = mapping(get(root, "on").ok_or("CUDA workflow omits on")?, "on")?;
     let Some(call) = get(on, "workflow_call") else {
-        return Ok(false);
+        return Ok(CudaDeliveryCapability::default());
     };
     let Some(outputs) = get(mapping(call, "workflow_call")?, "outputs") else {
-        return Ok(false);
+        return Ok(CudaDeliveryCapability::default());
     };
-    let Some(declaration) = get(mapping(outputs, "outputs")?, "cuda_sm120_asset_id") else {
-        return Ok(false);
+    let outputs = mapping(outputs, "outputs")?;
+    let policy = literal(outputs, "cuda_sm120_runtime_policy")?;
+    let reason = literal(outputs, "cuda_sm120_runtime_reason")?;
+    let Some(declaration) = get(outputs, "cuda_sm120_asset_id") else {
+        if policy.is_some() || reason.is_some() {
+            return Err("SM120 runtime policy requires the SM120 asset declaration".into());
+        }
+        return Ok(CudaDeliveryCapability::default());
     };
     let value = get(mapping(declaration, "cuda_sm120_asset_id")?, "value")
         .and_then(Value::as_str)
@@ -80,7 +123,19 @@ pub(super) fn workflow_requires_sm120(bytes: &[u8]) -> Result<bool, String> {
     if value.is_none() {
         return Err("SM120 output requires a nonempty scalar value".into());
     }
-    Ok(true)
+    let sm120_runtime = match (policy, reason) {
+        (None | Some("required"), None) => Sm120RuntimePolicy::Required,
+        (Some("not_run_hardware_unavailable"), Some(reason)) => {
+            Sm120RuntimePolicy::NotRunHardwareUnavailable {
+                reason: reason.to_owned(),
+            }
+        }
+        _ => return Err("invalid SM120 runtime policy or missing/contradictory reason".into()),
+    };
+    Ok(CudaDeliveryCapability {
+        sm120_asset_required: true,
+        sm120_runtime,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -138,17 +193,27 @@ mod tests {
 
     #[test]
     fn candidate_workflow_declaration_is_parsed_not_inferred_from_text() {
-        assert!(workflow_requires_sm120(DECLARED.as_bytes()).unwrap());
-        assert!(workflow_requires_sm120(
-            b"'on': {workflow_call: {outputs: {cuda_sm120_asset_id: {value: 'asset'}}}}"
-        )
-        .unwrap());
+        assert!(
+            workflow_delivery_capability(DECLARED.as_bytes())
+                .unwrap()
+                .sm120_asset_required
+        );
+        assert!(
+            workflow_delivery_capability(
+                b"'on': {workflow_call: {outputs: {cuda_sm120_asset_id: {value: 'asset'}}}}"
+            )
+            .unwrap()
+            .sm120_asset_required
+        );
         for legacy in [
             "on:\n  workflow_call:\n    outputs:\n      cuda_asset_id: {value: legacy}\n",
             "on: {workflow_call: {}}\n# cuda_sm120_asset_id: present only in a comment\n",
             "on: {workflow_dispatch: {}}\njobs: {sm120: {name: cuda_sm120_asset_id}}\n",
         ] {
-            assert!(!workflow_requires_sm120(legacy.as_bytes()).unwrap());
+            assert_eq!(
+                workflow_delivery_capability(legacy.as_bytes()).unwrap(),
+                CudaDeliveryCapability::default()
+            );
         }
         for invalid in [
             "on: [workflow_call]",
@@ -159,8 +224,80 @@ mod tests {
             "on: {workflow_call: {}}\non: {workflow_dispatch: {}}",
             "on: {workflow_call: {outputs: {cuda_sm120_asset_id: {value: a}, cuda_sm120_asset_id: {value: b}}}}",
         ] {
-            assert!(workflow_requires_sm120(invalid.as_bytes()).is_err(), "{invalid}");
+            assert!(workflow_delivery_capability(invalid.as_bytes()).is_err(), "{invalid}");
         }
+    }
+
+    fn declared_policy(policy: Option<&str>, reason: Option<&str>) -> Vec<u8> {
+        let mut workflow: serde_yaml::Value = serde_yaml::from_str(DECLARED).unwrap();
+        let outputs = workflow["on"]["workflow_call"]["outputs"]
+            .as_mapping_mut()
+            .unwrap();
+        for (name, value) in [
+            ("cuda_sm120_runtime_policy", policy),
+            ("cuda_sm120_runtime_reason", reason),
+        ] {
+            if let Some(value) = value {
+                outputs.insert(
+                    name.into(),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
+                        "value".into(),
+                        serde_yaml::Value::String(value.to_owned()),
+                    )])),
+                );
+            }
+        }
+        serde_yaml::to_string(&workflow).unwrap().into_bytes()
+    }
+
+    #[test]
+    fn sm120_policy_is_explicit_literal_and_never_inferred_from_missing_evidence() {
+        for policy in [None, Some("required")] {
+            assert_eq!(
+                workflow_delivery_capability(&declared_policy(policy, None))
+                    .unwrap()
+                    .sm120_runtime,
+                Sm120RuntimePolicy::Required
+            );
+        }
+        let unavailable = "not_run_hardware_unavailable";
+        assert_eq!(
+            workflow_delivery_capability(&declared_policy(
+                Some(unavailable),
+                Some("No approved SM120 executor.")
+            ))
+            .unwrap(),
+            CudaDeliveryCapability {
+                sm120_asset_required: true,
+                sm120_runtime: Sm120RuntimePolicy::NotRunHardwareUnavailable {
+                    reason: "No approved SM120 executor.".into()
+                },
+            }
+        );
+        for (policy, reason) in [
+            (None, Some("reason")),
+            (Some("required"), Some("reason")),
+            (Some(unavailable), None),
+            (Some(unavailable), Some("")),
+            (Some(unavailable), Some(" reason")),
+            (Some(unavailable), Some("reason\nsecond_output=true")),
+            (Some(unavailable), Some("reason\tcontrol")),
+            (Some(unavailable), Some("reason\u{7f}")),
+            (Some(unavailable), Some("${{ inputs.reason }}")),
+            (Some("${{ inputs.policy }}"), None),
+            (Some("not_required"), Some("reason")),
+            (Some(""), None),
+        ] {
+            assert!(
+                workflow_delivery_capability(&declared_policy(policy, reason)).is_err(),
+                "{policy:?} {reason:?}"
+            );
+        }
+        assert!(workflow_delivery_capability(
+            b"on: {workflow_call: {outputs: {cuda_sm120_runtime_policy: {value: required}}}}"
+        )
+        .is_err());
+        assert!(workflow_delivery_capability(b"on: {workflow_call: {outputs: {cuda_sm120_asset_id: {value: asset}, cuda_sm120_runtime_policy: {value: required}, cuda_sm120_runtime_policy: {value: not_run_hardware_unavailable}}}}").is_err());
     }
 
     #[tokio::test]
@@ -213,17 +350,63 @@ mod tests {
         let current = git(&["rev-parse", "HEAD"]);
         // An uncommitted older declaration must not downgrade this candidate.
         std::fs::write(&path, "on: {workflow_call: {}}\n").unwrap();
-        assert!(candidate_requires_sm120(directory.path(), &current)
+        let required = candidate_delivery_capability(directory.path(), &current)
             .await
-            .unwrap());
-        assert!(!candidate_requires_sm120(directory.path(), &legacy)
-            .await
-            .unwrap());
-        assert!(candidate_requires_sm120(directory.path(), "HEAD")
+            .unwrap();
+        assert!(required.sm120_asset_required);
+        assert_eq!(required.sm120_runtime, Sm120RuntimePolicy::Required);
+        assert_eq!(
+            candidate_delivery_capability(directory.path(), &legacy)
+                .await
+                .unwrap(),
+            CudaDeliveryCapability::default()
+        );
+        std::fs::write(
+            &path,
+            declared_policy(
+                Some("not_run_hardware_unavailable"),
+                Some("No approved SM120 executor."),
+            ),
+        )
+        .unwrap();
+        // A local policy change cannot downgrade an immutable older candidate.
+        assert_eq!(
+            candidate_delivery_capability(directory.path(), &current)
+                .await
+                .unwrap(),
+            required
+        );
+        git(&["add", WORKFLOW_PATH]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "declare unavailable runtime",
+        ]);
+        let unavailable = git(&["rev-parse", "HEAD"]);
+        std::fs::write(&path, DECLARED).unwrap();
+        assert!(matches!(
+            candidate_delivery_capability(directory.path(), &unavailable)
+                .await
+                .unwrap()
+                .sm120_runtime,
+            Sm120RuntimePolicy::NotRunHardwareUnavailable { .. }
+        ));
+        assert_eq!(
+            candidate_delivery_capability(directory.path(), &current)
+                .await
+                .unwrap(),
+            required
+        );
+        assert!(candidate_delivery_capability(directory.path(), "HEAD")
             .await
             .is_err());
-        assert!(candidate_requires_sm120(directory.path(), &"0".repeat(40))
-            .await
-            .is_err());
+        assert!(
+            candidate_delivery_capability(directory.path(), &"0".repeat(40))
+                .await
+                .is_err()
+        );
     }
 }

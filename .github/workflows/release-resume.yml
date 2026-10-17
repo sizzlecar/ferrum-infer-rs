@@ -105,7 +105,7 @@ jobs:
         run: |
           # Parse the original candidate's declaration, not the current tools
           # checkout or whichever public/staged assets happen to be present.
-          sm120_required=$(ruby -rpsych - "$GITHUB_WORKSPACE/candidate/.github/workflows/release-cuda.yml" <<'RUBY_YAML'
+          ruby -rpsych - "$GITHUB_WORKSPACE/candidate/.github/workflows/release-cuda.yml" resume >> "$GITHUB_OUTPUT" <<'RUBY_YAML'
           def mapping(node, location)
             raise "#{location} must be a YAML mapping" unless node.is_a?(Psych::Nodes::Mapping)
             node.children.each_slice(2).each_with_object({}) do |(key, value), entries|
@@ -114,25 +114,54 @@ jobs:
               entries[key.value] = value
             end
           end
-          path = ARGV.fetch(0)
-          unless File.exist?(path)
-            puts 'false'
-            exit
+          def scalar(entry, name)
+            value = mapping(entry, name)['value']
+            raise "#{name} needs a nonempty string value" unless value.is_a?(Psych::Nodes::Scalar) && !value.value.strip.empty?
+            if value.tag && value.tag != 'tag:yaml.org,2002:str'
+              raise "#{name} needs a string value"
+            end
+            if value.plain && !value.tag
+              scanner = Psych::ScalarScanner.new(Psych::ClassLoader::Restricted.new([], []))
+              raise "#{name} needs a string value" unless scanner.tokenize(value.value).is_a?(String)
+            end
+            value.value
           end
-          document = Psych.parse_file(path)
-          workflow = mapping(document&.root, 'workflow')
-          triggers = mapping(workflow.fetch('on'), 'on')
-          call = triggers['workflow_call']
-          outputs = call && mapping(call, 'workflow_call')['outputs']
-          declaration = outputs && mapping(outputs, 'outputs')['cuda_sm120_asset_id']
-          if declaration
-            value = mapping(declaration, 'cuda_sm120_asset_id')['value']
-            raise 'SM120 output needs a value' unless value.is_a?(Psych::Nodes::Scalar) && !value.value.strip.empty?
+          path, mode = ARGV
+          outputs = {}
+          if File.exist?(path)
+            workflow = mapping(Psych.parse_file(path)&.root, 'workflow')
+            triggers = mapping(workflow.fetch('on'), 'on')
+            call = triggers['workflow_call']
+            declared = call && mapping(call, 'workflow_call')['outputs']
+            outputs = mapping(declared, 'outputs') if declared
           end
-          puts declaration ? 'true' : 'false'
+          asset = outputs['cuda_sm120_asset_id']
+          scalar(asset, 'cuda_sm120_asset_id') if asset
+          policy_entry = outputs['cuda_sm120_runtime_policy']
+          reason_entry = outputs['cuda_sm120_runtime_reason']
+          raise 'SM120 runtime policy requires an SM120 asset declaration' if !asset && (policy_entry || reason_entry)
+          policy = policy_entry ? scalar(policy_entry, 'cuda_sm120_runtime_policy') : 'required'
+          reason = ''
+          case policy
+          when 'required'
+            raise 'Required SM120 validation must not declare an unavailable reason' if reason_entry
+          when 'not_run_hardware_unavailable'
+            raise 'Unavailable SM120 hardware needs a reason' unless reason_entry
+            reason = scalar(reason_entry, 'cuda_sm120_runtime_reason')
+            raise 'SM120 reason must be a literal, trimmed single line' if reason.match?(/\A[[:space:]]|[[:space:]]\z/u) || reason.include?('${{') || reason.match?(/[\x00-\x1f\x7f]/)
+          else
+            raise 'Unknown or nonliteral SM120 runtime policy'
+          end
+          runtime_required = !!asset && policy == 'required'
+          if mode == 'delivery'
+            raise 'This candidate requires real SM120 validation, but no approved SM120 runner is available; historical evidence is not a new verification run' if runtime_required
+            raise 'Active release must declare its SM120 asset' if ENV.fetch('VERIFY_PUBLISHED_VERSION', '').empty? && !asset
+          end
+          puts "sm120_required=#{!!asset}"
+          puts "sm120_runtime_required=#{runtime_required}"
+          puts "sm120_runtime_policy=#{policy}"
+          puts "sm120_runtime_reason=#{reason}"
           RUBY_YAML
-          )
-          printf 'sm120_required=%s\n' "$sm120_required" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -211,7 +240,7 @@ jobs:
           SOURCE_RUN: ${{ inputs.source_run_id }}
           PREUPLOAD_ASSET: ${{ inputs.preupload_asset }}
           PREUPLOAD_TIMEOUT_MINUTES: ${{ inputs.preupload_timeout_minutes }}
-          SM120_REQUIRED: ${{ steps.cuda-capability.outputs.sm120_required }}
+          SM120_RUNTIME_REQUIRED: ${{ steps.cuda-capability.outputs.sm120_runtime_required }}
         run: |
           version=$(cargo metadata --manifest-path candidate/Cargo.toml --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
           gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
@@ -224,13 +253,13 @@ jobs:
           done
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-cuda-evidence/installation-cuda.json"
             --installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
-          case "$SM120_REQUIRED" in
+          case "$SM120_RUNTIME_REQUIRED" in
             true)
               gate_args+=(--tasks "$RUNNER_TEMP/evidence/release-cuda-sm120-evidence/tasks/tasks.json"
                 --installation "$RUNNER_TEMP/evidence/release-cuda-sm120-evidence/installation-cuda-sm120.json")
               ;;
             false) ;;
-            *) echo 'Missing candidate SM120 capability declaration result' >&2; exit 1 ;;
+            *) echo 'Missing candidate SM120 runtime policy result' >&2; exit 1 ;;
           esac
           while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
             < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)

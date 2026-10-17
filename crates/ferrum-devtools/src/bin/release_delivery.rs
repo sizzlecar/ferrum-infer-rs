@@ -40,6 +40,25 @@ struct AcceptedRelease {
     workspace: PathBuf,
     notes: String,
     assets: Vec<AcceptedAsset>,
+    /// Model execution and extracted-archive startup, not public installer execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sm120_runtime: Option<Sm120RuntimeCoverage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct Sm120RuntimeCoverage {
+    asset_name: String,
+    asset_sha256: String,
+    binary_sha256: String,
+    #[serde(flatten)]
+    outcome: Sm120RuntimeOutcome,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum Sm120RuntimeOutcome {
+    Passed,
+    NotRun { reason: String },
 }
 #[derive(Parser)]
 #[command(about = "Run bounded model regression and deliver verified release assets")]
