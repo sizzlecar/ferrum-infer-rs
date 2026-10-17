@@ -124,6 +124,78 @@ mod tests {
         model
     }
 
+    #[test]
+    fn native_cuda_execution_defaults_are_shared_by_run_and_serve() {
+        use ferrum_types::{
+            CausalDecodeAttentionGrouping, CausalDecodeKvReuse, CompiledKernelFeatures,
+            InvocationPreparationStrategy, SamplingReadbackMode, SequenceBackingGrowth,
+        };
+        let hardware = HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures {
+            cuda: true,
+            cuda_graph: true,
+            vllm_paged_attn: true,
+            cuda_indexed_causal_attention: true,
+            cuda_causal_gqa2: true,
+            ..CompiledKernelFeatures::default()
+        });
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            for explicit_uniform in [false, true] {
+                let mut requested = RuntimeConfigSnapshot::default();
+                if explicit_uniform {
+                    requested.upsert(
+                        "FERRUM_SAMPLING_READBACK_MODE",
+                        "uniform",
+                        RuntimeConfigSource::ConfigFile,
+                    );
+                }
+                let resolved = resolve_config(
+                    requested,
+                    model(),
+                    hardware.clone(),
+                    WorkloadProfile::serving_default(),
+                    ExecutionResourceAuthority::PlanRuntime,
+                    usage,
+                )
+                .unwrap();
+                let mut engine = EngineConfig::default();
+                let numerical = engine.numerical_execution.clone();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine.runtime.invocation_preparation_strategy,
+                    InvocationPreparationStrategy::ResidentDecodeProgram
+                );
+                assert_eq!(
+                    engine.runtime.causal_decode_attention_grouping,
+                    CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                );
+                assert_eq!(
+                    engine.runtime.causal_decode_kv_reuse,
+                    CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
+                );
+                assert_eq!(
+                    engine.runtime.sequence_backing_growth,
+                    SequenceBackingGrowth::PagedGroup4GrowOnly
+                );
+                assert_eq!(
+                    engine.runtime.sampling_readback_mode,
+                    if explicit_uniform {
+                        SamplingReadbackMode::Uniform
+                    } else {
+                        SamplingReadbackMode::Participant
+                    }
+                );
+                assert_eq!(engine.numerical_execution, numerical);
+                assert_prefix_state_cache(
+                    &resolved,
+                    usage == StartupUsage::PersistentServing,
+                    RuntimeConfigSource::Default,
+                );
+            }
+        }
+    }
+
     fn assert_prefix_state_cache(
         resolved: &ResolvedFerrumConfig,
         enabled: bool,
