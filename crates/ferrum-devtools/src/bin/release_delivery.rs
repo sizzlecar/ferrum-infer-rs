@@ -40,6 +40,40 @@ struct AcceptedRelease {
     workspace: PathBuf,
     notes: String,
     assets: Vec<AcceptedAsset>,
+    /// Model execution and extracted-archive startup, not public installer execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sm120_runtime: Option<Sm120RuntimeCoverage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct Sm120RuntimeCoverage {
+    asset_name: String,
+    asset_sha256: String,
+    binary_sha256: String,
+    #[serde(flatten)]
+    outcome: Sm120RuntimeOutcome,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum Sm120RuntimeOutcome {
+    Passed {
+        source: gate::Sm120RuntimeSource,
+        ci_job: Sm120CiObservation,
+    },
+    NotRun {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct Sm120CiObservation {
+    workflow_run_id: u64,
+    job_id: Option<u64>,
+    run_attempt: Option<u64>,
+    status: String,
+    conclusion: Option<String>,
+    failed_steps: Vec<String>,
 }
 #[derive(Parser)]
 #[command(about = "Run bounded model regression and deliver verified release assets")]
@@ -125,5 +159,51 @@ mod tests {
     #[test]
     fn composed_delivery_commands_have_unambiguous_options() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn sm120_manual_runtime_source_requires_explicit_typed_cli_selection() {
+        let common = [
+            "release_delivery",
+            "gate",
+            "--plan",
+            "plan.json",
+            "--tasks",
+            "tasks.json",
+            "--contracts",
+            "contracts.json",
+            "--installation",
+            "installation.json",
+            "--abi",
+            "asset.abi.json",
+            "--windows-staged",
+            "windows",
+            "--version",
+            "0.13.0",
+            "--workspace",
+            "candidate",
+            "--notes",
+            "notes.md",
+            "--ci-run-id",
+            "17",
+            "--output",
+            "accepted.json",
+        ];
+        let Action::Gate { inputs, .. } = Args::try_parse_from(common).unwrap().action else {
+            panic!("expected gate")
+        };
+        assert_eq!(inputs.sm120_runtime_source, gate::Sm120RuntimeSource::Ci);
+        let mut manual = common.to_vec();
+        manual.extend(["--sm120-runtime-source", "manual"]);
+        let Action::Gate { inputs, .. } = Args::try_parse_from(manual).unwrap().action else {
+            panic!("expected gate")
+        };
+        assert_eq!(
+            inputs.sm120_runtime_source,
+            gate::Sm120RuntimeSource::Manual
+        );
+        let mut invalid = common.to_vec();
+        invalid.extend(["--sm120-runtime-source", "skip"]);
+        assert!(Args::try_parse_from(invalid).is_err());
     }
 }

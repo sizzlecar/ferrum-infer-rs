@@ -44,6 +44,12 @@ on:
       cuda_sm120_asset_id:
         description: Immutable Linux SM120 production artifact ID
         value: ${{ jobs.linux-x86_64-cuda-sm120.outputs.asset_id }}
+      cuda_sm120_runtime_policy:
+        description: Candidate-bound SM120 runtime validation scope
+        value: not_run_hardware_unavailable
+      cuda_sm120_runtime_reason:
+        description: Why this candidate has no SM120 runtime validation
+        value: 'SM120 hardware is unavailable in the approved fleet (local host, RTX 4060 and Mac mini 2); this candidate is not runtime validated on SM120.'
       windows_asset_id:
         description: Windows ZIP, installer, stable launcher and staging byte receipts
         value: ${{ jobs.windows-x86_64-cuda-sm89.outputs.asset_id }}
@@ -438,7 +444,7 @@ jobs:
             --cuda-compute-capability "$CUDA_COMPUTE_CAP" \
             --cuda-toolkit-image nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
 
-      - name: Deferred CUDA smoke contract
+      - name: CUDA package loadability scope
         run: |
           mkdir -p smoke
           tar -C smoke -xzf ferrum-linux-x86_64-cuda-sm120.tar.gz
@@ -448,7 +454,7 @@ jobs:
             test "$version_output" = "ferrum $VERSION"
             LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --help >/dev/null
           else
-            echo "Executable smoke is deferred to the exact staged-byte GPU gate."
+            echo "SM120 executable smoke: not_run (hardware unavailable in the approved fleet); archive and ABI inspection remain required."
             ldd ./smoke/ferrum
           fi
 

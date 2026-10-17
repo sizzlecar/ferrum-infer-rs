@@ -160,6 +160,7 @@ async fn package_source_check_rejects_unaccepted_inputs_and_ignores_unrelated_fi
         workspace: directory.path().into(),
         notes: String::new(),
         assets: vec![],
+        sm120_runtime: None,
     };
     let inputs = BTreeMap::from([("package.rs".into(), directory.path().join("package.rs"))]);
     let expected = source_fingerprint(&accepted, &inputs).await.unwrap();

@@ -258,6 +258,234 @@ fn cuda_pair() -> (Distributions, Vec<ExpectedModelRun>) {
     (distributions, vec![task(), second])
 }
 
+fn unavailable_sm120_policy() -> Sm120RuntimePolicy {
+    cuda_assets::workflow_delivery_capability(
+        br#"on:
+  workflow_call:
+    outputs:
+      cuda_sm120_asset_id: {value: '${{ jobs.sm120.outputs.asset_id }}'}
+      cuda_sm120_runtime_policy: {value: not_run_hardware_unavailable}
+      cuda_sm120_runtime_reason: {value: 'No approved SM120 executor.'}
+"#,
+    )
+    .unwrap()
+    .sm120_runtime
+}
+
+#[test]
+fn unavailable_sm120_keeps_sm89_tasks_and_forbids_substituted_runtime_claims() {
+    let (distributions, tasks) = cuda_pair();
+    let mut plan = make_plan(&tasks[0]);
+    plan.release_cuda = Some(ReleaseCudaPolicy {
+        model_limitations: Vec::new(),
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec![tasks[0].profile.id.clone()],
+        extended_cloud_profile_ids: Vec::new(),
+        reason: "Keep approved local CUDA model coverage".into(),
+    });
+    let schedule = model_task_schedule(&plan);
+    let mut prepared = PreparedTasks {
+        schema_version: 1,
+        expectations: vec![tasks[0].clone()],
+        unsupported_obligations: schedule.unsupported_obligations.clone(),
+        remaining_plan_gaps: plan.gaps.clone(),
+    };
+    let policy = unavailable_sm120_policy();
+    validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions,
+        "2.3.4",
+        &policy,
+    )
+    .unwrap();
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions,
+        "2.3.4",
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
+    let reports = vec![model_report(&tasks[0])];
+    let models = VerifiedModels::new(&prepared.expectations, &reports).unwrap();
+    verify_sm120_model_device(&distributions, &models, &policy).unwrap();
+    assert!(
+        verify_sm120_model_device(&distributions, &models, &Sm120RuntimePolicy::Required).is_err()
+    );
+    prepared.expectations = tasks.clone();
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions,
+        "2.3.4",
+        &policy
+    )
+    .unwrap_err()
+    .contains("contradict"));
+    let mut reports: Vec<_> = tasks.iter().map(model_report).collect();
+    reports[1]["cases"][2]["evidence"]["auto_config"]["hardware_capabilities"]
+        ["compute_capability"] = json!("12.0");
+    let models = VerifiedModels::new(&prepared.expectations, &reports).unwrap();
+    assert!(verify_sm120_model_device(&distributions, &models, &policy)
+        .unwrap_err()
+        .contains("contradict"));
+    prepared.expectations = vec![tasks[1].clone()];
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions,
+        "2.3.4",
+        &policy
+    )
+    .is_err());
+    prepared.expectations.clear();
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions,
+        "2.3.4",
+        &policy
+    )
+    .is_err());
+}
+
+#[test]
+fn unavailable_sm120_still_requires_exact_archive_inspection_without_runtime_claims() {
+    let (distributions, tasks) = cuda_pair();
+    let reports = vec![model_report(&tasks[0])];
+    let models = VerifiedModels::new(&tasks[..1], &reports).unwrap();
+    let policy = unavailable_sm120_policy();
+    let sm89 = extract_only();
+    let asset = distributions
+        .values()
+        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
+        .unwrap();
+    let mut sm120 = sm89.clone();
+    sm120.asset_name = asset.name.clone();
+    sm120.asset_sha256 = asset.sha256.clone();
+    sm120.binary_sha256 = asset.binary_sha256.clone();
+    let inspect = |sm120: installation::InstallationReport, policy: &Sm120RuntimePolicy| {
+        verify_installations(
+            &distributions,
+            &[sm89.clone(), sm120],
+            &models,
+            "2.3.4",
+            &"a".repeat(40),
+            policy,
+        )
+    };
+    inspect(sm120.clone(), &policy).unwrap();
+    assert!(inspect(sm120.clone(), &Sm120RuntimePolicy::Required).is_err());
+    assert!(verify_installations(
+        &distributions,
+        std::slice::from_ref(&sm89),
+        &models,
+        "2.3.4",
+        &"a".repeat(40),
+        &policy
+    )
+    .is_err());
+    for field in [
+        "asset_name",
+        "asset_sha256",
+        "binary_sha256",
+        "candidate_sha",
+        "version",
+        "target_triple",
+        "backend",
+    ] {
+        let mut stale = serde_json::to_value(&sm120).unwrap();
+        stale[field] = json!("wrong-identity");
+        assert!(
+            inspect(serde_json::from_value(stale).unwrap(), &policy).is_err(),
+            "{field}"
+        );
+    }
+    for status in ["passed", "failed", "skipped"] {
+        let mut contradictory = sm120.clone();
+        contradictory.status = status.into();
+        assert!(inspect(contradictory, &policy).is_err(), "{status}");
+    }
+    let mut contradictory = sm120.clone();
+    contradictory.error = Some("execution failed".into());
+    assert!(inspect(contradictory, &policy).is_err());
+    let mut contradictory = sm120.clone();
+    contradictory.schema_version = 2;
+    assert!(inspect(contradictory, &policy).is_err());
+    let mut contradictory = sm120.clone();
+    contradictory.observations.push(installation::Observation {
+        arguments: vec!["--version".into()],
+        exit_code: Some(0),
+        stdout: "ferrum 2.3.4".into(),
+        stderr: String::new(),
+    });
+    assert!(inspect(contradictory, &policy).is_err());
+    // SM89 still needs its own actual model evidence, even with an inspected SM120 archive.
+    let other_reports = vec![model_report(&tasks[1])];
+    let wrong_models = VerifiedModels::new(&tasks[1..], &other_reports).unwrap();
+    assert!(verify_installations(
+        &distributions,
+        &[sm89, sm120],
+        &wrong_models,
+        "2.3.4",
+        &"a".repeat(40),
+        &policy
+    )
+    .is_err());
+}
+
+#[test]
+fn accepted_sm120_scope_and_notes_preserve_explicit_not_run() {
+    let (distributions, _) = cuda_pair();
+    let mut notes = "Candidate release.".to_owned();
+    let coverage = sm120_runtime_coverage(
+        &distributions,
+        &unavailable_sm120_policy(),
+        Sm120RuntimeSource::Ci,
+        None,
+        &mut notes,
+    )
+    .unwrap()
+    .unwrap();
+    let serialized = serde_json::to_value(coverage).unwrap();
+    assert_eq!(serialized["status"], "not_run");
+    assert_eq!(serialized["reason"], "No approved SM120 executor.");
+    assert_eq!(
+        serialized["asset_name"],
+        "ferrum-linux-x86_64-cuda-sm120.tar.gz"
+    );
+    assert_eq!(serialized["asset_sha256"], "e".repeat(64));
+    assert_eq!(serialized["binary_sha256"], "d".repeat(64));
+    assert!(notes.contains("**not_run**"));
+    assert!(notes.contains("No approved SM120 executor."));
+    assert!(notes.contains("SM89 runtime evidence does not validate SM120"));
+    let mut required_notes = "Candidate release.".to_owned();
+    let coverage = sm120_runtime_coverage(
+        &distributions,
+        &Sm120RuntimePolicy::Required,
+        Sm120RuntimeSource::Ci,
+        Some(Sm120CiObservation {
+            workflow_run_id: 17,
+            job_id: Some(33),
+            run_attempt: Some(2),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            failed_steps: vec![],
+        }),
+        &mut required_notes,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(serde_json::to_value(coverage).unwrap()["status"], "passed");
+    assert_eq!(required_notes, "Candidate release.");
+}
+
 #[test]
 fn cuda_asset_identity_binds_architecture_toolkit_and_feature_set() {
     for (variant, name, capability, image, features) in [
@@ -315,18 +543,50 @@ fn cuda_task_envelopes_require_each_architecture_without_replacing_old_coverage(
             .collect(),
     )
     .unwrap();
-    validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").unwrap();
+    validate_tasks(
+        &plan,
+        &schedule,
+        &combined,
+        &distributions,
+        "2.3.4",
+        &Sm120RuntimePolicy::Required,
+    )
+    .unwrap();
     combined.expectations.pop();
-    assert!(validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").is_err());
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &combined,
+        &distributions,
+        "2.3.4",
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
     combined.expectations = vec![tasks[0].clone(), tasks[0].clone()];
-    assert!(validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").is_err());
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &combined,
+        &distributions,
+        "2.3.4",
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
     combined.expectations = tasks;
     let sm120 = distributions
         .values_mut()
         .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
         .unwrap();
     sm120.binary_sha256 = combined.expectations[0].binary_sha256.clone();
-    assert!(validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").is_err());
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &combined,
+        &distributions,
+        "2.3.4",
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
     let mut stale = envelope(vec![task()]);
     stale.remaining_plan_gaps.push(Gap::EmptyInventory);
     assert!(combine_tasks(&plan, &schedule, vec![stale]).is_err());
@@ -337,13 +597,17 @@ fn cuda_model_reports_are_verified_per_binary_and_require_actual_sm120_device() 
     let (distributions, tasks) = cuda_pair();
     let mut reports: Vec<_> = tasks.iter().map(model_report).collect();
     let verified = VerifiedModels::new(&tasks, &reports).unwrap();
-    assert!(verify_sm120_model_device(&distributions, &verified).is_err());
+    assert!(
+        verify_sm120_model_device(&distributions, &verified, &Sm120RuntimePolicy::Required)
+            .is_err()
+    );
     for capability in ["8.9", "12.0"] {
         reports[1]["cases"][2]["evidence"]["auto_config"]["hardware_capabilities"]
             ["compute_capability"] = json!(capability);
         let verified = VerifiedModels::new(&tasks, &reports).unwrap();
         assert_eq!(
-            verify_sm120_model_device(&distributions, &verified).is_ok(),
+            verify_sm120_model_device(&distributions, &verified, &Sm120RuntimePolicy::Required)
+                .is_ok(),
             capability == "12.0"
         );
     }
@@ -368,7 +632,8 @@ fn cuda_installation_requires_each_archive_and_actual_sm120_startup() {
         std::slice::from_ref(&old),
         &verified,
         "2.3.4",
-        &"a".repeat(40)
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required,
     )
     .is_err());
     let asset = distributions
@@ -384,7 +649,8 @@ fn cuda_installation_requires_each_archive_and_actual_sm120_startup() {
         &[old.clone(), new.clone()],
         &verified,
         "2.3.4",
-        &"a".repeat(40)
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required,
     )
     .is_err());
     new.status = "passed".into();
@@ -412,6 +678,7 @@ fn cuda_installation_requires_each_archive_and_actual_sm120_startup() {
         &verified,
         "2.3.4",
         &"a".repeat(40),
+        &Sm120RuntimePolicy::Required,
     )
     .unwrap();
     new.binary_sha256 = old.binary_sha256.clone();
@@ -420,7 +687,8 @@ fn cuda_installation_requires_each_archive_and_actual_sm120_startup() {
         &[old, new],
         &verified,
         "2.3.4",
-        &"a".repeat(40)
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required,
     )
     .is_err());
 }
@@ -447,19 +715,48 @@ fn release_plan_recomputes_schedule_and_rejects_removed_gap_or_stale_assignments
         unsupported_obligations: vec![],
         remaining_plan_gaps: vec![],
     };
-    validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4").unwrap();
+    validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions(),
+        "2.3.4",
+        &Sm120RuntimePolicy::Required,
+    )
+    .unwrap();
     prepared.remaining_plan_gaps.push(Gap::EmptyInventory);
-    assert!(validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4").is_err());
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions(),
+        "2.3.4",
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
     prepared.remaining_plan_gaps.clear();
     prepared.expectations[0].binary_sha256 = "d".repeat(64);
-    assert!(
-        validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4")
-            .unwrap_err()
-            .contains("staged bytes")
-    );
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions(),
+        "2.3.4",
+        &Sm120RuntimePolicy::Required
+    )
+    .unwrap_err()
+    .contains("staged bytes"));
     prepared.expectations[0].binary_sha256 = "b".repeat(64);
     prepared.expectations[0].use_default_backend = false;
-    assert!(validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4").is_err());
+    assert!(validate_tasks(
+        &plan,
+        &schedule,
+        &prepared,
+        &distributions(),
+        "2.3.4",
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
 }
 
 #[test]
@@ -482,7 +779,15 @@ fn prepared_capacity_cannot_override_quick_start_or_the_functional_workload() {
             unsupported_obligations: vec![],
             remaining_plan_gaps: vec![],
         };
-        validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4").unwrap();
+        validate_tasks(
+            &plan,
+            &schedule,
+            &prepared,
+            &distributions(),
+            "2.3.4",
+            &Sm120RuntimePolicy::Required,
+        )
+        .unwrap();
         for capacity in [
             None,
             Some(DEFAULT_FUNCTIONAL_CAPACITY),
@@ -499,11 +804,16 @@ fn prepared_capacity_cannot_override_quick_start_or_the_functional_workload() {
                 continue;
             }
             prepared.expectations[0].runtime_capacity = capacity;
-            assert!(
-                validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4")
-                    .unwrap_err()
-                    .contains("capacity")
-            );
+            assert!(validate_tasks(
+                &plan,
+                &schedule,
+                &prepared,
+                &distributions(),
+                "2.3.4",
+                &Sm120RuntimePolicy::Required
+            )
+            .unwrap_err()
+            .contains("capacity"));
         }
     }
 }
@@ -538,17 +848,30 @@ fn local_metal_capacity_and_backend_are_bound_without_overriding_quick_start() {
             remaining_plan_gaps: vec![],
         };
         // Even identical binary hashes cannot substitute a CUDA distribution.
-        assert!(
-            validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4")
-                .unwrap_err()
-                .contains("backend")
-        );
+        assert!(validate_tasks(
+            &plan,
+            &schedule,
+            &prepared,
+            &distributions(),
+            "2.3.4",
+            &Sm120RuntimePolicy::Required
+        )
+        .unwrap_err()
+        .contains("backend"));
         let mut metal_distribution = distributions().into_values().next().unwrap();
         metal_distribution.backend = Backend::Metal;
         metal_distribution.cuda_variant = None;
         metal_distribution.target = "aarch64-apple-darwin".into();
         let metal = BTreeMap::from([(metal_distribution.key(), metal_distribution)]);
-        validate_tasks(&plan, &schedule, &prepared, &metal, "2.3.4").unwrap();
+        validate_tasks(
+            &plan,
+            &schedule,
+            &prepared,
+            &metal,
+            "2.3.4",
+            &Sm120RuntimePolicy::Required,
+        )
+        .unwrap();
         for capacity in [
             None,
             Some(DEFAULT_METAL_FUNCTIONAL_CAPACITY),
@@ -563,9 +886,16 @@ fn local_metal_capacity_and_backend_are_bound_without_overriding_quick_start() {
                 continue;
             }
             prepared.expectations[0].runtime_capacity = capacity;
-            assert!(validate_tasks(&plan, &schedule, &prepared, &metal, "2.3.4")
-                .unwrap_err()
-                .contains("capacity"));
+            assert!(validate_tasks(
+                &plan,
+                &schedule,
+                &prepared,
+                &metal,
+                "2.3.4",
+                &Sm120RuntimePolicy::Required
+            )
+            .unwrap_err()
+            .contains("capacity"));
         }
     }
 }
@@ -615,12 +945,19 @@ fn cuda_extract_only_needs_validated_same_binary_run_and_serve_reports() {
         &verified,
         "2.3.4",
         &"a".repeat(40),
+        &Sm120RuntimePolicy::Required,
     )
     .unwrap();
     assert_eq!(report.status, "not_run");
-    assert!(
-        verify_installations(&distributions(), &[], &verified, "2.3.4", &"a".repeat(40)).is_err()
-    );
+    assert!(verify_installations(
+        &distributions(),
+        &[],
+        &verified,
+        "2.3.4",
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
     let mut stale = report.clone();
     stale.binary_sha256 = "e".repeat(64);
     assert!(verify_installations(
@@ -628,7 +965,8 @@ fn cuda_extract_only_needs_validated_same_binary_run_and_serve_reports() {
         &[stale],
         &verified,
         "2.3.4",
-        &"a".repeat(40)
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required,
     )
     .is_err());
     let mut failed = report;
@@ -638,7 +976,8 @@ fn cuda_extract_only_needs_validated_same_binary_run_and_serve_reports() {
         &[failed],
         &verified,
         "2.3.4",
-        &"a".repeat(40)
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required,
     )
     .is_err());
     for case_name in ["run-basic", "serve-startup"] {
@@ -748,6 +1087,29 @@ async fn ci_fixture_with_capability(
     cuda_policy: Option<&ReleaseCudaPolicy>,
     sm120_required: bool,
 ) -> Result<(), String> {
+    ci_fixture_with_runtime_source(
+        run,
+        jobs,
+        status,
+        expect_jobs,
+        windows_attempt,
+        cuda_policy,
+        sm120_required,
+        Sm120RuntimeSource::Ci,
+    )
+    .await
+    .map(|_| ())
+}
+async fn ci_fixture_with_runtime_source(
+    run: Value,
+    jobs: Vec<Value>,
+    status: u16,
+    expect_jobs: bool,
+    windows_attempt: Option<windows_assets::WindowsAttempts>,
+    cuda_policy: Option<&ReleaseCudaPolicy>,
+    sm120_required: bool,
+    source: Sm120RuntimeSource,
+) -> Result<Option<Sm120CiObservation>, String> {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
@@ -810,10 +1172,13 @@ async fn ci_fixture_with_capability(
                 attempt,
                 policy,
                 sm120_required,
+                source,
             )
             .await
         }
-        _ => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None).await,
+        _ => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None)
+            .await
+            .map(|_| None),
     };
     tokio::time::timeout(Duration::from_secs(3), worker)
         .await
@@ -917,6 +1282,132 @@ async fn sm120_job_cannot_be_missing_foreign_or_superseded_by_failure() {
         sm120["conclusion"] = json!(conclusion);
         assert!(verify(vec![old.clone(), sm120.clone()]).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn manual_sm120_preserves_actual_ci_failure_and_all_other_job_requirements() {
+    let mut local = ci_job();
+    local["id"] = json!(31);
+    local["name"] = json!("cuda-models");
+    let mut cloud = ci_job();
+    cloud["id"] = json!(32);
+    cloud["name"] = json!("cuda-models-cloud");
+    cloud["conclusion"] = json!("skipped");
+    let mut sm120 = ci_job();
+    sm120["id"] = json!(33);
+    sm120["name"] = json!("cuda-models-sm120");
+    sm120["conclusion"] = json!("failure");
+    sm120["steps"] = json!([{ "name": "Set up job", "conclusion": "failure" }]);
+    let policy = ReleaseCudaPolicy {
+        model_limitations: Vec::new(),
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec!["small".into()],
+        extended_cloud_profile_ids: vec!["large".into()],
+        reason: "Required actual CUDA runtime validation".into(),
+    };
+    let verify = |jobs| {
+        ci_fixture_with_runtime_source(
+            ci_run(),
+            jobs,
+            200,
+            true,
+            None,
+            Some(&policy),
+            true,
+            Sm120RuntimeSource::Manual,
+        )
+    };
+    let jobs = vec![ci_job(), local.clone(), cloud.clone(), sm120.clone()];
+    let observed = verify(jobs.clone()).await.unwrap().unwrap();
+    assert_eq!(observed.job_id, Some(33));
+    assert_eq!(observed.run_attempt, Some(2));
+    assert_eq!(observed.status, "completed");
+    assert_eq!(observed.conclusion.as_deref(), Some("failure"));
+    assert_eq!(observed.failed_steps, ["Set up job"]);
+    let (distributions, _) = cuda_pair();
+    let mut notes = "Candidate release.".to_owned();
+    let coverage = sm120_runtime_coverage(
+        &distributions,
+        &Sm120RuntimePolicy::Required,
+        Sm120RuntimeSource::Manual,
+        Some(observed),
+        &mut notes,
+    )
+    .unwrap()
+    .unwrap();
+    let coverage = serde_json::to_value(coverage).unwrap();
+    assert_eq!(coverage["status"], "passed");
+    assert_eq!(coverage["source"], "manual");
+    assert_eq!(coverage["ci_job"]["conclusion"], "failure");
+    assert_eq!(coverage["ci_job"]["failed_steps"], json!(["Set up job"]));
+    assert!(notes.contains("**manually**"));
+    assert!(notes.contains("conclusion: failure"));
+    assert!(notes.contains("does not claim CI job success"));
+    assert!(ci_fixture_with_capability(
+        ci_run(),
+        jobs.clone(),
+        200,
+        true,
+        None,
+        Some(&policy),
+        true
+    )
+    .await
+    .is_err());
+    for index in [0, 1] {
+        let mut invalid = jobs.clone();
+        invalid[index]["conclusion"] = json!("failure");
+        assert!(verify(invalid).await.is_err());
+    }
+    let mut invalid = jobs.clone();
+    invalid[3]["head_sha"] = json!("c".repeat(40));
+    assert!(verify(invalid).await.is_err());
+    let mut invalid = jobs;
+    invalid[2]["conclusion"] = json!("success");
+    assert!(verify(invalid).await.is_err());
+    let absent = verify(vec![ci_job(), local, cloud]).await.unwrap().unwrap();
+    assert_eq!(absent.status, "not_observed");
+    assert!(absent.job_id.is_none());
+    assert!(absent.conclusion.is_none());
+}
+
+#[test]
+fn manual_sm120_does_not_downgrade_required_models_device_or_archive() {
+    validate_sm120_runtime_source(true, Sm120RuntimeSource::Manual).unwrap();
+    assert!(validate_sm120_runtime_source(false, Sm120RuntimeSource::Manual).is_err());
+    let (distributions, tasks) = cuda_pair();
+    let reports: Vec<_> = tasks.iter().map(model_report).collect();
+    assert!(VerifiedModels::new(&tasks, &reports[..1]).is_err());
+    let models = VerifiedModels::new(&tasks, &reports).unwrap();
+    assert!(
+        verify_sm120_model_device(&distributions, &models, &Sm120RuntimePolicy::Required).is_err()
+    );
+    let sm89 = extract_only();
+    let asset = distributions
+        .values()
+        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
+        .unwrap();
+    let mut sm120 = sm89.clone();
+    sm120.asset_name = asset.name.clone();
+    sm120.asset_sha256 = asset.sha256.clone();
+    sm120.binary_sha256 = asset.binary_sha256.clone();
+    assert!(verify_installations(
+        &distributions,
+        &[sm89, sm120],
+        &models,
+        "2.3.4",
+        &"a".repeat(40),
+        &Sm120RuntimePolicy::Required
+    )
+    .is_err());
+    assert!(sm120_runtime_coverage(
+        &distributions,
+        &Sm120RuntimePolicy::Required,
+        Sm120RuntimeSource::Manual,
+        None,
+        &mut String::new()
+    )
+    .is_err());
 }
 
 fn windows_ci_job() -> Value {

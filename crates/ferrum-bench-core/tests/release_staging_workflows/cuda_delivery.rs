@@ -1,6 +1,8 @@
 //! Delivery wiring for a second CUDA architecture. Runtime evidence remains
 //! independent even when both archives implement the same model profile IDs.
-use super::{key, Value};
+#[cfg(unix)]
+use super::key;
+use super::Value;
 use std::{fs, path::Path};
 
 fn workflow(name: &str) -> Value {
@@ -124,301 +126,243 @@ fn cuda_staging_keeps_architecture_inputs_and_package_metadata_separate() {
 }
 
 #[test]
-fn publishing_requires_independent_sm120_tasks_runtime_and_final_asset() {
+fn publishing_keeps_sm120_archive_identity_without_claiming_runtime_validation() {
     let delivery = workflow("release-delivery.yml");
-    let runtime = &delivery["jobs"]["cuda-models-sm120"];
+    let tasks = &delivery["jobs"]["tasks"];
     let publish = &delivery["jobs"]["publish"];
     let asset = "needs.stage-cuda-linux.outputs.cuda_sm120_asset_id";
-    assert!(downloads(runtime, asset));
+    assert!(downloads(tasks, asset));
     assert!(downloads(publish, asset));
     assert!(needs(publish, "cuda-models"));
-    assert!(needs(publish, "cuda-models-sm120"));
-    assert!(publish["if"]
-        .as_str()
-        .unwrap()
-        .contains("needs.cuda-models-sm120.result == 'success'"));
-    let execute = script(runtime, "release_delivery local");
-    assert!(execute.contains("model_gate prepare --backend cuda --cuda-lane local"));
-    assert!(execute.contains("release_delivery inspect"));
-    assert!(!execute.contains("--extract-only"));
-    assert!(execute.contains("--candidate-sha \"$GITHUB_SHA\""));
-    assert!(execute.contains("--ferrum-bin \"$RUNNER_TEMP/extracted-cuda-sm120/ferrum\""));
-    assert!(execute.contains("--arg artifact \"$STAGED_ARTIFACT_ID\""));
-    let upload = steps(runtime)
+    let inspect = script(tasks, "extracted-cuda-sm120");
+    assert!(inspect
+        .contains("--abi \"$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json\""));
+    assert!(inspect.contains(
+        "--candidate-sha \"$GITHUB_SHA\" --extract-dir \"$RUNNER_TEMP/extracted-cuda-sm120\""
+    ));
+    assert!(
+        inspect.contains("--output \"$RUNNER_TEMP/installation/cuda-sm120.json\" --extract-only")
+    );
+    let accept = script(publish, "gate_args=(");
+    assert!(accept.contains("--tasks \"$RUNNER_TEMP/tasks/tasks.json\""));
+    assert!(!accept.contains("release-cuda-sm120-evidence"));
+    for (name, job) in delivery["jobs"].as_mapping().unwrap() {
+        assert!(
+            !serde_yaml::to_string(&job["runs-on"])
+                .unwrap()
+                .contains("ferrum-cuda-sm120"),
+            "{name:?}"
+        );
+    }
+    assert!(delivery["jobs"]["cuda-models-sm120"].is_null());
+    assert!(delivery["jobs"]["install-bootstrap-sm120"].is_null());
+    let preparation = steps(&delivery["jobs"]["prepare"]);
+    let notes_step = preparation
         .iter()
-        .find(|step| {
-            step["uses"]
+        .position(|step| {
+            step["run"]
                 .as_str()
-                .is_some_and(|action| action.starts_with("actions/upload-artifact@"))
+                .is_some_and(|run| run.contains("SM120 validation scope"))
         })
         .unwrap();
-    let artifact = upload["with"]["name"].as_str().unwrap();
-    let files = upload["with"]["path"].as_str().unwrap();
-    assert!(files.contains("/tasks/tasks.json"));
-    assert!(files.contains("/installation-cuda-sm120.json"));
-    for (name, consumer) in [
-        ("publish", publish.clone()),
-        (
-            "resume",
-            workflow("release-resume.yml")["jobs"]["publish"].clone(),
-        ),
-    ] {
-        let accept = script(&consumer, "gate_args=(");
-        assert!(
-            accept.contains("--tasks \"$RUNNER_TEMP/tasks/tasks.json\""),
-            "{name}: existing task set"
-        );
-        assert!(
-            accept.contains(&format!(
-                "--tasks \"$RUNNER_TEMP/evidence/{artifact}/tasks/tasks.json\""
-            )),
-            "{name}: independent SM120 task set"
-        );
-        assert!(
-            accept.contains(&format!(
-                "--installation \"$RUNNER_TEMP/evidence/{artifact}/installation-cuda-sm120.json\""
-            )),
-            "{name}: actual SM120 installation"
-        );
-    }
-}
-
-#[test]
-fn completion_requires_auto_installed_sm120_bytes_and_real_cuda_execution() {
-    let delivery = workflow("release-delivery.yml");
-    let install = &delivery["jobs"]["install-bootstrap-sm120"];
-    let complete = &delivery["jobs"]["complete"];
-    assert!(needs(install, "publish"));
-    assert!(needs(complete, "install-bootstrap-sm120"));
-    let install_script = script(install, "curl -fsSL");
-    assert!(install_script.contains("https://ferrum.pandaailabs.com/install.sh | sh\n"));
-    assert!(
-        !install_script.contains("| sh -s -- --backend"),
-        "public auto selection must be exercised"
-    );
-    assert!(install_script.contains(".binary_sha256 == $installed[0].binary_sha256"));
-    assert!(install_script.contains(".release_candidate_sha == $source"));
-    assert!(script(install, "--checks basic").contains("--backend cuda"));
-    let finish = script(complete, "test \"$PREPARE\"");
-    let step = steps(complete).first().unwrap();
-    let env = step["env"].as_mapping().unwrap();
-    let required = env
+    let archive_step = preparation
         .iter()
-        .find_map(|(name, value)| {
-            (value.as_str() == Some("${{ needs.install-bootstrap-sm120.result }}"))
-                .then(|| name.as_str().unwrap())
+        .position(|step| {
+            step["with"]["name"].as_str() == Some("release-plan")
+                && step["uses"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with("actions/upload-artifact@"))
         })
-        .expect("completion dependency result");
-    assert!(finish.contains(&format!("test \"${required}\" = success")));
-    assert!(delivery["jobs"]
-        .as_mapping()
-        .unwrap()
-        .contains_key(key("install-bootstrap-windows")));
-}
-
-#[cfg(unix)]
-#[test]
-fn checked_out_yaml_controls_sm120_requirement_without_version_or_asset_guessing() {
-    use std::process::Command;
-    let delivery = workflow("release-delivery.yml");
-    let prepare = &delivery["jobs"]["prepare"];
-    let step = steps(prepare)
-        .iter()
-        .find(|step| step["id"].as_str() == Some("cuda-capability"))
         .unwrap();
-    let command = step["run"].as_str().unwrap();
-    let staging = workflow("release-cuda.yml");
-    let current = serde_yaml::to_string(&staging).unwrap();
-    let mut previous = staging.clone();
-    previous["on"]["workflow_call"]["outputs"]
-        .as_mapping_mut()
-        .unwrap()
-        .remove(key("cuda_sm120_asset_id"));
-    let previous = serde_yaml::to_string(&previous).unwrap();
-    let run = |source: Option<&str>, verify_only: bool| {
-        let dir = tempfile::tempdir().unwrap();
-        if let Some(source) = source {
-            let workflows = dir.path().join(".github/workflows");
-            fs::create_dir_all(&workflows).unwrap();
-            fs::write(workflows.join("release-cuda.yml"), source).unwrap();
-        }
-        let output_file = dir.path().join("outputs");
-        let output = Command::new("bash")
-            .args([
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "-c",
-                command,
-            ])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("GITHUB_WORKSPACE", dir.path())
-            .env("GITHUB_OUTPUT", &output_file)
-            .env(
-                "VERIFY_PUBLISHED_VERSION",
-                if verify_only { "1.2.3" } else { "" },
-            )
-            .output()
-            .unwrap();
-        (
-            output.status.success(),
-            fs::read_to_string(output_file).unwrap_or_default(),
-        )
-    };
-    assert_eq!(
-        run(Some(&current), false),
-        (true, "sm120_required=true\n".into())
-    );
-    assert_eq!(
-        run(Some(&current), true),
-        (true, "sm120_required=true\n".into())
-    );
-    assert_eq!(
-        run(Some(&previous), true),
-        (true, "sm120_required=false\n".into())
-    );
-    assert!(
-        !run(Some(&previous), false).0,
-        "active release must declare the capability"
-    );
-    assert_eq!(run(None, true), (true, "sm120_required=false\n".into()));
-    assert!(!run(None, false).0);
-    // Flow style, a quoted trigger key and reordered mappings exercise actual
-    // YAML parsing rather than an indentation or line-count heuristic.
-    let compact = "'on': {workflow_call: {outputs: {cuda_sm120_asset_id: {value: '${{ jobs.build.outputs.asset }}'}}}}\n";
-    assert_eq!(
-        run(Some(compact), true),
-        (true, "sm120_required=true\n".into())
-    );
-    let unrelated =
-        "on: {workflow_call: {outputs: {}}}\nnote: 'cuda_sm120_asset_id: present only in text'\n";
-    assert_eq!(
-        run(Some(unrelated), true),
-        (true, "sm120_required=false\n".into())
-    );
-    for invalid in [
-        "on: [unfinished",
-        "on: {workflow_call: {outputs: {cuda_sm120_asset_id: {}}}}",
-        "on: {workflow_call: {outputs: {cuda_sm120_asset_id: {value: one}, cuda_sm120_asset_id: {value: two}}}}",
-    ] {
-        assert!(!run(Some(invalid), true).0, "malformed capability must not become an optional check");
-    }
-    assert_eq!(
-        prepare["outputs"]["sm120_required"].as_str(),
-        Some("${{ steps.cuda-capability.outputs.sm120_required }}")
-    );
-    assert!(delivery["jobs"]["install-bootstrap-sm120"]["if"]
+    assert!(notes_step < archive_step);
+    assert!(preparation[archive_step]["with"]["path"]
         .as_str()
         .unwrap()
-        .contains("needs.prepare.outputs.sm120_required == 'true'"));
+        .contains("release-notes.md"));
+    assert!(accept.contains("--notes \"$RUNNER_TEMP/plan/release-notes.md\""));
+    let notes = preparation[notes_step]["run"].as_str().unwrap();
+    assert!(notes.contains("Model execution and public SM120 installation/startup are not run"));
+    assert!(script(&delivery["jobs"]["complete"], "test \"$PREPARE\"")
+        .contains("SM120 model execution and public installation/startup: not_run"));
 }
 
 #[cfg(unix)]
-#[test]
-fn completion_accepts_legacy_skip_only_when_release_source_does_not_support_sm120() {
+fn read_capability(
+    source: Option<&str>,
+    current: Option<&str>,
+    resume: bool,
+    verify: bool,
+) -> (std::process::Output, String) {
     use std::process::Command;
-    let delivery = workflow("release-delivery.yml");
-    let complete = &delivery["jobs"]["complete"];
-    let command = script(complete, "test \"$PREPARE\"");
-    let run = |verify_only: bool, required: &str, result: &str| {
-        let dir = tempfile::tempdir().unwrap();
-        Command::new("bash")
-            .args([
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "-c",
-                command,
-            ])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("GITHUB_STEP_SUMMARY", dir.path().join("summary"))
-            .env("VERSION", "1.2.3")
-            .env("PREPARE", "success")
-            .env("VERIFY_ONLY", if verify_only { "true" } else { "false" })
-            .env("ACTIVE", if verify_only { "false" } else { "true" })
-            .env("PUBLISH", if verify_only { "skipped" } else { "success" })
-            .env("CARGO_INSTALL", "success")
-            .env("BREW_INSTALL", "success")
-            .env("UNIX_BOOTSTRAP", "success")
-            .env("WINDOWS_BOOTSTRAP", "success")
-            .env("SM120_REQUIRED", required)
-            .env("SM120_BOOTSTRAP", result)
-            .output()
-            .unwrap()
-            .status
-            .success()
-    };
-    assert!(run(false, "true", "success"));
-    assert!(run(true, "true", "success"));
-    assert!(run(true, "false", "skipped"));
-    assert!(!run(false, "false", "skipped"));
-    assert!(!run(true, "false", "success"));
-    for verify_only in [false, true] {
-        for result in ["skipped", "failure", "cancelled", ""] {
-            assert!(!run(verify_only, "true", result));
-        }
-        assert!(!run(verify_only, "", "skipped"));
-        assert!(!run(verify_only, "unknown", "skipped"));
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn resume_reads_candidate_yaml_and_preserves_single_task_legacy_callers() {
-    use std::process::Command;
-    let resume = workflow("release-resume.yml");
-    let publish = &resume["jobs"]["publish"];
-    let read = steps(publish)
+    let workflow = workflow(if resume {
+        "release-resume.yml"
+    } else {
+        "release-delivery.yml"
+    });
+    let command = steps(&workflow["jobs"][if resume { "publish" } else { "prepare" }])
         .iter()
         .find(|step| step["id"].as_str() == Some("cuda-capability"))
         .unwrap()["run"]
         .as_str()
         .unwrap();
-    let declared = "on: {workflow_call: {outputs: {cuda_sm120_asset_id: {value: '${{ jobs.stage.outputs.asset_id }}'}}}}\n";
-    let old = "on: {workflow_call: {outputs: {cuda_asset_id: {value: '${{ jobs.stage.outputs.asset_id }}'}}}}\n";
-    let run_reader = |candidate: &str, current: &str| {
-        let dir = tempfile::tempdir().unwrap();
-        for (relative, contents) in [
-            ("candidate/.github/workflows", candidate),
-            (".github/workflows", current),
-        ] {
-            let workflows = dir.path().join(relative);
-            fs::create_dir_all(&workflows).unwrap();
-            fs::write(workflows.join("release-cuda.yml"), contents).unwrap();
+    // GitHub evaluates expression delimiters before invoking the shell, even
+    // inside quoted Ruby strings. This reader receives all inputs via env/ARGV
+    // and must be a literal script for the exercised rejection rules to apply.
+    assert!(
+        !command.contains("${{"),
+        "candidate reader accidentally opens an Actions expression"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    for (relative, contents) in [
+        (
+            if resume {
+                "candidate/.github/workflows"
+            } else {
+                ".github/workflows"
+            },
+            source,
+        ),
+        (".github/workflows", if resume { current } else { None }),
+    ] {
+        if let Some(contents) = contents {
+            let path = dir.path().join(relative);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("release-cuda.yml"), contents).unwrap();
         }
-        let outputs = dir.path().join("outputs");
-        let result = Command::new("bash")
-            .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", read])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("GITHUB_WORKSPACE", dir.path())
-            .env("GITHUB_OUTPUT", &outputs)
-            .output()
-            .unwrap();
+    }
+    let outputs = dir.path().join("outputs");
+    let result = Command::new("bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            command,
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GITHUB_WORKSPACE", dir.path())
+        .env("GITHUB_OUTPUT", &outputs)
+        .env(
+            "VERIFY_PUBLISHED_VERSION",
+            if verify { "1.2.3" } else { "" },
+        )
+        .output()
+        .unwrap();
+    (result, fs::read_to_string(outputs).unwrap_or_default())
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_policy_preserves_legacy_requirements_and_fails_before_runner_queue() {
+    let staging = workflow("release-cuda.yml");
+    let current = serde_yaml::to_string(&staging).unwrap();
+    let mut required = staging.clone();
+    let outputs = required["on"]["workflow_call"]["outputs"]
+        .as_mapping_mut()
+        .unwrap();
+    outputs.remove(key("cuda_sm120_runtime_policy"));
+    outputs.remove(key("cuda_sm120_runtime_reason"));
+    let mut legacy = required.clone();
+    legacy["on"]["workflow_call"]["outputs"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(key("cuda_sm120_asset_id"));
+    let required = serde_yaml::to_string(&required).unwrap();
+    let legacy = serde_yaml::to_string(&legacy).unwrap();
+    for verify in [false, true] {
+        let (result, output) = read_capability(Some(&current), None, false, verify);
         assert!(
             result.status.success(),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        fs::read_to_string(outputs).unwrap()
-    };
-    assert_eq!(run_reader(old, declared), "sm120_required=false\n");
-    assert_eq!(run_reader(declared, old), "sm120_required=true\n");
+        assert!(output.contains("sm120_required=true\nsm120_runtime_required=false\nsm120_runtime_policy=not_run_hardware_unavailable\n"));
+        assert!(output.contains("sm120_runtime_reason=SM120 hardware is unavailable"));
+        let (result, _) = read_capability(Some(&required), None, false, verify);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("no approved SM120 runner"));
+    }
+    for source in [Some(legacy.as_str()), None] {
+        let (result, output) = read_capability(source, None, false, true);
+        assert!(result.status.success());
+        assert_eq!(output, "sm120_required=false\nsm120_runtime_required=false\nsm120_runtime_policy=required\nsm120_runtime_reason=\n");
+        assert!(!read_capability(source, None, false, false)
+            .0
+            .status
+            .success());
+    }
+    // The source under candidate/, not the executing workflow checkout, owns
+    // historical requirements. Missing policy on 0.13 remains Required.
+    let (result, output) = read_capability(Some(&required), Some(&current), true, false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(output, "sm120_required=true\nsm120_runtime_required=true\nsm120_runtime_policy=required\nsm120_runtime_reason=\n");
+    let (result, output) = read_capability(Some(&current), Some(&required), true, false);
+    assert!(result.status.success());
+    assert!(output.contains("sm120_required=true\nsm120_runtime_required=false\n"));
+    let (result, output) = read_capability(Some(&legacy), Some(&required), true, false);
+    assert!(result.status.success());
+    assert!(output.starts_with("sm120_required=false\nsm120_runtime_required=false\n"));
+}
 
-    let accept = script(publish, "gate_args=(");
-    let start = accept.find("case \"$SM120_REQUIRED\" in").unwrap();
+#[cfg(unix)]
+#[test]
+fn candidate_runtime_policy_rejects_ambiguous_or_injectable_declarations() {
+    let valid = "'on': {workflow_call: {outputs: {cuda_sm120_asset_id: {value: '${{ jobs.stage.outputs.id }}'}, cuda_sm120_runtime_policy: {value: not_run_hardware_unavailable}, cuda_sm120_runtime_reason: {value: 'No approved device.'}}}}\n";
+    for resume in [false, true] {
+        assert!(read_capability(Some(valid), None, resume, true)
+            .0
+            .status
+            .success());
+        for (before, after) in [
+            ("value: not_run_hardware_unavailable", "value: unknown"),
+            ("value: not_run_hardware_unavailable", "value: '${{ inputs.policy }}'"),
+            ("value: not_run_hardware_unavailable", "value: true"),
+            ("value: not_run_hardware_unavailable", "value: required"),
+            ("value: 'No approved device.'", "value: ''"),
+            ("value: 'No approved device.'", "value: ' trailing space '"),
+            ("value: 'No approved device.'", "value: '\u{a0}No approved device.'"),
+            ("value: 'No approved device.'", "value: '${{ inputs.reason }}'"),
+            ("value: 'No approved device.'", "value: true"),
+            ("value: 'No approved device.'", "value: 123"),
+            ("value: 'No approved device.'", "value: null"),
+            ("value: 'No approved device.'", "value: [reason]"),
+            ("value: 'No approved device.'", "value: \"line\\nsm120_runtime_required=false\""),
+            ("value: 'No approved device.'", "value: \"control\\u007f\""),
+            ("cuda_sm120_asset_id:", "other_asset:"),
+            ("cuda_sm120_runtime_reason:", "unrelated_reason:"),
+            ("cuda_sm120_runtime_policy: {value: not_run_hardware_unavailable},", "cuda_sm120_runtime_policy: {value: not_run_hardware_unavailable}, cuda_sm120_runtime_policy: {value: required},"),
+        ] {
+            let invalid = valid.replace(before, after);
+            assert!(!read_capability(Some(&invalid), None, resume, true).0.status.success(), "accepted {after:?}, resume={resume}");
+        }
+        for invalid in [
+            "on: [unfinished",
+            "on: {workflow_call: {outputs: {cuda_sm120_asset_id: {}}}}",
+            "on: {workflow_call: {outputs: {cuda_sm120_asset_id: {value: one}, cuda_sm120_asset_id: {value: two}}}}",
+        ] {
+            assert!(!read_capability(Some(invalid), None, resume, true).0.status.success());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_keeps_required_sm120_task_and_installation_evidence() {
+    use std::process::Command;
+    let resume = workflow("release-resume.yml");
+    let accept = script(&resume["jobs"]["publish"], "gate_args=(");
+    let start = accept.find("sm120_evidence=\"").unwrap();
     let end = start + accept[start..].find("esac").unwrap() + "esac".len();
     let condition = &accept[start..end];
-    let command = format!(
-        "gate_args=(--tasks original/tasks.json)\n{condition}\nprintf '%s\\n' \"${{gate_args[@]}}\""
-    );
-    let run_args = |required: &str| {
+    let command = format!("gate_args=(--tasks original/tasks.json)\n{condition}\nprintf '%s\\n' \"${{gate_args[@]}}\"");
+    let run = |required: &str, manual_asset: &str| {
         Command::new("bash")
             .args([
                 "--noprofile",
@@ -431,25 +375,228 @@ fn resume_reads_candidate_yaml_and_preserves_single_task_legacy_callers() {
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("SM120_REQUIRED", required)
+            .env("SM120_RUNTIME_REQUIRED", required)
+            .env("MANUAL_SM120_ASSET_ID", manual_asset)
             .env("RUNNER_TEMP", "/release-fixture")
             .output()
             .unwrap()
     };
-    let legacy = run_args("false");
-    assert!(legacy.status.success());
+    let not_run = run("false", "");
+    assert!(not_run.status.success());
     assert_eq!(
-        String::from_utf8(legacy.stdout).unwrap(),
+        String::from_utf8(not_run.stdout).unwrap(),
         "--tasks\noriginal/tasks.json\n"
     );
-    let current = run_args("true");
-    assert!(current.status.success());
-    assert_eq!(
-        String::from_utf8(current.stdout).unwrap(),
-        "--tasks\noriginal/tasks.json\n--tasks\n/release-fixture/evidence/release-cuda-sm120-evidence/tasks/tasks.json\n--installation\n/release-fixture/evidence/release-cuda-sm120-evidence/installation-cuda-sm120.json\n"
+    let required = run("true", "");
+    assert!(required.status.success());
+    assert_eq!(String::from_utf8(required.stdout).unwrap(), "--tasks\noriginal/tasks.json\n--tasks\n/release-fixture/evidence/release-cuda-sm120-evidence/tasks/tasks.json\n--installation\n/release-fixture/evidence/release-cuda-sm120-evidence/installation-cuda-sm120.json\n");
+    let manual = run("true", "123");
+    assert!(manual.status.success());
+    assert_eq!(String::from_utf8(manual.stdout).unwrap(), "--tasks\noriginal/tasks.json\n--sm120-runtime-source\nmanual\n--tasks\n/release-fixture/manual-sm120-evidence/tasks/tasks.json\n--installation\n/release-fixture/manual-sm120-evidence/installation-cuda-sm120.json\n");
+    assert!(!run("false", "123").status.success());
+    assert!(!run("", "").status.success());
+    assert!(!run("unknown", "").status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_manual_inputs_are_paired_and_only_publication_checkpoint_is_optional() {
+    use std::process::Command;
+    let resume = workflow("release-resume.yml");
+    let job = &resume["jobs"]["publish"];
+    let input = script(job, "if [ -n \"$MANUAL_SM120_ASSET_ID\" ] ||");
+    let run_input = |id: &str, sha: &str| {
+        Command::new("bash")
+            .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", input])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("MANUAL_SM120_ASSET_ID", id)
+            .env("MANUAL_SM120_SHA256", sha)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(run_input("", ""));
+    assert!(run_input("123", &"a".repeat(64)));
+    for (id, sha) in [
+        ("123", ""),
+        ("", "a"),
+        ("0", "a"),
+        ("1;exit 0", "a"),
+        ("123", "not-a-digest"),
+    ] {
+        assert!(!run_input(id, sha));
+    }
+    let source = script(job, "artifact_id() {");
+    let start = source.find("artifact_id() {").unwrap();
+    let end = start + source[start..].find("\nfor name ").unwrap();
+    let command = format!(
+        "{}\nartifact_id \"$REQUESTED_ARTIFACT\"",
+        &source[start..end]
     );
-    assert!(!run_args("").status.success());
-    assert!(!run_args("unknown").status.success());
+    let dir = tempfile::tempdir().unwrap();
+    let run_lookup = |artifacts: &str, name: &str| {
+        fs::write(dir.path().join("source-artifacts.json"), artifacts).unwrap();
+        Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                &command,
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("RUNNER_TEMP", dir.path())
+            .env("REQUESTED_ARTIFACT", name)
+            .output()
+            .unwrap()
+    };
+    let missing = run_lookup("[]", "publication-state");
+    assert!(missing.status.success());
+    assert!(String::from_utf8(missing.stdout).unwrap().trim().is_empty());
+    assert!(!run_lookup("[]", "release-tasks").status.success());
+    assert!(!run_lookup(
+        r#"[{"name":"publication-state","id":1},{"name":"publication-state","id":2}]"#,
+        "publication-state"
+    )
+    .status
+    .success());
+    let existing = run_lookup(
+        r#"[{"name":"publication-state","id":17}]"#,
+        "publication-state",
+    );
+    assert!(existing.status.success());
+    assert_eq!(String::from_utf8(existing.stdout).unwrap().trim(), "17");
+    for step in steps(job) {
+        if let Some(ids) = step["with"]["artifact-ids"].as_str() {
+            if ids.contains("outputs.publication_state") {
+                assert_eq!(
+                    step["if"].as_str(),
+                    Some("steps.source.outputs.publication_state != ''")
+                );
+            } else {
+                assert!(
+                    step["if"].is_null(),
+                    "required evidence cannot depend on a publication checkpoint"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_manual_archive_preserves_raw_bytes_and_rejects_bad_hash_links_and_missing_evidence() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let resume = workflow("release-resume.yml");
+    let download = script(&resume["jobs"]["publish"], "<<'RUBY_EVIDENCE'");
+    let ruby = download
+        .split_once("<<'RUBY_EVIDENCE'\n")
+        .unwrap()
+        .1
+        .split_once("\nRUBY_EVIDENCE")
+        .unwrap()
+        .0;
+    assert!(
+        !ruby.contains("${{"),
+        "Actions must pass the verifier as literal Ruby"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(source.join("tasks")).unwrap();
+    fs::create_dir_all(source.join("model-cuda-sm120/task-0")).unwrap();
+    fs::write(
+        source.join("tasks/tasks.json"),
+        b"{\"original_tasks\":true}\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("installation-cuda-sm120.json"),
+        b"{\"original_installation\":true}\n",
+    )
+    .unwrap();
+    let raw = b"{\"original_report\":\"transport does not assert semantic success\"}\n";
+    fs::write(source.join("model-cuda-sm120/task-0/report.json"), raw).unwrap();
+    let archive = dir.path().join("evidence.tar.gz");
+    let pack = || {
+        let result = Command::new("tar")
+            .args(["--format=ustar", "-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .args(["tasks", "installation-cuda-sm120.json", "model-cuda-sm120"])
+            .env("COPYFILE_DISABLE", "1")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()))
+    };
+    let extract = |sha: &str, name: &str| {
+        let mut child = Command::new("ruby")
+            .args([
+                "-rdigest",
+                "-rzlib",
+                "-rrubygems/package",
+                "-rfileutils",
+                "-",
+            ])
+            .arg(&archive)
+            .arg(dir.path().join(name))
+            .arg(sha)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(ruby.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let sha = pack();
+    let valid = extract(&sha, "accepted");
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert_eq!(
+        fs::read(
+            dir.path()
+                .join("accepted/model-cuda-sm120/task-0/report.json")
+        )
+        .unwrap(),
+        raw
+    );
+    assert!(!extract(&"0".repeat(64), "wrong-hash").status.success());
+    assert!(
+        !dir.path().join("wrong-hash").exists(),
+        "SHA must be checked before extraction"
+    );
+    std::os::unix::fs::symlink("../../outside", source.join("model-cuda-sm120/link")).unwrap();
+    let linked = pack();
+    assert!(!extract(&linked, "linked").status.success());
+    assert!(!dir.path().join("outside").exists());
+    fs::remove_file(source.join("model-cuda-sm120/link")).unwrap();
+    fs::remove_file(source.join("tasks/tasks.json")).unwrap();
+    let missing = pack();
+    assert!(!extract(&missing, "missing").status.success());
 }
 
 #[cfg(unix)]

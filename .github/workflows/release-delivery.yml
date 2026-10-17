@@ -53,6 +53,9 @@ jobs:
       verify_only: ${{ steps.plan.outputs.verify_only }}
       source_ref: ${{ steps.plan.outputs.source_ref }}
       sm120_required: ${{ steps.cuda-capability.outputs.sm120_required }}
+      sm120_runtime_required: ${{ steps.cuda-capability.outputs.sm120_runtime_required }}
+      sm120_runtime_policy: ${{ steps.cuda-capability.outputs.sm120_runtime_policy }}
+      sm120_runtime_reason: ${{ steps.cuda-capability.outputs.sm120_runtime_reason }}
       windows_launcher_url: ${{ steps.launcher.outputs.url }}
       windows_launcher_sha256: ${{ steps.launcher.outputs.sha256 }}
     steps:
@@ -69,7 +72,7 @@ jobs:
         run: |
           # Psych is Ruby's standard YAML parser. Read the checked-out tag for
           # verification-only runs, not the current workflow or public assets.
-          sm120_required=$(ruby -rpsych - "$GITHUB_WORKSPACE/.github/workflows/release-cuda.yml" <<'RUBY_YAML'
+          ruby -rpsych - "$GITHUB_WORKSPACE/.github/workflows/release-cuda.yml" delivery >> "$GITHUB_OUTPUT" <<'RUBY_YAML'
           def mapping(node, location)
             raise "#{location} must be a YAML mapping" unless node.is_a?(Psych::Nodes::Mapping)
             node.children.each_slice(2).each_with_object({}) do |(key, value), entries|
@@ -78,28 +81,54 @@ jobs:
               entries[key.value] = value
             end
           end
-          path = ARGV.fetch(0)
-          unless File.exist?(path)
-            puts 'false'
-            exit
+          def scalar(entry, name)
+            value = mapping(entry, name)['value']
+            raise "#{name} needs a nonempty string value" unless value.is_a?(Psych::Nodes::Scalar) && !value.value.strip.empty?
+            if value.tag && value.tag != 'tag:yaml.org,2002:str'
+              raise "#{name} needs a string value"
+            end
+            if value.plain && !value.tag
+              scanner = Psych::ScalarScanner.new(Psych::ClassLoader::Restricted.new([], []))
+              raise "#{name} needs a string value" unless scanner.tokenize(value.value).is_a?(String)
+            end
+            value.value
           end
-          document = Psych.parse_file(path)
-          workflow = mapping(document&.root, 'workflow')
-          triggers = mapping(workflow.fetch('on'), 'on')
-          call = triggers['workflow_call']
-          outputs = call && mapping(call, 'workflow_call')['outputs']
-          declaration = outputs && mapping(outputs, 'outputs')['cuda_sm120_asset_id']
-          if declaration
-            value = mapping(declaration, 'cuda_sm120_asset_id')['value']
-            raise 'SM120 output needs a value' unless value.is_a?(Psych::Nodes::Scalar) && !value.value.strip.empty?
+          path, mode = ARGV
+          outputs = {}
+          if File.exist?(path)
+            workflow = mapping(Psych.parse_file(path)&.root, 'workflow')
+            triggers = mapping(workflow.fetch('on'), 'on')
+            call = triggers['workflow_call']
+            declared = call && mapping(call, 'workflow_call')['outputs']
+            outputs = mapping(declared, 'outputs') if declared
           end
-          puts declaration ? 'true' : 'false'
+          asset = outputs['cuda_sm120_asset_id']
+          scalar(asset, 'cuda_sm120_asset_id') if asset
+          policy_entry = outputs['cuda_sm120_runtime_policy']
+          reason_entry = outputs['cuda_sm120_runtime_reason']
+          raise 'SM120 runtime policy requires an SM120 asset declaration' if !asset && (policy_entry || reason_entry)
+          policy = policy_entry ? scalar(policy_entry, 'cuda_sm120_runtime_policy') : 'required'
+          reason = ''
+          case policy
+          when 'required'
+            raise 'Required SM120 validation must not declare an unavailable reason' if reason_entry
+          when 'not_run_hardware_unavailable'
+            raise 'Unavailable SM120 hardware needs a reason' unless reason_entry
+            reason = scalar(reason_entry, 'cuda_sm120_runtime_reason')
+            raise 'SM120 reason must be a literal, trimmed single line' if reason.match?(/\A[[:space:]]|[[:space:]]\z/u) || reason.include?('$' + '{{') || reason.match?(/[\x00-\x1f\x7f]/)
+          else
+            raise 'Unknown or nonliteral SM120 runtime policy'
+          end
+          runtime_required = !!asset && policy == 'required'
+          if mode == 'delivery'
+            raise 'This candidate requires real SM120 validation, but no approved SM120 runner is available; historical evidence is not a new verification run' if runtime_required
+            raise 'Active release must declare its SM120 asset' if ENV.fetch('VERIFY_PUBLISHED_VERSION', '').empty? && !asset
+          end
+          puts "sm120_required=#{!!asset}"
+          puts "sm120_runtime_required=#{runtime_required}"
+          puts "sm120_runtime_policy=#{policy}"
+          puts "sm120_runtime_reason=#{reason}"
           RUBY_YAML
-          )
-          if [ -z "$VERIFY_PUBLISHED_VERSION" ]; then
-            test "$sm120_required" = true
-          fi
-          printf 'sm120_required=%s\n' "$sm120_required" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -111,6 +140,8 @@ jobs:
           RUN_CLOUD_CUDA: ${{ github.event_name == 'workflow_dispatch' && inputs.run_cloud_cuda }}
           REUSE_CUDA_RUN_ID: ${{ inputs.reuse_cuda_run_id }}
           VERIFY_PUBLISHED_VERSION: ${{ inputs.verify_published_version }}
+          SM120_RUNTIME_POLICY: ${{ steps.cuda-capability.outputs.sm120_runtime_policy }}
+          SM120_RUNTIME_REASON: ${{ steps.cuda-capability.outputs.sm120_runtime_reason }}
           GH_TOKEN: ${{ inputs.verify_published_version != '' && github.token || secrets.RELEASE_GITHUB_TOKEN }}
         run: |
           if [ -n "$VERIFY_PUBLISHED_VERSION" ]; then
@@ -190,6 +221,9 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
+          if [ "$SM120_RUNTIME_POLICY" = not_run_hardware_unavailable ]; then
+            printf '\n## SM120 validation scope\n\nThe SM120 package has archive, ABI and build validation. Model execution and public SM120 installation/startup are not run for this candidate: %s Earlier SM120 measurements remain evidence only for their original binaries and configurations.\n' "$SM120_RUNTIME_REASON" >> "$RUNNER_TEMP/release-notes.md"
+          fi
           if [ "$version" = 0.13.0 ]; then
             cat >> "$RUNNER_TEMP/release-notes.md" <<'NOTES_013'
 
@@ -401,7 +435,7 @@ jobs:
           path: ${{ runner.temp }}/plan
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage-metal.outputs.metal_asset_id }},${{ needs.stage-cuda-linux.outputs.cuda_asset_id }}
+          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage-metal.outputs.metal_asset_id }},${{ needs.stage-cuda-linux.outputs.cuda_asset_id }},${{ needs.stage-cuda-linux.outputs.cuda_sm120_asset_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged
       - name: Bind selected tasks and inspect CPU and CUDA archive bytes
@@ -419,6 +453,12 @@ jobs:
               --candidate-sha "$GITHUB_SHA" --extract-dir "$RUNNER_TEMP/extracted-$backend" \
               --output "$RUNNER_TEMP/installation/$backend.json" "${extra[@]}"
           done
+          # Inspect the exact SM120 bytes without substituting an SM89 run.
+          # The candidate's unavailable-hardware policy keeps this receipt not_run.
+          release_delivery inspect \
+            --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json" --version "$VERSION" \
+            --candidate-sha "$GITHUB_SHA" --extract-dir "$RUNNER_TEMP/extracted-cuda-sm120" \
+            --output "$RUNNER_TEMP/installation/cuda-sm120.json" --extract-only
           # Model runners execute Linux CPU/CUDA and macOS Metal. The separate
           # macOS CPU artifact has its own native installation report.
           model_gate prepare --plan "$RUNNER_TEMP/plan/release-plan.json" \
@@ -705,85 +745,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  cuda-models-sm120:
-    # Independently qualify the final SM120 archive on the controlled 5090.
-    # No cloud lease and no developer binary/model directory is used.
-    needs: [prepare, quality, tools, stage, stage-cuda-linux]
-    runs-on: [self-hosted, Linux, X64, ferrum-cuda-sm120]
-    concurrency:
-      group: ferrum-sm120-hardware
-      cancel-in-progress: false
-      queue: max
-    timeout-minutes: 90
-    env:
-      CUDA_HOME: /opt/ferrum-release/cuda-12.8.1
-      CUDA_ROOT: /opt/ferrum-release/cuda-12.8.1
-      LD_LIBRARY_PATH: /usr/lib/wsl/lib:/opt/ferrum-release/cuda-12.8.1/lib64:/opt/ferrum-release/nccl/lib
-      VERSION: ${{ needs.prepare.outputs.version }}
-      STAGED_ARTIFACT_ID: ${{ needs.stage-cuda-linux.outputs.cuda_sm120_asset_id }}
-    steps:
-      - name: Require the SM120 runtime device
-        run: |
-          export PATH="/usr/lib/wsl/lib:$PATH"
-          echo /usr/lib/wsl/lib >> "$GITHUB_PATH"
-          nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.free,driver_version --format=csv
-          test "$(nvidia-smi --id=0 --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')" = 12.0
-      - uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ needs.tools.outputs.artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/release-tools
-      - name: Verify prepared release tools
-        run: |
-          cd "$RUNNER_TEMP/release-tools"
-          tar -xzf tools.tar.gz
-          sha256sum --check binaries.sha256
-          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
-      - uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ needs.stage.outputs.linux_runner_id }},${{ needs.stage-cuda-linux.outputs.cuda_sm120_asset_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/staged-cuda-sm120
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-plan
-          path: ${{ runner.temp }}/plan
-      - name: Execute required SM120 models from the exact staged archive
-        run: |
-          nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.free,driver_version --format=csv
-          model_gate prepare --backend cuda --cuda-lane local --plan "$RUNNER_TEMP/plan/release-plan.json" \
-            --version "$VERSION" --abi "$RUNNER_TEMP/staged-cuda-sm120/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json" \
-            --output-dir "$RUNNER_TEMP/tasks"
-          release_delivery inspect \
-            --abi "$RUNNER_TEMP/staged-cuda-sm120/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json" \
-            --version "$VERSION" --candidate-sha "$GITHUB_SHA" \
-            --extract-dir "$RUNNER_TEMP/extracted-cuda-sm120" --output "$RUNNER_TEMP/installation-cuda-sm120.json"
-          cd "$RUNNER_TEMP/staged-cuda-sm120"
-          sha256sum --check model-regression-linux-x86_64.tar.gz.sha256
-          tar -xzf model-regression-linux-x86_64.tar.gz model_regression
-          runner_sha=$(awk '{print $1}' model-regression-linux-x86_64.binary.sha256)
-          jq -n --arg source "$GITHUB_SHA" --arg artifact "$STAGED_ARTIFACT_ID" \
-            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
-            --slurpfile abi "$RUNNER_TEMP/staged-cuda-sm120/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json" \
-            '{schema_version:1,source_sha:$source,staged_artifact_id:$artifact,workflow_run_id:$run,workflow_run_attempt:$attempt,abi:$abi[0]}' \
-            > "$RUNNER_TEMP/sm120-staged-origin.json"
-          release_delivery local --backend cuda \
-            --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cuda-sm120/ferrum" \
-            --runner "$RUNNER_TEMP/staged-cuda-sm120/model_regression" --runner-sha256 "$runner_sha" \
-            --report-dir "$RUNNER_TEMP/model-cuda-sm120" --task-timeout-secs 1500 --request-timeout-secs 300
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: release-cuda-sm120-evidence
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/installation-cuda-sm120.json
-            ${{ runner.temp }}/sm120-staged-origin.json
-            ${{ runner.temp }}/tasks/tasks.json
-            ${{ runner.temp }}/model-cuda-sm120/
-          if-no-files-found: error
-          retention-days: 30
-
   cuda-models-cloud:
     needs: [prepare, tools, stage, stage-cuda-linux]
     if: needs.prepare.outputs.active == 'true' && needs.prepare.outputs.cloud_cuda == 'true'
@@ -954,7 +915,7 @@ jobs:
           retention-days: 30
 
   publish:
-    needs: [prepare, quality, tools, stage, stage-metal, stage-cuda-linux, stage-cuda, stage-cpu-windows, tasks, metal-models, cuda-models, cuda-models-sm120, cuda-models-cloud, cpu-models]
+    needs: [prepare, quality, tools, stage, stage-metal, stage-cuda-linux, stage-cuda, stage-cpu-windows, tasks, metal-models, cuda-models, cuda-models-cloud, cpu-models]
     if: >-
       always() && !cancelled() &&
       needs.prepare.outputs.active == 'true' &&
@@ -963,7 +924,7 @@ jobs:
       needs.stage-metal.result == 'success' && needs.stage-cuda-linux.result == 'success' &&
       needs.stage-cuda.result == 'success' && needs.stage-cpu-windows.result == 'success' &&
       needs.tasks.result == 'success' && needs.metal-models.result == 'success' &&
-      needs.cuda-models.result == 'success' && needs.cuda-models-sm120.result == 'success' && needs.cpu-models.result == 'success' &&
+      needs.cuda-models.result == 'success' && needs.cpu-models.result == 'success' &&
       ((needs.prepare.outputs.cloud_cuda == 'true' && needs.cuda-models-cloud.result == 'success') ||
        (needs.prepare.outputs.cloud_cuda == 'false' && needs.cuda-models-cloud.result == 'skipped'))
     runs-on: ubuntu-22.04
@@ -1044,7 +1005,6 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
         run: |
           gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
-            --tasks "$RUNNER_TEMP/evidence/release-cuda-sm120-evidence/tasks/tasks.json"
             --contracts "$RUNNER_TEMP/contracts/contract-checks.json" --version "$VERSION"
             --workspace "$GITHUB_WORKSPACE" --notes "$RUNNER_TEMP/plan/release-notes.md"
             --windows-staged "$RUNNER_TEMP/staged-windows"
@@ -1056,7 +1016,6 @@ jobs:
             if [ "$install" != "$RUNNER_TEMP/installation/cuda.json" ]; then gate_args+=(--installation "$install"); fi
           done
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-cuda-evidence/installation-cuda.json")
-          gate_args+=(--installation "$RUNNER_TEMP/evidence/release-cuda-sm120-evidence/installation-cuda-sm120.json")
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
           while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
             < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
@@ -1246,86 +1205,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  install-bootstrap-sm120:
-    needs: [prepare, publish]
-    if: >-
-      always() && !cancelled() && needs.prepare.result == 'success' &&
-      needs.prepare.outputs.sm120_required == 'true' &&
-      ((needs.prepare.outputs.active == 'true' && needs.prepare.outputs.verify_only == 'false' && needs.publish.result == 'success') ||
-       (needs.prepare.outputs.active == 'false' && needs.prepare.outputs.verify_only == 'true' && needs.publish.result == 'skipped'))
-    runs-on: [self-hosted, Linux, X64, ferrum-cuda-sm120]
-    concurrency:
-      group: ferrum-sm120-hardware
-      cancel-in-progress: false
-      queue: max
-    timeout-minutes: 90
-    env:
-      CUDA_HOME: /opt/ferrum-release/cuda-12.8.1
-      CUDA_ROOT: /opt/ferrum-release/cuda-12.8.1
-      LD_LIBRARY_PATH: /usr/lib/wsl/lib:/opt/ferrum-release/cuda-12.8.1/lib64:/opt/ferrum-release/nccl/lib
-      VERSION: ${{ needs.prepare.outputs.version }}
-      SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
-      PUBLIC_SMOKE_MODEL: Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.source_ref }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.91.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Require the public SM120 installation device
-        run: |
-          export PATH="/usr/lib/wsl/lib:$PATH"
-          echo /usr/lib/wsl/lib >> "$GITHUB_PATH"
-          nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.free,driver_version --format=csv
-          test "$(nvidia-smi --id=0 --query-gpu=compute_cap --format=csv,noheader | tr -d '[:space:]')" = 12.0
-      - name: Build only public-install acceptance helpers
-        timeout-minutes: 30
-        run: cargo build --locked -p ferrum-devtools --bin release_delivery --bin model_regression
-      - name: Auto install the public SM120 package and bind its exact bytes
-        run: |
-          target/debug/release_delivery entry \
-            --url https://ferrum.pandaailabs.com/install.sh --expected-script scripts/install.sh \
-            --output "$RUNNER_TEMP/public-entry-sm120.json"
-          curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
-          target/debug/release_delivery installed --channel bootstrap --version "$VERSION" \
-            --binary "$HOME/.local/bin/ferrum" --output "$RUNNER_TEMP/public-bootstrap-sm120.json"
-          curl --fail --location --retry 5 --retry-all-errors \
-            "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json" \
-            --output "$RUNNER_TEMP/public-sm120.abi.json"
-          jq -e --arg source "$SOURCE_REF" --slurpfile installed "$RUNNER_TEMP/public-bootstrap-sm120.json" '
-            .asset_name == "ferrum-linux-x86_64-cuda-sm120.tar.gz" and
-            .release_candidate_sha == $source and .backend == "cuda" and
-            .binary_sha256 == $installed[0].binary_sha256 and
-            .binary_sha256 == $installed[0].binary_sha256_after and
-            $installed[0].status == "passed"' "$RUNNER_TEMP/public-sm120.abi.json"
-          target/debug/release_delivery entry \
-            --url https://ferrum.pandaailabs.com/install.sh --expected-script scripts/install.sh \
-            --output "$RUNNER_TEMP/public-entry-sm120-after.json"
-      - name: Run the auto-installed CUDA binary through real run and HTTP serve
-        timeout-minutes: 30
-        run: |
-          set -euo pipefail
-          receipt="$RUNNER_TEMP/public-bootstrap-sm120-runtime"
-          mkdir "$receipt"
-          target/debug/model_regression \
-            --ferrum-bin "$HOME/.local/bin/ferrum" --backend cuda \
-            --model "$PUBLIC_SMOKE_MODEL" --checks basic --profile-id public-install-sm120-basic \
-            --source-label "$PUBLIC_SMOKE_MODEL" --precision-label safetensors-bf16-f32 \
-            --context-tokens 2048 --max-num-seqs 1 --max-tokens 512 \
-            --run-timeout-secs 600 --startup-timeout-secs 600 --request-timeout-secs 300 \
-            --report-dir "$receipt/model" 2>&1 | tee "$receipt/model-runner.log"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: public-bootstrap-sm120
-          overwrite: true
-          path: |
-            ${{ runner.temp }}/public-*.json
-            ${{ runner.temp }}/public-bootstrap-sm120-runtime/
-          if-no-files-found: error
-          retention-days: 30
-
   install-bootstrap-windows:
     needs: [prepare, publish]
     if: >-
@@ -1403,7 +1282,7 @@ jobs:
           retention-days: 30
 
   complete:
-    needs: [prepare, publish, install-cargo, install-homebrew, install-bootstrap-unix, install-bootstrap-sm120, install-bootstrap-windows]
+    needs: [prepare, publish, install-cargo, install-homebrew, install-bootstrap-unix, install-bootstrap-windows]
     if: always() && !cancelled() && (needs.prepare.outputs.active == 'true' || needs.prepare.outputs.verify_only == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1419,7 +1298,9 @@ jobs:
           BREW_INSTALL: ${{ needs.install-homebrew.result }}
           UNIX_BOOTSTRAP: ${{ needs.install-bootstrap-unix.result }}
           SM120_REQUIRED: ${{ needs.prepare.outputs.sm120_required }}
-          SM120_BOOTSTRAP: ${{ needs.install-bootstrap-sm120.result }}
+          SM120_RUNTIME_REQUIRED: ${{ needs.prepare.outputs.sm120_runtime_required }}
+          SM120_RUNTIME_POLICY: ${{ needs.prepare.outputs.sm120_runtime_policy }}
+          SM120_RUNTIME_REASON: ${{ needs.prepare.outputs.sm120_runtime_reason }}
           WINDOWS_BOOTSTRAP: ${{ needs.install-bootstrap-windows.result }}
         run: |
           test "$PREPARE" = success
@@ -1434,14 +1315,19 @@ jobs:
           test "$CARGO_INSTALL" = success
           test "$BREW_INSTALL" = success
           test "$UNIX_BOOTSTRAP" = success
-          case "$SM120_REQUIRED" in
-            true) test "$SM120_BOOTSTRAP" = success ;;
-            false)
+          test "$SM120_RUNTIME_REQUIRED" = false
+          case "$SM120_REQUIRED:$SM120_RUNTIME_POLICY" in
+            true:not_run_hardware_unavailable)
+              test -n "$SM120_RUNTIME_REASON"
+              printf 'SM120 model execution and public installation/startup: not_run (hardware unavailable). %s\n' "$SM120_RUNTIME_REASON" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            false:required)
               test "$VERIFY_ONLY" = true
               test "$ACTIVE" = false
-              test "$SM120_BOOTSTRAP" = skipped
+              test -z "$SM120_RUNTIME_REASON"
+              printf 'SM120 runtime scope: not applicable; this legacy candidate declares no SM120 package.\n' >> "$GITHUB_STEP_SUMMARY"
               ;;
-            *) echo 'Missing declared SM120 delivery capability' >&2; exit 1 ;;
+            *) echo 'Missing or unsupported candidate SM120 validation scope' >&2; exit 1 ;;
           esac
           test "$WINDOWS_BOOTSTRAP" = success
-          printf 'Ferrum %s: required Cargo, Homebrew and public Windows/Linux/macOS installation/startup checks passed (verification-only=%s, SM120 automatic installation and CUDA run/serve required=%s).\n' "$VERSION" "$VERIFY_ONLY" "$SM120_REQUIRED" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Ferrum %s: required Cargo, Homebrew and public Windows/Linux/macOS installation/startup checks passed (verification-only=%s); SM120 runtime scope is recorded separately above.\n' "$VERSION" "$VERIFY_ONLY" >> "$GITHUB_STEP_SUMMARY"

@@ -21,6 +21,7 @@ pub(super) fn accepted(directory: &std::path::Path) -> AcceptedRelease {
         workspace: directory.into(),
         notes: "Verified candidate release".into(),
         assets,
+        sm120_runtime: None,
     }
 }
 pub(super) fn api(server: &Server) -> GitHub {
