@@ -24,7 +24,8 @@ pub fn setup_logging(
 
     // Build filter: suppress noisy warnings unless verbose. Default level
     // is WARN, but the model-load and weight-loader namespaces stay at
-    // INFO so users see per-layer progress during the (10-60s) load.
+    // INFO so users see per-layer progress and the selected execution path
+    // during the (10-60s) load.
     // Without this, `ferrum run /path/to/30b-moe` looks frozen between
     // "Loading..." and the first decode token.
     let filter = if verbose {
@@ -36,7 +37,8 @@ pub fn setup_logging(
                  tokenizers=error,\
                  ferrum_models=info,\
                  ferrum_quantization=info,\
-                 ferrum_engine::registry=info",
+                 ferrum_engine::registry=info,\
+                 ferrum_engine::product_composition=info",
                 log_level
             );
             if suppress_chat_template_warnings {
