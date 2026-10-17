@@ -70,7 +70,7 @@ use resident_decode::{
     PreparedDispatch, PreparedDispatchResult, PreparedRetirement, ResidentCache, ResidentMetrics,
 };
 mod mixed_batch;
-pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
+pub use composition::{VNextCompiledModel, VNextModelCompilationError, VNextRuntimeComposition};
 mod prefix_cache;
 mod program_binding_upload;
 mod request;

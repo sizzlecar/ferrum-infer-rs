@@ -12,6 +12,10 @@ mod types;
 pub use types::*;
 
 mod capabilities;
+mod device_attributes;
+#[cfg(feature = "cuda")]
+pub use device_attributes::probe_cuda_device_attributes;
+pub use device_attributes::CudaDeviceAttributes;
 mod memory;
 pub use memory::probe_device_memory;
 #[cfg(any(feature = "cuda", test))]

@@ -3412,7 +3412,7 @@ impl CudaDeviceRuntime {
         self
     }
 
-    /// Selected weight decoding for eligible original Q4_K M8 MMVQ plans.
+    /// Requested weight-decode policy; Auto is resolved by each prepared plan.
     pub fn q4_mmvq_weight_decode(&self) -> ferrum_types::Q4MmvqWeightDecode {
         self.q4_mmvq_weight_decode
     }
@@ -3440,10 +3440,18 @@ impl CudaDeviceRuntime {
         mut self,
         mode: ferrum_types::Q8ProjectionWeightPreparation,
     ) -> Self {
-        self.q8_projection_weight_preparation = mode;
+        // Auto needs whole-plan capacity selection, which belongs to product
+        // startup. A standalone runtime has only the conservative layout.
+        self.q8_projection_weight_preparation = match mode {
+            ferrum_types::Q8ProjectionWeightPreparation::Auto => {
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed
+            }
+            explicit => explicit,
+        };
         self
     }
 
+    /// Concrete immutable storage mode used by provider layout/fingerprints.
     pub fn q8_projection_weight_preparation(&self) -> ferrum_types::Q8ProjectionWeightPreparation {
         self.q8_projection_weight_preparation
     }
@@ -3457,7 +3465,7 @@ impl CudaDeviceRuntime {
         self.causal_decode_kv_reuse
     }
 
-    /// Selected weight decoding for eligible original Q5_K M8 MMVQ plans.
+    /// Requested weight-decode policy; Auto is resolved by each prepared plan.
     pub fn q5_mmvq_weight_decode(&self) -> ferrum_types::Q5MmvqWeightDecode {
         self.q5_mmvq_weight_decode
     }

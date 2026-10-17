@@ -35,9 +35,15 @@ Qwen3.5 声明 `qwen3_5.f16` 和 `qwen3_5.f32-master`。F32-master 保持混合�
 主干、残差和 logits 使用 FP32，FFN、KV 和卷积状态保留 FP16，delta 状态沿用
 模型的状态精度约束。名称不代表每一步都用 FP32。
 
-`Auto` 保留既有、已验证的编码与 recurrent 参数 ABI 组合。声明两个 profile
-不意味着所有 GGUF、SafeTensors、Metal 和 CUDA 组合都可用；新增 GGUF + F16
-组合在独立数值验收前不会进入默认候选。其他已迁移 family 先保留原有的单一方案。
+`Auto` 在模型声明的 GGUF 编码与 recurrent 参数 ABI、完整原生算子能力及实际
+CUDA `sm120` 设备均满足资格时，可优先选择
+`qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`。该 profile 包含8位激活量化和
+整数点积，并保留其声明的 F16/F32 阶段边界；它与原参考路径不保证逐位相同。
+固定该 profile 也不保证不同批大小或请求布局下的贪心输出逐 token 相同。
+资格或规划容量不满足时，`Auto` 尝试其他完整候选；显式指定
+`--numerical-profile qwen3_5.f32-master` 可保留原有混合精度参考路径。
+这不表示所有 GGUF、SafeTensors 或 CUDA 架构都已支持；Metal 和其他未满足资格的
+组合保留既有选择，其他专用数值 profile 仍需显式选择。
 
 ## 分阶段算术合同
 

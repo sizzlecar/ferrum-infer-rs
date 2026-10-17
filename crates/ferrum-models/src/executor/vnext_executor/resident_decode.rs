@@ -162,7 +162,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if kind != VNextExecutionWaveKind::Decode
             || !greedy
             || self.checkpoint_capture.is_some()
-            || self.checkpoint_token_evidence_enabled()
             || !self
                 .device_timing_mode()
                 .direct_reusable_execution_allowed()
@@ -171,6 +170,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             self.release_resident_decode();
             return Ok(None);
         }
+        // Prefix-cache token evidence belongs to this fresh request/frame, not
+        // the cached program. Resident completion and retirement publish its
+        // checked frontier just like an ordinary FullPlan wave.
         let request = self.step_request_for_spans(batch, spans, kind)?;
         let cached = self.resident_decode.lock().take();
         let mut reservation = None;

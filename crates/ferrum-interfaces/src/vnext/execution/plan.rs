@@ -43,6 +43,18 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    /// Capacity is a selectable candidate outcome only during fresh planning.
+    /// Rebuilding evidence for an existing plan must reject impossible memory
+    /// claims as contract violations, including changed node liveness.
+    pub(super) fn memory_pool_validation_error(error: VNextError) -> VNextError {
+        match error {
+            VNextError::PlanCapacityExceeded { .. } => invalid_plan(format!(
+                "reconstructed memory pool exceeds plan capacity: {error}"
+            )),
+            error => error,
+        }
+    }
+
     pub fn build<P: RuntimePolicy>(request: PlanBuildRequest<'_, P>) -> Result<Self, VNextError> {
         request.policy.validate()?;
         let maximum_active_sequences = request.policy.maximum_active_sequences();
@@ -2114,7 +2126,8 @@ impl ExecutionPlan {
             &self.payload.nodes,
             dynamic_capacity_bytes,
             &retained_completion_resources,
-        )?;
+        )
+        .map_err(Self::memory_pool_validation_error)?;
         let expected_reusable_execution = self
             .payload
             .memory
@@ -2152,7 +2165,8 @@ impl ExecutionPlan {
             &reusable_workspace_ceilings,
             &retained_completion_resources,
             &checkpoint_growth_ceilings,
-        )?;
+        )
+        .map_err(Self::memory_pool_validation_error)?;
         if self.payload.memory.dynamic_pools != expected_pools {
             return Err(invalid_plan(
                 "memory pools or invocation reuse are not derived from plan dependencies",

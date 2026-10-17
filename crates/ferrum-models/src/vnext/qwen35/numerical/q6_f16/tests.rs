@@ -33,7 +33,7 @@ fn id() -> NumericalProfileId {
 }
 
 #[test]
-fn q6_f16_require_preserves_auto_head_weights_state_and_program_structure() {
+fn q6_f16_auto_prefers_qualified_source_and_require_preserves_program_structure() {
     let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
     let config = source();
     let definition = registration
@@ -52,9 +52,25 @@ fn q6_f16_require_preserves_auto_head_weights_state_and_program_structure() {
         catalog
             .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
             .unwrap(),
+        [
+            new,
+            catalog
+                .resolve(&NumericalProfileId::new(F32_MASTER_NUMERICAL_PROFILE_ID).unwrap())
+                .unwrap(),
+        ]
+    );
+    assert_eq!(
+        catalog
+            .candidates(
+                &NumericalExecutionPolicy::Require(
+                    NumericalProfileId::new(F32_MASTER_NUMERICAL_PROFILE_ID).unwrap(),
+                ),
+                KvStorageFormat::F16,
+            )
+            .unwrap(),
         [catalog
             .resolve(&NumericalProfileId::new(F32_MASTER_NUMERICAL_PROFILE_ID).unwrap())
-            .unwrap()]
+            .unwrap()],
     );
     assert!(catalog
         .candidates(
@@ -129,6 +145,72 @@ fn q6_f16_require_preserves_auto_head_weights_state_and_program_structure() {
             serde_json::to_value(normalized).unwrap(),
             serde_json::to_value(prior).unwrap()
         );
+    }
+}
+
+#[test]
+fn q6_f16_auto_requires_native_source_abi_consumed_head_and_projection_geometry() {
+    let provider = Qwen35FamilyProvider::new().unwrap();
+    let valid = source();
+    assert_eq!(
+        provider
+            .numerical_profiles(&valid)
+            .unwrap()
+            .auto_preference()[0],
+        id()
+    );
+    let head = valid
+        .weights
+        .iter()
+        .position(|w| w.role == "lm_head")
+        .unwrap();
+    let mut unsupported = Vec::new();
+    let mut config = valid.clone();
+    config.weight_format = FamilyWeightFormat::SafetensorsDense;
+    unsupported.push(config);
+    let mut config = valid.clone();
+    config.recurrent_weight_abi = RecurrentWeightAbi::LogRateGrouped;
+    unsupported.push(config);
+    let mut config = valid.clone();
+    let FamilyWeightSourceEncoding::BlockQuantized(block) =
+        &mut config.weights[head].source_encoding
+    else {
+        unreachable!()
+    };
+    block.bytes_per_block -= 1;
+    unsupported.push(config);
+    let mut config = valid.clone();
+    config.weights[head].dimensions[1] = 255;
+    unsupported.push(config);
+    let mut config = valid.clone();
+    let q6 = config.weights[head].source_encoding.clone();
+    config
+        .weights
+        .iter_mut()
+        .find(|w| w.role == "embed_tokens")
+        .unwrap()
+        .source_encoding = q6;
+    config.weights[head].source_encoding = FamilyWeightSourceEncoding::Dense {
+        element_type: ElementType::F16,
+    };
+    unsupported.push(config);
+    let mut config = valid;
+    for weight in config
+        .weights
+        .iter_mut()
+        .filter(|weight| weight.layer_index.is_some())
+    {
+        weight.source_encoding = FamilyWeightSourceEncoding::Dense {
+            element_type: ElementType::F16,
+        };
+    }
+    unsupported.push(config);
+    for config in unsupported {
+        assert!(!provider
+            .numerical_profiles(&config)
+            .unwrap()
+            .auto_preference()
+            .contains(&id()));
     }
 }
 

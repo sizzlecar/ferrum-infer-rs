@@ -43,6 +43,17 @@ sha2 = "0.10"
 [features]
 default = []
 cuda = ["dep:cudarc", "marlin", "native-op-artifact"]
+# Full production capability set; requires a matching native operator-set lock.
+cuda-production = [
+    "cuda-upstream-q6-f32-linear",
+    "vllm-moe-marlin",
+    "vllm-paged-attn-v2",
+    "cuda-indexed-causal-attention",
+    "cuda-q4-shared-weight-decode",
+    "cuda-q5-shared-weight-decode",
+    "cuda-causal-gqa2",
+    "cuda-q6-f16-linear",
+]
 candle-cuda-compat = ["cuda", "candle-core/cuda"]
 metal = ["dep:metal"]  # Metal backend (macOS) — also gates the fused-transformer Metal pipelines
 marlin = []  # Marlin INT4xFP16 native artifact (auto-enabled by cuda).

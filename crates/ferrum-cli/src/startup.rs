@@ -81,10 +81,41 @@ pub(crate) fn hardware_for_request(
     request: Option<&StartupMemoryRequest>,
 ) -> HardwareCapabilities {
     let mut hardware = crate::commands::serve::hardware_capabilities_for_device(device);
+    #[cfg(feature = "cuda")]
+    if let ferrum_types::Device::CUDA(ordinal) = device {
+        if let Err(error) = apply_cuda_device_attributes(
+            &mut hardware,
+            ferrum_kernels::backend::probe_cuda_device_attributes(*ordinal),
+        ) {
+            tracing::warn!(
+                device_ordinal = *ordinal,
+                %error,
+                "CUDA device attributes unavailable; hardware qualification remains unknown"
+            );
+        }
+    }
     if let Some(request) = request {
         hardware.vram_bytes = Some(request.device.capacity_bytes);
     }
     hardware
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn apply_cuda_device_attributes(
+    hardware: &mut HardwareCapabilities,
+    observed: Result<ferrum_kernels::backend::CudaDeviceAttributes>,
+) -> Result<()> {
+    // A failed native query must not retain a shell observation or GPU-name
+    // guess as authority for automatic execution choices.
+    hardware.compute_capability = None;
+    hardware.sm_count = None;
+    let observed = observed?;
+    hardware.compute_capability = Some(format!(
+        "{}.{}",
+        observed.compute_capability_major, observed.compute_capability_minor
+    ));
+    hardware.sm_count = Some(observed.multiprocessor_count);
+    Ok(())
 }
 
 pub(crate) fn apply_engine_plan(resolved: &mut ResolvedFerrumConfig, engine_config: &EngineConfig) {
@@ -108,6 +139,56 @@ mod tests {
     use super::*;
     use ferrum_types::{DeviceMemorySnapshot, RuntimeConfigEntry};
 
+    #[test]
+    fn native_cuda_attributes_replace_shell_values_without_changing_versions_or_memory() {
+        let mut hardware = HardwareCapabilities {
+            backend: "cuda".into(),
+            cuda_runtime: Some("12.8".into()),
+            compute_capability: Some("8.0".into()),
+            sm_count: Some(1),
+            vram_bytes: Some(16 * 1024 * 1024 * 1024),
+            ..HardwareCapabilities::unknown()
+        };
+        let mut expected = hardware.clone();
+        expected.compute_capability = Some("12.0".into());
+        expected.sm_count = Some(32);
+
+        apply_cuda_device_attributes(
+            &mut hardware,
+            Ok(ferrum_kernels::backend::CudaDeviceAttributes {
+                compute_capability_major: 12,
+                compute_capability_minor: 0,
+                multiprocessor_count: 32,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(hardware, expected);
+    }
+
+    #[test]
+    fn native_cuda_attribute_failure_clears_guessed_qualification() {
+        let mut hardware = HardwareCapabilities {
+            backend: "cuda".into(),
+            cuda_runtime: Some("12.8".into()),
+            compute_capability: Some("8.9".into()),
+            sm_count: Some(128),
+            vram_bytes: Some(16 * 1024 * 1024 * 1024),
+            ..HardwareCapabilities::unknown()
+        };
+        let mut expected = hardware.clone();
+        expected.compute_capability = None;
+        expected.sm_count = None;
+
+        assert!(apply_cuda_device_attributes(
+            &mut hardware,
+            Err(FerrumError::device("driver attribute query failed")),
+        )
+        .is_err());
+
+        assert_eq!(hardware, expected);
+    }
+
     fn hardware() -> HardwareCapabilities {
         HardwareCapabilities {
             backend: "metal".into(),
@@ -122,6 +203,78 @@ mod tests {
         let mut model = ModelCapabilities::unknown();
         model.max_context_len = Some(262_144);
         model
+    }
+
+    #[test]
+    fn native_cuda_execution_defaults_are_shared_by_run_and_serve() {
+        use ferrum_types::{
+            CausalDecodeAttentionGrouping, CausalDecodeKvReuse, CompiledKernelFeatures,
+            InvocationPreparationStrategy, SamplingReadbackMode, SequenceBackingGrowth,
+        };
+        let hardware = HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures {
+            cuda: true,
+            cuda_graph: true,
+            vllm_paged_attn: true,
+            cuda_indexed_causal_attention: true,
+            cuda_causal_gqa2: true,
+            ..CompiledKernelFeatures::default()
+        });
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            for explicit_uniform in [false, true] {
+                let mut requested = RuntimeConfigSnapshot::default();
+                if explicit_uniform {
+                    requested.upsert(
+                        "FERRUM_SAMPLING_READBACK_MODE",
+                        "uniform",
+                        RuntimeConfigSource::ConfigFile,
+                    );
+                }
+                let resolved = resolve_config(
+                    requested,
+                    model(),
+                    hardware.clone(),
+                    WorkloadProfile::serving_default(),
+                    ExecutionResourceAuthority::PlanRuntime,
+                    usage,
+                )
+                .unwrap();
+                let mut engine = EngineConfig::default();
+                let numerical = engine.numerical_execution.clone();
+                engine
+                    .apply_runtime_config_snapshot(&resolved.runtime_config)
+                    .unwrap();
+                assert_eq!(
+                    engine.runtime.invocation_preparation_strategy,
+                    InvocationPreparationStrategy::ResidentDecodeProgram
+                );
+                assert_eq!(
+                    engine.runtime.causal_decode_attention_grouping,
+                    CausalDecodeAttentionGrouping::FixedExecutionCapacity
+                );
+                assert_eq!(
+                    engine.runtime.causal_decode_kv_reuse,
+                    CausalDecodeKvReuse::PairedQueryHeadsUnifiedV2
+                );
+                assert_eq!(
+                    engine.runtime.sequence_backing_growth,
+                    SequenceBackingGrowth::PagedGroup4GrowOnly
+                );
+                assert_eq!(
+                    engine.runtime.sampling_readback_mode,
+                    if explicit_uniform {
+                        SamplingReadbackMode::Uniform
+                    } else {
+                        SamplingReadbackMode::Participant
+                    }
+                );
+                assert_eq!(engine.numerical_execution, numerical);
+                assert_prefix_state_cache(
+                    &resolved,
+                    usage == StartupUsage::PersistentServing,
+                    RuntimeConfigSource::Default,
+                );
+            }
+        }
     }
 
     fn assert_prefix_state_cache(

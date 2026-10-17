@@ -384,6 +384,17 @@ impl DynamicBackingPoolSpec {
         let maximum_resident_bytes =
             u64::try_from(combined_ceiling_bytes.min(u128::from(dynamic_capacity_bytes)))
                 .map_err(|_| invalid_plan("dynamic pool resident ceiling exceeds u64"))?;
+        if u128::from(minimum_resident_bytes) > combined_ceiling_bytes {
+            return Err(invalid_plan(
+                "dynamic pool minimum exceeds its theoretical ceiling",
+            ));
+        }
+        if minimum_resident_bytes > dynamic_capacity_bytes {
+            return Err(VNextError::PlanCapacityExceeded {
+                required_bytes: minimum_resident_bytes,
+                usable_capacity_bytes: dynamic_capacity_bytes,
+            });
+        }
         let spec = Self {
             pool_id,
             compatibility,

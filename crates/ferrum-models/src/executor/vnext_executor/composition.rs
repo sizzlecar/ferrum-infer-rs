@@ -4,6 +4,72 @@
 
 use super::*;
 
+/// Preserve only fresh static-planning capacity failures across the model
+/// boundary. Contract errors and all initialization failures remain terminal.
+#[derive(Debug, thiserror::Error)]
+pub enum VNextModelCompilationError {
+    #[error("compiled plan requires {required_bytes} bytes, exceeding usable capacity {usable_capacity_bytes}")]
+    Capacity {
+        required_bytes: u64,
+        usable_capacity_bytes: u64,
+    },
+    #[error(transparent)]
+    Invalid(#[from] FerrumError),
+}
+
+impl From<VNextModelCompilationError> for FerrumError {
+    fn from(error: VNextModelCompilationError) -> Self {
+        match error {
+            VNextModelCompilationError::Invalid(error) => error,
+            capacity => FerrumError::config(capacity.to_string()),
+        }
+    }
+}
+
+impl VNextModelCompilationError {
+    fn from_plan(error: VNextError) -> Self {
+        match error {
+            VNextError::PlanCapacityExceeded {
+                required_bytes,
+                usable_capacity_bytes,
+            } => Self::Capacity {
+                required_bytes,
+                usable_capacity_bytes,
+            },
+            error => Self::Invalid(FerrumError::model(format!("vNext plan compile: {error}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_layout_capacity_preserves_only_typed_fresh_plan_pressure() {
+        assert!(matches!(
+            VNextModelCompilationError::from_plan(VNextError::PlanCapacityExceeded {
+                required_bytes: 8192,
+                usable_capacity_bytes: 8191,
+            }),
+            VNextModelCompilationError::Capacity {
+                required_bytes: 8192,
+                usable_capacity_bytes: 8191,
+            }
+        ));
+        assert!(matches!(
+            VNextModelCompilationError::from_plan(VNextError::InvalidExecutionPlan {
+                reason: "static memory exceeds usable capacity".into(),
+            }),
+            VNextModelCompilationError::Invalid(_)
+        ));
+        let error = FerrumError::from(VNextModelCompilationError::from(FerrumError::device(
+            "allocator out of memory",
+        )));
+        assert!(matches!(error, FerrumError::Device { .. }));
+    }
+}
+
 pub struct VNextRuntimeComposition<R: DeviceRuntime> {
     pub(super) runtime: Arc<R>,
     pub(super) registry: OperationRuntimeRegistry<R>,
@@ -58,11 +124,12 @@ impl<R: DeviceRuntime> VNextRuntimeComposition<R> {
         engine_config: &EngineConfig,
         config: VNextExecutorConfig,
         materializer_selection: WeightMaterializerSelection,
-    ) -> Result<VNextCompiledModel<'a, R>> {
+    ) -> std::result::Result<VNextCompiledModel<'a, R>, VNextModelCompilationError> {
         if self.runtime.descriptor() != self.catalog.device() {
             return Err(FerrumError::device(
                 "vNext static compilation catalog differs from the actual device runtime",
-            ));
+            )
+            .into());
         }
         let executor_startup = StartupPhaseTimer::start("executor_composition_total");
         let checkpoint_selection = VNextCheckpointSelection::from_config(
@@ -117,7 +184,7 @@ impl<R: DeviceRuntime> VNextRuntimeComposition<R> {
             &self.weight_materializers,
             &options,
         )
-        .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;
+        .map_err(VNextModelCompilationError::from_plan)?;
         config
             .plan_observation
             .validate_compilation(family, &compilation)?;

@@ -25,7 +25,7 @@ pub use tts_executor::TtsModelExecutor;
 pub use vnext_executor::{
     VNextCompiledModel, VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec,
     VNextDeterminismInitialState, VNextDeterminismParticipantSpec, VNextDeterminismPhase,
-    VNextDeterminismWorkspacePoison, VNextExecutorConfig, VNextModelExecutor,
-    VNextRuntimeComposition, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
+    VNextDeterminismWorkspacePoison, VNextExecutorConfig, VNextModelCompilationError,
+    VNextModelExecutor, VNextRuntimeComposition, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 pub use whisper_executor::WhisperModelExecutor;

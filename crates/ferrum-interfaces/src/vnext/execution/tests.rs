@@ -1042,6 +1042,153 @@ fn memory_plan_wire_rejects_missing_core_derived_pool() {
 }
 
 #[test]
+fn fresh_memory_plan_capacity_error_is_typed_but_validation_errors_are_not() {
+    let storage = DynamicStorageContract::new(
+        fixed_block_profile(4096),
+        workspace_storage_layout_fingerprint().unwrap(),
+    )
+    .unwrap();
+    let allocation = ResourceAllocation::new(
+        ResourceId::new("resource/optional-persistent").unwrap(),
+        1,
+        16,
+        BufferUsage::Persistent,
+        ElementType::U8,
+        AllocationKind::Persistent {
+            node_id: NodeId::new("node/optional-persistent").unwrap(),
+        },
+        storage.clone(),
+    )
+    .unwrap();
+    let nodes = [plan_node(
+        "node/optional-step",
+        &[],
+        &["resource/optional-step"],
+    )];
+    let compile = |budget, dynamic: Vec<DynamicResourceDescriptor>| {
+        let users = if dynamic.is_empty() {
+            &[][..]
+        } else {
+            &nodes[..]
+        };
+        MemoryPlan::from_core(
+            1 << 20,
+            budget,
+            0,
+            1024,
+            vec![allocation.clone()],
+            dynamic,
+            users,
+            None,
+        )
+    };
+    assert!(matches!(
+        compile(4095, vec![]),
+        Err(VNextError::PlanCapacityExceeded {
+            required_bytes: 4096,
+            usable_capacity_bytes: 4095,
+        })
+    ));
+    let mut exact = compile(4096, vec![]).unwrap();
+    assert_eq!(exact.static_bytes(), 4096);
+    exact.usable_capacity_bytes = 4095;
+    exact.policy_capacity_bytes = 4095;
+    assert!(matches!(
+        exact.validate(),
+        Err(VNextError::InvalidExecutionPlan { .. })
+    ));
+
+    let dynamic = step_descriptor("resource/optional-step", 1, BufferUsage::Scratch, storage);
+    let error = compile(8191, vec![dynamic.clone()]).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            VNextError::PlanCapacityExceeded {
+                required_bytes: 8192,
+                usable_capacity_bytes: 8191,
+            }
+        ),
+        "{error:?}"
+    );
+    let exact = compile(8192, vec![dynamic]).unwrap();
+    assert_eq!(
+        exact.static_bytes() + exact.minimum_runnable_request_bytes(),
+        8192
+    );
+}
+
+#[test]
+fn existing_plan_pool_validation_does_not_turn_false_liveness_into_capacity_fallback() {
+    let storage = DynamicStorageContract::new(
+        linear_profile(),
+        canonical_fingerprint(&"contiguous_v1", "test layout").unwrap(),
+    )
+    .unwrap();
+    let descriptors = vec![
+        step_descriptor("resource/a", 64, BufferUsage::Activations, storage.clone()),
+        step_descriptor("resource/b", 128, BufferUsage::Activations, storage),
+    ];
+    let ordered = [
+        plan_node("node/a", &[], &["resource/a"]),
+        plan_node("node/b", &["node/a"], &["resource/b"]),
+    ];
+    let claimed = MemoryPlan::from_core(
+        1 << 20,
+        128,
+        0,
+        1024,
+        vec![],
+        descriptors.clone(),
+        &ordered,
+        None,
+    )
+    .unwrap();
+    claimed.validate().unwrap();
+    assert_eq!(claimed.minimum_step_bytes(), 128);
+    // Standalone memory evidence can be internally consistent while its
+    // asserted reuse contradicts the actual plan's overlapping node users.
+    let overlap = [
+        ordered[0].clone(),
+        plan_node("node/b", &["node/a"], &["resource/a", "resource/b"]),
+    ];
+    assert!(matches!(
+        MemoryPlan::from_core(1 << 20, 128, 0, 1024, vec![], descriptors, &overlap, None),
+        Err(VNextError::PlanCapacityExceeded {
+            required_bytes: 192,
+            usable_capacity_bytes: 128
+        })
+    ));
+    let retained = BTreeSet::new();
+    // Exercise both real reconstruction calls used by validate_internal,
+    // including the same error boundary; no synthetic Capacity error input.
+    for rebuilt in [
+        MemoryPlan::derive_dynamic_pools_with_completion_retention(
+            claimed.dynamic_descriptors(),
+            &overlap,
+            128,
+            &retained,
+        ),
+        MemoryPlan::derive_dynamic_pools_with_checkpoint(
+            claimed.dynamic_descriptors(),
+            &overlap,
+            128,
+            &BTreeMap::new(),
+            &retained,
+            &BTreeMap::new(),
+        ),
+    ] {
+        assert!(matches!(
+            rebuilt,
+            Err(VNextError::PlanCapacityExceeded { .. })
+        ));
+        assert!(matches!(
+            rebuilt.map_err(ExecutionPlan::memory_pool_validation_error),
+            Err(VNextError::InvalidExecutionPlan { .. })
+        ));
+    }
+}
+
+#[test]
 fn plan_scope_allocation_round_trips_selected_storage_and_physical_quantum() {
     let storage = DynamicStorageContract::new(
         fixed_block_profile(4096),

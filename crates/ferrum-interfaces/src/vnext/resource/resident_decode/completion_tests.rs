@@ -39,6 +39,224 @@ fn submit(
     lane.reserve_enqueue().unwrap().submit(commands)
 }
 
+fn checkpoint_request(
+    batch: &ExecutionBatchParticipants<TestRuntime>,
+    bucket: &ReusableExecutionBucketSpec,
+    tokens: &[u32],
+) -> StepResourceAdmissionRequest {
+    let span = TokenSpanWork::from_token_ids_with_fit(tokens, tokens.len() - 1..tokens.len(), 4)
+        .unwrap()
+        .with_checkpoint_tokens(Arc::from(tokens))
+        .unwrap();
+    StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![span]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap()
+    .with_reusable_execution_bucket(bucket.bucket_id().clone())
+}
+
+fn frontier(session: &SequenceSession<TestRuntime>) -> SequenceCompletedFrontier {
+    let state = session.slot.state.lock().unwrap();
+    let SequenceSessionSlotState::Active(active) = &*state else {
+        panic!("test session must remain active")
+    };
+    active.completed_boundary.clone()
+}
+
+fn proven(session: &SequenceSession<TestRuntime>) -> Arc<CompletedSequenceBoundary> {
+    match frontier(session) {
+        SequenceCompletedFrontier::Proven(boundary) => boundary,
+        other => panic!("expected a completed frontier, got {other:?}"),
+    }
+}
+
+fn bootstrap_checkpoint_evidence(
+    harness: &Harness,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
+    reaper: &Arc<CompletionReaper<TestRuntime>>,
+    session: &Arc<SequenceSession<TestRuntime>>,
+    owner: &Arc<ResidentDecodeReservation<TestRuntime>>,
+    request: &StepResourceAdmissionRequest,
+) {
+    let (step, wave) = match owner.prepare_bootstrap(request).unwrap() {
+        ResidentBootstrapDecision::Prepared { step, wave } => (step, wave),
+        _ => panic!("tracked bootstrap must retain its original Step evidence"),
+    };
+    let completion = completed_boundary_tests::submit_fixture_wave_through_reaper(
+        &harness.root,
+        std::slice::from_ref(session),
+        lane,
+        wave,
+        reaper,
+    );
+    assert!(
+        matches!(completion.wait().unwrap(), CompletionObservation::Terminal(receipt)
+        if receipt.disposition() == &OperationCompletionDisposition::Succeeded)
+    );
+    assert!(matches!(
+        frontier(session),
+        SequenceCompletedFrontier::Fresh
+    ));
+    drop(completion);
+    step.try_retire_normal().unwrap();
+    assert_eq!(proven(session).token_prefix(), &[3]);
+}
+
+#[test]
+fn resident_checkpoint_evidence_advances_only_after_successful_retirement() {
+    let (harness, lane, bucket) = setup();
+    let sequence = admitted_sequence_with_ceiling(&harness.root, "resident-evidence", 4);
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let req = checkpoint_request(&batch, &bucket, &[3]);
+    let owner = batch
+        .try_reserve_resident_decode(&req, &lane)
+        .unwrap()
+        .unwrap();
+    let reaper = CompletionReaper::new();
+    bootstrap_checkpoint_evidence(&harness, &lane, &reaper, &session, &owner, &req);
+    let mut previous = proven(&session);
+    for tokens in [&[3, 5][..], &[3, 5, 8][..]] {
+        assert!(matches!(
+            session
+                .try_ensure_backing_covers(
+                    SequenceResourceExtensionRequest::new(
+                        work(tokens.len()),
+                        AdmissionPressureAction::WaitForRelease
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            SequenceResourceExtensionDecision::Extended(_)
+        ));
+        let req = checkpoint_request(&batch, &bucket, tokens);
+        let (use_, retirement) = ready(&owner, &batch, &req);
+        assert_eq!(
+            use_.work_shape().participant_work()[0]
+                .token_span()
+                .checkpoint_tokens()
+                .unwrap()
+                .as_ref(),
+            tokens
+        );
+        let step_id = use_.batch_step_id();
+        let mut completion = reserve(&harness, &lane, &reaper, use_);
+        let fence = match submit(&harness, &lane, &mut completion) {
+            LaneSubmitOutcome::Submitted(fence) => fence,
+            _ => panic!("tracked resident wave must submit"),
+        };
+        let handle = completion.arm(fence, DeviceTimingMode::Off).unwrap();
+        assert!(Arc::ptr_eq(&proven(&session), &previous));
+        assert!(
+            matches!(handle.wait().unwrap(), CompletionObservation::Terminal(receipt)
+            if receipt.disposition() == &OperationCompletionDisposition::Succeeded)
+        );
+        assert!(
+            Arc::ptr_eq(&proven(&session), &previous),
+            "completion alone cannot publish the frontier"
+        );
+        drop(handle);
+        retirement.try_retire_normal().unwrap();
+        let current = proven(&session);
+        assert_eq!(current.token_prefix(), tokens);
+        assert_eq!(current.batch_step_id(), Some(step_id));
+        assert_ne!(current.frame_id(), previous.frame_id());
+        assert!(!Arc::ptr_eq(&current, &previous));
+        assert!(owner.is_idle());
+        assert_eq!(reaper.retained_count(), 0);
+        previous = current;
+    }
+    drop(owner);
+    close_session(&session);
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(reaper);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+    assert_eq!(previous.token_prefix(), &[3, 5, 8]);
+}
+
+#[test]
+fn resident_checkpoint_evidence_rejects_changed_prefix_and_failed_completion() {
+    for changed_prefix in [true, false] {
+        let (harness, lane, bucket) = setup();
+        let sequence = admitted_sequence_with_ceiling(&harness.root, "resident-bad-evidence", 4);
+        let session = sequence.open_session().unwrap();
+        let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+        let first = checkpoint_request(&batch, &bucket, &[3]);
+        let owner = batch
+            .try_reserve_resident_decode(&first, &lane)
+            .unwrap()
+            .unwrap();
+        let reaper = CompletionReaper::new();
+        bootstrap_checkpoint_evidence(&harness, &lane, &reaper, &session, &owner, &first);
+        let previous = proven(&session);
+        assert!(matches!(
+            session
+                .try_ensure_backing_covers(
+                    SequenceResourceExtensionRequest::new(
+                        work(2),
+                        AdmissionPressureAction::WaitForRelease
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            SequenceResourceExtensionDecision::Extended(_)
+        ));
+        let tokens = if changed_prefix { [99, 5] } else { [3, 5] };
+        let req = checkpoint_request(&batch, &bucket, &tokens);
+        let (use_, retirement) = ready(&owner, &batch, &req);
+        if !changed_prefix {
+            harness
+                .runtime
+                .set_fence_behavior(TestFenceBehavior::FailedButQuiescent);
+        }
+        let mut completion = reserve(&harness, &lane, &reaper, use_);
+        let fence = match submit(&harness, &lane, &mut completion) {
+            LaneSubmitOutcome::Submitted(fence) => fence,
+            _ => panic!("test must observe the real completion path"),
+        };
+        let handle = completion.arm(fence, DeviceTimingMode::Off).unwrap();
+        let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+            panic!("failure must be quiescent")
+        };
+        if changed_prefix {
+            assert!(matches!(
+                receipt.disposition(),
+                OperationCompletionDisposition::ContractFailedButQuiescent(_)
+            ));
+        } else {
+            assert!(matches!(
+                receipt.disposition(),
+                OperationCompletionDisposition::FailedButQuiescent(_)
+            ));
+        }
+        assert!(
+            Arc::ptr_eq(&proven(&session), &previous),
+            "invalid evidence cannot replace the last proof"
+        );
+        drop(handle);
+        retirement.try_abort().unwrap();
+        assert!(matches!(
+            frontier(&session),
+            SequenceCompletedFrontier::Unproven
+        ));
+        assert_eq!(previous.token_prefix(), &[3]);
+        assert_eq!(reaper.retained_count(), 0);
+        drop(owner);
+        session.try_abort().unwrap();
+        drop(batch);
+        drop(session);
+        drop(sequence);
+        drop(reaper);
+        drop(lane);
+        close_dynamic_test_root(harness.root);
+    }
+}
+
 #[test]
 fn resident_completion_success_keeps_frame_until_original_fence_and_retirement() {
     let (harness, lane, bucket) = setup();

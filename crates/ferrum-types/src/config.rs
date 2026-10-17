@@ -258,6 +258,8 @@ pub const Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY: &str = "FERRUM_Q4_MMVQ_WEIGHT_DECODE
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Q4MmvqWeightDecode {
+    /// Resolve against the selected numerical route and prepared native geometry.
+    Auto,
     #[default]
     Baseline,
     SharedM8,
@@ -267,6 +269,7 @@ pub enum Q4MmvqWeightDecode {
 impl Q4MmvqWeightDecode {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Baseline => "baseline",
             Self::SharedM8 => "shared-m8",
             Self::SharedM4M8 => "shared-m4-m8",
@@ -275,11 +278,12 @@ impl Q4MmvqWeightDecode {
 
     pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "baseline" => Ok(Self::Baseline),
             "shared-m8" => Ok(Self::SharedM8),
             "shared-m4-m8" => Ok(Self::SharedM4M8),
             _ => Err(format!(
-                "expected baseline, shared-m8 or shared-m4-m8; got {raw:?}"
+                "expected auto, baseline, shared-m8 or shared-m4-m8; got {raw:?}"
             )),
         }
     }
@@ -303,6 +307,8 @@ pub const Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY: &str = "FERRUM_Q5_MMVQ_WEIGHT_DECODE
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Q5MmvqWeightDecode {
+    /// Resolve against the selected numerical route and prepared native geometry.
+    Auto,
     #[default]
     Baseline,
     SharedM8,
@@ -312,6 +318,7 @@ pub enum Q5MmvqWeightDecode {
 impl Q5MmvqWeightDecode {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Baseline => "baseline",
             Self::SharedM8 => "shared-m8",
             Self::SharedM4M8 => "shared-m4-m8",
@@ -320,11 +327,12 @@ impl Q5MmvqWeightDecode {
 
     pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "baseline" => Ok(Self::Baseline),
             "shared-m8" => Ok(Self::SharedM8),
             "shared-m4-m8" => Ok(Self::SharedM4M8),
             _ => Err(format!(
-                "expected baseline, shared-m8 or shared-m4-m8; got {raw:?}"
+                "expected auto, baseline, shared-m8 or shared-m4-m8; got {raw:?}"
             )),
         }
     }
@@ -349,6 +357,9 @@ pub const Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY: &str =
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Q8ProjectionWeightPreparation {
+    /// Try eligible F32 destinations only after the compressed plan's capacity
+    /// is fixed; retain compressed storage when the optional layout cannot fit.
+    Auto,
     #[default]
     Compressed,
     PredecodedF32,
@@ -357,6 +368,7 @@ pub enum Q8ProjectionWeightPreparation {
 impl Q8ProjectionWeightPreparation {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Compressed => "compressed",
             Self::PredecodedF32 => "predecoded-f32",
         }
@@ -364,10 +376,11 @@ impl Q8ProjectionWeightPreparation {
 
     pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "compressed" => Ok(Self::Compressed),
             "predecoded-f32" => Ok(Self::PredecodedF32),
             _ => Err(format!(
-                "expected compressed or predecoded-f32; got {raw:?}"
+                "expected auto, compressed or predecoded-f32; got {raw:?}"
             )),
         }
     }
@@ -2804,6 +2817,7 @@ mod tests {
         assert_eq!(restored.q4_mmvq_weight_decode, Q4MmvqWeightDecode::Baseline);
         for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
             for mode in [
+                Q4MmvqWeightDecode::Auto,
                 Q4MmvqWeightDecode::SharedM8,
                 Q4MmvqWeightDecode::SharedM4M8,
                 Q4MmvqWeightDecode::Baseline,
@@ -2844,6 +2858,7 @@ mod tests {
         assert_eq!(restored.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Baseline);
         for source in [RuntimeConfigSource::ConfigFile, RuntimeConfigSource::Cli] {
             for mode in [
+                Q5MmvqWeightDecode::Auto,
                 Q5MmvqWeightDecode::SharedM8,
                 Q5MmvqWeightDecode::SharedM4M8,
                 Q5MmvqWeightDecode::Baseline,
@@ -2954,6 +2969,7 @@ mod tests {
         engine.runtime.q5_mmvq_weight_decode = Q5MmvqWeightDecode::SharedM8;
         for source in [RuntimeConfigSource::Cli, RuntimeConfigSource::ConfigFile] {
             for mode in [
+                Q8ProjectionWeightPreparation::Auto,
                 Q8ProjectionWeightPreparation::PredecodedF32,
                 Q8ProjectionWeightPreparation::Compressed,
             ] {
@@ -2973,7 +2989,8 @@ mod tests {
         for (value, source) in [
             ("predecoded-f32", RuntimeConfigSource::Env),
             ("compressed", RuntimeConfigSource::Env),
-            ("auto", RuntimeConfigSource::Cli),
+            ("auto", RuntimeConfigSource::Env),
+            ("automatic", RuntimeConfigSource::Cli),
         ] {
             assert!(engine
                 .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_entries([

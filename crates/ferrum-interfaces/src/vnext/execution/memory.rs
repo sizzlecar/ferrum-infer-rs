@@ -113,15 +113,33 @@ impl MemoryPlan {
                     .checked_add(allocation.size_bytes)
                     .ok_or_else(|| invalid_plan("static memory total overflows u64"))
             })?;
-        let dynamic_capacity_bytes = usable_capacity_bytes
-            .checked_sub(static_bytes)
-            .ok_or_else(|| invalid_plan("static memory exceeds usable capacity"))?;
+        let dynamic_capacity_bytes = usable_capacity_bytes.checked_sub(static_bytes).ok_or(
+            VNextError::PlanCapacityExceeded {
+                required_bytes: static_bytes,
+                usable_capacity_bytes,
+            },
+        )?;
+        // A fresh pool reports pressure relative to its remaining dynamic
+        // budget. Preserve the exact global static + dynamic requirement.
+        let global_capacity_error = |error| match error {
+            VNextError::PlanCapacityExceeded { required_bytes, .. } => {
+                match static_bytes.checked_add(required_bytes) {
+                    Some(required_bytes) => VNextError::PlanCapacityExceeded {
+                        required_bytes,
+                        usable_capacity_bytes,
+                    },
+                    None => invalid_plan("minimum runnable plan bytes overflow u64"),
+                }
+            }
+            error => error,
+        };
         let base_dynamic_pools = Self::derive_dynamic_pools_with_completion_retention(
             &dynamic_descriptors,
             nodes,
             dynamic_capacity_bytes,
             retained_completion_resources,
-        )?;
+        )
+        .map_err(global_capacity_error)?;
         let reusable_execution = reusable_execution_policy
             .map(|policy| {
                 Self::derive_reusable_execution(
@@ -143,7 +161,8 @@ impl MemoryPlan {
             dynamic_capacity_bytes,
             &reusable_workspace_ceilings,
             retained_completion_resources,
-        )?;
+        )
+        .map_err(global_capacity_error)?;
         let (invocation_liveness_mode, invocation_liveness) =
             Self::summarize_pool_invocation_liveness(&dynamic_pools)?;
         let minimum_request_bytes = dynamic_pools.iter().try_fold(0_u64, |total, pool| {
@@ -188,9 +207,10 @@ impl MemoryPlan {
             .checked_add(minimum_runnable_request_bytes)
             .ok_or_else(|| invalid_plan("minimum runnable plan bytes overflow u64"))?;
         if minimum_runnable_bytes > usable_capacity_bytes {
-            return Err(invalid_plan(format!(
-                "minimum runnable plan requires {minimum_runnable_bytes} bytes, exceeding usable capacity {usable_capacity_bytes}"
-            )));
+            return Err(VNextError::PlanCapacityExceeded {
+                required_bytes: minimum_runnable_bytes,
+                usable_capacity_bytes,
+            });
         }
         let plan = Self {
             device_capacity_bytes,

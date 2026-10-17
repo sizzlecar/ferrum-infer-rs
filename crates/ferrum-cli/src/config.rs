@@ -1732,7 +1732,7 @@ mod tests {
     }
     #[test]
     fn q8_projection_weight_preparation_config_file_parses_explicit_mode() {
-        for value in ["compressed", "predecoded-f32"] {
+        for value in ["auto", "compressed", "predecoded-f32"] {
             let config: CliConfig = toml::from_str(&format!(
                 "[runtime]\nq8_projection_weight_preparation = \"{value}\"\n"
             ))
