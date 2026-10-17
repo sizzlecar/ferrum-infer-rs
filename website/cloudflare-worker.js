@@ -55,6 +55,8 @@ h1 { max-width: 900px; margin: 14px 0 22px; font-size: clamp(3.1rem, 8vw, 6.9rem
 .objective { max-width: 760px; margin-top: 28px; padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); }
 .objective p { margin: 0 0 12px; }
 .objective math { margin: 20px 0 4px; font-size: clamp(.95rem, 2vw, 1.15rem); }
+.objective-definitions { margin: 20px 0 0; padding-left: 18px; color: var(--muted); font-size: .88rem; }
+.objective-definitions li + li { margin-top: 8px; }
 p code { overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
 .button { display: inline-flex; align-items: center; justify-content: center; min-height: 46px; padding: 0 19px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); text-decoration: none; font-weight: 700; }
@@ -144,10 +146,13 @@ const pages = {
     h1: "Local LLMs.<br>One Rust binary.",
     lead: "Terminal chat and an OpenAI-compatible API, without a Python runtime.",
     goal: "Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.",
-    goalContext: "For fixed hardware, model, requests and output policy, optimize execution policy π under predeclared SLOs.",
-    goalMathLabel: "Maximize total output tokens per wall-clock second over execution policy pi, subject to separate TTFT, TPOT and ITL percentile limits.",
-    outputTokens: "total output tokens",
-    wallSeconds: "wall-clock seconds",
+    goalContext: "Fix hardware, model and output policy; choose execution policy π from eligible policies Π under predeclared SLOs.",
+    goalMathLabel: "Maximize valid output tokens from requests completed within fixed window T, divided by T, over eligible execution policies pi; require each latency percentile limit and completion fraction at least rho.",
+    goalDefinitions: [
+      "W fixes the request set and arrival times; T > 0 fixes the measurement window and common cutoff. N_out counts only valid output tokens from requests successfully completed within that window.",
+      'L_k is the latency sample distribution, Q_p_k its chosen quantile, and S_k its upper limit. TTFT includes queueing; missing latency does not count as meeting its SLO. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-evaluation.md">Sampling rules</a>.',
+      "C is the fraction of W successfully completed by the cutoff; its denominator includes rejected, failed, timed-out and unfinished requests. Declare p_k, S_k and 0 < ρ ≤ 1 before measuring.",
+    ],
     primary: "Install 0.13.0",
     secondary: "View on GitHub",
     quickTitle: "Install and run",
@@ -170,7 +175,7 @@ const pages = {
     ],
     supportNote: 'Support varies by architecture, format and backend. CPU is a compatibility backend; text support does not imply vision support. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">Validation scope</a>.',
     performanceTitle: "Recent 27B throughput",
-    performanceLead: "RTX 5090 · Qwen3.8-27B · frozen ShareGPT workload. Accepted 0.13 candidate measurements: fixed 32 slots, context/batch 2048; 200 requests × 2 repeats per cell, 8 warmups per repeat, zero protocol errors. Output tok/s = total output tokens / total measured time; C is client concurrency.",
+    performanceLead: "RTX 5090 · Qwen3.8-27B · frozen ShareGPT workload. Accepted 0.13 candidate measurements: fixed 32 slots, context/batch 2048; 200 requests × 2 repeats per cell, 8 warmups per repeat, zero protocol errors. These tables fix the request count and use each repeat’s actual elapsed time, rather than a fixed window. Output tok/s = total output tokens / total measured time; C in the tables is client concurrency.",
     ggufCaption: "GGUF Q4_K_M · same weights",
     ctCaption: "Compressed-tensors INT4 · group size 32",
     concurrency: "C",
@@ -195,10 +200,13 @@ const pages = {
     h1: "本地推理，<br>一个 Rust 二进制。",
     lead: "终端对话与 OpenAI 兼容 API，无需 Python 运行时。",
     goal: "目标：在满足 TTFT、TPOT、ITL SLO 的前提下，最大化输出吞吐。",
-    goalContext: "固定硬件、模型及负载口径（请求集与输出策略），在预设 SLO 下优化执行策略 π。",
-    goalMathLabel: "以执行策略π为变量，最大化输出token总数除以墙钟秒数，并分别满足TTFT、TPOT、ITL的分位数阈值。",
-    outputTokens: "输出 token 总数",
-    wallSeconds: "墙钟秒数",
+    goalContext: "固定硬件、模型与输出策略，在预设 SLO 下从可用策略集合 Π 中选择执行策略 π。",
+    goalMathLabel: "在可用执行策略π中，最大化固定窗口T内成功完成请求的有效输出token数除以T，并满足各延迟分位上限及最低完成比例ρ。",
+    goalDefinitions: [
+      "W 固定请求集合与到达时序；T > 0 为固定测量窗口，结束即共同统计截止。N_out 只计窗口内成功完成请求的有效输出 token。",
+      'L_k 为延迟采样分布，Q_p_k 为指定分位数，S_k 为上限。TTFT 包含排队；缺失延迟不视为达标。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-evaluation.md">采样规则</a>。',
+      "C 为同一 W 在截止前成功完成的比例，分母包含拒绝、失败、超时和未完成请求；p_k、S_k 与 0 < ρ ≤ 1 均须预先给定。",
+    ],
     primary: "安装 0.13.0",
     secondary: "查看 GitHub",
     quickTitle: "安装与使用",
@@ -221,7 +229,7 @@ const pages = {
     ],
     supportNote: '支持范围取决于架构、格式与后端组合。CPU 为兼容后端，文本支持不代表视觉支持。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">验证范围</a>。',
     performanceTitle: "近期 27B 吞吐",
-    performanceLead: "RTX 5090 · Qwen3.8-27B · 冻结 ShareGPT 负载。已验收的 0.13 候选测量：固定 32 槽、上下文/批处理 2048；每格正式 200 请求 × 2 轮，每轮另有 8 次预热，零协议错误。输出 token/s＝总输出 token / 总正式时长；C 为客户端并发。",
+    performanceLead: "RTX 5090 · Qwen3.8-27B · 冻结 ShareGPT 负载。已验收的 0.13 候选测量：固定 32 槽、上下文/批处理 2048；每格正式 200 请求 × 2 轮，每轮另有 8 次预热，零协议错误。本表固定请求数，以各轮实际耗时计算吞吐，不采用固定窗口。输出 token/s＝总输出 token / 总正式时长；表中 C 为客户端并发。",
     ggufCaption: "GGUF Q4_K_M · 同权重",
     ctCaption: "Compressed-tensors INT4 · group size 32",
     concurrency: "C",
@@ -274,7 +282,6 @@ function render(page) {
     [page.serveLabel, "ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000"],
   ].map(([label, command], index) => codeBlock(label, command, `run-command-${index}`)).join("");
   const table = (caption, baseline, values) => `<div class="table-wrap"><table><caption>${caption}<span>output tok/s</span></caption><thead><tr><th scope="col">${page.concurrency}</th><th scope="col">Ferrum</th><th scope="col">${baseline}</th><th scope="col">${page.ratio}</th></tr></thead><tbody>${values.map(([c, ferrum, reference, ratio]) => `<tr><th scope="row">${c}</th><td>${ferrum}</td><td>${reference}</td><td>${ratio}</td></tr>`).join("")}</tbody></table></div>`;
-  const constraints = ["TTFT", "TPOT", "ITL"].map((metric) => `<mtr><mtd><mrow><msub><mi>Q</mi><msub><mi>p</mi><mi mathvariant="normal">${metric}</mi></msub></msub><mo>(</mo><msub><mi mathvariant="normal">${metric}</mi><mi>π</mi></msub><mo>)</mo><mo>≤</mo><msub><mi>S</mi><mi mathvariant="normal">${metric}</mi></msub></mrow></mtd></mtr>`).join("");
   return `<!doctype html>
 <html lang="${page.lang}">
 <head>
@@ -314,11 +321,14 @@ function render(page) {
         <p class="muted">${page.goalContext}</p>
         <math display="block" aria-label="${escapeHtml(page.goalMathLabel)}">
           <mtable columnalign="center" rowspacing="0.5em">
-            <mtr><mtd><mrow><munder><mo>max</mo><mi>π</mi></munder><mspace width="0.4em"/><mfrac><mrow><mtext>${page.outputTokens}</mtext><mo>(</mo><mi>π</mi><mo>)</mo></mrow><mrow><mtext>${page.wallSeconds}</mtext><mo>(</mo><mi>π</mi><mo>)</mo></mrow></mfrac></mrow></mtd></mtr>
+            <mtr><mtd><mrow><munder><mo>max</mo><mrow><mi>π</mi><mo>∈</mo><mi>Π</mi></mrow></munder><mspace width="0.4em"/><mfrac><mrow><msub><mi>N</mi><mtext>out</mtext></msub><mo>(</mo><mi>π</mi><mo>;</mo><mi>W</mi><mo>,</mo><mi>T</mi><mo>)</mo></mrow><mi>T</mi></mfrac></mrow></mtd></mtr>
             <mtr><mtd><mtext>s.t.</mtext></mtd></mtr>
-            ${constraints}
+            <mtr><mtd><mrow><msub><mi>Q</mi><msub><mi>p</mi><mi>k</mi></msub></msub><mo>(</mo><msub><mi>L</mi><mi>k</mi></msub><mo>(</mo><mi>π</mi><mo>;</mo><mi>W</mi><mo>,</mo><mi>T</mi><mo>)</mo><mo>)</mo><mo>≤</mo><msub><mi>S</mi><mi>k</mi></msub></mrow></mtd></mtr>
+            <mtr><mtd><mrow><mo>∀</mo><mi>k</mi><mo>∈</mo><mo>{</mo><mtext>TTFT</mtext><mo>,</mo><mtext>TPOT</mtext><mo>,</mo><mtext>ITL</mtext><mo>}</mo></mrow></mtd></mtr>
+            <mtr><mtd><mrow><mi>C</mi><mo>(</mo><mi>π</mi><mo>;</mo><mi>W</mi><mo>,</mo><mi>T</mi><mo>)</mo><mo>≥</mo><mi>ρ</mi></mrow></mtd></mtr>
           </mtable>
         </math>
+        <ul class="objective-definitions">${page.goalDefinitions.map((definition) => `<li>${definition}</li>`).join("")}</ul>
       </div>
       <div class="actions"><a class="button primary" href="#quick-start">${page.primary}</a><a class="button" href="${REPOSITORY}">${page.secondary}</a></div>
     </div></header>
