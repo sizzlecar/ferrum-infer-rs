@@ -98,8 +98,10 @@ jobs:
             id=$(artifact_id "$name")
             printf '%s=%s\n' "${name//-/_}" "$id" >> "$GITHUB_OUTPUT"
           done
+          # Match distribution artifact names emitted by the staging workflows;
+          # build-evidence artifacts may legitimately exist for several attempts.
           jq -e --arg run "$SOURCE_RUN" --arg candidate "$candidate" '
-            [.[] | select(.name | test("^ferrum-(linux|macos|windows)-.*-run-" + $run + "-[1-9][0-9]*-" + $candidate + "$"))] |
+            [.[] | select(.name | test("^ferrum-(linux-x86_64(-cuda-sm(89|120))?|macos-aarch64|windows-x86_64-(cpu|cuda))-run-" + $run + "-[1-9][0-9]*-" + $candidate + "$"))] |
             group_by(.name | sub("-run-[0-9]+-[0-9]+-[0-9a-f]+$"; "")) |
             if length > 0 and all(length == 1) then flatten
             else error("missing or ambiguous staged distributions; do not guess an execution attempt") end' \
