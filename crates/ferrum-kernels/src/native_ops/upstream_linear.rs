@@ -312,6 +312,9 @@ impl PreparedUpstreamLinear {
         mut self,
         mode: ferrum_types::Q4MmvqWeightDecode,
     ) -> Result<Self, Error> {
+        if mode == ferrum_types::Q4MmvqWeightDecode::Auto {
+            return Err(Error::InvalidArgument);
+        }
         if mode != ferrum_types::Q4MmvqWeightDecode::Baseline {
             if !cfg!(feature = "cuda-q4-shared-weight-decode") {
                 return Err(Error::Unavailable);
@@ -332,6 +335,38 @@ impl PreparedUpstreamLinear {
     }
     pub fn q4_shared_weight_decode_eligible(&self) -> bool {
         self.shared_weight_decode_geometry(Format::Q4K, 8)
+    }
+    /// Cold policy resolution against the already validated native plan. The
+    /// caller supplies cached feature/export qualification; device attributes
+    /// are the actual values retained by native preparation, never GPU names.
+    pub(crate) fn automatic_q4_mmvq_weight_decode(
+        &self,
+        native_available: bool,
+    ) -> ferrum_types::Q4MmvqWeightDecode {
+        if self.automatic_shared_weight_decode_device(native_available)
+            && self.q4_shared_weight_decode_eligible()
+        {
+            ferrum_types::Q4MmvqWeightDecode::SharedM8
+        } else {
+            ferrum_types::Q4MmvqWeightDecode::Baseline
+        }
+    }
+    pub(crate) fn automatic_q5_mmvq_weight_decode(
+        &self,
+        native_available: bool,
+    ) -> ferrum_types::Q5MmvqWeightDecode {
+        if self.automatic_shared_weight_decode_device(native_available)
+            && self.q5_shared_weight_decode_eligible()
+        {
+            ferrum_types::Q5MmvqWeightDecode::SharedM8
+        } else {
+            ferrum_types::Q5MmvqWeightDecode::Baseline
+        }
+    }
+    fn automatic_shared_weight_decode_device(&self, native_available: bool) -> bool {
+        // Automatic promotion is currently qualified on SM120 only. Explicit
+        // modes retain their existing native capability/geometry validation.
+        native_available && self.raw.request.cc == 1200 && self.raw.request.sm_count > 0
     }
     fn shared_weight_decode_geometry(&self, format: Format, rows: u32) -> bool {
         #[cfg(any(feature = "cuda-upstream-linear", test))]
@@ -360,6 +395,9 @@ impl PreparedUpstreamLinear {
         mut self,
         mode: ferrum_types::Q5MmvqWeightDecode,
     ) -> Result<Self, Error> {
+        if mode == ferrum_types::Q5MmvqWeightDecode::Auto {
+            return Err(Error::InvalidArgument);
+        }
         if mode != ferrum_types::Q5MmvqWeightDecode::Baseline {
             if !cfg!(feature = "cuda-q5-shared-weight-decode") {
                 return Err(Error::Unavailable);
@@ -507,6 +545,7 @@ impl PreparedUpstreamLinear {
             }
             let api = dispatch::api(self.family, self.raw.algorithm)?;
             let dot = match self.q4_weight_decode {
+                ferrum_types::Q4MmvqWeightDecode::Auto => return Err(Error::InvalidArgument),
                 ferrum_types::Q4MmvqWeightDecode::Baseline => api.dot,
                 #[cfg(feature = "cuda-q4-shared-weight-decode")]
                 ferrum_types::Q4MmvqWeightDecode::SharedM4M8 if self.raw.request.rows == 4 => {
@@ -522,6 +561,7 @@ impl PreparedUpstreamLinear {
                 | ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => return Err(Error::Unavailable),
             };
             let dot = match self.q5_weight_decode {
+                ferrum_types::Q5MmvqWeightDecode::Auto => return Err(Error::InvalidArgument),
                 ferrum_types::Q5MmvqWeightDecode::Baseline => dot,
                 #[cfg(feature = "cuda-q5-shared-weight-decode")]
                 ferrum_types::Q5MmvqWeightDecode::SharedM4M8 if self.raw.request.rows == 4 => {
@@ -781,6 +821,8 @@ mod tests {
         raw.request.format = Format::Q4K as u32;
         raw.request.layout = Layout::Columns as u32;
         raw.request.rows = 8;
+        raw.request.cc = 1200;
+        raw.request.sm_count = 16;
         raw.ncols = 8;
         raw.channels = 1;
         raw.nwarps = 2;
@@ -796,10 +838,35 @@ mod tests {
             mmvq_launch: MmvqLaunchKind::Ordered,
         };
         assert!(plan.q4_shared_weight_decode_eligible());
+        assert_eq!(
+            plan.automatic_q4_mmvq_weight_decode(true),
+            ferrum_types::Q4MmvqWeightDecode::SharedM8
+        );
+        assert_eq!(
+            plan.automatic_q4_mmvq_weight_decode(false),
+            ferrum_types::Q4MmvqWeightDecode::Baseline
+        );
+        assert_eq!(
+            plan.automatic_q5_mmvq_weight_decode(true),
+            ferrum_types::Q5MmvqWeightDecode::Baseline
+        );
+        for (cc, sm_count) in [(0, 16), (890, 16), (1210, 16), (1200, 0)] {
+            let mut changed = plan.clone();
+            changed.raw.request.cc = cc;
+            changed.raw.request.sm_count = sm_count;
+            assert_eq!(
+                changed.automatic_q4_mmvq_weight_decode(true),
+                ferrum_types::Q4MmvqWeightDecode::Baseline
+            );
+        }
         let mutate = |f: fn(&mut PreparedUpstreamLinear)| {
             let mut changed = plan.clone();
             f(&mut changed);
             assert!(!changed.q4_shared_weight_decode_eligible());
+            assert_eq!(
+                changed.automatic_q4_mmvq_weight_decode(true),
+                ferrum_types::Q4MmvqWeightDecode::Baseline
+            );
         };
         mutate(|p| p.family = Family::Extra);
         mutate(|p| p.arithmetic = Arithmetic::V1);
@@ -817,6 +884,18 @@ mod tests {
             plan.q4_mmvq_weight_decode(),
             ferrum_types::Q4MmvqWeightDecode::Baseline
         );
+        assert_eq!(
+            plan.clone()
+                .with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::Baseline)
+                .unwrap()
+                .q4_mmvq_weight_decode(),
+            ferrum_types::Q4MmvqWeightDecode::Baseline
+        );
+        assert!(matches!(
+            plan.clone()
+                .with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::Auto),
+            Err(Error::InvalidArgument)
+        ));
         #[cfg(not(feature = "cuda-q4-shared-weight-decode"))]
         assert!(matches!(
             plan.with_q4_mmvq_weight_decode(ferrum_types::Q4MmvqWeightDecode::SharedM8),
@@ -830,6 +909,8 @@ mod tests {
         raw.request.format = Format::Q5K as u32;
         raw.request.layout = Layout::Columns as u32;
         raw.request.rows = 8;
+        raw.request.cc = 1200;
+        raw.request.sm_count = 16;
         raw.ncols = 8;
         raw.channels = 1;
         raw.nwarps = 2;
@@ -845,10 +926,35 @@ mod tests {
             q4_weight_decode: ferrum_types::Q4MmvqWeightDecode::Baseline,
         };
         assert!(plan.q5_shared_weight_decode_eligible());
+        assert_eq!(
+            plan.automatic_q5_mmvq_weight_decode(true),
+            ferrum_types::Q5MmvqWeightDecode::SharedM8
+        );
+        assert_eq!(
+            plan.automatic_q5_mmvq_weight_decode(false),
+            ferrum_types::Q5MmvqWeightDecode::Baseline
+        );
+        assert_eq!(
+            plan.automatic_q4_mmvq_weight_decode(true),
+            ferrum_types::Q4MmvqWeightDecode::Baseline
+        );
+        for (cc, sm_count) in [(0, 16), (890, 16), (1210, 16), (1200, 0)] {
+            let mut changed = plan.clone();
+            changed.raw.request.cc = cc;
+            changed.raw.request.sm_count = sm_count;
+            assert_eq!(
+                changed.automatic_q5_mmvq_weight_decode(true),
+                ferrum_types::Q5MmvqWeightDecode::Baseline
+            );
+        }
         let mutate = |f: fn(&mut PreparedUpstreamLinear)| {
             let mut changed = plan.clone();
             f(&mut changed);
             assert!(!changed.q5_shared_weight_decode_eligible());
+            assert_eq!(
+                changed.automatic_q5_mmvq_weight_decode(true),
+                ferrum_types::Q5MmvqWeightDecode::Baseline
+            );
         };
         mutate(|p| p.family = Family::Extra);
         mutate(|p| p.arithmetic = Arithmetic::V1);
@@ -866,6 +972,18 @@ mod tests {
             plan.q5_mmvq_weight_decode(),
             ferrum_types::Q5MmvqWeightDecode::Baseline
         );
+        assert_eq!(
+            plan.clone()
+                .with_q5_mmvq_weight_decode(ferrum_types::Q5MmvqWeightDecode::Baseline)
+                .unwrap()
+                .q5_mmvq_weight_decode(),
+            ferrum_types::Q5MmvqWeightDecode::Baseline
+        );
+        assert!(matches!(
+            plan.clone()
+                .with_q5_mmvq_weight_decode(ferrum_types::Q5MmvqWeightDecode::Auto),
+            Err(Error::InvalidArgument)
+        ));
         #[cfg(not(feature = "cuda-q5-shared-weight-decode"))]
         assert!(matches!(
             plan.with_q5_mmvq_weight_decode(ferrum_types::Q5MmvqWeightDecode::SharedM8),

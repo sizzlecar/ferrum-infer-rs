@@ -1339,11 +1339,12 @@ fn causal_decode_execution_context_limit(config: &ComponentConfig) -> Result<Opt
 }
 
 fn validate_q4_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
-    if config.engine_config.runtime.q4_mmvq_weight_decode
-        != ferrum_types::Q4MmvqWeightDecode::Baseline
-        && (!matches!(config.device, Device::CUDA(_))
-            || !plan_runtime
-            || !cfg!(feature = "cuda-q4-shared-weight-decode"))
+    if matches!(
+        config.engine_config.runtime.q4_mmvq_weight_decode,
+        ferrum_types::Q4MmvqWeightDecode::SharedM8 | ferrum_types::Q4MmvqWeightDecode::SharedM4M8
+    ) && (!matches!(config.device, Device::CUDA(_))
+        || !plan_runtime
+        || !cfg!(feature = "cuda-q4-shared-weight-decode"))
     {
         return Err(FerrumError::unsupported(format!(
             "{} Q4 weight decode requires a CUDA plan runtime with the cuda-q4-shared-weight-decode build feature and a Q4_K MarkerV2 MMVQ numerical route for the requested rows",
@@ -1353,11 +1354,12 @@ fn validate_q4_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) 
     Ok(())
 }
 fn validate_q5_mmvq_weight_decode(config: &ComponentConfig, plan_runtime: bool) -> Result<()> {
-    if config.engine_config.runtime.q5_mmvq_weight_decode
-        != ferrum_types::Q5MmvqWeightDecode::Baseline
-        && (!matches!(config.device, Device::CUDA(_))
-            || !plan_runtime
-            || !cfg!(feature = "cuda-q5-shared-weight-decode"))
+    if matches!(
+        config.engine_config.runtime.q5_mmvq_weight_decode,
+        ferrum_types::Q5MmvqWeightDecode::SharedM8 | ferrum_types::Q5MmvqWeightDecode::SharedM4M8
+    ) && (!matches!(config.device, Device::CUDA(_))
+        || !plan_runtime
+        || !cfg!(feature = "cuda-q5-shared-weight-decode"))
     {
         return Err(FerrumError::unsupported(format!(
             "{} Q5 weight decode requires a CUDA plan runtime with the cuda-q5-shared-weight-decode build feature and a Q5_K MarkerV2 MMVQ numerical route for the requested rows",
@@ -3506,6 +3508,9 @@ mod tests {
             config.device = device;
             for plan_runtime in [false, true] {
                 config.engine_config.runtime.q4_mmvq_weight_decode =
+                    ferrum_types::Q4MmvqWeightDecode::Auto;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
+                config.engine_config.runtime.q4_mmvq_weight_decode =
                     ferrum_types::Q4MmvqWeightDecode::Baseline;
                 validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
                 for mode in [
@@ -3534,6 +3539,9 @@ mod tests {
         for device in [Device::CPU, Device::CUDA(0)] {
             config.device = device;
             for plan_runtime in [false, true] {
+                config.engine_config.runtime.q5_mmvq_weight_decode =
+                    ferrum_types::Q5MmvqWeightDecode::Auto;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
                 config.engine_config.runtime.q5_mmvq_weight_decode =
                     ferrum_types::Q5MmvqWeightDecode::Baseline;
                 validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();

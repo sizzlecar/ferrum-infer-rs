@@ -3402,7 +3402,7 @@ impl CudaDeviceRuntime {
         self
     }
 
-    /// Selected weight decoding for eligible original Q4_K M8 MMVQ plans.
+    /// Requested weight-decode policy; Auto is resolved by each prepared plan.
     pub fn q4_mmvq_weight_decode(&self) -> ferrum_types::Q4MmvqWeightDecode {
         self.q4_mmvq_weight_decode
     }
@@ -3447,7 +3447,7 @@ impl CudaDeviceRuntime {
         self.causal_decode_kv_reuse
     }
 
-    /// Selected weight decoding for eligible original Q5_K M8 MMVQ plans.
+    /// Requested weight-decode policy; Auto is resolved by each prepared plan.
     pub fn q5_mmvq_weight_decode(&self) -> ferrum_types::Q5MmvqWeightDecode {
         self.q5_mmvq_weight_decode
     }

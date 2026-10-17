@@ -1332,36 +1332,44 @@ impl CudaVNextComposition {
                 "fixed execution capacity requires a positive execution context limit",
             ));
         }
-        if q4_mmvq_weight_decode != ferrum_types::Q4MmvqWeightDecode::Baseline
-            && (!cfg!(feature = "cuda-q4-shared-weight-decode")
-                || (matches!(purpose, CudaCompositionPurpose::Execution)
-                    && !match q4_mmvq_weight_decode {
-                        ferrum_types::Q4MmvqWeightDecode::Baseline => true,
-                        ferrum_types::Q4MmvqWeightDecode::SharedM8 => {
-                            q4_shared_weight_decode_compiled()
-                        }
-                        ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => {
-                            q4_shared_weight_decode_m4_m8_compiled()
-                        }
-                    }))
+        if matches!(
+            q4_mmvq_weight_decode,
+            ferrum_types::Q4MmvqWeightDecode::SharedM8
+                | ferrum_types::Q4MmvqWeightDecode::SharedM4M8
+        ) && (!cfg!(feature = "cuda-q4-shared-weight-decode")
+            || (matches!(purpose, CudaCompositionPurpose::Execution)
+                && !match q4_mmvq_weight_decode {
+                    ferrum_types::Q4MmvqWeightDecode::Auto
+                    | ferrum_types::Q4MmvqWeightDecode::Baseline => true,
+                    ferrum_types::Q4MmvqWeightDecode::SharedM8 => {
+                        q4_shared_weight_decode_compiled()
+                    }
+                    ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => {
+                        q4_shared_weight_decode_m4_m8_compiled()
+                    }
+                }))
         {
             return Err(CudaDeviceRuntimeError::contract(format!(
                 "{} Q4 weight decode requires its compiled upstream native exports",
                 q4_mmvq_weight_decode.as_runtime_value()
             )));
         }
-        if q5_mmvq_weight_decode != ferrum_types::Q5MmvqWeightDecode::Baseline
-            && (!cfg!(feature = "cuda-q5-shared-weight-decode")
-                || (matches!(purpose, CudaCompositionPurpose::Execution)
-                    && !match q5_mmvq_weight_decode {
-                        ferrum_types::Q5MmvqWeightDecode::Baseline => true,
-                        ferrum_types::Q5MmvqWeightDecode::SharedM8 => {
-                            q5_shared_weight_decode_compiled()
-                        }
-                        ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => {
-                            q5_shared_weight_decode_m4_m8_compiled()
-                        }
-                    }))
+        if matches!(
+            q5_mmvq_weight_decode,
+            ferrum_types::Q5MmvqWeightDecode::SharedM8
+                | ferrum_types::Q5MmvqWeightDecode::SharedM4M8
+        ) && (!cfg!(feature = "cuda-q5-shared-weight-decode")
+            || (matches!(purpose, CudaCompositionPurpose::Execution)
+                && !match q5_mmvq_weight_decode {
+                    ferrum_types::Q5MmvqWeightDecode::Auto
+                    | ferrum_types::Q5MmvqWeightDecode::Baseline => true,
+                    ferrum_types::Q5MmvqWeightDecode::SharedM8 => {
+                        q5_shared_weight_decode_compiled()
+                    }
+                    ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => {
+                        q5_shared_weight_decode_m4_m8_compiled()
+                    }
+                }))
         {
             return Err(CudaDeviceRuntimeError::contract(format!(
                 "{} Q5 weight decode requires its compiled upstream native exports",

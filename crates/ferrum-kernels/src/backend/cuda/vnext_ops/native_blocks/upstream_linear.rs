@@ -39,7 +39,9 @@ enum NativeFamily {
     Q6F16,
 }
 
-type NativeKey = (NativeFamily, u32, u32, u32, u32, u32, bool, bool);
+// Decode preferences and native export qualification are immutable per factory.
+// The cached plan contains the concrete selection for this exact geometry.
+type NativeKey = (NativeFamily, u32, u32, u32, u32, u32);
 
 /// The package ABI remains 1; its independently typed F16 boundary has tag 2.
 /// An old F32-only package cannot advertise this capability. Live catalog
@@ -114,6 +116,8 @@ pub(in crate::backend::cuda::vnext_ops) struct UpstreamPlanFactory {
     fingerprint: String,
     q4_weight_decode: ferrum_types::Q4MmvqWeightDecode,
     q5_weight_decode: ferrum_types::Q5MmvqWeightDecode,
+    automatic_q4_shared_available: bool,
+    automatic_q5_shared_available: bool,
     shared_weight_decode_encodes: Option<Arc<AtomicU64>>,
     q5_shared_weight_decode_encodes: Option<Arc<AtomicU64>>,
     // Geometry contains no allocation addresses or resource authorization.
@@ -153,6 +157,12 @@ impl UpstreamPlanFactory {
             fingerprint,
             q4_weight_decode,
             q5_weight_decode,
+            automatic_q4_shared_available: q4_weight_decode
+                == ferrum_types::Q4MmvqWeightDecode::Auto
+                && crate::backend::cuda::vnext_ops::q4_shared_weight_decode_compiled(),
+            automatic_q5_shared_available: q5_weight_decode
+                == ferrum_types::Q5MmvqWeightDecode::Auto
+                && crate::backend::cuda::vnext_ops::q5_shared_weight_decode_compiled(),
             shared_weight_decode_encodes,
             q5_shared_weight_decode_encodes,
             plans: Mutex::new(BTreeMap::new()),
@@ -199,29 +209,24 @@ impl UpstreamPlanFactory {
             .or_else(|| (family == NativeFamily::Q6F16).then_some(14))
             .ok_or("native format is absent")?;
         let shared_dot = match self.q4_weight_decode {
-            ferrum_types::Q4MmvqWeightDecode::Baseline => false,
+            ferrum_types::Q4MmvqWeightDecode::Auto | ferrum_types::Q4MmvqWeightDecode::Baseline => {
+                false
+            }
             ferrum_types::Q4MmvqWeightDecode::SharedM8 => rows == 8,
             ferrum_types::Q4MmvqWeightDecode::SharedM4M8 => matches!(rows, 4 | 8),
         } && family == NativeFamily::Base
             && algorithm == Algorithm::Mmvq
             && base == Some(Format::Q4K);
         let q5_shared_dot = match self.q5_weight_decode {
-            ferrum_types::Q5MmvqWeightDecode::Baseline => false,
+            ferrum_types::Q5MmvqWeightDecode::Auto | ferrum_types::Q5MmvqWeightDecode::Baseline => {
+                false
+            }
             ferrum_types::Q5MmvqWeightDecode::SharedM8 => rows == 8,
             ferrum_types::Q5MmvqWeightDecode::SharedM4M8 => matches!(rows, 4 | 8),
         } && family == NativeFamily::Base
             && algorithm == Algorithm::Mmvq
             && base == Some(Format::Q5K);
-        let key = (
-            family,
-            algorithm as u32,
-            format_code,
-            rows,
-            inputs,
-            outputs,
-            shared_dot,
-            q5_shared_dot,
-        );
+        let key = (family, algorithm as u32, format_code, rows, inputs, outputs);
         let mut plans = self
             .plans
             .lock()
@@ -269,17 +274,41 @@ impl UpstreamPlanFactory {
             _ => return Err("native format family is ambiguous".into()),
         }
         .map_err(|error| format!("{error}; family={family:?} algorithm={algorithm:?} format={format_code} rows={rows} inputs={inputs} outputs={outputs}"))?;
-        let plan = if shared_dot {
-            plan.with_q4_mmvq_weight_decode(self.q4_weight_decode)
-                .map_err(|error| format!("{error}; shared Q4 MMVQ native geometry"))?
-        } else {
-            plan
-        };
-        let plan = if q5_shared_dot {
-            plan.with_q5_mmvq_weight_decode(self.q5_weight_decode)
-                .map_err(|error| format!("{error}; shared Q5 MMVQ native geometry"))?
-        } else {
-            plan
+        let plan = match plan {
+            PreparedProjectionNative::Upstream(plan) => {
+                let q4_mode = if self.q4_weight_decode == ferrum_types::Q4MmvqWeightDecode::Auto {
+                    plan.automatic_q4_mmvq_weight_decode(self.automatic_q4_shared_available)
+                } else if shared_dot {
+                    self.q4_weight_decode
+                } else {
+                    ferrum_types::Q4MmvqWeightDecode::Baseline
+                };
+                let q5_mode = if self.q5_weight_decode == ferrum_types::Q5MmvqWeightDecode::Auto {
+                    plan.automatic_q5_mmvq_weight_decode(self.automatic_q5_shared_available)
+                } else if q5_shared_dot {
+                    self.q5_weight_decode
+                } else {
+                    ferrum_types::Q5MmvqWeightDecode::Baseline
+                };
+                let plan = plan
+                    .with_q4_mmvq_weight_decode(q4_mode)
+                    .map_err(|error| format!("{error}; shared Q4 MMVQ native geometry"))?
+                    .with_q5_mmvq_weight_decode(q5_mode)
+                    .map_err(|error| format!("{error}; shared Q5 MMVQ native geometry"))?;
+                tracing::debug!(
+                    q4_requested = self.q4_weight_decode.as_runtime_value(),
+                    q4_selected = plan.q4_mmvq_weight_decode().as_runtime_value(),
+                    q5_requested = self.q5_weight_decode.as_runtime_value(),
+                    q5_selected = plan.q5_mmvq_weight_decode().as_runtime_value(),
+                    rows,
+                    inputs,
+                    outputs,
+                    format = format_code,
+                    "resolved CUDA upstream weight decode for prepared native geometry"
+                );
+                PreparedProjectionNative::Upstream(plan)
+            }
+            plan @ PreparedProjectionNative::Q6F16(_) => plan,
         };
         let plan = plan
             .with_automatic_mmvq_launch()

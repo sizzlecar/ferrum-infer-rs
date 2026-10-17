@@ -201,6 +201,7 @@ impl SequenceBackingGrowthArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Q4MmvqWeightDecodeArg {
+    Auto,
     Baseline,
     SharedM8,
     #[value(name = "shared-m4-m8")]
@@ -210,6 +211,7 @@ pub enum Q4MmvqWeightDecodeArg {
 impl Q4MmvqWeightDecodeArg {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
+            Self::Auto => ferrum_types::Q4MmvqWeightDecode::Auto.as_runtime_value(),
             Self::Baseline => ferrum_types::Q4MmvqWeightDecode::Baseline.as_runtime_value(),
             Self::SharedM8 => ferrum_types::Q4MmvqWeightDecode::SharedM8.as_runtime_value(),
             Self::SharedM4M8 => ferrum_types::Q4MmvqWeightDecode::SharedM4M8.as_runtime_value(),
@@ -219,6 +221,7 @@ impl Q4MmvqWeightDecodeArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Q5MmvqWeightDecodeArg {
+    Auto,
     Baseline,
     SharedM8,
     #[value(name = "shared-m4-m8")]
@@ -228,6 +231,7 @@ pub enum Q5MmvqWeightDecodeArg {
 impl Q5MmvqWeightDecodeArg {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
+            Self::Auto => ferrum_types::Q5MmvqWeightDecode::Auto.as_runtime_value(),
             Self::Baseline => ferrum_types::Q5MmvqWeightDecode::Baseline.as_runtime_value(),
             Self::SharedM8 => ferrum_types::Q5MmvqWeightDecode::SharedM8.as_runtime_value(),
             Self::SharedM4M8 => ferrum_types::Q5MmvqWeightDecode::SharedM4M8.as_runtime_value(),
@@ -760,6 +764,7 @@ mod tests {
                 None
             );
             for (value, expected) in [
+                ("auto", Q4MmvqWeightDecodeArg::Auto),
                 ("baseline", Q4MmvqWeightDecodeArg::Baseline),
                 ("shared-m8", Q4MmvqWeightDecodeArg::SharedM8),
                 ("shared-m4-m8", Q4MmvqWeightDecodeArg::SharedM4M8),
@@ -794,6 +799,7 @@ mod tests {
                 None
             );
             for (value, expected) in [
+                ("auto", Q5MmvqWeightDecodeArg::Auto),
                 ("baseline", Q5MmvqWeightDecodeArg::Baseline),
                 ("shared-m8", Q5MmvqWeightDecodeArg::SharedM8),
                 ("shared-m4-m8", Q5MmvqWeightDecodeArg::SharedM4M8),

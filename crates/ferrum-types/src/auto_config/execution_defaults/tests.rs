@@ -35,7 +35,16 @@ fn engine(resolved: &ResolvedFerrumConfig) -> crate::EngineConfig {
 
 #[test]
 fn cuda_execution_defaults_materialize_the_validated_bundle() {
-    let resolved = resolve(cuda(), &[]);
+    let hardware = cuda();
+    // Match ordinary serve startup: supplying hardware alone leaves the
+    // builder's single-sequence workload in place.
+    let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+    assert!(workload.target_concurrency > 1);
+    let resolved = builder(hardware, &[])
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+    assert!(engine(&resolved).scheduler.max_running_requests > 1);
     let runtime = engine(&resolved).runtime;
     assert_eq!(
         runtime.invocation_preparation_strategy,
@@ -73,18 +82,31 @@ fn cuda_execution_defaults_materialize_the_validated_bundle() {
         runtime.sampling_readback_mode,
         SamplingReadbackMode::Participant
     );
-    assert_eq!(runtime.q4_mmvq_weight_decode, Q4MmvqWeightDecode::Baseline);
-    assert_eq!(runtime.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Baseline);
+    assert_eq!(runtime.q4_mmvq_weight_decode, Q4MmvqWeightDecode::Auto);
+    assert_eq!(runtime.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Auto);
     assert_eq!(
         runtime.q8_projection_weight_preparation,
         Q8ProjectionWeightPreparation::Compressed
     );
-    assert!(resolved
-        .runtime_config
-        .entries
-        .iter()
-        .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+    assert_eq!(
+        engine(&resolved).scheduler.active_decode_prefill_chunk,
+        Some(256)
+    );
+    assert_eq!(
+        engine(&resolved)
+            .scheduler
+            .active_decode_prefill_token_budget,
+        None
+    );
     for (selection, key) in [
+        (
+            "q4_mmvq_weight_decode",
+            crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
+        ),
+        (
+            "q5_mmvq_weight_decode",
+            crate::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
+        ),
         (
             "invocation_preparation_strategy",
             "FERRUM_INVOCATION_PREPARATION_STRATEGY",
@@ -137,8 +159,23 @@ fn cuda_execution_defaults_materialize_the_validated_bundle() {
 }
 
 #[test]
+fn cuda_execution_defaults_preserve_single_sequence_prefill_behavior() {
+    let resolved = resolve(cuda(), &[]);
+    let config = engine(&resolved);
+    assert_eq!(config.scheduler.max_running_requests, 1);
+    assert_eq!(config.scheduler.active_decode_prefill_chunk, None);
+    assert!(resolved
+        .runtime_config
+        .entries
+        .iter()
+        .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+}
+
+#[test]
 fn cuda_execution_defaults_preserve_explicit_opt_outs_and_provenance() {
     let entries = [
+        (crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY, "baseline"),
+        (crate::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY, "baseline"),
         ("FERRUM_INVOCATION_PREPARATION_STRATEGY", "full"),
         ("FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY", "sparse"),
         (crate::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY, "legacy"),
@@ -267,6 +304,14 @@ fn cuda_execution_defaults_respect_dependency_opt_outs() {
 
 #[test]
 fn cuda_execution_defaults_fall_back_when_compiled_capabilities_are_missing() {
+    // Auto is a preference, so missing shared-dot exports/features must not
+    // become an explicit-mode startup error before the provider can fall back.
+    let mut hardware = cuda();
+    hardware.compiled_features.cuda_q4_shared_weight_decode = false;
+    hardware.compiled_features.cuda_q5_shared_weight_decode = false;
+    let runtime = engine(&resolve(hardware, &[])).runtime;
+    assert_eq!(runtime.q4_mmvq_weight_decode, Q4MmvqWeightDecode::Auto);
+    assert_eq!(runtime.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Auto);
     let mut hardware = cuda();
     hardware.compiled_features.cuda = false;
     let runtime = engine(&resolve(hardware, &[])).runtime;
@@ -353,6 +398,8 @@ fn cuda_execution_defaults_do_not_change_other_backends_or_legacy() {
             .resolve()
             .unwrap();
         let runtime = engine(&resolved).runtime;
+        assert_eq!(runtime.q4_mmvq_weight_decode, Q4MmvqWeightDecode::Baseline);
+        assert_eq!(runtime.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Baseline);
         assert_eq!(
             runtime.invocation_preparation_strategy,
             InvocationPreparationStrategy::Full

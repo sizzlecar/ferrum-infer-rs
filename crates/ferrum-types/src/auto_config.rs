@@ -1417,15 +1417,21 @@ impl FerrumConfigBuilder {
         max_sequences: &ResolvedValue<usize>,
     ) -> Option<ResolvedValue<usize>> {
         if self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
-            || !self.hardware.backend.eq_ignore_ascii_case("metal")
             || max_sequences.value <= 1
         {
             return None;
         }
+        let value = if self.hardware.backend.eq_ignore_ascii_case("metal") {
+            128
+        } else if self.is_cuda_backend() && self.hardware.compiled_features.cuda {
+            256
+        } else {
+            return None;
+        };
         // Bound mixed-prefill work even with only one active decoder. Cold
         // prefills keep their elastic token budget; explicit limits still win.
         Some(ResolvedValue {
-            value: 128,
+            value,
             source: AutoConfigSource::Default,
             source_key: None,
         })
@@ -3032,10 +3038,12 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if mode != crate::Q4MmvqWeightDecode::Baseline
-            && (!self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
-                || !self.hardware.compiled_features.cuda_q4_shared_weight_decode)
+        if matches!(
+            mode,
+            crate::Q4MmvqWeightDecode::SharedM8 | crate::Q4MmvqWeightDecode::SharedM4M8
+        ) && (!self.is_cuda_backend()
+            || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            || !self.hardware.compiled_features.cuda_q4_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -3047,7 +3055,7 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["baseline", "shared-m8", "shared-m4-m8"],
+            ["auto", "baseline", "shared-m8", "shared-m4-m8"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -3071,10 +3079,12 @@ impl FerrumConfigBuilder {
                 None,
             ),
         };
-        if mode != crate::Q5MmvqWeightDecode::Baseline
-            && (!self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
-                || !self.hardware.compiled_features.cuda_q5_shared_weight_decode)
+        if matches!(
+            mode,
+            crate::Q5MmvqWeightDecode::SharedM8 | crate::Q5MmvqWeightDecode::SharedM4M8
+        ) && (!self.is_cuda_backend()
+            || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            || !self.hardware.compiled_features.cuda_q5_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -3086,7 +3096,7 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["baseline", "shared-m8", "shared-m4-m8"],
+            ["auto", "baseline", "shared-m8", "shared-m4-m8"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -7134,6 +7144,103 @@ mod tests {
     }
 
     #[test]
+    fn cuda_plan_active_prefill_default_and_overrides_reach_engine_and_trace() {
+        let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+        let resolve = |authority, sequences, compiled_cuda, entry: Option<RuntimeConfigEntry>| {
+            let mut hardware = HardwareCapabilities::unknown();
+            hardware.backend = "cuda".into();
+            hardware.compiled_features.cuda = compiled_cuda;
+            let mut workload = WorkloadProfile::serving_default();
+            workload.target_concurrency = sequences;
+            FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entry))
+                .with_hardware_capabilities(hardware)
+                .with_workload_profile(workload)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap()
+        };
+        for (authority, sequences, compiled_cuda, expected) in [
+            (ExecutionResourceAuthority::PlanRuntime, 4, true, Some(256)),
+            (ExecutionResourceAuthority::PlanRuntime, 1, true, None),
+            (ExecutionResourceAuthority::LegacyEngine, 4, true, None),
+            (ExecutionResourceAuthority::PlanRuntime, 4, false, None),
+        ] {
+            let resolved = resolve(authority, sequences, compiled_cuda, None);
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(engine.scheduler.active_decode_prefill_chunk, expected);
+            assert_eq!(engine.scheduler.active_decode_prefill_token_budget, None);
+            assert_eq!(engine.scheduler.prefill_step_chunk, None);
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key);
+            let policy = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "scheduler_admission_policy")
+                .unwrap();
+            if let Some(expected) = expected {
+                let entry = entry.unwrap();
+                assert_eq!(entry.effective_value, expected.to_string());
+                assert_eq!(entry.source, RuntimeConfigSource::Default);
+                assert!(policy
+                    .selected
+                    .split('+')
+                    .any(|part| part == format!("active_decode_prefill_chunk:{expected}")));
+                assert_eq!(policy.source, AutoConfigSource::Default);
+                assert_eq!(policy.source_key, None);
+            } else {
+                assert!(entry.is_none());
+                assert!(!policy.selected.contains("active_decode_prefill_chunk:"));
+            }
+        }
+        for (value, source) in [
+            ("24", RuntimeConfigSource::ConfigFile),
+            ("96", RuntimeConfigSource::Cli),
+            ("512", RuntimeConfigSource::Env),
+            ("32", RuntimeConfigSource::Default),
+        ] {
+            let resolved = resolve(
+                ExecutionResourceAuthority::PlanRuntime,
+                4,
+                true,
+                Some(RuntimeConfigEntry::new(key, value, source)),
+            );
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.scheduler.active_decode_prefill_chunk,
+                Some(value.parse().unwrap())
+            );
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, source);
+            let policy = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "scheduler_admission_policy")
+                .unwrap();
+            assert_eq!(policy.source, auto_config_source_from_runtime(source));
+            assert_eq!(policy.source_key.as_deref(), Some(key));
+            assert!(policy
+                .selected
+                .split('+')
+                .any(|part| part == format!("active_decode_prefill_chunk:{value}")));
+        }
+    }
+
+    #[test]
     fn explicit_active_prefill_limits_keep_their_value_and_source() {
         for (value, runtime_source, source) in [
             (
@@ -7767,7 +7874,7 @@ mod tests {
                 .effective_value,
             "baseline"
         );
-        for value in ["baseline", "shared-m8", "shared-m4-m8", "invalid"] {
+        for value in ["auto", "baseline", "shared-m8", "shared-m4-m8", "invalid"] {
             let result = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
                 RuntimeConfigEntry::new(key, value, RuntimeConfigSource::Env),
             ]))
@@ -7809,7 +7916,7 @@ mod tests {
                 .effective_value,
             "baseline"
         );
-        for value in ["baseline", "shared-m8", "shared-m4-m8", "invalid"] {
+        for value in ["auto", "baseline", "shared-m8", "shared-m4-m8", "invalid"] {
             let result = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries([
                 RuntimeConfigEntry::new(key, value, RuntimeConfigSource::Env),
             ]))

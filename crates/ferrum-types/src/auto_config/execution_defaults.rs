@@ -182,17 +182,27 @@ impl FerrumConfigBuilder {
                 "FERRUM_PREFILL_DECODE_EXECUTION",
                 PrefillDecodeExecution::default().as_runtime_value(),
             ),
-            // The builder does not know the selected numerical profile or
-            // weight layout. Do not infer these numerical/storage choices
-            // from model names or a generic quantization label.
+            // Preserve an unresolved preference until the selected numerical
+            // contract and exact native geometry are available to the provider.
             (
                 crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
-                Q4MmvqWeightDecode::default().as_runtime_value(),
+                if cuda_plan {
+                    Q4MmvqWeightDecode::Auto
+                } else {
+                    Q4MmvqWeightDecode::Baseline
+                }
+                .as_runtime_value(),
             ),
             (
                 crate::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
-                Q5MmvqWeightDecode::default().as_runtime_value(),
+                if cuda_plan {
+                    Q5MmvqWeightDecode::Auto
+                } else {
+                    Q5MmvqWeightDecode::Baseline
+                }
+                .as_runtime_value(),
             ),
+            // Q8 changes persistent storage and still requires explicit opt-in.
             (
                 crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY,
                 Q8ProjectionWeightPreparation::default().as_runtime_value(),
