@@ -12,13 +12,23 @@ Rust LLM inference and an OpenAI-compatible server in one binary, without a Pyth
 
 **Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.**
 
+Fix hardware, model and output policy; optimize execution policy $\pi\in\Pi$:
+
 $$
-\max\;\frac{\text{output tokens}}{\text{elapsed seconds}}
-\quad\text{subject to}\quad
-Q_p(TTFT)\le S_{TTFT},\;Q_p(TPOT)\le S_{TPOT},\;Q_p(ITL)\le S_{ITL}.
+\begin{gathered}
+\max_{\pi\in\Pi}\;\frac{N_{\mathrm{out}}(\pi;W,T)}{T} \\
+\text{s.t.} \\
+Q_{p_k}\!\left(L_k(\pi;W,T)\right)\le S_k \\
+\forall k\in\{\mathrm{TTFT},\mathrm{TPOT},\mathrm{ITL}\} \\
+C(\pi;W,T)\ge\rho
+\end{gathered}
 $$
 
-TTFT: time to first visible text. TPOT: time per output token. ITL: interval between non-empty visible text updates. Set percentile $p$ and limits $S$ before measuring. SLO compliance remains a goal.
+Maximize successful output token throughput under a fixed workload and measurement window, subject to tail-latency SLOs and a minimum request completion rate.
+
+- $W$: fixed request cohort and arrival schedule; $T>0$: fixed window, whose end is the common cutoff. $N_{\mathrm{out}}$: valid output tokens from requests successfully completed within that window.
+- $L_k$: latency samples; $Q_{p_k}$: quantile; $S_k$: limit. TTFT includes queueing; missing latency evidence does not establish compliance. [Sampling rules](docs/performance-popular-models-p0.zh.md).
+- $C$: fraction of $W$ successfully completed by the cutoff. Rejected, failed, timed-out and unfinished requests remain in the denominator. Declare $p_k$, $S_k$ and $0<\rho\le1$ before measuring.
 
 ## Install and run
 
@@ -58,6 +68,8 @@ Support varies by combination; CPU is a compatibility backend. See [validation s
 ## Recent throughput
 
 **0.13 candidate · RTX 5090 · Qwen3.8-27B · ShareGPT.** Fixed 32 slots, context/batch 2048. Each cell: 200 requests × 2 repeats, 8 warmups per repeat, zero protocol errors. Throughput = total output tokens / total measured time; C is client concurrency.
+
+These fixed-request measurements use each run's actual elapsed time; the objective above specifies a fixed measurement window.
 
 GGUF Q4_K_M, same weights; output tok/s:
 

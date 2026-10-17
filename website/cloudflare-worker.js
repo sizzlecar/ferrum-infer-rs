@@ -3,10 +3,6 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const DEMO_VIDEO_URL = "https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa";
-const DEMO_POSTER_URL = "https://github.com/user-attachments/assets/5deb7b83-fd96-4495-9f81-b162c4699af8";
-const DEMO_NOTES_URL = "https://github.com/sizzlecar/ferrum-infer-rs/pull/388#issuecomment-5741680379";
-const HISTORICAL_DEMO_ASSETS = "https://ferrum-downloads.pandaailabs.com/v0.3.1";
 
 const css = String.raw`
 :root {
@@ -56,24 +52,21 @@ header { padding: 92px 0 68px; }
 .eyebrow { color: var(--rust-light); font-size: .8rem; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; }
 h1 { max-width: 900px; margin: 14px 0 22px; font-size: clamp(3.1rem, 8vw, 6.9rem); line-height: .96; letter-spacing: -.065em; }
 .hero-copy { max-width: 760px; color: #c8cdd1; font-size: clamp(1.12rem, 2vw, 1.35rem); }
+.objective { max-width: 760px; margin-top: 28px; padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); }
+.objective p { margin: 0 0 12px; }
+.objective math { margin: 20px 0 4px; font-size: clamp(.95rem, 2vw, 1.15rem); }
+.objective-definitions { margin: 20px 0 0; padding-left: 18px; color: var(--muted); font-size: .88rem; }
+.objective-definitions li + li { margin-top: 8px; }
+p code { overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
 .button { display: inline-flex; align-items: center; justify-content: center; min-height: 46px; padding: 0 19px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); text-decoration: none; font-weight: 700; }
 .button.primary { border-color: var(--rust); background: var(--rust); color: #180b06; }
 .button:hover { transform: translateY(-1px); border-color: #59636c; }
 .button.primary:hover { border-color: var(--rust-light); background: var(--rust-light); }
-.proof { display: flex; flex-wrap: wrap; gap: 18px 30px; margin-top: 38px; color: var(--muted); font-size: .93rem; }
-.proof span::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 9px; border-radius: 50%; background: var(--green); }
 section { padding: 68px 0; scroll-margin-top: 68px; }
 .section-head { max-width: 760px; margin-bottom: 30px; }
 h2 { margin: 0 0 10px; font-size: clamp(2rem, 5vw, 3.25rem); line-height: 1.05; letter-spacing: -.045em; }
 .section-head p, .muted { color: var(--muted); }
-.demo-recording { margin: 0; }
-.demo-recording video { display: block; width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--line); border-radius: 16px; background: #101319; }
-.demo-recording figcaption { margin-top: 16px; color: var(--muted); font-size: .9rem; }
-.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-.card { padding: 25px; border: 1px solid var(--line); border-radius: 16px; background: linear-gradient(145deg, rgba(24,29,34,.94), rgba(15,18,21,.94)); }
-.card h3 { margin: 0 0 8px; font-size: 1.15rem; }
-.card p { margin: 0; color: var(--muted); }
 .code-shell { overflow: hidden; border: 1px solid #303840; border-radius: 16px; background: #080a0b; box-shadow: 0 26px 80px rgba(0,0,0,.28); }
 .code-top { display: flex; align-items: center; justify-content: space-between; min-height: 48px; padding: 0 18px; border-bottom: 1px solid #20262b; color: var(--muted); font-size: .82rem; }
 .install-commands { display: grid; gap: 16px; }
@@ -82,29 +75,38 @@ h2 { margin: 0 0 10px; font-size: clamp(2rem, 5vw, 3.25rem); line-height: 1.05; 
 .copy-button:focus-visible { outline: 2px solid var(--rust-light); outline-offset: 3px; }
 .copy-status { color: var(--muted); font-size: .9rem; }
 .copy-status:empty { display: none; }
-.dots { display: flex; gap: 7px; }
-.dots i { display: block; width: 9px; height: 9px; border-radius: 50%; background: #3b434a; }
 pre { margin: 0; padding: 24px; overflow-x: auto; color: #e6e3dc; font: 500 .92rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-.comment { color: #78838c; }
+.code-shell pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .command { color: #ffad80; }
 .note { margin-top: 18px; padding: 15px 18px; border-left: 3px solid var(--rust); background: rgba(240,104,47,.07); color: #cdd1d4; }
-.split { display: grid; grid-template-columns: 1.05fr .95fr; gap: 42px; align-items: start; }
-.list { display: grid; gap: 12px; }
-.list-item { display: grid; grid-template-columns: 28px 1fr; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--line); }
-.list-item b { color: var(--rust-light); }
-.faq { display: grid; gap: 10px; }
-details { border: 1px solid var(--line); border-radius: 13px; background: rgba(18,22,26,.85); }
-summary { cursor: pointer; padding: 17px 20px; font-weight: 700; }
-details p { margin: 0; padding: 0 20px 19px; color: var(--muted); }
-.cta { padding: 38px; border: 1px solid rgba(240,104,47,.45); border-radius: 20px; background: linear-gradient(120deg, rgba(240,104,47,.17), rgba(129,216,167,.07)); }
-.cta h2 { max-width: 780px; }
+.support-list { margin: 0; }
+.support-list > div { display: grid; grid-template-columns: 180px 1fr; gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.support-list dt { font-weight: 700; }
+.support-list dd { margin: 0; color: var(--muted); }
+.benchmark-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; }
+.table-wrap { min-width: 0; max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+caption { padding: 18px 14px; text-align: left; font-weight: 700; }
+caption span { display: block; color: var(--muted); font-size: .8rem; font-weight: 400; }
+th, td { padding: 11px 10px; border-top: 1px solid var(--line); text-align: right; }
+thead th { color: var(--muted); font-size: .82rem; font-weight: 500; }
+th:first-child { text-align: left; }
+tbody th { font-weight: 500; }
+tbody td:last-child { color: var(--green); }
 footer { margin-top: 52px; padding: 34px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; }
 .footer-inner { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
 @media (max-width: 820px) {
   header { padding-top: 72px; }
-  .grid, .split { grid-template-columns: 1fr; }
+  .benchmark-grid { grid-template-columns: 1fr; }
+  .support-list > div { grid-template-columns: 1fr; gap: 6px; }
   .nav-links a:not(.lang) { display: none; }
-  .cta { padding: 28px; }
+}
+@media (max-width: 400px) {
+  .wrap { width: calc(100% - 28px); }
+  .objective { padding: 16px 12px; }
+  .code-top { padding-inline: 12px; }
+  .code-shell pre { padding: 18px 12px; }
+  th, td { padding: 10px 7px; font-size: .83rem; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
@@ -116,162 +118,129 @@ const logoShapes = `<rect x="4" y="4" width="56" height="56" rx="13" fill="#0b0d
 const mark = `<svg class="mark" viewBox="0 0 64 64" aria-hidden="true">${logoShapes}</svg>`;
 const logoSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Ferrum">${logoShapes}</svg>`;
 
+const throughput = {
+  gguf: [
+    [4, "179.25", "170.13", "105.36%"],
+    [8, "356.42", "291.60", "122.23%"],
+    [16, "535.51", "377.41", "141.89%"],
+    [32, "666.24", "435.57", "152.96%"],
+  ],
+  ct: [
+    [4, "210.32", "233.45", "90.09%"],
+    [8, "374.32", "447.06", "83.73%"],
+    [16, "654.04", "733.86", "89.12%"],
+    [32, "836.79", "1035.09", "80.84%"],
+  ],
+};
+
 const pages = {
   en: {
     lang: "en",
     path: "/",
     alternatePath: "/zh/",
     alternateLabel: "中文",
-    title: "Ferrum — Serve LLMs with a single binary.",
-    description: "A Rust-native LLM serving engine. One binary, no Python runtime.",
-    nav: [
-      ["Bonsai 2", "#bonsai"],
-      ["Quick start", "#quick-start"],
-      ["Features", "#features"],
-      ["FAQ", "#faq"],
+    title: "Ferrum — Rust LLM inference",
+    description: "Local LLM inference and an OpenAI-compatible server in one Rust binary. Ferrum 0.13.0 is available.",
+    nav: [["Quick start", "#quick-start"], ["Supported scope", "#support"], ["Throughput", "#performance"], ["Project", "#project"]],
+    eyebrow: "v0.13.0 · Released",
+    h1: "Local LLMs.<br>One Rust binary.",
+    lead: "Terminal chat and an OpenAI-compatible API, without a Python runtime.",
+    goal: "Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.",
+    goalContext: "Fix hardware, model and output policy; choose execution policy π from eligible policies Π under predeclared SLOs.",
+    goalMathLabel: "Maximize valid output tokens from requests completed within fixed window T, divided by T, over eligible execution policies pi; require each latency percentile limit and completion fraction at least rho.",
+    goalDefinitions: [
+      "W fixes the request set and arrival times; T > 0 fixes the measurement window and common cutoff. N_out counts only valid output tokens from requests successfully completed within that window.",
+      'L_k is the latency sample distribution, Q_p_k its chosen quantile, and S_k its upper limit. TTFT includes queueing; missing latency does not count as meeting its SLO. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">Sampling rules</a>.',
+      "C is the fraction of W successfully completed by the cutoff; its denominator includes rejected, failed, timed-out and unfinished requests. Declare p_k, S_k and 0 < ρ ≤ 1 before measuring.",
     ],
-    eyebrow: "Rust-native LLM serving",
-    h1: "Serve LLMs with a single binary.",
-    lead: "A Rust-native LLM serving engine. One binary, no Python runtime.",
-    visionLabel: "Vision:",
-    vision: "Make high-performance LLM serving simple to deploy and operate.",
-    primary: "View on GitHub",
-    secondary: "Start locally",
-    proof: ["MIT licensed", "CPU + Metal + CUDA", "Run + OpenAI-compatible serve"],
-    bonsaiTitle: "Bonsai 2 27B on your Mac",
-    bonsaiLead: "Ferrum downloads the model and fits context, batching, and concurrency to available memory. Your explicit settings take precedence.",
-    bonsaiChat: "Chat locally",
-    bonsaiApi: "Start a local API",
-    bonsaiInstall: "Install or update Ferrum",
-    bonsaiScope: 'Apple Silicon · Metal · PQ2_0 text inference. Tested on M1 Max / 32 GB. <a href="https://github.com/sizzlecar/ferrum-infer-rs#bonsai-2-pq2_0-on-metal">Model details and tested limits</a>.',
-    demoTitle: "Bonsai 2, working on local code",
-    demoLead: "Orchestral reads and edits Rust code through Ferrum's local API. Bonsai 2 27B PQ2_0 · Metal · M1 Max / 32 GB.",
-    demoCaption: "The first edit failed to compile; one repair using compiler feedback passed both independent tests. 8× replay, including all waits; weights already cached.",
-    demoDetails: "Recording details",
-    demoCommands: "Try it locally",
-    demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs#see-it-in-action",
-    demoDownload: "Download the terminal demo",
-    demoHistorical: "Earlier demo: Qwen3.5-9B with three concurrent agents",
-    featureTitle: "The direct path from model to API",
-    featureLead: "Ferrum keeps the first experience small: inspect the install, name a model explicitly, run a prompt, or expose the same model over HTTP.",
-    cards: [
-      ["Rust-native product", "A single CLI and server binary with no Python runtime in the supported prebuilt release path."],
-      ["CPU and GPU inference", "Run GGUF models on CPU, Apple Silicon Metal, or supported NVIDIA CUDA GPUs. The installer detects available hardware."],
-      ["OpenAI-compatible", "Chat Completions, streaming usage, Responses text, function tools, and structured output."],
-      ["Explicit model choice", "Ferrum never silently selects a model. Every run and server starts from a model you named."],
-      ["Server controls", "Continuous batching, paged KV cache, prefix cache, session cache, and typed admission controls."],
-      ["Release-gated", "Both ferrum run and ferrum serve are validated against documented release flows before promotion."],
-    ],
-    quickTitle: "From install to first answer",
-    quickLead: "Install with one command, then run locally or connect an OpenAI-compatible client.",
-    installTitle: "Install",
+    primary: "Install 0.13.0",
+    secondary: "View on GitHub",
+    quickTitle: "Install and run",
+    installTitle: "Installation commands",
     copyLabel: "Copy",
     copiedLabel: "Copied!",
-    copyFailedLabel: "Copy was blocked by your browser. Select the command and copy it manually.",
-    installNote: "Run the command for your system. The installer verifies release checksums and adds Ferrum to your PATH. On macOS and Linux, open a new terminal afterward; PowerShell is ready immediately.",
-    upgradeNote: "Upgrade by running the same install command again. Existing sessions keep their current version; new launches use the update.",
-    runtimeNote: 'On Linux/WSL, automatic installation selects sm89 (compute capability 8.9, CUDA 12.4) or, from v0.13.0, sm120 (12.0, CUDA 12.8) when all visible GPUs match. Both require a compatible NVIDIA driver and matching CUDA/NCCL runtimes; installation falls back to CPU if CUDA cannot start. Homebrew CUDA targets sm89. Windows supports one sm89 GPU and includes CUDA and VC runtimes; install an <a href="https://www.nvidia.com/Download/index.aspx">NVIDIA driver</a> (551.78 or newer) separately.',
-    homebrewTitle: "Homebrew alternative (macOS / Linux)",
-    homebrewNote: 'Homebrew 6 needs both <a href="https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula">formula definitions</a> trusted for its conflict check. Review them before running the trust command; older Homebrew versions can skip it. <a href="https://docs.brew.sh/Tap-Trust">Homebrew trust details</a>.',
-    firstRunTitle: "First run",
-    note: "The quick start disables verbose reasoning for a short first response. Remove --disable-thinking when you want the model template's default reasoning behavior.",
-    platformTitle: "Built for local and private serving",
-    platformLead: "Use the interactive CLI while exploring, then serve the same model behind a familiar HTTP contract.",
-    platformRows: [
-      ["01", "Inspect before download", "ferrum doctor maps aliases and checks the compiled accelerator without downloading model weights."],
-      ["02", "Run interactively", "ferrum run opens a local chat loop and keeps multi-turn context in the process."],
-      ["03", "Serve over HTTP", "ferrum serve exposes health, model discovery, Chat Completions, and Responses endpoints."],
+    copyFailedLabel: "Copy was blocked. Select the command and copy it manually.",
+    installNote: "Installers verify checksums and configure PATH. Open a new terminal on macOS/Linux; PowerShell is ready immediately. Repeat the command to upgrade; models and configuration are preserved.",
+    runtimeNote: 'macOS uses Metal. Linux/WSL selects sm89 (CUDA 12.4) or sm120 (CUDA 12.8) when all visible GPUs report the matching compute capability. Compatible NVIDIA driver and CUDA/NCCL runtimes are required. Windows and Homebrew CUDA target sm89; Windows bundles CUDA/VC runtimes. Unsupported or mixed GPUs select CPU automatically, as does a CUDA load failure. Explicit CUDA fails when unavailable; missing matching assets also fail. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression.md#prepare-the-candidate">Runtime requirements</a>.',
+    runLabel: "Terminal chat",
+    serveLabel: "API server",
+    runNote: "Weights download on first use. Omit --disable-thinking to preserve the model template's default reasoning behavior.",
+    apiNote: 'API URL: <code>http://127.0.0.1:8000/v1</code>, model <code>ferrum</code>. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">Streaming, tools and structured output</a>.',
+    defaultsNote: 'Defaults adapt execution and capacity to capabilities, hardware and memory; explicit settings prevail. Qualified SM120 GGUF paths can use 8-bit activation quantization and integer dot products. <code>--numerical-profile qwen3_5.f32-master</code> retains the original mixed-precision reference. Batch layouts can change output. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">Numerical profiles</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">Caching</a>.',
+    supportTitle: "Architectures and formats",
+    supportRows: [
+      ["Text architectures", "Llama, Mistral, Qwen2, Qwen3 dense/MoE, Qwen3.5 hybrid dense/MoE, Gemma 3 text."],
+      ["Weights", "GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8."],
+      ["Specific paths", "Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only."],
     ],
-    faqTitle: "Frequently asked questions",
-    faq: [
-      ["What is Ferrum?", "A Rust-native LLM serving engine. One binary, no Python runtime."],
-      ["Does Ferrum require Python?", "No Python runtime is required. Linux/WSL CUDA uses a compatible NVIDIA driver and NCCL runtime, plus CUDA 12.4 for sm89 or CUDA 12.8 for sm120 (available from v0.13.0). Windows and Homebrew CUDA target sm89. The Windows installer includes CUDA and VC runtimes; its NVIDIA system driver is installed separately."],
-      ["Which models can I run?", 'Ferrum supports multiple model families and formats; support depends on the model and backend. See the <a href="https://github.com/sizzlecar/ferrum-infer-rs#features">supported models and capabilities</a>, including <a href="https://github.com/sizzlecar/ferrum-infer-rs#bonsai-2-pq2_0-on-metal">Bonsai 2 PQ2_0 on Metal</a>.'],
-      ["Can existing OpenAI clients connect to Ferrum?", "Ferrum implements OpenAI-compatible Chat Completions and stateless Responses surfaces. Check the compatibility document for the exact request contract."],
-      ["Is Ferrum a hosted AI service?", "No. Ferrum is inference software that runs on hardware you control. Model licenses and data-handling choices remain yours."],
-    ],
-    ctaTitle: "Run your next local model with fewer moving pieces.",
-    ctaPrimary: "Read the documentation",
-    ctaSecondary: "Browse releases",
-    footer: "Ferrum is open-source software maintained by Panda AI Labs contributors.",
+    supportNote: 'Support varies by architecture, format and backend. CPU is a compatibility backend; text support does not imply vision support. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">Validation scope</a>.',
+    performanceTitle: "Recent 27B throughput",
+    performanceLead: "RTX 5090 · Qwen3.8-27B · frozen ShareGPT workload. Accepted 0.13 candidate measurements: fixed 32 slots, context/batch 2048; 200 requests × 2 repeats per cell, 8 warmups per repeat, zero protocol errors. These tables fix the request count and use each repeat’s actual elapsed time, rather than a fixed window. Output tok/s = total output tokens / total measured time; C in the tables is client concurrency.",
+    ggufCaption: "GGUF Q4_K_M · same weights",
+    ctCaption: "Compressed-tensors INT4 · group size 32",
+    concurrency: "C",
+    ratio: "Ferrum / baseline",
+    performanceNote: 'Several cells fail latency SLOs. CT C32’s second repeat reached <strong>78.91%</strong>; 80% was not met in every repeat. CT uses FP16 activations/KV in Ferrum versus BF16 in vLLM (KV inferred from its auto setting). Same GGUF weights do not imply identical arithmetic. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">Full results</a> include latency percentiles, memory and quality limits. Joint SLO optimization follows in the next version.',
+    projectTitle: "An evolving open-source project",
+    projectBody: "Ferrum uses AI-assisted development and iterates quickly. Internal APIs may change; model coverage and performance evolve. Quality remains a priority through correctness checks, model validation and honest reporting of failures. Personal GPU resources are limited; hardware access and contributions are welcome.",
+    attribution: 'Thanks to <a href="https://github.com/vllm-project/vllm">vLLM</a> and <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> for code and implementation references. Component licenses and notices are preserved.',
+    docsLabel: "Documentation",
+    releaseLabel: "0.13.0 release",
+    footer: "Ferrum · MIT licensed",
   },
   zh: {
     lang: "zh-CN",
     path: "/zh/",
     alternatePath: "/",
     alternateLabel: "English",
-    title: "Ferrum — 用一个二进制文件提供大模型服务。",
-    description: "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。",
-    nav: [
-      ["Bonsai 2", "#bonsai"],
-      ["快速开始", "#quick-start"],
-      ["功能", "#features"],
-      ["常见问题", "#faq"],
+    title: "Ferrum — Rust 大模型推理",
+    description: "一个 Rust 二进制提供本地大模型推理与 OpenAI 兼容 API。Ferrum 0.13.0 已发布。",
+    nav: [["快速开始", "#quick-start"], ["支持范围", "#support"], ["吞吐结果", "#performance"], ["项目说明", "#project"]],
+    eyebrow: "v0.13.0 · 已发布",
+    h1: "本地推理，<br>一个 Rust 二进制。",
+    lead: "终端对话与 OpenAI 兼容 API，无需 Python 运行时。",
+    goal: "目标：在满足 TTFT、TPOT、ITL SLO 的前提下，最大化输出吞吐。",
+    goalContext: "固定硬件、模型与输出策略，在预设 SLO 下从可用策略集合 Π 中选择执行策略 π。",
+    goalMathLabel: "在可用执行策略π中，最大化固定窗口T内成功完成请求的有效输出token数除以T，并满足各延迟分位上限及最低完成比例ρ。",
+    goalDefinitions: [
+      "W 固定请求集合与到达时序；T > 0 为固定测量窗口，结束即共同统计截止。N_out 只计窗口内成功完成请求的有效输出 token。",
+      'L_k 为延迟采样分布，Q_p_k 为指定分位数，S_k 为上限。TTFT 包含排队；缺失延迟不视为达标。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">采样规则</a>。',
+      "C 为同一 W 在截止前成功完成的比例，分母包含拒绝、失败、超时和未完成请求；p_k、S_k 与 0 < ρ ≤ 1 均须预先给定。",
     ],
-    eyebrow: "Rust 原生大模型服务",
-    h1: "用一个二进制文件提供大模型服务。",
-    lead: "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。",
-    visionLabel: "愿景：",
-    vision: "让高性能大模型服务的部署与运维更简单。",
-    primary: "查看 GitHub",
-    secondary: "开始使用",
-    proof: ["MIT 开源", "CPU + Metal + CUDA", "命令行运行 + OpenAI 兼容服务"],
-    bonsaiTitle: "在 Mac 上运行 Bonsai 2 27B",
-    bonsaiLead: "Ferrum 自动下载模型，并根据可用内存适配上下文、批处理和并发。你明确指定的配置优先。",
-    bonsaiChat: "本地对话",
-    bonsaiApi: "启动本地 API",
-    bonsaiInstall: "安装或更新 Ferrum",
-    bonsaiScope: 'Apple Silicon · Metal · PQ2_0 文本推理。已在 M1 Max / 32 GB 上验证。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#在-metal-上运行-bonsai-2-pq2_0">模型详情与已验证范围</a>。',
-    demoTitle: "让 Bonsai 2 修改本地代码",
-    demoLead: "Orchestral 通过 Ferrum 的本地 API 读取、修改 Rust 代码。Bonsai 2 27B PQ2_0 · Metal · M1 Max / 32 GB。",
-    demoCaption: "首次修改未能编译；根据编译器反馈修复一次后，两项独立测试均通过。8 倍速回放，保留全部等待；权重已缓存。",
-    demoDetails: "录制说明",
-    demoCommands: "快速试用",
-    demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#看它如何工作",
-    demoDownload: "下载终端演示视频",
-    demoHistorical: "历史演示：Qwen3.5-9B 与三个并发 Agent",
-    featureTitle: "从模型直接到 API",
-    featureLead: "Ferrum 让首次体验保持简单：检查安装、明确指定模型、运行一次对话，或者把同一模型开放为 HTTP 服务。",
-    cards: [
-      ["Rust 原生产品", "受支持的预编译发布路径只有一个 CLI/Server 二进制，不依赖 Python runtime。"],
-      ["CPU 与 GPU 推理", "GGUF 模型可使用 CPU、Apple Silicon Metal 或受支持的 NVIDIA CUDA 显卡。安装脚本会检测可用硬件。"],
-      ["OpenAI 兼容", "支持 Chat Completions、streaming usage、Responses 文本、函数工具与结构化输出。"],
-      ["明确选择模型", "Ferrum 不会静默选择默认模型；每次 run 与 serve 都从你明确指定的模型开始。"],
-      ["服务端能力", "支持 continuous batching、paged KV cache、prefix cache、session cache 与 typed admission。"],
-      ["发布门禁", "正式提升版本前，ferrum run 与 ferrum serve 都会按公开文档流程完成回归。"],
-    ],
-    quickTitle: "从安装到第一次回答",
-    quickLead: "一行命令安装，随后在本地运行模型，或接入 OpenAI 兼容客户端。",
-    installTitle: "安装",
-    copyLabel: "复制命令",
-    copiedLabel: "已复制！",
+    primary: "安装 0.13.0",
+    secondary: "查看 GitHub",
+    quickTitle: "安装与使用",
+    installTitle: "安装命令",
+    copyLabel: "复制",
+    copiedLabel: "已复制",
     copyFailedLabel: "浏览器未允许复制，请选中命令后手动复制。",
-    installNote: "执行对应系统的一行命令。安装脚本会校验发布包并自动加入 PATH。macOS 和 Linux 完成后打开新终端；PowerShell 安装后即可使用。",
-    upgradeNote: "再次执行同一安装命令即可升级。已有会话继续使用原版本，新启动的会话使用更新后的版本。",
-    runtimeNote: 'Linux/WSL 自动安装在全部可见 GPU 能力一致时，选择 sm89（计算能力 8.9，CUDA 12.4）或从 v0.13.0 起提供的 sm120（12.0，CUDA 12.8）。两者均需兼容的 NVIDIA 驱动及匹配的 CUDA/NCCL 运行库；CUDA 无法启动时回退到 CPU。Homebrew CUDA 面向 sm89。Windows 支持单张 sm89 显卡，安装包内含 CUDA 与 VC 运行库；需另行安装 551.78 或更新的 <a href="https://www.nvidia.com/Download/index.aspx">NVIDIA 驱动</a>。',
-    homebrewTitle: "Homebrew 备选安装（macOS / Linux）",
-    homebrewNote: 'Homebrew 6 的冲突检查需要信任两个 <a href="https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula">formula 定义</a>。请先查看定义，再执行 trust 命令；旧版 Homebrew 可以跳过这一步。<a href="https://docs.brew.sh/Tap-Trust">Homebrew 信任机制说明</a>。',
-    firstRunTitle: "首次运行",
-    note: "快速开始通过 --disable-thinking 缩短第一次回答。需要模型模板默认推理行为时，删除这个参数即可。",
-    platformTitle: "为本地与私有服务而构建",
-    platformLead: "探索阶段使用交互式 CLI，随后通过熟悉的 HTTP 契约提供同一个模型。",
-    platformRows: [
-      ["01", "下载前检查", "ferrum doctor 会解析 alias 并检查已编译的加速后端，不会下载模型权重。"],
-      ["02", "交互式运行", "ferrum run 启动本地对话循环，并在进程内保留多轮上下文。"],
-      ["03", "通过 HTTP 服务", "ferrum serve 提供健康检查、模型发现、Chat Completions 与 Responses endpoint。"],
+    installNote: "安装器校验发布包并配置 PATH。macOS/Linux 安装后打开新终端，PowerShell 当前会话即可使用。再次执行即可升级，模型与配置保留。",
+    runtimeNote: 'macOS 使用 Metal。Linux/WSL 在全部可见 GPU 计算能力匹配时选择 sm89（CUDA 12.4）或 sm120（CUDA 12.8），需兼容的 NVIDIA 驱动及 CUDA/NCCL 运行库。Windows 与 Homebrew CUDA 面向 sm89；Windows 包内含 CUDA/VC 运行库。自动模式在 GPU 不受支持、混合架构或 CUDA 无法启动时回退 CPU；显式 CUDA 不满足条件或缺少对应资产会报错。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression.md#prepare-the-candidate">运行环境要求</a>。',
+    runLabel: "终端对话",
+    serveLabel: "API 服务",
+    runNote: "首次运行自动下载权重；删除 --disable-thinking 即恢复模型模板默认的思考行为。",
+    apiNote: 'API 地址：<code>http://127.0.0.1:8000/v1</code>，模型名 <code>ferrum</code>。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/openai-api-compatibility.md">流式输出、工具与结构化输出</a>。',
+    defaultsNote: '默认执行与容量按声明能力、硬件和内存选择，显式设置优先。合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积。<code>--numerical-profile qwen3_5.f32-master</code> 保留原混合精度参考路径；批布局可能改变输出。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/numerical-execution.zh.md">数值策略</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/cache-product.md">缓存说明</a>。',
+    supportTitle: "架构与格式",
+    supportRows: [
+      ["文本架构", "Llama、Mistral、Qwen2、Qwen3 dense/MoE、Qwen3.5 hybrid dense/MoE、Gemma 3 文本。"],
+      ["权重格式", "GGUF（含 Q4_K/Q5_K/Q6_K/Q8_0）、SafeTensors。部分 CUDA 路径支持 GPTQ INT4、compressed-tensors INT4、block-FP8。"],
+      ["专用路径", "Gemma 4 compressed-tensors W4A16、GPT-OSS MXFP4 为 CUDA 路径。PQ2_0 完整模型仅在 Metal 实测，CUDA 目前为算子级验证。"],
     ],
-    faqTitle: "常见问题",
-    faq: [
-      ["Ferrum 是什么？", "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。"],
-      ["Ferrum 需要 Python 吗？", "不需要 Python runtime。Linux/WSL CUDA 需要兼容的 NVIDIA 驱动与 NCCL 运行库，以及匹配的 CUDA 版本：sm89 使用 12.4，从 v0.13.0 起提供的 sm120 使用 12.8。Windows 与 Homebrew CUDA 面向 sm89。Windows 安装包内含 CUDA 与 VC 运行库，NVIDIA 系统驱动需单独安装。"],
-      ["可以运行哪些模型？", 'Ferrum 支持多种模型家族与格式，具体能力取决于模型和后端。请查看<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#功能">支持的模型与功能</a>，以及 <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#在-metal-上运行-bonsai-2-pq2_0">Bonsai 2 PQ2_0 的 Metal 支持范围</a>。'],
-      ["现有 OpenAI client 能连接 Ferrum 吗？", "Ferrum 实现 OpenAI 兼容的 Chat Completions 与无状态 Responses 接口；精确请求契约请查看兼容性文档。"],
-      ["Ferrum 是托管 AI 服务吗？", "不是。Ferrum 是运行在你控制的硬件上的推理软件；模型许可与数据处理方式仍由你决定。"],
-    ],
-    ctaTitle: "用更少的组件运行你的下一个本地模型。",
-    ctaPrimary: "阅读文档",
-    ctaSecondary: "查看发布版本",
-    footer: "Ferrum 是由 Panda AI Labs 贡献者维护的开源软件。",
+    supportNote: '支持范围取决于架构、格式与后端组合。CPU 为兼容后端，文本支持不代表视觉支持。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">验证范围</a>。',
+    performanceTitle: "近期 27B 吞吐",
+    performanceLead: "RTX 5090 · Qwen3.8-27B · 冻结 ShareGPT 负载。已验收的 0.13 候选测量：固定 32 槽、上下文/批处理 2048；每格正式 200 请求 × 2 轮，每轮另有 8 次预热，零协议错误。本表固定请求数，以各轮实际耗时计算吞吐，不采用固定窗口。输出 token/s＝总输出 token / 总正式时长；表中 C 为客户端并发。",
+    ggufCaption: "GGUF Q4_K_M · 同权重",
+    ctCaption: "Compressed-tensors INT4 · group size 32",
+    concurrency: "C",
+    ratio: "Ferrum / 对照",
+    performanceNote: '多档延迟 SLO 未通过。CT C32 第二轮仅 <strong>78.91%</strong>，未证明每轮稳定达到 80%。CT 对比中 Ferrum 激活/KV 为 FP16，vLLM 为 BF16（KV 由 auto 配置推导）。同 GGUF 权重不等于内部算术相同。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">完整结果</a>列出延迟分位、内存与质量边界；联合 SLO 优化留到下一版本。',
+    projectTitle: "持续迭代的开源项目",
+    projectBody: "Ferrum 使用 AI 辅助开发，仍在快速迭代。内部 API 暂不承诺稳定，模型支持与性能持续更新。质量始终重要：保留正确性检查、模型验证并如实报告失败。个人 GPU 资源有限，欢迎提供硬件测试支持和贡献。",
+    attribution: '感谢 <a href="https://github.com/vllm-project/vllm">vLLM</a> 与 <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>，部分实现参考或复用了其代码；相关许可证与署名随组件保留。',
+    docsLabel: "文档",
+    releaseLabel: "0.13.0 发布说明",
+    footer: "Ferrum · MIT 开源",
   },
 };
 
@@ -287,13 +256,13 @@ function escapeHtml(value) {
 
 function render(page) {
   const canonical = `${SITE_ORIGIN}${page.path}`;
-  const alternate = `${SITE_ORIGIN}${page.alternatePath}`;
   const schema = JSON.stringify({
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     name: "Ferrum",
     applicationCategory: "DeveloperApplication",
     operatingSystem: "macOS, Linux, Windows",
+    softwareVersion: "0.13.0",
     description: page.description,
     url: canonical,
     codeRepository: REPOSITORY,
@@ -301,20 +270,18 @@ function render(page) {
     license: `${REPOSITORY}/blob/main/LICENSE`,
     isAccessibleForFree: true,
   }).replace(/</g, "\\u003c");
-  const cards = page.cards.map(([title, body]) => `<article class="card"><h3>${title}</h3><p>${body}</p></article>`).join("");
-  const rows = page.platformRows.map(([number, title, body]) => `<div class="list-item"><b>${number}</b><div><strong>${title}</strong><div class="muted">${body}</div></div></div>`).join("");
-  const faq = page.faq.map(([question, answer]) => `<details><summary>${question}</summary><p>${answer}</p></details>`).join("");
   const nav = page.nav.map(([label, href]) => `<a href="${href}">${label}</a>`).join("");
-  const proof = page.proof.map((item) => `<span>${item}</span>`).join("");
-  const bonsaiCommands = [
-    [page.bonsaiChat, "ferrum run bonsai2:27b"],
-    [page.bonsaiApi, "ferrum serve --model bonsai2:27b"],
-  ].map(([label, command], index) => `<div class="code-shell"><div class="code-top"><span>${label}</span><button class="copy-button" type="button" data-copy="bonsai-command-${index}" aria-label="${page.copyLabel}: ${label}" hidden>${page.copyLabel}</button></div><pre><code class="command" id="bonsai-command-${index}">${escapeHtml(command)}</code></pre></div>`).join("");
+  const support = page.supportRows.map(([title, body]) => `<div><dt>${title}</dt><dd>${body}</dd></div>`).join("");
+  const codeBlock = (label, command, id) => `<div class="code-shell"><div class="code-top"><span>${label}</span><button class="copy-button" type="button" data-copy="${id}" aria-label="${page.copyLabel}: ${label}" hidden>${page.copyLabel}</button></div><pre><code class="command" id="${id}">${escapeHtml(command)}</code></pre></div>`;
   const installCommands = [
-    ["macOS Apple Silicon · Terminal", "curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh"],
-    ["Linux x86_64 · Terminal", "curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh"],
+    ["macOS Apple Silicon / Linux x86_64", "curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh"],
     ["Windows x64 · PowerShell", "irm https://ferrum.pandaailabs.com/install.ps1 | iex"],
-  ].map(([platform, command], index) => `<div class="code-shell"><div class="code-top"><span>${platform}</span><button class="copy-button" type="button" data-copy="install-command-${index}" aria-label="${page.copyLabel}: ${platform}" hidden>${page.copyLabel}</button></div><pre><code class="command" id="install-command-${index}">${escapeHtml(command)}</code></pre></div>`).join("");
+  ].map(([platform, command], index) => codeBlock(platform, command, `install-command-${index}`)).join("");
+  const runCommands = [
+    [page.runLabel, "ferrum run qwen3.5:4b-q4_k_m --disable-thinking"],
+    [page.serveLabel, "ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000"],
+  ].map(([label, command], index) => codeBlock(label, command, `run-command-${index}`)).join("");
+  const table = (caption, baseline, values) => `<div class="table-wrap"><table><caption>${caption}<span>output tok/s</span></caption><thead><tr><th scope="col">${page.concurrency}</th><th scope="col">Ferrum</th><th scope="col">${baseline}</th><th scope="col">${page.ratio}</th></tr></thead><tbody>${values.map(([c, ferrum, reference, ratio]) => `<tr><th scope="row">${c}</th><td>${ferrum}</td><td>${reference}</td><td>${ratio}</td></tr>`).join("")}</tbody></table></div>`;
   return `<!doctype html>
 <html lang="${page.lang}">
 <head>
@@ -340,68 +307,58 @@ function render(page) {
   <style>${css}</style>
 </head>
 <body>
-  <nav aria-label="Primary navigation"><div class="wrap nav-inner">
+  <nav aria-label="${page.lang === "en" ? "Primary navigation" : "主导航"}"><div class="wrap nav-inner">
     <a class="brand" href="${page.path}">${mark}<span>FERRUM</span></a>
     <div class="nav-links">${nav}<a class="lang" href="${page.alternatePath}" hreflang="${page.lang === "en" ? "zh-CN" : "en"}">${page.alternateLabel}</a></div>
   </div></nav>
   <main>
     <header><div class="wrap">
-      <div class="eyebrow">${page.eyebrow}</div>
+      <a class="eyebrow" href="${REPOSITORY}/releases/tag/v0.13.0">${page.eyebrow}</a>
       <h1>${page.h1}</h1>
       <p class="hero-copy">${page.lead}</p>
-      <p class="muted"><strong>${page.visionLabel}</strong> ${page.vision}</p>
-      <div class="actions"><a class="button primary" href="${REPOSITORY}">${page.primary}</a><a class="button" href="#quick-start">${page.secondary}</a></div>
-      <div class="proof">${proof}</div>
+      <div class="objective">
+        <p><strong>${page.goal}</strong></p>
+        <p class="muted">${page.goalContext}</p>
+        <math display="block" aria-label="${escapeHtml(page.goalMathLabel)}">
+          <mtable columnalign="center" rowspacing="0.5em">
+            <mtr><mtd><mrow><munder><mo>max</mo><mrow><mi>π</mi><mo>∈</mo><mi>Π</mi></mrow></munder><mspace width="0.4em"/><mfrac><mrow><msub><mi>N</mi><mtext>out</mtext></msub><mo>(</mo><mi>π</mi><mo>;</mo><mi>W</mi><mo>,</mo><mi>T</mi><mo>)</mo></mrow><mi>T</mi></mfrac></mrow></mtd></mtr>
+            <mtr><mtd><mtext>s.t.</mtext></mtd></mtr>
+            <mtr><mtd><mrow><msub><mi>Q</mi><msub><mi>p</mi><mi>k</mi></msub></msub><mo>(</mo><msub><mi>L</mi><mi>k</mi></msub><mo>(</mo><mi>π</mi><mo>;</mo><mi>W</mi><mo>,</mo><mi>T</mi><mo>)</mo><mo>)</mo><mo>≤</mo><msub><mi>S</mi><mi>k</mi></msub></mrow></mtd></mtr>
+            <mtr><mtd><mrow><mo>∀</mo><mi>k</mi><mo>∈</mo><mo>{</mo><mtext>TTFT</mtext><mo>,</mo><mtext>TPOT</mtext><mo>,</mo><mtext>ITL</mtext><mo>}</mo></mrow></mtd></mtr>
+            <mtr><mtd><mrow><mi>C</mi><mo>(</mo><mi>π</mi><mo>;</mo><mi>W</mi><mo>,</mo><mi>T</mi><mo>)</mo><mo>≥</mo><mi>ρ</mi></mrow></mtd></mtr>
+          </mtable>
+        </math>
+        <ul class="objective-definitions">${page.goalDefinitions.map((definition) => `<li>${definition}</li>`).join("")}</ul>
+      </div>
+      <div class="actions"><a class="button primary" href="#quick-start">${page.primary}</a><a class="button" href="${REPOSITORY}">${page.secondary}</a></div>
     </div></header>
-    <section id="bonsai"><div class="wrap">
-      <div class="section-head"><h2>${page.bonsaiTitle}</h2><p>${page.bonsaiLead}</p><a href="#quick-start">${page.bonsaiInstall} ↗</a></div>
-      <div class="install-commands">${bonsaiCommands}</div>
-      <p class="copy-status" role="status" aria-live="polite"></p>
-      <p class="note">${page.bonsaiScope}</p>
-    </div></section>
-    <section id="demo"><div class="wrap">
-      <div class="section-head"><h2>${page.demoTitle}</h2><p>${page.demoLead}</p></div>
-      <figure class="demo-recording">
-        <video controls playsinline preload="metadata" aria-describedby="demo-caption" poster="${DEMO_POSTER_URL}">
-          <source src="${DEMO_VIDEO_URL}" type="video/mp4">
-          <a href="${DEMO_VIDEO_URL}">${page.demoDownload}</a>
-        </video>
-        <figcaption id="demo-caption">${page.demoCaption} <a href="${page.demoCommandsUrl}">${page.demoCommands} ↗</a> · <a href="${DEMO_NOTES_URL}">${page.demoDetails} ↗</a></figcaption>
-      </figure>
-      <p class="muted"><a href="${HISTORICAL_DEMO_ASSETS}/ferrum-orch-three-agents.mp4">${page.demoHistorical}</a> · <a href="${HISTORICAL_DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></p>
-    </div></section>
     <section id="quick-start"><div class="wrap">
-      <div class="section-head"><h2>${page.quickTitle}</h2><p>${page.quickLead}</p></div>
-      <p class="note">${page.installNote}</p>
+      <div class="section-head"><h2>${page.quickTitle}</h2></div>
       <div class="install-commands" aria-label="${page.installTitle}">${installCommands}</div>
+      <p class="muted">${page.installNote}</p>
+      <p class="muted">${page.runtimeNote}</p>
+      <div class="install-commands">${runCommands}</div>
       <p class="copy-status" role="status" aria-live="polite"></p>
-      <p class="note">${page.runtimeNote}</p>
-      <p class="note">${page.upgradeNote}</p>
-      <details><summary>${page.homebrewTitle}</summary><p>${page.homebrewNote}</p><pre><span class="comment"># Homebrew 6</span>
-<span class="command">brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda</span>
-
-<span class="comment"># macOS Apple Silicon</span>
-<span class="command">brew install sizzlecar/ferrum/ferrum</span>
-
-<span class="comment"># Linux x86_64 · NVIDIA CUDA sm89</span>
-<span class="command">brew install sizzlecar/ferrum/ferrum-cuda</span></pre></details>
-      <p class="note">${page.note}</p>
-      <div class="code-shell"><div class="code-top"><span>${page.firstRunTitle}</span><span class="dots"><i></i><i></i><i></i></span></div><pre><span class="comment"># Ferrum 0.9.0+ · macOS / Linux / Windows</span>
-ferrum doctor qwen3.5:4b-q4_k_m
-ferrum run qwen3.5:4b-q4_k_m --disable-thinking
-
-ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000</pre></div>
+      <p class="muted">${page.runNote}</p>
+      <p>${page.apiNote}</p>
+      <p class="note">${page.defaultsNote}</p>
     </div></section>
-    <section id="features"><div class="wrap">
-      <div class="section-head"><h2>${page.featureTitle}</h2><p>${page.featureLead}</p></div>
-      <div class="grid">${cards}</div>
+    <section id="support"><div class="wrap">
+      <div class="section-head"><h2>${page.supportTitle}</h2></div>
+      <dl class="support-list">${support}</dl>
+      <p class="muted">${page.supportNote}</p>
     </div></section>
-    <section><div class="wrap split">
-      <div><div class="section-head"><h2>${page.platformTitle}</h2><p>${page.platformLead}</p></div><a class="button" href="${REPOSITORY}/blob/main/docs/openai-api-compatibility.md">OpenAI API contract</a></div>
-      <div class="list">${rows}</div>
+    <section id="performance"><div class="wrap">
+      <div class="section-head"><h2>${page.performanceTitle}</h2><p>${page.performanceLead}</p></div>
+      <div class="benchmark-grid">${table(page.ggufCaption, "llama.cpp b11429", throughput.gguf)}${table(page.ctCaption, "vLLM 0.31", throughput.ct)}</div>
+      <p class="note">${page.performanceNote}</p>
     </div></section>
-    <section id="faq"><div class="wrap"><div class="section-head"><h2>${page.faqTitle}</h2></div><div class="faq">${faq}</div></div></section>
-    <section><div class="wrap"><div class="cta"><h2>${page.ctaTitle}</h2><div class="actions"><a class="button primary" href="${REPOSITORY}#quick-start">${page.ctaPrimary}</a><a class="button" href="${REPOSITORY}/releases">${page.ctaSecondary}</a></div></div></div></section>
+    <section id="project"><div class="wrap">
+      <div class="section-head"><h2>${page.projectTitle}</h2></div>
+      <p>${page.projectBody}</p>
+      <p class="muted">${page.attribution}</p>
+      <div class="actions"><a class="button" href="${REPOSITORY}${page.lang === "en" ? "#readme" : "/blob/main/README_zh.md"}">${page.docsLabel}</a><a class="button" href="${REPOSITORY}/releases/tag/v0.13.0">${page.releaseLabel}</a></div>
+    </div></section>
   </main>
   <footer><div class="wrap footer-inner"><span>${page.footer}</span><span><a href="${REPOSITORY}">GitHub</a> · <a href="${REPOSITORY}/blob/main/LICENSE">MIT License</a></span></div></footer>
   <script>

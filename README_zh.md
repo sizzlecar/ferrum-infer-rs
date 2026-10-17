@@ -12,11 +12,23 @@ Rust 编写的本地大模型推理引擎，一个二进制提供终端对话和
 
 核心目标是在满足延迟 SLO 的前提下，最大化输出吞吐：
 
+固定硬件、模型和输出策略，优化候选执行策略 $\pi\in\Pi$：
+
 $$
-\max\;\text{输出 token/s}\quad\text{s.t.}\quad Q_{p_x}(x)\le S_x,\quad x\in\{\mathrm{TTFT},\mathrm{TPOT},\mathrm{ITL}\}
+\begin{gathered}
+\max_{\pi\in\Pi}\;\frac{N_{\mathrm{out}}(\pi;W,T)}{T} \\
+\text{s.t.} \\
+Q_{p_k}\!\left(L_k(\pi;W,T)\right)\le S_k \\
+\forall k\in\{\mathrm{TTFT},\mathrm{TPOT},\mathrm{ITL}\} \\
+C(\pi;W,T)\ge\rho
+\end{gathered}
 $$
 
-其中 TTFT 是首字延迟，TPOT 是平均输出 token 间隔，ITL 是相邻可见文本更新的间隔；分位数和阈值按负载预先约定。这是项目目标，当前结果尚未全部达成。
+在固定负载和测量窗口下，最大化成功请求的有效输出吞吐，同时满足尾延迟 SLO 和最低请求完成率。
+
+- $W$：固定请求集与到达时序；$T>0$：固定测量窗口，结束时为共同统计截止点。$N_{\mathrm{out}}$：窗口内成功完成请求的有效输出 token 数。
+- $L_k$：延迟样本；$Q_{p_k}$：指定分位数；$S_k$：上限。TTFT 包含排队时间，缺失延迟证据不能视为达标。[采样口径](docs/performance-popular-models-p0.zh.md)。
+- $C$：$W$ 中截止前成功完成的请求比例；分母不剔除拒绝、失败、超时和未完成请求。测量前预设 $p_k$、$S_k$ 及 $0<\rho\le1$。
 
 ## 安装与使用
 
@@ -58,6 +70,8 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 ## 近期性能
 
 RTX 5090、Qwen3.8-27B、固定 ShareGPT 样本；服务容量保持 32 槽、上下文及批处理上限均为 2048。每格正式 200 请求 × 2 轮，每轮另有 8 次预热，协议错误为 0。以下为 v0.13.0 候选的正式测量，单位为输出 token/s；两轮按总成功输出 usage token ÷ 总正式时长合并。
+
+本表采用固定请求数，以各轮实际耗时计算吞吐；上式描述固定测量窗口的目标。
 
 **GGUF Q4_K_M，同文件对比 llama.cpp b11429：**
 
