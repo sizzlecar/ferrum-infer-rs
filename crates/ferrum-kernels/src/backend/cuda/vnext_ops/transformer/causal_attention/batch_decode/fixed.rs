@@ -5,7 +5,7 @@ use super::*;
 use crate::backend::cuda::vllm_paged_attn::dispatch_vnext_addressed_paged_attention_fixed_masked_batch_raw;
 
 #[derive(Clone, Debug)]
-pub(super) struct FixedBatchDecode {
+pub(in super::super) struct FixedBatchDecode {
     participants: i32,
     packed_work: Option<PackedDecodeWork>,
     v1: BatchGeometry,

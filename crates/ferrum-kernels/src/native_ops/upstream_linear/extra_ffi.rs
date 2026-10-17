@@ -4,10 +4,6 @@ unsafe extern "C" {
         r: *const UpstreamLinearRequestV1,
         p: *mut UpstreamLinearPlanV1,
     ) -> i32;
-    pub(super) fn ferrum_upstream_extra_mmq_prefill_plan_v1(
-        r: *const UpstreamLinearRequestV1,
-        p: *mut UpstreamLinearPlanV1,
-    ) -> i32;
     pub(super) fn ferrum_upstream_extra_mmq_plan_v1(
         r: *const UpstreamLinearRequestV1,
         p: *mut UpstreamLinearPlanV1,
