@@ -24,6 +24,9 @@ mod candidate;
 #[path = "unix_bootstrap/reuse.rs"]
 mod reuse;
 
+#[path = "unix_bootstrap/cuda.rs"]
+mod cuda;
+
 #[test]
 fn cdn_transfer_fallback_replaces_partial_bytes_and_propagates_failure() {
     let payload = b"official release payload";
@@ -75,6 +78,20 @@ fn cdn_transfer_fallback_replaces_partial_bytes_and_propagates_failure() {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CudaArch {
+    Sm89,
+    Sm120,
+}
+impl CudaArch {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Sm89 => "-cuda-sm89",
+            Self::Sm120 => "-cuda-sm120",
+        }
+    }
+}
+
 struct Fixture {
     root: TempDir,
     executable: PathBuf,
@@ -110,16 +127,25 @@ impl Fixture {
         }
     }
     fn asset(&mut self, version: &str, platform: &str, cuda: bool, extra: bool) {
+        self.asset_with_arch(version, platform, cuda.then_some(CudaArch::Sm89), extra);
+    }
+    fn asset_with_arch(
+        &mut self,
+        version: &str,
+        platform: &str,
+        cuda: Option<CudaArch>,
+        extra: bool,
+    ) {
         let name = format!(
             "ferrum-{platform}{}.tar.gz",
-            if cuda { "-cuda-sm89" } else { "" }
+            cuda.map_or("", CudaArch::suffix)
         );
         let directory = tempfile::tempdir_in(self.root.path()).unwrap();
         fs::copy(&self.executable, directory.path().join("ferrum")).unwrap();
         fs::write(directory.path().join("LICENSE"), b"fixture license").unwrap();
         fs::write(directory.path().join("README.md"), b"fixture readme").unwrap();
         let mut members = vec!["ferrum", "LICENSE", "README.md"];
-        if cuda {
+        if cuda.is_some() {
             fs::write(
                 directory.path().join("CUDA-BUILD.txt"),
                 b"fixture CUDA runtime",
@@ -468,12 +494,15 @@ fn cuda_auto_uses_actual_capability_and_loader_failure_falls_back_explicit_cuda_
     let mut fixture = Fixture::new("1.2.3");
     fixture.asset("1.2.3", "linux-x86_64", false, false);
     fixture.asset("1.2.3", "linux-x86_64", true, false);
+    fixture.asset_with_arch("1.2.3", "linux-x86_64", Some(CudaArch::Sm120), false);
     let server = Server::new(fixture.assets.clone());
     for (caps, missing, expected) in [
         (None, false, "-cpu-"),
         (Some("8.9"), false, "-cuda-"),
+        (Some("12.0"), false, "-cuda-"),
         (Some("8.6"), false, "-cpu-"),
         (Some("8.9"), true, "-cpu-"),
+        (Some("12.0"), true, "-cpu-"),
     ] {
         let host = fixture.host();
         let result = fixture.run(
@@ -494,18 +523,28 @@ fn cuda_auto_uses_actual_capability_and_loader_failure_falls_back_explicit_cuda_
             assert!(String::from_utf8_lossy(&result.stderr).contains("selecting CPU"));
         }
     }
-    let host = fixture.host();
-    let result = fixture.run(
-        host.path(),
-        &server,
-        "1.2.3",
-        "Linux",
-        "cuda",
-        Some("8.9"),
-        true,
-    );
-    assert!(!result.status.success());
-    assert!(!host.path().join(".local/bin/ferrum").exists());
+    for caps in ["8.9", "12.0"] {
+        let host = fixture.host();
+        let before = server.requests().len();
+        let result = fixture.run(
+            host.path(),
+            &server,
+            "1.2.3",
+            "Linux",
+            "cuda",
+            Some(caps),
+            true,
+        );
+        assert!(!result.status.success());
+        assert!(!host.path().join(".local/bin/ferrum").exists());
+        assert!(server.requests()[before..]
+            .iter()
+            .all(|path| path.contains(if caps == "8.9" {
+                "-cuda-sm89."
+            } else {
+                "-cuda-sm120."
+            })));
+    }
 }
 
 #[test]

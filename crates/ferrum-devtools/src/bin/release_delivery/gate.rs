@@ -35,6 +35,10 @@ mod ci_evidence;
 #[path = "cuda_gate.rs"]
 mod cuda_gate;
 
+#[path = "cuda_assets.rs"]
+mod cuda_assets;
+use cuda_assets::CudaVariant;
+
 #[path = "windows_assets.rs"]
 pub(super) mod windows_assets;
 
@@ -42,8 +46,9 @@ pub(super) mod windows_assets;
 pub struct GateArgs {
     #[arg(long)]
     pub plan: PathBuf,
-    #[arg(long)]
-    pub tasks: PathBuf,
+    /// Prepared task envelopes; repeat for an additional CUDA asset's local lane.
+    #[arg(long, required = true)]
+    pub tasks: Vec<PathBuf>,
     #[arg(long)]
     pub contracts: PathBuf,
     #[arg(long, required = true)]
@@ -76,16 +81,24 @@ struct PreparedTasks {
     unsupported_obligations: Vec<usize>,
     remaining_plan_gaps: Vec<Gap>,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Distribution {
     backend: Backend,
+    cuda_variant: Option<CudaVariant>,
     name: String,
     sha256: String,
     binary_sha256: String,
     target: String,
     assets: Vec<AcceptedAsset>,
 }
-type Distributions = BTreeMap<(Backend, String), Distribution>;
+type DistributionKey = (Backend, String, Option<CudaVariant>);
+type Distributions = BTreeMap<DistributionKey, Distribution>;
+
+impl Distribution {
+    fn key(&self) -> DistributionKey {
+        (self.backend, self.target.clone(), self.cuda_variant)
+    }
+}
 
 pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     validate_repo(&args.repo)?;
@@ -115,6 +128,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != candidate {
         return Err("workspace HEAD does not match the plan candidate".into());
     }
+    let sm120_required = cuda_assets::candidate_requires_sm120(&workspace, &candidate).await?;
     {
         let catalog = Command::new("git")
             .arg("-C")
@@ -166,32 +180,45 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
             }
         }
         if distributions
-            .insert(
-                (distribution.backend, distribution.target.clone()),
-                distribution,
-            )
+            .insert(distribution.key(), distribution)
             .is_some()
         {
             return Err(
-                "multiple distribution archives declare the same backend and target".into(),
+                "multiple distribution archives declare the same backend, target and variant"
+                    .into(),
             );
         }
     }
     // These are the Unix products selected by the installer. CPU is required on
     // each supported platform independently of its accelerated package.
-    if distributions.keys().cloned().collect::<BTreeSet<_>>()
-        != BTreeSet::from([
-            (Backend::Cpu, "x86_64-unknown-linux-gnu".into()),
-            (Backend::Cpu, "aarch64-apple-darwin".into()),
-            (Backend::Metal, "aarch64-apple-darwin".into()),
-            (Backend::Cuda, "x86_64-unknown-linux-gnu".into()),
-        ])
-    {
+    let mut required_distributions = BTreeSet::from([
+        (Backend::Cpu, "x86_64-unknown-linux-gnu".into(), None),
+        (Backend::Cpu, "aarch64-apple-darwin".into(), None),
+        (Backend::Metal, "aarch64-apple-darwin".into(), None),
+        (
+            Backend::Cuda,
+            "x86_64-unknown-linux-gnu".into(),
+            Some(CudaVariant::Sm89),
+        ),
+    ]);
+    if sm120_required {
+        required_distributions.insert((
+            Backend::Cuda,
+            "x86_64-unknown-linux-gnu".into(),
+            Some(CudaVariant::Sm120),
+        ));
+    }
+    if distributions.keys().cloned().collect::<BTreeSet<_>>() != required_distributions {
         return Err(
-            "formal distribution inventory requires Linux CPU/CUDA and macOS CPU/Metal".into(),
+            "formal distribution inventory differs from the candidate's declared CUDA assets and required CPU/Metal packages".into(),
         );
     }
-    let tasks: PreparedTasks = read(&args.tasks)?;
+    let envelopes = args
+        .tasks
+        .iter()
+        .map(|path| read::<PreparedTasks>(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let tasks = combine_tasks(&plan, &schedule, envelopes)?;
     validate_tasks(&plan, &schedule, &tasks, &distributions, &args.version)?;
     let reports = args
         .report
@@ -199,6 +226,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         .map(|path| read::<Value>(path))
         .collect::<Result<Vec<_>, _>>()?;
     let models = VerifiedModels::new(&tasks.expectations, &reports)?;
+    verify_sm120_model_device(&distributions, &models)?;
     let installations = args
         .installation
         .iter()
@@ -224,6 +252,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &candidate,
         windows.attempts,
         cuda_policy,
+        sm120_required,
     )
     .await?;
     let ci_evidence = ci_evidence::load(
@@ -233,7 +262,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &plan,
         &text(&document["provenance"], "release_base_tag")?,
         &args.version,
-        &distributions[&(Backend::Metal, "aarch64-apple-darwin".into())].binary_sha256,
+        &distributions[&(Backend::Metal, "aarch64-apple-darwin".into(), None)].binary_sha256,
         &args.workspace,
         &args.contracts,
     )
@@ -246,6 +275,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &candidate,
         windows.attempts,
         cuda_policy,
+        sm120_required,
     )
     .await?;
     let notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
@@ -436,6 +466,7 @@ async fn distribution(path: &Path, version: &str, candidate: &str) -> Result<Dis
             })
             .transpose()?,
     };
+    let cuda_variant = CudaVariant::from_abi(&name, &abi_input)?;
     let audit_name = text(&dependencies, "audit_file")?;
     if !file_name(&audit_name) {
         return Err("dependency audit must be an adjacent declared filename".into());
@@ -544,11 +575,39 @@ async fn distribution(path: &Path, version: &str, candidate: &str) -> Result<Dis
     };
     Ok(Distribution {
         backend,
+        cuda_variant,
         name,
         sha256: text(&abi, "asset_sha256")?,
         binary_sha256: text(&abi, "binary_sha256")?,
         target: abi_input.target_triple,
         assets,
+    })
+}
+
+fn combine_tasks(
+    plan: &Plan,
+    schedule: &ModelTaskSchedule,
+    envelopes: Vec<PreparedTasks>,
+) -> Result<PreparedTasks, String> {
+    if envelopes.is_empty() {
+        return Err("prepared model task envelopes are required".into());
+    }
+    let mut expectations = Vec::new();
+    for envelope in envelopes {
+        if envelope.schema_version != 1
+            || envelope.remaining_plan_gaps != plan.gaps
+            || envelope.unsupported_obligations != schedule.unsupported_obligations
+            || envelope.expectations.is_empty()
+        {
+            return Err("prepared tasks do not preserve the current plan/schedule/gaps".into());
+        }
+        expectations.extend(envelope.expectations);
+    }
+    Ok(PreparedTasks {
+        schema_version: 1,
+        expectations,
+        unsupported_obligations: schedule.unsupported_obligations.clone(),
+        remaining_plan_gaps: plan.gaps.clone(),
     })
 }
 
@@ -562,13 +621,22 @@ fn validate_tasks(
     if tasks.schema_version != 1
         || tasks.remaining_plan_gaps != plan.gaps
         || tasks.unsupported_obligations != schedule.unsupported_obligations
-        || tasks.expectations.len() != schedule.runs.len()
     {
         return Err("prepared tasks do not preserve the current plan/schedule/gaps".into());
     }
+    let mut binary_identities = BTreeSet::new();
+    if distributions
+        .values()
+        .any(|asset| !binary_identities.insert(&asset.binary_sha256))
+    {
+        return Err("distinct distribution identities must not alias the same binary bytes".into());
+    }
     let mut seen = BTreeSet::new();
     for expected in &tasks.expectations {
-        if !seen.insert(&expected.profile.id) {
+        if !seen.insert((
+            expected.profile.id.as_str(),
+            expected.binary_sha256.as_str(),
+        )) {
             return Err("duplicate prepared model task".into());
         }
         let run = schedule
@@ -583,6 +651,11 @@ fn validate_tasks(
                     && distribution.binary_sha256 == expected.binary_sha256
             })
             .ok_or("model task has no matching staged bytes for its backend")?;
+        if binary.cuda_variant == Some(CudaVariant::Sm120)
+            && run.cuda_lane != Some(CudaModelLane::Local)
+        {
+            return Err("SM120 model evidence must cover the frozen local CUDA lane".into());
+        }
         if expected.profile != run.profile
             || expected.version != version
             || expected.binary_sha256 != binary.binary_sha256
@@ -606,6 +679,35 @@ fn validate_tasks(
             ));
         }
     }
+    for run in &schedule.runs {
+        let matching: Vec<_> = tasks
+            .expectations
+            .iter()
+            .filter(|task| task.profile.id == run.profile.id)
+            .collect();
+        if run.cuda_lane == Some(CudaModelLane::Local) {
+            let required: BTreeSet<_> = distributions
+                .values()
+                .filter(|asset| asset.backend == Backend::Cuda)
+                .map(|asset| asset.binary_sha256.as_str())
+                .collect();
+            let actual: BTreeSet<_> = matching
+                .iter()
+                .map(|task| task.binary_sha256.as_str())
+                .collect();
+            if required.is_empty() || actual != required {
+                return Err(format!(
+                    "local CUDA profile {} needs separate model tasks for every CUDA asset",
+                    run.profile.id
+                ));
+            }
+        } else if matching.len() != 1 {
+            return Err(format!(
+                "model profile {} must have exactly one prepared task",
+                run.profile.id
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -615,10 +717,71 @@ struct VerifiedModels<'a> {
 }
 impl<'a> VerifiedModels<'a> {
     fn new(tasks: &'a [ExpectedModelRun], reports: &'a [Value]) -> Result<Self, String> {
-        verify_model_reports(tasks, reports)
-            .map_err(|issues| format!("model evidence: {}", issues.join("; ")))?;
+        let mut groups = BTreeMap::<&str, Vec<ExpectedModelRun>>::new();
+        for task in tasks {
+            groups
+                .entry(task.binary_sha256.as_str())
+                .or_default()
+                .push(task.clone());
+        }
+        if groups.is_empty() {
+            return Err("model evidence requires prepared tasks".into());
+        }
+        let mut report_groups = BTreeMap::<&str, Vec<Value>>::new();
+        for report in reports {
+            let hash = report["binary_sha256"]
+                .as_str()
+                .filter(|hash| groups.contains_key(hash))
+                .ok_or("model report has no matching prepared binary identity")?;
+            report_groups.entry(hash).or_default().push(report.clone());
+        }
+        for (hash, group) in groups {
+            verify_model_reports(
+                &group,
+                report_groups.get(hash).map(Vec::as_slice).unwrap_or(&[]),
+            )
+            .map_err(|issues| format!("model evidence for {hash}: {}", issues.join("; ")))?;
+        }
         Ok(Self { tasks, reports })
     }
+}
+
+fn verify_sm120_model_device(
+    distributions: &Distributions,
+    models: &VerifiedModels<'_>,
+) -> Result<(), String> {
+    for asset in distributions
+        .values()
+        .filter(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
+    {
+        let reports: Vec<_> = models
+            .reports
+            .iter()
+            .filter(|report| report["binary_sha256"] == asset.binary_sha256)
+            .collect();
+        let mut observed = false;
+        for report in reports {
+            for case in report["cases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|case| case["case"] == "serve-startup")
+            {
+                let hardware = &case["evidence"]["auto_config"]["hardware_capabilities"];
+                if hardware["backend"] != "cuda" || hardware["compute_capability"] != "12.0" {
+                    return Err(
+                        "SM120 model startup evidence must observe CUDA compute capability 12.0"
+                            .into(),
+                    );
+                }
+                observed = true;
+            }
+        }
+        if !observed {
+            return Err("SM120 asset is missing actual model startup device evidence".into());
+        }
+    }
+    Ok(())
 }
 fn verify_installations(
     distributions: &Distributions,
@@ -631,11 +794,15 @@ fn verify_installations(
     for report in installations {
         let backend: Backend = serde_json::from_value(Value::String(report.backend.clone()))
             .map_err(|_| "invalid installation backend")?;
-        let identity = (backend, report.target_triple.clone());
         let expected = distributions
-            .get(&identity)
+            .values()
+            .find(|asset| {
+                asset.backend == backend
+                    && asset.target == report.target_triple
+                    && asset.name == report.asset_name
+            })
             .ok_or("unexpected installation report")?;
-        if !seen.insert(identity)
+        if !seen.insert(expected.key())
             || report.version != version
             || report.candidate_sha != candidate
             || report.asset_name != expected.name
@@ -648,6 +815,9 @@ fn verify_installations(
             );
         }
         if backend == Backend::Cuda && report.status == "not_run" {
+            if expected.cuda_variant == Some(CudaVariant::Sm120) {
+                return Err("SM120 installation requires actual startup of its extracted archive; extract-only is insufficient".into());
+            }
             if report.schema_version != 1
                 || report.error.is_some()
                 || !report.observations.is_empty()
@@ -667,6 +837,7 @@ fn verify_installations(
                 .any(|task| {
                     models.reports.iter().any(|model| {
                         model["profile_id"] == task.profile.id
+                            && model["binary_sha256"] == expected.binary_sha256
                             && model["cases"].as_array().is_some_and(|cases| {
                                 ["run-basic", "serve-startup"].iter().all(|name| {
                                     cases.iter().any(|case| {
@@ -871,6 +1042,7 @@ async fn verify_ci(
     candidate: &str,
     windows_attempt: windows_assets::WindowsAttempts,
     cuda_policy: &ReleaseCudaPolicy,
+    sm120_required: bool,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("ferrum-release-delivery")
@@ -887,6 +1059,7 @@ async fn verify_ci(
         token.as_deref(),
         Some(windows_attempt),
         Some(cuda_policy),
+        sm120_required,
     )
     .await
 }
@@ -899,7 +1072,10 @@ async fn ci_at(
     candidate: &str,
     token: Option<&str>,
 ) -> Result<(), String> {
-    ci_at_with_windows(client, base, repo, run_id, candidate, token, None, None).await
+    ci_at_with_windows(
+        client, base, repo, run_id, candidate, token, None, None, false,
+    )
+    .await
 }
 async fn ci_at_with_windows(
     client: &reqwest::Client,
@@ -910,6 +1086,7 @@ async fn ci_at_with_windows(
     token: Option<&str>,
     windows_attempt: Option<windows_assets::WindowsAttempts>,
     cuda_policy: Option<&ReleaseCudaPolicy>,
+    sm120_required: bool,
 ) -> Result<(), String> {
     if run_id == 0 {
         return Err("CI run id must be explicit and nonzero".into());
@@ -971,6 +1148,7 @@ async fn ci_at_with_windows(
     let mut windows_occurrences = BTreeMap::new();
     let mut windows_cpu_occurrences = BTreeMap::new();
     let mut local_cuda_occurrences = BTreeMap::new();
+    let mut sm120_cuda_occurrences = BTreeMap::new();
     let mut cloud_cuda_occurrences = BTreeMap::new();
     let mut ids = BTreeSet::new();
     let mut total = None;
@@ -995,10 +1173,12 @@ async fn ci_at_with_windows(
             let windows_job = job["name"] == "stage-cuda / Stage Windows x86_64 CUDA sm89";
             let windows_cpu_job = job["name"] == "stage-cpu-windows / Stage Windows x86_64 CPU";
             let local_cuda_job = job["name"] == "cuda-models";
+            let sm120_cuda_job = job["name"] == "cuda-models-sm120";
             let cloud_cuda_job = job["name"] == "cuda-models-cloud";
             if job["name"] != "Quality / CI required"
                 && !(windows_attempt.is_some() && (windows_job || windows_cpu_job))
-                && !(cuda_policy.is_some() && (local_cuda_job || cloud_cuda_job))
+                && !(cuda_policy.is_some()
+                    && (local_cuda_job || (sm120_required && sm120_cuda_job) || cloud_cuda_job))
             {
                 continue;
             }
@@ -1010,7 +1190,9 @@ async fn ci_at_with_windows(
             {
                 return Err("Quality job belongs to another run or candidate".into());
             }
-            let selected = if local_cuda_job {
+            let selected = if sm120_cuda_job {
+                &mut sm120_cuda_occurrences
+            } else if local_cuda_job {
                 &mut local_cuda_occurrences
             } else if cloud_cuda_job {
                 &mut cloud_cuda_occurrences
@@ -1034,6 +1216,9 @@ async fn ci_at_with_windows(
         return Err("CI returned an incomplete job inventory".into());
     }
     if let Some(policy) = cuda_policy {
+        if sm120_required {
+            cuda_gate::verify_sm120_job(&sm120_cuda_occurrences)?;
+        }
         cuda_gate::verify_jobs(
             policy,
             &run["event"],

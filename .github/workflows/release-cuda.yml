@@ -1,4 +1,4 @@
-name: Stage CUDA sm89 release assets
+name: Stage CUDA release assets
 
 on:
   workflow_call:
@@ -41,6 +41,9 @@ on:
       cuda_asset_id:
         description: Immutable uploaded artifact ID
         value: ${{ jobs.linux-x86_64-cuda-sm89.outputs.asset_id }}
+      cuda_sm120_asset_id:
+        description: Immutable Linux SM120 production artifact ID
+        value: ${{ jobs.linux-x86_64-cuda-sm120.outputs.asset_id }}
       windows_asset_id:
         description: Windows ZIP, installer, stable launcher and staging byte receipts
         value: ${{ jobs.windows-x86_64-cuda-sm89.outputs.asset_id }}
@@ -271,6 +274,199 @@ jobs:
             ferrum-linux-x86_64-cuda-sm89.tar.gz.dependency.json
             ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json
             ferrum-linux-x86_64-cuda-sm89.dependencies.txt
+
+  linux-x86_64-cuda-sm120:
+    if: inputs.platform != 'windows'
+    outputs:
+      asset_id: ${{ steps.asset_id.outputs.artifact-id }}
+    name: Stage Linux x86_64 CUDA SM120 production
+    runs-on: ubuntu-24.04
+    env:
+      CUDA_COMPUTE_CAP: 120
+      # Content-addressed portable set; the archive must be published before staging.
+      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v1/native-operator-set-cuda12.8-sm120-v1.tar.zst
+      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: e9a58975695a7cbf7bcac6106df93ed724aff137e3da7bcd119674564707c22c
+    timeout-minutes: 120
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
+    steps:
+      - name: Validate immutable staging inputs
+        run: |
+          case "$STAGING_PLATFORM" in all|linux) ;; *) echo 'Invalid staging platform' >&2; exit 1;; esac
+          if [[ "$PUBLISH_RELEASE" != "false" ]]; then
+            echo "publish_release must remain false; this workflow only stages bytes" >&2
+            exit 1
+          fi
+          if ! [[ "$RC_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "release_candidate_sha must be a full lowercase hexadecimal commit ID" >&2
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version must be a formal MAJOR.MINOR.PATCH version" >&2
+            exit 1
+          fi
+          tag_prefix="v${VERSION}-rc."
+          rc_number="${RC_TAG#"$tag_prefix"}"
+          if [[ "$RC_TAG" != "$tag_prefix"* ]] || ! [[ "$rc_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "release_candidate_tag must match v${VERSION}-rc.N" >&2
+            exit 1
+          fi
+          if ! [[ "$STAGING_LABEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid staging_label" >&2
+            exit 1
+          fi
+
+      - name: Validate bound SM120 native archive
+        run: |
+          if ! [[ "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'SM120 native archive SHA256 has not been bound to verified release bytes' >&2
+            exit 1
+          fi
+          case "$NATIVE_OPERATOR_SET_ARCHIVE_URL" in
+            https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v1/native-operator-set-cuda12.8-sm120-v1.tar.zst) ;;
+            *) echo 'Unexpected SM120 native archive source' >&2; exit 1;;
+          esac
+
+      - name: Install system dependencies and Rust
+        run: |
+          apt-get update
+          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file python3 zstd libnccl2 libnccl-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.91.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_candidate_sha }}
+          fetch-depth: 0
+
+      - name: Verify release candidate provenance
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$RC_SHA"
+          tag_ref="refs/tags/$RC_TAG"
+          test "$(git cat-file -t "$tag_ref")" = tag
+          test "$(git rev-parse "${tag_ref}^{}")" = "$RC_SHA"
+
+      - name: Materialize pinned CUDA native operator set
+        run: |
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.8-sm120-v1.tar.zst"
+          root="$RUNNER_TEMP/ferrum-native-operator-set"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
+          printf '%s  %s\n' "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" "$archive" \
+            | sha256sum --check --strict
+          mkdir -p "$root"
+          zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
+          lock="$root/native-operator-set.lock.json"
+          test -f "$lock"
+          echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: stage-rust1.91.0-linux-x86_64-cuda-sm120-cuda12.8-native-sm120-v1-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            stage-rust1.91.0-linux-x86_64-cuda-sm120-cuda12.8-native-sm120-v1-cargo-
+
+      - name: Build release metadata tool once
+        run: cargo build --release --locked -p ferrum-bench-core --example release_candidate
+
+      - name: Verify all workspace release versions
+        run: |
+          ./target/release/examples/release_candidate verify \
+            --workspace . --version "$VERSION" \
+            --candidate-sha "$RC_SHA" --candidate-tag "$RC_TAG" \
+            --staging-label "$STAGING_LABEL" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Build release CUDA sm120 binary exactly once
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+          test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
+          cargo build --release --locked -p ferrum-cli --bin ferrum \
+            --features cuda,cuda-production
+
+      - name: Strip and audit CUDA binary
+        run: |
+          strip target/release/ferrum
+          file target/release/ferrum | tee ferrum-linux-x86_64-cuda-sm120.dependencies.txt
+          ldd target/release/ferrum | tee -a ferrum-linux-x86_64-cuda-sm120.dependencies.txt
+
+      - name: Assemble SM120 distribution licenses from the pinned native packages
+        run: |
+          mkdir -p dist
+          cat LICENSE crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml > dist/LICENSE
+          native_set_root=$(dirname "$FERRUM_NATIVE_OPERATOR_SET_LOCK")
+          for native_license in "$native_set_root"/packages/*/licenses/*.txt; do
+            test -f "$native_license"
+            printf '\n--- %s ---\n' "${native_license#"$native_set_root/"}" >> dist/LICENSE
+            cat "$native_license" >> dist/LICENSE
+          done
+
+      - name: Package staged CUDA asset and adjacent manifests
+        run: |
+          asset="ferrum-linux-x86_64-cuda-sm120.tar.gz"
+          mkdir -p dist
+          cp target/release/ferrum dist/ferrum
+          cp README.md dist/README.md
+          cat > dist/CUDA-BUILD.txt <<EOF
+          Ferrum v${VERSION} CUDA release binary
+          CUDA toolkit image: nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
+          CUDA_COMPUTE_CAP: 120
+          Cargo features: cuda,cuda-production
+          Native operator archive: ${NATIVE_OPERATOR_SET_ARCHIVE_URL}
+          Native operator archive SHA256: ${NATIVE_OPERATOR_SET_ARCHIVE_SHA256}
+          Native operator lock SHA256: $(sha256sum "$FERRUM_NATIVE_OPERATOR_SET_LOCK" | cut -d ' ' -f 1)
+          NVIDIA driver, compatible CUDA 12.8 runtime, and NCCL runtime are required.
+          EOF
+          tar -C dist -czf "$asset" ferrum LICENSE README.md CUDA-BUILD.txt
+          ./target/release/examples/release_candidate manifest \
+            --version "$VERSION" \
+            --candidate-sha "$RC_SHA" --candidate-tag "$RC_TAG" \
+            --staging-label "$STAGING_LABEL" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --backend cuda --target-triple x86_64-unknown-linux-gnu \
+            --asset "$asset" --binary target/release/ferrum \
+            --dependencies ferrum-linux-x86_64-cuda-sm120.dependencies.txt \
+            --cargo-features cuda,cuda-production \
+            --cuda-compute-capability "$CUDA_COMPUTE_CAP" \
+            --cuda-toolkit-image nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
+
+      - name: Deferred CUDA smoke contract
+        run: |
+          mkdir -p smoke
+          tar -C smoke -xzf ferrum-linux-x86_64-cuda-sm120.tar.gz
+          if ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1'; then
+            version_output="$(LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --version)"
+            printf '%s\n' "$version_output"
+            test "$version_output" = "ferrum $VERSION"
+            LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --help >/dev/null
+          else
+            echo "Executable smoke is deferred to the exact staged-byte GPU gate."
+            ldd ./smoke/ferrum
+          fi
+
+      - name: Upload staged CUDA asset
+        id: asset_id
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-linux-x86_64-cuda-sm120-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ferrum-linux-x86_64-cuda-sm120.tar.gz
+            ferrum-linux-x86_64-cuda-sm120.tar.gz.sha256
+            ferrum-linux-x86_64-cuda-sm120.tar.gz.binary.sha256
+            ferrum-linux-x86_64-cuda-sm120.tar.gz.version.json
+            ferrum-linux-x86_64-cuda-sm120.tar.gz.dependency.json
+            ferrum-linux-x86_64-cuda-sm120.tar.gz.abi.json
+            ferrum-linux-x86_64-cuda-sm120.dependencies.txt
 
   windows-x86_64-cuda-sm89:
     if: inputs.platform != 'linux'

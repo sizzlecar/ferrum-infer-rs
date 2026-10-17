@@ -13,15 +13,34 @@ checksum() {
 read_checksum() {
     awk -v name="$2" 'NR == 1 && NF == 2 && $2 == name && length($1) == 64 && $1 !~ /[^0-9a-f]/ {hash=$1} END {if(NR != 1 || hash == "") exit 1; print hash}' "$1"
 }
+detect_cuda_arch() {
+    # WSL can expose the driver utility outside PATH. Prefer PATH when present;
+    # a failed query must not turn into a GPU-name or architecture guess.
+    if smi=$(command -v nvidia-smi 2>/dev/null); then :
+    elif [ -f "$1" ] && [ -x "$1" ]; then smi=$1
+    else return 1; fi
+    caps=$("$smi" --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || return 1
+    printf '%s\n' "$caps" | awk '
+        {gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+         if (($0 != "8.9" && $0 != "12.0") || (n > 0 && $0 != cap)) {bad=1; exit}
+         cap=$0; n++}
+        END {if (bad || n == 0) exit 1; print (cap == "8.9" ? "sm89" : "sm120")}'
+}
+download_failed() {
+    if [ "${backend:-}" = cuda ]; then
+        die "Download failed: $1; Ferrum $version requires the matching $cuda_arch asset ($asset). Select a release providing it or explicitly use --backend cpu."
+    fi
+    die "Download failed: $1"
+}
 download() {
     note "Downloading ${1##*/}..."
     if ! curl --fail --show-error --progress-bar --location --retry 2 --connect-timeout 20 \
         --max-time 600 --proto "$protocols" --proto-redir '=https' "$1" -o "$2"; then
-        [ -n "${3:-}" ] || die "Download failed: $1"
+        [ -n "${3:-}" ] || download_failed "$1"
         note 'CDN download unavailable; retrying the official GitHub release download...'
         curl --fail --show-error --progress-bar --location --retry 2 --connect-timeout 20 \
             --max-time 600 --proto "$protocols" --proto-redir '=https' "$3" -o "$2" \
-            || die "Download failed: $3"
+            || download_failed "$3"
     fi
     note "Downloaded ${1##*/}."
 }
@@ -38,7 +57,7 @@ cleanup() {
 }
 prepare() {
     asset="ferrum-$platform"
-    [ "$backend" != cuda ] || asset="$asset-cuda-sm89"
+    [ "$backend" != cuda ] || asset="$asset-cuda-$cuda_arch"
     if [ "$platform" = macos-aarch64 ] && [ "$backend" = cpu ]; then asset="$asset-cpu"; fi
     asset="$asset.tar.gz"
     note "Checking Ferrum $version ($backend, $platform)..."
@@ -126,7 +145,8 @@ main() {
                     '  --release-base-url URL  Explicit release mirror (vVERSION/asset layout)' \
                     'Installs to ~/.local/bin; preserves unmanaged Ferrum installations.' \
                     'Repeat to update; intact versions skip package downloads. Running processes keep their version.' \
-                    'Linux CUDA requires sm89 GPU, NVIDIA driver, CUDA 12.4 and NCCL runtimes.'
+                    'Linux CUDA selects sm89 (compute capability 8.9) or sm120 (12.0).' \
+                    'All visible GPUs must match; install the NVIDIA driver and the selected package CUDA/NCCL runtimes.'
                 return;;
             *) die "Unknown option: $1";;
         esac
@@ -172,15 +192,13 @@ main() {
             esac;;
         Linux/x86_64|Linux/amd64)
             platform=linux-x86_64
-            gpu_supported=no
-            if [ "$backend" != cpu ] && command -v nvidia-smi >/dev/null 2>&1; then
-                if caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null); then
-                    if printf '%s\n' "$caps" | awk 'BEGIN{n=0} {gsub(/[[:space:]]/,""); if($0!="8.9") exit 1; n++} END{if(n==0) exit 1}'; then gpu_supported=yes; fi
-                fi
+            cuda_arch=
+            if [ "$backend" != cpu ]; then
+                cuda_arch=$(detect_cuda_arch /usr/lib/wsl/lib/nvidia-smi) || cuda_arch=
             fi
             case "$backend" in
-                auto) if [ "$gpu_supported" = yes ]; then backend=cuda; else backend=cpu; fi;;
-                cuda) [ "$gpu_supported" = yes ] || die 'CUDA sm89 release requires an actual compute-capability 8.9 GPU';;
+                auto) if [ -n "$cuda_arch" ]; then backend=cuda; else backend=cpu; fi;;
+                cuda) [ -n "$cuda_arch" ] || die 'CUDA releases require all visible GPUs to report the same supported compute capability: 8.9 (sm89) or 12.0 (sm120)';;
                 cpu) ;; *) die 'Metal is available only on Apple Silicon macOS';;
             esac;;
         *) die "No official binary for $os/$arch";;

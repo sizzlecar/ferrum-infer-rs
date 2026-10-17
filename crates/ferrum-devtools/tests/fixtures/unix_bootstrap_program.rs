@@ -18,10 +18,15 @@ fn main() {
             })
             .unwrap()
         ),
-        "nvidia-smi" => match env::var("FIXTURE_GPU_CAPABILITIES") {
-            Ok(value) => println!("{value}"),
-            Err(_) => process::exit(1),
-        },
+        "nvidia-smi" => {
+            if argv[1..] != ["--query-gpu=compute_cap", "--format=csv,noheader"] {
+                process::exit(2);
+            }
+            match env::var("FIXTURE_GPU_CAPABILITIES") {
+                Ok(value) => println!("{value}"),
+                Err(_) => process::exit(1),
+            }
+        }
         "system_profiler" => println!(
             "{}",
             env::var("FIXTURE_METAL_INFO").unwrap_or_else(|_| {

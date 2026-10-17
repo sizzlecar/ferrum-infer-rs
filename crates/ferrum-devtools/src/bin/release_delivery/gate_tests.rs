@@ -167,9 +167,14 @@ fn release_policy_requires_committed_membership_and_complete_local_tasks() {
 }
 fn distributions() -> Distributions {
     BTreeMap::from([(
-        (Backend::Cuda, "x86_64-unknown-linux-gnu".into()),
+        (
+            Backend::Cuda,
+            "x86_64-unknown-linux-gnu".into(),
+            Some(CudaVariant::Sm89),
+        ),
         Distribution {
             backend: Backend::Cuda,
+            cuda_variant: Some(CudaVariant::Sm89),
             name: "fixture.tar.gz".into(),
             sha256: "c".repeat(64),
             binary_sha256: "b".repeat(64),
@@ -238,6 +243,186 @@ fn extract_only() -> installation::InstallationReport {
         observations: vec![],
         error: None,
     }
+}
+
+fn cuda_pair() -> (Distributions, Vec<ExpectedModelRun>) {
+    let mut distributions = distributions();
+    let mut sm120 = distributions.values().next().unwrap().clone();
+    sm120.cuda_variant = Some(CudaVariant::Sm120);
+    sm120.name = "ferrum-linux-x86_64-cuda-sm120.tar.gz".into();
+    sm120.binary_sha256 = "d".repeat(64);
+    sm120.sha256 = "e".repeat(64);
+    let mut second = task();
+    second.binary_sha256 = sm120.binary_sha256.clone();
+    distributions.insert(sm120.key(), sm120);
+    (distributions, vec![task(), second])
+}
+
+#[test]
+fn cuda_asset_identity_binds_architecture_toolkit_and_feature_set() {
+    for (variant, name, capability, image, features) in [
+        (CudaVariant::Sm89, "ferrum-linux-x86_64-cuda-sm89.tar.gz", "89",
+         "nvidia/cuda:12.4.0-devel-ubuntu22.04", vec!["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]),
+        (CudaVariant::Sm120, "ferrum-linux-x86_64-cuda-sm120.tar.gz", "120",
+         "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66", vec!["cuda", "cuda-production"]),
+    ] {
+        let mut abi = AbiInput {
+            backend: staging::Backend::Cuda,
+            target_triple: "x86_64-unknown-linux-gnu".into(),
+            cargo_features: features.iter().map(|value| (*value).into()).collect(),
+            cuda_compute_capability: Some(capability.into()),
+            cuda_toolkit_image: Some(image.into()),
+        };
+        assert_eq!(CudaVariant::from_abi(name, &abi).unwrap(), Some(variant));
+        abi.cuda_compute_capability = Some("80".into());
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+        abi.cuda_compute_capability = Some(capability.into());
+        abi.cuda_toolkit_image = Some("nvidia/cuda:12.4.0-devel-ubuntu22.04:unverified".into());
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+        abi.cuda_toolkit_image = Some(image.into());
+        abi.cargo_features = vec!["cuda".into()];
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+        abi.cargo_features = features.into_iter().map(str::to_owned).collect();
+        abi.target_triple = "x86_64-pc-windows-msvc".into();
+        assert!(CudaVariant::from_abi(name, &abi).is_err());
+    }
+}
+
+#[test]
+fn cuda_task_envelopes_require_each_architecture_without_replacing_old_coverage() {
+    let (mut distributions, tasks) = cuda_pair();
+    let mut plan = make_plan(&tasks[0]);
+    plan.release_cuda = Some(ReleaseCudaPolicy {
+        model_limitations: Vec::new(),
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec![tasks[0].profile.id.clone()],
+        extended_cloud_profile_ids: Vec::new(),
+        reason: "Local model execution for both installed CUDA assets".into(),
+    });
+    let schedule = model_task_schedule(&plan);
+    let envelope = |expectations| PreparedTasks {
+        schema_version: 1,
+        expectations,
+        unsupported_obligations: schedule.unsupported_obligations.clone(),
+        remaining_plan_gaps: plan.gaps.clone(),
+    };
+    let mut combined = combine_tasks(
+        &plan,
+        &schedule,
+        tasks
+            .iter()
+            .map(|task| envelope(vec![task.clone()]))
+            .collect(),
+    )
+    .unwrap();
+    validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").unwrap();
+    combined.expectations.pop();
+    assert!(validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").is_err());
+    combined.expectations = vec![tasks[0].clone(), tasks[0].clone()];
+    assert!(validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").is_err());
+    combined.expectations = tasks;
+    let sm120 = distributions
+        .values_mut()
+        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
+        .unwrap();
+    sm120.binary_sha256 = combined.expectations[0].binary_sha256.clone();
+    assert!(validate_tasks(&plan, &schedule, &combined, &distributions, "2.3.4").is_err());
+    let mut stale = envelope(vec![task()]);
+    stale.remaining_plan_gaps.push(Gap::EmptyInventory);
+    assert!(combine_tasks(&plan, &schedule, vec![stale]).is_err());
+}
+
+#[test]
+fn cuda_model_reports_are_verified_per_binary_and_require_actual_sm120_device() {
+    let (distributions, tasks) = cuda_pair();
+    let mut reports: Vec<_> = tasks.iter().map(model_report).collect();
+    let verified = VerifiedModels::new(&tasks, &reports).unwrap();
+    assert!(verify_sm120_model_device(&distributions, &verified).is_err());
+    for capability in ["8.9", "12.0"] {
+        reports[1]["cases"][2]["evidence"]["auto_config"]["hardware_capabilities"]
+            ["compute_capability"] = json!(capability);
+        let verified = VerifiedModels::new(&tasks, &reports).unwrap();
+        assert_eq!(
+            verify_sm120_model_device(&distributions, &verified).is_ok(),
+            capability == "12.0"
+        );
+    }
+    assert!(VerifiedModels::new(&tasks, &reports[..1]).is_err());
+    let replaced = vec![reports[0].clone(), reports[0].clone()];
+    assert!(VerifiedModels::new(&tasks, &replaced).is_err());
+    let mut wrong_answers = reports.clone();
+    wrong_answers[1]["cases"][1]["evidence"]["answers"][1]["content"] = json!("41");
+    assert!(VerifiedModels::new(&tasks, &wrong_answers).is_err());
+    reports[1]["binary_sha256"] = json!("f".repeat(64));
+    assert!(VerifiedModels::new(&tasks, &reports).is_err());
+}
+
+#[test]
+fn cuda_installation_requires_each_archive_and_actual_sm120_startup() {
+    let (distributions, tasks) = cuda_pair();
+    let reports: Vec<_> = tasks.iter().map(model_report).collect();
+    let verified = VerifiedModels::new(&tasks, &reports).unwrap();
+    let old = extract_only();
+    assert!(verify_installations(
+        &distributions,
+        std::slice::from_ref(&old),
+        &verified,
+        "2.3.4",
+        &"a".repeat(40)
+    )
+    .is_err());
+    let asset = distributions
+        .values()
+        .find(|asset| asset.cuda_variant == Some(CudaVariant::Sm120))
+        .unwrap();
+    let mut new = old.clone();
+    new.asset_name = asset.name.clone();
+    new.asset_sha256 = asset.sha256.clone();
+    new.binary_sha256 = asset.binary_sha256.clone();
+    assert!(verify_installations(
+        &distributions,
+        &[old.clone(), new.clone()],
+        &verified,
+        "2.3.4",
+        &"a".repeat(40)
+    )
+    .is_err());
+    new.status = "passed".into();
+    new.observations = [
+        vec!["--version"],
+        vec!["--help"],
+        vec!["run", "--help"],
+        vec!["serve", "--help"],
+    ]
+    .into_iter()
+    .map(|arguments| installation::Observation {
+        stdout: if arguments == ["--version"] {
+            "ferrum 2.3.4".into()
+        } else {
+            "Usage: ferrum".into()
+        },
+        arguments: arguments.into_iter().map(str::to_owned).collect(),
+        exit_code: Some(0),
+        stderr: String::new(),
+    })
+    .collect();
+    verify_installations(
+        &distributions,
+        &[old.clone(), new.clone()],
+        &verified,
+        "2.3.4",
+        &"a".repeat(40),
+    )
+    .unwrap();
+    new.binary_sha256 = old.binary_sha256.clone();
+    assert!(verify_installations(
+        &distributions,
+        &[old, new],
+        &verified,
+        "2.3.4",
+        &"a".repeat(40)
+    )
+    .is_err());
 }
 
 #[test]
@@ -360,11 +545,9 @@ fn local_metal_capacity_and_backend_are_bound_without_overriding_quick_start() {
         );
         let mut metal_distribution = distributions().into_values().next().unwrap();
         metal_distribution.backend = Backend::Metal;
+        metal_distribution.cuda_variant = None;
         metal_distribution.target = "aarch64-apple-darwin".into();
-        let metal = BTreeMap::from([(
-            (Backend::Metal, metal_distribution.target.clone()),
-            metal_distribution,
-        )]);
+        let metal = BTreeMap::from([(metal_distribution.key(), metal_distribution)]);
         validate_tasks(&plan, &schedule, &prepared, &metal, "2.3.4").unwrap();
         for capacity in [
             None,
@@ -545,6 +728,26 @@ async fn ci_fixture_with_validation(
     windows_attempt: Option<windows_assets::WindowsAttempts>,
     cuda_policy: Option<&ReleaseCudaPolicy>,
 ) -> Result<(), String> {
+    ci_fixture_with_capability(
+        run,
+        jobs,
+        status,
+        expect_jobs,
+        windows_attempt,
+        cuda_policy,
+        cuda_policy.is_some(),
+    )
+    .await
+}
+async fn ci_fixture_with_capability(
+    run: Value,
+    jobs: Vec<Value>,
+    status: u16,
+    expect_jobs: bool,
+    windows_attempt: Option<windows_assets::WindowsAttempts>,
+    cuda_policy: Option<&ReleaseCudaPolicy>,
+    sm120_required: bool,
+) -> Result<(), String> {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
@@ -606,6 +809,7 @@ async fn ci_fixture_with_validation(
                 None,
                 attempt,
                 policy,
+                sm120_required,
             )
             .await
         }
@@ -634,7 +838,13 @@ async fn cuda_jobs_are_bound_to_the_actual_candidate_and_latest_attempt() {
         extended_cloud_profile_ids: vec!["large".into()],
         reason: "Required local model execution and optional cloud extension".into(),
     };
-    let verify = |jobs| ci_fixture_with_validation(ci_run(), jobs, 200, true, None, Some(&policy));
+    let mut sm120 = ci_job();
+    sm120["id"] = json!(33);
+    sm120["name"] = json!("cuda-models-sm120");
+    let verify = |mut jobs: Vec<Value>| {
+        jobs.push(sm120.clone());
+        ci_fixture_with_validation(ci_run(), jobs, 200, true, None, Some(&policy))
+    };
     verify(vec![ci_job(), local.clone(), cloud.clone()])
         .await
         .unwrap();
@@ -659,6 +869,54 @@ async fn cuda_jobs_are_bound_to_the_actual_candidate_and_latest_attempt() {
     assert!(verify(vec![ci_job(), cloud.clone()]).await.is_err());
     cloud["conclusion"] = json!("success");
     assert!(verify(vec![ci_job(), old, cloud]).await.is_err());
+}
+
+#[tokio::test]
+async fn sm120_job_cannot_be_missing_foreign_or_superseded_by_failure() {
+    let mut local = ci_job();
+    local["id"] = json!(31);
+    local["name"] = json!("cuda-models");
+    let mut cloud = ci_job();
+    cloud["id"] = json!(32);
+    cloud["name"] = json!("cuda-models-cloud");
+    cloud["conclusion"] = json!("skipped");
+    let mut sm120 = ci_job();
+    sm120["id"] = json!(33);
+    sm120["name"] = json!("cuda-models-sm120");
+    let policy = ReleaseCudaPolicy {
+        model_limitations: Vec::new(),
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec!["small".into()],
+        extended_cloud_profile_ids: vec!["large".into()],
+        reason: "Both CUDA package architectures require model execution".into(),
+    };
+    let verify = |mut jobs: Vec<Value>| {
+        jobs.extend([ci_job(), local.clone(), cloud.clone()]);
+        ci_fixture_with_validation(ci_run(), jobs, 200, true, None, Some(&policy))
+    };
+    ci_fixture_with_capability(
+        ci_run(),
+        vec![ci_job(), local.clone(), cloud.clone()],
+        200,
+        true,
+        None,
+        Some(&policy),
+        false,
+    )
+    .await
+    .unwrap();
+    verify(vec![sm120.clone()]).await.unwrap();
+    assert!(verify(vec![]).await.is_err());
+    let mut foreign = sm120.clone();
+    foreign["head_sha"] = json!("c".repeat(40));
+    assert!(verify(vec![foreign]).await.is_err());
+    let mut old = sm120.clone();
+    old["id"] = json!(34);
+    old["run_attempt"] = json!(1);
+    for conclusion in ["failure", "skipped", "cancelled"] {
+        sm120["conclusion"] = json!(conclusion);
+        assert!(verify(vec![old.clone(), sm120.clone()]).await.is_err());
+    }
 }
 
 fn windows_ci_job() -> Value {
