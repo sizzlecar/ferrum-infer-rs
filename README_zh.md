@@ -135,6 +135,16 @@ orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
 
 ### 运行时设置
 
+`run` 与 `serve` 共用 CUDA 默认执行策略，按模型声明、已编译算子、实际设备和
+可用内存自动选择；显式 CLI 或配置值优先。这些默认优化不要求关闭缓存、忽略 EOS
+或关闭思考。
+
+默认数值策略 `auto` 可为已通过资格的 CUDA `sm120` GGUF 组合选择
+`qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`，包含该 profile 声明的8位激活量化
+和整数点积，因此数值路径会发生变化。显式指定 `--numerical-profile qwen3_5.f32-master`
+可保留原有混合精度参考路径。其他格式、设备和后端不因此获得支持，详见
+[数值执行策略](docs/numerical-execution.zh.md)。
+
 vNext 的 `run` 和 `serve` 共用工作目录下 `ferrum.toml` 中的可选设置：
 
 ```toml
@@ -364,6 +374,8 @@ cargo install ferrum-cli --locked --features metal
 官方预编译 Linux CUDA 资产的目标为 `sm89`。Linux CUDA 安装需要兼容的 NVIDIA driver、
 CUDA runtime 和 NCCL runtime。CUDA 源码构建还需要与 Ferrum 匹配的
 native-operator set，因此受支持的安装路径是预编译 CUDA tarball 或 Homebrew formula。
+源码构建可用 `--features cuda-production` 选择完整生产 feature 集；native-operator set
+lock 必须覆盖这些 feature 和目标架构。
 
 ## 愿景
 

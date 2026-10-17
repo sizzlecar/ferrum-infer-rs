@@ -148,6 +148,18 @@ fields, tool calls, and streaming behavior.
 
 ### Runtime settings
 
+`run` and `serve` share automatic CUDA execution defaults selected from the
+model's declared capabilities, compiled operators, actual device, and available
+memory. Explicit CLI or configuration values take precedence. These defaults do
+not require disabling caches, ignoring EOS, or disabling thinking.
+
+With `--numerical-profile auto` (the default), qualified CUDA `sm120` GGUF
+combinations can select `qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`, including
+its declared 8-bit activation quantization and integer dot products. This changes
+the numerical path. Select `--numerical-profile qwen3_5.f32-master` to retain the
+original mixed-precision reference profile. Other formats, devices, and backends
+are not implicitly qualified; see [numerical profiles](docs/numerical-execution.zh.md).
+
 For vNext execution, `run` and `serve` share this optional `ferrum.toml` setting
 in the working directory:
 
@@ -458,6 +470,9 @@ The official prebuilt Linux CUDA asset targets `sm89`. Linux CUDA installation r
 compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host.
 CUDA source builds also require Ferrum's matching native-operator set, so use
 the prebuilt CUDA tarball or Homebrew formula for the supported install path.
+Source builds can use `--features cuda-production` to select the complete
+production feature set; the native-operator set lock must cover those features
+and the target architecture.
 
 ## Vision
 
