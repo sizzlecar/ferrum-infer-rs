@@ -53,8 +53,9 @@ pub use executor::{
     BertModelExecutor, ClipModelExecutor, LlmExecutor, StubModelExecutor, TtsModelExecutor,
     VNextCompiledModel, VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec,
     VNextDeterminismInitialState, VNextDeterminismParticipantSpec, VNextDeterminismPhase,
-    VNextDeterminismWorkspacePoison, VNextExecutorConfig, VNextModelExecutor,
-    VNextRuntimeComposition, WhisperModelExecutor, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
+    VNextDeterminismWorkspacePoison, VNextExecutorConfig, VNextModelCompilationError,
+    VNextModelExecutor, VNextRuntimeComposition, WhisperModelExecutor,
+    MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;

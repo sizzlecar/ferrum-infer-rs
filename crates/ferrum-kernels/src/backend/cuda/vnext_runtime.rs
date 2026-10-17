@@ -3430,10 +3430,18 @@ impl CudaDeviceRuntime {
         mut self,
         mode: ferrum_types::Q8ProjectionWeightPreparation,
     ) -> Self {
-        self.q8_projection_weight_preparation = mode;
+        // Auto needs whole-plan capacity selection, which belongs to product
+        // startup. A standalone runtime has only the conservative layout.
+        self.q8_projection_weight_preparation = match mode {
+            ferrum_types::Q8ProjectionWeightPreparation::Auto => {
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed
+            }
+            explicit => explicit,
+        };
         self
     }
 
+    /// Concrete immutable storage mode used by provider layout/fingerprints.
     pub fn q8_projection_weight_preparation(&self) -> ferrum_types::Q8ProjectionWeightPreparation {
         self.q8_projection_weight_preparation
     }

@@ -241,6 +241,7 @@ impl Q5MmvqWeightDecodeArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Q8ProjectionWeightPreparationArg {
+    Auto,
     Compressed,
     PredecodedF32,
 }
@@ -248,6 +249,7 @@ pub enum Q8ProjectionWeightPreparationArg {
 impl Q8ProjectionWeightPreparationArg {
     pub const fn as_runtime_value(self) -> &'static str {
         match self {
+            Self::Auto => ferrum_types::Q8ProjectionWeightPreparation::Auto.as_runtime_value(),
             Self::Compressed => {
                 ferrum_types::Q8ProjectionWeightPreparation::Compressed.as_runtime_value()
             }
@@ -834,6 +836,7 @@ mod tests {
                 None
             );
             for (value, expected) in [
+                ("auto", Q8ProjectionWeightPreparationArg::Auto),
                 ("compressed", Q8ProjectionWeightPreparationArg::Compressed),
                 (
                     "predecoded-f32",

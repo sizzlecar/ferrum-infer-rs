@@ -1324,6 +1324,14 @@ impl CudaVNextComposition {
         q8_projection_weight_preparation: ferrum_types::Q8ProjectionWeightPreparation,
         causal_decode_kv_reuse: ferrum_types::CausalDecodeKvReuse,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        // Auto must start with compressed storage. Product startup may create
+        // a separate immutable predecoded composition after fitting this plan.
+        let q8_projection_weight_preparation = match q8_projection_weight_preparation {
+            ferrum_types::Q8ProjectionWeightPreparation::Auto => {
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed
+            }
+            explicit => explicit,
+        };
         if causal_decode_attention_grouping
             == ferrum_types::CausalDecodeAttentionGrouping::FixedExecutionCapacity
             && execution_context_limit == Some(0)

@@ -202,10 +202,15 @@ impl FerrumConfigBuilder {
                 }
                 .as_runtime_value(),
             ),
-            // Q8 changes persistent storage and still requires explicit opt-in.
+            // Product startup resolves Q8 only after fitting compressed storage.
             (
                 crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY,
-                Q8ProjectionWeightPreparation::default().as_runtime_value(),
+                if cuda_plan {
+                    Q8ProjectionWeightPreparation::Auto
+                } else {
+                    Q8ProjectionWeightPreparation::Compressed
+                }
+                .as_runtime_value(),
             ),
         ] {
             if self.entry(key).is_none() {

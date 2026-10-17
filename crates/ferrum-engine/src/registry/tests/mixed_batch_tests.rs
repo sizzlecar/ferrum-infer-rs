@@ -45,6 +45,7 @@ impl CpuFixture {
             materializers,
             catalog,
             |_| Ok(WeightMaterializerSelection::exact(materializer.clone())),
+            None,
         )
         .unwrap();
         executor.prepare_startup().await.unwrap();

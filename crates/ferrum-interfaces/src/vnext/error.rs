@@ -583,6 +583,13 @@ pub enum VNextError {
     },
     #[error("invalid execution plan: {reason}")]
     InvalidExecutionPlan { reason: String },
+    /// Capacity rejection while constructing a fresh, otherwise valid plan.
+    /// Deserialized-plan validation and allocator failures never use this case.
+    #[error("compiled plan requires {required_bytes} bytes, exceeding usable capacity {usable_capacity_bytes}")]
+    PlanCapacityExceeded {
+        required_bytes: u64,
+        usable_capacity_bytes: u64,
+    },
     #[error("weight materializer `{materializer_id}` requires typed numerical-quality approval")]
     WeightMaterializerQualityApprovalRequired { materializer_id: String },
     #[error("dynamic admission {kind:?}: {reason}")]

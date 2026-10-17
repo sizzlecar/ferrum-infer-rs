@@ -3138,7 +3138,7 @@ impl FerrumConfigBuilder {
             mode.as_runtime_value(),
             source,
             source_key,
-            ["compressed", "predecoded-f32"],
+            ["auto", "compressed", "predecoded-f32"],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
         ))
@@ -7806,7 +7806,7 @@ mod tests {
                 ExecutionResourceAuthority::PlanRuntime,
             ] {
                 for compiled in [false, true] {
-                    for mode in ["compressed", "predecoded-f32"] {
+                    for mode in ["auto", "compressed", "predecoded-f32"] {
                         let mut hardware = HardwareCapabilities::unknown();
                         hardware.backend = backend.into();
                         hardware.compiled_features.cuda = compiled;
@@ -7817,7 +7817,7 @@ mod tests {
                             .with_hardware_capabilities(hardware)
                             .with_execution_resource_authority(authority)
                             .resolve();
-                        let supported = mode == "compressed"
+                        let supported = mode != "predecoded-f32"
                             || (backend == "cuda"
                                 && compiled
                                 && authority == ExecutionResourceAuthority::PlanRuntime);

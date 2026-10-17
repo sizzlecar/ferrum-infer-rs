@@ -86,7 +86,7 @@ fn cuda_execution_defaults_materialize_the_validated_bundle() {
     assert_eq!(runtime.q5_mmvq_weight_decode, Q5MmvqWeightDecode::Auto);
     assert_eq!(
         runtime.q8_projection_weight_preparation,
-        Q8ProjectionWeightPreparation::Compressed
+        Q8ProjectionWeightPreparation::Auto
     );
     assert_eq!(
         engine(&resolved).scheduler.active_decode_prefill_chunk,
@@ -99,6 +99,10 @@ fn cuda_execution_defaults_materialize_the_validated_bundle() {
         None
     );
     for (selection, key) in [
+        (
+            "q8_projection_weight_preparation",
+            crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY,
+        ),
         (
             "q4_mmvq_weight_decode",
             crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
@@ -174,6 +178,10 @@ fn cuda_execution_defaults_preserve_single_sequence_prefill_behavior() {
 #[test]
 fn cuda_execution_defaults_preserve_explicit_opt_outs_and_provenance() {
     let entries = [
+        (
+            crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY,
+            "compressed",
+        ),
         (crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY, "baseline"),
         (crate::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY, "baseline"),
         ("FERRUM_INVOCATION_PREPARATION_STRATEGY", "full"),

@@ -20,7 +20,10 @@ use ferrum_interfaces::vnext::{
 use ferrum_models::vnext::{
     DefinedProductionModel, PreparedProductionModel, ProductionModelFamilyRegistry,
 };
-use ferrum_models::{VNextExecutorConfig, VNextModelExecutor, VNextRuntimeComposition};
+use ferrum_models::{
+    VNextCompiledModel, VNextExecutorConfig, VNextModelCompilationError, VNextModelExecutor,
+    VNextRuntimeComposition,
+};
 use ferrum_types::{EngineConfig, FerrumError, ModelInfo, ResponseFormat, Result, SamplingParams};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -61,6 +64,7 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         WeightMaterializerSelection,
         ferrum_interfaces::vnext::VNextError,
     >,
+    q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
 ) -> Result<VNextModelExecutor<R>> {
     create_vnext_executor_with_configuration(
         engine,
@@ -70,6 +74,7 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         weight_materializers,
         catalog,
         select_materializer,
+        q8_predecoded_composition,
         |engine, info, runtime| VNextExecutorConfig::from_engine_config(engine, info, runtime),
     )
 }
@@ -88,6 +93,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         WeightMaterializerSelection,
         ferrum_interfaces::vnext::VNextError,
     >,
+    mut q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
     executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<VNextExecutorConfig>,
 ) -> Result<VNextModelExecutor<R>> {
     let requested_kv_storage = ferrum_types::KvStorageFormat::try_from(engine.kv_cache.dtype)
@@ -173,6 +179,12 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         let model_info =
             prepared.model_info(engine.model.model_id.clone(), engine.backend.device.clone());
         let mut selected_engine = engine.clone();
+        if selected_engine.runtime.q8_projection_weight_preparation
+            == ferrum_types::Q8ProjectionWeightPreparation::Auto
+        {
+            selected_engine.runtime.q8_projection_weight_preparation =
+                ferrum_types::Q8ProjectionWeightPreparation::Compressed;
+        }
         if let Some(request) = &engine.runtime.startup_memory_request {
             selected_engine.memory.usable_capacity_bytes = Some(
                 usize::try_from(request.usable_capacity_bytes)
@@ -249,10 +261,10 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                 let config = executor_config(&selected_engine, &model_info, composition.runtime())?;
                 composition.compile_model(
                     &prepared,
-                    model_info,
+                    model_info.clone(),
                     &selected_engine,
                     config,
-                    materializer,
+                    materializer.clone(),
                 )?
             };
             // Compilation may select different provider layouts for the final
@@ -293,33 +305,125 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         } else {
             compiled
         };
-        tracing::info!(requested_numerical_policy = ?engine.numerical_execution,
+        let initialize = |compiled: VNextCompiledModel<'_, R>, selected_engine: &EngineConfig| {
+            tracing::info!(requested_numerical_policy = ?engine.numerical_execution,
             requested_kv_dtype = engine.kv_cache.dtype.as_str(),
             kv_storage = ?requested_kv_storage,
             numerical_profile = %profile.id, rejected_numerical_profiles = ?rejected,
             family_id = %prepared.family().family_id(),
+            q8_preparation_requested = engine.runtime.q8_projection_weight_preparation.as_runtime_value(),
+            q8_preparation_selected = selected_engine.runtime.q8_projection_weight_preparation.as_runtime_value(),
             "Selected numerical profile using the complete static program");
-        return compiled.initialize(|prepared, runtime, catalog, compilation| {
-            let numerical_execution = NumericalProfileResolution::from_static_plan(
-                selected_engine.numerical_execution.clone(),
-                requested_kv_storage,
-                defined.definition(),
-                prepared.family(),
-                catalog,
-                runtime,
-                compilation.executable().execution_plan(),
-                rejected,
-            )
-            .map_err(|error| FerrumError::model(error.to_string()))?;
-            resolve_model_plan(
-                &selected_engine,
-                prepared,
-                catalog,
-                runtime,
-                compilation,
-                &numerical_execution,
-            )
-        });
+            compiled.initialize(|prepared, runtime, catalog, compilation| {
+                let numerical_execution = NumericalProfileResolution::from_static_plan(
+                    selected_engine.numerical_execution.clone(),
+                    requested_kv_storage,
+                    defined.definition(),
+                    prepared.family(),
+                    catalog,
+                    runtime,
+                    compilation.executable().execution_plan(),
+                    rejected,
+                )
+                .map_err(|error| FerrumError::model(error.to_string()))?;
+                resolve_model_plan(
+                    selected_engine,
+                    prepared,
+                    catalog,
+                    runtime,
+                    compilation,
+                    &numerical_execution,
+                )
+            })
+        };
+        if q8_predecoded_composition.is_some()
+            && q8_auto_preparation_eligible(
+                engine,
+                profile,
+                composition.runtime().descriptor().ordinal,
+                probe_auto_cuda_attributes,
+            )?
+        {
+            // The compressed plan has already fixed context, concurrency and
+            // batch capacity. The optional layout cannot buy speed by lowering
+            // any of those limits. It owns a separate immutable provider cache.
+            let optional_composition = q8_predecoded_composition.as_mut().unwrap()()?;
+            let mut optional_engine = selected_engine.clone();
+            optional_engine.runtime.q8_projection_weight_preparation =
+                ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32;
+            let config = executor_config(
+                &optional_engine,
+                &model_info,
+                optional_composition.runtime(),
+            )?;
+            match optional_composition.compile_model(
+                &prepared,
+                model_info.clone(),
+                &optional_engine,
+                config,
+                materializer.clone(),
+            ) {
+                Ok(mut optional) => {
+                    let baseline_static = compiled
+                        .compilation()
+                        .executable()
+                        .execution_plan()
+                        .payload()
+                        .memory()
+                        .static_bytes();
+                    let optional_static = optional
+                        .compilation()
+                        .executable()
+                        .execution_plan()
+                        .payload()
+                        .memory()
+                        .static_bytes();
+                    // The existing provider checks physical Q8_0 leaf ABI,
+                    // transforms, staging, K and N. No added destination means
+                    // no eligible work; retain the original compressed plan.
+                    if optional_static > baseline_static {
+                        let baseline = selected_engine
+                            .runtime
+                            .startup_memory_plan
+                            .as_ref()
+                            .ok_or_else(|| {
+                                FerrumError::internal(
+                                    "Q8 Auto lost its fitted compressed memory plan",
+                                )
+                            })?;
+                        let verified = verify_optional_q8_capacity(
+                            baseline,
+                            |workload| optional.startup_peak_bytes(workload),
+                            || ferrum_kernels::backend::probe_device_memory(&engine.backend.device),
+                        )?;
+                        if let Some(verified) = verified {
+                            verified
+                                .apply_to_engine_config(&mut optional_engine)
+                                .map_err(FerrumError::config)?;
+                            optional.set_startup_memory_plan(verified)?;
+                            // No static reserve, commit, upload or KV allocation
+                            // has occurred. Release the losing runtime/modules
+                            // before initializing the selected plan exactly once.
+                            drop(compiled);
+                            drop(composition);
+                            return initialize(optional, &optional_engine);
+                        }
+                    }
+                    drop(optional);
+                }
+                Err(VNextModelCompilationError::Capacity {
+                    required_bytes,
+                    usable_capacity_bytes,
+                }) => {
+                    tracing::info!(required_bytes, usable_capacity_bytes, "Q8 Auto retained compressed storage: optional static layout exceeds capacity");
+                }
+                Err(error) => return Err(error.into()),
+            }
+            // Drop the failed probe's provider caches, modules and runtime
+            // before reserving any resources for the compressed plan.
+            drop(optional_composition);
+        }
+        return initialize(compiled, &selected_engine);
     }
     Err(FerrumError::unsupported(format!(
         "no declared numerical profile satisfies {:?} with KV dtype {}: {}",
@@ -334,6 +438,88 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             .collect::<Vec<_>>()
             .join("; ")
     )))
+}
+
+fn q8_auto_preparation_eligible(
+    engine: &EngineConfig,
+    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
+    runtime_ordinal: u32,
+    probe: impl FnOnce(
+        usize,
+    )
+        -> std::result::Result<ferrum_kernels::backend::CudaDeviceAttributes, String>,
+) -> Result<bool> {
+    if engine.runtime.q8_projection_weight_preparation
+        != ferrum_types::Q8ProjectionWeightPreparation::Auto
+        || engine.runtime.startup_memory_request.is_none()
+        || !profile.operations.iter().any(|operation| {
+            operation
+                .composite_arithmetic
+                .as_ref()
+                .is_some_and(composite_supports_q8_preparation)
+        })
+    {
+        return Ok(false);
+    }
+    let ferrum_types::Device::CUDA(ordinal) = &engine.backend.device else {
+        return Ok(false);
+    };
+    if u32::try_from(*ordinal).ok() != Some(runtime_ordinal) {
+        return Err(FerrumError::device(
+            "Q8 Auto requested device differs from the actual runtime ordinal",
+        ));
+    }
+    let attributes = probe(*ordinal).map_err(FerrumError::device)?;
+    Ok(attributes.compute_capability_major == 12
+        && attributes.compute_capability_minor == 0
+        && attributes.multiprocessor_count > 0)
+}
+
+/// Verify an optional layout at the already fitted limits. Only concrete
+/// capacity comparisons may decline it; estimation/probe errors propagate.
+fn verify_optional_q8_capacity(
+    baseline: &ferrum_types::StartupMemoryPlan,
+    mut peak: impl FnMut(ferrum_types::StartupWorkload) -> Result<u64>,
+    probe: impl FnOnce() -> Result<ferrum_types::DeviceMemorySnapshot>,
+) -> Result<Option<ferrum_types::StartupMemoryPlan>> {
+    let limits = baseline.selected;
+    let context_peak = peak(ferrum_types::StartupWorkload::Prefill {
+        context_tokens: limits.context_tokens,
+        chunk_tokens: limits.max_batch_tokens.min(limits.context_tokens),
+    })?;
+    let decode_peak = peak(ferrum_types::StartupWorkload::Decode {
+        context_tokens: limits.context_tokens,
+        active_sequences: limits.max_sequences,
+    })?;
+    let budget = baseline.request.usable_capacity_bytes;
+    if context_peak.max(decode_peak) > budget {
+        tracing::info!(
+            context_peak,
+            decode_peak,
+            budget,
+            "Q8 Auto retained compressed storage: optional layout exceeds fixed startup capacity"
+        );
+        return Ok(None);
+    }
+    // Both runtimes are still alive here, so the observed free bytes already
+    // account for the trial's module/driver footprint. Keep the original budget
+    // fully backed rather than silently shrinking it to fit the trial.
+    let observed = probe()?;
+    if observed.capacity_bytes != baseline.request.device.capacity_bytes
+        || observed.available_bytes > observed.capacity_bytes
+    {
+        return Err(FerrumError::device(
+            "Q8 Auto memory observation differs from the selected device capacity",
+        ));
+    }
+    if observed.available_bytes < budget {
+        tracing::info!(available_bytes = observed.available_bytes, budget, "Q8 Auto retained compressed storage: driver/module footprint leaves insufficient budget headroom");
+        return Ok(None);
+    }
+    let mut verified = baseline.clone();
+    verified.context_peak_bytes = context_peak;
+    verified.decode_peak_bytes = decode_peak;
+    Ok(Some(verified))
 }
 
 fn probe_auto_cuda_attributes(
@@ -1027,6 +1213,199 @@ mod tests {
             compute_capability_minor: 0,
             multiprocessor_count: 32,
         }
+    }
+
+    fn q8_compressed_capacity() -> ferrum_types::StartupMemoryPlan {
+        use ferrum_types::{DeviceMemorySnapshot, StartupMemoryRequest, StartupResourceLimits};
+        ferrum_types::fit_startup_resources(
+            &StartupMemoryRequest {
+                device: DeviceMemorySnapshot {
+                    capacity_bytes: 16_384,
+                    available_bytes: 12_288,
+                    source: "selected-device-memory".into(),
+                },
+                usable_capacity_bytes: 8192,
+                context_is_explicit: false,
+                sequences_is_explicit: true,
+                batch_is_explicit: false,
+            },
+            StartupResourceLimits {
+                context_tokens: 128,
+                max_sequences: 4,
+                max_batch_tokens: 16,
+            },
+            |_| Ok(4096),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn q8_auto_requires_budget_exact_profile_and_selected_device_attributes() {
+        use ferrum_types::Q8ProjectionWeightPreparation as Preparation;
+        let profile = q6_auto_profile();
+        let mut engine = EngineConfig::default();
+        engine.backend.device = ferrum_types::Device::CUDA(3);
+        engine.runtime.q8_projection_weight_preparation = Preparation::Auto;
+        engine.runtime.startup_memory_request = Some(q8_compressed_capacity().request);
+        assert!(
+            q8_auto_preparation_eligible(&engine, &profile, 3, |ordinal| {
+                assert_eq!(ordinal, 3);
+                Ok(qualified_q6_device())
+            })
+            .unwrap()
+        );
+        assert!(q8_auto_preparation_eligible(&engine, &profile, 0, |_| {
+            panic!("must not probe a device other than the runtime owner")
+        })
+        .is_err());
+        assert!(q8_auto_preparation_eligible(&engine, &profile, 3, |_| {
+            Err("driver query failed".into())
+        })
+        .is_err());
+        for (major, minor, count) in [(8, 9, 32), (12, 1, 32), (12, 0, 0)] {
+            assert!(!q8_auto_preparation_eligible(&engine, &profile, 3, |_| {
+                Ok(ferrum_kernels::backend::CudaDeviceAttributes {
+                    compute_capability_major: major,
+                    compute_capability_minor: minor,
+                    multiprocessor_count: count,
+                })
+            })
+            .unwrap());
+        }
+        let mut unrelated = profile.clone();
+        unrelated.operations.iter_mut().for_each(|operation| {
+            operation.composite_arithmetic = None;
+        });
+        assert!(!q8_auto_preparation_eligible(&engine, &unrelated, 3, |_| {
+            panic!("unsupported numerical contracts must not reach the CUDA probe")
+        })
+        .unwrap());
+        for mode in [Preparation::Compressed, Preparation::PredecodedF32] {
+            engine.runtime.q8_projection_weight_preparation = mode;
+            assert!(!q8_auto_preparation_eligible(&engine, &profile, 3, |_| {
+                panic!("explicit preparation keeps its original behavior")
+            })
+            .unwrap());
+        }
+        engine.runtime.q8_projection_weight_preparation = Preparation::Auto;
+        engine.runtime.startup_memory_request = None;
+        assert!(!q8_auto_preparation_eligible(&engine, &profile, 3, |_| {
+            panic!("Auto cannot allocate optional storage without a fitted budget")
+        })
+        .unwrap());
+        engine.runtime.startup_memory_request = Some(q8_compressed_capacity().request);
+        engine.backend.device = ferrum_types::Device::CPU;
+        assert!(!q8_auto_preparation_eligible(&engine, &profile, 0, |_| {
+            panic!("CPU Auto must remain compressed")
+        })
+        .unwrap());
+    }
+
+    #[test]
+    fn q8_auto_optional_capacity_preserves_limits_and_checks_both_workloads() {
+        use ferrum_types::StartupWorkload;
+        let baseline = q8_compressed_capacity();
+        let mut seen = Vec::new();
+        let verified = verify_optional_q8_capacity(
+            &baseline,
+            |workload| {
+                seen.push(workload);
+                Ok(match workload {
+                    StartupWorkload::Prefill { .. } => 8192,
+                    StartupWorkload::Decode { .. } => 8191,
+                })
+            },
+            || {
+                Ok(ferrum_types::DeviceMemorySnapshot {
+                    available_bytes: 8192,
+                    ..baseline.request.device.clone()
+                })
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                StartupWorkload::Prefill {
+                    context_tokens: 128,
+                    chunk_tokens: 16
+                },
+                StartupWorkload::Decode {
+                    context_tokens: 128,
+                    active_sequences: 4
+                },
+            ]
+        );
+        assert_eq!(verified.request, baseline.request);
+        assert_eq!(verified.requested, baseline.requested);
+        assert_eq!(verified.selected, baseline.selected);
+        assert_eq!(verified.reasons, baseline.reasons);
+        assert_eq!(
+            (verified.context_peak_bytes, verified.decode_peak_bytes),
+            (8192, 8191)
+        );
+        for prefill_overflow in [true, false] {
+            assert!(verify_optional_q8_capacity(
+                &baseline,
+                |workload| Ok(
+                    if matches!(workload, StartupWorkload::Prefill { .. }) == prefill_overflow {
+                        8193
+                    } else {
+                        8192
+                    }
+                ),
+                || panic!("a static capacity refusal needs no driver probe"),
+            )
+            .unwrap()
+            .is_none());
+        }
+        assert!(
+            verify_optional_q8_capacity(
+                &baseline,
+                |_| Ok(8192),
+                || Ok(ferrum_types::DeviceMemorySnapshot {
+                    available_bytes: 8191,
+                    ..baseline.request.device.clone()
+                }),
+            )
+            .unwrap()
+            .is_none(),
+            "module footprint must not reduce the previously fixed budget"
+        );
+    }
+
+    #[test]
+    fn q8_auto_optional_capacity_never_masks_estimator_or_driver_errors() {
+        let baseline = q8_compressed_capacity();
+        assert!(matches!(
+            verify_optional_q8_capacity(
+                &baseline,
+                |_| Err(FerrumError::model("invalid provider shape")),
+                || panic!("invalid provider metadata must abort before the memory probe"),
+            ),
+            Err(FerrumError::Model { .. })
+        ));
+        assert!(matches!(
+            verify_optional_q8_capacity(
+                &baseline,
+                |_| Ok(4096),
+                || Err(FerrumError::device("memory query failed")),
+            ),
+            Err(FerrumError::Device { .. })
+        ));
+        assert!(matches!(
+            verify_optional_q8_capacity(
+                &baseline,
+                |_| Ok(4096),
+                || Ok(ferrum_types::DeviceMemorySnapshot {
+                    capacity_bytes: baseline.request.device.capacity_bytes / 2,
+                    available_bytes: 8192,
+                    source: "changed-capacity".into(),
+                }),
+            ),
+            Err(FerrumError::Device { .. })
+        ));
     }
 
     #[test]

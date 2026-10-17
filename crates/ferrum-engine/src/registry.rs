@@ -1484,10 +1484,10 @@ fn create_registered_vnext_executor(
                     "device.cuda.{ordinal}"
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
-                let composition =
+                let create_composition = |q8_preparation| {
                     ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_causal_decode_kv_reuse(
                         *ordinal,
-                        device_id,
+                        device_id.clone(),
                         crate::product_composition::cuda_attention_policy_for_kv(
                             config.engine_config.runtime.attention_execution_policy,
                             config.engine_config.kv_cache.dtype,
@@ -1500,12 +1500,20 @@ fn create_registered_vnext_executor(
                         config.engine_config.runtime.q4_mmvq_weight_decode,
                         config.engine_config.runtime.q5_mmvq_weight_decode,
                         causal_decode_execution_context_limit(config)?,
-                        config.engine_config.runtime.q8_projection_weight_preparation,
+                        q8_preparation,
                         config.engine_config.runtime.causal_decode_kv_reuse,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
-                    })?;
+                    })
+                };
+                let composition = create_composition(config.engine_config.runtime.q8_projection_weight_preparation)?;
+                let mut optional_q8_composition = || {
+                    let (runtime, operations, materializers, catalog) = create_composition(
+                        ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32,
+                    )?.into_parts();
+                    Ok(ferrum_models::VNextRuntimeComposition::new(runtime, operations, materializers, catalog))
+                };
                 let (
                     runtime,
                     operation_registry,
@@ -1520,6 +1528,7 @@ fn create_registered_vnext_executor(
                     weight_materializers,
                     catalog,
                     ferrum_kernels::backend::cuda::vnext_ops::cuda_weight_materializer_selection,
+                    Some(&mut optional_q8_composition),
                 )?;
                 info!(
                     resolved_plan_fingerprint = executor
@@ -1580,6 +1589,7 @@ fn create_registered_vnext_executor(
                 weight_materializers,
                 catalog,
                 |_| Ok(weight_materializer_selection.clone()),
+                None,
             )?;
             info!(
                 resolved_plan_fingerprint = executor
@@ -1607,7 +1617,7 @@ fn create_registered_vnext_executor(
             );
             let executor = crate::product_composition::create_vnext_executor(
                 &config.engine_config, prepared.as_ref(), runtime, operation_registry,
-                weight_materializers, catalog, |_| Ok(selection.clone()),
+                weight_materializers, catalog, |_| Ok(selection.clone()), None,
             )?;
             info!(
                 resolved_plan_fingerprint = executor.resolved_model_plan().map(|plan| plan.fingerprint()).unwrap_or("missing"),
@@ -2977,6 +2987,119 @@ mod tests {
         ComponentConfig::from_engine_config(&engine_config)
     }
 
+    #[test]
+    fn optional_layout_compilation_drops_trial_before_one_terminal_initialization() {
+        use ferrum_interfaces::vnext::{DeviceId, ExecutablePlanView, WeightMaterializerSelection};
+        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
+        use ferrum_models::{
+            VNextExecutorConfig, VNextModelCompilationError, VNextRuntimeComposition,
+        };
+
+        let dir = write_qwen35_fixture_model_dir();
+        // Compilation needs source identity, not a tokenizer execution fixture.
+        std::fs::write(dir.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
+        let defined = ferrum_models::vnext::qwen35::define_from_model_dir(&dir).unwrap();
+        let mut engine = qwen35_fixture_component_config(&dir).engine_config;
+        engine.scheduler.max_running_requests = 4;
+        engine.batching.max_num_batched_tokens = 8;
+        engine.backend.enable_reusable_execution = false;
+        let profile = defined
+            .definition()
+            .numerical_profiles()
+            .candidates(
+                &engine.numerical_execution,
+                ferrum_types::KvStorageFormat::F16,
+            )
+            .unwrap()[0]
+            .id
+            .clone();
+        let prepared = defined.prepare(&profile).unwrap();
+        let info = prepared.model_info(engine.model.model_id.clone(), Device::CPU);
+        let composition = || {
+            let (runtime, operations, materializers, materializer, catalog) =
+                CpuVNextComposition::create(
+                    DeviceId::new(format!("device.cpu.optional-{}", uuid::Uuid::new_v4())).unwrap(),
+                    16 * 1024 * 1024,
+                )
+                .unwrap()
+                .into_parts()
+                .unwrap();
+            let observed = Arc::downgrade(&runtime);
+            (
+                VNextRuntimeComposition::new(runtime, operations, materializers, catalog),
+                materializer,
+                observed,
+            )
+        };
+        let (retained, materializer, retained_owner) = composition();
+        let config =
+            VNextExecutorConfig::from_engine_config(&engine, &info, retained.runtime()).unwrap();
+        let compiled = retained
+            .compile_model(
+                &prepared,
+                info.clone(),
+                &engine,
+                config,
+                WeightMaterializerSelection::exact(materializer.clone()),
+            )
+            .unwrap();
+        assert_eq!(retained.runtime().peak_resident_bytes(), 0);
+
+        let (trial, trial_materializer, trial_owner) = composition();
+        let mut trial_engine = engine.clone();
+        trial_engine.memory.usable_capacity_bytes = Some(
+            usize::try_from(
+                compiled
+                    .compilation()
+                    .executable()
+                    .execution_plan()
+                    .payload()
+                    .memory()
+                    .static_bytes()
+                    - 1,
+            )
+            .unwrap(),
+        );
+        let trial_config =
+            VNextExecutorConfig::from_engine_config(&trial_engine, &info, trial.runtime()).unwrap();
+        assert!(matches!(
+            trial.compile_model(
+                &prepared,
+                info,
+                &trial_engine,
+                trial_config,
+                WeightMaterializerSelection::exact(trial_materializer)
+            ),
+            Err(VNextModelCompilationError::Capacity { .. })
+        ));
+        assert_eq!(trial.runtime().peak_resident_bytes(), 0);
+        drop(trial);
+        assert!(
+            trial_owner.upgrade().is_none(),
+            "rejected composition must release its runtime owners"
+        );
+
+        // A terminal initialization failure consumes the retained plan. It must
+        // not be interpreted as permission to retry another storage layout.
+        let mut initializations = 0;
+        let error = compiled
+            .initialize(|_, _, _, _| {
+                initializations += 1;
+                Err(FerrumError::device("terminal initialization failure"))
+            })
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, FerrumError::Device { message } if message == "terminal initialization failure")
+        );
+        assert_eq!(initializations, 1);
+        assert_eq!(retained.runtime().peak_resident_bytes(), 0);
+        drop(retained);
+        assert!(retained_owner.upgrade().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn startup_memory_real_cpu_plan_fits_before_upload_and_reaches_engine_config() {
         use ferrum_interfaces::vnext::{
@@ -3021,6 +3144,7 @@ mod tests {
                 materializers,
                 catalog,
                 |_| Ok(WeightMaterializerSelection::exact(materializer.clone())),
+                None,
             );
             (observed, executor)
         };
@@ -3598,6 +3722,12 @@ mod tests {
         for device in [Device::CPU, Device::CUDA(0)] {
             config.device = device;
             for plan_runtime in [false, true] {
+                config
+                    .engine_config
+                    .runtime
+                    .q8_projection_weight_preparation =
+                    ferrum_types::Q8ProjectionWeightPreparation::Auto;
+                validate_causal_decode_preparation_mode(&config, plan_runtime).unwrap();
                 config
                     .engine_config
                     .runtime
