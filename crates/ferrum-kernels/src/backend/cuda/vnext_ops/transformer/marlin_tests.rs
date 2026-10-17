@@ -454,7 +454,7 @@ fn marlin_fp8_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on
             name: "fp8-single-group",
             rows: 1,
             input_features: 128,
-            output_features: 128,
+            output_features: 256,
         },
         Fixture {
             name: "fp8-decode-split-k",
@@ -466,7 +466,7 @@ fn marlin_fp8_invocation_workspace_dirty_reuse_and_graph_replay_are_bit_exact_on
             name: "fp8-prefill-m-split",
             rows: 65,
             input_features: 512,
-            output_features: 128,
+            output_features: 256,
         },
     ]
     .into_iter()
