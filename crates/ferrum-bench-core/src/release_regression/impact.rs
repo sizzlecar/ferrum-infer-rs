@@ -70,7 +70,8 @@ pub(super) fn path_backend(path: &str) -> Option<Backend> {
     if !valid_relative_path(path) {
         return None;
     }
-    if cuda_build_descriptor(path) {
+    if cuda_build_descriptor(path) || cuda_operator_source(path) || cuda_operator_distribution(path)
+    {
         return Some(Backend::Cuda);
     }
     let relative = path.strip_prefix("crates/ferrum-kernels/src/backend/")?;
@@ -100,7 +101,9 @@ fn cuda_build_descriptor(path: &str) -> bool {
         return false;
     };
     let suffix = match directory {
-        "source-bundles" | "source-definitions" | "package-definitions" => ".json",
+        "source-bundles" | "source-definitions" | "package-definitions" | "source-overlays" => {
+            ".json"
+        }
         "source-locks" => ".plan.json",
         _ => return false,
     };
@@ -108,6 +111,39 @@ fn cuda_build_descriptor(path: &str) -> bool {
         && filename
             .strip_suffix(suffix)
             .is_some_and(|stem| !stem.is_empty())
+}
+
+/// Reviewed native adapter families. Keep arbitrary nested files and new source
+/// directories unmapped until their build and runtime ownership is established.
+fn cuda_operator_member(path: &str) -> Option<&str> {
+    let relative = path.strip_prefix("native-operators/cuda/")?;
+    let (directory, filename) = relative.split_once('/')?;
+    (matches!(
+        directory,
+        "upstream-linear"
+            | "upstream-extra-linear"
+            | "upstream-q6-f32-linear"
+            | "vllm-paged-attention-indexed"
+    ) && !filename.is_empty()
+        && !filename.contains('/'))
+    .then_some(filename)
+}
+
+fn cuda_operator_source(path: &str) -> bool {
+    cuda_operator_member(path).is_some_and(|filename| {
+        [".cu", ".cuh", ".h"].into_iter().any(|suffix| {
+            filename
+                .strip_suffix(suffix)
+                .is_some_and(|stem| !stem.is_empty())
+        })
+    })
+}
+
+fn cuda_operator_distribution(path: &str) -> bool {
+    matches!(
+        cuda_operator_member(path),
+        Some("README.md" | "llama-MIT.txt")
+    )
 }
 
 fn cargo_integration_target(relative: &str) -> bool {
@@ -181,6 +217,14 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return Some((vec![Build, Kernel],
             "declared CUDA native source/package manifests and locked compiler inputs: retain artifact/ABI validation and CUDA operator coverage; model architecture is a separate source owner"));
     }
+    if cuda_operator_source(path) {
+        return Some((vec![Build, Kernel],
+            "declared CUDA native adapter sources and headers, including diagnostic variants: retain artifact/ABI, operator numerics, boundaries and model-forward obligations"));
+    }
+    if cuda_operator_distribution(path) {
+        return Some((vec![Build],
+            "declared CUDA native packaging instructions and license inputs; retain distribution validation without treating them as operator implementations"));
+    }
     if path.starts_with(".github/workflows/")
         || path.starts_with(".github/ci/")
         || matches!(
@@ -220,6 +264,7 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
                 "tests/support/http_fixture.rs"
                     | "tests/unix_bootstrap/candidate.rs"
                     | "tests/unix_bootstrap/reuse.rs"
+                    | "tests/unix_bootstrap/cuda.rs"
                     | "tests/windows_bootstrap/installed.rs"
             )
         {
@@ -576,10 +621,17 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
     if matches!(
         relative,
         "src/arrivals.rs"
+            | "src/client_slo.rs"
+            | "src/client_slo/tests.rs"
+            | "src/dataset.rs"
+            | "src/dataset/records.rs"
+            | "src/dataset/records/tests.rs"
             | "src/decode_isolation.rs"
             | "src/env.rs"
             | "src/report.rs"
             | "src/stats.rs"
+            | "src/sse_text_event_gap.rs"
+            | "src/sse_text_event_gap/tests.rs"
             | "examples/model_gate.rs"
             | "examples/checkpoint_diff.rs"
             | "examples/checkpoint_diff/directory.rs"
@@ -599,6 +651,7 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "tests/release_staging_workflows.rs"
             | "tests/release_staging_workflows/installer.rs"
             | "tests/release_staging_workflows/windows_build.rs"
+            | "tests/release_staging_workflows/cuda_delivery.rs"
     ) || relative.starts_with("src/release_regression/")
         || relative.starts_with("src/release_candidate/")
         || relative.starts_with("examples/release_candidate/")
@@ -673,6 +726,7 @@ mod tests {
             "native-operators/cuda/source-definitions/marlin.json",
             "native-operators/cuda/package-definitions/vllm-paged-attention-v2.json",
             "native-operators/cuda/source-locks/vllm-moe-marlin.plan.json",
+            "native-operators/cuda/source-overlays/vllm-paged-attention-indexed.json",
         ];
         for path in descriptors {
             assert_eq!(path_backend(path), Some(Backend::Cuda));
@@ -694,6 +748,8 @@ mod tests {
             "native-operators/cuda/kernels/marlin.cu",
             "native-operators/cuda/source-definitions/dispatch.cu",
             "native-operators/cuda/source-definitions/nested/config.json",
+            "native-operators/cuda/source-overlays/nested/config.json",
+            "native-operators/cuda/source-overlays/launcher.cu",
             "native-operators/cuda/source-locks/not-a-plan.json",
             "native-operators/cuda/source-definitions/.json",
             "native-operators/metal/source-definitions/operator.json",
@@ -707,6 +763,51 @@ mod tests {
     }
 
     #[test]
+    fn declared_native_cuda_sources_keep_operator_scope_and_distribution_keeps_build() {
+        let sources = [
+            "native-operators/cuda/upstream-linear/mmq.cu",
+            "native-operators/cuda/upstream-linear/mmvq-shared-weight-decode-test.cu",
+            "native-operators/cuda/upstream-extra-linear/abi.h",
+            "native-operators/cuda/upstream-q6-f32-linear/f16_adapter.cuh",
+            "native-operators/cuda/vllm-paged-attention-indexed/launcher_gqa2_test.cu",
+        ];
+        for path in sources {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, [ChangeArea::Kernel, ChangeArea::Build]);
+            assert_eq!(path_backend(path), Some(Backend::Cuda));
+            assert!(impact.unknown_paths.is_empty(), "{path}");
+        }
+        for path in [
+            "native-operators/cuda/upstream-linear/README.md",
+            "native-operators/cuda/upstream-extra-linear/llama-MIT.txt",
+            "native-operators/cuda/upstream-q6-f32-linear/llama-MIT.txt",
+            "native-operators/cuda/vllm-paged-attention-indexed/README.md",
+        ] {
+            assert_eq!(analyze_paths([path]).areas, [ChangeArea::Build]);
+            assert_eq!(path_backend(path), Some(Backend::Cuda));
+        }
+        for unknown in [
+            "native-operators/cuda/new-operator/mmq.cu",
+            "native-operators/cuda/upstream-linear/nested/mmq.cu",
+            "native-operators/cuda/upstream-linear/build.sh",
+            "native-operators/cuda/upstream-linear/unknown.txt",
+            "native-operators/cuda/upstream-linear/.cu",
+            "native-operators/cuda/upstream-linear/../mmq.cu",
+        ] {
+            let impact = analyze_paths([sources[0], unknown]);
+            assert_eq!(impact.areas, ALL_AREAS, "{unknown}");
+            assert_eq!(impact.unknown_paths, [unknown]);
+            assert_eq!(path_backend(unknown), None);
+        }
+        let shared = "crates/ferrum-models/src/lib.rs";
+        let mixed = analyze_paths([sources[0], shared]);
+        for area in analyze_paths([shared]).areas {
+            assert!(mixed.areas.contains(&area));
+        }
+        assert_eq!(path_backend(shared), None);
+    }
+
+    #[test]
     fn private_integration_targets_and_declared_fixtures_do_not_reclassify_unknown_helpers() {
         for path in [
             "crates/ferrum-devtools/tests/unix_bootstrap.rs",
@@ -715,6 +816,7 @@ mod tests {
             "crates/ferrum-devtools/tests/support/http_fixture.rs",
             "crates/ferrum-devtools/tests/unix_bootstrap/candidate.rs",
             "crates/ferrum-devtools/tests/unix_bootstrap/reuse.rs",
+            "crates/ferrum-devtools/tests/unix_bootstrap/cuda.rs",
             "crates/ferrum-devtools/tests/windows_bootstrap/installed.rs",
             "crates/ferrum-devtools/README.md",
             "crates/ferrum-cli/src/source_resolver/cache/tests.rs",
@@ -1109,6 +1211,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn client_measurement_modules_keep_validation_without_hiding_production_or_unknown_paths() {
+        let measurement = [
+            "crates/ferrum-bench-core/src/client_slo.rs",
+            "crates/ferrum-bench-core/src/client_slo/tests.rs",
+            "crates/ferrum-bench-core/src/dataset.rs",
+            "crates/ferrum-bench-core/src/dataset/records.rs",
+            "crates/ferrum-bench-core/src/dataset/records/tests.rs",
+            "crates/ferrum-bench-core/src/sse_text_event_gap.rs",
+            "crates/ferrum-bench-core/src/sse_text_event_gap/tests.rs",
+            "crates/ferrum-bench-core/tests/release_staging_workflows/cuda_delivery.rs",
+        ];
+        for path in measurement {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, [ChangeArea::Validation]);
+            assert!(impact.unknown_paths.is_empty(), "{path}");
+        }
+        for unknown in [
+            "crates/ferrum-bench-core/src/dataset/runtime.rs",
+            "crates/ferrum-bench-core/src/client_slo/new_policy.rs",
+            "crates/ferrum-bench-core/tests/release_staging_workflows/unknown.rs",
+        ] {
+            let impact = analyze_paths(measurement.into_iter().chain([unknown]));
+            assert_eq!(impact.areas, ALL_AREAS);
+            assert_eq!(impact.unknown_paths, [unknown]);
+        }
+        let mixed = analyze_paths(measurement.into_iter().chain([
+            "crates/ferrum-bench-core/src/lib.rs",
+            "native-operators/cuda/upstream-linear/mmq.cu",
+        ]));
+        assert_eq!(
+            mixed.areas,
+            [
+                ChangeArea::Kernel,
+                ChangeArea::Build,
+                ChangeArea::Observability,
+                ChangeArea::Validation,
+            ]
+        );
     }
 
     #[test]
