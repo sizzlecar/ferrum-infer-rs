@@ -4,399 +4,85 @@
   </a>
 </p>
 
-[![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
+[English](README.md) · [Crates.io](https://crates.io/crates/ferrum-cli) · [MIT](LICENSE)
 
-# 用一个二进制文件提供大模型服务。
+# Ferrum
 
-通过 OpenAI 兼容 API，将本地大模型接入你的应用和编程 Agent。
-Ferrum 使用 Rust 编写，以单个二进制文件运行，支持 Apple Silicon Metal 和
-[兼容的 NVIDIA GPU](#安装) 上的 CUDA。推理服务自身无需 Python 运行时。
+Rust 编写的本地大模型推理引擎，一个二进制提供终端对话和 OpenAI 兼容 API，无需 Python 运行时。
 
-[English](README.md)
+核心目标是在满足延迟 SLO 的前提下，最大化输出吞吐：
 
-| 你想做什么？ | 从这里开始 |
-|---|---|
-| 安装 Ferrum | [快速开始](#快速开始) · [更多安装方式](#安装) |
-| 在终端运行模型 | [运行模型](#运行模型) |
-| 接入应用或编程 Agent | [启动 API 服务](#启动-api-服务) · [连接应用](#连接应用或编程-agent) |
-| 查看模型与格式 | [支持的模型与示例](#支持的模型与示例) |
+$$
+\max\;\text{输出 token/s}\quad\text{s.t.}\quad Q_{p_x}(x)\le S_x,\quad x\in\{\mathrm{TTFT},\mathrm{TPOT},\mathrm{ITL}\}
+$$
 
-## 功能
+其中 TTFT 是首字延迟，TPOT 是平均输出 token 间隔，ITL 是相邻可见文本更新的间隔；分位数和阈值按负载预先约定。这是项目目标，当前结果尚未全部达成。
 
-- 一个 Rust 二进制同时提供 `ferrum run` 和 `ferrum serve`。
-- 支持 OpenAI 兼容的 Chat Completions 与无状态 Responses API、流式输出、
-  tools 和 structured output。
-- 同一 runtime 覆盖 Apple Silicon Metal 与 NVIDIA CUDA。
-- 支持 continuous batching、paged KV cache、prefix cache 和 typed admission。
-- 支持在兼容的 vNext Metal、portable CUDA 路径选择 8-bit KV，默认保持 FP16。
-- Metal 与 CUDA 均支持 GGUF；CUDA 还支持 GPTQ/safetensors。
-- 模型示例包括 Qwen3.5 4B、Qwen3 30B-A3B 和 Llama 3.1 8B dense，
-  详见[支持的模型与示例](#支持的模型与示例)。
+## 安装与使用
 
-Ferrum 专注于语言模型推理。
+macOS Apple Silicon / Linux x86_64：
 
-## 快速开始
-
-在 macOS Apple Silicon 或 Linux x86_64 上安装 Ferrum 最新正式版：
-
-```bash
+```sh
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 ```
 
-安装脚本会校验发布包，并将 `~/.local/bin` 加入 shell 的 PATH；完成后打开新终端。
-也可以使用 [Homebrew 或手动安装](#安装)。
-
-Windows x64 支持 CPU 推理及兼容的 NVIDIA sm89 显卡。在 PowerShell 中执行：
+Windows x64，在 PowerShell 中执行：
 
 ```powershell
 irm https://ferrum.pandaailabs.com/install.ps1 | iex
 ```
 
-脚本校验 setup 的 SHA256 后为当前用户安装，并自动添加 PATH；当前 PowerShell 也会立即生效。
+脚本校验发布包并配置 PATH；安装后打开新终端。再次执行即可升级，模型与配置保留。命令获取最新已发布正式版。
 
-没有受支持的 GPU 时，安装脚本会选择 CPU 版本。安装包优先通过 Cloudflare CDN 下载，
-保留 SHA256 校验，下载失败时回退到 GitHub。再次执行同一命令即可安装最新正式版。
+macOS 使用 Metal；Linux/WSL CUDA 支持 SM89（CUDA 12.4），SM120（CUDA 12.8）需 v0.13.0 或更新版本，需匹配的 NVIDIA 驱动及 CUDA/NCCL 运行库。Windows 与 Homebrew CUDA 面向 SM89；Windows 包内含 CUDA/VC 运行库，驱动需单独安装。自动安装在 GPU 不受支持或 CUDA 无法启动时回退 CPU；指定版本缺少对应资产会明确报错。
 
-下载权重前先检查安装的二进制：
+运行同一个 GGUF 示例，选择终端对话或 API 服务：
 
-```bash
-ferrum --version
-ferrum --help
-ferrum doctor
-```
-
-### 运行模型
-
-在 **Ferrum 0.9.0 及以上版本**中，macOS、Linux 和 Windows 使用同一个 GGUF 模型、
-同一条命令。Ferrum 自动选择可用后端；Metal 和 CUDA 均支持此 Q4_K_M 示例。
-
-```bash
+```sh
 ferrum run qwen3.5:4b-q4_k_m --disable-thinking
-```
-
-首次运行会下载约 **2.55 GiB**。下载耗时取决于本机到 Hugging Face 的网络链路，
-CLI 会显示下载进度。Ferrum 会在启动时根据可用内存适配上下文、批处理和并发。
-
-### 启动 API 服务
-
-三个平台的服务启动命令也相同：
-
-```bash
 ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000
 ```
 
-然后从另一个终端发送请求。macOS 或 Linux：
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
-```
-
-Windows PowerShell：
-
-```powershell
-$body = @{ model = 'ferrum'; messages = @(@{ role = 'user'; content = 'Reply with a short hello from Ferrum.' }); max_tokens = 32 } | ConvertTo-Json -Depth 4
-Invoke-RestMethod http://localhost:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body
-```
+首次运行自动下载权重；上下文、批处理及并发按可用内存适配，显式设置优先。示例关闭思考，删除 `--disable-thinking` 即恢复模型模板默认行为。
 
-Ferrum 不会静默选择模型。`run` 必须提供 MODEL；`serve` 必须提供 `--model`，
-或者在 `ferrum.toml` 中有意设置 `default_model`。
+应用的 API 地址设为 `http://127.0.0.1:8000/v1`，模型名设为 `ferrum`。支持 Chat Completions、无状态 Responses、流式输出、工具调用和结构化输出，具体字段见 [API 兼容说明](docs/openai-api-compatibility.md)。下载资产与发行状态见 [Releases](https://github.com/sizzlecar/ferrum-infer-rs/releases)。
 
-正常时请求会返回 HTTP 200 和非空的 assistant 回答。原生 `run` 和 `serve`
-从模型声明的上下文上限出发，根据设备当前可用内存，自动适配未指定的上下文、
-批次和并发设置，并在启动时显示生效值。显式设置会被保留；容量不足时明确报错。
-上下文上限包含渲染后的输入与输出。
+## 模型与格式
 
-示例使用 `--disable-thinking`，让首次回答简短直接。删除该参数即可恢复模型模板默认的
-推理行为；HTTP 请求也可以通过 `chat_template_kwargs.enable_thinking`、Chat 的
-`reasoning_effort` 或 Responses 的 `reasoning.effort` 覆盖服务端默认值。
-模型支持范围及兼容行为见 [API 说明](docs/openai-api-compatibility.md#chat-fields)。
+文本架构包括 Llama、Mistral、Qwen2/Qwen3、Qwen3 MoE、Qwen3.5 dense/MoE 和 Gemma 3。支持 GGUF（含 Q4_K/Q5_K/Q6_K/Q8_0）与 SafeTensors；部分 CUDA 路径支持 GPTQ INT4、compressed-tensors INT4 和 block-FP8。Gemma 4 W4A16、GPT-OSS MXFP4 为专用 CUDA 文本路径；PQ2_0 完整模型目前仅在 Metal 实测。
 
-`GET /v1/models` 还提供可选的 `reasoning` 元数据：`thinking.default_enabled`
-表示受支持思考开关的服务端实际默认值，`supported_efforts` 列出模型明确声明的强度档位。
-支持思考开关不代表支持 low/medium/high；省略档位字段表示支持情况未知。
+并非任意架构、格式和设备组合都受支持，也不由文本支持推断视觉能力；范围见[回归目录](docs/release-regression-catalog.md)。
 
-`ferrum doctor <MODEL>` 会解析模型来源并打印下一条 `run`、`serve` 命令，
-不会下载模型或启动推理引擎。
+默认执行策略按设备、算子能力和容量选择；合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积，数值路径或批布局可能改变输出。`--numerical-profile qwen3_5.f32-master` 保留原混合精度参考路径，见[数值执行策略](docs/numerical-execution.zh.md)与[缓存说明](docs/cache-product.md)。
 
-### 连接应用或编程 Agent
+## 近期性能
 
-将应用的 OpenAI 兼容 API 地址设为 `http://127.0.0.1:8000/v1`，模型名使用
-`GET /v1/models` 返回的名称（上面的快速开始示例为 `ferrum`）。例如，安装 [Orchestral](https://github.com/sizzlecar/orchestral#install)
-后，在项目目录运行：
+RTX 5090、Qwen3.8-27B、固定 ShareGPT 样本；服务容量保持 32 槽、上下文及批处理上限均为 2048。每格正式 200 请求 × 2 轮，每轮另有 8 次预热，协议错误为 0。以下为 v0.13.0 候选的正式测量，单位为输出 token/s；两轮按总成功输出 usage token ÷ 总正式时长合并。
 
-```sh
-orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
-```
+**GGUF Q4_K_M，同文件对比 llama.cpp b11429：**
 
-支持的请求字段、工具调用与流式输出见 [API 兼容说明](docs/openai-api-compatibility.md)。
+| 并发 | Ferrum | llama.cpp | Ferrum / llama.cpp |
+| ---: | ---: | ---: | ---: |
+| 4 | 179.25 | 170.13 | 105.36% |
+| 8 | 356.42 | 291.60 | 122.23% |
+| 16 | 535.51 | 377.41 | 141.89% |
+| 32 | 666.24 | 435.57 | 152.96% |
 
-### 运行时设置
+**compressed-tensors INT4、group size 32，对比 vLLM 0.31：**
 
-`run` 与 `serve` 共用 CUDA 默认执行策略，按模型声明、已编译算子、实际设备和
-可用内存自动选择；显式 CLI 或配置值优先。这些默认优化不要求关闭缓存、忽略 EOS
-或关闭思考。
+| 并发 | Ferrum | vLLM | Ferrum / vLLM |
+| ---: | ---: | ---: | ---: |
+| 4 | 210.32 | 233.45 | 90.09% |
+| 8 | 374.32 | 447.06 | 83.73% |
+| 16 | 654.04 | 733.86 | 89.12% |
+| 32 | 836.79 | 1035.09 | 80.84% |
 
-默认数值策略 `auto` 可为已通过资格的 CUDA `sm120` GGUF 组合选择
-`qwen3_5.f32-master.gguf-q6-head.q6-f16-mmq-v1`，包含该 profile 声明的8位激活量化
-和整数点积，因此数值路径会发生变化，也不保证不同批大小或请求布局下的贪心输出一致。
-显式指定 `--numerical-profile qwen3_5.f32-master`
-可保留原有混合精度参考路径。其他格式、设备和后端不因此获得支持，详见
-[数值执行策略](docs/numerical-execution.zh.md)。
+多档延迟 SLO 未通过；吞吐过线不代表 SLO 达成。INT4 对比中 Ferrum 的激活/KV 为 FP16，vLLM 为 BF16；C32 第二轮比例为 **78.91%**，未证明每轮稳定达到 80%。同 GGUF 文件也不等于内部算术相同，零协议错误不等于所有回答语义正确。这些结果仅覆盖上述模型、硬件与负载。
 
-vNext 的 `run` 和 `serve` 共用工作目录下 `ferrum.toml` 中的可选设置：
+完整配置、TTFT/TPOT/可见 SSE ITL 的 P50/P99、显存与内存峰值、质量边界见[结果与决定](docs/performance-popular-models-p0.zh.md)。联合 SLO 优化安排在下一版本。
 
-```toml
-[runtime]
-reusable_execution_preparation = "auto" # auto、startup、on_demand
-```
+## 项目说明
 
-`auto` 在声明支持的运行时（目前为 CUDA）使用有容量上限的按需准备：
-新形状先普通执行，后续再次出现时才准备并复用设备程序，因此首次使用的延迟可能高于稳定运行时。
-`startup` 在服务就绪前预备配置指定的形状；其他后端保持原有行为，显式指定不支持的
-`on_demand` 会报错。设置 `reusable_execution = false` 可关闭设备程序准备。
-这些选项不改变请求准入、排队或模型数值策略。
+Ferrum 使用 AI 辅助开发，仍在快速迭代；内部 API 暂不承诺稳定，支持范围与性能持续更新。个人硬件资源有限，欢迎提供显卡测试支持；质量标准和如实报告失败、未验证范围的要求不会因此降低。
 
-### KV 缓存精度
-
-Ferrum v0.11.0 的 `run` 和 `serve` 均可使用 `--kv-dtype int8`，默认仍为 FP16。
-此选项需要支持标准 causal attention 的 vNext 模型，以及 Metal 或 portable CUDA
-执行路径；不支持的组合会明确报错。
-
-```sh
-ferrum run unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
-ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
-```
-
-此选项减少注意力 KV 的存储占用，包含量化所需的 scale；模型权重和固定大小的循环状态
-保持原有大小。通过 `/health` 的 `kv_storage` 可确认实际生效格式。
-整个模型的 checkpoint 恢复需要所有模型状态均支持恢复。关闭 prefix cache 或没有兼容的
-checkpoint 时，重新发送历史会重新计算输入；命中兼容缓存后，可恢复模型状态并
-计算剩余后缀。Session cache 保存聊天消息，与 GPU 前缀状态复用是两回事。
-
-`ferrum serve` 默认请求启用 plan runtime 的前缀状态缓存。是否实际启用由编译后的
-模型执行计划及 checkpoint 能力决定；不支持时正常执行完整输入计算。缓存状态与
-推理共享运行时内存预算，并在容量压力下回收。显式 CLI、环境变量、配置文件及
-预设配置优先；`ferrum run` 保持原有默认行为。
-可以通过 `--disable-prefix-cache`、`[runtime] prefix_cache = false` 或
-`FERRUM_PREFIX_CACHE=0` 关闭。使用 `/health` 查看实际启用状态与缓存命中情况。
-
-## 支持的模型与示例
-
-支持的模型包括 Qwen3.5 4B、Qwen3.5 35B-A3B、Qwen3 30B-A3B 和 Llama 3.1 8B dense。
-不同模型、权重格式和后端的支持范围不同；下面的示例说明各自用法和验证范围。
-
-| 模型示例 | 用法 |
-|---|---|
-| Qwen3.5 4B GGUF Q4_K_M | [终端运行](#运行模型) · [API 服务](#启动-api-服务) |
-| Qwen3.5 9B GGUF | [KV 缓存精度示例](#kv-缓存精度) |
-| Ternary Bonsai 2 27B PQ2_0 | [Metal 示例与已验证范围](#在-metal-上运行-bonsai-2-pq2_0) |
-
-### 在 Metal 上运行 Bonsai 2 PQ2_0
-
-在 Apple Silicon 上运行较大 GGUF 模型的一个示例：
-
-```sh
-ferrum run bonsai2:27b
-```
-
-或者启动本地 API，供应用调用：
-
-```sh
-ferrum serve --model bonsai2:27b
-```
-
-首次启动自动下载约 **7.2 GB 的 PQ2_0 权重**及匹配元数据，之后复用缓存，
-无需手动准备文件。Ferrum 根据可用内存适配上下文、批处理和并发，你明确
-指定的配置优先。API 地址为 `http://127.0.0.1:8000/v1`。
-
-已在 **M1 Max / 32 GB** 上验证 Metal 文本推理。需要 Ferrum **0.12.1 或更高版本**。
-[安装或更新 Ferrum](#快速开始)。
-
-<details>
-<summary><strong>模型来源与实测范围</strong></summary>
-
-快捷入口只选择模型文件，资源配置沿用 Ferrum 的通用默认值和自动容量管理。
-规划依据是所选设备的可用内存，以及编译后的权重、序列状态和算子工作区，
-不会为 Bonsai 单独固定上下文、批处理、并发或内存预算。显式配置及 CLI
-参数优先。保留模型原本的思考行为；需要关闭时，追加 `--disable-thinking`。
-
-Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
-并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，
-包括 Orchestral 真实工具执行、会话续接和前缀状态复用。在 M1 Max / 32 GB 上
-的测试包括 8K 上下文请求，更长上下文尚未在这台机器上验收。生效的上下文上限
-不超过模型声明，并可能根据机器容量缩减。并发请求共享运行时容量；并发上限
-不意味着为每个请求都预留完整上下文。
-
-快捷入口自动下载[官方 PQ2_0 文件](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)，
-以及[固定源模型版本](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0)
-中的 `config.json`、`generation_config.json`、`tokenizer.json`、
-`tokenizer_config.json` 和 `chat_template.jinja`，无需手动整理。
-
-CUDA PQ2_0/Hadamard 算子和小型混合状态 checkpoint 测试已在真实 GPU 上通过，
-**完整 27B 模型的 CUDA 验收仍未完成**。此 Bonsai 路径不支持 PTQ1_0、旧代
-Q1_0/Q2_0 编码、MLX 包、视觉或完整 CPU 推理；Bonsai 与 INT8 KV 的组合尚未验收。
-模型声明的上下文上限不代表超过上述长度的范围已经实测。
-
-</details>
-
-### 看它如何工作
-
-[Qwen3.5-9B 与三个并发 Agent](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4)
-· [录制说明](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-demo-notes.md)。
-
-<details>
-<summary>Bonsai 2 27B 与 Orchestral：视频和录制说明</summary>
-
-**在 M1 Max / 32 GB 上运行 Bonsai 2 27B PQ2_0。** Orchestral 通过 Ferrum
-的本地 API 读取、修改 Rust 代码。
-
-[![观看 Bonsai 2、Ferrum 和 Orchestral 演示](https://github.com/user-attachments/assets/5deb7b83-fd96-4495-9f81-b162c4699af8)](https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa)
-
-[观看演示](https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa) · [录制说明](https://github.com/sizzlecar/ferrum-infer-rs/pull/388#issuecomment-5741680379)
-· [同机实测（已提交）](https://github.com/PrismML-Eng/Bonsai-demo/pull/198)。
-8 倍速回放，保留全部等待过程；模型已缓存。首次修改遇到 Rust 编译错误 `E0282`，
-随后根据编译器反馈修复一次，两项独立 Rust 测试均通过，原测试和需求文件保持不变。
-Agent 的命令执行工具已禁用。
-
-复现时，使用上面的 Bonsai 模型命令，再按[连接应用](#连接应用或编程-agent)的步骤启动 Orchestral。
-录像的具体配置见录制说明。
-
-</details>
-
-## 性能快照
-
-最新 R2 development `ferrum serve` 测量。前三行在 Metal 使用随机 64-token 输入、
-128-token 输出，在 CUDA 使用 256 / 128。数值为 3 次 repeat 的平均 tok/s，`±` 为
-95% 置信区间半宽。
-
-| 模型 | M1 Max 32 GB Metal | RTX 4090 CUDA | L40S 48 GB CUDA |
-|---|---:|---:|---:|
-| Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |  |
-| Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |  |
-| Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |  |
-| Qwen3.8 27B AWQ INT4 |  | c=4 · 78.19 ± 0.04 · c=16 · 115.12 ± 1.18 · c=32 · 115.18 ± 0.97 |  |
-| [Qwen3.8 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a) |  |  | ready 80.91 s · c=1 · 15.23 ± 0.19 · c=8 · 41.75 ± 1.26 · c=32 · 49.75 ± 0.95 |
-| [Qwen3.6 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8/tree/e89b16ebf1988b3d6befa7de50abc2d76f26eb09) |  |  | ready 93.39 s · c=1 · 15.15 ± 0.05 · c=8 · 42.37 ± 3.04 · c=32 · 50.38 ± 0.29 |
-| [Qwen3.6 35B-A3B official block-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8/tree/95a723d08a9490559dae23d0cff1d9466213d989) |  |  | ready 69.62 s · c=1 · 45.01 ± 7.54 · c=8 · 92.78 ± 2.03 · c=32 · 92.78 ± 0.84 |
-| [GPT-OSS 20B official MXFP4](https://huggingface.co/openai/gpt-oss-20b/tree/6cee5e81ee83917806bbde320786a8fb61efebee) |  | ready 23.65 s · c=1 · 61.49 ± 4.19 · c=8 · 77.16 ± 0.70 · c=32 · 77.23 ± 4.37 |  |
-| [Gemma 4 12B official W4A16 CT](https://huggingface.co/google/gemma-4-12B-it-qat-w4a16-ct/tree/1d2c2d7f2466070e69d6fb3fd5ce9a7d75f2f6ee) |  | ready 24.90 s · c=1 · 9.79 ± 0.01 · c=8 · 52.91 ± 0.88 · c=32 · 66.05 ± 6.78 |  |
-
-`c` 为服务端实际活跃并发。前三行均完成 100 请求 × 3 repeats，错误数为零。
-
-## OpenAI 兼容 API
-
-Ferrum 支持：
-
-- chat completions 与 streaming usage
-- 无状态 Responses 文本、流式输出、usage 与 function tools
-- `auto`、`none`、`required` 或指定函数的 function tools
-- `json_object` 与 strict `json_schema` structured output
-- 多轮会话、prefix cache 与 session cache
-- typed 并发、内存和 scheduler 控制
-
-精确请求契约见 [OpenAI API 兼容说明](docs/openai-api-compatibility.md)，prefix
-与 session cache 配置见 [cache 产品说明](docs/cache-product.md)。
-
-## 安装
-
-Windows **0.8.9 及以后版本**也可以从
-[Releases](https://github.com/sizzlecar/ferrum-infer-rs/releases) 下载
-`ferrum-<version>-windows-x86_64-cuda-sm89-setup.exe` 与对应 `.sha256` 文件，
-核对校验和后运行 setup。安装位置为 `%LOCALAPPDATA%\Programs\Ferrum`，自动添加当前用户 PATH；
-手动运行 setup 后请打开新终端。安装包包含 CUDA 与 VC 运行库，需要兼容的 NVIDIA sm89 显卡和
-551.78 或更新的驱动，不安装系统驱动，也不包含模型。用户不需要安装 CUDA Toolkit、Rust 或
-编译工具。Ferrum 通过 `run`、`serve` 命令使用，不提供图形界面或后台服务。
-
-Windows 升级时重新执行同一条 PowerShell 安装命令，或运行新版 setup。正在运行的会话继续使用
-原版本，新启动的会话使用新版；模型、配置和已有版本目录会保留。已有服务可在需要更新时自行重启。
-
-macOS/Linux 一键安装在 Apple Silicon 上选择 Metal。在 Linux/WSL 上，脚本查询全部可见 GPU
-的实际 compute capability：全部为 8.9 时选择需 CUDA 12.4 运行库的 `sm89`，全部为 12.0 时选择
-需 CUDA 12.8 运行库的 `sm120`；两者均需兼容的 NVIDIA 驱动和 NCCL 运行库。能力未知、不受支持或混合时，
-自动模式选择 CPU，显式要求 CUDA 则报错；已下载的 CUDA 二进制无法加载时，自动模式也会回退 CPU。
-指定版本缺少匹配架构的资产时会明确失败，旧版本同样如此。也可以明确要求后端或指定版本：
-
-```bash
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.11.0
-```
-
-使用脚本安装后，重新执行原安装命令即可升级。同版本、同后端已安装且校验通过时，
-脚本只获取很小的发布校验文件，跳过安装包下载。脚本保留已有版本目录，将入口切换到
-校验后的新版二进制。正在运行的会话继续使用原版本，新启动的会话使用新版本；已有服务
-可在需要更新时自行重启。模型和配置会保留。
-
-如果希望当前终端立即使用 Ferrum，可执行：
-
-```bash
-. "$HOME/.local/share/ferrum/installer/env"
-```
-
-通过 Homebrew 安装的用户使用 `brew upgrade` 升级对应公式。Homebrew 6 检查互斥安装时需要
-信任两条[公式定义](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)，请先查看定义再运行
-信任命令；旧版 Homebrew 可跳过。详见 [Homebrew 信任说明](https://docs.brew.sh/Tap-Trust)。
-
-```bash
-# Homebrew 6：信任已查看的两条公式定义
-brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
-
-# macOS Apple Silicon Metal
-brew install sizzlecar/ferrum/ferrum
-
-# Linux x86_64 CUDA sm89
-brew install sizzlecar/ferrum/ferrum-cuda
-```
-
-最新正式版的预编译 tarball：
-
-使用 `sm120` 时，将下面 CUDA 压缩包及校验文件名中的 `sm89` 替换为 `sm120`。
-
-```bash
-# Linux x86_64 CUDA sm89
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
-sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
-tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
-LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
-
-# macOS Apple Silicon Metal
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz.sha256
-shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
-tar -xzf ferrum-macos-aarch64.tar.gz
-./ferrum --version
-```
-
-从 crates.io 安装最新版 Metal build：
-
-```bash
-# macOS Apple Silicon Metal
-cargo install ferrum-cli --locked --features metal
-```
-
-官方预编译 Linux CUDA 资产的目标为 `sm89` 和 `sm120`。安装需要兼容的 NVIDIA driver、
-CUDA runtime 和 NCCL runtime。CUDA 源码构建还需要与 Ferrum 匹配的
-native-operator set，因此请使用匹配的预编译 CUDA tarball，或面向 `sm89` 的 Homebrew formula。
-源码构建可用 `--features cuda-production` 选择完整生产 feature 集；native-operator set
-lock 必须覆盖这些 feature 和目标架构。
-
-## 愿景
-
-让高性能大模型服务的部署与运维更简单。
-
-## 架构
-
-- 契约：`ferrum-types`、`ferrum-interfaces`
-- 执行：`ferrum-engine`、`ferrum-scheduler`、`ferrum-kv`、`ferrum-sampler`
-- 模型与计算：`ferrum-models`、`ferrum-kernels`、`ferrum-native-ops`、`ferrum-quantization`
-- 产品入口：`ferrum-cli`、`ferrum-server`、`ferrum-tokenizer`
-- 验证：`ferrum-bench-core`、`ferrum-testkit`
-
-开发接口说明：[数值执行策略](docs/numerical-execution.zh.md)。
-
-## License
-
-MIT
+感谢 [vLLM](https://github.com/vllm-project/vllm) 与 [llama.cpp](https://github.com/ggml-org/llama.cpp)，部分实现参考或复用了其代码，相关许可证随分发保留。Ferrum 自身采用 [MIT 许可证](LICENSE)。
