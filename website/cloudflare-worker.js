@@ -150,7 +150,7 @@ const pages = {
     goalMathLabel: "Maximize valid output tokens from requests completed within fixed window T, divided by T, over eligible execution policies pi; require each latency percentile limit and completion fraction at least rho.",
     goalDefinitions: [
       "W fixes the request set and arrival times; T > 0 fixes the measurement window and common cutoff. N_out counts only valid output tokens from requests successfully completed within that window.",
-      'L_k is the latency sample distribution, Q_p_k its chosen quantile, and S_k its upper limit. TTFT includes queueing; missing latency does not count as meeting its SLO. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-evaluation.md">Sampling rules</a>.',
+      'L_k is the latency sample distribution, Q_p_k its chosen quantile, and S_k its upper limit. TTFT includes queueing; missing latency does not count as meeting its SLO. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">Sampling rules</a>.',
       "C is the fraction of W successfully completed by the cutoff; its denominator includes rejected, failed, timed-out and unfinished requests. Declare p_k, S_k and 0 < ρ ≤ 1 before measuring.",
     ],
     primary: "Install 0.13.0",
@@ -204,7 +204,7 @@ const pages = {
     goalMathLabel: "在可用执行策略π中，最大化固定窗口T内成功完成请求的有效输出token数除以T，并满足各延迟分位上限及最低完成比例ρ。",
     goalDefinitions: [
       "W 固定请求集合与到达时序；T > 0 为固定测量窗口，结束即共同统计截止。N_out 只计窗口内成功完成请求的有效输出 token。",
-      'L_k 为延迟采样分布，Q_p_k 为指定分位数，S_k 为上限。TTFT 包含排队；缺失延迟不视为达标。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-evaluation.md">采样规则</a>。',
+      'L_k 为延迟采样分布，Q_p_k 为指定分位数，S_k 为上限。TTFT 包含排队；缺失延迟不视为达标。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">采样规则</a>。',
       "C 为同一 W 在截止前成功完成的比例，分母包含拒绝、失败、超时和未完成请求；p_k、S_k 与 0 < ρ ≤ 1 均须预先给定。",
     ],
     primary: "安装 0.13.0",
