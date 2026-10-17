@@ -11,7 +11,7 @@
 - 首轮用户/参考答案回放；输入 4–1024 token、输出至少 4、输入+参考输出+32-token 模板预留 ≤2048；输出长度取参考答案，ignore_eos、thinking off、temperature 0、top_p 1、repetition penalty 1。使用原冻结 Rust HTTP 客户端，版本/hash、完整命令与配置见各结果摘要。
 - 三项分别判 P99，并要求错误/拒绝均为 0；TPOT 截止 last-visible output，ITL 是跨请求 pooled 的连续非空**可见 SSE 文本事件间隔**，排除 role-only/空/finish-only 事件；不沿用旧 joint 总状态，不丢弃长停顿。
 - CUDA RTX 5090：P99 TTFT/TPOT/ITL = **200/15/50ms**；context 2048、slots 32、batch 2048、24GiB Ferrum runtime budget，prefix/session cache off。容量在并发扫描中固定。
-- CUDA RN profile 为 `qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8`；旧 G32（`e3b9dda0`）与最终 `2929f339` 为静态/split/budget 0，c068 与 4d373 主表为 mixed、无显式 chunk/budget，c068 静态/动态之间只改变 `--scheduler-slo`。llama.cpp 为 b11065，保留其独立 KV/实现配置；可复制的最终 Ferrum 命令见 [README](../README.md#runtime-settings)。
+- CUDA RN profile 为 `qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8`；旧 G32（`e3b9dda0`）与最终 `2929f339` 为静态/split/budget 0，c068 与 4d373 主表为 mixed、无显式 chunk/budget，c068 静态/动态之间只改变 `--scheduler-slo`。llama.cpp 为 b11065，保留其独立 KV/实现配置；可复制的最终 Ferrum 命令见 [当时的 README](https://github.com/sizzlecar/ferrum-infer-rs/blob/5334b358d00a6b2e05252908631773b91f95bd4c/README.md#runtime-settings)。
 - M4：context 4096、slots 32、batch 2048、Ferrum runtime budget 8GiB、KV capacity 4096、cache off；旧 G32 为 f16-head/split/budget 0，a890 为 Auto→f32-master/mixed/chunk 128/budget 256，两者 effective reusable execution 均为 0。llama.cpp b10964 / `b29c606e2-device-memory` 使用 unified KV 32×4096、ubatch 512、Flash Attention，模板及长度政策相同。
 - M4 下表按原 **3400/212/359ms** 判断；用户授权后续 TTFT P99 改为 **5500ms**，TPOT/ITL 仍为 212/359ms、样本不变。历史数据没有重跑，旧失败标签不改写为新阈值验收。
 
