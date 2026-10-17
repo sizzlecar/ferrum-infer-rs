@@ -35,6 +35,10 @@ path = "src/bin/kv_teacher_regression.rs"
 name = "reference_teacher_compare"
 path = "src/bin/reference_teacher_compare.rs"
 
+[[bin]]
+name = "reference_quality"
+path = "src/bin/reference_quality.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 ferrum-bench-core = { workspace = true }
