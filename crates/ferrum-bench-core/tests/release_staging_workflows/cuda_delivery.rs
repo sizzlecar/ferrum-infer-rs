@@ -205,6 +205,13 @@ fn read_capability(
         .unwrap()["run"]
         .as_str()
         .unwrap();
+    // GitHub evaluates expression delimiters before invoking the shell, even
+    // inside quoted Ruby strings. This reader receives all inputs via env/ARGV
+    // and must be a literal script for the exercised rejection rules to apply.
+    assert!(
+        !command.contains("${{"),
+        "candidate reader accidentally opens an Actions expression"
+    );
     let dir = tempfile::tempdir().unwrap();
     for (relative, contents) in [
         (

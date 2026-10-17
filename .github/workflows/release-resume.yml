@@ -148,7 +148,7 @@ jobs:
           when 'not_run_hardware_unavailable'
             raise 'Unavailable SM120 hardware needs a reason' unless reason_entry
             reason = scalar(reason_entry, 'cuda_sm120_runtime_reason')
-            raise 'SM120 reason must be a literal, trimmed single line' if reason.match?(/\A[[:space:]]|[[:space:]]\z/u) || reason.include?('${{') || reason.match?(/[\x00-\x1f\x7f]/)
+            raise 'SM120 reason must be a literal, trimmed single line' if reason.match?(/\A[[:space:]]|[[:space:]]\z/u) || reason.include?('$' + '{{') || reason.match?(/[\x00-\x1f\x7f]/)
           else
             raise 'Unknown or nonliteral SM120 runtime policy'
           end
