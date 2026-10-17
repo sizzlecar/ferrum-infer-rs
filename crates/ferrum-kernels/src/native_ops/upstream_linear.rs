@@ -339,6 +339,7 @@ impl PreparedUpstreamLinear {
     /// Cold policy resolution against the already validated native plan. The
     /// caller supplies cached feature/export qualification; device attributes
     /// are the actual values retained by native preparation, never GPU names.
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn automatic_q4_mmvq_weight_decode(
         &self,
         native_available: bool,
@@ -351,6 +352,7 @@ impl PreparedUpstreamLinear {
             ferrum_types::Q4MmvqWeightDecode::Baseline
         }
     }
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn automatic_q5_mmvq_weight_decode(
         &self,
         native_available: bool,
@@ -363,6 +365,7 @@ impl PreparedUpstreamLinear {
             ferrum_types::Q5MmvqWeightDecode::Baseline
         }
     }
+    #[cfg(any(feature = "cuda", test))]
     fn automatic_shared_weight_decode_device(&self, native_available: bool) -> bool {
         // Automatic promotion is currently qualified on SM120 only. Explicit
         // modes retain their existing native capability/geometry validation.
