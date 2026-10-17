@@ -244,10 +244,11 @@ which files were downloaded and which were reused; do not call reuse a fresh
 download test.
 
 Check binary architecture, accelerator features, driver/runtime dependencies,
-available memory and storage before downloading large weights. CUDA assets target
-sm89 and require compatible NVIDIA, CUDA and NCCL runtimes. Start paid hardware
-when the candidate and test inputs are ready. Export evidence before releasing
-temporary instances; retain paid storage only when its reuse justifies the cost.
+available memory and storage before downloading large weights. Linux CUDA assets target
+sm89 (CUDA 12.4 runtime) or sm120 (CUDA 12.8 runtime), with compatible NVIDIA drivers
+and NCCL runtimes. Start paid hardware when the candidate and test inputs are ready.
+Export evidence before releasing temporary instances; retain paid storage only when
+its reuse justifies the cost.
 
 ## GGUF source inventory
 

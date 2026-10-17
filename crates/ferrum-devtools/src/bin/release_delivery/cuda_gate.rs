@@ -148,6 +148,16 @@ pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> 
     Ok(())
 }
 
+pub(super) fn verify_sm120_job(jobs: &BTreeMap<u64, Value>) -> Result<(), String> {
+    let (_, job) = jobs
+        .last_key_value()
+        .ok_or("missing required SM120 CUDA job")?;
+    if job["status"] != "completed" || job["conclusion"] != "success" {
+        return Err("latest required SM120 CUDA job did not succeed".into());
+    }
+    Ok(())
+}
+
 pub(super) fn verify_jobs(
     policy: &ReleaseCudaPolicy,
     event: &Value,

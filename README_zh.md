@@ -313,8 +313,11 @@ Windows **0.8.9 及以后版本**也可以从
 Windows 升级时重新执行同一条 PowerShell 安装命令，或运行新版 setup。正在运行的会话继续使用
 原版本，新启动的会话使用新版；模型、配置和已有版本目录会保留。已有服务可在需要更新时自行重启。
 
-macOS/Linux 一键安装在 Apple Silicon 上选择 Metal。在 Linux 上，兼容的 sm89 显卡能够加载驱动、
-CUDA 12.4 与 NCCL 运行库时选择 CUDA，否则选择 CPU。也可以明确要求后端或指定版本：
+macOS/Linux 一键安装在 Apple Silicon 上选择 Metal。在 Linux/WSL 上，脚本查询全部可见 GPU
+的实际 compute capability：全部为 8.9 时选择需 CUDA 12.4 运行库的 `sm89`，全部为 12.0 时选择
+需 CUDA 12.8 运行库的 `sm120`；两者均需兼容的 NVIDIA 驱动和 NCCL 运行库。能力未知、不受支持或混合时，
+自动模式选择 CPU，显式要求 CUDA 则报错；已下载的 CUDA 二进制无法加载时，自动模式也会回退 CPU。
+指定版本缺少匹配架构的资产时会明确失败，旧版本同样如此。也可以明确要求后端或指定版本：
 
 ```bash
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
@@ -349,6 +352,8 @@ brew install sizzlecar/ferrum/ferrum-cuda
 
 最新正式版的预编译 tarball：
 
+使用 `sm120` 时，将下面 CUDA 压缩包及校验文件名中的 `sm89` 替换为 `sm120`。
+
 ```bash
 # Linux x86_64 CUDA sm89
 curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz
@@ -372,9 +377,9 @@ tar -xzf ferrum-macos-aarch64.tar.gz
 cargo install ferrum-cli --locked --features metal
 ```
 
-官方预编译 Linux CUDA 资产的目标为 `sm89`。Linux CUDA 安装需要兼容的 NVIDIA driver、
+官方预编译 Linux CUDA 资产的目标为 `sm89` 和 `sm120`。安装需要兼容的 NVIDIA driver、
 CUDA runtime 和 NCCL runtime。CUDA 源码构建还需要与 Ferrum 匹配的
-native-operator set，因此受支持的安装路径是预编译 CUDA tarball 或 Homebrew formula。
+native-operator set，因此请使用匹配的预编译 CUDA tarball，或面向 `sm89` 的 Homebrew formula。
 源码构建可用 `--features cuda-production` 选择完整生产 feature 集；native-operator set
 lock 必须覆盖这些 feature 和目标架构。
 

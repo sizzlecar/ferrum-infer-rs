@@ -14,6 +14,9 @@ mod installer;
 #[path = "release_staging_workflows/windows_build.rs"]
 mod windows_build;
 
+#[path = "release_staging_workflows/cuda_delivery.rs"]
+mod cuda_delivery;
+
 fn key(name: &str) -> Value {
     Value::String(name.into())
 }

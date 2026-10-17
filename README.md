@@ -403,9 +403,15 @@ Existing sessions keep running their original version; new launches use the
 updated version. Models, configuration, and existing version directories are
 preserved. Restart an existing server when you want it to use the update.
 
-The macOS/Linux one-line installer selects Metal on Apple Silicon. On Linux it selects CUDA
-for compatible sm89 GPUs when the driver, CUDA 12.4 and NCCL runtimes can load,
-and otherwise selects CPU. You can require a backend or install a specific version:
+The macOS/Linux one-line installer selects Metal on Apple Silicon. On Linux/WSL,
+it queries every visible GPU's compute capability: when all report 8.9, it selects
+`sm89` (CUDA 12.4 runtime); when all report 12.0, it selects `sm120` (CUDA 12.8
+runtime). Both require compatible NVIDIA drivers and NCCL runtimes. Unknown,
+unsupported, or mixed capabilities select CPU in automatic mode; explicitly
+requesting CUDA fails.
+Automatic mode also falls back to CPU if the downloaded CUDA binary cannot load.
+A requested release without a matching architecture asset fails explicitly,
+including older versions. You can require a backend or install a specific version:
 
 ```bash
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
@@ -444,6 +450,8 @@ brew install sizzlecar/ferrum/ferrum-cuda
 
 Prebuilt tarballs from the latest stable release:
 
+For `sm120`, replace `sm89` in the CUDA archive and checksum filenames below.
+
 ```bash
 # Linux x86_64 CUDA sm89
 curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz
@@ -467,10 +475,10 @@ Install the latest Metal build from crates.io:
 cargo install ferrum-cli --locked --features metal
 ```
 
-The official prebuilt Linux CUDA asset targets `sm89`. Linux CUDA installation requires a
+The official prebuilt Linux CUDA assets target `sm89` and `sm120`. Installation requires a
 compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host.
 CUDA source builds also require Ferrum's matching native-operator set, so use
-the prebuilt CUDA tarball or Homebrew formula for the supported install path.
+the matching prebuilt CUDA tarball, or the Homebrew formula for `sm89`.
 Source builds can use `--features cuda-production` to select the complete
 production feature set; the native-operator set lock must cover those features
 and the target architecture.

@@ -8,6 +8,7 @@ const INSTALLERS: &[&str] = &[
     "install-cargo",
     "install-homebrew",
     "install-bootstrap-unix",
+    "install-bootstrap-sm120",
     "install-bootstrap-windows",
 ];
 
@@ -38,6 +39,7 @@ struct State {
     ancestors_succeeded: bool,
     active: &'static str,
     verify_only: &'static str,
+    sm120_required: &'static str,
     results: BTreeMap<String, ResultState>,
 }
 
@@ -48,6 +50,7 @@ impl State {
             ancestors_succeeded: false, // optional cloud ancestor was skipped
             active,
             verify_only,
+            sm120_required: "true",
             results: BTreeMap::from([
                 ("prepare".into(), ResultState::Success),
                 (
@@ -66,6 +69,7 @@ impl State {
         let value = match name {
             "needs.prepare.outputs.active" => self.active,
             "needs.prepare.outputs.verify_only" => self.verify_only,
+            "needs.prepare.outputs.sm120_required" => self.sm120_required,
             "needs.prepare.outputs.cloud_cuda" => "false",
             "needs.prepare.outputs.version" => "0.10.0",
             _ => {
@@ -182,8 +186,9 @@ fn scheduled(expr: &Expr, state: &State) -> Result<bool, String> {
     Ok(condition && (explicit_status || state.ancestors_succeeded))
 }
 
-fn expected_install(state: &State) -> bool {
+fn expected_install(state: &State, sm120: bool) -> bool {
     !state.cancelled
+        && (!sm120 || state.sm120_required == "true")
         && state.results["prepare"] == ResultState::Success
         && matches!(
             (state.active, state.verify_only, state.results["publish"]),
@@ -191,7 +196,7 @@ fn expected_install(state: &State) -> bool {
         )
 }
 
-fn verify_installer(job: &Value) -> Result<(), String> {
+fn verify_installer(job: &Value, sm120: bool) -> Result<(), String> {
     let guard = expression(
         job["if"]
             .as_str()
@@ -208,8 +213,13 @@ fn verify_installer(job: &Value) -> Result<(), String> {
                             state.ancestors_succeeded = ancestors_succeeded;
                             state.results.insert("prepare".into(), prepare);
                             state.results.insert("publish".into(), publish);
-                            if scheduled(&guard, &state)? != expected_install(&state) {
-                                return Err(format!("installation outcome mismatch: {state:?}"));
+                            for required in ["", "false", "true", "unknown"] {
+                                state.sm120_required = required;
+                                if scheduled(&guard, &state)? != expected_install(&state, sm120) {
+                                    return Err(format!(
+                                        "installation outcome mismatch: {state:?}"
+                                    ));
+                                }
                             }
                         }
                     }
@@ -225,7 +235,8 @@ fn public_installation_guards_handle_optional_skip_and_both_delivery_modes() {
     let workflow = workflow();
     for name in INSTALLERS {
         let job = &workflow["jobs"][*name];
-        verify_installer(job).unwrap_or_else(|error| panic!("{name}: {error}"));
+        verify_installer(job, *name == "install-bootstrap-sm120")
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
         let needs = dependencies(job);
         assert!(needs.contains(&"prepare".into()) && needs.contains(&"publish".into()));
         let checkout = job["steps"]
@@ -251,7 +262,7 @@ fn installation_regressions_cannot_hide_behind_implicit_success_or_weakened_guar
     let source = original["if"].as_str().unwrap();
     let mut equivalent = original.clone();
     equivalent["if"] = Value::String(format!("({source}) && always()"));
-    verify_installer(&equivalent).unwrap();
+    verify_installer(&equivalent, false).unwrap();
     for changed in [
         source
             .replace("always()", "true")
@@ -264,7 +275,7 @@ fn installation_regressions_cannot_hide_behind_implicit_success_or_weakened_guar
         let mut job = original.clone();
         job["if"] = Value::String(changed.clone());
         assert!(
-            verify_installer(&job).is_err(),
+            verify_installer(&job, false).is_err(),
             "accepted weakened guard: {changed}"
         );
     }
@@ -278,6 +289,19 @@ fn installation_regressions_cannot_hide_behind_implicit_success_or_weakened_guar
     assert!(expression("unreviewed()")
         .and_then(|expr| scheduled(&expr, &formal))
         .is_err());
+    assert!(
+        expression("true || needs.prepare.outputs.unreviewed == 'true'")
+            .and_then(|expr| scheduled(&expr, &formal))
+            .is_err()
+    );
+    let mut sm120 = workflow()["jobs"]["install-bootstrap-sm120"].clone();
+    sm120["if"] = Value::String(
+        sm120["if"]
+            .as_str()
+            .unwrap()
+            .replace("needs.prepare.outputs.sm120_required == 'true'", "true"),
+    );
+    assert!(verify_installer(&sm120, true).is_err());
 }
 
 fn dependencies(job: &Value) -> Vec<String> {
@@ -296,50 +320,56 @@ fn dependencies(job: &Value) -> Vec<String> {
 fn verification_only_cannot_schedule_staging_models_cloud_or_publication() {
     let workflow = workflow();
     let jobs = workflow["jobs"].as_mapping().unwrap();
-    let mut state = State::new("false", "true");
-    state.results.remove("publish");
-    let mut pending: BTreeSet<String> = jobs
-        .keys()
-        .map(|key| key.as_str().unwrap().to_owned())
-        .filter(|name| {
-            name != "prepare" && name != "complete" && !INSTALLERS.contains(&name.as_str())
-        })
-        .collect();
-    while !pending.is_empty() {
-        let ready: Vec<_> = pending
-            .iter()
+    for required in ["true", "false"] {
+        let mut state = State::new("false", "true");
+        state.sm120_required = required;
+        state.results.remove("publish");
+        let mut pending: BTreeSet<String> = jobs
+            .keys()
+            .map(|key| key.as_str().unwrap().to_owned())
             .filter(|name| {
-                dependencies(&jobs[name.as_str()])
-                    .iter()
-                    .all(|need| state.results.contains_key(need))
+                name != "prepare" && name != "complete" && !INSTALLERS.contains(&name.as_str())
             })
-            .cloned()
             .collect();
-        assert!(
-            !ready.is_empty(),
-            "cyclic or missing dependencies: {pending:?}"
-        );
-        for name in ready {
-            let job = &jobs[name.as_str()];
-            state.ancestors_succeeded = dependencies(job)
+        while !pending.is_empty() {
+            let ready: Vec<_> = pending
                 .iter()
-                .all(|need| state.results[need] == ResultState::Success);
-            let guard = expression(job["if"].as_str().unwrap_or("success()")).unwrap();
+                .filter(|name| {
+                    dependencies(&jobs[name.as_str()])
+                        .iter()
+                        .all(|need| state.results.contains_key(need))
+                })
+                .cloned()
+                .collect();
             assert!(
-                !scheduled(&guard, &state).unwrap(),
-                "verification scheduled heavy job {name}"
+                !ready.is_empty(),
+                "cyclic or missing dependencies: {pending:?}"
             );
-            state.results.insert(name.clone(), ResultState::Skipped);
-            pending.remove(&name);
+            for name in ready {
+                let job = &jobs[name.as_str()];
+                state.ancestors_succeeded = dependencies(job)
+                    .iter()
+                    .all(|need| state.results[need] == ResultState::Success);
+                let guard = expression(job["if"].as_str().unwrap_or("success()")).unwrap();
+                assert!(
+                    !scheduled(&guard, &state).unwrap(),
+                    "verification scheduled heavy job {name}"
+                );
+                state.results.insert(name.clone(), ResultState::Skipped);
+                pending.remove(&name);
+            }
         }
-    }
-    assert_eq!(state.results["publish"], ResultState::Skipped);
-    for name in INSTALLERS {
-        assert!(scheduled(
-            &expression(jobs[*name]["if"].as_str().unwrap()).unwrap(),
-            &state
-        )
-        .unwrap());
+        assert_eq!(state.results["publish"], ResultState::Skipped);
+        for name in INSTALLERS {
+            assert_eq!(
+                scheduled(
+                    &expression(jobs[*name]["if"].as_str().unwrap()).unwrap(),
+                    &state
+                )
+                .unwrap(),
+                *name != "install-bootstrap-sm120" || required == "true"
+            );
+        }
     }
 }
 
@@ -391,12 +421,22 @@ fn complete_accepts(workflow: &Value, state: &State) -> bool {
 #[test]
 fn complete_requires_the_correct_publication_mode_and_every_public_installation() {
     let workflow = workflow();
-    for (active, verify_only) in [("true", "false"), ("false", "true")] {
+    for (active, verify_only, required) in [
+        ("true", "false", "true"),
+        ("false", "true", "true"),
+        ("false", "true", "false"),
+    ] {
         let mut state = State::new(active, verify_only);
+        state.sm120_required = required;
         for installer in INSTALLERS {
             state
                 .results
                 .insert((*installer).into(), ResultState::Success);
+        }
+        if required == "false" {
+            state
+                .results
+                .insert("install-bootstrap-sm120".into(), ResultState::Skipped);
         }
         assert!(complete_accepts(&workflow, &state), "{state:?}");
         for name in std::iter::once("prepare")
@@ -420,6 +460,32 @@ fn complete_requires_the_correct_publication_mode_and_every_public_installation(
             !complete_accepts(&workflow, &state),
             "cancelled workflow was accepted"
         );
+    }
+    // An active release may never downgrade its declared requirement. Empty or
+    // unrecognized output cannot stand in for a legacy candidate declaration.
+    for (active, verify_only, required) in [
+        ("true", "false", "false"),
+        ("true", "false", ""),
+        ("true", "false", "unknown"),
+        ("false", "true", ""),
+        ("false", "true", "unknown"),
+    ] {
+        let mut invalid = State::new(active, verify_only);
+        invalid.sm120_required = required;
+        for installer in INSTALLERS {
+            invalid
+                .results
+                .insert((*installer).into(), ResultState::Success);
+        }
+        for result in ResultState::ALL {
+            invalid
+                .results
+                .insert("install-bootstrap-sm120".into(), result);
+            assert!(
+                !complete_accepts(&workflow, &invalid),
+                "invalid requirement: {invalid:?}"
+            );
+        }
     }
     for active in ["", "false", "true"] {
         for verify_only in ["", "false", "true"] {
