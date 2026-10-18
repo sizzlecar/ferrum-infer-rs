@@ -20,11 +20,10 @@ use crate::openai::{ChatFunctionCall, MessageRole};
 use std::collections::HashSet;
 
 mod request;
-mod stream;
+pub(super) mod stream;
 mod tools;
 
 use request::ResponsesRequest;
-use stream::adapt_chat_stream;
 
 #[cfg(test)]
 use request::{parse_input, parse_input_phases};
@@ -43,7 +42,7 @@ struct ConvertedRequest {
 }
 
 #[derive(Clone)]
-struct ResponseContext {
+pub(super) struct ResponseContext {
     id: String,
     created_at: u64,
     model: String,
@@ -119,16 +118,23 @@ pub(super) async fn responses_handler(
         )
     })?;
     let converted = request.convert()?;
-    let chat_response = super::chat_completions_handler_with_phases(
-        State(state),
-        headers,
-        Ok(Json(converted.chat)),
-        Some(converted.message_phases),
-    )
-    .await?;
     if converted.stream {
-        Ok(adapt_chat_stream(chat_response, converted.response))
+        super::chat_completions_handler_with_projection(
+            State(state),
+            headers,
+            Ok(Json(converted.chat)),
+            Some(converted.message_phases),
+            Some(converted.response),
+        )
+        .await
     } else {
+        let chat_response = super::chat_completions_handler_with_phases(
+            State(state),
+            headers,
+            Ok(Json(converted.chat)),
+            Some(converted.message_phases),
+        )
+        .await?;
         adapt_chat_sync(chat_response, converted.response).await
     }
 }

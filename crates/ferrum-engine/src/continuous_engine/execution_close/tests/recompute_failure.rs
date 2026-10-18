@@ -10,10 +10,10 @@ fn attach_clients(
     request_id: &RequestId,
 ) -> (
     tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
-    tokio::sync::mpsc::Receiver<Result<StreamChunk>>,
+    OutputReceiver,
 ) {
     let (response, receiver) = tokio::sync::oneshot::channel();
-    let (stream, updates) = tokio::sync::mpsc::channel(4);
+    let (stream, updates) = engine.inner.output_channel(request_id.clone(), 4).unwrap();
     let mut sequences = engine.inner.sequences.write();
     let sequence = sequences.get_mut(request_id).unwrap();
     sequence.response_sender = Some(response);
@@ -70,7 +70,7 @@ async fn install_controlled_request(
 
 async fn assert_client_failed(
     response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
-    mut stream: tokio::sync::mpsc::Receiver<Result<StreamChunk>>,
+    mut stream: OutputReceiver,
 ) {
     let error = response.await.unwrap().unwrap_err();
     assert!(error

@@ -21,6 +21,7 @@ ferrum-runtime = { workspace = true }
 ferrum-execution = { workspace = true }
 # Core dependencies
 ferrum-types = { workspace = true }
+ferrum-output = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-models = { workspace = true }

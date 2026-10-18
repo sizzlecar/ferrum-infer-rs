@@ -302,7 +302,7 @@ async fn execute_one_token(
             let mut stream = engine.infer_stream(request).await.unwrap();
             let mut finished = false;
             while let Some(chunk) = stream.next().await {
-                finished |= chunk.unwrap().finish_reason.is_some();
+                finished |= chunk.unwrap().chunk().finish_reason.is_some();
             }
             assert!(finished);
         } else {

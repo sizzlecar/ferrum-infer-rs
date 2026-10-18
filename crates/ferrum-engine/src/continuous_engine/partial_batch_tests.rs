@@ -284,9 +284,7 @@ fn assert_full_logits(expected: &[f32], actual: &[f32], vocab: usize) {
     }
 }
 
-fn drain(
-    receiver: &mut tokio::sync::mpsc::Receiver<Result<StreamChunk>>,
-) -> Vec<Result<StreamChunk>> {
+fn drain(receiver: &mut OutputReceiver) -> Vec<Result<OutputChunk>> {
     let mut chunks = Vec::new();
     while let Ok(chunk) = receiver.try_recv() {
         chunks.push(chunk);
@@ -294,7 +292,7 @@ fn drain(
     chunks
 }
 
-fn assert_fault_error(result: &Result<StreamChunk>, fault: FaultKind) {
+fn assert_fault_error(result: &Result<OutputChunk>, fault: FaultKind) {
     let error = match result {
         Err(error) => error,
         Ok(_) => {
@@ -328,7 +326,8 @@ fn sample_reference(
         .unwrap()
 }
 
-fn assert_visible_update(chunk: &StreamChunk, expected: TokenId, tokenizer: &TinyTokenizer) {
+fn assert_visible_update(output: &OutputChunk, expected: TokenId, tokenizer: &TinyTokenizer) {
+    let chunk = output.chunk();
     assert_eq!(chunk.token, Some(expected));
     assert_eq!(chunk.text, tokenizer.decode(&[expected], true).unwrap());
     assert!(!chunk.text.is_empty());
@@ -449,7 +448,7 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             Some(tokenizer.clone()),
             Some(cfg.vocab_size),
         );
-        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let (sender, receiver) = engine.inner.output_channel(request.id.clone(), 16).unwrap();
         sequence.stream_sender = Some(sender);
         sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id.clone()));
         streams.insert(request.id.clone(), receiver);
@@ -550,13 +549,11 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     failed_batch.requests.truncate(2);
     executor.armed.store(true, Ordering::SeqCst);
     let batch_result = engine.inner.process_batch(&failed_batch).await;
-    if fault == FaultKind::MissingLogits {
-        // The producer already ended this incarnation and retained its
-        // product-validation error alongside the actual close disposition.
-        assert_fault_cause(&batch_result.unwrap_err(), fault);
-    } else {
-        batch_result.unwrap();
-    }
+    // Product completion is managed separately from the iteration. The
+    // original error is asserted on its client terminal below, not returned
+    // synchronously by a now non-blocking whole-batch delivery operation.
+    batch_result.unwrap();
+    engine.inner.output_tasks.join_current().await;
     engine.inner.execution_closes.join_observers().await;
     engine.inner.drain_execution_closes().unwrap();
     assert_eq!(
@@ -627,7 +624,7 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     let update = a_updates[0].as_ref().unwrap();
     assert_visible_update(update, a_expected_token, &tokenizer);
     assert_eq!(
-        update.token,
+        update.chunk().token,
         engine.inner.sequences.read()[&a]
             .generated_tokens
             .last()
@@ -720,6 +717,7 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             expected.insert(id.clone(), (position, logits, token));
         }
         engine.inner.process_batch(&finish).await.unwrap();
+        engine.inner.output_tasks.join_current().await;
         for scheduled in &finish.requests {
             let id = &scheduled.request.id;
             let (cache_id, prompt_len, _) = &initial[id];
@@ -759,7 +757,7 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             assert_eq!(chunks.len(), if previous_outputs == 3 { 2 } else { 1 });
             assert_visible_update(chunks[0].as_ref().unwrap(), *token, &tokenizer);
             if previous_outputs == 3 {
-                let terminal = chunks[1].as_ref().unwrap();
+                let terminal = chunks[1].as_ref().unwrap().chunk();
                 assert!(terminal.token.is_none());
                 assert!(terminal.text.is_empty());
                 assert_eq!(terminal.finish_reason, Some(FinishReason::Length));

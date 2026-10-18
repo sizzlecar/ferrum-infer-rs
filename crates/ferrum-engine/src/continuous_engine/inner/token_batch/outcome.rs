@@ -338,7 +338,7 @@ impl EngineInner {
                     );
                 }
             }
-            self.complete_request_with_error(request_id, error).await
+            self.complete_request_detached(request_id, FinishReason::Error, Some(error))
         } else {
             // Never cancel a replacement merely because it reused RequestId.
             // The old product's slot/close obligation is no longer ours. Keep
@@ -375,7 +375,7 @@ impl EngineInner {
                 self.send_stream_update(request_id, *token).await;
             }
             if let Some(reason) = stop {
-                if let Err(error) = self.complete_request(request_id, reason).await {
+                if let Err(error) = self.complete_request_detached(request_id, reason, None) {
                     first_error.get_or_insert(error);
                 }
             }

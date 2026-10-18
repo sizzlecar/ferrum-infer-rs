@@ -94,10 +94,11 @@ impl EngineInner {
                         self.fail_token_frontier(target.key.request_id(), frontier, error, None)
                             .await
                     }
-                    None => {
-                        self.complete_request_with_error(target.key.request_id(), error)
-                            .await
-                    }
+                    None => self.complete_request_detached(
+                        target.key.request_id(),
+                        FinishReason::Error,
+                        Some(error),
+                    ),
                 };
                 if let Err(error) = result {
                     first_error.get_or_insert(error);

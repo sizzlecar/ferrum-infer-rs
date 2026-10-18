@@ -163,7 +163,7 @@ async fn streaming_produces_chunks() {
     // Last chunk should have finish_reason
     let last = chunks.last().unwrap();
     assert!(
-        last.finish_reason.is_some(),
+        last.chunk().finish_reason.is_some(),
         "Final chunk should have finish_reason"
     );
 }
@@ -201,10 +201,13 @@ async fn streaming_final_usage_matches_tokenizer_and_emitted_tokens() {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let emitted_tokens = chunks.iter().filter(|chunk| chunk.token.is_some()).count();
+    let emitted_tokens = chunks
+        .iter()
+        .filter(|chunk| chunk.chunk().token.is_some())
+        .count();
     let final_usage = chunks
         .last()
-        .and_then(|chunk| chunk.usage.as_ref())
+        .and_then(|chunk| chunk.chunk().usage.as_ref())
         .expect("final stream chunk should include usage");
 
     assert_eq!(final_usage.prompt_tokens, expected_prompt_tokens);
@@ -431,7 +434,7 @@ async fn concurrent_streams_all_complete() {
         assert!(!chunks.is_empty(), "Each stream should produce chunks");
         let last = chunks.last().unwrap();
         assert!(
-            last.finish_reason.is_some(),
+            last.chunk().finish_reason.is_some(),
             "Final chunk should have finish_reason"
         );
     }

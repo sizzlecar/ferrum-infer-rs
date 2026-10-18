@@ -1286,6 +1286,7 @@ dependencies = [
  "ferrum-interfaces",
  "ferrum-kernels",
  "ferrum-models",
+ "ferrum-output",
  "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-scheduler",
@@ -1368,6 +1369,7 @@ dependencies = [
  "ferrum-kernels",
  "ferrum-kv",
  "ferrum-models",
+ "ferrum-output",
  "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-sampler",
@@ -1434,8 +1436,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "ferrum-output",
  "ferrum-types",
- "futures",
  "parking_lot",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
@@ -1566,6 +1568,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-output"
+version = "0.13.0"
+dependencies = [
+ "chrono",
+ "ferrum-types",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ferrum-quantization"
 version = "0.13.0"
 dependencies = [
@@ -1657,6 +1670,7 @@ name = "ferrum-server"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -1666,6 +1680,7 @@ dependencies = [
  "ferrum-engine",
  "ferrum-execution",
  "ferrum-interfaces",
+ "ferrum-output",
  "ferrum-sampler",
  "ferrum-scheduler",
  "ferrum-testkit",

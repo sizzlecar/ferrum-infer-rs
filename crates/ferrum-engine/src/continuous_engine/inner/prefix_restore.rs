@@ -198,14 +198,14 @@ impl EngineInner {
                 }
                 Err(error) => {
                     drop(prepared);
-                    self.complete_request_with_error(&request_id, error).await?;
+                    self.complete_request_detached(&request_id, FinishReason::Error, Some(error))?;
                     continue;
                 }
             };
             if let Err(error) = output.validate_for(&request_id, prompt_tokens, &incarnation) {
                 drop(output);
                 drop(prepared);
-                self.complete_request_with_error(&request_id, error).await?;
+                self.complete_request_detached(&request_id, FinishReason::Error, Some(error))?;
                 continue;
             }
             let restored_tokens = output.restored_tokens();
@@ -247,7 +247,7 @@ impl EngineInner {
                     .commit_prefix_restored(prepared, restored_tokens)
             })();
             if let Err(error) = committed {
-                self.complete_request_with_error(&request_id, error).await?;
+                self.complete_request_detached(&request_id, FinishReason::Error, Some(error))?;
                 continue;
             }
             self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);

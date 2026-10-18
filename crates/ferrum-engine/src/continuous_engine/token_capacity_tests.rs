@@ -175,18 +175,21 @@ fn fixture(
     Arc<ContinuousBatchScheduler>,
     Arc<TokenCapacityExecutor>,
 ) {
-    let (mut engine, scheduler, source, _) = match next_stage {
-        Some(next) => {
-            plan_runtime_batch_decode_test_engine_with_stage_transition(behavior, stage, next)
-        }
-        None => plan_runtime_batch_decode_test_engine_with_stage(behavior, stage),
-    };
+    let source = Arc::new(
+        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+            behavior, stage, next_stage,
+        ),
+    );
     let executor = Arc::new(TokenCapacityExecutor {
         source,
         issuer: ExecutorSequenceIssuer::new(),
         live: Mutex::new(HashMap::new()),
     });
-    Arc::get_mut(&mut engine.inner).unwrap().model_executor = executor.clone();
+    let (engine, scheduler, executor, _) = plan_runtime_test_engine(
+        plan_runtime_test_config(None),
+        executor,
+        Arc::new(MockTensorFactory),
+    );
     (engine, scheduler, executor)
 }
 

@@ -2187,51 +2187,16 @@ fn plan_runtime_batch_decode_profile_test_engine(
     Arc<PlanRuntimeBatchDecodeTestExecutor>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
-    let (mut engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
-    Arc::get_mut(&mut engine.inner)
-        .expect("new test engine must have one inner owner")
-        .config
-        .runtime
-        .profile_detail = profile_detail;
-    (engine, scheduler, executor, tokenizer)
-}
-
-fn plan_runtime_batch_decode_test_engine_with_stage(
-    behavior: PlanRuntimeBatchDecodeBehavior,
-    capacity_stage: ExecutorExecutionCapacityStage,
-) -> (
-    ContinuousBatchEngine,
-    Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
-    Arc<dyn Tokenizer + Send + Sync>,
-) {
-    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
-        behavior,
-        None,
-        Arc::new(MockTensorFactory),
-        capacity_stage,
-        None,
-    )
-}
-
-fn plan_runtime_batch_decode_test_engine_with_stage_transition(
-    behavior: PlanRuntimeBatchDecodeBehavior,
-    capacity_stage: ExecutorExecutionCapacityStage,
-    capacity_stage_after_first_call: ExecutorExecutionCapacityStage,
-) -> (
-    ContinuousBatchEngine,
-    Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
-    Arc<dyn Tokenizer + Send + Sync>,
-) {
-    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
-        behavior,
-        None,
-        Arc::new(MockTensorFactory),
-        capacity_stage,
-        Some(capacity_stage_after_first_call),
-    )
+    let mut config = plan_runtime_test_config(None);
+    config.runtime.profile_detail = profile_detail;
+    let executor = Arc::new(
+        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+            PlanRuntimeBatchDecodeBehavior::Exact,
+            ExecutorExecutionCapacityStage::StepAdmission,
+            None,
+        ),
+    );
+    plan_runtime_test_engine(config, executor, Arc::new(MockTensorFactory))
 }
 
 fn plan_runtime_batch_decode_test_engine_with_trace(
@@ -2281,14 +2246,6 @@ fn plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
     Arc<PlanRuntimeBatchDecodeTestExecutor>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    config.runtime.scheduler_trace_jsonl = trace_path;
-    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
     let executor = Arc::new(
         PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
             behavior,
@@ -2296,6 +2253,35 @@ fn plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
             capacity_stage_after_first_call,
         ),
     );
+    plan_runtime_test_engine(
+        plan_runtime_test_config(trace_path),
+        executor,
+        tensor_factory,
+    )
+}
+
+fn plan_runtime_test_config(trace_path: Option<PathBuf>) -> EngineConfig {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.runtime.scheduler_trace_jsonl = trace_path;
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
+    config
+}
+
+fn plan_runtime_test_engine<E: ModelExecutor + 'static>(
+    config: EngineConfig,
+    executor: Arc<E>,
+    tensor_factory: Arc<dyn TensorFactory>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<E>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         scheduler.clone(),
@@ -2564,15 +2550,18 @@ async fn token_capacity_unproved_close_keeps_the_release_fence_and_original_owne
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
         .await
         .unwrap();
+    engine.inner.process_batch(&batch).await.unwrap();
+    engine.inner.execution_closes.join_observers().await;
+    engine.inner.output_tasks.join_current().await;
     let error = engine
         .inner
-        .process_batch(&batch)
+        .run_iteration()
         .await
-        .expect_err("unproved close must retain pressure");
+        .err()
+        .expect("the driver must observe the managed close failure");
     assert!(error
         .to_string()
         .contains("synthetic request-scoped close failure"));
-    engine.inner.execution_closes.join_observers().await;
     let _ = engine.inner.drain_execution_closes();
     assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 0);
     assert!(incarnations
@@ -5311,7 +5300,13 @@ fn sequence_state_detects_closed_run_and_serve_receivers() {
     assert!(run_sequence.client_receiver_closed());
 
     let mut serve_sequence = SequenceState::new(policy_request(), vec![TokenId::new(1)]);
-    let (stream_sender, stream_receiver) = tokio::sync::mpsc::channel(1);
+    let budget = OutputBudget::new(ferrum_types::OutputConfig::default()).unwrap();
+    let (stream_sender, stream_receiver) = OutputSender::new(
+        Weak::new(),
+        serve_sequence.original_request.id.clone(),
+        budget.try_open_session().unwrap(),
+        1,
+    );
     serve_sequence.stream_sender = Some(stream_sender);
     assert!(!serve_sequence.client_receiver_closed());
     drop(stream_receiver);

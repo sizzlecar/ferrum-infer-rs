@@ -94,22 +94,20 @@ async fn mixed_fixture_with_execution(
     final_prefill: bool,
     execution: Option<ferrum_types::PrefillDecodeExecution>,
 ) -> MixedFixture {
-    let (mut engine, scheduler, executor, _) = plan_runtime_batch_decode_test_engine_with_trace(
-        PlanRuntimeBatchDecodeBehavior::Exact,
-        None,
+    let executor = Arc::new(
+        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+            PlanRuntimeBatchDecodeBehavior::Exact,
+            ExecutorExecutionCapacityStage::StepAdmission,
+            None,
+        ),
     );
+    let mut config = plan_runtime_test_config(None);
     if let Some(execution) = execution {
-        Arc::get_mut(&mut engine.inner)
-            .unwrap()
-            .config
-            .batching
-            .prefill_decode_execution = execution;
+        config.batching.prefill_decode_execution = execution;
     }
-    Arc::get_mut(&mut engine.inner)
-        .unwrap()
-        .config
-        .runtime
-        .profile_detail = ferrum_types::ObservabilityProfileDetail::Latency;
+    config.runtime.profile_detail = ferrum_types::ObservabilityProfileDetail::Latency;
+    let (engine, scheduler, executor, _) =
+        plan_runtime_test_engine(config, executor, Arc::new(MockTensorFactory));
     *executor.mixed_behavior.lock().unwrap() = behavior;
     let decode_id = install_mixed_request(&engine, &scheduler, vec![TokenId::new(5)], true).await;
     let first = scheduler
@@ -348,7 +346,15 @@ async fn mixed_batch_submitted_failure_never_replays() {
         mixed_fixture(Some(MixedBehavior::SubmittedError), true).await;
     let prefill = executor.token_frontier_for_request(&prefill_id).unwrap();
     let decode = executor.token_frontier_for_request(&decode_id).unwrap();
-    let error = engine.inner.process_batch(&batch).await.unwrap_err();
+    engine.inner.process_batch(&batch).await.unwrap();
+    engine.inner.execution_closes.join_observers().await;
+    engine.inner.output_tasks.join_current().await;
+    let error = engine
+        .inner
+        .run_iteration()
+        .await
+        .err()
+        .expect("driver must observe the submitted execution failure");
     assert!(error
         .to_string()
         .contains("mixed device failure after submission"));
@@ -376,7 +382,10 @@ async fn mixed_batch_submitted_failure_terminates_peers_when_first_cleanup_fails
         .cancel(prefill_id.clone())
         .await
         .unwrap());
-    assert!(engine.inner.process_batch(&batch).await.is_err());
+    engine.inner.process_batch(&batch).await.unwrap();
+    engine.inner.execution_closes.join_observers().await;
+    engine.inner.output_tasks.join_current().await;
+    assert!(engine.inner.run_iteration().await.is_err());
     assert!(!engine.inner.sequences.read().contains_key(&prefill_id));
     assert!(!engine.inner.sequences.read().contains_key(&decode_id));
     assert!(prefill.sequence().observed_end().is_some());
@@ -398,7 +407,10 @@ async fn mixed_batch_rejects_invalid_phase_without_discarding_valid_peer() {
             mixed_fixture(Some(behavior), true).await;
         let prefill = executor.token_frontier_for_request(&prefill_id).unwrap();
         let decode = executor.token_frontier_for_request(&decode_id).unwrap();
-        assert!(engine.inner.process_batch(&batch).await.is_err());
+        engine.inner.process_batch(&batch).await.unwrap();
+        engine.inner.execution_closes.join_observers().await;
+        engine.inner.output_tasks.join_current().await;
+        assert!(engine.inner.run_iteration().await.is_err());
         let sequences = engine.inner.sequences.read();
         let (
             healthy_id,

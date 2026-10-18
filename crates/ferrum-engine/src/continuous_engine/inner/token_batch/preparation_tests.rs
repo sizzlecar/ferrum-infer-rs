@@ -194,6 +194,10 @@ async fn token_preparation_bad_tail_commits_healthy_cpu_peer_before_closing_fail
         *executor.executed.lock(),
         vec![healthy_frontier.sequence().clone()]
     );
+    // Closing is independently managed; healthy numerical publication above
+    // remains synchronous and precedes the actual close invocation.
+    engine.inner.execution_closes.join_observers().await;
+    engine.inner.output_tasks.join_current().await;
     assert_eq!(
         *executor.cancelled.lock(),
         vec![bad_frontier.sequence().clone()]

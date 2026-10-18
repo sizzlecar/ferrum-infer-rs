@@ -240,12 +240,29 @@ async fn token_outcome_wrong_index_held_conflicts_only_with_its_actual_incarnati
             Vec::new(),
             vec![FerrumError::backend("conflicting actual incarnation").into()],
         ));
-        assert!(engine
+        assert!(matches!(
+            &outcome,
+            ExecutionBatchOutcome::ContractViolation(_)
+        ));
+        engine
             .inner
             .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
             .await
-            .is_err());
+            .unwrap();
         engine.inner.execution_closes.join_observers().await;
+        engine.inner.output_tasks.join_current().await;
+        // Delivery no longer blocks the batch. The same production driver
+        // consumer must still observe the asynchronous close/control failure.
+        let error = engine
+            .inner
+            .run_iteration()
+            .await
+            .err()
+            .expect("driver must observe the conflicting incarnation");
+        assert_eq!(
+            error.to_string(),
+            FerrumError::backend("conflicting actual incarnation").to_string()
+        );
         engine.inner.drain_execution_closes().unwrap();
         assert!(!engine
             .inner

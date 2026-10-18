@@ -153,7 +153,7 @@ pub(super) struct Fixture {
     pub(super) identity: ExecutorSequence,
     pub(super) request_id: RequestId,
     pub(super) response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
-    pub(super) stream: tokio::sync::mpsc::Receiver<Result<StreamChunk>>,
+    pub(super) stream: OutputReceiver,
     pub(super) started: tokio::sync::oneshot::Receiver<()>,
     pub(super) gate: Option<tokio::sync::oneshot::Sender<()>>,
     pub(super) trace: tempfile::TempDir,
@@ -297,7 +297,7 @@ pub(super) async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
     state.record_decode_ready();
     state.record_generated_token_commit();
     let (response_sender, response) = tokio::sync::oneshot::channel();
-    let (stream_sender, stream) = tokio::sync::mpsc::channel(16);
+    let (stream_sender, stream) = engine.inner.output_channel(request_id.clone(), 16).unwrap();
     state.response_sender = Some(response_sender);
     state.stream_sender = Some(stream_sender);
     let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
@@ -440,7 +440,7 @@ async fn token_completion_cpu_real_ended_preserves_publication_error() {
     while let Ok(chunk) = fixture.stream.try_recv() {
         match chunk {
             Ok(chunk) => assert!(
-                chunk.finish_reason.is_none(),
+                chunk.chunk().finish_reason.is_none(),
                 "no successful terminal after publication failure"
             ),
             Err(actual) => {

@@ -17,7 +17,7 @@ struct Fixture {
     identity: ExecutorSequence,
     request_id: RequestId,
     response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
-    stream: tokio::sync::mpsc::Receiver<Result<StreamChunk>>,
+    stream: OutputReceiver,
     trace: tempfile::TempDir,
     layers: usize,
 }
@@ -117,9 +117,9 @@ async fn fixture() -> Fixture {
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = prompt.len();
     let (response_sender, response) = tokio::sync::oneshot::channel();
-    let (stream_sender, stream) = tokio::sync::mpsc::channel(1);
+    let (stream_sender, stream) = engine.inner.output_channel(request_id.clone(), 1).unwrap();
     stream_sender
-        .try_send(Ok(StreamChunk {
+        .send(Ok(StreamChunk {
             request_id: request_id.clone(),
             text: "already visible".into(),
             token: None,
@@ -130,6 +130,7 @@ async fn fixture() -> Fixture {
             api_response: None,
             execution_evidence: None,
         }))
+        .await
         .unwrap();
     sequence.response_sender = Some(response_sender);
     sequence.stream_sender = Some(stream_sender);
@@ -218,7 +219,7 @@ async fn cancelled_error_publication(close_before_caller_drop: bool) {
     }
     drop(completion);
     assert_eq!(
-        fixture.stream.try_recv().unwrap().unwrap().text,
+        fixture.stream.try_recv().unwrap().unwrap().chunk().text,
         "already visible"
     );
     let terminal = tokio::time::timeout(Duration::from_secs(3), fixture.stream.recv())

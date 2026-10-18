@@ -142,6 +142,17 @@ const EXECUTION_READINESS_READY: u8 = 1;
 const EXECUTION_READINESS_FAILED: u8 = 2;
 const EXECUTION_READINESS_CANCELLED: u8 = 3;
 
+/// Output eligibility only: waking this original ticket grants no execution
+/// capacity and cannot affect a replacement with the same RequestId.
+#[derive(Debug, Clone)]
+pub struct OutputReadinessWake(Arc<std::sync::atomic::AtomicBool>);
+
+impl OutputReadinessWake {
+    pub fn resume(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 struct ExecutionReadinessState {
     status: AtomicU8,
@@ -445,6 +456,7 @@ pub struct ContinuousBatchRequest {
     /// hazards. It is compare-exact so a stale waiter cannot unblock a newer
     /// frontier generation that reuses the same product request id.
     execution_readiness_block: Option<ExecutionReadinessBlock>,
+    output_readiness: Option<OutputReadinessWake>,
     /// Scheduler-owned fairness yield after a proven physical backing mutation.
     execution_maintenance_retry: Option<ExecutionMaintenanceRetryTicket>,
     /// Rejects replay of a previously consumed maintenance mutation receipt.
@@ -477,6 +489,7 @@ impl ContinuousBatchRequest {
             waiting_admission_ticket: None,
             execution_capacity_deferral: None,
             execution_readiness_block: None,
+            output_readiness: None,
             execution_maintenance_retry: None,
             last_execution_maintenance_capacity_epoch: None,
         }
@@ -1239,6 +1252,9 @@ impl ContinuousBatchScheduler {
         {
             let prefill = self.prefill_queue.read();
             for request in prefill.iter() {
+                if Self::output_is_blocked(request) {
+                    continue;
+                }
                 if request
                     .execution_readiness_block
                     .as_ref()
@@ -1258,6 +1274,9 @@ impl ContinuousBatchScheduler {
         {
             let decode = self.decode_queue.read();
             for request in decode.requests.values() {
+                if Self::output_is_blocked(request) {
+                    continue;
+                }
                 if request
                     .execution_readiness_block
                     .as_ref()
@@ -1351,15 +1370,16 @@ impl ContinuousBatchScheduler {
                 .iter()
                 .chain(decode.requests.values())
                 .all(|request| {
-                    request
-                        .execution_readiness_block
-                        .as_ref()
-                        .is_some_and(|block| {
-                            matches!(
-                                block.status(),
-                                EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
-                            )
-                        })
+                    Self::output_is_blocked(request)
+                        || request
+                            .execution_readiness_block
+                            .as_ref()
+                            .is_some_and(|block| {
+                                matches!(
+                                    block.status(),
+                                    EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
+                                )
+                            })
                 })
     }
 
@@ -1376,6 +1396,9 @@ impl ContinuousBatchScheduler {
             .iter()
             .chain(decode.requests.values())
             .all(|request| {
+                if Self::output_is_blocked(request) {
+                    return true;
+                }
                 if let Some(ExecutionCapacityDeferral::Allocator {
                     domain,
                     release_epoch,
@@ -2339,6 +2362,33 @@ impl ContinuousBatchScheduler {
             deferred_count: installed,
             wake: ExecutionReadinessWake { ticket_id, state },
         })
+    }
+
+    /// The engine serializes this installation with exact outer publication.
+    /// The returned capability belongs to this queue entry, not its string id.
+    pub fn pause_for_output(&self, request_id: &RequestId) -> Result<OutputReadinessWake> {
+        let mut prefill = self.prefill_queue.write();
+        let mut decode = self.decode_queue.write();
+        let request = prefill
+            .iter_mut()
+            .chain(decode.requests.values_mut())
+            .find(|request| &request.inner.request.id == request_id)
+            .ok_or_else(|| FerrumError::scheduler("output pause has no active request"))?;
+        if let Some(wake) = request.output_readiness.as_ref() {
+            if !wake.0.load(Ordering::Acquire) {
+                return Ok(wake.clone());
+            }
+        }
+        let wake = OutputReadinessWake(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        request.output_readiness = Some(wake.clone());
+        Ok(wake)
+    }
+
+    fn output_is_blocked(request: &ContinuousBatchRequest) -> bool {
+        request
+            .output_readiness
+            .as_ref()
+            .is_some_and(|wake| !wake.0.load(Ordering::Acquire))
     }
 
     fn rollback_execution_readiness_install(
@@ -3932,6 +3982,10 @@ impl ContinuousBatchScheduler {
     }
 
     fn execution_readiness_is_blocked(req: &mut ContinuousBatchRequest) -> bool {
+        if Self::output_is_blocked(req) {
+            return true;
+        }
+        req.output_readiness = None;
         let Some(block) = req.execution_readiness_block.as_ref() else {
             return false;
         };

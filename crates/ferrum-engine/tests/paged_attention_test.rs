@@ -185,7 +185,7 @@ async fn streaming_with_paged_kv() {
 
     let last = chunks.last().unwrap();
     assert!(
-        last.finish_reason.is_some(),
+        last.chunk().finish_reason.is_some(),
         "Final chunk should have finish_reason"
     );
 }

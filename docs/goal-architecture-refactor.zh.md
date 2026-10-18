@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 首片统一驱动启动、关闭准入和退出清理；有界输出与后续隔离仍未完成。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已实现统一驱动生命周期，以及持有额度的流式输出和 HTTP 按需拉取；语义历史限额、锁内解码与后续隔离仍未完成。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -73,6 +73,7 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 |---|---|---|
 | `ferrum-types` | 通用值类型、配置声明、能力与数值描述 | 自动调优策略、运行时全局变量、SLO 拟合逻辑 |
 | `ferrum-interfaces` | 不依赖执行实现的基础端口与公共语义，例如 tokenizer、sampler、模型描述 | 资源池实现、具体 runtime 授权、产品默认选择 |
+| `ferrum-output` | 输出会话、内容额度与持有额度的流/内容容器；供 Engine 和 HTTP 共用 | 模型资源、调度策略、HTTP 事件语义 |
 | `ferrum-runtime` | 计划准备、资源授权、提交/完成/退休、设备执行端口、复用与失效、实例上下文 | 请求 SLO 目标、统计特征、模型名称策略 |
 | `ferrum-execution` | 建立在 runtime 授权之上的产品执行契约、泛型执行驱动、结果/延期/取消协议；契约与驱动分模块 | 第二套资源运行时、具体模型/后端装配、训练器、HTTP 协议 |
 | `ferrum-models` / `ferrum-kernels` | 模型语义与计划生成；CPU/Metal/CUDA 的具体执行、布局和数值能力 | 校准样本目录、训练 schema、SLO 拒单策略 |
@@ -87,7 +88,9 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 
 R1 Rust API 迁移：原 `ferrum_interfaces::vnext::*` 改为 `ferrum_runtime::*`，`model_executor` 与 `ModelExecutor` 改由 `ferrum_execution` 导出。原 `ferrum_models::VNextModelExecutor` / `VNextExecutorConfig` 改为 `ferrum_execution::ProgramExecutor` / `ProgramExecutorConfig`，编译结果与装配合同改为 `CompiledProgram` / `RuntimeComposition`；不保留旧路径别名。产品 prefix 观测使用 `ProductExecutionEventSink`，可向上转型为 runtime sink，不增加队列或放宽事件授权；基础 interfaces 不向上重导出。
 
-R2 驱动 API：`ContinuousBatchEngine::start_loop()` 返回 `Result<DriverObserver>`；显式启动和首请求共用同一任务。用 `observer.wait().await.result()` 观察退出，停止仍调用 `shutdown()`；观察端没有 abort 权限，取消等待不取消清理。关闭后拒绝新请求和重启；失败报告保留未证明已释放的原资源。慢消费者下的有界输出仍待后续切片完成。
+R2 驱动 API：`ContinuousBatchEngine::start_loop()` 返回 `Result<DriverObserver>`；显式启动和首请求共用同一任务。用 `observer.wait().await.result()` 观察退出，停止仍调用 `shutdown()`；观察端没有 abort 权限，取消等待不取消清理。关闭后拒绝新请求和重启；失败报告保留未证明已释放的原资源。
+
+R2 输出 API：`infer_stream()` 返回 `ferrum_output::InferenceStream`，每项为 `Result<OutputChunk>`，通过 `chunk()` 借用原数据。会话随流与内容的真实所有者保留，不能在模型完成或上游 EOF 时提前归还。CLI 的 `[output]` 与库的 `EngineConfig.output` 使用同一 typed 配置；HTTP 复用 Engine 的会话和额度，不另建一套。慢流暂停自己的生成，关闭错误仍由原驱动观察；停服可中断交付并返回明确错误。语义全文、工具参数及 tokenizer 临时分配的完整限额仍待后续切片，不据队列有界宣称全部内存有界。
 
 产品装配层组合模型准备结果、具体设备 runtime 与泛型驱动。迁移 `VNextModelExecutor<R>` 时同时解开其对 `PreparedProductionModel` 的依赖，将中立准备输入与编译结果归到正确层，并保留 source/registry/初始化身份校验；不能整文件搬迁后让 execution 再引用 models。泛型驱动本身已后端中立，不能将这项整理描述成新消除的具体 GPU 绑定。量化格式描述/解析与设备执行也按此分层，不能经 quantization 引回 kernels 依赖环。
 

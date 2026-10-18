@@ -5,12 +5,11 @@ use ferrum_types::{
     EngineConfig, EngineMetrics, EngineStatus, FinishReason, HealthStatus, InferenceRequest,
     InferenceResponse, MemoryUsage, ModelId, StreamChunk, TokenId, TokenUsage,
 };
-use futures::{stream, Stream};
+use futures::stream;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -90,8 +89,7 @@ impl LlmInferenceEngine for StubLlm {
     async fn infer_stream(
         &self,
         request: InferenceRequest,
-    ) -> ferrum_types::Result<Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>>
-    {
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
         let chunk = StreamChunk {
             request_id: request.id,
             text: self.text.clone(),
@@ -103,7 +101,13 @@ impl LlmInferenceEngine for StubLlm {
             api_response: None,
             execution_evidence: None,
         };
-        Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
+        let budget = ferrum_output::OutputBudget::new(ferrum_types::OutputConfig::default())?;
+        let session = budget.try_open_session()?;
+        let chunk = session.wrap_chunk(chunk).await?;
+        Ok(ferrum_output::InferenceStream::new(
+            session,
+            Box::pin(stream::iter(vec![Ok(chunk)])),
+        ))
     }
 }
 

@@ -533,6 +533,10 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             ],
             "shared execution: retain protocol, sampling, resource and backend interactions",
         ),
+        "ferrum-output" => (
+            vec![Template, Termination, Structured, Tools, Scheduler, Kv, Architecture],
+            "shared output ownership and backpressure affect run/serve semantics, admission and request lifetime",
+        ),
         "ferrum-sampler" => (
             vec![Termination, Structured, Tools],
             "sampling, grammar and terminal selection interact across output protocols",
@@ -589,6 +593,7 @@ fn known_component(component: &str) -> bool {
             | "ferrum-interfaces"
             | "ferrum-runtime"
             | "ferrum-execution"
+            | "ferrum-output"
             | "ferrum-engine"
             | "ferrum-sampler"
             | "ferrum-tokenizer"
@@ -1057,6 +1062,7 @@ mod tests {
             "crates/ferrum-interfaces/src/tokenizer.rs",
             "crates/ferrum-runtime/src/resource.rs",
             "crates/ferrum-execution/src/model_executor.rs",
+            "crates/ferrum-output/src/lib.rs",
             "crates/ferrum-engine/src/continuous_engine.rs",
         ] {
             let impact = analyze_paths([path]);
@@ -1407,6 +1413,7 @@ mod tests {
         for component in [
             "ferrum-cli",
             "ferrum-engine",
+            "ferrum-output",
             "ferrum-models",
             "ferrum-kernels",
             "ferrum-bench-core",

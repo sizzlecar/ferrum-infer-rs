@@ -144,6 +144,8 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    engine_config.output = config.output.clone();
+    engine_config.output.validate()?;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
     let model_sources = product_input.model_sources;
@@ -453,18 +455,7 @@ async fn run_single(
     Ok(collect_stream(stream).await?)
 }
 
-async fn collect_stream(
-    mut stream: std::pin::Pin<
-        Box<
-            dyn futures::Stream<
-                    Item = std::result::Result<
-                        ferrum_types::StreamChunk,
-                        ferrum_types::FerrumError,
-                    >,
-                > + Send,
-        >,
-    >,
-) -> Result<RequestRecord> {
+async fn collect_stream(mut stream: ferrum_output::InferenceStream) -> Result<RequestRecord> {
     let start = Instant::now();
     let mut token_count: u32 = 0;
     let mut first_token_time: Option<Instant> = None;
@@ -476,6 +467,7 @@ async fn collect_stream(
     while let Some(result) = stream.next().await {
         match result {
             Ok(chunk) => {
+                let chunk = chunk.chunk();
                 if chunk.token.is_some() {
                     let now = Instant::now();
                     if first_token_time.is_none() {

@@ -362,8 +362,7 @@ impl LlmInferenceEngine for ToolFeedbackLlm {
     async fn infer_stream(
         &self,
         request: InferenceRequest,
-    ) -> ferrum_types::Result<Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>>
-    {
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
         self.reply(&request).infer_stream(request).await
     }
 }

@@ -7,6 +7,7 @@ use futures::StreamExt;
 // remain protocol fixtures, not model numerical evidence.
 struct StopBoundaryExecutor {
     inner: ferrum_testkit::ConfigurableModelExecutor,
+    finish_signal: Mutex<Option<tokio::sync::oneshot::Sender<ExecutionEndReason>>>,
 }
 
 impl StopBoundaryExecutor {
@@ -15,6 +16,7 @@ impl StopBoundaryExecutor {
             inner: ferrum_testkit::ConfigurableModelExecutor::with_token_sequence(
                 vocabulary, tokens,
             ),
+            finish_signal: Mutex::new(None),
         }
     }
 }
@@ -53,7 +55,16 @@ impl ModelExecutor for StopBoundaryExecutor {
         sequence: &ExecutorSequence,
         reason: ExecutionEndReason,
     ) -> Result<ExecutionCloseOutcome> {
-        self.inner.finish_tokens(sequence, reason).await
+        let outcome = self.inner.finish_tokens(sequence, reason).await?;
+        if let Some(signal) = self.finish_signal.lock().take() {
+            assert!(outcome.error.is_none());
+            assert!(matches!(
+                &outcome.disposition,
+                ferrum_execution::token_execution::ExecutionCloseDisposition::Ended(_)
+            ));
+            let _ = signal.send(reason);
+        }
+        Ok(outcome)
     }
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.inner.cancel_tokens(sequence)
@@ -61,6 +72,20 @@ impl ModelExecutor for StopBoundaryExecutor {
 }
 
 fn stop_boundary_engine(pieces: &[&str], end_with_eos: bool) -> ContinuousBatchEngine {
+    stop_boundary_engine_with_options(pieces, end_with_eos, StopBoundaryOptions::default())
+}
+
+#[derive(Default)]
+struct StopBoundaryOptions {
+    output_queue_items: Option<usize>,
+    finish_signal: Option<tokio::sync::oneshot::Sender<ExecutionEndReason>>,
+}
+
+fn stop_boundary_engine_with_options(
+    pieces: &[&str],
+    end_with_eos: bool,
+    options: StopBoundaryOptions,
+) -> ContinuousBatchEngine {
     let mut pairs = vec![("test", 5), ("", 6)];
     pairs.extend(
         pieces
@@ -75,23 +100,119 @@ fn stop_boundary_engine(pieces: &[&str], end_with_eos: bool) -> ContinuousBatchE
     if end_with_eos {
         tokens.push(3); // PolicyTokenizer's ordinary EOS has no decoded text.
     }
-    let config = EngineConfig::default();
+    let mut config = EngineConfig::default();
+    if let Some(items) = options.output_queue_items {
+        config.output.engine_queue_items = items;
+    }
+    let executor = StopBoundaryExecutor::with_token_sequence(128, tokens);
+    *executor.finish_signal.lock() = options.finish_signal;
     ContinuousBatchEngine::new(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         tokenizer,
         Arc::new(crate::registry::GreedySampler),
         Arc::new(MockKvCacheManager::new(256)),
-        Arc::new(StopBoundaryExecutor::with_token_sequence(128, tokens)),
+        Arc::new(executor),
         Arc::new(MockTensorFactory),
     )
     .unwrap()
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn output_stop_prefix_flush_preserves_two_pending_spans_before_terminal() {
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let engine = stop_boundary_engine_with_options(
+        &["first", "answerab"],
+        false,
+        StopBoundaryOptions {
+            output_queue_items: Some(1),
+            finish_signal: Some(finish),
+        },
+    );
+    let mut request = policy_request();
+    request.sampling_params.stop_sequences = vec!["abc".into()];
+    request.sampling_params.max_tokens = 4;
+    request.evidence_request.capture_prompt_token_ids = true;
+    let request_id = request.id.clone();
+    let stream = engine.infer_stream(request).await.unwrap();
+
+    // No client poll has happened. Tokens 6,6 are empty, 7 fills the queue,
+    // and 8 creates "answer" plus the unmatched terminal "ab" flush. On
+    // this single-thread runtime the synchronous completion handoff registers
+    // both spans before the separately owned finish task can send this signal.
+    let reason = tokio::time::timeout(Duration::from_secs(2), finished)
+        .await
+        .expect("physical finish must not wait for the client to drain output")
+        .unwrap();
+    assert_eq!(
+        reason,
+        ExecutionEndReason::Completed {
+            input_tokens: 1,
+            output_tokens: 4
+        }
+    );
+    assert!(engine.inner.sequences.read().is_empty());
+
+    let chunks = tokio::time::timeout(Duration::from_secs(2), stream.collect::<Vec<_>>())
+        .await
+        .expect("both pending spans and the terminal must drain in order")
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.chunk().text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "answer", "ab", ""]
+    );
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.chunk().text.as_str())
+            .collect::<String>(),
+        "firstanswerab"
+    );
+    assert!(chunks
+        .iter()
+        .all(|chunk| chunk.chunk().request_id == request_id));
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.chunk().token.map(TokenId::get))
+            .collect::<Vec<_>>(),
+        vec![Some(7), Some(8), None, None]
+    );
+    assert!(chunks[..3]
+        .iter()
+        .all(|chunk| chunk.chunk().finish_reason.is_none() && chunk.chunk().usage.is_none()));
+    let terminal = chunks.last().unwrap().chunk();
+    assert_eq!(terminal.finish_reason, Some(FinishReason::Length));
+    let usage = terminal.usage.as_ref().unwrap();
+    assert_eq!(usage.prompt_tokens, 1);
+    assert_eq!(usage.completion_tokens, 4);
+    let evidence = terminal.execution_evidence.as_ref().unwrap();
+    assert_eq!(evidence.prompt_token_ids, vec![TokenId::new(5)]);
+    assert_eq!(
+        evidence.output_token_ids,
+        vec![
+            TokenId::new(6),
+            TokenId::new(6),
+            TokenId::new(7),
+            TokenId::new(8)
+        ]
+    );
+    engine.shutdown().await.unwrap();
+    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    drop(chunks);
+    assert_eq!(engine.inner.output_budget.usage().sessions, 0);
+    assert_eq!(engine.inner.output_budget.usage().queued_bytes, 0);
+}
+
 async fn stop_boundary_outputs(
     pieces: &[&str],
     stops: &[&str],
-) -> (InferenceResponse, Vec<StreamChunk>) {
+) -> (InferenceResponse, Vec<ferrum_output::OutputChunk>) {
     stop_boundary_outputs_with_eos(pieces, stops, false).await
 }
 
@@ -99,7 +220,7 @@ async fn stop_boundary_outputs_with_eos(
     pieces: &[&str],
     stops: &[&str],
     end_with_eos: bool,
-) -> (InferenceResponse, Vec<StreamChunk>) {
+) -> (InferenceResponse, Vec<ferrum_output::OutputChunk>) {
     let mut request = policy_request();
     request.sampling_params.stop_sequences = stops.iter().map(|s| (*s).to_owned()).collect();
     request.sampling_params.max_tokens = pieces.len() + 2 + usize::from(end_with_eos);
@@ -110,7 +231,7 @@ async fn stop_boundary_outputs_for_request(
     pieces: &[&str],
     end_with_eos: bool,
     mut request: InferenceRequest,
-) -> (InferenceResponse, Vec<StreamChunk>) {
+) -> (InferenceResponse, Vec<ferrum_output::OutputChunk>) {
     let engine = stop_boundary_engine(pieces, end_with_eos);
     let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request.clone()))
         .await
@@ -151,7 +272,7 @@ async fn harmony_user_stop_preserves_exact_payload_and_terminal_usage() {
         let expected = format!("{FINAL}答案 ");
         let mut streamed = String::new();
         for chunk in &chunks {
-            streamed.push_str(&chunk.text);
+            streamed.push_str(&chunk.chunk().text);
             assert!(
                 expected.starts_with(&streamed),
                 "a stop prefix leaked: {streamed:?}"
@@ -161,9 +282,9 @@ async fn harmony_user_stop_preserves_exact_payload_and_terminal_usage() {
         assert_eq!(streamed, expected);
         assert_eq!(response.finish_reason, FinishReason::Stop);
         let terminal = chunks.last().unwrap();
-        assert!(terminal.text.is_empty());
-        assert_eq!(terminal.finish_reason, Some(FinishReason::Stop));
-        let usage = terminal.usage.as_ref().unwrap();
+        assert!(terminal.chunk().text.is_empty());
+        assert_eq!(terminal.chunk().finish_reason, Some(FinishReason::Stop));
+        let usage = terminal.chunk().usage.as_ref().unwrap();
         assert_eq!(usage.prompt_tokens, response.usage.prompt_tokens);
         assert_eq!(usage.completion_tokens, response.usage.completion_tokens);
         assert_eq!(usage.total_tokens, response.usage.total_tokens);
@@ -180,7 +301,7 @@ async fn stop_boundary_react_marker_never_leaks_into_stream() {
     .await;
     let text = chunks
         .iter()
-        .map(|chunk| chunk.text.as_str())
+        .map(|chunk| chunk.chunk().text.as_str())
         .collect::<String>();
     assert_eq!(
         text, "Action Input: wiki",
@@ -192,8 +313,8 @@ async fn stop_boundary_react_marker_never_leaks_into_stream() {
     );
     assert_eq!(response.finish_reason, FinishReason::Stop);
     let terminal = chunks.last().unwrap();
-    assert_eq!(terminal.finish_reason, Some(FinishReason::Stop));
-    let usage = terminal.usage.as_ref().unwrap();
+    assert_eq!(terminal.chunk().finish_reason, Some(FinishReason::Stop));
+    let usage = terminal.chunk().usage.as_ref().unwrap();
     assert_eq!(usage.prompt_tokens, response.usage.prompt_tokens);
     assert_eq!(usage.completion_tokens, response.usage.completion_tokens);
     assert_eq!(usage.total_tokens, response.usage.total_tokens);
@@ -208,7 +329,7 @@ async fn stop_boundary_inside_token_preserves_preceding_text() {
     let (response, chunks) = stop_boundary_outputs(&["OK \n\n"], &["\n"]).await;
     let text = chunks
         .iter()
-        .map(|chunk| chunk.text.as_str())
+        .map(|chunk| chunk.chunk().text.as_str())
         .collect::<String>();
     assert_eq!(
         text, "OK ",
@@ -261,7 +382,7 @@ async fn stop_boundary_flushes_and_selects_the_earliest_match() {
             stop_boundary_outputs_with_eos(case.pieces, case.stops, case.end_with_eos).await;
         let text = chunks
             .iter()
-            .map(|chunk| chunk.text.as_str())
+            .map(|chunk| chunk.chunk().text.as_str())
             .collect::<String>();
         assert_eq!(
             text, case.expected,
@@ -270,7 +391,10 @@ async fn stop_boundary_flushes_and_selects_the_earliest_match() {
         );
         assert_eq!(response.text, text);
         assert_eq!(response.finish_reason, case.finish);
-        assert_eq!(chunks.last().unwrap().finish_reason, Some(case.finish));
+        assert_eq!(
+            chunks.last().unwrap().chunk().finish_reason,
+            Some(case.finish)
+        );
     }
 }
 
@@ -280,8 +404,8 @@ async fn stop_boundary_mismatch_releases_the_prefix_before_later_output() {
     let mut text = String::new();
     let mut released_after_mismatch = false;
     for chunk in chunks {
-        text.push_str(&chunk.text);
-        released_after_mismatch |= text == "abx" && chunk.finish_reason.is_none();
+        text.push_str(&chunk.chunk().text);
+        released_after_mismatch |= text == "abx" && chunk.chunk().finish_reason.is_none();
     }
     assert!(
         released_after_mismatch,
@@ -419,11 +543,11 @@ async fn stop_boundary_rejects_strict_json_truncated_inside_a_token() {
             let chunks = chunks.into_iter().collect::<Result<Vec<_>>>().unwrap();
             let text = chunks
                 .iter()
-                .map(|chunk| chunk.text.as_str())
+                .map(|chunk| chunk.chunk().text.as_str())
                 .collect::<String>();
             assert_eq!(text, expected);
             assert_eq!(
-                chunks.last().unwrap().finish_reason,
+                chunks.last().unwrap().chunk().finish_reason,
                 Some(FinishReason::Stop)
             );
         } else {
@@ -433,9 +557,9 @@ async fn stop_boundary_rejects_strict_json_truncated_inside_a_token() {
                     .iter()
                     .filter_map(|chunk| chunk.as_ref().ok())
                     .all(|chunk| {
-                        chunk.text.is_empty()
-                            && chunk.finish_reason.is_none()
-                            && chunk.usage.is_none()
+                        chunk.chunk().text.is_empty()
+                            && chunk.chunk().finish_reason.is_none()
+                            && chunk.chunk().usage.is_none()
                     }),
                 "invalid structured tail must not be flushed as successful output: {chunks:?}"
             );

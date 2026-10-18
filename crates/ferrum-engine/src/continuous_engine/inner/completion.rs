@@ -16,14 +16,69 @@ impl Drop for RemovedCompletionSequence<'_> {
     }
 }
 
-struct CompletionHandoff {
-    response: InferenceResponse,
-    stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
+pub(in crate::continuous_engine) struct CompletionHandoff {
+    inner: Weak<EngineInner>,
+    pub(in crate::continuous_engine) done: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    pub(in crate::continuous_engine) response: InferenceResponse,
+    pub(in crate::continuous_engine) stream_sender: Option<OutputSender>,
     response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
     terminal_error: Option<FerrumError>,
+    terminal_error_published: bool,
+    terminal_error_is_delivery: bool,
     completion_error: Option<FerrumError>,
     terminal_token_trace: Option<SequenceTokenTraceEvidence>,
     token_close: Option<Result<execution_close::ExecutionCloseTicket>>,
+}
+
+impl Drop for CompletionHandoff {
+    fn drop(&mut self) {
+        // An output stop may drop a not-yet-polled completion or interrupt a
+        // queue/close wait. Its physical ticket is only an observer; preserve
+        // the client terminal and trace without awaiting that observer.
+        if !self.terminal_error_published && !self.terminal_error_is_delivery {
+            if let Some(error) = self.terminal_error.take() {
+                if let Some(inner) = self.inner.upgrade() {
+                    inner.output_tasks.record_interrupted_error(error);
+                    inner.work_notify.notify_one();
+                }
+            }
+        }
+        if let Some(trace) = self.terminal_token_trace.take() {
+            if let Some(inner) = self.inner.upgrade() {
+                inner.write_sequence_terminal_token_trace(
+                    &self.response.request_id,
+                    "completed",
+                    Some(FinishReason::Error),
+                    Some(&trace),
+                );
+            }
+        }
+        if let Some(sender) = self.response_sender.take() {
+            let _ = sender.send(Err(FerrumError::scheduler(
+                "engine stopped before output completion",
+            )));
+        }
+        if let Some(sender) = self.stream_sender.take() {
+            sender.interrupt_delivery();
+        }
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Err(FerrumError::scheduler(
+                "engine stopped before output completion",
+            )));
+        }
+    }
+}
+
+impl CompletionHandoff {
+    pub(in crate::continuous_engine) fn retain_delivery_error(&mut self, error: FerrumError) {
+        if self.terminal_error.is_none() {
+            self.terminal_error_is_delivery = true;
+            self.terminal_error = Some(error.clone());
+        }
+        self.completion_error.get_or_insert(error);
+        self.response.finish_reason = FinishReason::Error;
+        self.response.api_response = None;
+    }
 }
 
 impl SequenceState {
@@ -153,7 +208,7 @@ impl SequenceState {
             || self
                 .stream_sender
                 .as_ref()
-                .is_some_and(tokio::sync::mpsc::Sender::is_closed)
+                .is_some_and(OutputSender::is_closed)
     }
 
     pub(in crate::continuous_engine) fn structured_output_terminal_error(
@@ -305,11 +360,16 @@ impl EngineInner {
             })
     }
 
-    pub(super) async fn send_stream_update(&self, request_id: &RequestId, token: TokenId) {
-        self.send_stream_text(request_id, Some(token), None).await;
+    pub(in crate::continuous_engine) async fn send_stream_update(
+        &self,
+        request_id: &RequestId,
+        token: TokenId,
+    ) {
+        self.send_stream_text(request_id, Some(token), None);
+        tokio::task::yield_now().await;
     }
 
-    async fn send_stream_text(
+    fn send_stream_text(
         &self,
         request_id: &RequestId,
         token: Option<TokenId>,
@@ -330,7 +390,7 @@ impl EngineInner {
         // multi-byte sequence), (d) otherwise carve off the substring
         // past `streamed_text_len` and bump the watermark. Possible stop
         // prefixes are held until they match, diverge, or generation ends.
-        let (sender, delta, ttft_s, itl_s, first_emit_prof) = {
+        let (ttft_s, itl_s, first_emit_prof) = {
             let mut sequences = self.sequences.write();
             let Some(seq) = sequences.get_mut(request_id) else {
                 return;
@@ -366,6 +426,27 @@ impl EngineInner {
                 return;
             };
             let delta = delta.to_string();
+            let range = seq.streamed_text_len..visible.len();
+            if !delta.is_empty() {
+                if let Some(sender) = sender {
+                    let chunk = StreamChunk {
+                        request_id: request_id.clone(),
+                        text: delta.clone(),
+                        token,
+                        finish_reason: None,
+                        usage: None,
+                        created_at: chrono::Utc::now(),
+                        metadata: HashMap::new(),
+                        api_response: None,
+                        execution_evidence: None,
+                    };
+                    if let Err(error) = sender.publish_text(self, chunk, range, terminal) {
+                        sender.record_failure(error);
+                        self.work_notify.notify_one();
+                        return;
+                    }
+                }
+            }
             seq.streamed_text_len = visible.len();
 
             // Latency-metric tracking (PLAYBOOK § 7 definitions).
@@ -401,7 +482,7 @@ impl EngineInner {
                 seq.emitted_chunks = seq.emitted_chunks.saturating_add(1);
             }
 
-            (sender, delta, ttft_s, itl_s, first_emit_prof)
+            (ttft_s, itl_s, first_emit_prof)
         };
 
         if let Some(t) = ttft_s {
@@ -431,36 +512,71 @@ impl EngineInner {
                 );
             }
         }
+    }
 
-        if let Some(tx) = sender {
-            if delta.is_empty() {
-                return;
+    pub(in crate::continuous_engine) fn rebuild_output_span(
+        &self,
+        sender: &OutputSender,
+        request_id: &RequestId,
+        span: &output_delivery::TextSpan,
+    ) -> Result<Option<StreamChunk>> {
+        // Sequence -> output lock order matches publication. Reading both
+        // sources under this lock closes the remove/handoff lookup race.
+        let sequences = self.sequences.read();
+        let text = match sender.completed_text(span.bytes.clone())? {
+            Some(text) => text,
+            None => {
+                let Some(sequence) = sequences.get(request_id).filter(|sequence| {
+                    sequence
+                        .stream_sender
+                        .as_ref()
+                        .is_some_and(|actual| actual.same_owner(sender))
+                }) else {
+                    return Ok(None);
+                };
+                let visible =
+                    sequence.decoded_output_text(self.tokenizer.as_ref(), span.terminal)?;
+                visible
+                    .get(span.bytes.clone())
+                    .ok_or_else(|| {
+                        FerrumError::internal(
+                            "pending output span disagrees with original token history",
+                        )
+                    })?
+                    .to_owned()
             }
-            let chunk = StreamChunk {
-                request_id: request_id.clone(),
-                text: delta,
-                token,
-                finish_reason: None,
-                usage: None,
-                created_at: chrono::Utc::now(),
-                metadata: HashMap::new(),
-                api_response: None,
-                execution_evidence: None,
-            };
-            if tx.send(Ok(chunk)).await.is_ok() {
-                // A bounded channel send often completes immediately, so a
-                // hot decode loop can keep running without giving the CLI /
-                // HTTP stream receiver a chance to flush visible output. Yield
-                // after successful streaming sends to preserve token-level UX;
-                // non-streaming requests do not enter this branch.
-                tokio::task::yield_now().await;
-            }
-        }
+        };
+        Ok(Some(StreamChunk {
+            request_id: request_id.clone(),
+            text,
+            token: span.token,
+            finish_reason: None,
+            usage: None,
+            created_at: span.created_at,
+            metadata: HashMap::new(),
+            api_response: None,
+            execution_evidence: None,
+        }))
     }
 
     // ── completion ─────────────────────────────────────────────────────
 
     pub(super) async fn cancel_abandoned_requests(&self) -> Result<()> {
+        let failed: Vec<_> = self
+            .sequences
+            .read()
+            .iter()
+            .filter_map(|(id, sequence)| {
+                sequence
+                    .stream_sender
+                    .as_ref()
+                    .and_then(OutputSender::failure)
+                    .map(|error| (id.clone(), error))
+            })
+            .collect();
+        for (id, error) in failed {
+            self.complete_request_detached(&id, FinishReason::Error, Some(error))?;
+        }
         let abandoned: Vec<_> = self
             .sequences
             .read()
@@ -665,15 +781,7 @@ impl EngineInner {
         scheduler_result.and(close_error.map_or(Ok(()), Err))
     }
 
-    pub(super) async fn complete_request(
-        &self,
-        request_id: &RequestId,
-        finish_reason: FinishReason,
-    ) -> Result<()> {
-        self.complete_request_inner(request_id, finish_reason, None, None)
-            .await
-    }
-
+    #[cfg(test)]
     pub(in crate::continuous_engine) async fn complete_request_with_error(
         &self,
         request_id: &RequestId,
@@ -698,16 +806,40 @@ impl EngineInner {
         key: &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
         error: FerrumError,
     ) -> Result<()> {
-        self.complete_request_inner(
+        self.register_request_completion(
             key.request_id(),
             FinishReason::Error,
             Some(error),
             Some(key),
         )
-        .await
+        .map(drop)
     }
 
+    #[cfg(test)]
     async fn complete_request_inner(
+        &self,
+        request_id: &RequestId,
+        finish_reason: FinishReason,
+        explicit_terminal_error: Option<FerrumError>,
+        expected_admission: Option<
+            &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
+        >,
+    ) -> Result<()> {
+        let Some(receiver) = self.register_request_completion(
+            request_id,
+            finish_reason,
+            explicit_terminal_error,
+            expected_admission,
+        )?
+        else {
+            return Ok(());
+        };
+        receiver
+            .await
+            .map_err(|_| FerrumError::internal("completion delivery stopped"))?
+    }
+
+    fn register_request_completion(
         &self,
         request_id: &RequestId,
         finish_reason: FinishReason,
@@ -715,7 +847,7 @@ impl EngineInner {
         expected_admission: Option<
             &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
         >,
-    ) -> Result<()> {
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<Result<()>>>> {
         // An unpublished admission has no prefix restore, and its original
         // scheduler ticket has already been removed. Neither operation may
         // touch a replacement merely because it reuses the RequestId.
@@ -723,8 +855,14 @@ impl EngineInner {
             self.discard_pending_prefix_restore(request_id);
         }
         let mut classified_api_response = None;
+        let mut terminal_error_is_delivery = false;
         if explicit_terminal_error.is_none() {
             explicit_terminal_error = self.sequences.read().get(request_id).and_then(|seq| {
+                let delivery_error = seq.stream_sender.as_ref().and_then(OutputSender::failure);
+                if delivery_error.is_some() {
+                    terminal_error_is_delivery = true;
+                    return delivery_error;
+                }
                 seq.structured_output_terminal_error(finish_reason)
                     .or_else(|| {
                         seq.validate_structured_stop_boundary(self.tokenizer.as_ref())
@@ -745,19 +883,67 @@ impl EngineInner {
             // Flush held, unmatched prefixes and legal text before an in-token
             // stop as a separate text chunk. Consumers may defer a text delta;
             // they must still receive the independent terminal/usage event.
-            self.send_stream_text(request_id, None, Some(finish_reason))
-                .await;
+            self.send_stream_text(request_id, None, Some(finish_reason));
         }
         let Some(handoff) = self.handoff_request_completion(
             request_id,
             finish_reason,
             explicit_terminal_error,
+            terminal_error_is_delivery,
             expected_admission,
             classified_api_response,
         ) else {
-            return Ok(());
+            return Ok(None);
         };
-        self.finish_request_completion(request_id, handoff).await
+        self.schedule_output_completion(request_id, handoff)
+            .map(Some)
+    }
+
+    pub(in crate::continuous_engine) fn complete_request_detached(
+        &self,
+        request_id: &RequestId,
+        finish_reason: FinishReason,
+        error: Option<FerrumError>,
+    ) -> Result<()> {
+        self.register_request_completion(request_id, finish_reason, error, None)
+            .map(drop)
+    }
+
+    fn schedule_output_completion(
+        &self,
+        request_id: &RequestId,
+        mut handoff: CompletionHandoff,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<()>>> {
+        if let Some(error) = handoff.completion_error.as_ref().or_else(|| {
+            handoff
+                .token_close
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+        }) {
+            self.output_tasks.record_control_error(error.clone());
+            self.work_notify.notify_one();
+        }
+        let (done, receiver) = tokio::sync::oneshot::channel();
+        handoff.done = Some(done);
+        if let Some(sender) = handoff.stream_sender.take() {
+            sender.complete(self, handoff)?;
+        } else {
+            let inner = self
+                .self_weak
+                .upgrade()
+                .ok_or_else(|| FerrumError::internal("completion engine unavailable"))?;
+            let request_id = request_id.clone();
+            let mut stop = self.output_tasks.stop_receiver();
+            drop(self.output_tasks.spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = output_delivery::wait_for_stop(&mut stop) => {},
+                    _ = inner.finish_output_completion(&request_id, handoff, None) => {},
+                }
+                Ok(())
+            })?);
+        }
+        Ok(receiver)
     }
 
     fn handoff_request_completion(
@@ -765,6 +951,7 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
+        terminal_error_is_delivery: bool,
         expected_admission: Option<
             &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
         >,
@@ -776,7 +963,7 @@ impl EngineInner {
         let mut completion_error = None;
         let (
             response,
-            mut stream_sender,
+            stream_sender,
             mut response_sender,
             terminal_error,
             terminal_token_trace,
@@ -935,25 +1122,17 @@ impl EngineInner {
             if let Some(tx) = response_sender.take() {
                 let _ = tx.send(Err(error.clone()));
             }
-            if let Some(tx) = stream_sender.take() {
-                match tx.try_send(Err(error.clone())) {
-                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(terminal)) => {
-                        // One bounded terminal delivery, only on the error
-                        // path. The close registry retains all physical owners;
-                        // this task owns only the client channel and its error.
-                        drop(tokio::spawn(async move {
-                            let _ = tx.send(terminal).await;
-                        }));
-                    }
-                }
-            }
         }
+
         Some(CompletionHandoff {
+            inner: self.self_weak.clone(),
+            done: None,
             response,
             stream_sender,
             response_sender,
             terminal_error,
+            terminal_error_published: false,
+            terminal_error_is_delivery,
             completion_error,
             terminal_token_trace,
             token_close,
@@ -973,48 +1152,74 @@ impl EngineInner {
         let mut errors = Vec::new();
         for request_id in request_ids {
             self.discard_pending_prefix_restore(&request_id);
-            if let Some(handoff) = self.handoff_request_completion(
+            if let Some(mut handoff) = self.handoff_request_completion(
                 &request_id,
                 FinishReason::Error,
                 Some(FerrumError::scheduler(
                     "engine shut down before request completion",
                 )),
+                false,
                 None,
                 None,
             ) {
+                // Shutdown cannot wait for a full client queue. Publish one
+                // bounded fallback before relinquishing the last sender; the
+                // receiver emits it only after already queued data.
+                if let Some(sender) = handoff.stream_sender.take() {
+                    sender.interrupt_delivery();
+                }
                 self.write_sequence_terminal_token_trace(
                     &request_id,
                     "completed",
                     Some(handoff.response.finish_reason),
-                    handoff.terminal_token_trace.as_ref(),
+                    handoff.terminal_token_trace.take().as_ref(),
                 );
-                if let Some(error) = handoff.completion_error {
+                if let Some(error) = handoff.completion_error.take() {
                     errors.push(error);
                 }
-                if let Some(Err(error)) = handoff.token_close {
+                if let Some(Err(error)) = handoff.token_close.take() {
                     errors.push(error);
                 }
-                // The ticket is observation only. Registry tasks retain all
-                // actual owners; shutdown joins them after the entire handoff.
+                handoff.terminal_error.take();
+                // Physical ownership already resides in execution_closes.
+                // The ticket is an observer, never the release authority.
             }
         }
         errors
     }
 
+    pub(in crate::continuous_engine) async fn finish_output_completion(
+        &self,
+        request_id: &RequestId,
+        mut handoff: CompletionHandoff,
+        stream_sender: Option<&OutputSender>,
+    ) {
+        let result = self
+            .finish_request_completion(request_id, &mut handoff, stream_sender)
+            .await;
+        if let Some(done) = handoff.done.take() {
+            let _ = done.send(result);
+        }
+    }
+
     async fn finish_request_completion(
         &self,
         request_id: &RequestId,
-        handoff: CompletionHandoff,
+        handoff: &mut CompletionHandoff,
+        stream_sender: Option<&OutputSender>,
     ) -> Result<()> {
-        let CompletionHandoff {
-            mut response,
-            stream_sender,
-            response_sender,
-            mut terminal_error,
-            mut completion_error,
-            terminal_token_trace,
-            token_close,
-        } = handoff;
+        let terminal_error = &mut handoff.terminal_error;
+        let mut completion_error = handoff.completion_error.take();
+        let token_close = handoff.token_close.take();
+        let response = &mut handoff.response;
+        // An already-known product error precedes physical-close observation,
+        // but follows every earlier text span in this same delivery owner.
+        let known_stream_error = terminal_error.is_some();
+        if let (Some(sender), Some(error)) = (stream_sender, terminal_error.as_ref()) {
+            if sender.send(Err(error.clone())).await.is_ok() {
+                handoff.terminal_error_published = true;
+            }
+        }
         // Physical closure may remain held after logical completion. Awaiting
         // the initial result cannot cancel the registry's independent owner.
         if let Some(ticket) = token_close {
@@ -1025,6 +1230,8 @@ impl EngineInner {
             // Drain all terminal owners even if the operation itself failed.
             let observation_result = self.drain_execution_closes();
             if let Err(error) = close_result.and(observation_result) {
+                self.output_tasks.record_control_error(error.clone());
+                self.work_notify.notify_one();
                 terminal_error.get_or_insert_with(|| error.clone());
                 completion_error.get_or_insert(error);
                 response.finish_reason = FinishReason::Error;
@@ -1035,19 +1242,21 @@ impl EngineInner {
             request_id,
             "completed",
             Some(response.finish_reason),
-            terminal_token_trace.as_ref(),
+            handoff.terminal_token_trace.take().as_ref(),
         );
 
-        if let Some(tx) = response_sender {
+        if let Some(tx) = handoff.response_sender.take() {
             let response_result = terminal_error
                 .as_ref()
                 .map_or_else(|| Ok(response.clone()), |error| Err(error.clone()));
             let _ = tx.send(response_result);
         }
 
-        if let Some(tx) = stream_sender {
-            if let Some(error) = terminal_error {
-                let _ = tx.send(Err(error)).await;
+        if let Some(tx) = stream_sender.filter(|_| !known_stream_error) {
+            if let Some(error) = terminal_error.as_ref() {
+                if tx.send(Err(error.clone())).await.is_ok() {
+                    handoff.terminal_error_published = true;
+                }
             } else {
                 let final_chunk = StreamChunk {
                     request_id: request_id.clone(),
@@ -1060,7 +1269,15 @@ impl EngineInner {
                     api_response: response.api_response.clone(),
                     execution_evidence: response.execution_evidence.clone(),
                 };
-                let _ = tx.send(Ok(final_chunk)).await;
+                if let Err(error) = tx.send(Ok(final_chunk)).await {
+                    if !tx.is_closed() {
+                        // A terminal payload can exceed the queue byte limit
+                        // (for example structured output/evidence). EOF is not
+                        // a valid substitute for that explicit delivery error.
+                        let _ = tx.send(Err(error.clone())).await;
+                        completion_error.get_or_insert(error);
+                    }
+                }
             }
         }
 
@@ -1071,6 +1288,9 @@ impl EngineInner {
             response.finish_reason
         );
 
+        // All requested publication attempts have reached their disposition.
+        // Only cancellation before this point uses the shutdown fallback.
+        handoff.terminal_error.take();
         completion_error.map_or(Ok(()), Err)
     }
 }

@@ -13,8 +13,8 @@ use ferrum_types::{
     should_defer_model_reasoning_stream_delta, FerrumError, FinishReason, InferenceRequest,
     InferenceResponse, ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority,
     RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
-    RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage,
-    WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
+    RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, TokenUsage, WorkloadProfile,
+    DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,13 +26,12 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use uuid::Uuid;
 
 #[cfg(test)]
 use crate::source_resolver::tokenizer_sibling_repo;
 #[cfg(test)]
-use ferrum_types::{has_unclosed_thinking_block, THINK_END_TAG};
+use ferrum_types::{has_unclosed_thinking_block, StreamChunk, THINK_END_TAG};
 
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
@@ -485,7 +484,7 @@ fn require_run_terminal_reason(reason: Option<FinishReason>) -> Result<()> {
     }
 }
 
-type RunResponseStream = Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send + 'static>>;
+type RunResponseStream = ferrum_output::InferenceStream;
 
 struct RunStreamOutput {
     protocol: ModelOutputProtocol,
@@ -561,7 +560,8 @@ async fn collect_run_stream(
     let mut chunk_count = 0usize;
     let mut execution_evidence = None;
     while let Some(chunk) = stream.next().await {
-        let mut chunk = chunk?;
+        let output_chunk = chunk?;
+        let chunk = output_chunk.chunk();
         let chunk_request_id = chunk.request_id.to_string();
         if chunk_request_id != expected_request_id {
             return Err(FerrumError::internal(format!(
@@ -605,8 +605,8 @@ async fn collect_run_stream(
         if chunk.finish_reason.is_some() {
             finish_reason = chunk.finish_reason;
         }
-        if let Some(evidence) = chunk.execution_evidence.take() {
-            if execution_evidence.replace(evidence).is_some() {
+        if let Some(evidence) = chunk.execution_evidence.as_ref() {
+            if execution_evidence.replace(evidence.clone()).is_some() {
                 return Err(FerrumError::internal(
                     "run stream emitted engine execution evidence more than once",
                 ));
@@ -645,13 +645,14 @@ async fn collect_run_text_stream(
     let mut chunk_count = 0usize;
     let mut execution_evidence = None;
     while let Some(chunk) = stream.next().await {
-        let mut chunk = match chunk {
+        let output_chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
                 clear_first_token_indicator(&mut first_token_indicator);
                 return Err(error);
             }
         };
+        let chunk = output_chunk.chunk();
         if &chunk.request_id != expected_request_id {
             clear_first_token_indicator(&mut first_token_indicator);
             return Err(FerrumError::internal(format!(
@@ -698,8 +699,8 @@ async fn collect_run_text_stream(
         if chunk.finish_reason.is_some() {
             finish_reason = chunk.finish_reason;
         }
-        if let Some(evidence) = chunk.execution_evidence.take() {
-            if execution_evidence.replace(evidence).is_some() {
+        if let Some(evidence) = chunk.execution_evidence.as_ref() {
+            if execution_evidence.replace(evidence.clone()).is_some() {
                 clear_first_token_indicator(&mut first_token_indicator);
                 return Err(FerrumError::internal(
                     "run stream emitted engine execution evidence more than once",
@@ -1133,6 +1134,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    engine_config.output = config.output.clone();
+    engine_config.output.validate()?;
     engine_config.scheduler.slo = scheduler_slo;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
@@ -2996,6 +2999,18 @@ mod tests {
     use super::*;
     use ferrum_types::{RuntimeConfigSource, SequenceFitPolicy, TokenId};
 
+    fn budgeted_test_stream(chunks: Vec<Result<StreamChunk>>) -> RunResponseStream {
+        let budget = ferrum_output::OutputBudget::new(ferrum_types::OutputConfig::default())
+            .expect("valid fixture output budget");
+        let session = budget.try_open_session().expect("fixture output session");
+        let producer = session.clone();
+        let stream = futures::stream::iter(chunks).then(move |chunk| {
+            let session = producer.clone();
+            async move { session.wrap_chunk(chunk?).await }
+        });
+        RunResponseStream::new(session, Box::pin(stream))
+    }
+
     fn default_params(max_tokens: usize) -> SamplingParams {
         SamplingParams {
             max_tokens,
@@ -4626,7 +4641,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-            let stream: RunResponseStream = Box::pin(futures::stream::iter(chunks));
+            let stream = budgeted_test_stream(chunks);
             let result = if text_output {
                 collect_run_text_stream(
                     stream,
@@ -4681,7 +4696,7 @@ mod tests {
                         })
                     })
                     .collect::<Vec<_>>();
-                let stream: RunResponseStream = Box::pin(futures::stream::iter(chunks));
+                let stream = budgeted_test_stream(chunks);
                 let result = if text_output {
                     collect_run_text_stream(
                         stream,

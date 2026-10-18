@@ -87,9 +87,15 @@ async fn managed_driver_explicit_lazy_share_one_real_cpu_execution() {
     let response = response.unwrap();
     assert_eq!(response.tokens.len(), 4);
     let chunks = chunks.into_iter().collect::<Result<Vec<_>>>().unwrap();
-    let text: String = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+    let text: String = chunks
+        .iter()
+        .map(|chunk| chunk.chunk().text.as_str())
+        .collect();
     assert_eq!(text, response.text);
-    let stream_tokens: Vec<_> = chunks.iter().filter_map(|chunk| chunk.token).collect();
+    let stream_tokens: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.chunk().token)
+        .collect();
     let visible: Vec<_> = response
         .tokens
         .iter()
@@ -98,7 +104,7 @@ async fn managed_driver_explicit_lazy_share_one_real_cpu_execution() {
         .collect();
     assert_eq!(stream_tokens, visible);
     assert_eq!(
-        chunks.last().unwrap().finish_reason,
+        chunks.last().unwrap().chunk().finish_reason,
         Some(FinishReason::Length)
     );
     assert_eq!(fixture.executor.maximum_in_flight.load(Ordering::SeqCst), 1);
@@ -416,3 +422,6 @@ async fn managed_driver_clean_exit_releases_inner_without_observer_wait() {
     assert!(control.upgrade().is_none());
     drop(observer);
 }
+
+#[path = "managed_driver_tests/output.rs"]
+mod output;

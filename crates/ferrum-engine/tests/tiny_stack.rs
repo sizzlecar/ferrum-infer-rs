@@ -229,14 +229,17 @@ async fn tiny_stack_stream_chunk_contract() {
         .expect("all chunks ok");
 
     assert!(!chunks.is_empty(), "stream must produce chunks");
-    let terminal = chunks.iter().filter(|c| c.finish_reason.is_some()).count();
+    let terminal = chunks
+        .iter()
+        .filter(|c| c.chunk().finish_reason.is_some())
+        .count();
     assert_eq!(terminal, 1, "exactly one terminal chunk");
     assert!(
-        chunks.last().unwrap().finish_reason.is_some(),
+        chunks.last().unwrap().chunk().finish_reason.is_some(),
         "the last chunk is the terminal one"
     );
 
-    let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+    let joined: String = chunks.iter().map(|c| c.chunk().text.as_str()).collect();
     assert!(!joined.is_empty(), "streamed text must be non-empty");
 }
 

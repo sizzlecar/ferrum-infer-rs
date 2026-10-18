@@ -342,6 +342,9 @@ impl Drop for DriverExitGuard<'_> {
 impl EngineInner {
     async fn shutdown_cleanup(&self) -> Vec<FerrumError> {
         let mut errors = self.handoff_shutdown_requests();
+        if let Err(error) = self.output_tasks.stop_and_join().await {
+            errors.push(error);
+        }
         if let Err(error) = self.execution_readiness_waiters.abort_and_join().await {
             errors.push(error);
         }

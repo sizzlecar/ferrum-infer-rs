@@ -25,6 +25,31 @@ will define their own contracts at the model registration and assembly boundary.
 | `POST /v1/audio/transcriptions` | Removed | Returns HTTP 404. |
 | `POST /v1/audio/speech` | Removed | Returns HTTP 404. |
 
+## Streaming Output Limits
+
+`run` and `serve` share these optional `ferrum.toml` settings (shown with defaults):
+
+```toml
+[output]
+max_sessions = 2048
+engine_queue_items = 100
+queued_bytes_total = 67108864
+encoded_bytes_total = 67108864
+max_event_bytes = 33554432
+```
+
+Limits must be positive; a single encoded event must fit its pool. Completed
+streams and retained HTTP frames still hold their session until their owners are
+dropped. Exhausted session capacity rejects new streaming requests before model
+admission. Slow consumers pause their own generation; they do not receive
+silently truncated output. An oversized event terminates with an explicit error;
+each session has one separate error allowance of at most 1 KiB.
+
+These limits cover queued content and encoded frames. Semantic text/tool history,
+tokenizer scratch space, allocator overhead and transport buffers are separate;
+the values are not a process-memory limit. Library callers use
+`EngineConfig.output` and borrow each `OutputChunk` through `chunk()`.
+
 ## Model Capacity
 
 For loaded language models, each model card includes `max_model_len` when the

@@ -3,6 +3,25 @@ use super::*;
 use futures::FutureExt;
 use std::time::Duration;
 
+// Pulling the next frame is what advances the upstream engine now. Preserve
+// every frame produced before the gate instead of relying on an eager relay.
+async fn pull_until_gate(
+    body: &mut axum::body::BodyDataStream,
+    text: &mut String,
+    gate: &StreamGate,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = gate.entered.notified() => return,
+            frame = body.next() => {
+                let frame = frame.expect("engine gate precedes HTTP EOF").unwrap();
+                text.push_str(std::str::from_utf8(&frame).unwrap());
+            }
+        }
+    }
+}
+
 fn template() -> ModelChatTemplate {
     let mut template = ModelChatTemplate::new(
         "{% for message in messages %}{{ message.content }}{% endfor %}",
@@ -103,7 +122,7 @@ async fn native_xml_stream_exposes_body_before_engine_can_finish_without_repeati
                     break;
                 }
             }
-            gate.entered.notified().await;
+            pull_until_gate(&mut body, &mut text, &gate).await;
         })
         .await
         .expect("ordinary body must arrive before the gated engine continuation");
@@ -194,7 +213,7 @@ async fn native_xml_stream_body_cannot_be_reclassified_by_late_reasoning_or_bare
                 let frame = body.next().await.unwrap().unwrap();
                 text.push_str(std::str::from_utf8(&frame).unwrap());
             }
-            gate.entered.notified().await;
+            pull_until_gate(&mut body, &mut text, &gate).await;
         })
         .await
         .expect("body must be readable before the closer is generated");
@@ -227,9 +246,17 @@ async fn native_xml_required_stream_keeps_body_held_and_retains_terminal_error()
     )
     .await;
     let mut body = response.into_body().into_data_stream();
-    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
-        .await
-        .unwrap();
+    let mut before_gate = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        pull_until_gate(&mut body, &mut before_gate, &gate),
+    )
+    .await
+    .unwrap();
+    assert!(
+        before_gate.is_empty(),
+        "required output cannot leak before terminal validation"
+    );
     assert!(
         body.next().now_or_never().is_none(),
         "required output cannot leak while the engine is gated"
@@ -274,7 +301,7 @@ async fn native_xml_stream_length_and_engine_error_never_publish_executable_call
                 let frame = body.next().await.unwrap().unwrap();
                 text.push_str(std::str::from_utf8(&frame).unwrap());
             }
-            gate.entered.notified().await;
+            pull_until_gate(&mut body, &mut text, &gate).await;
         })
         .await
         .unwrap();

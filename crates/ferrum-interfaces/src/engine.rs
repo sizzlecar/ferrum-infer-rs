@@ -4,12 +4,11 @@
 //! implementing text-generation operations or creating dummy KV state.
 
 use async_trait::async_trait;
+use ferrum_output::InferenceStream;
 use ferrum_types::{
     EngineConfig, ExecutionResourceAuthority, ExecutorAdmissionSnapshot, InferenceRequest,
-    InferenceResponse, Result, StreamChunk,
+    InferenceResponse, Result,
 };
-use futures::Stream;
-use std::pin::Pin;
 
 /// Lifecycle / status methods shared by every engine kind.
 ///
@@ -92,11 +91,9 @@ pub trait LlmInferenceEngine: InferenceEngine {
     /// Execute single inference request.
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse>;
 
-    /// Execute streaming inference request.
-    async fn infer_stream(
-        &self,
-        request: InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>>;
+    /// Execute streaming inference request. Each output chunk retains its
+    /// session budget until the consumer releases it.
+    async fn infer_stream(&self, request: InferenceRequest) -> Result<InferenceStream>;
 }
 
 /// Advanced engine capabilities — opt-in addition to LLM engines that

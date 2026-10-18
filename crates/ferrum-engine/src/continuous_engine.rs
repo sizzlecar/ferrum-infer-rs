@@ -30,6 +30,7 @@ use ferrum_interfaces::{
     KvCacheManager, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler, TensorFactory,
     Tokenizer,
 };
+use ferrum_output::{InferenceStream, OutputBudget, OutputChunk};
 use ferrum_runtime::{
     AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
     BoundExecutionResourceMaintenance, CapacityAvailabilityEpoch, DeferredAction,
@@ -1384,7 +1385,13 @@ impl EngineResourceComposition {
     }
 }
 
+mod output_delivery;
+use output_delivery::{OutputReceiver, OutputSender, OutputTaskRegistry};
+
 struct EngineInner {
+    self_weak: Weak<EngineInner>,
+    output_budget: OutputBudget,
+    output_tasks: Arc<OutputTaskRegistry>,
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
@@ -1498,12 +1505,12 @@ impl Drop for ClientReceiverDropWake {
 }
 
 struct CancellationAwareResponseStream {
-    receiver: tokio_stream::wrappers::ReceiverStream<Result<StreamChunk>>,
+    receiver: OutputReceiver,
     receiver_drop_wake: ClientReceiverDropWake,
 }
 
 impl Stream for CancellationAwareResponseStream {
-    type Item = Result<StreamChunk>;
+    type Item = Result<OutputChunk>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = Pin::new(&mut self.receiver).poll_next(cx);
@@ -2315,8 +2322,12 @@ impl ContinuousBatchEngine {
         }
 
         let driver = Arc::new(ManagedDriver::default());
+        let output_budget = OutputBudget::new(config.output.clone())?;
         Ok(Self {
-            inner: Arc::new(EngineInner {
+            inner: Arc::new_cyclic(|self_weak| EngineInner {
+                self_weak: self_weak.clone(),
+                output_budget,
+                output_tasks: Arc::new(OutputTaskRegistry::default()),
                 config,
                 scheduler,
                 tokenizer,
@@ -2496,13 +2507,16 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         result
     }
 
-    async fn infer_stream(
-        &self,
-        mut request: InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+    async fn infer_stream(&self, mut request: InferenceRequest) -> Result<InferenceStream> {
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
-        let (tx, rx) = mpsc::channel(100);
+        let session = self.inner.output_budget.try_open_session()?;
+        let (tx, rx) = OutputSender::new(
+            self.inner.self_weak.clone(),
+            request.id.clone(),
+            session.clone(),
+            self.inner.config.output.engine_queue_items,
+        );
         let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
@@ -2543,10 +2557,13 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         seq_state.stream_sender = Some(tx);
         self.publish_request(request, seq_state).await?;
 
-        Ok(Box::pin(CancellationAwareResponseStream {
-            receiver: tokio_stream::wrappers::ReceiverStream::new(rx),
-            receiver_drop_wake,
-        }))
+        Ok(InferenceStream::new(
+            session,
+            Box::pin(CancellationAwareResponseStream {
+                receiver: rx,
+                receiver_drop_wake,
+            }),
+        ))
     }
 }
 

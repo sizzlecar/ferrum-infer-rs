@@ -261,7 +261,7 @@ pub struct SequenceState {
     /// Number of prompt tokens already written into the model KV cache by
     /// opt-in unified chunked prefill. Zero for the normal full-prefill path.
     pub prefill_tokens_processed: usize,
-    pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
+    pub(super) stream_sender: Option<OutputSender>,
     pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
     pub(super) request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,

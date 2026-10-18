@@ -12,6 +12,7 @@ ferrum-runtime = { workspace = true }
 ferrum-execution = { workspace = true }
 # Core dependencies - New architecture
 ferrum-types = { workspace = true }
+ferrum-output = { workspace = true }
 ferrum-interfaces = { workspace = true }
 
 # Implementation crates

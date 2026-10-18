@@ -803,6 +803,8 @@ pub struct EngineConfig {
     pub batching: BatchConfig,
     pub monitoring: MonitoringConfig,
     #[serde(default)]
+    pub output: crate::OutputConfig,
+    #[serde(default)]
     pub runtime: RuntimeKnobs,
 }
 

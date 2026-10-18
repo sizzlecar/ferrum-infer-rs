@@ -84,7 +84,7 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
     while let Ok(chunk) = fixture.stream.try_recv() {
         match chunk {
             Ok(chunk) => assert!(
-                chunk.finish_reason.is_none(),
+                chunk.chunk().finish_reason.is_none(),
                 "no success terminal after an error"
             ),
             Err(actual) => {

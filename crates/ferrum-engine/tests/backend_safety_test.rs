@@ -129,10 +129,10 @@ async fn streaming_delivers_tokens_incrementally() {
     while let Some(result) = stream.next().await {
         match result {
             Ok(chunk) => {
-                if chunk.token.is_some() {
+                if chunk.chunk().token.is_some() {
                     token_count += 1;
                 }
-                if chunk.finish_reason.is_some() {
+                if chunk.chunk().finish_reason.is_some() {
                     saw_finish = true;
                     break;
                 }

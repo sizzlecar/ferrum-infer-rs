@@ -21,6 +21,9 @@ pub struct CliConfig {
     /// Shared run/serve scheduler policy; explicit CLI selection takes precedence.
     pub scheduler: SchedulerCliConfig,
 
+    /// Output sessions and byte budgets shared by run and serve.
+    pub output: ferrum_types::OutputConfig,
+
     /// Server configuration
     pub server: ServerCliConfig,
 
@@ -828,9 +831,11 @@ impl CliConfig {
             ferrum_types::FerrumError::io_str(format!("Failed to read config file: {}", e))
         })?;
 
-        toml::from_str(&content).map_err(|e| {
+        let config: Self = toml::from_str(&content).map_err(|e| {
             ferrum_types::FerrumError::configuration(format!("Failed to parse config: {}", e))
-        })
+        })?;
+        config.output.validate()?;
+        Ok(config)
     }
 
     /// Save configuration to file
@@ -847,6 +852,7 @@ impl CliConfig {
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         self.resolve_scheduler_slo(None)?;
+        self.output.validate()?;
         // Validate server config
         if self.server.port == 0 {
             return Err(ferrum_types::FerrumError::configuration(
@@ -994,6 +1000,41 @@ impl Default for DevConfig {
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+
+    #[tokio::test]
+    async fn output_config_load_preserves_explicit_limits_and_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ferrum.toml");
+        let missing = CliConfig::load(&path).await.unwrap();
+        assert_eq!(missing.output, ferrum_types::OutputConfig::default());
+        fs::write(
+            &path,
+            "[output]\nmax_sessions = 3\nengine_queue_items = 2\nqueued_bytes_total = 4096\nencoded_bytes_total = 8192\nmax_event_bytes = 2048\n",
+        )
+        .await
+        .unwrap();
+        let configured = CliConfig::load(&path).await.unwrap();
+        assert_eq!(configured.output.max_sessions, 3);
+        assert_eq!(configured.output.engine_queue_items, 2);
+        assert_eq!(configured.output.queued_bytes_total, 4096);
+        assert_eq!(configured.output.encoded_bytes_total, 8192);
+        assert_eq!(configured.output.max_event_bytes, 2048);
+        configured.save(&path).await.unwrap();
+        assert_eq!(
+            CliConfig::load(&path).await.unwrap().output,
+            configured.output
+        );
+
+        fs::write(&path, "[output]\nmax_sessions = 0\n")
+            .await
+            .unwrap();
+        assert!(CliConfig::load(&path)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("output.max_sessions"));
+        assert!(toml::from_str::<CliConfig>("[output]\nunlimited = true\n").is_err());
+    }
 
     #[test]
     fn scheduler_config_rejects_removed_and_unknown_fields_but_keeps_slo() {

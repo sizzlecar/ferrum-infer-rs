@@ -7,7 +7,7 @@ use ferrum_execution::token_execution::{
 use ferrum_runtime::DynamicBackingPressure;
 
 mod batch;
-mod completion;
+pub(super) mod completion;
 pub(super) mod prefix_rendezvous;
 pub(super) mod prefix_restore;
 mod token_admission;
@@ -979,7 +979,9 @@ impl EngineInner {
                 error = %error,
                 "Typed prefill admission failed"
             );
-            if let Err(error) = self.complete_request_with_error(&request_id, error).await {
+            if let Err(error) =
+                self.complete_request_detached(&request_id, FinishReason::Error, Some(error))
+            {
                 warn!(request_id = %request_id, %error, "Admission failure cleanup reported an error");
                 first_error.get_or_insert(error);
             }
@@ -1035,14 +1037,14 @@ impl EngineInner {
         self.execution_readiness_waiters.reap_finished();
         for failure in self.execution_readiness_waiters.take_failures() {
             for request_id in failure.request_ids {
-                self.complete_request_with_error(
+                self.complete_request_detached(
                     &request_id,
-                    FerrumError::backend(format!(
+                    FinishReason::Error,
+                    Some(FerrumError::backend(format!(
                         "Request-state readiness ticket {} failed: {}",
                         failure.ticket_id, failure.message
-                    )),
-                )
-                .await?;
+                    ))),
+                )?;
             }
         }
         Ok(())
@@ -1162,8 +1164,12 @@ impl EngineInner {
         let iteration_guard = self.iteration_lock.lock().await;
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
         let close_error = self.drain_execution_closes().err();
+        let output_control_error = self.output_tasks.take_control_error();
+        if output_control_error.is_some() {
+            counter!("ferrum.engine.completion_control_errors_total").increment(1);
+        }
         let failure_completion = self.complete_failed_execution_recomputes().await;
-        if let Some(error) = close_error {
+        if let Some(error) = close_error.or(output_control_error) {
             return Err(error);
         }
         failure_completion?;

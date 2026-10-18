@@ -188,6 +188,33 @@ fn retired_runtime_config_is_rejected_before_run_or_serve() {
 }
 
 #[test]
+fn invalid_output_budget_is_rejected_before_run_or_serve_model_selection() {
+    let workspace = TempDirGuard::new("invalid-output-budget");
+    for (declaration, expected_field) in [
+        ("max_sessions = 0", "output.max_sessions"),
+        ("engine_queue_items = 0", "output.engine_queue_items"),
+        (
+            "encoded_bytes_total = 1024\nmax_event_bytes = 2048",
+            "output.max_event_bytes",
+        ),
+    ] {
+        write_file(
+            &workspace.path().join("ferrum.toml"),
+            format!("[output]\n{declaration}\n").as_bytes(),
+        );
+        for command in ["run", "serve"] {
+            let output = run(base_cmd(workspace.path()).arg(command));
+            assert!(
+                !output.status.success(),
+                "{command} must reject invalid output limits"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(expected_field), "{stderr}");
+        }
+    }
+}
+
+#[test]
 fn retired_scheduler_config_is_rejected_before_run_or_serve() {
     let workspace = TempDirGuard::new("retired-scheduler-config");
     for (key, value) in [

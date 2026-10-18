@@ -34,6 +34,7 @@ pub(super) struct NumericalExecutor {
     pub(super) maximum_in_flight: AtomicUsize,
     pub(super) admissions: AtomicUsize,
     pub(super) closes: AtomicUsize,
+    close_notify: Notify,
     pub(super) checked_outputs: AtomicUsize,
     pub(super) dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     layers: usize,
@@ -195,6 +196,18 @@ impl ModelExecutor for NumericalExecutor {
 }
 
 impl NumericalExecutor {
+    pub(super) async fn wait_for_closes(&self, count: usize) {
+        loop {
+            let changed = self.close_notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.closes.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     fn check_close(&self, sequence: &ExecutorSequence, result: &ExecutionCloseOutcome) {
         let ExecutionCloseDisposition::Ended(ended) = &result.disposition else {
             panic!("the actual synchronous CPU close must prove terminal");
@@ -214,6 +227,7 @@ impl NumericalExecutor {
             .contains_key(&state.cache));
         reference.model.release(&state.cache);
         self.closes.fetch_add(1, Ordering::SeqCst);
+        self.close_notify.notify_waiters();
     }
 }
 
@@ -227,6 +241,10 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) fn new() -> Self {
+        Self::with_config(|_| {})
+    }
+
+    pub(super) fn with_config(configure: impl FnOnce(&mut EngineConfig)) -> Self {
         let (inner, observed, cfg) = closure::observed_cpu_model();
         let (reached_tx, reached) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
@@ -245,6 +263,7 @@ impl Fixture {
             maximum_in_flight: AtomicUsize::new(0),
             admissions: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
+            close_notify: Notify::new(),
             checked_outputs: AtomicUsize::new(0),
             dropped: Mutex::new(None),
             layers: cfg.num_layers,
@@ -253,6 +272,7 @@ impl Fixture {
         let mut config = EngineConfig::default();
         config.backend.device = Device::CPU;
         config.runtime.scheduler_trace_jsonl = Some(trace.path().join("trace.jsonl"));
+        configure(&mut config);
         let engine = ContinuousBatchEngine::new(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
