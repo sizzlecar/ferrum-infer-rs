@@ -8,6 +8,9 @@
 mod traits;
 pub use traits::*;
 
+mod completion;
+pub use completion::BackendCompletion;
+
 mod types;
 pub use types::*;
 

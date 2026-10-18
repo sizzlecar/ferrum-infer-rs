@@ -68,13 +68,16 @@ impl ExecutorSequenceIssuer {
     /// Cloning this handle does not duplicate that state or grant another release.
     pub fn issue_sequence(&self) -> Result<ExecutorSequence> {
         Ok(ExecutorSequence {
-            issuer: Arc::clone(&self.identity),
-            incarnation: self.next_identity()?,
+            identity: Arc::new(SequenceIdentity {
+                issuer: Arc::clone(&self.identity),
+                incarnation: self.next_identity()?,
+                ended: std::sync::atomic::AtomicBool::new(false),
+            }),
         })
     }
 
     fn require_sequence(&self, sequence: &ExecutorSequence) -> Result<()> {
-        if !Arc::ptr_eq(&self.identity, &sequence.issuer) {
+        if !Arc::ptr_eq(&self.identity, &sequence.identity.issuer) {
             return Err(invalid("sequence belongs to a different executor"));
         }
         Ok(())
@@ -146,13 +149,22 @@ impl ExecutorSequenceIssuer {
 /// Opaque process-local executor instance plus never-reused incarnation.
 #[derive(Debug, Clone)]
 pub struct ExecutorSequence {
+    identity: Arc<SequenceIdentity>,
+}
+
+#[derive(Debug)]
+struct SequenceIdentity {
     issuer: Arc<IssuerIdentity>,
     incarnation: NonZeroU64,
+    // A terminal fact published by the original issuer, not another resource
+    // registry. Its lifetime follows the caller's opaque identity, so removing
+    // a closed native entry cannot erase proof needed by a later close observer.
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl PartialEq for ExecutorSequence {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.issuer, &other.issuer) && self.incarnation == other.incarnation
+        Arc::ptr_eq(&self.identity, &other.identity)
     }
 }
 
@@ -160,8 +172,8 @@ impl Eq for ExecutorSequence {}
 
 impl Hash for ExecutorSequence {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.issuer).hash(state);
-        self.incarnation.hash(state);
+        Arc::as_ptr(&self.identity.issuer).hash(state);
+        self.identity.incarnation.hash(state);
     }
 }
 
@@ -344,6 +356,26 @@ pub enum ExecutionProduct {
     Sampling(ExecutorSamplingOutput),
 }
 
+impl ExecutionProduct {
+    fn validate_for(
+        &self,
+        executed: ExecutedTokenWork,
+        input: &ExecutionWork<'_>,
+        vocabulary_size: usize,
+    ) -> Result<()> {
+        let needs_sampling = executed.validate_for(input.work)?;
+        match (self, needs_sampling) {
+            (Self::Intermediate, false) => Ok(()),
+            (Self::Sampling(output), true) => {
+                output.validate_for_policy(input.logits_policy, vocabulary_size)
+            }
+            _ => Err(invalid(
+                "completion product does not match actual work finality",
+            )),
+        }
+    }
+}
+
 /// A successfully retired model operation and committed executor frontier.
 /// Product sampling/publication may still fail after the Engine receives it.
 #[derive(Debug)]
@@ -370,6 +402,30 @@ impl ExecutionCompletion {
 
     pub fn product(&self) -> &ExecutionProduct {
         &self.product
+    }
+
+    /// Check an individual result against the caller's retained input before
+    /// publishing it. In particular, ContractViolation may retain a completion
+    /// from another batch. The caller must separately reject duplicate indices
+    /// and conflicts with interrupted/rejected participants across the batch.
+    pub fn validate_for(
+        &self,
+        input_index: usize,
+        input: &ExecutionWork<'_>,
+        vocabulary_size: usize,
+    ) -> Result<()> {
+        input.validate()?;
+        if self.input_index != input_index
+            || self.next_frontier.sequence() != input.sequence()
+            || self.executed.range()?.start() != input.expected_frontier.consumed_tokens()
+            || self.executed.range()?.end() != self.next_frontier.consumed_tokens()
+        {
+            return Err(invalid(
+                "completion does not match the caller's current incarnation/frontier",
+            ));
+        }
+        self.product
+            .validate_for(self.executed, input, vocabulary_size)
     }
 
     pub fn into_parts(
@@ -695,18 +751,7 @@ impl ExecutionBatch<'_> {
     > {
         let checked = (|| {
             let input = self.input(input_index)?;
-            let needs_sampling = executed.validate_for(input.work)?;
-            match (&product, needs_sampling) {
-                (ExecutionProduct::Intermediate, false) => {}
-                (ExecutionProduct::Sampling(output), true) => {
-                    output.validate_for_policy(input.logits_policy, self.vocabulary_size)?;
-                }
-                _ => {
-                    return Err(invalid(
-                        "completion product does not match actual work finality",
-                    ))
-                }
-            }
+            product.validate_for(executed, input, self.vocabulary_size)?;
             Ok(ExecutionFrontier {
                 sequence: input.sequence().clone(),
                 consumed_tokens: executed.range()?.end(),
@@ -1055,6 +1100,47 @@ mod tests {
             &policy,
         )
         .is_err());
+    }
+
+    #[test]
+    fn retained_completion_requires_the_callers_current_input_before_publication() {
+        let issuer = ExecutorSequenceIssuer::new();
+        let sequence = issuer.issue_sequence().unwrap();
+        let frontier = issuer.frontier(&sequence, 3).unwrap();
+        let policy = LogitsReturnPolicy::FullLogits;
+        let inputs = [decode(&frontier, &policy)];
+        let scope = issuer.batch(&inputs, 2).unwrap();
+        let completion = scope
+            .completion(0, ExecutedTokenWork::Decode { position: 3 }, logits())
+            .unwrap();
+
+        completion.validate_for(0, &inputs[0], 2).unwrap();
+        assert!(completion.validate_for(1, &inputs[0], 2).is_err());
+        assert!(completion.validate_for(0, &inputs[0], 3).is_err());
+
+        let replacement = issuer
+            .frontier(&issuer.issue_sequence().unwrap(), 3)
+            .unwrap();
+        assert!(completion
+            .validate_for(0, &decode(&replacement, &policy), 2)
+            .is_err());
+        assert!(completion
+            .validate_for(0, &decode(completion.next_frontier(), &policy), 2)
+            .is_err());
+        let prefill = ExecutionWork::new(
+            &frontier,
+            TokenWork::Prefill(PrefillChunk::new(3, 1, 4).unwrap()),
+            &policy,
+        )
+        .unwrap();
+        assert!(completion.validate_for(0, &prefill, 2).is_err());
+        // Rejecting stale or foreign publication must retain the original
+        // successfully executed product for the cold-path consumer.
+        assert!(matches!(
+            completion.product(),
+            ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(values))
+                if values == &[0.25, -0.5]
+        ));
     }
 
     #[test]

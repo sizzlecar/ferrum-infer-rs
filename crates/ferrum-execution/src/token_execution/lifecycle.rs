@@ -40,8 +40,49 @@ pub enum TokenAdmissionOutcome {
     /// Issued only after actual admission and publication of the retained state.
     Admitted(ExecutionFrontier),
     Deferred(ferrum_runtime::AdmissionDeferred),
+    /// A real allocator fit rejection without native coordinator epochs.
+    /// Retry only after an actual physical release notification. This snapshot
+    /// is diagnostic evidence, never a reservation or permission to execute.
+    CapacityDeferred(TokenAdmissionCapacityDeferral),
     MaintenanceDeferred(ExecutorPrefillMaintenanceDeferral),
     PermanentRejected(ferrum_runtime::AdmissionRejected),
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenAdmissionCapacityDeferral {
+    required_blocks: usize,
+    snapshot: crate::model_executor::KvSlotCapacitySnapshot,
+}
+
+impl TokenAdmissionCapacityDeferral {
+    /// Called by the actual model owner after its allocator rejected admission.
+    /// Impossible total-capacity requests must fail, rather than wait forever.
+    pub fn new(
+        required_blocks: usize,
+        snapshot: crate::model_executor::KvSlotCapacitySnapshot,
+    ) -> Result<Self> {
+        if snapshot.block_size == 0
+            || snapshot.free_blocks > snapshot.total_blocks
+            || required_blocks <= snapshot.free_blocks
+            || required_blocks > snapshot.total_blocks
+        {
+            return Err(invalid(
+                "capacity deferral requires a satisfiable physical block shortfall",
+            ));
+        }
+        Ok(Self {
+            required_blocks,
+            snapshot,
+        })
+    }
+
+    pub fn required_blocks(&self) -> usize {
+        self.required_blocks
+    }
+
+    pub fn snapshot(&self) -> &crate::model_executor::KvSlotCapacitySnapshot {
+        &self.snapshot
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +106,20 @@ pub struct ExecutionEnded {
 impl ExecutionEnded {
     pub fn sequence(&self) -> &ExecutorSequence {
         &self.sequence
+    }
+}
+
+impl ExecutorSequence {
+    /// Recover a terminal fact explicitly published by the actual executor.
+    /// A missing registry entry, closed client, or dropped future cannot create
+    /// this fact. It owns no device resources and grants no retry permission.
+    pub fn observed_end(&self) -> Option<ExecutionEnded> {
+        self.identity
+            .ended
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| ExecutionEnded {
+                sequence: self.clone(),
+            })
     }
 }
 
@@ -145,6 +200,10 @@ impl ExecutorSequenceIssuer {
     /// the sequence. Closing flags or missing registry entries are insufficient.
     pub fn ended(&self, sequence: &ExecutorSequence) -> Result<ExecutionEnded> {
         self.require_sequence(sequence)?;
+        sequence
+            .identity
+            .ended
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(ExecutionEnded {
             sequence: sequence.clone(),
         })
@@ -166,6 +225,22 @@ impl ExecutorSequenceIssuer {
 mod tests {
     use super::*;
     use futures::{channel::oneshot, executor::block_on};
+
+    #[test]
+    fn published_end_survives_owner_removal_without_closing_another_incarnation() {
+        let issuer = ExecutorSequenceIssuer::new();
+        let original = issuer.issue_sequence().unwrap();
+        let caller = original.clone();
+        let replacement = issuer.issue_sequence().unwrap();
+        assert!(caller.observed_end().is_none());
+        assert!(ExecutorSequenceIssuer::new().ended(&original).is_err());
+        assert!(caller.observed_end().is_none());
+        drop(issuer.ended(&original).unwrap());
+        drop(original);
+        drop(issuer);
+        assert_eq!(caller.observed_end().unwrap().sequence(), &caller);
+        assert!(replacement.observed_end().is_none());
+    }
 
     #[test]
     fn held_observer_keeps_completion_published_before_waiting() {
@@ -215,5 +290,21 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(publisher.ended(&first).unwrap().sequence(), &first);
         assert!(ExecutorSequenceIssuer::new().ended(&first).is_err());
+    }
+
+    #[test]
+    fn physical_capacity_wait_requires_a_shortfall_that_release_can_resolve() {
+        let snapshot = crate::model_executor::KvSlotCapacitySnapshot {
+            block_size: 16,
+            total_blocks: 8,
+            free_blocks: 2,
+        };
+        let wait = TokenAdmissionCapacityDeferral::new(3, snapshot.clone()).unwrap();
+        assert_eq!(wait.required_blocks(), 3);
+        assert_eq!(wait.snapshot(), &snapshot);
+        // Neither an already-fitting request nor one larger than the entire
+        // physical pool can be made runnable by waiting for another release.
+        assert!(TokenAdmissionCapacityDeferral::new(2, snapshot.clone()).is_err());
+        assert!(TokenAdmissionCapacityDeferral::new(9, snapshot).is_err());
     }
 }

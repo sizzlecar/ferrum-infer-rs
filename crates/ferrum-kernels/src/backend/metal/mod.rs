@@ -463,93 +463,114 @@ unsafe impl Sync for MetalBuf {}
 /// across multiple `Backend` method calls. `sync()` commits + waits and
 /// drops the handle so the next call creates a fresh buffer.
 pub struct MetalContext {
-    cmd: Option<&'static metal::CommandBufferRef>,
-    /// Sticky compute encoder. Held open across multiple `Backend`
-    /// method calls so consecutive compute dispatches share one encoder
-    /// — Metal serializes dispatches within a single encoder and prior
-    /// dispatch's device-memory writes are visible to the next
-    /// dispatch's reads, so this is correct for the model's dataflow.
-    /// Closing happens on `sync`, on `compute_encoder_end` (e.g. before
-    /// a blit encoder), or naturally on context drop.
-    encoder: Option<&'static metal::ComputeCommandEncoderRef>,
+    // Own the Objective-C objects. The command queue's lifetime does not make
+    // an autoreleased command buffer or encoder a Rust 'static reference.
+    cmd: Option<metal::CommandBuffer>,
+    encoder: Option<metal::ComputeCommandEncoder>,
+    // Kept across an unsuccessful observation. A retry observes this exact
+    // command buffer; it must not commit a replacement or forget its status.
+    submitted: Option<metal::CommandBuffer>,
+    last_completion: Option<ObservedMetalCommand>,
+}
+
+struct ObservedMetalCommand {
+    status: metal::MTLCommandBufferStatus,
+    code: Option<i64>,
+    detail: Option<String>,
 }
 
 impl MetalContext {
-    /// Return the current in-flight command buffer, creating one on first
-    /// use. The `'static` is safe: the command queue lives in a `OnceLock`
-    /// for the program's lifetime, and autoreleased command buffers are
-    /// retained for as long as that queue lives.
-    fn cmd(&mut self) -> &'static metal::CommandBufferRef {
-        match self.cmd {
-            Some(c) => c,
-            None => {
-                // Tried `new_command_buffer_with_unretained_references`
-                // here (matching llama.cpp): output regressed to "The The
-                // The…" — likely some buffer we bind isn't kept alive
-                // long enough between encode and execute on this code
-                // path. The retained variant is correct and the CPU
-                // overhead from retains turned out to be negligible at
-                // our dispatch rate.
-                let c = st().pipes.queue.new_command_buffer();
-                let c_static: &'static metal::CommandBufferRef =
-                    unsafe { std::mem::transmute::<&metal::CommandBufferRef, _>(c) };
-                self.cmd = Some(c_static);
-                c_static
-            }
+    fn cmd(&mut self) -> &metal::CommandBufferRef {
+        assert!(
+            self.submitted.is_none(),
+            "Metal context has an unresolved submission"
+        );
+        if self.cmd.is_none() {
+            self.last_completion = None;
+            self.cmd = Some(st().pipes.queue.new_command_buffer().to_owned());
         }
+        self.cmd.as_ref().expect("command buffer was initialized")
     }
 
-    /// Return a compute command encoder, opening one on the current cmd
-    /// buffer if there isn't already one. Subsequent calls during the
-    /// same window return the same encoder — set the pipeline state
-    /// before each dispatch.
-    pub(crate) fn compute_encoder(&mut self) -> &'static metal::ComputeCommandEncoderRef {
-        if let Some(enc) = self.encoder {
-            return enc;
+    /// Keep one encoder open across adjacent compute operations, preserving
+    /// the existing command order and batching behavior.
+    pub(crate) fn compute_encoder(&mut self) -> &metal::ComputeCommandEncoderRef {
+        if self.encoder.is_none() {
+            let encoder = self.cmd().new_compute_command_encoder().to_owned();
+            self.encoder = Some(encoder);
         }
-        let cmd = self.cmd();
-        let enc = cmd.new_compute_command_encoder();
-        let enc_static: &'static metal::ComputeCommandEncoderRef =
-            unsafe { std::mem::transmute::<&metal::ComputeCommandEncoderRef, _>(enc) };
-        self.encoder = Some(enc_static);
-        enc_static
+        self.encoder.as_ref().expect("encoder was initialized")
     }
 
-    /// Close the active compute encoder if one is open. Caller must do
-    /// this before switching to a blit encoder, before commit, or before
-    /// recording into a different cmd buffer.
     fn compute_encoder_end(&mut self) {
         if let Some(enc) = self.encoder.take() {
             enc.end_encoding();
         }
     }
 
-    /// The single submission path shared by ordinary and checked synchronization.
-    fn submit_and_wait(&mut self) -> Option<&'static metal::CommandBufferRef> {
-        self.compute_encoder_end();
-        let cmd = self.cmd.take()?;
-        cmd.commit();
+    fn submit_and_wait(&mut self) -> Option<&metal::CommandBufferRef> {
+        if self.submitted.is_none() {
+            self.compute_encoder_end();
+            self.submitted = self.cmd.take();
+            self.submitted.as_ref()?.commit();
+        }
+        let cmd = self.submitted.as_ref()?;
         cmd.wait_until_completed();
         Some(cmd)
     }
 
     pub(crate) fn flush(&mut self) {
-        let _ = self.submit_and_wait();
+        // Ordinary sync historically permits an empty no-op. A submitted
+        // command remains owned if the backend cannot establish its terminal
+        // state; no later encode may silently reuse this context.
+        if self.cmd.is_some() || self.submitted.is_some() {
+            let _ = self.observe_completion();
+        }
     }
 
-    fn flush_checked(&mut self) -> Result<()> {
-        let cmd = self.submit_and_wait().ok_or_else(|| {
-            FerrumError::backend(
-                "Metal checked synchronization has no pending command buffer to submit",
-            )
-        })?;
+    fn observe_completion(&mut self) -> crate::backend::BackendCompletion {
+        use crate::backend::BackendCompletion;
+        if self.cmd.is_none() && self.submitted.is_none() {
+            return match &self.last_completion {
+                Some(observed) => classify_command_buffer_completion(
+                    observed.status,
+                    observed.code,
+                    observed.detail.as_deref(),
+                ),
+                None => BackendCompletion::Unresolved(FerrumError::backend(
+                    "Metal checked synchronization has no pending command buffer to submit",
+                )),
+            };
+        }
+        let cmd = self.submit_and_wait().expect("pending command is retained");
         let status = cmd.status();
         let (code, detail) = if status == metal::MTLCommandBufferStatus::Completed {
             (None, None)
         } else {
             command_buffer_error(cmd)
         };
-        validate_command_buffer_completion(status, code, detail.as_deref())
+        let completion = classify_command_buffer_completion(status, code, detail.as_deref());
+        if completion.is_terminal() {
+            self.last_completion = Some(ObservedMetalCommand {
+                status,
+                code,
+                detail,
+            });
+            self.submitted = None;
+        }
+        completion
+    }
+
+    fn flush_checked(&mut self) -> Result<()> {
+        // Operator validation requires a real submission in this call. The
+        // lifecycle observer can separately reuse an earlier terminal fact
+        // when no subsequent command has been encoded into this context.
+        if self.cmd.is_none() && self.submitted.is_none() {
+            return Err(FerrumError::backend(
+                "Metal checked synchronization has no pending command buffer to submit",
+            ));
+        }
+        self.observe_completion().into_result()
     }
 }
 
@@ -581,13 +602,14 @@ fn command_buffer_error(cmd: &metal::CommandBufferRef) -> (Option<i64>, Option<S
     }
 }
 
-fn validate_command_buffer_completion(
+fn classify_command_buffer_completion(
     status: metal::MTLCommandBufferStatus,
     code: Option<i64>,
     detail: Option<&str>,
-) -> Result<()> {
+) -> crate::backend::BackendCompletion {
+    use crate::backend::BackendCompletion;
     if status == metal::MTLCommandBufferStatus::Completed {
-        return Ok(());
+        return BackendCompletion::Succeeded;
     }
     let mut message =
         format!("Metal command buffer did not complete successfully: status {status:?}");
@@ -598,7 +620,21 @@ fn validate_command_buffer_completion(
         message.push_str(": ");
         message.push_str(detail);
     }
-    Err(FerrumError::backend(message))
+    let error = FerrumError::backend(message);
+    if status == metal::MTLCommandBufferStatus::Error {
+        BackendCompletion::Failed(error)
+    } else {
+        BackendCompletion::Unresolved(error)
+    }
+}
+
+#[cfg(test)]
+fn validate_command_buffer_completion(
+    status: metal::MTLCommandBufferStatus,
+    code: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    classify_command_buffer_completion(status, code, detail).into_result()
 }
 
 #[cfg(test)]
@@ -635,10 +671,58 @@ mod checked_sync_tests {
     }
 
     #[test]
+    fn terminal_device_error_is_distinct_from_unknown_lifetime() {
+        use crate::backend::BackendCompletion;
+        assert!(matches!(
+            classify_command_buffer_completion(Status::Error, Some(8), Some("device error")),
+            BackendCompletion::Failed(_)
+        ));
+        for status in [
+            Status::NotEnqueued,
+            Status::Enqueued,
+            Status::Committed,
+            Status::Scheduled,
+        ] {
+            assert!(matches!(
+                classify_command_buffer_completion(status, None, None),
+                BackendCompletion::Unresolved(_)
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an actual Metal device"]
+    fn owned_command_buffer_survives_context_transfer_and_is_not_resubmitted() {
+        let mut buffer = MetalBackend::from_slice(&[1.0, -2.0, 3.0, -4.0]);
+        let mut ctx = MetalBackend::new_context();
+        MetalBackend::scale_inplace(&mut ctx, &mut buffer, 2.0, 4);
+        let original = &**ctx.cmd.as_ref().expect("actual encoded command")
+            as *const metal::CommandBufferRef as usize;
+        // Move the real owner to the thread that observes completion. No
+        // queue-lifetime or autorelease-pool assumption keeps the object alive.
+        std::thread::spawn(move || {
+            let command = ctx.submit_and_wait().expect("actual submitted command");
+            assert_eq!(command as *const metal::CommandBufferRef as usize, original);
+            assert_eq!(command.status(), Status::Completed);
+            assert!(ctx.observe_completion().is_terminal());
+            assert!(ctx.submitted.is_none());
+            assert_eq!(MetalBackend::to_vec(&buffer, 4), vec![2.0, -4.0, 6.0, -8.0]);
+            // An empty repeat does not manufacture another completion or
+            // commit the already completed command buffer a second time.
+            assert!(ctx.flush_checked().is_err());
+            assert_eq!(MetalBackend::to_vec(&buffer, 4), vec![2.0, -4.0, 6.0, -8.0]);
+        })
+        .join()
+        .expect("completion observer did not panic");
+    }
+
+    #[test]
     fn missing_submission_is_not_success() {
         let mut ctx = MetalContext {
             cmd: None,
             encoder: None,
+            submitted: None,
+            last_completion: None,
         };
         let error = MetalBackend::sync_checked(&mut ctx).unwrap_err();
         assert!(error.to_string().contains("no pending command buffer"));
@@ -731,6 +815,8 @@ impl Backend for MetalBackend {
         MetalContext {
             cmd: None,
             encoder: None,
+            submitted: None,
+            last_completion: None,
         }
     }
     fn sync(ctx: &mut Self::Context) {
@@ -739,6 +825,10 @@ impl Backend for MetalBackend {
 
     fn try_sync(ctx: &mut Self::Context) -> Result<()> {
         ctx.flush_checked()
+    }
+
+    fn observe_completion(ctx: &mut Self::Context) -> crate::backend::BackendCompletion {
+        ctx.observe_completion()
     }
     fn sync_before_host_readback(ctx: &mut Self::Context) {
         Self::sync(ctx);

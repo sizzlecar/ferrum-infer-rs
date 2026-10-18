@@ -184,7 +184,10 @@ fn ferrum_device_to_candle(d: &ferrum_types::Device) -> ferrum_types::Result<can
 }
 
 pub struct LlmExecutor {
-    model: Mutex<Box<dyn DecoderOnlyLLM>>,
+    // A submitted device task must be able to retain the actual model-owned
+    // weights, KV and scratch independently of the awaiting caller/executor.
+    // This changes ownership, not the single exclusive model lock per batch.
+    model: Arc<Mutex<Box<dyn DecoderOnlyLLM>>>,
     adapter_support: AdapterExecutionSupport,
     info: ModelInfo,
     bound_sources: Option<Arc<ProductionModelSourceBundle>>,
@@ -216,7 +219,7 @@ impl LlmExecutor {
     ) -> Self {
         let adapter_support = model.adapter_execution_support();
         Self {
-            model: Mutex::new(model),
+            model: Arc::new(Mutex::new(model)),
             adapter_support,
             info,
             bound_sources,

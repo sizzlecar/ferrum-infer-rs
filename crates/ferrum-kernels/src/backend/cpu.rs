@@ -354,6 +354,10 @@ impl Backend for CpuBackend {
         true
     }
 
+    fn observe_completion(_ctx: &mut Self::Context) -> super::BackendCompletion {
+        super::BackendCompletion::Succeeded
+    }
+
     fn try_sync(_ctx: &mut Self::Context) -> ferrum_types::Result<()> {
         Ok(())
     }

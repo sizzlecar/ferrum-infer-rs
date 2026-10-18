@@ -798,6 +798,27 @@ impl Fixture {
         checkpoint: &SequenceCheckpoint<Runtime>,
         tokens: Arc<[u32]>,
     ) {
+        self.restore_publication(target, checkpoint, tokens)
+            .acknowledge()
+            .unwrap();
+        self.assert_checkpoint_timing(
+            self.reaper.checkpoint_timing_snapshot().restore,
+            checkpoint.logical_bytes(),
+        );
+    }
+
+    /// Returns the real device-copy publication without opening its target gate.
+    /// Product acknowledgement tests use this exact owner, not a mock callback.
+    pub fn restore_publication(
+        &self,
+        target: &Arc<SequenceSession<Runtime>>,
+        checkpoint: &SequenceCheckpoint<Runtime>,
+        tokens: Arc<[u32]>,
+    ) -> CheckpointRestorePublication<Runtime> {
+        let suffix = token_span(
+            Arc::clone(&tokens),
+            checkpoint.completed_tokens()..tokens.len(),
+        );
         let start = self
             .reaper
             .try_restore_sequence_checkpoint_with_timing(
@@ -816,11 +837,18 @@ impl Fixture {
                     publication.completed_tokens(),
                     checkpoint.completed_tokens()
                 );
-                publication.acknowledge().unwrap();
-                self.assert_checkpoint_timing(
-                    self.reaper.checkpoint_timing_snapshot().restore,
-                    checkpoint.logical_bytes(),
+                let batch = ExecutionBatchParticipants::new(vec![Arc::clone(target)]).unwrap();
+                let request = StepResourceAdmissionRequest::new(
+                    batch.bind_work_shape(vec![suffix]).unwrap(),
+                    AdmissionFitPolicy::ImmediateOnly,
+                    AdmissionPressureAction::WaitForRelease,
+                )
+                .unwrap();
+                assert!(
+                    batch.try_begin_step(request, &self.lane).is_err(),
+                    "a completed copy must keep execution gated until acknowledgement"
                 );
+                publication
             }
             _ => panic!("restore did not publish its exact target frontier"),
         }
