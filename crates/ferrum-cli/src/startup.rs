@@ -341,7 +341,6 @@ mod tests {
             .apply_runtime_config_snapshot(&resolved.runtime_config)
             .unwrap();
         assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
-        assert!(!engine.runtime.prefix_cache_enabled);
     }
 
     #[test]
@@ -417,7 +416,6 @@ mod tests {
                 .apply_runtime_config_snapshot(&resolved.runtime_config)
                 .unwrap();
             assert!(!engine.runtime.prefix_state_cache_enabled);
-            assert!(!engine.runtime.prefix_cache_enabled);
         }
     }
 

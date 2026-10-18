@@ -131,6 +131,7 @@ fn measured_request_count(cmd: &BenchCommand) -> Result<u32> {
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
+    let runtime_config = crate::runtime_env::capture_supported_runtime_environment()?;
     let cache_dir = crate::source_resolver::hf_cache_dir(&config);
     let resolved = crate::source_resolver::resolve_model_source(
         &cmd.model,
@@ -159,8 +160,6 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let device = super::run::select_device(&cmd.backend)?;
     let backend_str = format!("{:?}", device).to_lowercase();
     eprintln!("{} {:?}", "Device:".dimmed(), device);
-    let runtime_config = ferrum_types::RuntimeConfigSnapshot::capture_current();
-
     #[cfg(feature = "cuda")]
     {
         let graph_mode =

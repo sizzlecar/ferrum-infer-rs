@@ -138,7 +138,6 @@ mod tests {
             num_layers,
             num_heads,
             head_dim,
-            enable_prefix_cache: false,
             ..Default::default()
         };
         let manager = PagedKvCacheManager::new(Device::CPU, config).unwrap();

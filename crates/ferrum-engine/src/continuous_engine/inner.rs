@@ -1439,31 +1439,6 @@ impl EngineInner {
             .from_slice(&f32_data, &[1, len], DataType::FP32, Device::CPU)
     }
 
-    /// Rebuild a KvCacheHandle with a corrected sequence_length.
-    ///
-    /// Only meaningful for `GenericKvCacheHandle`, which is what the LLM
-    /// executor (`LlmExecutor::prefill` / `decode`) constructs and threads
-    /// through speculative decoding. Resource handles minted by
-    /// `KvCacheManager` impls (Paged / Default) are returned as a plain
-    /// clone — those handles don't track per-iter position (the model's
-    /// internal paged_pool does), and the engine no longer reads
-    /// `sequence_length` from them for position purposes (see
-    /// `process_batch_unified` for the SequenceState-sourced pos_offset).
-    pub(super) fn make_kv_handle_with_seq(
-        &self,
-        h: &std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle>,
-        new_seq: usize,
-    ) -> std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle> {
-        if let Some(g) = h
-            .as_any()
-            .downcast_ref::<ferrum_models::executor::common::GenericKvCacheHandle>()
-        {
-            std::sync::Arc::new(g.with_sequence_length(new_seq))
-        } else {
-            h.clone()
-        }
-    }
-
     /// Build the model-executor KV handle used by `LlmExecutor::decode`.
     ///
     /// The continuous engine has two KV identities:

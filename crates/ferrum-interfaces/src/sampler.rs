@@ -776,14 +776,6 @@ impl SamplingConfig {
         builder.with_sampler(sampler).build()
     }
 
-    /// Whether the current plan is exactly raw greedy argmax.
-    ///
-    /// The legacy speculative runner only represents temperature and drafts
-    /// with argmax. Any logits processor would otherwise be silently skipped.
-    pub fn supports_raw_greedy_speculation(&self) -> bool {
-        self.sampler.is_deterministic() && self.processor_chain.is_empty()
-    }
-
     /// Process logits and sample token
     pub fn sample(&self, mut ctx: SamplingContext, rng: &mut dyn RngCore) -> Result<TokenId> {
         // Apply all logits processors

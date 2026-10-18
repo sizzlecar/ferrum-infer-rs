@@ -163,7 +163,14 @@ fn retired_modal_commands_and_options_are_rejected() {
 #[test]
 fn retired_runtime_config_is_rejected_before_run_or_serve() {
     let workspace = TempDirGuard::new("retired-runtime-config");
-    for (key, value) in [("moe_graph", "false"), ("moe_batch_threshold", "4")] {
+    for (key, value) in [
+        ("moe_graph", "false"),
+        ("moe_batch_threshold", "4"),
+        ("whole_prompt_prefix_cache", "false"),
+        ("prefix_cache_enabled", "false"),
+        ("spec_draft", "\"\""),
+        ("spec_n", "0"),
+    ] {
         write_file(
             &workspace.path().join("ferrum.toml"),
             format!("[runtime]\n{key} = {value}\n").as_bytes(),
@@ -177,6 +184,75 @@ fn retired_runtime_config_is_rejected_before_run_or_serve() {
                 "{stderr}"
             );
         }
+    }
+}
+
+#[test]
+fn retired_scheduler_config_is_rejected_before_run_or_serve() {
+    let workspace = TempDirGuard::new("retired-scheduler-config");
+    for (key, value) in [
+        ("policy", "\"Priority\""),
+        ("scheduler_type", "\"fifo\""),
+        ("enable_load_balancing", "false"),
+        ("fair_share_weights", "{}"),
+        ("enable_sla_enforcement", "false"),
+    ] {
+        write_file(
+            &workspace.path().join("ferrum.toml"),
+            format!("[scheduler]\n{key} = {value}\n").as_bytes(),
+        );
+        for command in ["run", "serve"] {
+            let output = run(base_cmd(workspace.path()).arg(command));
+            assert!(!output.status.success(), "{command} must reject {key}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("unknown field") && stderr.contains(key),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn retired_execution_environment_is_rejected_before_model_selection() {
+    let workspace = TempDirGuard::new("retired-execution-env");
+    let keys = [
+        "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",
+        "FERRUM_SPEC_DRAFT",
+        "FERRUM_SPEC_N",
+    ];
+    for key in keys {
+        for value in ["", "false", "0", "1"] {
+            for command in ["run", "serve", "bench"] {
+                let mut cmd = base_cmd(workspace.path());
+                for removed in keys {
+                    cmd.env_remove(removed);
+                }
+                // No explicit model is supplied: the retired option must be
+                // reported before resolving a source or initializing a backend.
+                let output = run(cmd.arg(command).env(key, value));
+                assert!(!output.status.success(), "{command} must reject {key}");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains(key) && stderr.contains("retired"),
+                    "{stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn retired_speculative_serve_options_are_rejected_by_parser() {
+    let workspace = TempDirGuard::new("retired-speculative-options");
+    for (option, value) in [("--spec-draft", "draft-model"), ("--spec-tokens", "4")] {
+        let output = run(base_cmd(workspace.path()).args(["serve", option, value]));
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument") && stderr.contains(option),
+            "{stderr}"
+        );
     }
 }
 

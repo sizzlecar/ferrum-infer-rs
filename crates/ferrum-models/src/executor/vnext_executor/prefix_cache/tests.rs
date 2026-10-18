@@ -348,9 +348,7 @@ fn product_flag_resolves_to_existing_memory_budget_without_reserving_slots() {
         metadata: Default::default(),
     };
     let mut engine = EngineConfig::default();
-    // Enabling the independent whole-prompt cache does not allocate vNext
-    // sequence-state checkpoint capacity.
-    engine.runtime.prefix_cache_enabled = true;
+    // Native checkpoint capacity follows its own explicit state-cache policy.
     engine.runtime.prefix_state_cache_enabled = false;
     let disabled =
         VNextExecutorConfig::from_engine_config(&engine, &info, composition.runtime().as_ref())

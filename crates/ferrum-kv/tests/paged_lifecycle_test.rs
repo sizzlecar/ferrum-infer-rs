@@ -18,7 +18,6 @@ fn small_config(block_size: usize, max_blocks: usize) -> PagedKvCacheConfig {
         num_layers: 1,
         num_heads: 2,
         head_dim: 4,
-        enable_prefix_cache: false,
         ..Default::default()
     }
 }

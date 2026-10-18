@@ -84,17 +84,6 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub layer_split_pipeline_mode: Option<crate::layer_split_pipeline::LayerSplitPipelineModeArg>,
 
-    /// Speculative decoding: draft model id (same family as target).
-    /// Example: `--spec-draft qwen3:0.6b` when serving `qwen3:4b`.
-    /// The draft model must share the tokenizer + vocabulary.
-    #[arg(long, value_name = "MODEL")]
-    pub spec_draft: Option<String>,
-
-    /// Number of speculative tokens per draft forward pass (default: 4).
-    /// Only active when --spec-draft is set.
-    #[arg(long, default_value = "4")]
-    pub spec_tokens: usize,
-
     /// Fraction of currently available device memory used by native startup
     /// planning (default: 0.9). Legacy CUDA models use this fraction of total
     /// GPU memory for their KV pool estimate.
@@ -432,6 +421,7 @@ async fn execute_with_compatibility(
     configured_interleaved_system_coalescing: bool,
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
 ) -> Result<()> {
+    let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let ServeCommand {
         model,
         model_option,
@@ -445,8 +435,6 @@ async fn execute_with_compatibility(
         numerical_profile,
         gpu_devices,
         layer_split_pipeline_mode,
-        spec_draft,
-        spec_tokens,
         gpu_memory_utilization,
         runtime_memory_budget_bytes,
         max_model_len,
@@ -593,9 +581,6 @@ async fn execute_with_compatibility(
         return Ok(());
     }
 
-    // Keep the original user environment independent of inferred defaults.
-    let user_environment = RuntimeConfigSnapshot::capture_current();
-
     // Select the requested device before model/cache resolution. Explicit
     // backend requests must fail closed instead of doing model work and then
     // silently running on CPU.
@@ -734,37 +719,6 @@ async fn execute_with_compatibility(
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
     let engine_model_path = source.local_path.to_string_lossy().to_string();
-
-    // Speculative decoding draft model: resolve the draft path and pass it
-    // through EngineConfig backend options. Validates that the draft model is
-    // actually cached before the target load kicks in.
-    let mut engine_spec_draft_path = None;
-    if let Some(ref draft_name) = spec_draft {
-        if gguf_path.is_some() {
-            return Err(ferrum_types::FerrumError::unsupported(
-                "Speculative decoding is not yet wired through the GGUF path",
-            ));
-        }
-        let draft_id = crate::source_resolver::resolve_model_alias(draft_name);
-        println!("{} {}", "Draft model:".dimmed(), draft_id.cyan());
-        let cache_dir = crate::source_resolver::hf_cache_dir(&config);
-        let draft_source = crate::source_resolver::find_cached_model(&cache_dir, &draft_id)
-            .ok_or_else(|| {
-                eprintln!(
-                    "{} Draft model '{}' not in HF cache. Run: ferrum pull {}",
-                    "Error:".red().bold(),
-                    draft_id,
-                    draft_name
-                );
-                ferrum_types::FerrumError::model("Draft model not found")
-            })?;
-        engine_spec_draft_path = Some(draft_source.local_path.to_string_lossy().to_string());
-        println!(
-            "{} {} tokens / verify pass",
-            "Speculative decoding:".dimmed(),
-            spec_tokens
-        );
-    }
 
     println!("{} {:?}", "Device:".dimmed(), device);
     let current_runtime = merge_runtime_config_sources(
@@ -1079,16 +1033,6 @@ async fn execute_with_compatibility(
             &startup_auto_config.runtime_config,
             &mut engine_config.backend.backend_options,
         )?;
-        if let Some(draft_path) = engine_spec_draft_path.as_ref() {
-            engine_config.backend.backend_options.insert(
-                "spec_draft".to_string(),
-                serde_json::Value::String(draft_path.clone()),
-            );
-            engine_config.backend.backend_options.insert(
-                "spec_n".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(spec_tokens)),
-            );
-        }
         super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
         let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
             Arc::from(match (defined_model, model_sources) {
@@ -3987,7 +3931,6 @@ mod tests {
             .apply_runtime_config_snapshot(&resolved.runtime_config)
             .unwrap();
         assert!(engine.runtime.prefix_state_cache_enabled);
-        assert!(!engine.runtime.prefix_cache_enabled);
     }
 
     #[test]
@@ -4156,7 +4099,6 @@ mod tests {
                 .apply_runtime_config_snapshot(&resolved.runtime_config)
                 .unwrap();
             assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
-            assert!(!engine.runtime.prefix_cache_enabled);
         }
     }
 

@@ -100,7 +100,7 @@ pub trait LlmInferenceEngine: InferenceEngine {
 }
 
 /// Advanced engine capabilities — opt-in addition to LLM engines that
-/// support batching / speculation / runtime reconfig / diagnostics.
+/// support batching / runtime reconfig / diagnostics.
 #[async_trait]
 pub trait AdvancedInferenceEngine: LlmInferenceEngine {
     /// Execute batch inference.
@@ -108,13 +108,6 @@ pub trait AdvancedInferenceEngine: LlmInferenceEngine {
         &self,
         requests: Vec<InferenceRequest>,
     ) -> Result<Vec<Result<InferenceResponse>>>;
-
-    /// Execute speculative inference.
-    async fn infer_speculative(
-        &self,
-        request: InferenceRequest,
-        speculation_config: ferrum_types::SpeculationConfig,
-    ) -> Result<InferenceResponse>;
 
     /// Warm up engine with sample requests.
     async fn warmup(
@@ -134,9 +127,6 @@ pub trait AdvancedInferenceEngine: LlmInferenceEngine {
     /// Import engine state for debugging/testing.
     async fn import_state(&mut self, state: ferrum_types::EngineState) -> Result<()>;
 }
-
-/// Speculation configuration for speculative decoding.
-pub type SpeculationConfig = ferrum_types::SpeculationConfig;
 
 /// Hardware constraints alias.
 pub type HardwareConstraints = ferrum_types::HardwareConstraints;

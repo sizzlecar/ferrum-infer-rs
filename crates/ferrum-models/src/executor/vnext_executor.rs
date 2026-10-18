@@ -672,13 +672,7 @@ impl VNextExecutorConfig {
                 FerrumError::config("batching.max_num_batched_tokens exceeds the vNext limit")
             })?;
         let scheduling = match engine.scheduler.policy {
-            SchedulingPolicy::Priority | SchedulingPolicy::FairShare => {
-                SchedulingDiscipline::Priority
-            }
-            SchedulingPolicy::FCFS
-            | SchedulingPolicy::SJF
-            | SchedulingPolicy::RoundRobin
-            | SchedulingPolicy::ContinuousBatch => SchedulingDiscipline::FirstReady,
+            SchedulingPolicy::ContinuousBatch => SchedulingDiscipline::FirstReady,
         };
         let dynamic_storage_profile_order = descriptor
             .dynamic_storage_profiles

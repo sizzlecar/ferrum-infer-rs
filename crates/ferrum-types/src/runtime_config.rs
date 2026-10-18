@@ -47,8 +47,20 @@ pub struct RuntimeConfigSnapshot {
 impl RuntimeConfigSnapshot {
     /// Reject controls whose only executor has been retired. A forced-off
     /// value is still an explicit unsupported option, not a retained feature.
-    pub(crate) fn validate_retired_options(&self) -> Result<(), (&str, &'static str)> {
+    pub fn validate_retired_options(&self) -> Result<(), (&str, &'static str)> {
         for entry in &self.entries {
+            let retired = match entry.key.as_str() {
+                "FERRUM_WHOLE_PROMPT_PREFIX_CACHE" => Some(
+                    "whole-prompt clone caching has been retired; remove this option; FERRUM_PREFIX_CACHE controls retained sequence-state checkpoints",
+                ),
+                "FERRUM_SPEC_DRAFT" | "FERRUM_SPEC_N" => Some(
+                    "speculative decoding has been retired; remove this option",
+                ),
+                _ => None,
+            };
+            if let Some(reason) = retired {
+                return Err((entry.key.as_str(), reason));
+            }
             if matches!(
                 entry.key.as_str(),
                 "FERRUM_MOE_GRAPH"

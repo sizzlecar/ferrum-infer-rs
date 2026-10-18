@@ -37,7 +37,6 @@ fn make_engine() -> (ContinuousBatchEngine, Arc<PagedKvCacheManager>) {
         num_layers: NUM_LAYERS,
         num_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
-        enable_prefix_cache: false,
         ..Default::default()
     };
 
@@ -127,7 +126,6 @@ async fn paged_executor_tracks_operations() {
         num_layers: NUM_LAYERS,
         num_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
-        enable_prefix_cache: false,
         ..Default::default()
     };
 
@@ -217,7 +215,6 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
         num_layers: NUM_LAYERS,
         num_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
-        enable_prefix_cache: false,
         ..Default::default()
     };
 

@@ -43,7 +43,6 @@ use ferrum_interfaces::{
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
-use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
 use ferrum_scheduler::implementations::{
     ContinuousBatchScheduler, ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot,
@@ -98,8 +97,6 @@ const MAX_MODEL_LEN_ENV: &str = "FERRUM_MAX_MODEL_LEN";
 #[cfg(test)]
 const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
 #[cfg(test)]
-const WHOLE_PROMPT_PREFIX_CACHE_ENV: &str = "FERRUM_WHOLE_PROMPT_PREFIX_CACHE";
-#[cfg(test)]
 const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 #[cfg(test)]
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
@@ -141,7 +138,6 @@ struct ContinuousEngineRuntimeConfig {
     next_batch_prof: bool,
     profile_entrypoint: Option<ProfileEntrypoint>,
     profile_jsonl: Option<PathBuf>,
-    prefix_cache_enabled: bool,
     rbd_prof: bool,
     scheduler_trace_jsonl: Option<PathBuf>,
     legacy_scheduler_trace_jsonl: Option<PathBuf>,
@@ -164,7 +160,6 @@ impl ContinuousEngineRuntimeConfig {
             next_batch_prof: r.next_batch_prof,
             profile_entrypoint: r.profile_entrypoint,
             profile_jsonl: r.profile_jsonl.clone(),
-            prefix_cache_enabled: r.prefix_cache_enabled,
             rbd_prof: r.rbd_prof,
             scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
             legacy_scheduler_trace_jsonl: r.legacy_scheduler_trace_jsonl.clone(),
@@ -197,9 +192,6 @@ impl ContinuousEngineRuntimeConfig {
             profile_jsonl: vars
                 .get("FERRUM_PROFILE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
-            prefix_cache_enabled: vars
-                .get(WHOLE_PROMPT_PREFIX_CACHE_ENV)
-                .is_some_and(|v| v == "1"),
             rbd_prof: vars.contains_key(RBD_PROF_ENV),
             scheduler_trace_jsonl: vars
                 .get("FERRUM_SCHEDULER_TRACE_JSONL")
@@ -1414,11 +1406,6 @@ struct EngineInner {
     sampler: Arc<dyn Sampler + Send + Sync>,
     resource_composition: EngineResourceComposition,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-    /// Optional draft executor for speculative decoding. When set alongside
-    /// `spec_config`, `run_single_decode` routes through `SpeculativeRunner`.
-    draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
-    /// Speculative decoding parameters (N, temperature). `None` = disabled.
-    spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
     tensor_factory: Arc<dyn TensorFactory>,
     sequences: RwLock<HashMap<RequestId, SequenceState>>,
     is_running: AtomicBool,
@@ -1429,8 +1416,6 @@ struct EngineInner {
     iteration_lock: tokio::sync::Mutex<()>,
     /// Wakes callers or a background loop when new work is submitted.
     work_notify: Arc<Notify>,
-    /// Prefix cache: shares KV blocks across requests with common prompts.
-    prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
     profile_trace_jsonl: Option<SchedulerTraceJournal>,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
@@ -2387,14 +2372,6 @@ impl EngineInner {
             self.release_kv_allocation(request_id, kv_allocation.request_id, kv_allocation.blocks)
                 .await;
         }
-        if let Some(draft_kv_allocation) = resources.legacy_draft_kv_allocation {
-            self.release_kv_allocation(
-                request_id,
-                draft_kv_allocation.request_id,
-                draft_kv_allocation.blocks,
-            )
-            .await;
-        }
         if let Some(recurrent_allocation) = resources.recurrent_state_allocation {
             self.release_recurrent_allocation(request_id, recurrent_allocation.slots)
                 .await;
@@ -2647,7 +2624,7 @@ impl ContinuousBatchEngine {
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         tensor_factory: Arc<dyn TensorFactory>,
     ) -> Result<Self> {
-        Self::new_with_speculation(
+        Self::new_with_recurrent_state_manager(
             config,
             scheduler,
             tokenizer,
@@ -2656,14 +2633,13 @@ impl ContinuousBatchEngine {
             model_executor,
             tensor_factory,
             None,
-            None,
         )
     }
 
-    /// Build an engine with optional speculative decoding. Pass both the
-    /// draft executor AND the config together — either both or neither.
+    /// Build an engine with an optional recurrent-state manager for
+    /// state-space / hybrid models.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_speculation(
+    pub fn new_with_recurrent_state_manager(
         config: EngineConfig,
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
@@ -2671,36 +2647,6 @@ impl ContinuousBatchEngine {
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         tensor_factory: Arc<dyn TensorFactory>,
-        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
-        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
-    ) -> Result<Self> {
-        Self::new_with_speculation_and_recurrent_state_manager(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            kv_cache,
-            model_executor,
-            tensor_factory,
-            draft_executor,
-            spec_config,
-            None,
-        )
-    }
-
-    /// Build an engine with optional speculative decoding and an optional
-    /// recurrent-state manager for state-space / hybrid models.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_speculation_and_recurrent_state_manager(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-        tensor_factory: Arc<dyn TensorFactory>,
-        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
-        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     ) -> Result<Self> {
         Self::new_with_resource_composition(
@@ -2714,8 +2660,6 @@ impl ContinuousBatchEngine {
             },
             model_executor,
             tensor_factory,
-            draft_executor,
-            spec_config,
         )
     }
 
@@ -2739,8 +2683,6 @@ impl ContinuousBatchEngine {
             EngineResourceComposition::PlanRuntime,
             model_executor,
             tensor_factory,
-            None,
-            None,
         )
     }
 
@@ -2753,23 +2695,8 @@ impl ContinuousBatchEngine {
         resource_composition: EngineResourceComposition,
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         tensor_factory: Arc<dyn TensorFactory>,
-        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
-        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
     ) -> Result<Self> {
         let executor_authority = model_executor.execution_resource_authority();
-        if draft_executor.is_some() != spec_config.is_some() {
-            return Err(FerrumError::config(
-                "speculative decoding requires both a draft executor and its configuration",
-            ));
-        }
-        if let Some(draft_executor) = draft_executor.as_ref() {
-            let draft_authority = draft_executor.execution_resource_authority();
-            if draft_authority != executor_authority {
-                return Err(FerrumError::config(format!(
-                    "draft executor authority {draft_authority:?} does not match target authority {executor_authority:?}"
-                )));
-            }
-        }
         if resource_composition.authority() != executor_authority {
             return Err(FerrumError::config(format!(
                 "engine resource composition {:?} does not match executor authority {:?}",
@@ -2780,9 +2707,7 @@ impl ContinuousBatchEngine {
         let recurrent_state_manager = resource_composition.recurrent_state_manager().is_some();
         info!(
             ?executor_authority,
-            "Creating ContinuousBatchEngine (speculative_decoding={}, recurrent_state_manager={})",
-            draft_executor.is_some() && spec_config.is_some(),
-            recurrent_state_manager
+            "Creating ContinuousBatchEngine (recurrent_state_manager={})", recurrent_state_manager
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let profile_trace_jsonl = runtime_config
@@ -2837,10 +2762,7 @@ impl ContinuousBatchEngine {
                 None
             };
         if let Some(sink) = execution_sink {
-            model_executor.attach_execution_event_sink(Arc::clone(&sink));
-            if let Some(draft_executor) = draft_executor.as_ref() {
-                draft_executor.attach_execution_event_sink(sink);
-            }
+            model_executor.attach_execution_event_sink(sink);
         }
 
         Ok(Self {
@@ -2852,8 +2774,6 @@ impl ContinuousBatchEngine {
                 sampler,
                 resource_composition,
                 model_executor,
-                draft_executor,
-                spec_config,
                 tensor_factory,
                 sequences: RwLock::new(HashMap::new()),
                 is_running: AtomicBool::new(false),
@@ -2861,7 +2781,6 @@ impl ContinuousBatchEngine {
                 iteration_lock: tokio::sync::Mutex::new(()),
                 work_notify: Arc::new(Notify::new()),
                 iteration_count: AtomicU64::new(0),
-                prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
                 profile_trace_jsonl,
                 scheduler_trace_jsonl,
@@ -2914,11 +2833,6 @@ impl ContinuousBatchEngine {
     /// tests + /metrics endpoint; monotonic, Relaxed-ordered.
     pub fn prefix_cache_hits(&self) -> u64 {
         self.inner.prefix_cache_hits.load(Ordering::Relaxed)
-    }
-
-    /// Snapshot of prefix cache stats (hits/misses/evictions/active entries).
-    pub fn prefix_cache_stats(&self) -> ferrum_kv::cache::prefix::PrefixCacheStats {
-        self.inner.prefix_cache.stats()
     }
 
     /// Start a background iteration loop.  Returns a `JoinHandle` that
@@ -3388,24 +3302,7 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        if let Some(snapshot) = self.inner.model_executor.cache_metrics_snapshot() {
-            return Some(snapshot);
-        }
-
-        let stats = self.inner.prefix_cache.stats();
-        Some(serde_json::json!({
-            "position": "engine-whole-prompt-debug-cache",
-            "source": "continuous-engine-whole-prompt-prefix-cache",
-            "enabled": self.inner.runtime_config.prefix_cache_enabled,
-            "hits": stats.hits as u64,
-            "misses": stats.misses as u64,
-            "evictions": stats.evictions as u64,
-            "saved_prefill_tokens": self.inner.prefix_cache_hits.load(Ordering::Relaxed),
-            "entries": stats.active_prefixes as u64,
-            "bytes": 0u64,
-            "cached_tokens": stats.total_cached_tokens as u64,
-            "hit_rate": stats.hit_rate,
-        }))
+        self.inner.model_executor.cache_metrics_snapshot()
     }
 
     fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {

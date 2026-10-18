@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 两批退役清理、LoRA 隔离与统一来源绑定已合并（PR #429–#432），必需 CI 全过；保留链路通过真实 CPU `run` / `serve`、CUDA 图重放后的 LoRA 数值回归及 Metal/CUDA 的 GGUF 融合 bias 回归。当前清退平行旧 MoE/Candle 路径及专属配置，并修复 SafeTensors 直接投影遗漏 bias。R1 尚未开始；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 五批清理与正确性修复已合并（PR #429–#433），必需 CI 全过；包含旧 MoE/Candle 清理、LoRA 隔离、统一来源绑定及 GGUF/SafeTensors bias 数值回归。当前清退旧缓存、独立调度/模拟执行器、实验性投机解码及无实现文本注册，正在定向验证。R1 尚未开始；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -42,6 +42,8 @@ R0 两批退役清理、LoRA 隔离与统一来源绑定已合并（PR #429–#4
 来源 API 迁移：移除 `LlmExecutor::new_with_vnext_model`、`vnext_model`、`vnext_family` 的未接线计划标签；实际使用产品来源的 legacy 构造器改用 `new_with_model_sources`，保留无来源的 `new`。配置了产品来源的自定义 executor 须通过 `bound_resolved_sources` 报告其实际来源；typed 实现还校验真实 plan。此报告是可信实现的组装一致性合同，不是执行授权或全部文件的原子快照。
 
 MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 和独立 `GgufRuntime`；通过产品来源注册入口使用保留的 typed MoE。旧 CPU MoE 整模型路径随之退役，CPU 路由/dispatch 数值参考不代表 typed CPU MoE 可运行。旧 MoE graph/batch 专属选项明确拒绝；`[runtime]` 未知字段及已有 `ferrum.toml` 的读取/解析错误会报错，缺少配置文件仍使用默认值。
+
+旧执行 API 迁移：移除独立 FIFO/Priority、pipeline/模拟 parallel、speculative 驱动及 whole-prompt 缓存 API；Engine 使用连续批处理配置，普通 prefix 使用原有 `FERRUM_PREFIX_CACHE`/CLI 选项。旧 speculative/whole-prompt 参数、退役配置字段和策略名称明确拒绝，不能静默转成默认行为；原生 checkpoint、请求优先级、真实 layer-split/chunked prefill 和显式自定义注册保留。`GenericKvCacheHandle::clone_handle` 拒绝没有物理 fork 的复制；Phi/GPT2 不再被内建注册为可执行家族，通用元数据识别和下载不受此限制。
 
 扩展点限于任务能力声明、可组合的注册/装配边界，以及未来按任务定义独立请求/结果的空间；**不新建无人使用的 Embed/ASR/TTS 引擎、空实现或插件框架来替代删除。** Candle、量化加载、通用算子等仍被文本 LLM 使用的依赖继续保留；独立 CLIP 处理链和未支持的聊天视觉输入不是同一件事，不能删掉主线已有的能力限制校验。
 

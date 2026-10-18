@@ -281,7 +281,6 @@ pub struct SequenceState {
     pub preemption_count: usize,
     /// Tokenizer-aware hard grammar for `json_object` and strict schema.
     pub structured_output_processor: Option<StructuredOutputProcessor>,
-    pub(super) draft_kv: Option<SequenceDraftKvState>,
     /// Generated-token history scoped to the active typed output domain.
     pub(super) sampling_history: SequenceSamplingHistory,
     /// Single-token stop ids: model's EOS + any `stop_sequences` that encode to
@@ -469,35 +468,9 @@ impl SequenceRecurrentState {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct SequenceDraftKvState {
-    pub(super) cache: Arc<dyn KvCacheHandle>,
-    pub(super) request_id: RequestId,
-    pub(super) resource_blocks: usize,
-}
-
-impl SequenceDraftKvState {
-    pub(super) fn new(
-        cache: Arc<dyn KvCacheHandle>,
-        request_id: RequestId,
-        resource_blocks: usize,
-    ) -> Self {
-        Self {
-            cache,
-            request_id,
-            resource_blocks: resource_blocks.max(1),
-        }
-    }
-
-    pub(super) fn allocation(self) -> SequenceKvAllocation {
-        SequenceKvAllocation::new(self.request_id, self.resource_blocks)
-    }
-}
-
 #[derive(Debug, Default)]
 pub(super) struct SequencePhysicalResources {
     pub(super) legacy_kv_allocation: Option<SequenceKvAllocation>,
-    pub(super) legacy_draft_kv_allocation: Option<SequenceKvAllocation>,
     pub(super) recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
     pub(super) model_cache_id: Option<String>,
 }
@@ -843,7 +816,6 @@ impl SequenceState {
             tokens_this_iteration: 0,
             preemption_count: 0,
             structured_output_processor,
-            draft_kv: None,
             sampling_history: SequenceSamplingHistory::default(),
             stop_token_ids,
             model_eos_token_ids,
@@ -1005,10 +977,8 @@ impl SequenceState {
                 (legacy_kv_allocation, Some(model_cache_id))
             })
             .unwrap_or((None, None));
-        let legacy_draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
         let resources = SequencePhysicalResources {
             legacy_kv_allocation,
-            legacy_draft_kv_allocation,
             recurrent_state_allocation: self
                 .recurrent_state
                 .take()
@@ -1075,19 +1045,6 @@ impl SequenceState {
         allocation: SequenceKvAllocation,
     ) -> ModelCacheRefUpdate {
         self.install_model_kv_state(SequenceModelKvState::legacy_allocated(kv_cache, allocation))
-    }
-
-    pub(super) fn commit_cached_prefill_physical_resources(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        prefill_tokens_processed: usize,
-    ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
-        self.prefill_tokens_processed = prefill_tokens_processed;
-        self.prefill_complete = true;
-        self.phase = RequestPhase::Decoding;
-        self.record_decode_ready();
-        model_cache_update
     }
 
     pub(super) fn commit_prefill_physical_resources(
@@ -1227,10 +1184,6 @@ impl SequenceState {
         self.recurrent_state.as_ref().and_then(|state| state.slots)
     }
 
-    pub(super) fn draft_kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
-        self.draft_kv.as_ref().map(|draft| draft.cache.clone())
-    }
-
     pub(super) fn kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
         self.model_kv.as_ref().map(SequenceModelKvState::handle)
     }
@@ -1288,57 +1241,6 @@ impl SequenceState {
         self.recurrent_state.take().and_then(|state| state.slots)
     }
 
-    pub(super) fn commit_speculative_decode_physical_resources(
-        &mut self,
-        target_kv_cache: Arc<dyn KvCacheHandle>,
-        draft_kv_cache: Arc<dyn KvCacheHandle>,
-    ) -> Result<()> {
-        self.model_kv
-            .as_ref()
-            .ok_or_else(|| {
-                FerrumError::internal(
-                    "speculative decode completed without an active target KV lease",
-                )
-            })?
-            .validate_replacement_cache(&target_kv_cache)?;
-        if let Some(draft) = &self.draft_kv {
-            let replacement_cache_id = draft_kv_cache.cache_id();
-            if replacement_cache_id != draft.cache.cache_id() {
-                return Err(FerrumError::internal(format!(
-                    "speculative decode replaced draft cache authority {} with {}",
-                    draft.cache.cache_id(),
-                    replacement_cache_id
-                )));
-            }
-        } else {
-            return Err(FerrumError::internal(
-                "draft KV cache updated without owned allocation metadata",
-            ));
-        }
-        self.model_kv
-            .as_mut()
-            .expect("validated target KV lease remains installed")
-            .replace_cache_handle(target_kv_cache)?;
-        self.draft_kv
-            .as_mut()
-            .expect("validated draft KV lease remains installed")
-            .cache = draft_kv_cache;
-        Ok(())
-    }
-
-    pub(super) fn commit_draft_kv_allocation(
-        &mut self,
-        draft_kv_cache: Arc<dyn KvCacheHandle>,
-        draft_request_id: RequestId,
-        draft_resource_blocks: usize,
-    ) {
-        self.draft_kv = Some(SequenceDraftKvState::new(
-            draft_kv_cache,
-            draft_request_id,
-            draft_resource_blocks,
-        ));
-    }
-
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
         if !self.can_use_model_greedy_argmax() {
             return LogitsReturnPolicy::FullLogits;
@@ -1372,15 +1274,6 @@ impl SequenceState {
             && !self.pending_decoded_utf8_fragment
             && self.structured_output_processor.is_none()
             && matches!(params.response_format, ResponseFormat::Text)
-    }
-
-    pub(super) fn supports_raw_speculative_decode(&self) -> bool {
-        self.structured_output_processor.is_none()
-            && self.sampling_plan.supports_raw_greedy_speculation()
-            && self
-                .argmax_token_mask
-                .as_ref()
-                .is_none_or(|mask| mask.valid_token_mask.iter().all(|&value| value != 0))
     }
 
     pub(super) fn model_decode_repetition_penalty(&self) -> Option<GreedyRepetitionPenalty> {
@@ -1963,8 +1856,6 @@ impl Drop for SequenceState {
                 kv_resource_blocks = ?self.kv_resource_blocks(),
                 has_recurrent_state = self.recurrent_state.is_some(),
                 recurrent_state_slots = ?self.recurrent_state_slots(),
-                has_draft_kv = self.draft_kv.is_some(),
-                draft_kv_resource_blocks = ?self.draft_kv.as_ref().map(|draft| draft.resource_blocks),
                 "{message}"
             );
             #[cfg(test)]
@@ -2285,7 +2176,6 @@ pub(super) struct PendingBatchPrefill {
     pub(super) kv_lease: Option<KvAllocationLease>,
     pub(super) recurrent_state: RecurrentStateAdmission,
     pub(super) metadata: HashMap<String, serde_json::Value>,
-    pub(super) can_use_prefix_cache: bool,
 }
 
 impl PendingBatchPrefill {
@@ -2295,7 +2185,6 @@ impl PendingBatchPrefill {
         kv_lease: KvAllocationLease,
         recurrent_state: RecurrentStateAdmission,
         metadata: HashMap<String, serde_json::Value>,
-        can_use_prefix_cache: bool,
     ) -> Self {
         Self {
             request_id,
@@ -2303,7 +2192,6 @@ impl PendingBatchPrefill {
             kv_lease: Some(kv_lease),
             recurrent_state,
             metadata,
-            can_use_prefix_cache,
         }
     }
 

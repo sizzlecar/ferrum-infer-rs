@@ -710,6 +710,7 @@ impl VNextTeacherForcingConfig {
 /// config instead of `std::env::vars()`, so the env bridge stays at the
 /// composition root and tests can vary the knobs per `EngineConfig`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeKnobs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_memory_request: Option<crate::StartupMemoryRequest>,
@@ -728,7 +729,6 @@ pub struct RuntimeKnobs {
     pub profile_entrypoint: Option<ProfileEntrypoint>,
     pub profile_detail: ObservabilityProfileDetail,
     pub unified_post_prof: bool,
-    pub prefix_cache_enabled: bool,
     /// Retain independent vNext sequence-state checkpoints across requests.
     #[serde(default)]
     pub prefix_state_cache_enabled: bool,
@@ -772,14 +772,12 @@ pub struct RuntimeKnobs {
     pub q8_projection_weight_preparation: Q8ProjectionWeightPreparation,
 
     // Engine-build composition knobs. Previously read directly from the
-    // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
-    // FERRUM_SPEC_N) and `registry.rs` (FERRUM_DTYPE / FERRUM_METAL_DTYPE /
+    // environment by `builder.rs` (FERRUM_MODEL_PATH) and `registry.rs`
+    // (FERRUM_DTYPE / FERRUM_METAL_DTYPE /
     // FERRUM_TP). The CLI composition root now resolves them into this typed
     // field so the engine builder and component registry read the snapshot,
     // not `std::env`.
     pub model_path: Option<String>,
-    pub spec_draft: Option<String>,
-    pub spec_n: Option<usize>,
     pub dtype: Option<String>,
     pub metal_dtype: Option<String>,
     pub tp: Option<usize>,
@@ -1048,10 +1046,6 @@ impl EngineConfig {
         }
         self.runtime.unified_post_prof |=
             runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
-        self.runtime.prefix_cache_enabled |=
-            runtime_config_value(snapshot, "FERRUM_WHOLE_PROMPT_PREFIX_CACHE")
-                .map(|v| v == "1")
-                .unwrap_or(false);
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_CACHE") {
             self.runtime.prefix_state_cache_enabled = parse_bool_env_value(value)
                 .map_err(|reason| format!("FERRUM_PREFIX_CACHE: {reason}"))?;
@@ -1062,16 +1056,6 @@ impl EngineConfig {
         // later snapshot apply without the key keeps an earlier value.
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_MODEL_PATH") {
             self.runtime.model_path = Some(value.to_string());
-        }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SPEC_DRAFT") {
-            self.runtime.spec_draft = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SPEC_N") {
-            self.runtime.spec_n = value.parse::<usize>().ok();
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_DTYPE") {
             self.runtime.dtype = Some(value.to_string());
@@ -1199,6 +1183,7 @@ where
 
 /// Scheduler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// Optional feedback-driven latency targets. None retains static scheduling.
     #[serde(default)]
@@ -1211,12 +1196,6 @@ pub struct SchedulerConfig {
     pub max_running_requests: usize,
     /// Enable request preemption
     pub enable_preemption: bool,
-    /// Enable load balancing
-    pub enable_load_balancing: bool,
-    /// Fair share weights per client
-    pub fair_share_weights: HashMap<String, f32>,
-    /// SLA enforcement enabled
-    pub enable_sla_enforcement: bool,
     /// Use prompt-token metadata for initial continuous-batch admission estimates.
     #[serde(default = "default_prompt_token_estimate")]
     pub prompt_token_estimate: bool,
@@ -1252,13 +1231,10 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             slo: None,
-            policy: SchedulingPolicy::Priority,
+            policy: SchedulingPolicy::ContinuousBatch,
             max_waiting_requests: 1000,
             max_running_requests: 32,
             enable_preemption: true,
-            enable_load_balancing: false,
-            fair_share_weights: HashMap::new(),
-            enable_sla_enforcement: false,
             prompt_token_estimate: default_prompt_token_estimate(),
             prefill_first_until_active: None,
             prefix_rendezvous_max_wait_ms: None,
@@ -1380,24 +1356,16 @@ fn parse_presence_bool(value: &str) -> std::result::Result<bool, String> {
 }
 
 /// Scheduling policies
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub enum SchedulingPolicy {
-    /// First-Come-First-Served
-    FCFS,
-    /// Priority-based scheduling
-    Priority,
-    /// Fair-share scheduling
-    FairShare,
-    /// Shortest-Job-First
-    SJF,
-    /// Round-Robin
-    RoundRobin,
     /// Iteration-level continuous batching with preemption
+    #[default]
     ContinuousBatch,
 }
 
 /// KV Cache configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KvCacheConfig {
     /// Cache implementation type
     pub cache_type: KvCacheType,
@@ -1419,10 +1387,6 @@ pub struct KvCacheConfig {
     pub enable_multi_level: bool,
     /// Swap threshold (when to move to CPU)
     pub swap_threshold: f32,
-    /// Enable prefix caching
-    pub enable_prefix_caching: bool,
-    /// Prefix cache size
-    pub prefix_cache_size: usize,
 }
 
 impl Default for KvCacheConfig {
@@ -1440,8 +1404,6 @@ impl Default for KvCacheConfig {
             compression_ratio: 0.5,
             enable_multi_level: true,
             swap_threshold: 0.8,
-            enable_prefix_caching: true,
-            prefix_cache_size: 100,
         }
     }
 }
@@ -2456,7 +2418,6 @@ mod tests {
                 )]))
                 .unwrap();
             assert_eq!(config.runtime.prefix_state_cache_enabled, expected);
-            assert!(!config.runtime.prefix_cache_enabled);
             config
                 .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
                 .unwrap();
@@ -2471,15 +2432,8 @@ mod tests {
     }
 
     #[test]
-    fn prefix_state_cache_is_independent_of_whole_prompt_flag_and_defaults_on_old_wire() {
+    fn prefix_state_cache_defaults_on_supported_older_wire() {
         let mut config = EngineConfig::default();
-        config
-            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
-                "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",
-                "1",
-            )]))
-            .unwrap();
-        assert!(config.runtime.prefix_cache_enabled);
         assert!(!config.runtime.prefix_state_cache_enabled);
         config.runtime.prefix_state_cache_enabled = true;
         config
@@ -2488,7 +2442,6 @@ mod tests {
                 "false",
             )]))
             .unwrap();
-        assert!(config.runtime.prefix_cache_enabled);
         assert!(!config.runtime.prefix_state_cache_enabled);
         let mut old = serde_json::to_value(&config.runtime).unwrap();
         old.as_object_mut()
@@ -2496,7 +2449,6 @@ mod tests {
             .remove("prefix_state_cache_enabled");
         let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
         assert!(!restored.prefix_state_cache_enabled);
-        assert!(restored.prefix_cache_enabled);
     }
 
     #[test]

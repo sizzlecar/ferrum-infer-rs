@@ -213,7 +213,16 @@ fn unknown_architecture_is_rejected_even_with_dense_metadata() {
 
 #[test]
 fn unsupported_architectures_are_rejected_before_dimensions_or_weights() {
-    for arch in ["bert", "clip", "whisper", "qwen3_tts", "mistral3", "custom"] {
+    for arch in [
+        "bert",
+        "clip",
+        "whisper",
+        "qwen3_tts",
+        "mistral3",
+        "phi",
+        "gpt2",
+        "custom",
+    ] {
         // Valid GGUF container, but no model dimensions or runnable weights:
         // both public entrypoints must reject the architecture first.
         let tmp = build_metadata_gguf(arch, &[], 1, 1);

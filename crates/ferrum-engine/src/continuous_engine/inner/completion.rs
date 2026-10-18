@@ -3,7 +3,6 @@ use super::*;
 impl SequencePhysicalResources {
     pub(super) fn is_empty(&self) -> bool {
         self.legacy_kv_allocation.is_none()
-            && self.legacy_draft_kv_allocation.is_none()
             && self.recurrent_state_allocation.is_none()
             && self.model_cache_id.is_none()
     }

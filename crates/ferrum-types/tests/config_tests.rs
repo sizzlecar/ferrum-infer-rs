@@ -179,7 +179,7 @@ fn engine_config_rejects_invalid_runtime_snapshot() {
 
 #[test]
 fn engine_config_applies_build_composition_knobs() {
-    // FERRUM_MODEL_PATH / SPEC_* / DTYPE / METAL_DTYPE / TP used to be read
+    // FERRUM_MODEL_PATH / DTYPE / METAL_DTYPE / TP used to be read
     // straight from env by builder.rs and registry.rs. They now land in
     // EngineConfig.runtime here; the builder/registry read the typed field.
     let snapshot = RuntimeConfigSnapshot::from_entries([
@@ -188,12 +188,6 @@ fn engine_config_applies_build_composition_knobs() {
             "/models/target",
             RuntimeConfigSource::Env,
         ),
-        RuntimeConfigEntry::new(
-            "FERRUM_SPEC_DRAFT",
-            "/models/draft",
-            RuntimeConfigSource::Env,
-        ),
-        RuntimeConfigEntry::new("FERRUM_SPEC_N", "8", RuntimeConfigSource::Env),
         RuntimeConfigEntry::new("FERRUM_DTYPE", "fp32", RuntimeConfigSource::Env),
         RuntimeConfigEntry::new("FERRUM_METAL_DTYPE", "fp16", RuntimeConfigSource::Env),
         RuntimeConfigEntry::new("FERRUM_TP", "4", RuntimeConfigSource::Env),
@@ -203,33 +197,117 @@ fn engine_config_applies_build_composition_knobs() {
     cfg.apply_runtime_config_snapshot(&snapshot).unwrap();
 
     assert_eq!(cfg.runtime.model_path.as_deref(), Some("/models/target"));
-    assert_eq!(cfg.runtime.spec_draft.as_deref(), Some("/models/draft"));
-    assert_eq!(cfg.runtime.spec_n, Some(8));
     assert_eq!(cfg.runtime.dtype.as_deref(), Some("fp32"));
     assert_eq!(cfg.runtime.metal_dtype.as_deref(), Some("fp16"));
     assert_eq!(cfg.runtime.tp, Some(4));
 }
 
 #[test]
-fn engine_config_build_knobs_ignore_empty_spec_draft() {
-    // Empty FERRUM_SPEC_DRAFT must resolve to None (disabled), matching the
-    // old builder env parse that treated "" as "no draft".
-    let snapshot = RuntimeConfigSnapshot::from_entries([
-        RuntimeConfigEntry::new("FERRUM_SPEC_DRAFT", "", RuntimeConfigSource::Env),
-        RuntimeConfigEntry::new("FERRUM_SPEC_N", "not-a-number", RuntimeConfigSource::Env),
-    ]);
-    let mut cfg = EngineConfig::default();
+fn retired_execution_controls_reject_before_mutating_engine_config() {
+    for key in [
+        "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",
+        "FERRUM_SPEC_DRAFT",
+        "FERRUM_SPEC_N",
+    ] {
+        for value in ["", "false", "0", "1", "/models/draft"] {
+            for source in [
+                RuntimeConfigSource::Env,
+                RuntimeConfigSource::ConfigFile,
+                RuntimeConfigSource::Cli,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1024", source),
+                    RuntimeConfigEntry::new(key, value, source),
+                ]);
+                let mut cfg = EngineConfig::default();
+                let before = serde_json::to_value(&cfg).unwrap();
+                let error = cfg.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+                assert!(error.contains(key) && error.contains("retired"), "{error}");
+                assert_eq!(serde_json::to_value(&cfg).unwrap(), before);
+            }
+        }
+    }
+}
 
-    cfg.apply_runtime_config_snapshot(&snapshot).unwrap();
+#[test]
+fn retired_config_fields_are_rejected_even_when_disabled_or_null() {
+    use serde_json::json;
 
-    assert_eq!(cfg.runtime.spec_draft, None);
-    assert_eq!(cfg.runtime.spec_n, None);
+    let baseline = serde_json::to_value(EngineConfig::default()).unwrap();
+    serde_json::from_value::<EngineConfig>(baseline.clone()).unwrap();
+    for (section, key, values) in [
+        (
+            "runtime",
+            "prefix_cache_enabled",
+            vec![json!(false), json!(true), json!(null)],
+        ),
+        (
+            "runtime",
+            "spec_draft",
+            vec![json!(""), json!("/models/draft"), json!(null)],
+        ),
+        ("runtime", "spec_n", vec![json!(0), json!(4), json!(null)]),
+        (
+            "scheduler",
+            "enable_load_balancing",
+            vec![json!(false), json!(true)],
+        ),
+        (
+            "scheduler",
+            "fair_share_weights",
+            vec![json!({}), json!({"client": 1.0})],
+        ),
+        (
+            "scheduler",
+            "enable_sla_enforcement",
+            vec![json!(false), json!(true)],
+        ),
+        (
+            "kv_cache",
+            "enable_prefix_caching",
+            vec![json!(false), json!(true)],
+        ),
+        ("kv_cache", "prefix_cache_size", vec![json!(0), json!(100)]),
+        ("runtime", "unknown_runtime_option", vec![json!(false)]),
+        ("scheduler", "unknown_scheduler_option", vec![json!(false)]),
+        ("kv_cache", "unknown_cache_option", vec![json!(false)]),
+    ] {
+        for value in values {
+            let mut wire = baseline.clone();
+            wire[section]
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value);
+            let error = serde_json::from_value::<EngineConfig>(wire).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+    }
+}
+
+#[test]
+fn scheduler_policy_only_accepts_continuous_batch() {
+    let baseline = serde_json::to_value(SchedulerConfig::default()).unwrap();
+    assert_eq!(baseline["policy"], "ContinuousBatch");
+    assert_eq!(
+        serde_json::to_value(SchedulingPolicy::default()).unwrap(),
+        "ContinuousBatch"
+    );
+    let restored: SchedulerConfig = serde_json::from_value(baseline.clone()).unwrap();
+    assert!(matches!(restored.policy, SchedulingPolicy::ContinuousBatch));
+    for policy in ["FCFS", "Priority", "FairShare", "SJF", "RoundRobin"] {
+        let mut wire = baseline.clone();
+        wire["policy"] = serde_json::Value::String(policy.to_string());
+        let error = serde_json::from_value::<SchedulerConfig>(wire).unwrap_err();
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+        assert!(error.to_string().contains(policy), "{error}");
+    }
 }
 
 #[test]
 fn scheduler_config_default_sane() {
     let cfg = SchedulerConfig::default();
-    assert!(matches!(cfg.policy, SchedulingPolicy::Priority));
+    assert!(matches!(cfg.policy, SchedulingPolicy::ContinuousBatch));
     assert!(cfg.max_waiting_requests >= 1);
     assert!(cfg.prompt_token_estimate);
     assert_eq!(cfg.prefill_first_until_active, None);

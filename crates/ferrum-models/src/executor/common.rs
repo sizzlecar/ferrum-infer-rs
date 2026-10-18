@@ -7,11 +7,8 @@ use ferrum_interfaces::{
     KvCacheHandle, TensorRef,
 };
 use ferrum_types::{Device, FerrumError, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Global counter for generating unique clone cache IDs.
-static CLONE_COUNTER: AtomicU64 = AtomicU64::new(0);
 use std::time::Instant;
 
 use crate::tensor_wrapper::CandleTensorWrapper;
@@ -142,12 +139,9 @@ impl KvCacheHandle for GenericKvCacheHandle {
         Ok(None)
     }
     fn clone_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
-        // Each clone gets a unique cache_id so CUDA runner's kv_states
-        // HashMap can distinguish between sequences with same prompt.
-        let mut cloned = self.clone();
-        let n = CLONE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        cloned.cache_id = format!("{}-clone-{n}", self.cache_id);
-        Ok(Arc::new(cloned))
+        Err(FerrumError::unsupported(
+            "generic KV handle cloning cannot fork executor-owned model state",
+        ))
     }
     fn stats(&self) -> CacheHandleStats {
         CacheHandleStats {
@@ -260,13 +254,18 @@ mod tests {
     }
 
     #[test]
-    fn generic_kv_cache_handle_clone_handle() {
+    fn generic_kv_cache_handle_clone_requires_a_physical_fork() {
         let handle =
             GenericKvCacheHandle::new(4, 8, 64, CandleDevice::Cpu, 5, "cache-2".to_string());
-        let cloned = handle.clone_handle().unwrap();
-        // Clone gets unique ID: "cache-2-clone-N"
-        assert!(cloned.cache_id().starts_with("cache-2-clone-"));
-        assert_eq!(cloned.num_layers(), 4);
+        assert!(matches!(
+            handle.clone_handle(),
+            Err(FerrumError::Unsupported { .. })
+        ));
+        assert_eq!(handle.cache_id(), "cache-2");
+        assert_eq!(handle.block_table().sequence_length, 5);
+        let same_sequence = handle.with_sequence_length(6);
+        assert_eq!(same_sequence.cache_id(), handle.cache_id());
+        assert_eq!(same_sequence.block_table().sequence_length, 6);
     }
 
     #[test]
