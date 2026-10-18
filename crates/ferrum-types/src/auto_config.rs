@@ -892,11 +892,6 @@ impl FerrumConfigBuilder {
                 && self.hardware.compiled_features.vllm_moe_marlin,
             AutoConfigSource::WorkloadPreset,
         )?;
-        let device_route = self.bool_value(
-            "FERRUM_MOE_DEVICE_ROUTE",
-            vllm_moe.value,
-            AutoConfigSource::WorkloadPreset,
-        )?;
         let pair_ids = self.bool_value(
             "FERRUM_VLLM_MOE_PAIR_IDS",
             vllm_moe.value,
@@ -1029,7 +1024,7 @@ impl FerrumConfigBuilder {
                 fa2_direct_ffi.value,
             )?;
         }
-        self.validate_moe(vllm_moe.value, device_route.value, pair_ids.value)?;
+        self.validate_moe(vllm_moe.value, pair_ids.value)?;
         self.validate_batched_graph(batched_graph.value)?;
         self.validate_unified_graph(
             unified_graph.value,
@@ -1124,7 +1119,6 @@ impl FerrumConfigBuilder {
             .filter(|_| !plan_runtime)
             .chain([
                 ("FERRUM_VLLM_MOE", &vllm_moe),
-                ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
                 ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
                 ("FERRUM_BATCHED_GRAPH", &batched_graph),
                 ("FERRUM_REUSABLE_EXECUTION", &reusable_execution),
@@ -1188,7 +1182,7 @@ impl FerrumConfigBuilder {
                 );
             }
         }
-        decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
+        decisions.push(self.moe_decision(vllm_moe));
         decisions.push(self.reusable_execution_decision(reusable_execution));
         decisions.push(self.decode_graph_decision(
             batched_graph,
@@ -1759,23 +1753,12 @@ impl FerrumConfigBuilder {
         Ok(())
     }
 
-    fn validate_moe(
-        &self,
-        vllm_moe: bool,
-        device_route: bool,
-        pair_ids: bool,
-    ) -> Result<(), AutoConfigError> {
+    fn validate_moe(&self, vllm_moe: bool, pair_ids: bool) -> Result<(), AutoConfigError> {
         if vllm_moe && !self.hardware.compiled_features.vllm_moe_marlin {
             return self.invalid("FERRUM_VLLM_MOE", "vLLM Marlin MoE is not compiled");
         }
         if vllm_moe && !self.is_cuda_backend() {
             return self.invalid("FERRUM_VLLM_MOE", "vLLM Marlin MoE requires CUDA backend");
-        }
-        if device_route && !vllm_moe {
-            return self.invalid(
-                "FERRUM_MOE_DEVICE_ROUTE",
-                "device route currently requires vLLM MoE",
-            );
         }
         if pair_ids && !vllm_moe {
             return self.invalid(
@@ -2337,45 +2320,26 @@ impl FerrumConfigBuilder {
         )
     }
 
-    fn moe_decision(
-        &self,
-        vllm_moe: ResolvedValue<bool>,
-        device_route: ResolvedValue<bool>,
-        pair_ids: ResolvedValue<bool>,
-    ) -> AutoConfigDecision {
-        let selected = if vllm_moe.value && device_route.value && pair_ids.value {
-            "vllm_marlin_moe_device_route_pair_ids"
-        } else if vllm_moe.value && device_route.value {
-            "vllm_marlin_moe_device_route"
-        } else if vllm_moe.value {
-            "vllm_marlin_moe"
+    fn moe_decision(&self, vllm_moe: ResolvedValue<bool>) -> AutoConfigDecision {
+        // Startup selects the shared implementation preference. Actual device
+        // routing additionally requires executor-owned route scratch; it must
+        // not be claimed by an environment option with no execution consumer.
+        let selected = if vllm_moe.value {
+            "vllm_marlin_enabled"
         } else {
-            "legacy_moe"
+            "vllm_marlin_disabled"
         };
         self.decision(
-            "moe_implementation",
+            "moe_dispatch_preference",
             selected,
             vllm_moe.source,
             vllm_moe.source_key,
-            [
-                "vllm_marlin_moe_device_route_pair_ids",
-                "vllm_marlin_moe_device_route",
-                "vllm_marlin_moe",
-                "legacy_moe",
-            ],
+            ["vllm_marlin_enabled", "vllm_marlin_disabled"],
             self.rejected_except(
                 selected,
                 [
-                    (
-                        "vllm_marlin_moe_device_route_pair_ids",
-                        "pair-id device route not selected",
-                    ),
-                    (
-                        "vllm_marlin_moe_device_route",
-                        "device-route MoE not selected",
-                    ),
-                    ("vllm_marlin_moe", "vLLM Marlin MoE not selected"),
-                    ("legacy_moe", "legacy MoE not selected"),
+                    ("vllm_marlin_enabled", "vLLM Marlin MoE is not enabled"),
+                    ("vllm_marlin_disabled", "vLLM Marlin MoE is enabled"),
                 ],
             ),
             vec![RuntimeConfigEffect::Performance],
@@ -3695,6 +3659,10 @@ mod tests {
     fn retired_legacy_moe_controls_are_rejected_for_every_executor() {
         for key in [
             "FERRUM_MOE_GRAPH",
+            "FERRUM_MOE_DEVICE_ROUTE",
+            "FERRUM_MOE_HOST_TOPK",
+            "FERRUM_MOE_FUSED_GATE_UP_SILU",
+            "FERRUM_MOE_DIRECT_DISPATCH",
             "FERRUM_MOE_BATCHED",
             "FERRUM_MOE_BATCHED_DECODE",
             "FERRUM_MOE_BATCH_THRESHOLD",
@@ -3702,6 +3670,13 @@ mod tests {
             "FERRUM_MOE_PREFILL_THRESHOLD",
             "FERRUM_QWEN_UNIFIED_PREFILL",
             "FERRUM_QWEN_UNIFIED_TRACE",
+            "FERRUM_UNIFIED_GREEDY_ARGMAX",
+            "FERRUM_UNIFIED_LAYER_PROF",
+            "FERRUM_UNIFIED_LAYER_PROF_EVERY",
+            "FERRUM_UNIFIED_LAYER_PROF_MAX_M",
+            "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS",
+            "FERRUM_VLLM_DECODE_VARLEN",
+            "FERRUM_VLLM_VARLEN_TILED_Q4",
         ] {
             for value in ["0", "1"] {
                 for authority in [
@@ -3739,11 +3714,14 @@ mod tests {
             decisions["attention_decode_backend"],
             "vllm_paged_attn_v1_short"
         );
-        assert_eq!(
-            decisions["moe_implementation"],
-            "vllm_marlin_moe_device_route_pair_ids"
-        );
+        assert_eq!(decisions["moe_dispatch_preference"], "vllm_marlin_enabled");
         assert!(!decisions.contains_key("moe_graph_policy"));
+        assert!(resolved.runtime_config.entries.iter().all(|entry| {
+            entry.key != "FERRUM_MOE_DEVICE_ROUTE" && entry.key != "FERRUM_MOE_HOST_TOPK"
+        }));
+        assert!(resolved.runtime_config.entries.iter().any(|entry| {
+            entry.key == "FERRUM_VLLM_MOE_PAIR_IDS" && entry.effective_value == "1"
+        }));
         assert_eq!(decisions["decode_graph_policy"], "graph_disabled");
         assert_eq!(decisions["prefix_cache_policy"], "prefix_cache_disabled");
         assert_eq!(decisions["sampling_readback_path"], "gpu_greedy_argmax");
@@ -3780,7 +3758,7 @@ mod tests {
             "serving-default workload must not be the m3 preset"
         );
         assert_eq!(
-            decisions["moe_implementation"], "vllm_marlin_moe_device_route_pair_ids",
+            decisions["moe_dispatch_preference"], "vllm_marlin_enabled",
             "CUDA GPTQ MoE should get the fast vLLM-Marlin path without the m3 preset"
         );
         // The decision is not enough — the model reads FERRUM_VLLM_MOE from the
@@ -4821,7 +4799,7 @@ mod tests {
             "legacy_paged_varlen"
         );
         assert_eq!(decisions["attention_decode_backend"], "legacy_paged_decode");
-        assert_eq!(decisions["moe_implementation"], "legacy_moe");
+        assert_eq!(decisions["moe_dispatch_preference"], "vllm_marlin_disabled");
         assert!(!decisions.contains_key("moe_graph_policy"));
         assert_eq!(decisions["sampling_readback_path"], "logits_readback");
     }

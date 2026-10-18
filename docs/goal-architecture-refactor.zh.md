@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 两批退役清理及 LoRA 隔离修复已合并（PR #429–#431），必需 CI 全过；保留链路通过真实 CPU `run` / `serve`、Metal 定向检查及 CUDA 图重放后的 LoRA 数值回归。当前统一来源绑定：冻结配置、执行器实际来源报告、启动前校验，以及 legacy 加载器的语义/物理配置一致性。原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 两批退役清理、LoRA 隔离与统一来源绑定已合并（PR #429–#432），必需 CI 全过；保留链路通过真实 CPU `run` / `serve`、CUDA 图重放后的 LoRA 数值回归及 Metal/CUDA 的 GGUF 融合 bias 回归。当前清退平行旧 MoE/Candle 路径及专属配置，并修复 SafeTensors 直接投影遗漏 bias。R1 尚未开始；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 

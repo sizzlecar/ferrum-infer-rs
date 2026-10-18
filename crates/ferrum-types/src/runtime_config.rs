@@ -52,6 +52,10 @@ impl RuntimeConfigSnapshot {
             if matches!(
                 entry.key.as_str(),
                 "FERRUM_MOE_GRAPH"
+                    | "FERRUM_MOE_DEVICE_ROUTE"
+                    | "FERRUM_MOE_HOST_TOPK"
+                    | "FERRUM_MOE_FUSED_GATE_UP_SILU"
+                    | "FERRUM_MOE_DIRECT_DISPATCH"
                     | "FERRUM_MOE_BATCHED"
                     | "FERRUM_MOE_BATCHED_DECODE"
                     | "FERRUM_MOE_BATCH_THRESHOLD"
@@ -59,6 +63,13 @@ impl RuntimeConfigSnapshot {
                     | "FERRUM_MOE_PREFILL_THRESHOLD"
                     | "FERRUM_QWEN_UNIFIED_PREFILL"
                     | "FERRUM_QWEN_UNIFIED_TRACE"
+                    | "FERRUM_UNIFIED_GREEDY_ARGMAX"
+                    | "FERRUM_UNIFIED_LAYER_PROF"
+                    | "FERRUM_UNIFIED_LAYER_PROF_EVERY"
+                    | "FERRUM_UNIFIED_LAYER_PROF_MAX_M"
+                    | "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS"
+                    | "FERRUM_VLLM_DECODE_VARLEN"
+                    | "FERRUM_VLLM_VARLEN_TILED_Q4"
             ) {
                 return Err((
                     entry.key.as_str(),

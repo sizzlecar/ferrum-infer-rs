@@ -1257,15 +1257,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 effective_runtime_config.upsert_entry(entry);
             }
         }
-        let entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
-            &source.local_path,
-            &device,
-            &effective_runtime_config,
-            RuntimeConfigSource::Default,
-        );
-        for entry in entries {
-            effective_runtime_config.upsert_entry(entry);
-        }
     }
     let typed_model_capabilities = defined_model
         .as_ref()

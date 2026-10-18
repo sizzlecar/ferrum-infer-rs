@@ -60,4 +60,3 @@ test_data_dir = "./test_data"
 # paged_max_seqs = 32
 # max_batched_tokens = 2048
 # prefix_cache = false
-# moe_graph = true

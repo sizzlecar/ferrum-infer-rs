@@ -588,33 +588,6 @@ fn normalize_model_family(raw: &str) -> String {
     }
 }
 
-/// Correctness fallback for Metal GGUF MoE.
-///
-/// The device-side prefill MoE top-k/bucketing path currently produces
-/// incorrect first-token logits for Qwen3-30B-A3B GGUF on Metal. The host
-/// top-k path is slower, but is the validated product path until the Metal
-/// GPU router is fixed. Keep this scoped to Metal + GGUF + MoE and let an
-/// explicit `FERRUM_MOE_HOST_TOPK` env/config value win for diagnostics.
-pub fn metal_gguf_moe_correctness_entries(
-    snapshot_path: &Path,
-    device: &ferrum_types::Device,
-    current: &RuntimeConfigSnapshot,
-    source: RuntimeConfigSource,
-) -> Vec<RuntimeConfigEntry> {
-    let is_gguf = snapshot_path.is_file()
-        && snapshot_path
-            .extension()
-            .map(|e| e.eq_ignore_ascii_case("gguf"))
-            .unwrap_or(false);
-    if !is_gguf || !device_is_metal(device) || !detect_moe_arch(snapshot_path) {
-        return Vec::new();
-    }
-
-    let mut entries = Vec::new();
-    push_missing_entry(&mut entries, current, "FERRUM_MOE_HOST_TOPK", "1", source);
-    entries
-}
-
 /// Product defaults for `ferrum serve` on GGUF LLMs.
 ///
 /// GGUF paths do not go through the HF-directory autosizer. Without an

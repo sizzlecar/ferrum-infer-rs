@@ -212,7 +212,14 @@ mod tests {
                 ExecutionResourceAuthority::LegacyEngine,
                 ExecutionResourceAuthority::PlanRuntime,
             ] {
-                for key in ["FERRUM_MOE_GRAPH", "FERRUM_MOE_BATCH_THRESHOLD"] {
+                for key in [
+                    "FERRUM_MOE_GRAPH",
+                    "FERRUM_MOE_DEVICE_ROUTE",
+                    "FERRUM_MOE_BATCH_THRESHOLD",
+                    "FERRUM_MOE_HOST_TOPK",
+                    "FERRUM_MOE_FUSED_GATE_UP_SILU",
+                    "FERRUM_MOE_DIRECT_DISPATCH",
+                ] {
                     let error = resolve_config(
                         RuntimeConfigSnapshot::from_env_vars([(key, "0")]),
                         model(),

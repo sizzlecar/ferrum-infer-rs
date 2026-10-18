@@ -1491,8 +1491,8 @@ impl Default for MoeRouteScratch {
 
 /// Bundle of pre-allocated device buffers for the graph-capturable
 /// device-routing path in [`moe_forward_bucketed`]. Pass `Some` to
-/// take the device path (under `FERRUM_MOE_DEVICE_ROUTE=1`); pass
-/// `None` for the legacy host-mediated path (used by tests + the
+/// make the device path available when vLLM MoE is enabled and host routing
+/// is not forced; pass `None` for the host-mediated path (used by tests + the
 /// non-vLLM CUDA bucketed path).
 ///
 /// Buffers are pre-allocated by the caller so per-layer calls do not
@@ -1545,10 +1545,9 @@ pub struct MoeForwardBucketedParams<'a, B: QuantLlmBackend + BackendMoeFused> {
     pub down_packed: &'a mut B::Buffer,
     pub route_scratch: &'a mut MoeRouteScratch,
     pub profile_bucket: bool,
-    // Optional device routing scratch — when Some AND
-    // FERRUM_MOE_DEVICE_ROUTE=1 AND FERRUM_VLLM_MOE=1, runs the
-    // graph-capturable device-routing branch. None / unset = legacy
-    // host-mediated path (used by tests + non-vLLM path).
+    // Caller-owned routing scratch. Some permits the graph-capturable device
+    // route when vLLM MoE is enabled and host routing is not forced; None uses
+    // the host-mediated path (used by tests + the non-vLLM path).
     pub device_route: Option<DeviceRouteScratch<'a, B>>,
 }
 
@@ -1590,8 +1589,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── Device-route fast path (opt-in via FERRUM_MOE_DEVICE_ROUTE=1
-    //     + FERRUM_VLLM_MOE=1 + device_route Some) ────────────────────
+    // ── Device-route fast path (caller provides device_route scratch,
+    //     vLLM MoE enabled, and host routing not forced) ──────────────
     //
     // Skips ALL host round-trips in the routing + bucket-plan stages:
     //   1. B::route_topk_softmax → device expert_ids + weights

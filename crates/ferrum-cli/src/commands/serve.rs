@@ -788,22 +788,6 @@ async fn execute_with_compatibility(
         non_env_runtime_entries =
             RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     }
-    let metal_moe_entries = if vnext_plan_owns_context_capacity {
-        Vec::new()
-    } else {
-        crate::source_resolver::metal_gguf_moe_correctness_entries(
-            &source.local_path,
-            &device,
-            &current_runtime,
-            RuntimeConfigSource::Default,
-        )
-    };
-    if !metal_moe_entries.is_empty() {
-        non_env_runtime_entries.extend(metal_moe_entries.clone());
-        non_env_runtime_entries =
-            RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    }
-
     // Read architecture capabilities for the language engine. For GGUF we skip
     // ConfigManager::load_from_path (which expects HF safetensors layout)
     // and route directly to the continuous-batching LLM engine — the
@@ -1520,7 +1504,6 @@ pub(crate) fn runtime_preset_entries(
     let pairs: &[(&str, &str)] = match preset {
         M3_QWEN3_30B_A3B_INT4_PRESET => &[
             ("FERRUM_BACKEND", "cuda"),
-            ("FERRUM_MOE_DEVICE_ROUTE", "1"),
             ("FERRUM_MOE_STREAMS", "4"),
             ("FERRUM_GREEDY_ARGMAX", "1"),
             ("FERRUM_KV_MAX_BLOCKS", "2048"),
@@ -3682,6 +3665,9 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.key == "FERRUM_MOE_GRAPH"));
+        assert!(!snapshot.entries.iter().any(|entry| {
+            entry.key == "FERRUM_MOE_DEVICE_ROUTE" || entry.key == "FERRUM_MOE_HOST_TOPK"
+        }));
     }
 
     #[test]
