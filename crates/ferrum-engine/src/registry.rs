@@ -865,17 +865,17 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
 /// Builds a [`ModelExecutor`] from a resolved model path. Despite the
 /// historical "candle" name (PR #127 deleted the legacy `CandleBackend`
 /// trait), this factory now produces real `Backend<B>`-based executors
-/// for text LLMs (LlamaFamilyModel / Qwen3MoeModel).
+/// for dense text LLMs and the typed production-family executors.
 ///
 /// The factory dispatches over four axes:
-///   - Dim 1 (architecture): LlamaFamilyModel vs Qwen3MoeModel — runtime
-///     value, decided inside [`build_llm`].
+///   - Dim 1 (architecture): typed family registration or dense Llama-family
+///     configuration, resolved before backend construction.
 ///   - Dim 3 (weight format): safetensors vs GGUF — runtime branch on
 ///     `WeightFormat::detect()` at the top of [`Self::create`].
 ///   - Dim 4 (device): CpuBackend / MetalBackend / CudaBackend — type
 ///     parameter `B`, picked by the `(device, kv_dtype)` cascade below.
 ///   - Dim 5 (kv dtype): KvFp16 / KvInt8 / KvFp8 — type parameter `K`,
-///     same cascade. Only `KvFp16` is wired today.
+///     same cascade; unsupported backend/storage pairs are rejected.
 pub struct LlmExecutorFactory;
 
 /// Loaders without a typed KV selection must not discard a non-default
@@ -965,8 +965,7 @@ fn resolve_llama_layer_stage_config(
         .map(Some)
 }
 
-/// Generic LLM construction helper. Picks the model type (LlamaFamilyModel
-/// or Qwen3MoeModel) by `arch`, opens a `NativeSafetensorsLoader<B>`, and
+/// Dense LLM construction helper. Opens a `NativeSafetensorsLoader<B>` and
 /// returns a `Box<dyn DecoderOnlyLLM>` ready to be wrapped in `LlmExecutor`.
 ///
 /// Generic over both Dim 4 (`B`: hardware backend) and Dim 5 (`K`: KV
@@ -975,9 +974,7 @@ fn resolve_llama_layer_stage_config(
 /// arm to the cascade — this helper already accepts `K` so the callers
 /// don't need to be touched again.
 fn build_llm<B, K>(
-    arch: ferrum_models::Architecture,
     qcfg: ferrum_models::models::LlamaFamilyConfig,
-    moe_cfg: Option<ferrum_models::moe_config::Qwen3MoeConfig>,
     model_path: &str,
     llama_layer_split_plan: Option<crate::layer_split::ParsedLayerSplitPlan>,
     llama_layer_split_pipeline_mode: Option<ferrum_models::models::LlamaPipelineMode>,
@@ -988,73 +985,55 @@ where
     ferrum_models::models::LlamaFamilyModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
     ferrum_models::models::LlamaFamilyPipelineModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
 {
-    if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
-        if llama_layer_split_plan.is_some() {
-            return Err(FerrumError::unsupported(
-                "CUDA layer_split stage loading is wired only for Llama-family dense models; \
-                 Qwen3MoeModel requires a separate MoE stage loader.",
-            ));
-        }
-        let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
-        let mc = moe_cfg.ok_or_else(|| {
-            FerrumError::internal(
-                "Qwen3Moe arch reached build_llm without Qwen3MoeConfig (caller bug)",
-            )
-        })?;
-        Ok(Box::new(
-            ferrum_models::models::Qwen3MoeModel::<B, K>::new_safetensors(mc, &weight_loader)?,
-        ))
-    } else {
-        if llama_layer_split_plan.is_some() && !B::supports_device_ordinal_scope() {
-            return Err(FerrumError::unsupported(
-                "selected_distributed_strategy=layer_split requires a backend with \
-                 device-scoped execution; refusing to silently use the default device",
-            ));
-        }
-        let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
-        if let Some(plan) = llama_layer_split_plan {
-            let stage_configs = plan.to_llama_stage_configs();
-            let stage_device_ordinals = plan
-                .stages
-                .iter()
-                .map(|stage| Some(stage.device))
-                .collect::<Vec<_>>();
-            let mut stages = Vec::with_capacity(stage_configs.len());
-            for (idx, (stage_config, device_ordinal)) in stage_configs
-                .into_iter()
-                .zip(stage_device_ordinals.iter().copied())
-                .enumerate()
-            {
-                tracing::info!(
-                    "Loading Llama layer_split stage {idx} on backend device {:?}",
-                    device_ordinal
-                );
-                let stage = B::with_device_ordinal(device_ordinal, || {
-                    ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage(
-                        qcfg.clone(),
-                        &weight_loader,
-                        stage_config,
-                    )
-                })?;
-                stages.push(stage);
-            }
-            Ok(Box::new(ferrum_models::models::LlamaFamilyPipelineModel::<
-                B,
-                K,
-            >::new_with_placement(
-                stages,
-                ferrum_models::models::LlamaPipelinePlacement::from_backend_device_ordinals(
-                    stage_device_ordinals,
+    if llama_layer_split_plan.is_some() && !B::supports_device_ordinal_scope() {
+        return Err(FerrumError::unsupported(
+            "selected_distributed_strategy=layer_split requires a backend with \
+             device-scoped execution; refusing to silently use the default device",
+        ));
+    }
+    let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
+    if let Some(plan) = llama_layer_split_plan {
+        let stage_configs = plan.to_llama_stage_configs();
+        let stage_device_ordinals = plan
+            .stages
+            .iter()
+            .map(|stage| Some(stage.device))
+            .collect::<Vec<_>>();
+        let mut stages = Vec::with_capacity(stage_configs.len());
+        for (idx, (stage_config, device_ordinal)) in stage_configs
+            .into_iter()
+            .zip(stage_device_ordinals.iter().copied())
+            .enumerate()
+        {
+            tracing::info!(
+                "Loading Llama layer_split stage {idx} on backend device {:?}",
+                device_ordinal
+            );
+            let stage = B::with_device_ordinal(device_ordinal, || {
+                ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage(
+                    qcfg.clone(),
+                    &weight_loader,
+                    stage_config,
                 )
-                .with_pipeline_mode(
-                    llama_layer_split_pipeline_mode.expect("layer split pipeline mode resolved"),
-                ),
-            )?))
-        } else {
-            Ok(Box::new(
-                ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?,
-            ))
+            })?;
+            stages.push(stage);
         }
+        Ok(Box::new(ferrum_models::models::LlamaFamilyPipelineModel::<
+            B,
+            K,
+        >::new_with_placement(
+            stages,
+            ferrum_models::models::LlamaPipelinePlacement::from_backend_device_ordinals(
+                stage_device_ordinals,
+            )
+            .with_pipeline_mode(
+                llama_layer_split_pipeline_mode.expect("layer split pipeline mode resolved"),
+            ),
+        )?))
+    } else {
+        Ok(Box::new(
+            ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?,
+        ))
     }
 }
 
@@ -1732,7 +1711,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             arch @ (ferrum_models::Architecture::Llama
             | ferrum_models::Architecture::Qwen2
             | ferrum_models::Architecture::Qwen3
-            | ferrum_models::Architecture::Qwen3Moe
             | ferrum_models::Architecture::Gemma3
             | ferrum_models::Architecture::Mistral) => {
                 let _loader = ferrum_models::SafeTensorsLoader::new(&model_path);
@@ -1756,59 +1734,26 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // explicitly listed a quantization method.
                 let _ = ferrum_models::loader::QuantizeConfig::from_model_dir(&model_dir_path);
 
-                // Resolve the architecture-specific config in one place.
-                // Qwen3-MoE needs both `LlamaFamilyConfig` (dense attention
-                // shares the Llama path) AND `Qwen3MoeConfig` (router +
-                // experts); other arches only need `LlamaFamilyConfig`.
-                let (qcfg, moe_cfg): (
-                    ferrum_models::models::LlamaFamilyConfig,
-                    Option<ferrum_models::moe_config::Qwen3MoeConfig>,
-                ) = match arch {
-                    ferrum_models::Architecture::Qwen3Moe => {
-                        info!("Loading Qwen3-MoE via Qwen3MoeModel (safetensors GPTQ)");
-                        let mc = ferrum_models::moe_config::Qwen3MoeConfig::from_def(&model_def)?;
-                        // dense attention reuses the Qwen3 dense config —
-                        // build_llm only consumes `qcfg` on the LlamaFamily
-                        // arm, so passing the MoE's `base` is fine.
-                        (mc.base.clone(), Some(mc))
-                    }
+                let qcfg = match arch {
                     ferrum_models::Architecture::Qwen3 => {
                         info!("Loading Qwen3 via LlamaFamilyModel (QK-norm on)");
-                        (
-                            ferrum_models::models::LlamaFamilyConfig::qwen3_from_def(&model_def),
-                            None,
-                        )
+                        ferrum_models::models::LlamaFamilyConfig::qwen3_from_def(&model_def)
                     }
                     ferrum_models::Architecture::Qwen2 => {
                         info!("Loading Qwen2 via LlamaFamilyModel");
-                        (
-                            ferrum_models::models::LlamaFamilyConfig::qwen2_from_def(&model_def),
-                            None,
-                        )
+                        ferrum_models::models::LlamaFamilyConfig::qwen2_from_def(&model_def)
                     }
                     ferrum_models::Architecture::Mistral => {
                         info!("Loading Mistral via LlamaFamilyModel (sliding_window from config)");
-                        (
-                            ferrum_models::models::LlamaFamilyConfig::mistral_from_def(&model_def),
-                            None,
-                        )
+                        ferrum_models::models::LlamaFamilyConfig::mistral_from_def(&model_def)
                     }
                     ferrum_models::Architecture::Gemma3 => {
-                        info!(
-                            "Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, \
-                             sandwich norms)"
-                        );
-                        (
-                            ferrum_models::models::LlamaFamilyConfig::gemma3_from_def(&model_def),
-                            None,
-                        )
+                        info!("Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)");
+                        ferrum_models::models::LlamaFamilyConfig::gemma3_from_def(&model_def)
                     }
                     _ => {
                         info!("Loading Llama via LlamaFamilyModel");
-                        (
-                            ferrum_models::models::LlamaFamilyConfig::llama_from_def(&model_def),
-                            None,
-                        )
+                        ferrum_models::models::LlamaFamilyConfig::llama_from_def(&model_def)
                     }
                 };
 
@@ -1836,9 +1781,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         (Device::CPU, KvCacheDtype::Fp16) => {
                             info!("  Backend: CPU, KV: fp16");
                             build_llm::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(
-                                arch,
                                 qcfg,
-                                moe_cfg,
                                 &model_path,
                                 llama_layer_split_plan,
                                 llama_layer_split_pipeline_mode,
@@ -1859,9 +1802,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     .unwrap_or("f32");
                                 info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
-                                    arch,
                                     qcfg,
-                                    moe_cfg,
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
@@ -1879,9 +1820,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             {
                                 info!("  Backend: CUDA, KV: fp16");
                                 build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvFp16>(
-                                    arch,
                                     qcfg,
-                                    moe_cfg,
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
@@ -1897,24 +1836,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         (Device::CUDA(_), KvCacheDtype::Int8) => {
                             #[cfg(feature = "cuda")]
                             {
-                                // Dim 5 PR C: only CudaBackend implements
-                                // BackendInt8KvOps with real launchers; LlamaFamilyModel<B, KvInt8>
-                                // uses LayerKvCache::Int8 + paged INT8 KV. Qwen3-MoE
-                                // INT8 KV is a follow-up — reject here so users
-                                // see a clear error instead of a panic at
-                                // alloc_paged_int8_layer time.
-                                if matches!(arch, ferrum_models::Architecture::Qwen3Moe) {
-                                    return Err(FerrumError::unsupported(
-                                        "INT8 KV cache is not yet wired through Qwen3MoeModel \
-                                     (LlamaFamilyModel-only in PR C). Use --kv-dtype fp16 \
-                                     for MoE models or wait for the follow-up PR.",
-                                    ));
-                                }
+                                // The CUDA backend provides paged INT8 KV for dense models.
                                 info!("  Backend: CUDA, KV: int8 (paged, vLLM-style)");
                                 build_llm::<ferrum_kernels::backend::cuda::CudaBackend, KvInt8>(
-                                    arch,
                                     qcfg,
-                                    moe_cfg,
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
@@ -1951,7 +1876,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         ComponentMetadata {
             name: "llm".to_string(),
             version: "0.2.0".to_string(),
-            description: "LLM executor (LlamaFamily / Qwen3MoE via Backend<B>)".to_string(),
+            description: "LLM executor (typed production families and Backend<B> dense models)"
+                .to_string(),
             supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec![
                 "llama".to_string(),
@@ -3391,9 +3317,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let err = match build_llm::<ferrum_kernels::backend::cpu::CpuBackend, KvFp16>(
-            ferrum_models::Architecture::Llama,
             qcfg,
-            None,
             "/missing/model/path",
             Some(plan),
             Some(ferrum_models::models::LlamaPipelineMode::Overlapped),

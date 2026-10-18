@@ -16,14 +16,12 @@ pub mod deltanet_s1;
 pub mod executor;
 pub mod gguf_config;
 pub mod gguf_engine_loader;
-pub mod gguf_runtime;
 pub mod hf_download;
 pub mod legacy_capabilities;
 pub mod loader;
 pub mod lora;
 pub mod models;
 pub mod moe;
-pub mod moe_config;
 pub mod qwen35_config;
 #[cfg(any(test, feature = "test-support"))]
 pub mod qwen35_s1;

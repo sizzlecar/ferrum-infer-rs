@@ -375,10 +375,6 @@ pub fn tokenizer_sibling_repo(gguf_repo: &str) -> Option<String> {
 ///   - `FERRUM_PAGED_MAX_SEQS=2` dense / `1` MoE, `FERRUM_MAX_BATCH=1` — single-user REPL.
 ///     Keeps the paged pool at ~1.7 GB for `cap=8192` dense; without this
 ///     cap the default `max_seqs=32` makes the pool ~30 GB on a 32 GB Mac.
-///   - `FERRUM_MOE_BATCHED=0`, `FERRUM_MOE_BATCHED_DECODE=0`,
-///     `FERRUM_MOE_BATCH_THRESHOLD=2` — MoE only. `run` is an interactive
-///     single-session path, so do not engage unneeded multi-sequence MoE
-///     batching.
 ///
 /// Idempotent: if a user explicitly sets one of these env vars before
 /// invoking `ferrum run`, that value wins (we only set when unset).
@@ -452,15 +448,6 @@ fn chat_profile_runtime_entries_for_arch(
         for (k, v) in [
             ("FERRUM_PAGED_MAX_SEQS", if is_moe { "1" } else { "2" }),
             ("FERRUM_MAX_BATCH", "1"),
-        ] {
-            push_missing_entry(&mut entries, current, k, v, source);
-        }
-    }
-    if is_moe {
-        for (k, v) in [
-            ("FERRUM_MOE_BATCHED", "0"),
-            ("FERRUM_MOE_BATCHED_DECODE", "0"),
-            ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
         ] {
             push_missing_entry(&mut entries, current, k, v, source);
         }
@@ -601,33 +588,6 @@ fn normalize_model_family(raw: &str) -> String {
     }
 }
 
-/// Correctness fallback for Metal GGUF MoE.
-///
-/// The device-side prefill MoE top-k/bucketing path currently produces
-/// incorrect first-token logits for Qwen3-30B-A3B GGUF on Metal. The host
-/// top-k path is slower, but is the validated product path until the Metal
-/// GPU router is fixed. Keep this scoped to Metal + GGUF + MoE and let an
-/// explicit `FERRUM_MOE_HOST_TOPK` env/config value win for diagnostics.
-pub fn metal_gguf_moe_correctness_entries(
-    snapshot_path: &Path,
-    device: &ferrum_types::Device,
-    current: &RuntimeConfigSnapshot,
-    source: RuntimeConfigSource,
-) -> Vec<RuntimeConfigEntry> {
-    let is_gguf = snapshot_path.is_file()
-        && snapshot_path
-            .extension()
-            .map(|e| e.eq_ignore_ascii_case("gguf"))
-            .unwrap_or(false);
-    if !is_gguf || !device_is_metal(device) || !detect_moe_arch(snapshot_path) {
-        return Vec::new();
-    }
-
-    let mut entries = Vec::new();
-    push_missing_entry(&mut entries, current, "FERRUM_MOE_HOST_TOPK", "1", source);
-    entries
-}
-
 /// Product defaults for `ferrum serve` on GGUF LLMs.
 ///
 /// GGUF paths do not go through the HF-directory autosizer. Without an
@@ -729,14 +689,13 @@ pub fn serve_profile_runtime_entries_for_arch(
         push_missing_entry(&mut entries, current, k, v, source);
     }
     if is_moe {
-        for (k, v) in [
-            ("FERRUM_MAX_BATCHED_TOKENS", "2048"),
-            ("FERRUM_MOE_BATCHED", "1"),
-            ("FERRUM_MOE_BATCHED_DECODE", "1"),
-            ("FERRUM_MOE_BATCH_THRESHOLD", "2"),
-        ] {
-            push_missing_entry(&mut entries, current, k, v, source);
-        }
+        push_missing_entry(
+            &mut entries,
+            current,
+            "FERRUM_MAX_BATCHED_TOKENS",
+            "2048",
+            source,
+        );
     }
     entries
 }
@@ -2658,11 +2617,8 @@ mod tests {
         );
         assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
-        assert_eq!(
-            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
-            Some("1")
-        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED_DECODE"), None);
     }
 
     #[test]
@@ -2691,11 +2647,8 @@ mod tests {
         );
         assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
-        assert_eq!(
-            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
-            Some("1")
-        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED_DECODE"), None);
     }
 
     #[test]
@@ -2915,15 +2868,9 @@ mod tests {
             Some("1")
         );
         assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
-        assert_eq!(
-            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
-            Some("0")
-        );
-        assert_eq!(
-            value(&entries, "FERRUM_MOE_BATCH_THRESHOLD").as_deref(),
-            Some("2")
-        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED_DECODE"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCH_THRESHOLD"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2946,7 +2893,7 @@ mod tests {
             value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
             Some("4096")
         );
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2973,11 +2920,8 @@ mod tests {
             Some("0")
         );
         assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("0"));
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
-        assert_eq!(
-            value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
-            Some("0")
-        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED_DECODE"), None);
     }
 
     #[test]
@@ -2988,13 +2932,13 @@ mod tests {
         );
         let current = RuntimeConfigSnapshot::from_entries([
             RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1234", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new("FERRUM_MOE_BATCH_THRESHOLD", "7", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "7", RuntimeConfigSource::Env),
         ]);
         let entries = chat_profile_runtime_entries(&dir, &current, RuntimeConfigSource::Default);
 
         assert_eq!(value(&entries, "FERRUM_KV_CAPACITY"), None);
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCH_THRESHOLD"), None);
-        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
+        assert_eq!(value(&entries, "FERRUM_PAGED_MAX_SEQS"), None);
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

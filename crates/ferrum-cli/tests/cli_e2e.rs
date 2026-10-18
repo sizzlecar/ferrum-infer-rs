@@ -161,6 +161,26 @@ fn retired_modal_commands_and_options_are_rejected() {
 }
 
 #[test]
+fn retired_runtime_config_is_rejected_before_run_or_serve() {
+    let workspace = TempDirGuard::new("retired-runtime-config");
+    for (key, value) in [("moe_graph", "false"), ("moe_batch_threshold", "4")] {
+        write_file(
+            &workspace.path().join("ferrum.toml"),
+            format!("[runtime]\n{key} = {value}\n").as_bytes(),
+        );
+        for command in ["run", "serve"] {
+            let output = run(base_cmd(workspace.path()).arg(command));
+            assert!(!output.status.success(), "{command} must reject {key}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("unknown field") && stderr.contains(key),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn list_reports_empty_cache() {
     let workspace = TempDirGuard::new("list-empty");
     let hf_home = workspace.path().join("hf-cache");

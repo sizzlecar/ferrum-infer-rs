@@ -1190,8 +1190,7 @@ impl BackendPagedKv for CudaBackend {
             );
         }
 
-        // q_len > 1: prefill. Only single-seq is exercised — the only
-        // caller (Qwen3MoeModel::forward_layer) always passes num_seqs=1.
+        // q_len > 1: this prefill wrapper accepts one sequence per call.
         if num_seqs != 1 {
             return Err(FerrumError::model(format!(
                 "paged_decode_attention(CUDA): q_len={q_len} num_seqs={num_seqs} \
@@ -1230,18 +1229,10 @@ impl BackendPagedKv for CudaBackend {
         let mut pos_offsets_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
         <Self as Backend>::write_typed::<u32>(ctx, &mut pos_offsets_buf, &[pos_offset]);
 
-        // The caller's q buffer (despite being named `q_head_major` in
-        // Qwen3MoeModel) is ALREADY token-major in paged mode: the
-        // paged-write kernel split_qkv_norm_rope_into_paged_cache_f16
-        // writes `q_out[tok, head, hd]` (see kernel comment at
-        // kernels/split_qkv_norm_rope_into_paged_cache.cu:102). So
-        // paged_varlen_attention can read q directly. No Q transpose.
-        //
-        // Output, however, is written by paged_varlen as
-        // `[M_total, num_q_heads, head_dim]` token-major (kernel:16),
-        // while Qwen3MoeModel's downstream code does
-        // `transpose_head_to_token(attn_head_major_out → attn_flat)`,
-        // expecting head-major. We transpose token→head into `out`.
+        // The paged-write kernel produces q_out[token, head, dim], which
+        // paged_varlen_attention reads directly. Its output is also
+        // token-major; this wrapper's output contract is head-major, so
+        // transpose token→head into `out` after attention completes.
         let q_n = q_len * num_heads * head_dim;
 
         // Lazy-grow the cached token-major output scratch. Stable

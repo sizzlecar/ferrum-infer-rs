@@ -36,7 +36,6 @@ tokenizers = { workspace = true }
 # ML Framework - Candle
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 safetensors = { workspace = true }
 memmap2 = "0.9"

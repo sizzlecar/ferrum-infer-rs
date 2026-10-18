@@ -3424,7 +3424,7 @@ impl Backend for CudaBackend {
 
     /// Inverse of `transpose_head_to_token`. Used by the CUDA paged
     /// attention wrapper to convert paged_varlen_attention's token-major
-    /// output back to the head-major buffer Qwen3MoeModel expects.
+    /// output back to the wrapper's head-major buffer.
     fn transpose_token_to_head(
         ctx: &mut Self::Context,
         src: &Self::Buffer,

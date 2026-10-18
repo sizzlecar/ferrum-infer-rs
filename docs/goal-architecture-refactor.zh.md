@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 两批退役清理及 LoRA 隔离修复已合并（PR #429–#431），必需 CI 全过；保留链路通过真实 CPU `run` / `serve`、Metal 定向检查及 CUDA 图重放后的 LoRA 数值回归。当前统一来源绑定：冻结配置、执行器实际来源报告、启动前校验，以及 legacy 加载器的语义/物理配置一致性。原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 两批退役清理、LoRA 隔离与统一来源绑定已合并（PR #429–#432），必需 CI 全过；保留链路通过真实 CPU `run` / `serve`、CUDA 图重放后的 LoRA 数值回归及 Metal/CUDA 的 GGUF 融合 bias 回归。当前清退平行旧 MoE/Candle 路径及专属配置，并修复 SafeTensors 直接投影遗漏 bias。R1 尚未开始；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -40,6 +40,8 @@ R0 两批退役清理及 LoRA 隔离修复已合并（PR #429–#431），必需
 仓内未找到调用方不能证明公开 API 无外部使用。清退这些旧 API 时明确破坏性变化或受支持替代入口；Qwen3-MoE 还须统一语义来源与权重目录配置的身份/架构判断，不能只修一处 GGUF 分流就认定全部入口已关闭。退役旧构造器不删除通用 custom executor 扩展能力，有效的缓存/释放/回退测试迁至保留路径。现有 layer-split 接线属于保护范围，代码存在本身不构成多 GPU 性能或正确性验收。
 
 来源 API 迁移：移除 `LlmExecutor::new_with_vnext_model`、`vnext_model`、`vnext_family` 的未接线计划标签；实际使用产品来源的 legacy 构造器改用 `new_with_model_sources`，保留无来源的 `new`。配置了产品来源的自定义 executor 须通过 `bound_resolved_sources` 报告其实际来源；typed 实现还校验真实 plan。此报告是可信实现的组装一致性合同，不是执行授权或全部文件的原子快照。
+
+MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 和独立 `GgufRuntime`；通过产品来源注册入口使用保留的 typed MoE。旧 CPU MoE 整模型路径随之退役，CPU 路由/dispatch 数值参考不代表 typed CPU MoE 可运行。旧 MoE graph/batch 专属选项明确拒绝；`[runtime]` 未知字段及已有 `ferrum.toml` 的读取/解析错误会报错，缺少配置文件仍使用默认值。
 
 扩展点限于任务能力声明、可组合的注册/装配边界，以及未来按任务定义独立请求/结果的空间；**不新建无人使用的 Embed/ASR/TTS 引擎、空实现或插件框架来替代删除。** Candle、量化加载、通用算子等仍被文本 LLM 使用的依赖继续保留；独立 CLIP 处理链和未支持的聊天视觉输入不是同一件事，不能删掉主线已有的能力限制校验。
 

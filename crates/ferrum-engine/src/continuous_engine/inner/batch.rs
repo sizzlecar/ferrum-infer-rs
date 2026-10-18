@@ -26,16 +26,6 @@ impl EngineInner {
         if self.spec_config.is_some() {
             return self.process_batch_legacy_split(batch).await;
         }
-        let info = self.model_executor.info();
-        let is_qwen3_moe = info
-            .metadata
-            .get("ferrum_arch")
-            .and_then(|value| value.as_str())
-            == Some("qwen3moe");
-        let backend_lacks_native_unified = !self.model_executor.supports_native_unified_decode();
-        if is_qwen3_moe && backend_lacks_native_unified {
-            return self.process_batch_legacy_split(batch).await;
-        }
         self.process_batch_unified(batch).await
     }
 
@@ -295,11 +285,11 @@ impl EngineInner {
     /// get [last_token] at pos_offset=current_kv_len), then a single
     /// `model_executor.unified_decode` call drives the entire forward.
     ///
-    /// When the model's `unified_forward` returns Unsupported (Qwen3Moe
-    /// today, until Phase 2 native), `LlmExecutor.unified_decode`'s fallback
+    /// When the model's `unified_forward` returns Unsupported,
+    /// `LlmExecutor.unified_decode`'s fallback
     /// partitions the batch by item shape and serializes prefills under one
-    /// model lock — behavior-preserving but no perf gain. Llama already
-    /// supports unified_forward, so M2 immediately co-batches prefill+decode.
+    /// model lock. Models with native unified forward can co-batch
+    /// prefill and decode work.
     async fn process_batch_unified(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
         use ferrum_interfaces::model_executor::{
             LogitsReturnPolicy, UnifiedBatch, UnifiedBatchItem,

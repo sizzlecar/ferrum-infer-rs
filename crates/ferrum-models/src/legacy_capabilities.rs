@@ -83,7 +83,6 @@ fn from_definition_with_weight_bytes_inner(
             .or_else(|| estimated_weight_bytes_from_definition(definition)),
         recurrent_state_bytes_per_sequence: None,
         supported_dtypes: vec!["fp16".to_owned(), "fp32".to_owned()],
-        graph_safe_moe: false,
     }
 }
 

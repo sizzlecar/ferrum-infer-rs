@@ -233,6 +233,34 @@ fn unsupported_architectures_are_rejected_before_dimensions_or_weights() {
 }
 
 #[test]
+fn moe_gguf_requires_typed_sources_before_dimensions_or_weights() {
+    for arch in ["qwen3moe", "mixtral", "deepseek2"] {
+        let tmp = build_metadata_gguf(arch, &[], 1, 1);
+        let gguf = GgufFile::open(tmp.path()).unwrap();
+        let error = LlamaFamilyConfig::from_gguf(&gguf).unwrap_err();
+        assert!(matches!(error, FerrumError::Unsupported { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(arch) && message.contains("typed semantic"),
+            "{message}"
+        );
+    }
+
+    // A valid container without runnable tensors must fail before backend
+    // creation or a weight lookup, including on a CPU-only test host.
+    let tmp = build_metadata_gguf("qwen3moe", &[], 1, 1);
+    for device in [ferrum_types::Device::CPU, ferrum_types::Device::CUDA(0)] {
+        let error = load_gguf_decoder(tmp.path(), &device).err().unwrap();
+        assert!(matches!(error, FerrumError::Unsupported { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("qwen3moe") && message.contains("typed semantic"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
 fn supported_dense_architectures_keep_metadata_parsing() {
     for arch in ["qwen", "qwen2", "qwen3", "llama", "mistral", "gemma3"] {
         let metadata = [

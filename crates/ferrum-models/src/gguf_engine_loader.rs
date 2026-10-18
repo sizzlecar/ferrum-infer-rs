@@ -17,8 +17,6 @@ use crate::common::DecoderOnlyLLM;
 use crate::definition::{ConfigManager, ModelDefinition};
 use crate::gguf_config::{validate_dense_gguf_architecture, validate_dense_gguf_sources};
 use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
-use crate::models::Qwen3MoeModel;
-use crate::moe_config::Qwen3MoeConfig;
 use crate::vnext::{ProductionModelSourceBundle, ProductionWeightArtifact};
 
 /// Returns `true` if the path looks like a GGUF model (ends in `.gguf`
@@ -96,21 +94,19 @@ fn strip_quant_suffix(stem: &str) -> &str {
 }
 
 /// Load a GGUF model file as a `Box<dyn DecoderOnlyLLM>` ready for
-/// `LlmExecutor` / `ContinuousBatchEngine`. Auto-detects MoE
-/// (qwen3moe) vs dense (qwen3 / qwen2 / llama / mistral) from the
-/// GGUF metadata.
+/// `LlmExecutor` / `ContinuousBatchEngine`. This entrypoint accepts the
+/// supported dense Llama-family architectures. Migrated families require
+/// typed semantic and tokenizer sources through the production registry.
 ///
 /// `device` selects the backend:
-///   - [`Device::CPU`] → `LlamaFamilyModel<CpuBackend>` / `Qwen3MoeModel<CpuBackend>`
+///   - [`Device::CPU`] → `LlamaFamilyModel<CpuBackend>`.
 ///   - [`Device::Metal`] → same on `MetalBackend` (also registers the
 ///     mmap with the Metal weight cache so subsequent `B::load_quant*`
 ///     calls wrap weights as zero-copy `MTLBuffer`s — see
 ///     `register_gguf_mmap` in ferrum-kernels).
 ///
-/// CUDA is not currently wired here — the GGUF Q4_K_M decode path on
-/// CUDA still goes through candle's `quantized_*` modules in
-/// `gguf_runtime.rs`. Add a CUDA branch below when we have native
-/// CUDA Q4_K_M kernels in `ferrum-kernels`.
+/// CUDA GGUF execution uses the production registry rather than this
+/// lower-level decoder constructor.
 pub fn load_gguf_decoder(gguf_path: &Path, device: &Device) -> Result<Box<dyn DecoderOnlyLLM>> {
     let (llm, _info) = load_gguf_decoder_with_info(
         gguf_path,
@@ -167,34 +163,25 @@ fn load_open_gguf_decoder_with_info(
     // `mistral3` (YaRN-from-GGUF + attention temperature scaling) loads
     // "successfully" that way and then generates pure garbage — a loud
     // error beats degraded output.
-    let is_moe = arch == "qwen3moe";
-    if !is_moe {
-        validate_dense_gguf_architecture(&arch)?;
+    if crate::vnext::gguf_architecture_requires_typed_product_sources(&arch) {
+        return Err(FerrumError::unsupported(format!(
+            "GGUF architecture '{arch}' requires typed semantic and tokenizer sources through the production model registry"
+        )));
     }
+    validate_dense_gguf_architecture(&arch)?;
 
     let dense_cfg = if let Some(definition) = semantic {
-        Some(validate_dense_gguf_sources(&gguf, definition)?)
-    } else if is_moe {
-        None
+        validate_dense_gguf_sources(&gguf, definition)?
     } else {
-        Some(LlamaFamilyConfig::from_gguf(&gguf)?)
-    };
-    let moe_cfg = if is_moe {
-        Some(Qwen3MoeConfig::from_gguf(&gguf)?)
-    } else {
-        None
+        LlamaFamilyConfig::from_gguf(&gguf)?
     };
 
     // Build a ModelInfo for the engine's LlmExecutor. The fields here drive
     // memory estimation + OpenAI /v1/models responses; the inference hot path
     // doesn't read them.
-    let base_cfg = if let Some(c) = dense_cfg.as_ref() {
-        c.clone()
-    } else {
-        moe_cfg.as_ref().unwrap().base.clone()
-    };
+    let base_cfg = &dense_cfg;
     let model_type = match arch.as_str() {
-        "qwen3" | "qwen3moe" | "qwen2" | "qwen" => ModelType::Qwen,
+        "qwen3" | "qwen2" | "qwen" => ModelType::Qwen,
         "llama" => ModelType::Llama,
         "mistral" => ModelType::Mistral,
         other => ModelType::Custom(other.to_string()),
@@ -224,14 +211,8 @@ fn load_open_gguf_decoder_with_info(
         Device::CPU => {
             use ferrum_kernels::backend::cpu::CpuBackend;
             let loader = GgufLoader::<CpuBackend>::from_file(gguf_arc.clone());
-            if let Some(mc) = moe_cfg {
-                let model = Qwen3MoeModel::<CpuBackend>::new(mc, &loader, &gguf_arc)?;
-                Box::new(model)
-            } else {
-                let dc = dense_cfg.unwrap();
-                let model = LlamaFamilyModel::<CpuBackend>::new(dc, &loader)?;
-                Box::new(model)
-            }
+            let model = LlamaFamilyModel::<CpuBackend>::new(dense_cfg, &loader)?;
+            Box::new(model)
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         Device::Metal => {
@@ -247,18 +228,11 @@ fn load_open_gguf_decoder_with_info(
                 )
                 .map_err(|e| FerrumError::model(format!("register_gguf_mmap: {e}")))?;
                 let loader = GgufLoader::<MetalBackend>::from_file(gguf_arc.clone());
-                let model: Box<dyn DecoderOnlyLLM> = if let Some(mc) = moe_cfg {
-                    let model = Qwen3MoeModel::<MetalBackend>::new(mc, &loader, &gguf_arc)?;
-                    Box::new(model)
-                } else {
-                    let dc = dense_cfg.unwrap();
-                    let model = LlamaFamilyModel::<MetalBackend>::new(dc, &loader)?;
-                    Box::new(model)
-                };
+                let model = LlamaFamilyModel::<MetalBackend>::new(dense_cfg, &loader)?;
                 mmap_registration
                     .commit_residency()
                     .map_err(|e| FerrumError::model(format!("commit_gguf_mmap_residency: {e}")))?;
-                model
+                Box::new(model)
             }
             #[cfg(not(feature = "metal"))]
             {
@@ -269,9 +243,8 @@ fn load_open_gguf_decoder_with_info(
         }
         Device::CUDA(_) => {
             return Err(FerrumError::unsupported(
-                "GGUF decoder loading on CUDA is not yet wired through the engine — \
-                 use --features cuda with the safetensors path, or fall back to \
-                 `ferrum run <path.gguf>` which uses candle's quantized_* modules.",
+                "CUDA GGUF execution requires the production model registry; \
+                 this lower-level decoder constructor supports CPU and Metal",
             ));
         }
         other => {

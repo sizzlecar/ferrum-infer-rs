@@ -12,7 +12,7 @@
 //! unchanged regardless of source format.
 //!
 //! The dense constructor accepts only the architectures implemented by the
-//! Llama-family runtime. MoE metadata uses its separate config constructor.
+//! Llama-family runtime. MoE families require their typed production definition.
 //!
 //! Architecture-specific notes:
 //!   - **qwen3**: has QK-norm by convention; rope_theta default 1e6.
@@ -28,11 +28,10 @@ use crate::definition::ModelDefinition;
 use crate::models::llama_family::{
     llama_layer_attention_schedule, LlamaFamilyConfig, RopeScalingConfig,
 };
-use crate::moe_config::Qwen3MoeConfig;
 use crate::registry::Architecture;
 
 /// Architectures that are known MoE — `LlamaFamilyConfig::from_gguf` rejects
-/// them with a pointer to the appropriate MoE constructor rather than
+/// them with a pointer to typed production sources rather than
 /// silently lowering them to a dense config.
 const KNOWN_MOE_ARCHS: &[&str] = &["qwen3moe", "mixtral", "deepseek2"];
 
@@ -382,9 +381,8 @@ impl LlamaFamilyConfig {
     ///
     /// Errors if `general.architecture` is missing or unrecognised, if
     /// any required architecture-scoped key is absent, or if the GGUF
-    /// is a known MoE variant — those go through
-    /// [`Qwen3MoeConfig::from_gguf`] instead so the MoE-specific
-    /// hyperparameters aren't silently dropped.
+    /// is a known MoE variant. Those require typed semantic and tokenizer
+    /// sources through the production registry so expert routing is preserved.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let arch = gguf
             .architecture()
@@ -392,8 +390,8 @@ impl LlamaFamilyConfig {
             .to_string();
 
         if KNOWN_MOE_ARCHS.contains(&arch.as_str()) {
-            return Err(FerrumError::model(format!(
-                "GGUF arch '{arch}' is MoE — use Qwen3MoeConfig::from_gguf or the matching MoE config builder, not LlamaFamilyConfig::from_gguf"
+            return Err(FerrumError::unsupported(format!(
+                "GGUF arch '{arch}' is MoE and requires typed semantic and tokenizer sources through a supported production model registry; it cannot use the dense Llama-family config"
             )));
         }
         validate_dense_gguf_architecture(&arch)?;
@@ -517,118 +515,6 @@ impl LlamaFamilyConfig {
         }
 
         Ok(cfg)
-    }
-}
-
-impl Qwen3MoeConfig {
-    /// Parse a `Qwen3MoeConfig` out of a GGUF file's metadata.
-    ///
-    /// Expects `general.architecture == "qwen3moe"`. Reads the dense fields
-    /// from the `qwen3moe.*` namespace (same shape as `LlamaFamilyConfig`)
-    /// plus the MoE-specific extras. Falls back to sane defaults for
-    /// missing optional fields, matching `LlamaFamilyConfig::from_gguf`.
-    ///
-    /// Qwen3-MoE uses **QK-norm** like dense Qwen3 — that flag is set
-    /// regardless of how `LlamaFamilyConfig::from_gguf` would treat the
-    /// arch, because the dense path explicitly excludes MoE archs.
-    pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
-        let arch = gguf
-            .architecture()
-            .map_err(|e| FerrumError::model(format!("read general.architecture: {e}")))?
-            .to_string();
-        if arch != "qwen3moe" {
-            return Err(FerrumError::model(format!(
-                "Qwen3MoeConfig::from_gguf: expected arch 'qwen3moe', got '{arch}'"
-            )));
-        }
-
-        // Reuse the same key conventions as the dense path — qwen3moe.*
-        // mirrors qwen3.* exactly for the shared transformer dims.
-        let num_layers = read_u32(gguf, "qwen3moe.block_count")? as usize;
-        let hidden_size = read_u32(gguf, "qwen3moe.embedding_length")? as usize;
-        let num_heads = read_u32(gguf, "qwen3moe.attention.head_count")? as usize;
-        let num_kv_heads = match read_u32(gguf, "qwen3moe.attention.head_count_kv") {
-            Ok(v) => v as usize,
-            Err(_) => num_heads,
-        };
-        let rms_norm_eps = read_f32(gguf, "qwen3moe.attention.layer_norm_rms_epsilon")?;
-        let max_seq_len = read_u32(gguf, "qwen3moe.context_length")
-            .map(|v| v as usize)
-            .unwrap_or(32768);
-        let rope_theta = read_f32(gguf, "qwen3moe.rope.freq_base")
-            .map(|v| v as f64)
-            .unwrap_or(1_000_000.0);
-        let vocab_size = match read_u32(gguf, "qwen3moe.vocab_size") {
-            Ok(v) => v as usize,
-            Err(_) => infer_vocab_from_embed(gguf)?,
-        };
-
-        // See LlamaFamilyConfig::from_gguf for the rationale: prefer the
-        // explicit `qwen3moe.attention.key_length` GGUF key. For
-        // Qwen3-30B-A3B specifically, hidden=2048 but head_dim=128
-        // (num_heads*head_dim=4096 ≠ hidden), so the shortcut divide
-        // gives 64 → wrong q_dim → garbage attention output.
-        let head_dim = match read_u32(gguf, "qwen3moe.attention.key_length") {
-            Ok(v) => v as usize,
-            Err(_) => {
-                if num_heads == 0 || hidden_size % num_heads != 0 {
-                    return Err(FerrumError::model(format!(
-                        "GGUF Qwen3-MoE: head_dim missing AND hidden_size {hidden_size} not divisible by num_heads {num_heads}"
-                    )));
-                }
-                hidden_size / num_heads
-            }
-        };
-
-        // MoE-specific keys.
-        let num_experts = read_u32(gguf, "qwen3moe.expert_count")? as usize;
-        let num_experts_per_tok = read_u32(gguf, "qwen3moe.expert_used_count")? as usize;
-        // Per-expert FFN length — distinct from the legacy `feed_forward_length`
-        // (which most qwen3moe GGUFs leave as the dense reference value).
-        let expert_intermediate_size =
-            read_u32(gguf, "qwen3moe.expert_feed_forward_length")? as usize;
-        // Whether the router normalises the top-K logits before combining.
-        // Qwen3-MoE: yes. Some legacy GGUFs omit this key.
-        let norm_topk_prob = match gguf.metadata_bool("qwen3moe.expert_norm_topk_prob") {
-            Ok(v) => v,
-            Err(_) => true,
-        };
-
-        if num_experts_per_tok == 0 || num_experts_per_tok > num_experts {
-            return Err(FerrumError::model(format!(
-                "GGUF Qwen3-MoE: invalid expert_used_count {num_experts_per_tok} (num_experts={num_experts})"
-            )));
-        }
-
-        let base = LlamaFamilyConfig {
-            hidden_size,
-            // Qwen3-MoE has no shared dense FFN; mirror expert size into
-            // base for any code that reads `intermediate_size`.
-            intermediate_size: expert_intermediate_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_layers,
-            vocab_size,
-            max_seq_len,
-            rms_norm_eps,
-            rope_theta,
-            rope_scaling: None,
-            rope_interleaved: false,
-            // Qwen3-MoE uses QK-norm exactly like dense Qwen3.
-            has_qk_norm: true,
-            // No sliding window in Qwen3-MoE.
-            sliding_window: 0,
-            ..Default::default()
-        };
-
-        Ok(Self::from_base(
-            base,
-            num_experts,
-            num_experts_per_tok,
-            expert_intermediate_size,
-            norm_topk_prob,
-        ))
     }
 }
 

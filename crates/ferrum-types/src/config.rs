@@ -813,6 +813,9 @@ impl EngineConfig {
         &mut self,
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
+        snapshot
+            .validate_retired_options()
+            .map_err(|(key, reason)| format!("{key}: {reason}"))?;
         self.scheduler.apply_runtime_config_snapshot(snapshot)?;
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFILL_DECODE_EXECUTION") {
             self.batching.prefill_decode_execution =
@@ -1949,6 +1952,51 @@ impl Default for BatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+
+    #[test]
+    fn retired_legacy_moe_controls_reject_before_mutating_engine_config() {
+        for key in [
+            "FERRUM_MOE_GRAPH",
+            "FERRUM_MOE_DEVICE_ROUTE",
+            "FERRUM_MOE_HOST_TOPK",
+            "FERRUM_MOE_FUSED_GATE_UP_SILU",
+            "FERRUM_MOE_DIRECT_DISPATCH",
+            "FERRUM_MOE_BATCHED",
+            "FERRUM_MOE_BATCHED_DECODE",
+            "FERRUM_MOE_BATCH_THRESHOLD",
+            "FERRUM_MOE_BUCKETED",
+            "FERRUM_MOE_PREFILL_THRESHOLD",
+            "FERRUM_QWEN_UNIFIED_PREFILL",
+            "FERRUM_QWEN_UNIFIED_TRACE",
+            "FERRUM_UNIFIED_GREEDY_ARGMAX",
+            "FERRUM_UNIFIED_LAYER_PROF",
+            "FERRUM_UNIFIED_LAYER_PROF_EVERY",
+            "FERRUM_UNIFIED_LAYER_PROF_MAX_M",
+            "FERRUM_UNIFIED_LAYER_PROF_MIN_SEQS",
+            "FERRUM_VLLM_DECODE_VARLEN",
+            "FERRUM_VLLM_VARLEN_TILED_Q4",
+        ] {
+            for source in [RuntimeConfigSource::Env, RuntimeConfigSource::ConfigFile] {
+                let mut config = EngineConfig::default();
+                let before = serde_json::to_value(&config).unwrap();
+                let snapshot = RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1024", source),
+                    RuntimeConfigEntry::new(key, "0", source),
+                ]);
+                let error = config.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+                assert!(error.contains(key) && error.contains("retired"), "{error}");
+                assert_eq!(serde_json::to_value(&config).unwrap(), before);
+            }
+        }
+        EngineConfig::default()
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_VLLM_MOE", "1"),
+                ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
+                ("FERRUM_MOE_HOST_ROUTE", "0"),
+            ]))
+            .unwrap();
+    }
 
     #[test]
     fn sampling_readback_defaults_to_uniform_and_validates_typed_overrides() {

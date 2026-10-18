@@ -18,7 +18,6 @@ fn llama_8b(quantization: &str) -> ModelCapabilities {
         estimated_weight_bytes: Some(5 * GIB),
         recurrent_state_bytes_per_sequence: None,
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-        graph_safe_moe: false,
     }
 }
 
@@ -72,8 +71,7 @@ fn assert_common_contract(document: &Value, backend: &str, architecture: &str) {
 
     for name in [
         "attention_decode_backend",
-        "moe_graph_policy",
-        "moe_implementation",
+        "moe_dispatch_preference",
         "prefix_cache_policy",
     ] {
         let item = decision(document, name);
@@ -106,8 +104,8 @@ fn metal_dense_and_moe_presets_choose_supported_product_paths() {
         "portable"
     );
     assert_eq!(
-        decision(&dense, "moe_implementation")["selected"],
-        "legacy_moe"
+        decision(&dense, "moe_dispatch_preference")["selected"],
+        "vllm_marlin_disabled"
     );
 
     let moe = resolve(qwen3_moe_gguf(), metal_hardware());
@@ -117,8 +115,8 @@ fn metal_dense_and_moe_presets_choose_supported_product_paths() {
         "portable"
     );
     assert_eq!(
-        decision(&moe, "moe_implementation")["selected"],
-        "legacy_moe"
+        decision(&moe, "moe_dispatch_preference")["selected"],
+        "vllm_marlin_disabled"
     );
 }
 
@@ -131,8 +129,8 @@ fn cuda_dense_and_moe_presets_choose_supported_product_paths() {
         "cuda_native_adaptive"
     );
     assert_eq!(
-        decision(&dense, "moe_implementation")["selected"],
-        "legacy_moe"
+        decision(&dense, "moe_dispatch_preference")["selected"],
+        "vllm_marlin_disabled"
     );
 
     let moe = resolve(
@@ -145,7 +143,7 @@ fn cuda_dense_and_moe_presets_choose_supported_product_paths() {
         "cuda_native_adaptive"
     );
     assert_eq!(
-        decision(&moe, "moe_implementation")["selected"],
-        "vllm_marlin_moe_device_route_pair_ids"
+        decision(&moe, "moe_dispatch_preference")["selected"],
+        "vllm_marlin_enabled"
     );
 }

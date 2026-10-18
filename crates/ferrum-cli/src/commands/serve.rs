@@ -788,22 +788,6 @@ async fn execute_with_compatibility(
         non_env_runtime_entries =
             RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     }
-    let metal_moe_entries = if vnext_plan_owns_context_capacity {
-        Vec::new()
-    } else {
-        crate::source_resolver::metal_gguf_moe_correctness_entries(
-            &source.local_path,
-            &device,
-            &current_runtime,
-            RuntimeConfigSource::Default,
-        )
-    };
-    if !metal_moe_entries.is_empty() {
-        non_env_runtime_entries.extend(metal_moe_entries.clone());
-        non_env_runtime_entries =
-            RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    }
-
     // Read architecture capabilities for the language engine. For GGUF we skip
     // ConfigManager::load_from_path (which expects HF safetensors layout)
     // and route directly to the continuous-batching LLM engine — the
@@ -861,26 +845,6 @@ async fn execute_with_compatibility(
             inferred_entries.extend(non_env_runtime_entries);
             non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(inferred_entries).entries;
         }
-    }
-
-    // Preserve the historical non-preset serve default for Qwen3-MoE, but
-    // route it through the typed startup snapshot instead of a hidden
-    // process-wide env mutation. M3 explicit or model-inferred presets already
-    // carry the same graph-clean defaults in the typed snapshot.
-    if selected_runtime_preset_name.is_none()
-        && arch_for_dispatch == Some(ferrum_models::Architecture::Qwen3Moe)
-    {
-        let current_runtime = merge_runtime_config_sources(
-            non_env_runtime_entries.clone(),
-            user_environment.clone(),
-            Vec::new(),
-        );
-        let mut legacy_entries = crate::runtime_env::moe_graph_default_entries(
-            &current_runtime,
-            RuntimeConfigSource::Default,
-        );
-        legacy_entries.extend(non_env_runtime_entries);
-        non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(legacy_entries).entries;
     }
 
     let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
@@ -1540,13 +1504,11 @@ pub(crate) fn runtime_preset_entries(
     let pairs: &[(&str, &str)] = match preset {
         M3_QWEN3_30B_A3B_INT4_PRESET => &[
             ("FERRUM_BACKEND", "cuda"),
-            ("FERRUM_MOE_DEVICE_ROUTE", "1"),
             ("FERRUM_MOE_STREAMS", "4"),
             ("FERRUM_GREEDY_ARGMAX", "1"),
             ("FERRUM_KV_MAX_BLOCKS", "2048"),
             ("FERRUM_PAGED_MAX_SEQS", "32"),
             ("FERRUM_KV_CAPACITY", "512"),
-            ("FERRUM_MOE_GRAPH", "0"),
             ("FERRUM_VLLM_MOE", "1"),
             ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
             ("FERRUM_ATTENTION_POLICY", "native-adaptive"),
@@ -3690,7 +3652,6 @@ mod tests {
         };
 
         assert_eq!(entry("FERRUM_BACKEND").effective_value, "cuda");
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
         assert_eq!(entry("FERRUM_VLLM_MOE_PAIR_IDS").effective_value, "1");
         assert_eq!(
@@ -3700,7 +3661,13 @@ mod tests {
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "512");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_BACKEND").source, RuntimeConfigSource::Cli);
-        assert_eq!(snapshot.entries.len(), 12);
+        assert!(!snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.key == "FERRUM_MOE_GRAPH"));
+        assert!(!snapshot.entries.iter().any(|entry| {
+            entry.key == "FERRUM_MOE_DEVICE_ROUTE" || entry.key == "FERRUM_MOE_HOST_TOPK"
+        }));
     }
 
     #[test]
@@ -3717,13 +3684,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
 
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
         assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "1");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "512");
-        assert_eq!(
-            entry("FERRUM_MOE_GRAPH").source,
-            RuntimeConfigSource::Default
-        );
         assert_eq!(
             entry("FERRUM_VLLM_MOE").source,
             RuntimeConfigSource::Default
@@ -3871,62 +3833,6 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_moe_serve_defaults_are_typed_default_entries() {
-        let entries = crate::runtime_env::moe_graph_default_entries(
-            &RuntimeConfigSnapshot::default(),
-            RuntimeConfigSource::Default,
-        );
-        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
-        let entry = |key: &str| {
-            snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .unwrap_or_else(|| panic!("missing {key}"))
-        };
-
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
-        assert_eq!(
-            entry("FERRUM_MOE_GRAPH").source,
-            RuntimeConfigSource::Default
-        );
-        assert_eq!(snapshot.entries.len(), 1);
-    }
-
-    #[test]
-    fn qwen3_moe_serve_defaults_keep_config_file_overrides() {
-        let config_entries = crate::config::RuntimeCliConfig {
-            moe_graph: Some(false),
-            vllm_moe: Some(false),
-            ..Default::default()
-        }
-        .runtime_config_entries();
-        let current = RuntimeConfigSnapshot::from_entries(config_entries.clone());
-        let mut entries =
-            crate::runtime_env::moe_graph_default_entries(&current, RuntimeConfigSource::Default);
-        entries.extend(config_entries);
-        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
-        let entry = |key: &str| {
-            snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .unwrap_or_else(|| panic!("missing {key}"))
-        };
-
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "0");
-        assert_eq!(
-            entry("FERRUM_MOE_GRAPH").source,
-            RuntimeConfigSource::ConfigFile
-        );
-        assert_eq!(entry("FERRUM_VLLM_MOE").effective_value, "0");
-        assert_eq!(
-            entry("FERRUM_VLLM_MOE").source,
-            RuntimeConfigSource::ConfigFile
-        );
-    }
-
-    #[test]
     fn model_inferred_m3_preset_keeps_config_file_overrides() {
         let mut inferred_entries =
             runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)
@@ -3957,10 +3863,6 @@ mod tests {
         assert_eq!(
             entry("FERRUM_KV_MAX_BLOCKS").source,
             RuntimeConfigSource::ConfigFile
-        );
-        assert_eq!(
-            entry("FERRUM_MOE_GRAPH").source,
-            RuntimeConfigSource::Default
         );
     }
 

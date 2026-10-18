@@ -1236,13 +1236,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         ferrum_types::ExecutionResourceAuthority::LegacyEngine
     };
     if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
-        let defaults = crate::runtime_env::moe_graph_default_entries(
-            &effective_runtime_config,
-            RuntimeConfigSource::Default,
-        );
-        for entry in defaults {
-            effective_runtime_config.upsert_entry(entry);
-        }
         if let Some((profile, utilization)) =
             run_autosize_for_device(&device, cmd.gpu_memory_utilization)
         {
@@ -1263,15 +1256,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             for entry in entries {
                 effective_runtime_config.upsert_entry(entry);
             }
-        }
-        let entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
-            &source.local_path,
-            &device,
-            &effective_runtime_config,
-            RuntimeConfigSource::Default,
-        );
-        for entry in entries {
-            effective_runtime_config.upsert_entry(entry);
         }
     }
     let typed_model_capabilities = defined_model

@@ -206,6 +206,37 @@ mod tests {
     }
 
     #[test]
+    fn retired_moe_options_fail_for_run_and_serve_startup() {
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            for authority in [
+                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionResourceAuthority::PlanRuntime,
+            ] {
+                for key in [
+                    "FERRUM_MOE_GRAPH",
+                    "FERRUM_MOE_DEVICE_ROUTE",
+                    "FERRUM_MOE_BATCH_THRESHOLD",
+                    "FERRUM_MOE_HOST_TOPK",
+                    "FERRUM_MOE_FUSED_GATE_UP_SILU",
+                    "FERRUM_MOE_DIRECT_DISPATCH",
+                ] {
+                    let error = resolve_config(
+                        RuntimeConfigSnapshot::from_env_vars([(key, "0")]),
+                        model(),
+                        hardware(),
+                        WorkloadProfile::serving_default(),
+                        authority,
+                        usage,
+                    )
+                    .expect_err("removed controls must not disappear at either startup boundary");
+                    assert!(error.to_string().contains(key), "{error}");
+                    assert!(error.to_string().contains("retired"), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_cuda_execution_defaults_are_shared_by_run_and_serve() {
         use ferrum_types::{
             CausalDecodeAttentionGrouping, CausalDecodeKvReuse, CompiledKernelFeatures,

@@ -207,10 +207,9 @@ fn moe_profile_enabled() -> bool {
 /// fused `[gate; up]` projection or its `down` projection.
 ///
 /// `B::Buffer` is hidden behind `Linear<B>` so this struct is generic
-/// over backend. Production (`Qwen3MoeModel::forward`) dispatches through
-/// the generic [`moe_forward<B>`] (this file, line ~960) and
-/// [`moe_forward_bucketed<B>`]; the CPU-only `moe_forward_cpu` is the
-/// reference path used by parity tests + `Qwen3MoeLayer::forward_cpu`.
+/// over backend. The generic [`moe_forward`] and [`moe_forward_bucketed`]
+/// operate on these weights; [`moe_forward_cpu`] provides the CPU reference
+/// used by numerical parity tests.
 pub struct ExpertStack<B: QuantLlmBackend + BackendMoeFused> {
     /// Fused `[gate; up]` projection per expert. Output shape per token:
     /// `[2 * expert_intermediate]` — the lower half is gate, upper is up.
@@ -594,10 +593,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
         )
     }
 
-    // ── Per-item offset GEMV (Phase 3d, qwen3_moe.rs decode path) ──
+    // ── Per-item offset GEMV ──
     //
-    // Used by the per-item batched-decode loop in `Qwen3MoeModel::forward`
-    // when offset variants are supported. Reads `src1` at `src1_offset`
+    // When offset variants are supported, reads `src1` at `src1_offset`
     // floats and `ids` at `ids_offset` ids, writes `dst` from offset 0.
 
     /// Gate offset gemv. `src1_stride=0` → broadcast.
@@ -1270,8 +1268,8 @@ pub fn moe_forward<B: QuantLlmBackend + BackendMoeFused>(
     Ok(())
 }
 
-/// Largest moe_block_size we'd ever pick. Drives Qwen3MoeScratch
-/// `route_sorted_tokens_dev` sizing (allocates `t*top_k + n_exp*MAX`).
+/// Largest selectable MoE block size. Callers size sorted-token scratch
+/// for `tokens * top_k + num_experts * MOE_BLOCK_SIZE_MAX`.
 pub const MOE_BLOCK_SIZE_MAX: usize = 64;
 
 /// Pick `moe_block_size` ∈ {16, 32, 64} based on routing distribution.
@@ -1493,12 +1491,12 @@ impl Default for MoeRouteScratch {
 
 /// Bundle of pre-allocated device buffers for the graph-capturable
 /// device-routing path in [`moe_forward_bucketed`]. Pass `Some` to
-/// take the device path (under `FERRUM_MOE_DEVICE_ROUTE=1`); pass
-/// `None` for the legacy host-mediated path (used by tests + the
+/// make the device path available when vLLM MoE is enabled and host routing
+/// is not forced; pass `None` for the host-mediated path (used by tests + the
 /// non-vLLM CUDA bucketed path).
 ///
-/// Pre-allocated on Qwen3MoeScratch (`route_pairs_dev` etc.) so the
-/// per-layer call doesn't alloc inside a captured stream.
+/// Buffers are pre-allocated by the caller so per-layer calls do not
+/// allocate inside a captured stream.
 pub struct DeviceRouteScratch<'a, B: crate::moe::dispatch::Backend> {
     pub selected_ids: &'a mut B::Buffer,
     pub pair_weights: &'a mut B::Buffer,
@@ -1547,10 +1545,9 @@ pub struct MoeForwardBucketedParams<'a, B: QuantLlmBackend + BackendMoeFused> {
     pub down_packed: &'a mut B::Buffer,
     pub route_scratch: &'a mut MoeRouteScratch,
     pub profile_bucket: bool,
-    // Optional device routing scratch — when Some AND
-    // FERRUM_MOE_DEVICE_ROUTE=1 AND FERRUM_VLLM_MOE=1, runs the
-    // graph-capturable device-routing branch. None / unset = legacy
-    // host-mediated path (used by tests + non-vLLM path).
+    // Caller-owned routing scratch. Some permits the graph-capturable device
+    // route when vLLM MoE is enabled and host routing is not forced; None uses
+    // the host-mediated path (used by tests + the non-vLLM path).
     pub device_route: Option<DeviceRouteScratch<'a, B>>,
 }
 
@@ -1592,8 +1589,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    // ── Device-route fast path (opt-in via FERRUM_MOE_DEVICE_ROUTE=1
-    //     + FERRUM_VLLM_MOE=1 + device_route Some) ────────────────────
+    // ── Device-route fast path (caller provides device_route scratch,
+    //     vLLM MoE enabled, and host routing not forced) ──────────────
     //
     // Skips ALL host round-trips in the routing + bucket-plan stages:
     //   1. B::route_topk_softmax → device expert_ids + weights
@@ -1603,8 +1600,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     //   4. (rest of function reuses these device buffers; the vLLM
     //      MoE GEMM consumes them directly)
     //
-    // This is the prerequisite for CUDA Graph capture over the MoE
-    // layer loop in Qwen3MoeModel::decode_batch_internal.
+    // Keeping routing on device permits capture of this dispatch path.
     let stack_requires_vllm = experts
         .gate_up_marlin_stack
         .as_ref()
@@ -1792,7 +1788,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     let gu_store = experts.gate_up_stacked_store(0).ok_or_else(|| {
         FerrumError::model(
             "moe_forward_bucketed requires stacked gate_up store \
-             (load via Qwen3MoeModel::new_safetensors)",
+             with a compatible stacked weight loader",
         )
     })?;
     let zero_marlin_workspace = !use_vllm_moe || runtime_config.vllm_moe_zero_ws;
@@ -1830,8 +1826,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // a conservative 16 (matches pre-PR behaviour, no regression).
     //
     // Worst-case scratch sizing: 64 (the largest block_size we'd pick).
-    // `Qwen3MoeScratch.route_sorted_tokens_dev` capacity is allocated
-    // assuming this upper bound.
+    // The caller's sorted-token scratch must account for this upper bound.
     let max_block_size: usize = 64;
     let moe_block_size: usize = pick_moe_block_size_with_config(
         runtime_config,
@@ -2050,7 +2045,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     let d_store = experts.down_stacked_store(0).ok_or_else(|| {
         FerrumError::model(
             "moe_forward_bucketed requires stacked down store \
-             (load via Qwen3MoeModel::new_safetensors)",
+             with a compatible stacked weight loader",
         )
     })?;
     if zero_marlin_workspace {

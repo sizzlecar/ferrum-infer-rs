@@ -601,7 +601,7 @@ jobs:
           # invocation: contract_checks accepts only artifacts reported by its
           # completed build, even if another step already compiled the target.
           features="ferrum-kernels/$BACKEND,ferrum-testkit/$BACKEND,ferrum-models/$BACKEND,ferrum-quantization/$BACKEND"
-          targets=(--lib --test op_diff --test "vnext_${BACKEND}_checkpoint_continuation" --test gguf_loader_test)
+          targets=(--lib --test op_diff --test "vnext_${BACKEND}_checkpoint_continuation" --test gguf_loader_test --test native_safetensors_loader_test)
           if [[ "$BACKEND" == cuda ]]; then
             features="$features,ferrum-kernels/vllm-moe-marlin,ferrum-kernels/vllm-paged-attn-v2"
             targets+=(--test compressed_tensors_marlin_eq)
