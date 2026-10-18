@@ -9,6 +9,7 @@ use super::dispatch_contract::{
 use super::foundation::invalid_operation;
 use super::retained_dependency::SealedResidentPlanDependencies;
 use super::segment_compile::{CompiledSegmentBindingRecipe, CompiledSegmentResourceSource};
+use super::work_facts::PreparedSubmissionWork;
 use crate::resource::SegmentPlanResourceRequest;
 use crate::*;
 use std::any::Any;
@@ -258,6 +259,7 @@ pub enum ResidentDecodeDispatchError<R: DeviceRuntime> {
     PostSubmitContract {
         error: VNextError,
         completion: CompletionHandle<R>,
+        observation: SubmissionObservation,
     },
 }
 impl<R: DeviceRuntime> fmt::Debug for ResidentDecodeDispatchError<R> {
@@ -598,10 +600,40 @@ impl OperationDispatch {
         resolved: &dyn ExecutablePlanView,
         identity: &BatchOperationIdentity,
         uploads: &[SubmissionWaveInputUpload],
+        use_: ResidentDecodeUse<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+        timing_mode: DeviceTimingMode,
+        timing: &S,
+    ) -> Result<ProfiledSubmissionHandle<R>, ResidentDecodeDispatchError<R>> {
+        Self::encode_and_submit_resident_decode_with_inputs_and_facts(
+            program,
+            resolved,
+            identity,
+            uploads,
+            use_,
+            lane,
+            reaper,
+            timing_mode,
+            ExecutionFactsCapture::Off,
+            timing,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_resident_decode_with_inputs_and_facts<
+        R: DeviceRuntime,
+        S: SubmissionWaveDispatchTimingSink,
+    >(
+        program: &Arc<ResidentDecodeProgram<R>>,
+        resolved: &dyn ExecutablePlanView,
+        identity: &BatchOperationIdentity,
+        uploads: &[SubmissionWaveInputUpload],
         mut use_: ResidentDecodeUse<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         timing: &S,
     ) -> Result<ProfiledSubmissionHandle<R>, ResidentDecodeDispatchError<R>> {
         let contract = SubmissionWaveDispatchStageTimer::start(
@@ -676,6 +708,8 @@ impl OperationDispatch {
             timing,
             SubmissionWaveDispatchStage::BackingAndInputEncode,
         );
+        let work = PreparedSubmissionWork::for_resident(facts_capture, identity, &use_)
+            .map_err(invalid)?;
         use_.begin_dispatch().map_err(invalid)?;
         let mut completion =
             CompletionReaper::reserve_resident(reaper, use_, Arc::clone(lane), identity.clone())
@@ -685,6 +719,7 @@ impl OperationDispatch {
             timing_mode,
             DeviceComputePathRequirement::ReplayedOnly,
         );
+        commands.set_execution_facts_capture(facts_capture);
         completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| match error {
@@ -809,12 +844,21 @@ impl OperationDispatch {
                 let device = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.submission_attribution(&fence)
                 }));
-                let handle =
-                    completion
-                        .arm(fence, timing_mode)
-                        .map_err(|(error, completion)| {
-                            ResidentDecodeDispatchError::PostSubmitContract { error, completion }
-                        })?;
+                let handle = match completion.arm(fence, timing_mode) {
+                    Ok(handle) => handle,
+                    Err((error, completion)) => {
+                        let observation = SubmissionObservation::new(
+                            work.map(|work| work.bind(completion.receipt())),
+                            None,
+                        );
+                        return Err(ResidentDecodeDispatchError::PostSubmitContract {
+                            error,
+                            completion,
+                            observation,
+                        });
+                    }
+                };
+                let work = work.map(|work| work.bind(handle.receipt()));
                 let device = match device {
                     Ok(device) => device,
                     Err(_) => {
@@ -824,6 +868,7 @@ impl OperationDispatch {
                                 "resident attribution panicked after submission",
                             ),
                             completion: handle,
+                            observation: SubmissionObservation::new(work, None),
                         });
                     }
                 };
@@ -832,6 +877,7 @@ impl OperationDispatch {
                     return Err(ResidentDecodeDispatchError::PostSubmitContract {
                         error: invalid_operation("resident runtime drifted after submission"),
                         completion: handle,
+                        observation: SubmissionObservation::new(work, None),
                     });
                 }
                 let attribution = match device
@@ -849,10 +895,14 @@ impl OperationDispatch {
                         return Err(ResidentDecodeDispatchError::PostSubmitContract {
                             error,
                             completion: handle,
+                            observation: SubmissionObservation::new(work, None),
                         })
                     }
                 };
-                Ok(ProfiledSubmissionHandle::new(handle, attribution))
+                Ok(ProfiledSubmissionHandle::new(
+                    handle,
+                    SubmissionObservation::new(work, attribution),
+                ))
             }
         };
         drop(lane_stage);

@@ -397,9 +397,12 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         mut completed: Vec<ExecutionCompletion>,
         error: FerrumError,
         progress: &WaveProgress,
+        observation_error: Option<FerrumError>,
+        observation_error_reported: bool,
     ) -> ExecutionBatchOutcome {
         let mut remaining = Vec::with_capacity(inputs.len().saturating_sub(completed.len()));
         let mut causes = vec![ExecutionInterruptionCause::Error(error)];
+        causes.extend(observation_error.map(ExecutionInterruptionCause::Error));
         let mut violation: Option<ExecutionContractViolation> = None;
         for (canonical, sequence) in sequences.iter().enumerate() {
             let index = indices[canonical];
@@ -430,7 +433,11 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             self.sequences.lock().remove_ended_exact(sequence);
             let ended = matches!(&close.disposition, ExecutionCloseDisposition::Ended(_));
             if let Some(error) = close.error {
-                causes.push(error.into());
+                // token_close_observation exposes this same original
+                // settlement's callback error; do not report it twice.
+                if !observation_error_reported {
+                    causes.push(error.into());
+                }
             }
             let range = match actual[canonical].range() {
                 Ok(range) => range,
@@ -861,6 +868,8 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                                 Vec::new(),
                                 error,
                                 &WaveProgress::BeforeSubmit,
+                                None,
+                                false,
                             ));
                         }
                     }
@@ -884,12 +893,15 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                                 Vec::new(),
                                 error,
                                 &WaveProgress::BeforeSubmit,
+                                None,
+                                false,
                             ));
                         }
                     }
                 }
                 Err(failure) => {
-                    let (error, progress) = failure.into_parts();
+                    let (error, progress, observation_error, observation_error_reported) =
+                        failure.into_parts();
                     drop(cancellation);
                     return Ok(self.interrupted_native_tokens(
                         &scope,
@@ -900,6 +912,8 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         Vec::new(),
                         error,
                         &progress,
+                        observation_error,
+                        observation_error_reported,
                     ));
                 }
             }
@@ -927,6 +941,8 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 Vec::new(),
                 FerrumError::backend("native token wave returned incomplete participant results"),
                 &WaveProgress::Retired(receipt),
+                None,
+                false,
             );
             return Ok(retain_rejected_products(
                 outcome,
@@ -1039,6 +1055,8 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 completed,
                 error,
                 &WaveProgress::Retired(receipt),
+                None,
+                false,
             );
             return Ok(if rejected_products.is_empty() {
                 outcome

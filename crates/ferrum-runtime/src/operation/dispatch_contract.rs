@@ -9,7 +9,7 @@ use super::super::{
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandPhase, DeviceComputePathRequirement,
     DeviceRuntime, DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming,
     DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTimingMeasurement, HostTransferLayout,
-    IdentifiedFailure, IndeterminateSubmissionHandle, NodeId, VNextError,
+    IdentifiedFailure, IndeterminateSubmissionHandle, NodeId, SubmissionObservation, VNextError,
 };
 use super::foundation::invalid_operation;
 use super::{BatchOperationIdentity, OperationFailure};
@@ -49,6 +49,7 @@ where
     PostSubmitContract {
         error: VNextError,
         completion: CompletionHandle<R>,
+        observation: SubmissionObservation,
     },
 }
 
@@ -208,27 +209,19 @@ fn terminal_timing_matches_submission_attribution(
 #[must_use = "profiled submission evidence and completion must be consumed together"]
 pub struct ProfiledSubmissionHandle<R: DeviceRuntime> {
     completion: CompletionHandle<R>,
-    attribution: Option<BoundDeviceSubmissionAttribution>,
+    observation: SubmissionObservation,
 }
 
 impl<R: DeviceRuntime> ProfiledSubmissionHandle<R> {
-    pub(super) fn new(
-        completion: CompletionHandle<R>,
-        attribution: Option<BoundDeviceSubmissionAttribution>,
-    ) -> Self {
+    pub(super) fn new(completion: CompletionHandle<R>, observation: SubmissionObservation) -> Self {
         Self {
             completion,
-            attribution,
+            observation,
         }
     }
 
-    pub fn into_parts(
-        self,
-    ) -> (
-        CompletionHandle<R>,
-        Option<BoundDeviceSubmissionAttribution>,
-    ) {
-        (self.completion, self.attribution)
+    pub fn into_parts(self) -> (CompletionHandle<R>, SubmissionObservation) {
+        (self.completion, self.observation)
     }
 }
 
@@ -529,7 +522,9 @@ where
                 .debug_struct("SubmissionIndeterminate")
                 .field("recovery", recovery)
                 .finish(),
-            Self::PostSubmitContract { error, completion } => formatter
+            Self::PostSubmitContract {
+                error, completion, ..
+            } => formatter
                 .debug_struct("PostSubmitContract")
                 .field("error", error)
                 .field("completion", completion)
@@ -581,7 +576,7 @@ where
                 "operation submission may have reached the device; completion slot {} retains ownership",
                 recovery.slot_id().get()
             ),
-            Self::PostSubmitContract { error, completion } => write!(
+            Self::PostSubmitContract { error, completion, .. } => write!(
                 formatter,
                 "operation submission reached the device but slot {} observed a contract failure: {error}",
                 completion.slot_id().get()

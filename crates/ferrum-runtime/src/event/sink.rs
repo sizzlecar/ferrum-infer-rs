@@ -182,6 +182,24 @@ pub trait ExecutionEventSink: Send + Sync {
         super::super::DeviceTimingMode::Off
     }
 
+    /// Observation only: this must not change timing, execution qualification,
+    /// or reusable program identity. The caller fixes this choice and sink for
+    /// the submission rather than consulting a replacement sink at completion.
+    fn execution_facts_capture(&self) -> super::super::ExecutionFactsCapture {
+        super::super::ExecutionFactsCapture::Off
+    }
+
+    /// Called synchronously on an execution or recovery thread with borrowed
+    /// facts. Consumers must not block or retain execution owners; deferred
+    /// delivery must use their bounded, nonblocking enqueue path. Failure to
+    /// observe a terminal receipt never authorizes replay of its submitted work.
+    fn record_execution_facts(
+        &self,
+        _facts: super::super::TerminalExecutionFacts<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        Ok(())
+    }
+
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         ExecutionEventCapturePolicy::AllFrames
     }

@@ -8,11 +8,12 @@ use super::super::{
     DeviceCommandLogicalWork, DeviceComputePathRequirement, DeviceReusableExecutionCapture,
     DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram,
     DeviceReusableExecutionProgramId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, InvocationResourceLease, LaneSubmitOutcome, NodeId, NodeInvocationId,
-    OperationId, ParticipantNodeKey, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
-    ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment, SubmissionWavePurpose,
-    TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
+    DeviceTimingMode, ExecutablePlanView, ExecutionFactsCapture, ExecutionIdentityEnvelope,
+    ExecutionIdentityParts, ExecutionLane, InvocationResourceLease, LaneSubmitOutcome, NodeId,
+    NodeInvocationId, OperationId, ParticipantNodeKey, PreparedStepSubmissionWave,
+    ProgramBindingNodeBinding, ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment,
+    SubmissionObservation, SubmissionWavePurpose, TrustedActiveSequenceBinding, VNextError,
+    EXECUTION_IDENTITY_VERSION,
 };
 use super::backing_upload::encode_submission_wave_backing_upload;
 use super::determinism::{
@@ -28,6 +29,7 @@ use super::dispatch_contract::{
 };
 use super::foundation::invalid_operation;
 use super::invocation::OperationInvocationResources;
+use super::work_facts::PreparedSubmissionWork;
 use super::workspace_encoding::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
 };
@@ -922,6 +924,7 @@ impl OperationDispatch {
                         return Err(OperationDispatchError::PostSubmitContract {
                             error,
                             completion,
+                            observation: SubmissionObservation::default(),
                         });
                     }
                 };
@@ -930,6 +933,7 @@ impl OperationDispatch {
                     return Err(OperationDispatchError::PostSubmitContract {
                         error: invalid_operation("operation submit completion runtime drifted"),
                         completion,
+                        observation: SubmissionObservation::default(),
                     });
                 }
                 Ok(completion)
@@ -987,6 +991,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             SubmissionExecutionPolicy::adaptive(),
             None,
@@ -1022,6 +1027,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1062,6 +1068,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1080,6 +1087,7 @@ impl OperationDispatch {
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         input_uploads: &[SubmissionWaveInputUpload],
         execution_policy: SubmissionExecutionPolicy,
         strategy: ferrum_types::InvocationPreparationStrategy,
@@ -1110,6 +1118,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            facts_capture,
             input_uploads,
             execution_policy,
             None,
@@ -1160,6 +1169,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             &[],
             SubmissionExecutionPolicy::determinism_eager(scratch_fill),
             Some(restore),
@@ -1245,6 +1255,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             &[],
             SubmissionExecutionPolicy::determinism_replayed(scratch_fill),
             Some(restore),
@@ -1288,6 +1299,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             SubmissionExecutionPolicy::adaptive(),
             None,
@@ -1324,6 +1336,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1362,6 +1375,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1380,6 +1394,7 @@ impl OperationDispatch {
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         input_uploads: &[SubmissionWaveInputUpload],
         reusable_program: &DeviceReusableExecutionProgram,
         execution_policy: SubmissionExecutionPolicy,
@@ -1411,6 +1426,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            facts_capture,
             input_uploads,
             execution_policy,
             None,
@@ -1429,6 +1445,7 @@ impl OperationDispatch {
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         input_uploads: &[SubmissionWaveInputUpload],
         execution_policy: SubmissionExecutionPolicy,
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
@@ -1589,6 +1606,8 @@ impl OperationDispatch {
                 "replay-required submission requires one sealed reusable execution program",
             )));
         }
+        let work = PreparedSubmissionWork::for_wave(facts_capture, batch_identity, &wave)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         wave.begin_dispatch()
             .map_err(SubmissionWaveDispatchError::Contract)?;
         let mut completion =
@@ -1620,6 +1639,7 @@ impl OperationDispatch {
             timing_mode,
             effective_compute_path,
         );
+        commands.set_execution_facts_capture(facts_capture);
         if effective_compute_path
             == DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
         {
@@ -2490,12 +2510,18 @@ impl OperationDispatch {
                 let completion = match completion.arm(fence, timing_mode) {
                     Ok(completion) => completion,
                     Err((error, completion)) => {
+                        let observation = SubmissionObservation::new(
+                            work.map(|work| work.bind(completion.receipt())),
+                            None,
+                        );
                         return Err(SubmissionWaveDispatchError::PostSubmitContract {
                             error,
                             completion,
+                            observation,
                         });
                     }
                 };
+                let work = work.map(|work| work.bind(completion.receipt()));
                 let device_attribution = match device_attribution {
                     Ok(attribution) => attribution,
                     Err(_) => {
@@ -2503,6 +2529,7 @@ impl OperationDispatch {
                         return Err(SubmissionWaveDispatchError::PostSubmitContract {
                             error: invalid_operation("wave attribution panicked after submission"),
                             completion,
+                            observation: SubmissionObservation::new(work, None),
                         });
                     }
                 };
@@ -2511,6 +2538,7 @@ impl OperationDispatch {
                     return Err(SubmissionWaveDispatchError::PostSubmitContract {
                         error: invalid_operation("wave submit completion runtime drifted"),
                         completion,
+                        observation: SubmissionObservation::new(work, None),
                     });
                 }
                 let attribution = match device_attribution
@@ -2528,11 +2556,15 @@ impl OperationDispatch {
                         return Err(SubmissionWaveDispatchError::PostSubmitContract {
                             error,
                             completion,
+                            observation: SubmissionObservation::new(work, None),
                         });
                     }
                 };
                 drop(completion_arm_stage);
-                Ok(ProfiledSubmissionHandle::new(completion, attribution))
+                Ok(ProfiledSubmissionHandle::new(
+                    completion,
+                    SubmissionObservation::new(work, attribution),
+                ))
             }
         };
         drop(lane_stage);

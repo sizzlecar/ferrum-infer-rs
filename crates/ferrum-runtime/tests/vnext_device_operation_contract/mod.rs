@@ -7,6 +7,7 @@ pub(crate) use ferrum_runtime::*;
 #[path = "../vnext_numerical_fixture/mod.rs"]
 mod numerical_fixture;
 pub(crate) use numerical_fixture::*;
+mod resident_backend;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
@@ -773,6 +774,7 @@ impl ProviderBehavior {
 
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
+    pub(crate) segment_regions_by_node: BTreeMap<NodeId, Vec<SegmentBindingRegionRequest>>,
     pub(crate) reusable_binding_resources: ReusableBindingResources,
     pub(crate) reusable_views: Vec<(NodeId, BTreeSet<ResourceId>, BTreeSet<ProgramValueId>)>,
     pub(crate) reusable_topology_calls: u64,
@@ -1062,6 +1064,29 @@ impl OperationProvider<TestRuntime> for TestProvider {
             )
             .unwrap()),
         }
+    }
+
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, TestBuffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<TestCommand>,
+            Option<SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        let regions = self
+            .trace
+            .lock()
+            .unwrap()
+            .segment_regions_by_node
+            .get(invocation.node_id())
+            .cloned();
+        let declaration = regions
+            .map(|regions| SegmentBindingDeclaration::new(regions, vec![], Arc::new(())).unwrap());
+        self.encode_selected(invocation)
+            .map(|encoded| (encoded, declaration))
     }
 
     fn encode_reusable_execution_bindings(
@@ -1542,6 +1567,10 @@ pub(crate) enum ReadbackBehavior {
 
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) resident_enabled: bool,
+    pub(crate) resident_compile_calls: usize,
+    pub(crate) resident_encode_calls: usize,
+    pub(crate) resident_source_ranges: Vec<Vec<std::ops::Range<u64>>>,
     pub(crate) terminal_readback_enabled: bool,
     pub(crate) terminal_prepare_calls: usize,
     pub(crate) terminal_finish_calls: usize,
@@ -2116,6 +2145,33 @@ impl DeviceRuntime for TestRuntime {
         }))
     }
 
+    fn supports_physical_segment_bindings(&self) -> bool {
+        self.trace.lock().unwrap().resident_enabled
+    }
+
+    fn compile_sequence_physical_bindings(
+        &self,
+        table: &SequencePhysicalBindingTable<Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        resident_backend::compile_table(self, table)
+    }
+
+    fn compile_resident_decode_program(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        wave: &PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        resident_backend::compile_program(self, program, wave)
+    }
+
+    fn encode_resident_decode_program(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        request: &mut DeviceResidentDecodeRequest<'_>,
+    ) -> Result<Option<DeviceEncodedResidentDecode<Self::Command>>, Self::Error> {
+        resident_backend::encode_program(self, program, request)
+    }
+
     fn reusable_execution_entry_identity(
         &self,
         _stream: &Self::Stream,
@@ -2267,7 +2323,12 @@ impl DeviceRuntime for TestRuntime {
         trace.program_binding_coalesce_calls += 1;
         trace.program_binding_input_counts.push(commands.len());
         drop(trace);
-        if commands.is_empty() {
+        if matches!(commands.as_slice(), [TestCommand::CoalescedProgramBinding]) {
+            // The whole-segment encoder already produced the single prelude.
+            // Preserve it at the dispatcher's common coalescing boundary;
+            // mixed or unrelated commands still fail the test-backend contract.
+            Ok(commands)
+        } else if commands.is_empty() {
             Ok(commands)
         } else if commands
             .iter()

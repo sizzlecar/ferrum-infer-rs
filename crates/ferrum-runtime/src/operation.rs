@@ -50,6 +50,7 @@ mod semantic;
 mod storage_profile;
 mod tensor_contract;
 mod weight_contract;
+mod work_facts;
 mod workspace_encoding;
 
 pub use attribute::{AttributeConstraint, AttributeSchema, AttributeSpec};

@@ -238,6 +238,16 @@ impl ObservabilityProfileDetail {
             Self::Latency | Self::Kernel | Self::Replay | Self::Verify | Self::Full
         )
     }
+
+    /// Detailed diagnostics retain the actual submitted work and terminal
+    /// disposition. This does not request device timestamps or change an
+    /// executable's eligibility for reuse.
+    pub const fn captures_execution_facts(self) -> bool {
+        matches!(
+            self,
+            Self::Kernel | Self::Debug | Self::Replay | Self::Verify | Self::Full
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

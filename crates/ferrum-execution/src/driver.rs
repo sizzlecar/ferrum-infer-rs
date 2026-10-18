@@ -78,7 +78,9 @@ mod reusable_catalog;
 mod reusable_cold_path;
 mod sampling_readback;
 mod sequence_settlement;
+mod terminal_facts;
 use sequence_settlement::{PreparedWaveGuard, RetiredWave, SequenceSettlement, WaveFailure};
+use terminal_facts::PendingSubmissionObservation;
 mod state_memory;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -3934,7 +3936,7 @@ impl<R: DeviceRuntime> Drop for VNextSequence<R> {
 enum DispatchOutcome<R: DeviceRuntime> {
     Submitted {
         completion: CompletionHandle<R>,
-        attribution: Option<BoundDeviceSubmissionAttribution>,
+        observation: SubmissionObservation,
     },
     QuiescentFailure(FerrumError),
     SubmissionIndeterminate {
@@ -3944,6 +3946,7 @@ enum DispatchOutcome<R: DeviceRuntime> {
     PostSubmitContract {
         message: String,
         completion: CompletionHandle<R>,
+        observation: SubmissionObservation,
     },
 }
 
@@ -7289,6 +7292,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         mut cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
         resident_bootstrap: Option<Arc<ResidentDecodeReservation<R>>>,
         resident_install: &mut Option<Arc<ResidentDecodeProgram<R>>>,
+        facts_capture: ExecutionFactsCapture,
     ) -> DispatchOutcome<R> {
         if participants.is_empty()
             || participants.len() != token_mask_plans.len()
@@ -7498,6 +7502,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                             &identity,
                             active_bindings(),
                             device_timing_mode,
+                            facts_capture,
                             &uploads,
                             reusable_program,
                             execution_policy,
@@ -7516,6 +7521,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                             &identity,
                             active_bindings(),
                             device_timing_mode,
+                            facts_capture,
                             &uploads,
                             reusable_program,
                             execution_policy,
@@ -7526,7 +7532,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                             &self.lane,
                             &self.reaper,
                         )
-                        .map(|profiled| (profiled.into_parts().0, None))
+                        .map(ProfiledSubmissionHandle::into_parts)
                     }
                 } else if let Some(timing_sink) = observation.as_ref() {
                     OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
@@ -7535,6 +7541,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         &identity,
                         active_bindings(),
                         device_timing_mode,
+                        facts_capture,
                         &uploads,
                         execution_policy,
                         self.invocation_preparation_strategy,
@@ -7552,6 +7559,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         &identity,
                         active_bindings(),
                         device_timing_mode,
+                        facts_capture,
                         &uploads,
                         execution_policy,
                         self.invocation_preparation_strategy,
@@ -7561,7 +7569,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         &self.lane,
                         &self.reaper,
                     )
-                    .map(|profiled| (profiled.into_parts().0, None))
+                    .map(ProfiledSubmissionHandle::into_parts)
                 };
                 drop(phase_timer);
                 if cold_wave.is_some() {
@@ -7602,7 +7610,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 );
             }
             match submission {
-                Ok((completion, attribution)) => {
+                Ok((completion, observation)) => {
                     let identity_materialization = identity.materialization_snapshot();
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
                     self.metrics.identity_waves.fetch_add(1, Ordering::Relaxed);
@@ -7640,7 +7648,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     }
                     return DispatchOutcome::Submitted {
                         completion,
-                        attribution,
+                        observation,
                     };
                 }
                 Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry })
@@ -7681,10 +7689,15 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         recovery,
                     }
                 }
-                Err(SubmissionWaveDispatchError::PostSubmitContract { error, completion }) => {
+                Err(SubmissionWaveDispatchError::PostSubmitContract {
+                    error,
+                    completion,
+                    observation,
+                }) => {
                     return DispatchOutcome::PostSubmitContract {
                         message: error.to_string(),
                         completion,
+                        observation,
                     }
                 }
             }
@@ -7857,8 +7870,25 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             dispatch,
         } = prepared;
         let mut guard = PreparedWaveGuard::new(self, retirement, participants);
-        // Prepared wave owners must drop before the guard publishes recovery.
+        // Prepared wave owners must drop before the guard publishes recovery,
+        // including a panic in an external observer's capture query.
         let mut wave = dispatch;
+        // Snapshot once for this attempt, before dispatch. Late attachment does
+        // not retarget a submitted observation or recreate missing work facts.
+        let observation_sink = self.event_sink.read().clone();
+        let facts_capture = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observation_sink
+                .as_ref()
+                .map_or(ExecutionFactsCapture::Off, |sink| {
+                    sink.execution_facts_capture()
+                })
+        }))
+        .map_err(|_| {
+            guard.fail(FerrumError::backend(
+                "execution observer capture contract panicked",
+            ))
+        })?;
+        let legacy_attribution = self.host_dispatch_timing_enabled();
         let mut resident_install = None;
         let capture_claim = match (kind, self.checkpoint_capture.as_ref()) {
             (VNextExecutionWaveKind::Prefill, Some(capture)) => {
@@ -7961,6 +7991,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 token_mask_residency.plans(),
                 cold_wave.as_mut(),
                 &mut resident_install,
+                facts_capture,
             );
             let dispatch = match dispatch {
                 PreparedDispatchResult::Outcome(dispatch) => dispatch,
@@ -8021,13 +8052,20 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             break (token_mask_residency, dispatch);
         };
         let mut execution_event_error = None;
-        let (completion, attribution) = match dispatch {
+        let mut event_error_is_terminal_observation = false;
+        let completion = match dispatch {
             DispatchOutcome::Submitted {
                 completion,
-                attribution,
+                observation,
             } => {
                 guard.observe_submission(&completion);
-                (completion, attribution)
+                guard.set_submission_observation(
+                    observation_sink.clone(),
+                    facts_capture,
+                    observation,
+                    legacy_attribution,
+                );
+                completion
             }
             DispatchOutcome::QuiescentFailure(error) => {
                 token_mask_residency.invalidate_before_slot_release();
@@ -8048,7 +8086,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     .map_err(|error| {
                         guard.fail(FerrumError::backend(format!("{message}: {error}")))
                     })?
-                    .into_inner();
+                    .into_inner(&mut guard);
                 let message = match &recovered {
                     Ok(CompletionRecoveryOutcome::Drained(_)) => message,
                     Ok(CompletionRecoveryOutcome::Quarantined(_)) => {
@@ -8064,8 +8102,15 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             DispatchOutcome::PostSubmitContract {
                 message,
                 completion,
+                observation,
             } => {
                 guard.observe_submission(&completion);
+                guard.set_submission_observation(
+                    observation_sink.clone(),
+                    facts_capture,
+                    observation,
+                    legacy_attribution,
+                );
                 let route = guard.worker_route();
                 let reaper = Arc::clone(&self.reaper);
                 let observed = self
@@ -8079,7 +8124,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     .map_err(|error| {
                         guard.fail(FerrumError::backend(format!("{message}: {error}")))
                     })?
-                    .into_inner();
+                    .into_inner(&mut guard);
                 let message = match &observed {
                     Ok(CompletionObservation::Terminal(_)) => message,
                     Ok(other) => {
@@ -8169,7 +8214,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         "vNext completion task failed: {error}"
                     )))
                 })?
-                .into_inner()
+                .into_inner(&mut guard)
         };
         let _postprocess_timing = self.metrics.wave_timing.host_postprocess.start();
         let _phase_postprocess_timing = phase_timing.host_postprocess.start();
@@ -8179,6 +8224,12 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             Err(error) => Some(error.to_string()),
         };
         guard.accept_readback_observation(observation);
+        if let Some(error) = guard.observation_error() {
+            if execution_event_error.is_none() {
+                execution_event_error = Some(error.to_string());
+                event_error_is_terminal_observation = true;
+            }
+        }
         if let Some(message) = observation_error {
             self.metrics.record_failure(message.clone());
             token_mask_residency.invalidate_before_slot_release();
@@ -8189,38 +8240,6 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let receipt = guard.readbacks();
         self.metrics.device_timing.record(receipt);
         self.metrics.device_timing_for(kind).record(receipt);
-        if let Some(attribution) = attribution {
-            match attribution.bind_terminal_timing(receipt.completion().submission_timing().clone())
-            {
-                Ok(attribution) => {
-                    let sink = self.event_sink.read().clone();
-                    if let Some(sink) = sink {
-                        if let Err(error) = crate::event_sink::resolve_event_delivery(
-                            sink.as_ref(),
-                            sink.record_device_submission_attribution(&attribution),
-                        ) {
-                            execution_event_error.get_or_insert_with(|| error.to_string());
-                        }
-                    }
-                }
-                Err(error) => {
-                    execution_event_error.get_or_insert_with(|| error.to_string());
-                }
-            }
-        } else if !matches!(
-            receipt.completion().submission_timing(),
-            DeviceTimingMeasurement::NotRequested
-        ) {
-            let sink = self.event_sink.read().clone();
-            if let Some(sink) = sink {
-                if let Err(error) = crate::event_sink::resolve_event_delivery(
-                    sink.as_ref(),
-                    sink.record_physical_device_submission_timing(receipt.completion()),
-                ) {
-                    execution_event_error.get_or_insert_with(|| error.to_string());
-                }
-            }
-        }
         if !diagnostic_failure_requested {
             for participant in participants {
                 if let Some(events) = &participant.sequence.events {
@@ -8265,7 +8284,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 let message =
                     format!("vNext diagnostic resource failure attribution failed closed: {error}");
                 self.metrics.record_failure(message.clone());
-                return Err(retired.retirement.fail(FerrumError::backend(message)));
+                let failure = retired.retirement.fail(FerrumError::backend(message));
+                return Err(
+                    guard.attach_observation_failure(failure, event_error_is_terminal_observation)
+                );
             }
             if let Err(error) = participants[0].sequence.abort_after_observed_failure() {
                 return Err(retired.retirement.fail(error));
@@ -8552,7 +8574,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         if let Some(error) = execution_event_error {
             let message = format!("vNext execution event emission failed: {error}");
             self.metrics.record_failure(message.clone());
-            return Err(retired.retirement.fail(FerrumError::backend(message)));
+            let failure = retired.retirement.fail(FerrumError::backend(message));
+            return Err(
+                guard.attach_observation_failure(failure, event_error_is_terminal_observation)
+            );
         }
         if let Some(ready) = ready_segment_publication {
             // Publication checks exact retirement and current entry.

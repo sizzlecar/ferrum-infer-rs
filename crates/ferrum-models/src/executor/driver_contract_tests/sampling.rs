@@ -9,7 +9,7 @@ use ferrum_types::{
 };
 use std::sync::Arc;
 
-pub(in crate::executor::driver_contract_tests) mod fixture;
+pub(crate) use crate::test_support::native_program as fixture;
 mod lifecycle;
 mod observability;
 mod startup;

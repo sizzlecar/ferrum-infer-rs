@@ -10,7 +10,9 @@ pub(super) struct SequenceSettlement<R: DeviceRuntime> {
     pub(super) cancel_requested: bool,
     pub(super) terminal: Option<SequenceSessionTerminalReceipt>,
     held: Option<Arc<HeldCohort<R>>>,
-    terminal_waiters: Vec<tokio::sync::oneshot::Sender<crate::token_execution::ExecutionEnded>>,
+    observation_error: Option<FerrumError>,
+    terminal_waiters:
+        Vec<tokio::sync::oneshot::Sender<crate::token_execution::ExecutionTerminalOutcome>>,
 }
 
 impl<R: DeviceRuntime> Default for SequenceSettlement<R> {
@@ -20,6 +22,7 @@ impl<R: DeviceRuntime> Default for SequenceSettlement<R> {
             cancel_requested: false,
             terminal: None,
             held: None,
+            observation_error: None,
             terminal_waiters: Vec::new(),
         }
     }
@@ -55,6 +58,15 @@ pub(super) enum RetainedWaveObservation {
 }
 
 impl RetainedWaveObservation {
+    fn terminal_completion(&self) -> Option<&OperationCompletionReceipt> {
+        match self {
+            Self::Readbacks(Ok(CompletionReadbackBatchObservation::Terminal(receipt))) => {
+                Some(receipt.completion())
+            }
+            Self::Completion(Ok(CompletionObservation::Terminal(receipt))) => Some(receipt),
+            _ => None,
+        }
+    }
     fn release_readback_payload(self) -> Self {
         match self {
             Self::Readbacks(Ok(CompletionReadbackBatchObservation::Terminal(receipt))) => {
@@ -122,6 +134,7 @@ pub(super) struct DetachedWaveObservation<R: DeviceRuntime> {
     registry: Arc<Mutex<VNextSequenceRegistry<R>>>,
     reaper: Arc<CompletionReaper<R>>,
     observer: WaveObserver<R>,
+    submission_observation: Option<PendingSubmissionObservation>,
     armed: bool,
 }
 
@@ -147,6 +160,7 @@ impl<R: DeviceRuntime> DetachedWaveObservation<R> {
             None,
             Some(self.observer.clone()),
             observation,
+            self.submission_observation.take(),
             false,
             Arc::clone(&self.reaper),
         );
@@ -167,8 +181,9 @@ pub(super) struct WorkerOutcomeEnvelope<R: DeviceRuntime, T: RetainWaveObservati
 }
 
 impl<R: DeviceRuntime, T: RetainWaveObservation> WorkerOutcomeEnvelope<R, T> {
-    pub(super) fn into_inner(mut self) -> T {
+    pub(super) fn into_inner(mut self, guard: &mut PreparedWaveGuard<'_, R>) -> T {
         self.route.armed = false;
+        guard.submission_observation = self.route.submission_observation.take();
         self.value.take().expect("worker envelope consumed once")
     }
 }
@@ -194,16 +209,29 @@ pub(super) enum WaveProgress {
 pub(super) struct WaveFailure {
     error: FerrumError,
     progress: WaveProgress,
+    // A terminal callback can fail alongside the original device/contract
+    // failure. This is returned evidence, not another completion owner.
+    observation_error: Option<FerrumError>,
+    observation_error_in_primary: bool,
 }
 
 impl WaveFailure {
-    pub(super) fn into_parts(self) -> (FerrumError, WaveProgress) {
-        (self.error, self.progress)
+    pub(super) fn into_parts(self) -> (FerrumError, WaveProgress, Option<FerrumError>, bool) {
+        let observation_reported =
+            self.observation_error_in_primary || self.observation_error.is_some();
+        (
+            self.error,
+            self.progress,
+            self.observation_error,
+            observation_reported,
+        )
     }
     pub(super) fn not_submitted(error: FerrumError) -> Self {
         Self {
             error,
             progress: WaveProgress::BeforeSubmit,
+            observation_error: None,
+            observation_error_in_primary: false,
         }
     }
     pub(super) fn into_error(self) -> FerrumError {
@@ -225,7 +253,13 @@ impl WaveFailure {
                 "vNext product processing failed after retirement"
             ),
         }
-        self.error
+        match self.observation_error {
+            Some(observation) => FerrumError::backend(format!(
+                "{}; additional terminal observation failure: {observation}",
+                self.error
+            )),
+            None => self.error,
+        }
     }
 }
 
@@ -252,6 +286,8 @@ impl<R: DeviceRuntime> RetiredWaveGuard<R> {
         WaveFailure {
             error,
             progress: WaveProgress::Retired(receipt),
+            observation_error: None,
+            observation_error_in_primary: false,
         }
     }
 }
@@ -270,6 +306,8 @@ pub(super) struct PreparedWaveGuard<'a, R: DeviceRuntime> {
     retirement: Option<PreparedRetirement<R>>,
     observer: Option<WaveObserver<R>>,
     observation: Option<RetainedWaveObservation>,
+    submission_observation: Option<PendingSubmissionObservation>,
+    observation_error: Option<FerrumError>,
     terminal_fact: Option<bool>,
     worker_pending: bool,
 }
@@ -286,9 +324,42 @@ impl<'a, R: DeviceRuntime> PreparedWaveGuard<'a, R> {
             retirement: Some(retirement),
             observer: None,
             observation: None,
+            submission_observation: None,
+            observation_error: None,
             terminal_fact: None,
             worker_pending: false,
         }
+    }
+
+    pub(super) fn set_submission_observation(
+        &mut self,
+        sink: Option<Arc<dyn ProductExecutionEventSink>>,
+        capture: ExecutionFactsCapture,
+        observation: SubmissionObservation,
+        legacy_attribution: bool,
+    ) {
+        self.submission_observation = sink.map(|sink| {
+            PendingSubmissionObservation::new(sink, capture, observation, legacy_attribution)
+        });
+    }
+
+    pub(super) fn observation_error(&self) -> Option<&FerrumError> {
+        self.observation_error.as_ref()
+    }
+    pub(super) fn attach_observation_failure(
+        &mut self,
+        mut failure: WaveFailure,
+        is_primary: bool,
+    ) -> WaveFailure {
+        let observation = self.observation_error.take();
+        if is_primary {
+            // The ordinary successful-device path already uses this error as
+            // its primary cause; retain provenance without a second copy.
+            failure.observation_error_in_primary = observation.is_some();
+        } else {
+            failure.observation_error = observation;
+        }
+        failure
     }
 
     pub(super) fn observe_submission(&mut self, handle: &CompletionHandle<R>) {
@@ -307,6 +378,7 @@ impl<'a, R: DeviceRuntime> PreparedWaveGuard<'a, R> {
                 .as_ref()
                 .expect("submitted wave owns its observer")
                 .clone(),
+            submission_observation: self.submission_observation.take(),
             armed: true,
         }
     }
@@ -314,6 +386,26 @@ impl<'a, R: DeviceRuntime> PreparedWaveGuard<'a, R> {
         self.worker_pending = false;
         self.terminal_fact = observation.terminal_fact();
         self.observation = Some(observation);
+        // Store the real observation before any fallible external callback.
+        if let Some(receipt) = self
+            .observation
+            .as_ref()
+            .and_then(RetainedWaveObservation::terminal_completion)
+        {
+            if let Some(delivery) = self.submission_observation.take() {
+                if let Some(error) = delivery.deliver(receipt) {
+                    for participant in self.participants {
+                        participant
+                            .sequence
+                            .settlement
+                            .lock()
+                            .observation_error
+                            .get_or_insert_with(|| error.clone());
+                    }
+                    self.observation_error.get_or_insert(error);
+                }
+            }
+        }
     }
     pub(super) fn accept_readback_observation(
         &mut self,
@@ -363,6 +455,8 @@ impl<'a, R: DeviceRuntime> PreparedWaveGuard<'a, R> {
         self.retirement = Some(retirement);
         self.observer = None;
         self.observation = None;
+        self.submission_observation = None;
+        self.observation_error = None;
         self.terminal_fact = None;
         self.worker_pending = false;
     }
@@ -379,7 +473,12 @@ impl<'a, R: DeviceRuntime> PreparedWaveGuard<'a, R> {
         // Every caller returns immediately. The dispatch owner is declared
         // after this guard and must drop before Drop publishes recovery work.
         // Publishing here could race its still-live StepResourceLease owner.
-        WaveFailure { error, progress }
+        WaveFailure {
+            error,
+            progress,
+            observation_error: self.observation_error.take(),
+            observation_error_in_primary: false,
+        }
     }
     fn retain(&mut self) {
         let Some(retirement) = self.retirement.take() else {
@@ -400,6 +499,7 @@ impl<'a, R: DeviceRuntime> PreparedWaveGuard<'a, R> {
             self.terminal_fact,
             self.observer.take(),
             self.observation.take(),
+            self.submission_observation.take(),
             self.worker_pending,
             Arc::clone(&self.executor.reaper),
         );
@@ -454,6 +554,8 @@ struct HeldCohortState<R: DeviceRuntime> {
     retirement: Option<PreparedRetirement<R>>,
     observer: Option<WaveObserver<R>>,
     observation: Option<RetainedWaveObservation>,
+    submission_observation: Option<PendingSubmissionObservation>,
+    observation_error: Option<FerrumError>,
     terminal_fact: Option<bool>,
     worker_pending: bool,
     observer_finished: bool,
@@ -520,6 +622,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         terminal_fact: Option<bool>,
         observer: Option<WaveObserver<R>>,
         observation: Option<RetainedWaveObservation>,
+        submission_observation: Option<PendingSubmissionObservation>,
         worker_pending: bool,
         reaper: Arc<CompletionReaper<R>>,
     ) {
@@ -540,6 +643,8 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
                     retirement: None,
                     observer: None,
                     observation: None,
+                    submission_observation: None,
+                    observation_error: None,
                     terminal_fact: None,
                     worker_pending: false,
                     observer_finished: false,
@@ -563,6 +668,10 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             }
             if observer.is_some() {
                 state.observer = observer;
+            }
+            if let Some(delivery) = submission_observation {
+                debug_assert!(state.submission_observation.is_none());
+                state.submission_observation = Some(delivery);
             }
             if let Some(observation) = observation {
                 state.terminal_fact = observation.terminal_fact().or(state.terminal_fact);
@@ -627,8 +736,12 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         }
         // The issuer only names the authentic receipt already retained above.
         if let Ok(ended) = self.token_issuer.ended(&self.token_identity) {
+            let error = settlement.observation_error.clone();
             for waiter in settlement.terminal_waiters.drain(..) {
-                let _ = waiter.send(ended.clone());
+                let _ = waiter.send(crate::token_execution::ExecutionTerminalOutcome {
+                    ended: ended.clone(),
+                    error: error.clone(),
+                });
             }
         }
     }
@@ -645,10 +758,12 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         use crate::token_execution::ExecutionCloseOutcome;
         let mut settlement = self.settlement.lock();
         if settlement.terminal.is_some() {
-            return self
-                .token_issuer
-                .ended(&self.token_identity)
-                .map(ExecutionCloseOutcome::ended);
+            return self.token_issuer.ended(&self.token_identity).map(|ended| {
+                ExecutionCloseOutcome {
+                    disposition: crate::token_execution::ExecutionCloseDisposition::Ended(ended),
+                    error: settlement.observation_error.clone(),
+                }
+            });
         }
         // Reserved before admission publication; a cold close never needs a
         // new identity allocation that could exhaust after model execution.
@@ -657,14 +772,11 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         settlement.terminal_waiters.push(sender);
         self.token_issuer
             .held(key, async move {
-                receiver
-                    .await
-                    .map_err(|_| {
-                        FerrumError::backend(
-                            "native terminal owner ended without publishing a terminal receipt",
-                        )
-                    })
-                    .map(crate::token_execution::ExecutionTerminalOutcome::ended)
+                receiver.await.map_err(|_| {
+                    FerrumError::backend(
+                        "native terminal owner ended without publishing a terminal receipt",
+                    )
+                })
             })
             .map(ExecutionCloseOutcome::held)
     }
@@ -715,6 +827,7 @@ struct RecoveryCheckout<'a, R: DeviceRuntime> {
     held: &'a HeldCohort<R>,
     retirement: Option<PreparedRetirement<R>>,
     observation: Option<RetainedWaveObservation>,
+    submission_observation: Option<PendingSubmissionObservation>,
     terminal_fact: Option<bool>,
     finalized: bool,
 }
@@ -724,6 +837,7 @@ impl<R: DeviceRuntime> Drop for RecoveryCheckout<'_, R> {
         let mut state = self.held.state.lock();
         state.retirement = self.retirement.take();
         state.observation = self.observation.take();
+        state.submission_observation = self.submission_observation.take();
         state.terminal_fact = self.terminal_fact;
         state.finalized = self.finalized;
         state.recovering = false;
@@ -745,6 +859,7 @@ fn recover_cohort<R: DeviceRuntime>(held: &Arc<HeldCohort<R>>) -> bool {
                 held,
                 retirement: state.retirement.take(),
                 observation: state.observation.take(),
+                submission_observation: state.submission_observation.take(),
                 terminal_fact: state.terminal_fact,
                 finalized: false,
             },
@@ -785,6 +900,17 @@ fn recover_cohort<R: DeviceRuntime>(held: &Arc<HeldCohort<R>>) -> bool {
                 .observation
                 .as_ref()
                 .and_then(RetainedWaveObservation::terminal_fact);
+        }
+    }
+    if let Some(receipt) = checkout
+        .observation
+        .as_ref()
+        .and_then(RetainedWaveObservation::terminal_completion)
+    {
+        if let Some(delivery) = checkout.submission_observation.take() {
+            if let Some(error) = delivery.deliver(receipt) {
+                held.state.lock().observation_error.get_or_insert(error);
+            }
         }
     }
     if observer.is_some() && checkout.terminal_fact.is_none() {
@@ -834,6 +960,7 @@ pub(super) fn install_recovery<R: DeviceRuntime>(
         }
         for held in cohorts {
             if recover_cohort(&held) {
+                let observation_error = held.state.lock().observation_error.clone();
                 for sequence in &sequences {
                     let mut settlement = sequence.settlement.lock();
                     if settlement
@@ -841,6 +968,9 @@ pub(super) fn install_recovery<R: DeviceRuntime>(
                         .as_ref()
                         .is_some_and(|current| Arc::ptr_eq(current, &held))
                     {
+                        if let Some(error) = &observation_error {
+                            settlement.observation_error.get_or_insert_with(|| error.clone());
+                        }
                         settlement.held = None;
                     }
                 }

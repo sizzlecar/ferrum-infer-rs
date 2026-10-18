@@ -96,7 +96,7 @@ impl ExecutionEventSink for FailingDelivery {
 }
 impl ProductExecutionEventSink for FailingDelivery {}
 
-async fn settled<R: DeviceRuntime>(executor: &ProgramExecutor<R>) {
+pub(super) async fn settled<R: DeviceRuntime>(executor: &ProgramExecutor<R>) {
     for _ in 0..2 {
         executor
             .completion_worker

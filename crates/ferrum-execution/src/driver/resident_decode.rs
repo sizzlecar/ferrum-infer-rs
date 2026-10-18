@@ -315,6 +315,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         mask_plans: &[VNextProductTokenMaskSubmissionPlan],
         cold_wave: Option<&mut reusable_cold_path::WaveObservation<'_>>,
         pending_install: &mut Option<Arc<ResidentDecodeProgram<R>>>,
+        facts_capture: ExecutionFactsCapture,
     ) -> PreparedDispatchResult<R> {
         let (program, mut use_) = match wave {
             PreparedDispatch::Resident { program, use_ } => (program, use_),
@@ -328,6 +329,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     cold_wave,
                     reservation,
                     pending_install,
+                    facts_capture,
                 ));
             }
         };
@@ -367,7 +369,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 phase: self.metrics.wave_timing_for(kind),
             };
             let submission = if self.host_dispatch_timing_enabled() {
-                OperationDispatch::encode_and_submit_resident_decode_with_inputs(
+                OperationDispatch::encode_and_submit_resident_decode_with_inputs_and_facts(
                     &program,
                     &self.resolved_plan,
                     &identity,
@@ -376,10 +378,11 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     &self.lane,
                     &self.reaper,
                     self.device_timing_mode(),
+                    facts_capture,
                     &timing,
                 )
             } else {
-                OperationDispatch::encode_and_submit_resident_decode_with_inputs(
+                OperationDispatch::encode_and_submit_resident_decode_with_inputs_and_facts(
                     &program,
                     &self.resolved_plan,
                     &identity,
@@ -388,19 +391,20 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     &self.lane,
                     &self.reaper,
                     self.device_timing_mode(),
+                    facts_capture,
                     &invocation_preparation::DisabledTiming,
                 )
             };
             let outcome = match submission {
                 Ok(submission) => {
-                    let (completion, attribution) = submission.into_parts();
+                    let (completion, observation) = submission.into_parts();
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
                     self.resident_metrics
                         .submitted
                         .fetch_add(1, Ordering::Relaxed);
                     DispatchOutcome::Submitted {
                         completion,
-                        attribution,
+                        observation,
                     }
                 }
                 Err(ResidentDecodeDispatchError::Unavailable { use_ }) => {
@@ -426,12 +430,15 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         recovery,
                     }
                 }
-                Err(ResidentDecodeDispatchError::PostSubmitContract { error, completion }) => {
-                    DispatchOutcome::PostSubmitContract {
-                        message: error.to_string(),
-                        completion,
-                    }
-                }
+                Err(ResidentDecodeDispatchError::PostSubmitContract {
+                    error,
+                    completion,
+                    observation,
+                }) => DispatchOutcome::PostSubmitContract {
+                    message: error.to_string(),
+                    completion,
+                    observation,
+                },
                 Err(error) => {
                     DispatchOutcome::QuiescentFailure(FerrumError::backend(error.to_string()))
                 }

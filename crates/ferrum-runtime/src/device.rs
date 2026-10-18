@@ -3305,6 +3305,7 @@ pub struct DeviceCommandBatch<C> {
     compute_path_requirement: DeviceComputePathRequirement,
     declared_eager_compute_node_indices: Vec<u32>,
     attribution_requirement: DeviceSubmissionAttributionRequirement,
+    execution_facts_capture: crate::ExecutionFactsCapture,
     reusable_execution_capture: Option<DeviceReusableExecutionCapture>,
 }
 
@@ -3316,6 +3317,7 @@ impl<C> DeviceCommandBatch<C> {
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            execution_facts_capture: crate::ExecutionFactsCapture::Off,
             reusable_execution_capture: None,
             terminal_readback: None,
         }
@@ -3328,6 +3330,7 @@ impl<C> DeviceCommandBatch<C> {
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            execution_facts_capture: crate::ExecutionFactsCapture::Off,
             reusable_execution_capture: None,
             terminal_readback: None,
         }
@@ -3344,6 +3347,7 @@ impl<C> DeviceCommandBatch<C> {
             compute_path_requirement,
             declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
+            execution_facts_capture: crate::ExecutionFactsCapture::Off,
             reusable_execution_capture: None,
             terminal_readback: None,
         }
@@ -3370,6 +3374,16 @@ impl<C> DeviceCommandBatch<C> {
 
     pub(crate) fn require_logical_execution_path_attribution(&mut self) {
         self.attribution_requirement = DeviceSubmissionAttributionRequirement::LogicalExecutionPath;
+    }
+
+    pub(crate) fn set_execution_facts_capture(&mut self, capture: crate::ExecutionFactsCapture) {
+        self.execution_facts_capture = capture;
+    }
+
+    /// Independent observation request. Backends must not use this to alter
+    /// command selection, reusable qualification, or submission identities.
+    pub const fn execution_facts_capture(&self) -> crate::ExecutionFactsCapture {
+        self.execution_facts_capture
     }
 
     pub(crate) fn set_reusable_execution_capture(

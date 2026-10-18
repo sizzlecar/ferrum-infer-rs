@@ -1,18 +1,23 @@
 //! A tiny language program using the production compiler, providers and terminal worker.
-use super::*;
 use crate::vnext::{
     CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
 };
+use ferrum_execution::driver::ProgramExecutor;
 use ferrum_quantization::SafetensorsArchive;
 use ferrum_runtime::*;
+use ferrum_types::{
+    AttentionExecutionPolicy, Device, EngineConfig, ReusableExecutionPreparationMode,
+    SamplingReadbackMode,
+};
 use half::f16;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::OnceLock;
 
-pub(super) const VOCAB: usize = 4;
+pub const VOCAB: usize = 4;
 const MAX_TOKENS: usize = 16;
 const TOKENIZER_CONFIG: &[u8] = br#"{"chat_template":"{{ messages }}"}"#;
 
@@ -289,7 +294,7 @@ impl ModelFamilyRegistry for FamilyRegistry {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct FixtureOptions {
+pub struct FixtureOptions {
     pub logits_type: ElementType,
     pub nonfinite_token: Option<usize>,
     pub reusable_startup: bool,
@@ -307,13 +312,13 @@ impl Default for FixtureOptions {
     }
 }
 
-pub(super) struct Fixture<R: DeviceRuntime> {
-    pub(super) _directory: tempfile::TempDir,
-    pub(super) executor: ProgramExecutor<R>,
+pub struct Fixture<R: DeviceRuntime> {
+    pub(crate) _directory: tempfile::TempDir,
+    pub executor: ProgramExecutor<R>,
 }
 
 impl<R: DeviceRuntime> Fixture<R> {
-    pub(super) fn new(
+    pub fn new(
         mode: SamplingReadbackMode,
         device: ferrum_types::Device,
         runtime: Arc<R>,
@@ -503,7 +508,7 @@ impl<R: DeviceRuntime> Fixture<R> {
     }
 }
 
-pub(in crate::executor::driver_contract_tests) fn resolve_plan(
+pub(crate) fn resolve_plan(
     prepared: &PreparedProductionModel,
     runtime: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
@@ -697,7 +702,7 @@ pub(in crate::executor::driver_contract_tests) fn resolve_plan(
                     producer_version: ContractVersion::new(1, 0),
                     producer_implementation_fingerprint: ResolutionFingerprint::new(format!(
                         "{:x}",
-                        Sha256::digest(include_bytes!("fixture.rs"))
+                        Sha256::digest(include_bytes!("native_program.rs"))
                     ))
                     .unwrap(),
                     revision: "fixture-v1".into(),

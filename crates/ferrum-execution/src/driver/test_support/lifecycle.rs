@@ -15,13 +15,13 @@ type WorkerTask<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
 /// Holding the first worker job makes one manual poll a deterministic enqueue
 /// or queue-capacity wait. Drop also opens the gate if an assertion fails.
-struct WorkerGate<'a> {
+pub(super) struct WorkerGate<'a> {
     release: Option<mpsc::Sender<()>>,
     completion: WorkerTask<'a>,
 }
 
 impl<'a> WorkerGate<'a> {
-    async fn closed(worker: &'a VNextCompletionWorker) -> Self {
+    pub(super) async fn closed(worker: &'a VNextCompletionWorker) -> Self {
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
         let (release, released) = mpsc::channel();
         let mut completion: WorkerTask<'a> = Box::pin(async move {
@@ -41,7 +41,7 @@ impl<'a> WorkerGate<'a> {
         }
     }
 
-    async fn open(mut self) {
+    pub(super) async fn open(mut self) {
         self.release.take().unwrap().send(()).unwrap();
         self.completion.as_mut().await;
     }

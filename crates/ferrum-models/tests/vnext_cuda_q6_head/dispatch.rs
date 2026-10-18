@@ -292,7 +292,8 @@ impl Fixture {
             )
             .unwrap()
         };
-        let (handle, attribution) = profiled.into_parts();
+        let (handle, observation) = profiled.into_parts();
+        let (_, attribution) = observation.into_parts();
         // Keep the first submission's command leases alive until the other
         // lane has encoded and submitted against the same retained state.
         if let Some(guard) = submission_guard.as_mut() {

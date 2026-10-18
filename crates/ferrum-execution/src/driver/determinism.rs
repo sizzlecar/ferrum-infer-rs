@@ -599,7 +599,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     })
                     .await;
                 let recovered = match recovered {
-                    Ok(envelope) => envelope.into_inner(),
+                    Ok(envelope) => envelope.into_inner(guard),
                     Err(error) => {
                         return guard.fail(FerrumError::backend(format!(
                             "vNext determinism submission recovery task failed: {error}"
@@ -618,7 +618,11 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 guard.accept_recovery(recovered);
                 guard.fail(FerrumError::backend(message))
             }
-            SubmissionWaveDispatchError::PostSubmitContract { error, completion } => {
+            SubmissionWaveDispatchError::PostSubmitContract {
+                error,
+                completion,
+                observation: _,
+            } => {
                 let message = error.to_string();
                 guard.observe_submission(&completion);
                 let route = guard.worker_route();
@@ -632,7 +636,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     })
                     .await;
                 match observed {
-                    Ok(envelope) => guard.accept_observation(envelope.into_inner()),
+                    Ok(envelope) => {
+                        let observation = envelope.into_inner(guard);
+                        guard.accept_observation(observation);
+                    }
                     Err(error) => {
                         return guard.fail(FerrumError::backend(format!(
                             "{message}; vNext determinism drain task failed: {error}"
@@ -919,7 +926,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     )))
                     .into_error()
             })?
-            .into_inner();
+            .into_inner(&mut guard);
         let observation_error = match &observation {
             Ok(CompletionReadbackBatchObservation::Terminal(_)) => None,
             Ok(other) => Some(nonterminal_completion_message(other)),

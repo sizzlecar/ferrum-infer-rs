@@ -1997,7 +1997,8 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
         compute_expectation: SubmissionWaveDeterminismComputeExpectation,
     ) -> Self {
-        let (completion, attribution) = profiled.into_parts();
+        let (completion, observation) = profiled.into_parts();
+        let (_, attribution) = observation.into_parts();
         Self {
             completion,
             attribution,

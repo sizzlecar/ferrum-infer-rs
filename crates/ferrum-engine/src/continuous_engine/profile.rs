@@ -70,6 +70,7 @@ struct VNextProfileEventContext {
 
 mod journal;
 pub(super) use journal::*;
+mod execution_facts;
 
 pub(super) struct VNextProfileExecutionEventSink {
     journals: Box<[SchedulerTraceJournal]>,
@@ -1564,6 +1565,27 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
 
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         self.context.capture_policy
+    }
+
+    fn execution_facts_capture(&self) -> ferrum_runtime::ExecutionFactsCapture {
+        if self.context.profile_detail.captures_execution_facts() {
+            ferrum_runtime::ExecutionFactsCapture::On
+        } else {
+            ferrum_runtime::ExecutionFactsCapture::Off
+        }
+    }
+
+    fn record_execution_facts(
+        &self,
+        facts: ferrum_runtime::TerminalExecutionFacts<'_>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if !self.context.profile_detail.captures_execution_facts() {
+            return Ok(());
+        }
+        let event = self
+            .context
+            .execution_facts_event(facts, chrono::Utc::now())?;
+        self.enqueue_profile_batch(vec![event])
     }
 
     fn capture_policy_for_request(

@@ -523,8 +523,8 @@ fn typed_contiguous_input_uploads_coalesce_before_the_plan() {
             SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,
         ]
     );
-    let (handle, attribution) = handle.into_parts();
-    assert!(attribution.is_none());
+    let (handle, observation) = handle.into_parts();
+    assert!(observation.attribution().is_none());
     assert!(matches!(
         handle.wait().unwrap(),
         CompletionObservation::Terminal(_)

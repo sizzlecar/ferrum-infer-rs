@@ -174,7 +174,8 @@ fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
         &reaper,
     )
     .unwrap();
-    let (handle, attribution) = profiled.into_parts();
+    let (handle, observation) = profiled.into_parts();
+    let (_, attribution) = observation.into_parts();
     let attribution = attribution.expect("kernel profile must return bound native work");
     assert_eq!(
         attribution.submission_fingerprint(),
@@ -853,8 +854,8 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
         &reaper,
     )
     .unwrap();
-    let (handle, attribution) = handle.into_parts();
-    assert!(attribution.is_none());
+    let (handle, observation) = handle.into_parts();
+    assert!(observation.attribution().is_none());
     assert_eq!(
         *timing.stages.lock().unwrap(),
         vec![

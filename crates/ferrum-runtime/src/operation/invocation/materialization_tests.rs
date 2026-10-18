@@ -13,6 +13,8 @@ use vnext_device_operation_wave_contract::prepare_wave;
 mod coverage_tests;
 #[path = "descriptor_agreement_tests.rs"]
 mod descriptor_agreement_tests;
+#[path = "resident_work_facts_tests.rs"]
+mod resident_work_facts_tests;
 #[path = "segment_authority_tests.rs"]
 mod segment_authority_tests;
 #[path = "segment_compile_tests.rs"]
@@ -27,6 +29,8 @@ mod segment_owner_tests;
 mod segment_program_tests;
 #[path = "segment_publication_tests.rs"]
 mod segment_publication_tests;
+#[path = "work_facts_tests.rs"]
+mod work_facts_tests;
 
 fn step_for(
     batch: &ExecutionBatchParticipants<TestRuntime>,

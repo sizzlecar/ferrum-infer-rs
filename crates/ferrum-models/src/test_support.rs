@@ -367,3 +367,6 @@ impl Tokenizer for TinyTokenizer {
         }
     }
 }
+
+/// Real compiled language-program construction shared by upper-layer tests.
+pub mod native_program;
