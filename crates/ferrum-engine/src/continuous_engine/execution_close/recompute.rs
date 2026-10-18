@@ -277,7 +277,7 @@ impl EngineInner {
                         self.total_preemptions.fetch_add(1, Ordering::Relaxed);
                         counter!("ferrum.engine.preemptions_total").increment(1);
                     }
-                    self.write_scheduler_trace_event(serde_json::json!({
+                    self.write_scheduler_trace_event(|| serde_json::json!({
                         "event": "scheduler_pressure_release_fence_completed",
                         "episode_id": transaction.episode_id().get(),
                         "victim_request_id": request_id,

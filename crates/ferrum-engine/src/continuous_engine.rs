@@ -71,7 +71,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1218,7 +1217,7 @@ mod execution_close;
 use execution_close::ExecutionCloseRegistry;
 mod managed_driver;
 use managed_driver::ManagedDriver;
-pub use managed_driver::{DriverExitReport, DriverObserver};
+pub use managed_driver::{DriverExitReport, DriverJournalDelivery, DriverObserver};
 
 enum EngineIterationOutcome {
     Progressed,
@@ -1425,7 +1424,10 @@ struct EngineInner {
     runtime_config: ContinuousEngineRuntimeConfig,
     profile_trace_jsonl: Option<SchedulerTraceJournal>,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
-    legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
+    legacy_scheduler_trace_jsonl: Option<JsonlJournal<serde_json::Value>>,
+    observation_health: ObservationHealth,
+    #[cfg(test)]
+    trace_payload_builds: AtomicU64,
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
@@ -1716,11 +1718,11 @@ impl EngineInner {
             attributes,
         };
         if let Err(error) = event.validate() {
-            warn!("Skipping invalid engine resource trace event: {}", error);
+            self.report_observation_failure(ExecutionEventSinkError::contract(error));
             return;
         }
         if let Err(error) = sink.enqueue(event) {
-            warn!("Failed to enqueue engine resource trace event: {}", error);
+            self.report_observation_failure(error);
         }
     }
 
@@ -1877,17 +1879,11 @@ impl EngineInner {
             attributes,
         };
         if let Err(error) = event.validate() {
-            warn!(
-                "Skipping invalid engine resource close trace event: {}",
-                error
-            );
+            self.report_observation_failure(ExecutionEventSinkError::contract(error));
             return;
         }
         if let Err(error) = sink.enqueue(event) {
-            warn!(
-                "Failed to enqueue engine resource close trace event: {}",
-                error
-            );
+            self.report_observation_failure(error);
         }
     }
 
@@ -2276,31 +2272,23 @@ impl ContinuousBatchEngine {
             "Creating ContinuousBatchEngine (recurrent_state_manager={})", recurrent_state_manager
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
-        let profile_trace_jsonl = runtime_config
-            .profile_jsonl
-            .as_ref()
-            .map(|path| {
-                SchedulerTraceJournal::create(path.clone()).map_err(|error| {
-                    FerrumError::io(format!(
-                        "open product profile JSONL {}: {error}",
-                        path.display()
-                    ))
-                })
-            })
-            .transpose()?;
-        let scheduler_trace_jsonl = match runtime_config.scheduler_trace_jsonl.as_deref() {
-            Some(path)
-                if profile_trace_jsonl
-                    .as_ref()
-                    .is_some_and(|journal| journal.path() == path) =>
-            {
-                profile_trace_jsonl.clone()
-            }
-            path => create_scheduler_trace_sink(path),
+        let observation_health = ObservationHealth::default();
+        let open_profile = |path: Option<&Path>| {
+            open_observation_journal(
+                path,
+                config.runtime.profile_detail,
+                &observation_health,
+                |path| SchedulerTraceJournal::create(path.to_path_buf()),
+            )
         };
-        let legacy_scheduler_trace_jsonl = create_legacy_scheduler_trace_sink(
+        let profile_trace_jsonl = open_profile(runtime_config.profile_jsonl.as_deref())?;
+        let scheduler_trace_jsonl = open_profile(runtime_config.scheduler_trace_jsonl.as_deref())?;
+        let legacy_scheduler_trace_jsonl = open_observation_journal(
             runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
-        );
+            config.runtime.profile_detail,
+            &observation_health,
+            |path| JsonlJournal::<serde_json::Value>::create(path.to_path_buf()),
+        )?;
         let mut execution_profile_journals = Vec::with_capacity(2);
         if let Some(journal) = profile_trace_jsonl.as_ref() {
             execution_profile_journals.push(journal.clone());
@@ -2355,6 +2343,9 @@ impl ContinuousBatchEngine {
                 profile_trace_jsonl,
                 scheduler_trace_jsonl,
                 legacy_scheduler_trace_jsonl,
+                observation_health,
+                #[cfg(test)]
+                trace_payload_builds: AtomicU64::new(0),
                 scheduler_trace_none_streak: AtomicU64::new(0),
                 resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
                 resource_trace_event_counter: AtomicU64::new(0),

@@ -168,7 +168,7 @@ impl CaptureState {
                     .events
                     .lock()
                     .push(Event::Acknowledged(target, boundary));
-                Ok(frontier)
+                Ok(ferrum_execution::model_executor::PrefixRestoreAcknowledgement::new(frontier))
             },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)

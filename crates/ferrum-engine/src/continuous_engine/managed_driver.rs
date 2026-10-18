@@ -35,10 +35,21 @@ impl std::fmt::Debug for DriverObserver {
     }
 }
 
-/// Actual driver and cleanup results. A failed exit retains its original product owners.
+/// Driver, delivery and cleanup facts. Diagnostics do not confer resource custody.
 pub struct DriverExitReport {
     errors: Vec<FerrumError>,
+    telemetry_degradations: Vec<FerrumError>,
+    journal_deliveries: Vec<DriverJournalDelivery>,
+    optional_observation_failures: u64,
     retained: Option<Arc<EngineInner>>,
+    cleanup_unproved: bool,
+}
+
+/// Final facts from the original ordered journal, including earlier dropped records.
+#[derive(Debug, Clone)]
+pub struct DriverJournalDelivery {
+    pub path: PathBuf,
+    pub stats: ferrum_bench_core::jsonl_journal::JsonlJournalDeliveryStats,
 }
 
 impl DriverExitReport {
@@ -50,9 +61,25 @@ impl DriverExitReport {
         &self.errors
     }
 
+    pub fn telemetry_degradations(&self) -> &[FerrumError] {
+        &self.telemetry_degradations
+    }
+
+    pub fn journal_deliveries(&self) -> &[DriverJournalDelivery] {
+        &self.journal_deliveries
+    }
+
+    /// Failures reported directly by Engine, including journal open failures.
+    /// Native sink delivery is counted by each original journal instead; use
+    /// `journal_deliveries()` and `telemetry_degradations()` for that loss.
+    pub fn optional_observation_failures(&self) -> u64 {
+        self.optional_observation_failures
+    }
+
     pub fn retains_unproved_owners(&self) -> bool {
         self.retained.as_ref().is_some_and(|inner| {
-            !inner.sequences.is_empty()
+            self.cleanup_unproved
+                || !inner.sequences.is_empty()
                 || inner.execution_closes.unreclaimed_count() != 0
                 || inner.execution_readiness_waiters.pending_count() != 0
         })
@@ -63,6 +90,12 @@ impl std::fmt::Debug for DriverExitReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DriverExitReport")
             .field("errors", &self.errors)
+            .field("telemetry_degradations", &self.telemetry_degradations)
+            .field("journal_deliveries", &self.journal_deliveries)
+            .field(
+                "optional_observation_failures",
+                &self.optional_observation_failures,
+            )
             .field("retains_unproved_owners", &self.retains_unproved_owners())
             .finish()
     }
@@ -84,6 +117,10 @@ impl DriverObserver {
                     "managed engine task failed: {error}"
                 ))],
                 retained: self.task.custody.lock().take(),
+                telemetry_degradations: Vec::new(),
+                journal_deliveries: Vec::new(),
+                optional_observation_failures: 0,
+                cleanup_unproved: true,
             }),
         };
         self.task.custody.lock().take();
@@ -246,16 +283,30 @@ impl ManagedDriver {
         // A body panic must close admission and still execute the independent
         // cleanup future. One catch around both would skip that cleanup.
         self.mark_closing();
-        match std::panic::AssertUnwindSafe(inner.shutdown_cleanup())
-            .catch_unwind()
-            .await
-        {
-            Ok(cleanup_errors) => errors.extend(cleanup_errors),
-            Err(_) => errors.push(FerrumError::internal("managed engine cleanup panicked")),
-        }
+        let (cleanup, cleanup_unproved) =
+            match std::panic::AssertUnwindSafe(inner.shutdown_cleanup())
+                .catch_unwind()
+                .await
+            {
+                Ok(cleanup) => (cleanup, false),
+                Err(_) => {
+                    errors.push(FerrumError::internal("managed engine cleanup panicked"));
+                    (ShutdownCleanupReport::default(), true)
+                }
+            };
+        errors.extend(cleanup.errors);
+        let has_owners = !inner.sequences.is_empty()
+            || inner.execution_closes.unreclaimed_count() != 0
+            || inner.execution_readiness_waiters.pending_count() != 0;
         let report = Arc::new(DriverExitReport {
-            retained: (!errors.is_empty()).then(|| Arc::clone(&inner)),
+            // An evidence error does not mean GPU work is still live. A panic
+            // during cleanup, however, cannot be cleared by empty counters.
+            retained: (cleanup_unproved || has_owners).then(|| Arc::clone(&inner)),
             errors,
+            telemetry_degradations: cleanup.telemetry_degradations,
+            journal_deliveries: cleanup.journal_deliveries,
+            optional_observation_failures: cleanup.optional_observation_failures,
+            cleanup_unproved,
         });
         self.mark_finished();
         exit.armed = false;
@@ -339,62 +390,141 @@ impl Drop for DriverExitGuard<'_> {
     }
 }
 
+#[derive(Default)]
+struct ShutdownCleanupReport {
+    errors: Vec<FerrumError>,
+    telemetry_degradations: Vec<FerrumError>,
+    journal_deliveries: Vec<DriverJournalDelivery>,
+    optional_observation_failures: u64,
+}
+
+enum ClosingJournal {
+    Profile(SchedulerTraceJournal),
+    Legacy(JsonlJournal<serde_json::Value>),
+}
+
+impl ClosingJournal {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Profile(journal) => journal.path(),
+            Self::Legacy(journal) => journal.path(),
+        }
+    }
+
+    fn close(&self) -> std::result::Result<(), JsonlJournalError> {
+        match self {
+            Self::Profile(journal) => journal.close(),
+            Self::Legacy(journal) => journal.close(),
+        }
+    }
+
+    fn stats(&self) -> ferrum_bench_core::jsonl_journal::JsonlJournalDeliveryStats {
+        match self {
+            Self::Profile(journal) => journal.delivery_stats(),
+            Self::Legacy(journal) => journal.delivery_stats(),
+        }
+    }
+}
+
 impl EngineInner {
-    async fn shutdown_cleanup(&self) -> Vec<FerrumError> {
-        let mut errors = self.handoff_shutdown_requests();
+    async fn shutdown_cleanup(&self) -> ShutdownCleanupReport {
+        let mut report = ShutdownCleanupReport {
+            errors: self.handoff_shutdown_requests(),
+            ..ShutdownCleanupReport::default()
+        };
         if let Err(error) = self.output_tasks.stop_and_join().await {
-            errors.push(error);
+            report.errors.push(error);
         }
         if let Err(error) = self.execution_readiness_waiters.abort_and_join().await {
-            errors.push(error);
+            report.errors.push(error);
         }
         self.execution_closes.join_observers().await;
         if let Err(error) = self.complete_failed_execution_recomputes().await {
-            errors.push(error);
+            report.errors.push(error);
         }
         if let Err(error) = self.drain_execution_closes() {
-            errors.push(error);
+            report.errors.push(error);
         }
         let unreclaimed = self.execution_closes.unreclaimed_count();
         if unreclaimed > 0 || !self.sequences.is_empty() {
-            errors.push(FerrumError::internal(format!(
+            report.errors.push(FerrumError::internal(format!(
                 "engine shutdown retains {unreclaimed} unproved execution closures and {} requests",
                 self.sequences.len()
             )));
-            return errors;
         }
-        let mut trace_journals = Vec::with_capacity(2);
-        if let Some(journal) = self.profile_trace_jsonl.clone() {
-            trace_journals.push(journal);
+        let (required, optional, optional_failures) = self.observation_health.snapshot();
+        report.errors.extend(required);
+        report.telemetry_degradations.extend(optional);
+        report.optional_observation_failures = optional_failures;
+        let mut journals = Vec::with_capacity(3);
+        for journal in [
+            self.profile_trace_jsonl.clone(),
+            self.scheduler_trace_jsonl.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if journals
+                .iter()
+                .all(|existing: &ClosingJournal| existing.path() != journal.path())
+            {
+                journals.push(ClosingJournal::Profile(journal));
+            }
         }
-        if let Some(journal) = self.scheduler_trace_jsonl.clone() {
-            if trace_journals
+        if let Some(journal) = self.legacy_scheduler_trace_jsonl.clone() {
+            if journals
                 .iter()
                 .all(|existing| existing.path() != journal.path())
             {
-                trace_journals.push(journal);
+                journals.push(ClosingJournal::Legacy(journal));
             }
         }
-        if !trace_journals.is_empty() {
+        let policy = observation_delivery_policy(self.config.runtime.profile_detail);
+        if !journals.is_empty() {
             match tokio::task::spawn_blocking(move || {
-                let mut errors = Vec::new();
-                for journal in trace_journals {
-                    if let Err(error) = journal.close() {
-                        errors.push(FerrumError::internal(format!(
-                            "scheduler trace close failed: {error}"
-                        )));
-                    }
+                let mut results = Vec::with_capacity(journals.len());
+                for journal in journals {
+                    // A bad diagnostic destination must not skip the others.
+                    let close = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| journal.close()));
+                    let stats = journal.stats();
+                    let incomplete = stats.dropped != 0 || stats.failed != 0
+                        || stats.flushed != stats.accepted || stats.flush_pending
+                        || stats.pending_payload_bytes != 0 || !stats.worker_finished
+                        || stats.failure_kind.is_some();
+                    let error = match close {
+                        Ok(Err(error)) => Some(journal_observation_error(error)),
+                        Err(_) => Some(ExecutionEventSinkError::contract("execution journal close panicked")),
+                        Ok(Ok(())) if incomplete => Some(ExecutionEventSinkError::transport(format!(
+                            "execution journal {} is incomplete: accepted={}, dropped={}, failed={}, flushed={}",
+                            journal.path().display(), stats.accepted, stats.dropped, stats.failed, stats.flushed,
+                        ))),
+                        Ok(Ok(())) => None,
+                    };
+                    results.push((DriverJournalDelivery { path: journal.path().to_path_buf(), stats }, error));
                 }
-                errors
-            })
-            .await
-            {
-                Ok(trace_errors) => errors.extend(trace_errors),
-                Err(error) => errors.push(FerrumError::internal(format!(
-                    "scheduler trace close task failed: {error}"
-                ))),
+                results
+            }).await {
+                Ok(results) => for (delivery, error) in results {
+                    report.journal_deliveries.push(delivery);
+                    if let Some(error) = error {
+                        let failure = FerrumError::internal(format!("execution observation close failed: {error}"));
+                        if error.is_optional_transport(policy) {
+                            // One managed close and one result per deduplicated
+                            // destination: visible even to callers reading only result().
+                            warn!(error = %error, "optional execution journal closed with incomplete telemetry");
+                            report.telemetry_degradations.push(failure);
+                        } else {
+                            report.errors.push(failure);
+                        }
+                    }
+                },
+                Err(error) => {
+                    let failure = FerrumError::internal(format!("execution journal close task failed: {error}"));
+                    // A task unwind is an unknown internal failure, not I/O.
+                    report.errors.push(failure);
+                }
             }
         }
-        errors
+        report
     }
 }

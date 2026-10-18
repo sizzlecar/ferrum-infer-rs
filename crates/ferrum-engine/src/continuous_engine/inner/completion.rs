@@ -440,18 +440,20 @@ impl EngineInner {
             ProfileEventKind::Instant,
             ProfileStatus::DiagnosticOnly,
             None,
-            BTreeMap::from([
-                (
-                    "prompt_token_count".to_string(),
-                    serde_json::json!(evidence.prompt_token_count),
-                ),
-                (
-                    "generated_token_count".to_string(),
-                    serde_json::json!(evidence.generated_token_count),
-                ),
-            ]),
-            attributes,
-            None,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([
+                    (
+                        "prompt_token_count".to_string(),
+                        serde_json::json!(evidence.prompt_token_count),
+                    ),
+                    (
+                        "generated_token_count".to_string(),
+                        serde_json::json!(evidence.generated_token_count),
+                    ),
+                ]),
+                attributes: attributes,
+                error: None,
+            },
         );
     }
 
@@ -746,7 +748,7 @@ impl EngineInner {
 
     async fn cancel_abandoned_sequence(&self, handle: &Arc<SequenceHandle>) -> Result<()> {
         let request_id = handle.request_id();
-        let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
+        let detected_scheduler_iteration = self.scheduler.current_iteration();
         let (terminal_token_trace, token_close, request_slot_present, scheduler_cancel) = {
             let mut state = handle.lock();
             let Some(sequence) = state.as_mut() else {
@@ -809,21 +811,23 @@ impl EngineInner {
             ProfileEventKind::Instant,
             ProfileStatus::Ok,
             None,
-            BTreeMap::from([(
-                "scheduler_iteration".to_string(),
-                serde_json::json!(detected_scheduler_iteration),
-            )]),
-            BTreeMap::from([
-                (
-                    "disconnect_reason".to_string(),
-                    serde_json::json!("client_receiver_closed"),
-                ),
-                (
-                    "terminal_state".to_string(),
-                    serde_json::json!("pending_release"),
-                ),
-            ]),
-            None,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([(
+                    "scheduler_iteration".to_string(),
+                    serde_json::json!(detected_scheduler_iteration),
+                )]),
+                attributes: BTreeMap::from([
+                    (
+                        "disconnect_reason".to_string(),
+                        serde_json::json!("client_receiver_closed"),
+                    ),
+                    (
+                        "terminal_state".to_string(),
+                        serde_json::json!("pending_release"),
+                    ),
+                ]),
+                error: None,
+            },
         );
 
         let mut close_error = None;
@@ -838,7 +842,7 @@ impl EngineInner {
             token_close_pending = frontier.sequence().observed_end().is_none();
         }
 
-        let terminal_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
+        let terminal_scheduler_iteration = self.scheduler.current_iteration();
         let scheduler_tick_delta =
             terminal_scheduler_iteration.saturating_sub(detected_scheduler_iteration);
         let (phase, status, scheduler_cancel_result, terminal_state, profile_error) =
@@ -875,47 +879,49 @@ impl EngineInner {
             ProfileEventKind::Instant,
             status,
             None,
-            BTreeMap::from([
-                (
-                    "detected_scheduler_iteration".to_string(),
-                    serde_json::json!(detected_scheduler_iteration),
-                ),
-                (
-                    "terminal_scheduler_iteration".to_string(),
-                    serde_json::json!(terminal_scheduler_iteration),
-                ),
-                (
-                    "scheduler_tick_delta".to_string(),
-                    serde_json::json!(scheduler_tick_delta),
-                ),
-            ]),
-            BTreeMap::from([
-                (
-                    "disconnect_reason".to_string(),
-                    serde_json::json!("client_receiver_closed"),
-                ),
-                (
-                    "scheduler_cancel_result".to_string(),
-                    serde_json::json!(scheduler_cancel_result),
-                ),
-                (
-                    "terminal_state".to_string(),
-                    serde_json::json!(if token_close_pending {
-                        "close_pending"
-                    } else {
-                        terminal_state
-                    }),
-                ),
-                (
-                    "execution_incarnation_present".to_string(),
-                    serde_json::json!(execution_incarnation_present),
-                ),
-                (
-                    "request_slot_present".to_string(),
-                    serde_json::json!(request_slot_present),
-                ),
-            ]),
-            profile_error,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([
+                    (
+                        "detected_scheduler_iteration".to_string(),
+                        serde_json::json!(detected_scheduler_iteration),
+                    ),
+                    (
+                        "terminal_scheduler_iteration".to_string(),
+                        serde_json::json!(terminal_scheduler_iteration),
+                    ),
+                    (
+                        "scheduler_tick_delta".to_string(),
+                        serde_json::json!(scheduler_tick_delta),
+                    ),
+                ]),
+                attributes: BTreeMap::from([
+                    (
+                        "disconnect_reason".to_string(),
+                        serde_json::json!("client_receiver_closed"),
+                    ),
+                    (
+                        "scheduler_cancel_result".to_string(),
+                        serde_json::json!(scheduler_cancel_result),
+                    ),
+                    (
+                        "terminal_state".to_string(),
+                        serde_json::json!(if token_close_pending {
+                            "close_pending"
+                        } else {
+                            terminal_state
+                        }),
+                    ),
+                    (
+                        "execution_incarnation_present".to_string(),
+                        serde_json::json!(execution_incarnation_present),
+                    ),
+                    (
+                        "request_slot_present".to_string(),
+                        serde_json::json!(request_slot_present),
+                    ),
+                ]),
+                error: profile_error,
+            },
         );
 
         let scheduler_result = match scheduler_cancel {

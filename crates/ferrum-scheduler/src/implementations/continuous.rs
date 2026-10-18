@@ -1471,6 +1471,11 @@ impl ContinuousBatchScheduler {
         self.prefill_queue.read().len()
     }
 
+    /// Read the scheduler clock without locking or materializing queue contents.
+    pub fn current_iteration(&self) -> u64 {
+        self.current_iteration.load(Ordering::Relaxed)
+    }
+
     /// Snapshot queue lengths and counters for explicit scheduler trace artifacts.
     pub fn trace_snapshot(&self) -> ContinuousSchedulerTraceSnapshot {
         self.trace_snapshot_with_prefill_read_observer(|| {})

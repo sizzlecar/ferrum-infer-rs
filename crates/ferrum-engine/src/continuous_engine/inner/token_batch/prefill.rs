@@ -37,27 +37,29 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "tokens_processed".to_owned(),
-                        serde_json::json!(chunk.tokens_processed()),
-                    ),
-                    (
-                        "scheduled_tokens".to_owned(),
-                        serde_json::json!(chunk.tokens_to_process()),
-                    ),
-                    (
-                        "planned_tokens".to_owned(),
-                        serde_json::json!(planned.tokens_to_process()),
-                    ),
-                    (
-                        "capture_boundary".to_owned(),
-                        serde_json::json!(plan.boundary),
-                    ),
-                    ("capture_span".to_owned(), serde_json::json!(plan.span)),
-                ]),
-                BTreeMap::new(),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "tokens_processed".to_owned(),
+                            serde_json::json!(chunk.tokens_processed()),
+                        ),
+                        (
+                            "scheduled_tokens".to_owned(),
+                            serde_json::json!(chunk.tokens_to_process()),
+                        ),
+                        (
+                            "planned_tokens".to_owned(),
+                            serde_json::json!(planned.tokens_to_process()),
+                        ),
+                        (
+                            "capture_boundary".to_owned(),
+                            serde_json::json!(plan.boundary),
+                        ),
+                        ("capture_span".to_owned(), serde_json::json!(plan.span)),
+                    ]),
+                    attributes: BTreeMap::new(),
+                    error: None,
+                },
             );
         }
         Ok(planned)
@@ -80,23 +82,25 @@ impl EngineInner {
             ProfileEventKind::Instant,
             ProfileStatus::Ok,
             None,
-            BTreeMap::from([
-                (
-                    "start_token".to_owned(),
-                    serde_json::json!(chunk.tokens_processed()),
-                ),
-                ("end_token".to_owned(), serde_json::json!(chunk.end())),
-                (
-                    "computed_tokens".to_owned(),
-                    serde_json::json!(chunk.tokens_to_process()),
-                ),
-                (
-                    "prompt_tokens".to_owned(),
-                    serde_json::json!(chunk.total_prompt_tokens()),
-                ),
-            ]),
-            BTreeMap::new(),
-            None,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([
+                    (
+                        "start_token".to_owned(),
+                        serde_json::json!(chunk.tokens_processed()),
+                    ),
+                    ("end_token".to_owned(), serde_json::json!(chunk.end())),
+                    (
+                        "computed_tokens".to_owned(),
+                        serde_json::json!(chunk.tokens_to_process()),
+                    ),
+                    (
+                        "prompt_tokens".to_owned(),
+                        serde_json::json!(chunk.total_prompt_tokens()),
+                    ),
+                ]),
+                attributes: BTreeMap::new(),
+                error: None,
+            },
         );
     }
 }

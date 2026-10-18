@@ -12,6 +12,12 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod delivery;
+use delivery::{BoundedJob, DeliveryState};
+pub use delivery::{JsonlJournalDeliveryStats, JsonlJournalErrorKind, JsonlJournalWorkerState};
+#[cfg(test)]
+mod delivery_tests;
+
 static JSONL_JOURNAL_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<JsonlJournalInner>>>> =
     OnceLock::new();
 
@@ -70,6 +76,12 @@ pub struct JsonlJournalConfig {
     pub queue_capacity: usize,
     pub buffer_capacity_bytes: usize,
     pub flush_interval: Duration,
+    /// Maximum measured JSONL payload retained by `try_*`, including active work.
+    pub payload_capacity_bytes: usize,
+    /// Includes the record's trailing newline.
+    pub max_record_bytes: usize,
+    pub max_batch_bytes: usize,
+    pub max_batch_records: usize,
 }
 
 impl Default for JsonlJournalConfig {
@@ -78,20 +90,34 @@ impl Default for JsonlJournalConfig {
             queue_capacity: 256,
             buffer_capacity_bytes: 1024 * 1024,
             flush_interval: Duration::from_millis(50),
+            payload_capacity_bytes: 16 * 1024 * 1024,
+            max_record_bytes: 1024 * 1024,
+            max_batch_bytes: 4 * 1024 * 1024,
+            max_batch_records: 1024,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonlJournalError {
+    kind: JsonlJournalErrorKind,
     message: String,
 }
 
 impl JsonlJournalError {
     fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(JsonlJournalErrorKind::Worker, message)
+    }
+
+    fn with_kind(kind: JsonlJournalErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
         }
+    }
+
+    pub fn kind(&self) -> JsonlJournalErrorKind {
+        self.kind
     }
 
     pub fn message(&self) -> &str {
@@ -108,37 +134,22 @@ impl fmt::Display for JsonlJournalError {
 impl std::error::Error for JsonlJournalError {}
 
 struct JournalFailure {
-    failed: AtomicBool,
-    error: Mutex<Option<JsonlJournalError>>,
+    error: OnceLock<JsonlJournalError>,
 }
 
 impl JournalFailure {
     fn new() -> Self {
         Self {
-            failed: AtomicBool::new(false),
-            error: Mutex::new(None),
+            error: OnceLock::new(),
         }
     }
 
     fn record(&self, error: JsonlJournalError) {
-        if self
-            .failed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            *self.error.lock().unwrap() = Some(error);
-        }
+        let _ = self.error.set(error);
     }
 
     fn current(&self) -> Option<JsonlJournalError> {
-        if !self.failed.load(Ordering::Acquire) {
-            return None;
-        }
-        self.error.lock().unwrap().clone().or_else(|| {
-            Some(JsonlJournalError::new(
-                "JSONL journal failed without a recorded cause",
-            ))
-        })
+        self.error.get().cloned()
     }
 }
 
@@ -147,6 +158,7 @@ type EncodeJob = Box<dyn FnOnce(&mut Vec<u8>) -> Result<(), serde_json::Error> +
 enum JournalCommand {
     Encode(EncodeJob),
     Encoded(Vec<u8>),
+    Bounded(BoundedJob),
     Flush(SyncSender<Result<(), JsonlJournalError>>),
     Close(SyncSender<Result<(), JsonlJournalError>>),
 }
@@ -158,16 +170,18 @@ struct JsonlJournalInner {
     worker: Mutex<Option<JoinHandle<()>>>,
     failure: Arc<JournalFailure>,
     closed: AtomicBool,
+    config: JsonlJournalConfig,
+    delivery: Arc<DeliveryState>,
 }
 
 impl JsonlJournalInner {
     fn send(&self, command: JournalCommand) -> Result<(), JsonlJournalError> {
         let _send_guard = self.send_gate.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
-            return Err(JsonlJournalError::new(format!(
-                "JSONL journal {} is closed",
-                self.path.display()
-            )));
+            return Err(JsonlJournalError::with_kind(
+                JsonlJournalErrorKind::Closed,
+                format!("JSONL journal {} is closed", self.path.display()),
+            ));
         }
         if let Some(error) = self.failure.current() {
             return Err(error);
@@ -241,6 +255,14 @@ where
 }
 
 fn validate_config(config: JsonlJournalConfig) -> io::Result<()> {
+    if config.max_record_bytes == 0
+        || config.max_batch_records == 0
+        || config.max_record_bytes > config.max_batch_bytes
+        || config.max_batch_bytes > config.payload_capacity_bytes
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "JSONL limits require 0 < record <= batch <= payload capacity and nonzero batch records"));
+    }
     if config.queue_capacity == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -301,6 +323,8 @@ fn open_shared_inner(
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let (sender, receiver) = sync_channel(config.queue_capacity);
     let failure = Arc::new(JournalFailure::new());
+    let delivery = Arc::new(DeliveryState::new());
+    let worker_delivery = Arc::clone(&delivery);
     let worker_failure = Arc::clone(&failure);
     let worker_path = path.clone();
     let worker = thread::Builder::new()
@@ -313,6 +337,7 @@ fn open_shared_inner(
                 &worker_path,
                 config.buffer_capacity_bytes,
                 config.flush_interval,
+                worker_delivery,
             )
         })?;
     let inner = Arc::new(JsonlJournalInner {
@@ -322,6 +347,8 @@ fn open_shared_inner(
         worker: Mutex::new(Some(worker)),
         failure,
         closed: AtomicBool::new(false),
+        config,
+        delivery,
     });
     registry.insert(path, Arc::downgrade(&inner));
     Ok(inner)
@@ -371,19 +398,26 @@ where
         )
     }
 
+    /// Blocking tool delivery, with original worker-side serialization and no
+    /// payload byte limit. Production callbacks should use `try_enqueue`.
     pub fn enqueue(&self, event: T) -> Result<(), JsonlJournalError> {
         self.inner
             .send(JournalCommand::Encode(Box::new(move |encoded| {
                 serde_json::to_writer(&mut *encoded, &event)?;
                 encoded.push(b'\n');
                 Ok(())
-            })))
+            })))?;
+        self.inner.delivery.record_unbounded(1);
+        Ok(())
     }
 
+    /// Blocking, payload-unbounded tool batch; see `try_enqueue_batch` for
+    /// bounded production publication on the same ordered writer.
     pub fn enqueue_batch(&self, events: Vec<T>) -> Result<(), JsonlJournalError> {
         if events.is_empty() {
             return Ok(());
         }
+        let records = events.len();
         self.inner
             .send(JournalCommand::Encode(Box::new(move |encoded| {
                 for event in &events {
@@ -391,7 +425,24 @@ where
                     encoded.push(b'\n');
                 }
                 Ok(())
-            })))
+            })))?;
+        self.inner.delivery.record_unbounded(records);
+        Ok(())
+    }
+
+    /// Effective configuration of the original shared path owner.
+    pub fn config(&self) -> JsonlJournalConfig {
+        self.inner.config
+    }
+
+    /// Counters describe `try_*` delivery; `unbounded_accepted` separately
+    /// discloses legacy tool records. This is not an allocator/RSS bound, nor
+    /// does accepted/written imply a complete or successfully flushed artifact.
+    pub fn delivery_stats(&self) -> JsonlJournalDeliveryStats {
+        self.inner.delivery.snapshot(
+            self.inner.closed.load(Ordering::Acquire),
+            self.inner.failure.error.get().map(JsonlJournalError::kind),
+        )
     }
 
     pub fn flush(&self) -> Result<(), JsonlJournalError> {
@@ -413,27 +464,37 @@ pub fn write_jsonl_records<T: Serialize>(
     records: &[T],
 ) -> Result<(), JsonlJournalError> {
     if records.is_empty() {
-        return Err(JsonlJournalError::new(format!(
-            "JSONL record set for {} must not be empty",
-            path.display()
-        )));
+        return Err(JsonlJournalError::with_kind(
+            JsonlJournalErrorKind::Encoding,
+            format!("JSONL record set for {} must not be empty", path.display()),
+        ));
     }
     let mut encoded = Vec::with_capacity(4096);
     for record in records {
         serde_json::to_writer(&mut encoded, record).map_err(|error| {
-            JsonlJournalError::new(format!(
-                "serialize JSONL record for {}: {error}",
-                path.display()
-            ))
+            JsonlJournalError::with_kind(
+                JsonlJournalErrorKind::Encoding,
+                format!("serialize JSONL record for {}: {error}", path.display()),
+            )
         })?;
         encoded.push(b'\n');
     }
 
     let inner = open_shared_inner(path.to_path_buf(), mode, JsonlJournalConfig::default())
         .map_err(|error| {
-            JsonlJournalError::new(format!("open JSONL journal {}: {error}", path.display()))
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<JsonlJournalError>())
+                .cloned()
+                .unwrap_or_else(|| {
+                    JsonlJournalError::new(format!(
+                        "open JSONL journal {}: {error}",
+                        path.display()
+                    ))
+                })
         })?;
     inner.send(JournalCommand::Encoded(encoded))?;
+    inner.delivery.record_unbounded(records.len());
     flush_inner(&inner)
 }
 
@@ -444,6 +505,51 @@ fn run_writer(
     path: &Path,
     buffer_capacity_bytes: usize,
     flush_interval: Duration,
+    delivery: Arc<DeliveryState>,
+) {
+    // Keep Receiver outside the unwinding writer frame. Publish the actual
+    // panic before dropping queued close/flush replies can wake their callers.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_writer_loop(
+            file,
+            &receiver,
+            failure.clone(),
+            path,
+            buffer_capacity_bytes,
+            flush_interval,
+            delivery.clone(),
+        );
+    }));
+    if outcome.is_err() {
+        failure.record(JsonlJournalError::with_kind(
+            JsonlJournalErrorKind::Panic,
+            "JSONL writer panicked",
+        ));
+    }
+    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(receiver)));
+    if cleanup.is_err() {
+        failure.record(JsonlJournalError::with_kind(
+            JsonlJournalErrorKind::Panic,
+            "JSONL queued payload cleanup panicked",
+        ));
+    }
+    delivery.worker_finished();
+    if let Err(cause) = outcome {
+        std::panic::resume_unwind(cause);
+    }
+    if let Err(cause) = cleanup {
+        std::panic::resume_unwind(cause);
+    }
+}
+
+fn run_writer_loop(
+    file: File,
+    receiver: &Receiver<JournalCommand>,
+    failure: Arc<JournalFailure>,
+    path: &Path,
+    buffer_capacity_bytes: usize,
+    flush_interval: Duration,
+    delivery: Arc<DeliveryState>,
 ) {
     let mut writer = BufWriter::with_capacity(buffer_capacity_bytes, file);
     let mut encoded = Vec::with_capacity(4096);
@@ -455,7 +561,7 @@ fn run_writer(
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    flush_if_healthy(&mut writer, &failure, path, &mut writable);
+                    flush_if_healthy(&mut writer, &failure, path, &mut writable, &delivery);
                     flush_deadline = None;
                     continue;
                 }
@@ -464,15 +570,40 @@ fn run_writer(
             None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match command {
+            Ok(JournalCommand::Bounded(mut job)) => {
+                flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
+                if writable {
+                    match job.encode() {
+                        Ok(encoded) => {
+                            write_encoded_if_healthy(
+                                &mut writer,
+                                &encoded,
+                                &failure,
+                                path,
+                                &mut writable,
+                            );
+                            drop(encoded);
+                            job.finish(writable);
+                        }
+                        Err(error) => {
+                            writable = false;
+                            failure.record(error);
+                            job.finish(false);
+                        }
+                    }
+                } else {
+                    job.finish(false);
+                }
+            }
             Ok(JournalCommand::Encode(job)) => {
                 flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
                 encoded.clear();
                 if let Err(error) = job(&mut encoded) {
                     writable = false;
-                    failure.record(JsonlJournalError::new(format!(
-                        "serialize JSONL event for {}: {error}",
-                        path.display()
-                    )));
+                    failure.record(JsonlJournalError::with_kind(
+                        JsonlJournalErrorKind::Encoding,
+                        format!("serialize JSONL event for {}: {error}", path.display()),
+                    ));
                 } else {
                     write_encoded_if_healthy(&mut writer, &encoded, &failure, path, &mut writable);
                 }
@@ -482,24 +613,24 @@ fn run_writer(
                 write_encoded_if_healthy(&mut writer, &encoded, &failure, path, &mut writable);
             }
             Ok(JournalCommand::Flush(reply)) => {
-                flush_if_healthy(&mut writer, &failure, path, &mut writable);
+                flush_if_healthy(&mut writer, &failure, path, &mut writable, &delivery);
                 flush_deadline = None;
                 let _ = reply.send(failure.current().map_or(Ok(()), Err));
             }
             Ok(JournalCommand::Close(reply)) => {
-                flush_if_healthy(&mut writer, &failure, path, &mut writable);
+                flush_if_healthy(&mut writer, &failure, path, &mut writable, &delivery);
                 let _ = reply.send(failure.current().map_or(Ok(()), Err));
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush_if_healthy(&mut writer, &failure, path, &mut writable);
+                flush_if_healthy(&mut writer, &failure, path, &mut writable, &delivery);
                 flush_deadline = None;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    flush_if_healthy(&mut writer, &failure, path, &mut writable);
+    flush_if_healthy(&mut writer, &failure, path, &mut writable, &delivery);
 }
 
 fn write_encoded_if_healthy(
@@ -526,6 +657,7 @@ fn flush_if_healthy(
     failure: &JournalFailure,
     path: &Path,
     writable: &mut bool,
+    delivery: &DeliveryState,
 ) {
     if !*writable {
         return;
@@ -536,6 +668,8 @@ fn flush_if_healthy(
             "flush JSONL journal {}: {error}",
             path.display()
         )));
+    } else {
+        delivery.record_flushed();
     }
 }
 
@@ -925,6 +1059,7 @@ mod tests {
                 queue_capacity: 1,
                 buffer_capacity_bytes: 4096,
                 flush_interval: Duration::from_millis(10),
+                ..JsonlJournalConfig::default()
             },
         )
         .unwrap();
@@ -1029,6 +1164,7 @@ mod tests {
                 queue_capacity: 128,
                 buffer_capacity_bytes: 1024 * 1024,
                 flush_interval: Duration::from_millis(25),
+                ..JsonlJournalConfig::default()
             },
         )
         .unwrap();

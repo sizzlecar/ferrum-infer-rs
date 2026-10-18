@@ -114,7 +114,25 @@ pub struct PlanRuntimePrefixRestoreOutput {
     restored_tokens: usize,
     prompt_tokens: usize,
     sequence: ExecutorSequence,
-    acknowledge: Box<dyn FnOnce() -> Result<ExecutionFrontier> + Send>,
+    acknowledge: Box<dyn FnOnce() -> Result<PrefixRestoreAcknowledgement> + Send>,
+}
+
+/// The actual publication survives a subsequent observation failure. Consumers
+/// retain this frontier before handling `error`; they must not cold-replay it.
+#[derive(Debug)]
+#[must_use = "retain the actual frontier and handle any post-publication error"]
+pub struct PrefixRestoreAcknowledgement {
+    pub frontier: ExecutionFrontier,
+    pub error: Option<FerrumError>,
+}
+
+impl PrefixRestoreAcknowledgement {
+    pub fn new(frontier: ExecutionFrontier) -> Self {
+        Self {
+            frontier,
+            error: None,
+        }
+    }
 }
 
 impl PlanRuntimePrefixRestoreOutput {
@@ -125,7 +143,7 @@ impl PlanRuntimePrefixRestoreOutput {
         restored_tokens: usize,
         prompt_tokens: usize,
         sequence: ExecutorSequence,
-        acknowledge: impl FnOnce() -> Result<ExecutionFrontier> + Send + 'static,
+        acknowledge: impl FnOnce() -> Result<PrefixRestoreAcknowledgement> + Send + 'static,
     ) -> Result<Self> {
         let output = Self {
             request_id,
@@ -181,18 +199,23 @@ impl PlanRuntimePrefixRestoreOutput {
 
     /// Open the original native publication gate and return its actual frontier.
     /// The callback must revalidate cancellation and the physical restored target.
-    /// Any error requires closing this incarnation, never replaying from zero.
-    pub fn acknowledge_tokens(self) -> Result<ExecutionFrontier> {
+    /// Pre-publication rejection is `Err`; a post-publication failure accompanies
+    /// the actual frontier. Either failure requires closing, never cold replay.
+    pub fn acknowledge_tokens(self) -> Result<PrefixRestoreAcknowledgement> {
         self.validate_for(&self.request_id, self.prompt_tokens, &self.sequence)?;
-        let frontier = (self.acknowledge)()?;
-        if frontier.sequence() != &self.sequence
-            || frontier.consumed_tokens() != self.restored_tokens
+        let mut acknowledged = (self.acknowledge)()?;
+        if acknowledged.frontier.sequence() != &self.sequence
+            || acknowledged.frontier.consumed_tokens() != self.restored_tokens
         {
-            return Err(FerrumError::backend(
-                "prefix acknowledgement returned a different incarnation or frontier",
-            ));
+            let prior = acknowledged.error.take();
+            acknowledged.error = Some(FerrumError::backend(match prior {
+                Some(error) => format!(
+                    "prefix acknowledgement returned a different incarnation or frontier; observation: {error}"
+                ),
+                None => "prefix acknowledgement returned a different incarnation or frontier".into(),
+            }));
         }
-        Ok(frontier)
+        Ok(acknowledged)
     }
 }
 
@@ -234,7 +257,7 @@ mod tests {
         PlanRuntimePrefixRestoreOutput::new_tokens(request, restored, 8, sequence, move || {
             called.fetch_add(1, Ordering::SeqCst);
             drop(retained);
-            Ok(result)
+            Ok(PrefixRestoreAcknowledgement::new(result))
         })
     }
 
@@ -262,7 +285,9 @@ mod tests {
         assert!(output.validate_for(&request, 9, &sequence).is_err());
         assert_eq!(called.load(Ordering::SeqCst), 0);
         output.validate_for(&request, 8, &sequence).unwrap();
-        let frontier = output.acknowledge_tokens().unwrap();
+        let acknowledged = output.acknowledge_tokens().unwrap();
+        assert!(acknowledged.error.is_none());
+        let frontier = acknowledged.frontier;
         assert_eq!(frontier.sequence(), &sequence);
         assert_eq!(frontier.consumed_tokens(), 3);
         assert_eq!(called.load(Ordering::SeqCst), 1);
@@ -301,6 +326,7 @@ mod tests {
         ] {
             let called = Arc::new(AtomicUsize::new(0));
             let dropped = Arc::new(AtomicUsize::new(0));
+            let actual = result.clone();
             let output = publication(
                 RequestId::new(),
                 sequence.clone(),
@@ -310,7 +336,12 @@ mod tests {
                 &dropped,
             )
             .unwrap();
-            assert!(output.acknowledge_tokens().is_err());
+            let acknowledged = output.acknowledge_tokens().unwrap();
+            assert!(acknowledged.error.is_some());
+            assert_eq!(
+                acknowledged.frontier, actual,
+                "post-publication rejection retains the exact returned frontier"
+            );
             assert_eq!(called.load(Ordering::SeqCst), 1);
             assert_eq!(dropped.load(Ordering::SeqCst), 1);
         }

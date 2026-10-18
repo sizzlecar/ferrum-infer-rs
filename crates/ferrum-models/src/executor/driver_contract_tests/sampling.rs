@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub(in crate::executor::driver_contract_tests) mod fixture;
 mod lifecycle;
+mod observability;
 mod startup;
 mod token_execution;
 use fixture::{Fixture, FixtureOptions};

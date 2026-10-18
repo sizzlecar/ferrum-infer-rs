@@ -37,8 +37,9 @@ pub mod trace;
 
 pub use env::{Env, EnvHash};
 pub use jsonl_journal::{
-    normalize_jsonl_path, write_jsonl_records, JsonlJournal, JsonlJournalConfig, JsonlJournalError,
-    JsonlJournalOpenMode,
+    normalize_jsonl_path, write_jsonl_records, JsonlJournal, JsonlJournalConfig,
+    JsonlJournalDeliveryStats, JsonlJournalError, JsonlJournalErrorKind, JsonlJournalOpenMode,
+    JsonlJournalWorkerState,
 };
 pub use profile::{
     configure_global_profile, flush_global_profile, global_profile, parse_profile_event_value,

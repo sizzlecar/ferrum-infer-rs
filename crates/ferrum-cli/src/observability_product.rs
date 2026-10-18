@@ -534,25 +534,38 @@ fn write_profile_outputs(
     include_memory: bool,
     include_scheduler: bool,
 ) -> Result<Vec<PathBuf>> {
-    let mut targets = BTreeMap::<PathBuf, ProfileOutputRoles>::new();
-    if include_profile {
-        add_profile_output_target(&mut targets, config.profile_jsonl.as_ref(), |roles| {
-            &mut roles.profile
+    for event in events {
+        event.validate().map_err(|error| {
+            FerrumError::internal(format!("invalid product observability event: {error}"))
         })?;
     }
-    if include_memory {
-        add_profile_output_target(
-            &mut targets,
+    let mut targets = BTreeMap::<PathBuf, ProfileOutputRoles>::new();
+    let mut required_failure = None;
+    let roles: [(
+        bool,
+        Option<&PathBuf>,
+        fn(&mut ProfileOutputRoles) -> &mut bool,
+    ); 3] = [
+        (include_profile, config.profile_jsonl.as_ref(), |roles| {
+            &mut roles.profile
+        }),
+        (
+            include_memory,
             config.memory_profile_jsonl.as_ref(),
             |roles| &mut roles.memory,
-        )?;
-    }
-    if include_scheduler {
-        add_profile_output_target(
-            &mut targets,
+        ),
+        (
+            include_scheduler,
             config.scheduler_trace_jsonl.as_ref(),
             |roles| &mut roles.scheduler,
-        )?;
+        ),
+    ];
+    for (included, path, role) in roles {
+        if included {
+            if let Err(error) = add_profile_output_target(&mut targets, path, role) {
+                record_profile_transport_failure(config, path, error, &mut required_failure)?;
+            }
+        }
     }
 
     let mut written = Vec::with_capacity(targets.len());
@@ -569,10 +582,31 @@ fn write_profile_outputs(
         if selected.is_empty() {
             continue;
         }
-        write_profile_events(&path, mode, &selected)?;
-        written.push(path);
+        match write_profile_events(&path, mode, &selected) {
+            Ok(()) => written.push(path),
+            Err(error) => {
+                record_profile_transport_failure(config, Some(&path), error, &mut required_failure)?
+            }
+        }
     }
-    Ok(written)
+    required_failure.map_or(Ok(written), Err)
+}
+
+fn record_profile_transport_failure(
+    config: &ProductObservabilityConfig,
+    path: Option<&PathBuf>,
+    error: FerrumError,
+    required_failure: &mut Option<FerrumError>,
+) -> Result<()> {
+    if !matches!(error, FerrumError::IO { .. }) {
+        return Err(error);
+    }
+    if config.profile_detail.requires_complete_evidence() {
+        required_failure.get_or_insert(error);
+    } else {
+        tracing::warn!(?path, %error, "Optional profile artifact is incomplete");
+    }
+    Ok(())
 }
 
 fn product_events(
@@ -1944,8 +1978,17 @@ fn write_profile_events(
             FerrumError::internal(format!("invalid product observability event: {err}"))
         })?;
     }
-    ferrum_bench_core::write_jsonl_records(path, mode, events)
-        .map_err(|error| FerrumError::io(error.to_string()))
+    ferrum_bench_core::write_jsonl_records(path, mode, events).map_err(|error| {
+        if matches!(
+            error.kind(),
+            ferrum_bench_core::JsonlJournalErrorKind::Encoding
+                | ferrum_bench_core::JsonlJournalErrorKind::Panic
+        ) {
+            FerrumError::serialization(error.to_string())
+        } else {
+            FerrumError::io(error.to_string())
+        }
+    })
 }
 
 fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
@@ -2000,6 +2043,73 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_fanout_keeps_healthy_output_and_required_evidence_failure() {
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            for detail in [
+                ProfileDetailArg::Basic,
+                ProfileDetailArg::Replay,
+                ProfileDetailArg::Verify,
+                ProfileDetailArg::Full,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let blocked_parent = directory.path().join("blocked");
+                fs::write(&blocked_parent, "occupied by a file").unwrap();
+                let failed = blocked_parent.join("profile.jsonl");
+                let healthy = directory.path().join("scheduler.jsonl");
+                let config = ProductObservabilityConfig::new(
+                    entrypoint,
+                    "test-model",
+                    Some(&failed),
+                    detail,
+                    None,
+                    Some(&healthy),
+                    None,
+                    1.0,
+                );
+                let events = product_events(&config, "request", "ferrum run");
+                let result = write_profile_outputs(
+                    &config,
+                    &events,
+                    ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+                    true,
+                    false,
+                    true,
+                );
+                if config.profile_detail.requires_complete_evidence() {
+                    assert!(matches!(result, Err(FerrumError::IO { .. })));
+                } else {
+                    let written = result.unwrap();
+                    assert_eq!(written.len(), 1);
+                    assert_eq!(fs::read(&written[0]).unwrap(), fs::read(&healthy).unwrap());
+                }
+                let actual: Vec<FerrumProfileEvent> = fs::read_to_string(&healthy)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert!(!actual.is_empty());
+                for event in actual {
+                    assert!(event.resource.is_some());
+                    event.validate().unwrap();
+                }
+                let mut invalid = events;
+                invalid[0].request_id.clear();
+                assert!(matches!(
+                    write_profile_outputs(
+                        &config,
+                        &invalid,
+                        ferrum_bench_core::JsonlJournalOpenMode::Append,
+                        true,
+                        false,
+                        true
+                    ),
+                    Err(FerrumError::Internal { .. })
+                ));
+            }
+        }
+    }
 
     #[test]
     fn basic_metrics_only_product_writers_skip_artifacts_and_keep_validation() {

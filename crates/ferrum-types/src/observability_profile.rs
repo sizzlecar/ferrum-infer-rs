@@ -180,6 +180,13 @@ pub enum ObservabilityProfileDetail {
 }
 
 impl ObservabilityProfileDetail {
+    /// Replay, verification and full captures require an intact artifact.
+    /// Other profiles are optional telemetry: transport loss is reported without
+    /// changing the outcome of already executed inference work.
+    pub const fn requires_complete_evidence(self) -> bool {
+        matches!(self, Self::Replay | Self::Verify | Self::Full)
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
@@ -545,8 +552,10 @@ mod tests {
             Some(ObservabilityProfileDetail::Replay)
         );
         assert_eq!(ObservabilityProfileDetail::Replay.as_str(), "replay");
+        assert!(ObservabilityProfileDetail::Replay.requires_complete_evidence());
         assert!(ObservabilityProfileDetail::Replay.diagnostic_only());
         assert!(!ObservabilityProfileDetail::Basic.diagnostic_only());
+        assert!(!ObservabilityProfileDetail::Basic.requires_complete_evidence());
     }
 
     #[test]

@@ -158,7 +158,7 @@ impl RestoreState {
                 let frontier = tokens.restore_frontier(&sequence, guard.state.tokens)?;
                 guard.acknowledged = true;
                 guard.state.acknowledgements.fetch_add(1, Ordering::Relaxed);
-                Ok(frontier)
+                Ok(ferrum_execution::model_executor::PrefixRestoreAcknowledgement::new(frontier))
             },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)

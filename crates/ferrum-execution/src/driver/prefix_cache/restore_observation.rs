@@ -1,5 +1,5 @@
 use super::*;
-use crate::model_executor::PrefixRestoreObservation;
+use crate::model_executor::{PrefixRestoreAcknowledgement, PrefixRestoreObservation};
 
 pub(super) struct PrefixRestoreObserver {
     sink: Option<Arc<dyn ProductExecutionEventSink>>,
@@ -20,54 +20,56 @@ impl PrefixRestoreObserver {
         }
     }
 
-    pub(super) fn record(&self, decision: PrefixRestoreDecision<'_>) {
-        let Some(sink) = &self.sink else { return };
-        if let Err(error) = sink.record_prefix_restore_decision(&PrefixRestoreObservation {
+    pub(super) fn record(&self, decision: PrefixRestoreDecision<'_>) -> Result<()> {
+        let Some(sink) = &self.sink else {
+            return Ok(());
+        };
+        let result = sink.record_prefix_restore_decision(&PrefixRestoreObservation {
             request_id: &self.request_id,
             source: self.source,
             decision,
-        }) {
-            // Observation failure cannot change an acknowledged publication or
-            // convert a safe cold-prefill fallback into a request failure.
-            tracing::warn!(request_id = %self.request_id, %error, "prefix restore observation failed");
-        }
+        });
+        crate::event_sink::resolve_event_delivery(sink.as_ref(), result)
+            .map_err(|error| FerrumError::backend(format!("prefix restore observation: {error}")))
     }
 
     pub(super) fn capacity_ready(
         &self,
         candidate_prefix_tokens: usize,
         decision: &VNextExecutionCapacityDecision<()>,
-    ) -> bool {
+    ) -> Result<bool> {
         match decision {
-            VNextExecutionCapacityDecision::Ready(()) => true,
+            VNextExecutionCapacityDecision::Ready(()) => Ok(true),
             VNextExecutionCapacityDecision::Deferred(capacity) => {
                 self.record(PrefixRestoreDecision::SequenceCapacityNotReady {
                     candidate_prefix_tokens,
                     capacity,
-                });
-                false
+                })?;
+                Ok(false)
             }
             VNextExecutionCapacityDecision::RequestStateDeferred(request_state) => {
                 self.record(PrefixRestoreDecision::RequestStateNotReady {
                     candidate_prefix_tokens,
                     request_state,
-                });
-                false
+                })?;
+                Ok(false)
             }
         }
     }
 
-    pub(super) fn acknowledge<T>(
+    pub(super) fn acknowledge(
         &self,
         metrics: &PrefixCacheMetrics,
         restored_tokens: usize,
-        acknowledge: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        let output = metrics.acknowledge_restore(restored_tokens, acknowledge)?;
-        self.record(PrefixRestoreDecision::Restored {
-            candidate_prefix_tokens: restored_tokens,
-        });
-        Ok(output)
+        acknowledge: impl FnOnce() -> Result<crate::token_execution::ExecutionFrontier>,
+    ) -> Result<PrefixRestoreAcknowledgement> {
+        let frontier = metrics.acknowledge_restore(restored_tokens, acknowledge)?;
+        let error = self
+            .record(PrefixRestoreDecision::Restored {
+                candidate_prefix_tokens: restored_tokens,
+            })
+            .err();
+        Ok(PrefixRestoreAcknowledgement { frontier, error })
     }
 }
 
@@ -78,10 +80,15 @@ mod tests {
     struct Sink {
         enabled: bool,
         fail: bool,
+        policy: ExecutionEventDeliveryPolicy,
+        kind: ExecutionEventSinkErrorKind,
         decisions: Mutex<Vec<serde_json::Value>>,
     }
 
     impl ExecutionEventSink for Sink {
+        fn delivery_policy(&self) -> ExecutionEventDeliveryPolicy {
+            self.policy
+        }
         fn is_enabled(&self, _: ExecutionEventKind) -> bool {
             false
         }
@@ -105,7 +112,14 @@ mod tests {
                 .lock()
                 .push(serde_json::to_value(observation).unwrap());
             if self.fail {
-                Err(ExecutionEventSinkError::new("sink unavailable"))
+                Err(match self.kind {
+                    ExecutionEventSinkErrorKind::Contract => {
+                        ExecutionEventSinkError::contract("invalid prefix projection")
+                    }
+                    ExecutionEventSinkErrorKind::Transport => {
+                        ExecutionEventSinkError::transport("sink unavailable")
+                    }
+                })
             } else {
                 Ok(())
             }
@@ -116,6 +130,8 @@ mod tests {
         Arc::new(Sink {
             enabled,
             fail,
+            policy: ExecutionEventDeliveryPolicy::OptionalTelemetry,
+            kind: ExecutionEventSinkErrorKind::Transport,
             decisions: Mutex::new(Vec::new()),
         })
     }
@@ -153,6 +169,7 @@ mod tests {
             output(false)
                 .acknowledge_tokens()
                 .unwrap()
+                .frontier
                 .consumed_tokens(),
             3
         );
@@ -170,7 +187,13 @@ mod tests {
         let failing = recording_sink(true, true);
         let observer =
             PrefixRestoreObserver::new(Some(failing), RequestId::new(), PrefixRestoreSource::Index);
-        assert!(observer.acknowledge(&metrics, 2, || Ok(())).is_ok());
+        let issuer = crate::token_execution::ExecutorSequenceIssuer::new();
+        let sequence = issuer.issue_sequence().unwrap();
+        let acknowledged = observer
+            .acknowledge(&metrics, 2, || issuer.frontier(&sequence, 2))
+            .unwrap();
+        assert!(acknowledged.error.is_none());
+        assert_eq!(acknowledged.frontier.sequence(), &sequence);
         assert_eq!(metrics.hits.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.saved_prefill_tokens.load(Ordering::Relaxed), 5);
     }
@@ -206,10 +229,12 @@ mod tests {
             request_id.clone(),
             PrefixRestoreSource::Index,
         );
-        assert!(observer.capacity_ready(128, &VNextExecutionCapacityDecision::Ready(())));
+        assert!(observer
+            .capacity_ready(128, &VNextExecutionCapacityDecision::Ready(()))
+            .unwrap());
         assert!(sink.decisions.lock().is_empty());
         let decision = VNextExecutionCapacityDecision::Deferred(capacity);
-        assert!(!observer.capacity_ready(128, &decision));
+        assert!(!observer.capacity_ready(128, &decision).unwrap());
         let decisions = sink.decisions.lock();
         assert_eq!(decisions[0]["request_id"], serde_json::json!(request_id));
         assert_eq!(
@@ -225,8 +250,51 @@ mod tests {
             request_id,
             PrefixRestoreSource::Index,
         );
-        assert!(!observer.capacity_ready(128, &decision));
-        observer.record(PrefixRestoreDecision::NoReusableEntry);
+        assert!(!observer.capacity_ready(128, &decision).unwrap());
+        observer
+            .record(PrefixRestoreDecision::NoReusableEntry)
+            .unwrap();
         assert!(disabled.decisions.lock().is_empty());
+    }
+
+    #[test]
+    fn prefix_restore_post_ack_contract_and_required_transport_keep_actual_frontier() {
+        for (policy, kind) in [
+            (
+                ExecutionEventDeliveryPolicy::OptionalTelemetry,
+                ExecutionEventSinkErrorKind::Contract,
+            ),
+            (
+                ExecutionEventDeliveryPolicy::RequiredEvidence,
+                ExecutionEventSinkErrorKind::Transport,
+            ),
+        ] {
+            let sink = Arc::new(Sink {
+                enabled: true,
+                fail: true,
+                policy,
+                kind,
+                decisions: Mutex::new(Vec::new()),
+            });
+            let observer = PrefixRestoreObserver::new(
+                Some(sink),
+                RequestId::new(),
+                PrefixRestoreSource::Index,
+            );
+            let metrics = PrefixCacheMetrics::default();
+            let issuer = crate::token_execution::ExecutorSequenceIssuer::new();
+            let sequence = issuer.issue_sequence().unwrap();
+            let actual = issuer.frontier(&sequence, 3).unwrap();
+            let acknowledged = observer
+                .acknowledge(&metrics, 3, || Ok(actual.clone()))
+                .unwrap();
+            assert!(acknowledged.error.is_some());
+            assert_eq!(acknowledged.frontier, actual);
+            assert_eq!(metrics.hits.load(Ordering::Relaxed), 1);
+            assert_eq!(metrics.saved_prefill_tokens.load(Ordering::Relaxed), 3);
+            assert!(observer
+                .record(PrefixRestoreDecision::NoReusableEntry)
+                .is_err());
+        }
     }
 }

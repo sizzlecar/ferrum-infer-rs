@@ -3069,10 +3069,10 @@ const fn journal_clock_anchor_required(timing_mode: DeviceTimingMode) -> bool {
 
 fn system_time_unix_nanos(time: SystemTime) -> std::result::Result<i64, ExecutionEventSinkError> {
     let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
-        ExecutionEventSinkError::new(format!("system clock predates Unix epoch: {error}"))
+        ExecutionEventSinkError::contract(format!("system clock predates Unix epoch: {error}"))
     })?;
     i64::try_from(duration.as_nanos())
-        .map_err(|_| ExecutionEventSinkError::new("system clock Unix nanos exceed i64"))
+        .map_err(|_| ExecutionEventSinkError::contract("system clock Unix nanos exceed i64"))
 }
 
 fn bounded_wall_anchor(wall_before: i64, wall_after: i64) -> (i64, u64) {
@@ -3109,7 +3109,7 @@ struct VNextExecutionJournal {
 
 impl VNextExecutionJournal {
     fn error(error: impl fmt::Display) -> ExecutionEventSinkError {
-        ExecutionEventSinkError::new(error.to_string())
+        ExecutionEventSinkError::contract(error.to_string())
     }
 
     fn open(
@@ -6474,12 +6474,15 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         "vNext execution resource maintenance binding: {error}"
                     ))
                 })?;
-                sink.record_execution_resource_maintenance(maintenance)
-                    .map_err(|error| {
-                        FerrumError::backend(format!(
-                            "vNext execution resource maintenance event: {error}"
-                        ))
-                    })?;
+                crate::event_sink::resolve_event_delivery(
+                    sink.as_ref(),
+                    sink.record_execution_resource_maintenance(maintenance),
+                )
+                .map_err(|error| {
+                    FerrumError::backend(format!(
+                        "vNext execution resource maintenance event: {error}"
+                    ))
+                })?;
                 Ok(None)
             }
             DynamicDeferredMaintenanceOutcome::WaitForRelease {
@@ -8192,8 +8195,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 Ok(attribution) => {
                     let sink = self.event_sink.read().clone();
                     if let Some(sink) = sink {
-                        if let Err(error) = sink.record_device_submission_attribution(&attribution)
-                        {
+                        if let Err(error) = crate::event_sink::resolve_event_delivery(
+                            sink.as_ref(),
+                            sink.record_device_submission_attribution(&attribution),
+                        ) {
                             execution_event_error.get_or_insert_with(|| error.to_string());
                         }
                     }
@@ -8208,9 +8213,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         ) {
             let sink = self.event_sink.read().clone();
             if let Some(sink) = sink {
-                if let Err(error) =
-                    sink.record_physical_device_submission_timing(receipt.completion())
-                {
+                if let Err(error) = crate::event_sink::resolve_event_delivery(
+                    sink.as_ref(),
+                    sink.record_physical_device_submission_timing(receipt.completion()),
+                ) {
                     execution_event_error.get_or_insert_with(|| error.to_string());
                 }
             }

@@ -6,6 +6,7 @@ use super::*;
 use crate::token_execution::*;
 
 pub mod lifecycle;
+pub mod observability;
 pub mod sampling;
 pub mod startup;
 pub mod token_execution;

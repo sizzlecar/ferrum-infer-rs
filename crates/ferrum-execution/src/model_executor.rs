@@ -26,8 +26,8 @@ pub use prefix_capture::{
 };
 pub use prefix_restore::{
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
-    PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
-    PrefixRestoreObservation, PrefixRestoreSource,
+    PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreAcknowledgement,
+    PrefixRestoreDecision, PrefixRestoreObservation, PrefixRestoreSource,
 };
 
 /// One model-owned KV slot reservation request.

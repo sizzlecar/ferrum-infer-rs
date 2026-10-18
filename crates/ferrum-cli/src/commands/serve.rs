@@ -304,7 +304,7 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
-    /// Product observability detail level. Basic without artifact paths collects timing metrics only.
+    /// Profile detail. Basic without paths collects metrics only; replay/verify/full require complete artifacts.
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 

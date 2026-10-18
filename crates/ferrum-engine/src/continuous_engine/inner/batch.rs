@@ -52,7 +52,7 @@ impl EngineInner {
             observed_free_blocks,
         ) {
             Ok((victim_requeued, aborted_ordinal, closed_ordinal)) => {
-                self.write_scheduler_trace_event(serde_json::json!({
+                self.write_scheduler_trace_event(|| serde_json::json!({
                     "event": "scheduler_pressure_yield_aborted",
                     "episode_id": transaction.episode_id().get(),
                     "handoff_generation": transaction.handoff_generation(),
@@ -102,15 +102,17 @@ impl EngineInner {
                     error,
                 )
             })?;
-        self.write_scheduler_trace_event(serde_json::json!({
-            "event": "scheduler_pressure_release_fence_armed",
-            "episode_id": transaction.episode_id().get(),
-            "handoff_generation": transaction.handoff_generation(),
-            "victim_request_id": transaction.victim_request_id(),
-            "progress_owner_id": transaction.progress_owner_id(),
-            "transition_ordinal": armed.get(),
-            "physical_release_completed": false,
-        }));
+        self.write_scheduler_trace_event(|| {
+            serde_json::json!({
+                "event": "scheduler_pressure_release_fence_armed",
+                "episode_id": transaction.episode_id().get(),
+                "handoff_generation": transaction.handoff_generation(),
+                "victim_request_id": transaction.victim_request_id(),
+                "progress_owner_id": transaction.progress_owner_id(),
+                "transition_ordinal": armed.get(),
+                "physical_release_completed": false,
+            })
+        });
         // The independent close task retains the original slot and transaction if
         // this caller is cancelled. Its first result is not an Ended attestation.
         let first = ticket.initial_result().await;

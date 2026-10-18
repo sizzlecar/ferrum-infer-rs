@@ -103,7 +103,7 @@ impl RestoreState {
                 assert_eq!(checkpoint.status(), PrefixCaptureStatus::Ready);
                 let frontier = tokens.restore_frontier(&sequence, checkpoint.boundary())?;
                 state.acknowledged.lock().push(id);
-                Ok(frontier)
+                Ok(ferrum_execution::model_executor::PrefixRestoreAcknowledgement::new(frontier))
             },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)

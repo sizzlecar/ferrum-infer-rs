@@ -238,15 +238,17 @@ impl EngineInner {
                         deferral.capacity(),
                         &release,
                     )?;
-                    self.write_scheduler_trace_event(serde_json::json!({
-                        "event": "scheduler_prefix_restore_capacity",
-                        "request_id": request_id,
-                        "candidate_prefix_tokens": deferral.checkpoint().boundary(),
-                        "retained": retained,
-                        "stage": deferral.capacity().stage(),
-                        "wait_condition": deferral.capacity().wait_condition(),
-                        "typed_evidence": deferral.capacity().evidence(),
-                    }));
+                    self.write_scheduler_trace_event(|| {
+                        serde_json::json!({
+                            "event": "scheduler_prefix_restore_capacity",
+                            "request_id": request_id,
+                            "candidate_prefix_tokens": deferral.checkpoint().boundary(),
+                            "retained": retained,
+                            "stage": deferral.capacity().stage(),
+                            "wait_condition": deferral.capacity().wait_condition(),
+                            "typed_evidence": deferral.capacity().evidence(),
+                        })
+                    });
                     if retained {
                         self.prefix_restore_pending.lock().insert(
                             request_id,
@@ -316,7 +318,8 @@ impl EngineInner {
                 // The actual native acknowledgement opens the execution gate.
                 // Publish its frontier before a fallible scheduler transition:
                 // failure closes this incarnation, never replays from zero.
-                let frontier = output.acknowledge_tokens()?;
+                let acknowledgement = output.acknowledge_tokens()?;
+                let frontier = acknowledgement.frontier;
                 if frontier.sequence() != &incarnation
                     || frontier.consumed_tokens() != restored_tokens
                 {
@@ -326,6 +329,9 @@ impl EngineInner {
                 }
                 sequence.execution_frontier = Some(frontier);
                 sequence.prefill_tokens_processed = restored_tokens;
+                if let Some(error) = acknowledgement.error {
+                    return Err(error);
+                }
                 self.scheduler
                     .commit_prefix_restored(prepared, restored_tokens)
             })();
@@ -347,18 +353,20 @@ impl EngineInner {
                 ProfileEventKind::TimedSpan,
                 ProfileStatus::Ok,
                 Some(duration_to_us(started.elapsed())),
-                BTreeMap::from([
-                    (
-                        "restored_tokens".to_string(),
-                        serde_json::json!(restored_tokens),
-                    ),
-                    (
-                        "prompt_tokens".to_string(),
-                        serde_json::json!(prompt_tokens),
-                    ),
-                ]),
-                BTreeMap::new(),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "restored_tokens".to_string(),
+                            serde_json::json!(restored_tokens),
+                        ),
+                        (
+                            "prompt_tokens".to_string(),
+                            serde_json::json!(prompt_tokens),
+                        ),
+                    ]),
+                    attributes: BTreeMap::new(),
+                    error: None,
+                },
             );
         }
         Ok(())

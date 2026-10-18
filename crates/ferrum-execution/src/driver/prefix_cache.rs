@@ -1303,7 +1303,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 .prefix_cache
                 .misses
                 .fetch_add(1, Ordering::Relaxed);
-            observer.record(PrefixRestoreDecision::NoReusableEntry);
+            observer.record(PrefixRestoreDecision::NoReusableEntry)?;
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
         let (slot, sequence) = self
@@ -1327,7 +1327,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let restored_tokens = checkpoint.completed_tokens();
         let work = prefix_restore_extension_work(checkpoint.token_prefix())?;
         let capacity = self.extend_sequence_with_capacity(&sequence, work)?;
-        if !observer.capacity_ready(restored_tokens, &capacity) {
+        if !observer.capacity_ready(restored_tokens, &capacity)? {
             execution.restore_ready()?;
             return Ok(match capacity {
                 VNextExecutionCapacityDecision::Deferred(capacity) => {
@@ -1376,7 +1376,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 execution.restore_ready()?;
                 observer.record(PrefixRestoreDecision::NativeRestoreSkipped {
                     candidate_prefix_tokens: restored_tokens,
-                });
+                })?;
                 return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
             }
             Some(NativeCheckpointResult::Restored(publication)) => publication,

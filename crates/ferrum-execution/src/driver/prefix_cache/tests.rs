@@ -988,7 +988,9 @@ fn restore_metrics_wait_for_consuming_ack_and_ignore_cancelled_or_dropped_output
                         return Err(FerrumError::cancelled("exact restore target was cancelled"));
                     }
                     publication.acknowledge();
-                    issuer.frontier(&sequence, restored)
+                    issuer
+                        .frontier(&sequence, restored)
+                        .map(crate::model_executor::PrefixRestoreAcknowledgement::new)
                 })
             },
         )
@@ -1008,8 +1010,13 @@ fn restore_metrics_wait_for_consuming_ack_and_ignore_cancelled_or_dropped_output
     cancelled.store(false, Ordering::Release);
     let pending = output(3, 4).unwrap();
     assert_eq!(metrics.hits.load(Ordering::Relaxed), 0);
-    pending.acknowledge_tokens().unwrap();
-    output(2, 4).unwrap().acknowledge_tokens().unwrap();
+    assert!(pending.acknowledge_tokens().unwrap().error.is_none());
+    assert!(output(2, 4)
+        .unwrap()
+        .acknowledge_tokens()
+        .unwrap()
+        .error
+        .is_none());
     assert_eq!(metrics.hits.load(Ordering::Relaxed), 2);
     assert_eq!(metrics.saved_prefill_tokens.load(Ordering::Relaxed), 5);
     assert_eq!(metrics.misses.load(Ordering::Relaxed), 0);

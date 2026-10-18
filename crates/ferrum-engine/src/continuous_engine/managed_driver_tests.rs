@@ -343,7 +343,21 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
     assert!(report.result().is_err());
     assert!(report.retains_unproved_owners());
     assert!(fixture.identity.observed_end().is_none());
-    assert_eq!(closure::slot_events(&fixture, ResourceAction::Release), 0);
+    // Diagnostic writers finish even when the report retains an unresolved
+    // execution owner. Read their actual flushed output without reopening them.
+    assert!(!report.journal_deliveries().is_empty());
+    for delivery in report.journal_deliveries() {
+        assert!(delivery.stats.worker_finished);
+        assert_eq!(delivery.stats.pending_payload_bytes, 0);
+        assert_eq!(delivery.stats.accepted, delivery.stats.flushed);
+    }
+    assert_eq!(
+        fixture::closed_slot_events(
+            &fixture.trace.path().join("trace.jsonl"),
+            ResourceAction::Release,
+        ),
+        0
+    );
     assert_eq!(fixture.model.lock().model.kv_caches.len(), 1);
     drop(observer);
     drop(fixture.engine);
@@ -432,3 +446,9 @@ mod output;
 
 #[path = "managed_driver_tests/semantic.rs"]
 mod semantic;
+
+#[path = "managed_driver_tests/trace_lazy.rs"]
+mod trace_lazy;
+
+#[path = "managed_driver_tests/observability.rs"]
+mod observability;

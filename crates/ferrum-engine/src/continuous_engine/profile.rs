@@ -68,98 +68,8 @@ struct VNextProfileEventContext {
     capture_policy: ExecutionEventCapturePolicy,
 }
 
-#[derive(Clone)]
-struct DeferredVNextProfileEvent {
-    event: ExecutionEvent,
-    timestamp: chrono::DateTime<chrono::Utc>,
-    context: Arc<VNextProfileEventContext>,
-}
-
-enum SchedulerTraceRecord {
-    Profile(FerrumProfileEvent),
-    DeferredVNext(DeferredVNextProfileEvent),
-}
-
-impl serde::Serialize for SchedulerTraceRecord {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Profile(event) => serde::Serialize::serialize(event, serializer),
-            Self::DeferredVNext(record) => {
-                let event = record
-                    .context
-                    .profile_event(&record.event, record.timestamp.to_owned())
-                    .map_err(serde::ser::Error::custom)?;
-                serde::Serialize::serialize(&event, serializer)
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct SchedulerTraceJournal {
-    inner: JsonlJournal<SchedulerTraceRecord>,
-}
-
-impl SchedulerTraceJournal {
-    pub(super) fn create(path: impl Into<PathBuf>) -> std::io::Result<Self> {
-        JsonlJournal::create(path).map(|inner| Self { inner })
-    }
-
-    pub(super) fn enqueue(
-        &self,
-        event: FerrumProfileEvent,
-    ) -> std::result::Result<(), JsonlJournalError> {
-        self.inner.enqueue(SchedulerTraceRecord::Profile(event))
-    }
-
-    pub(super) fn enqueue_batch(
-        &self,
-        events: Vec<FerrumProfileEvent>,
-    ) -> std::result::Result<(), JsonlJournalError> {
-        self.inner.enqueue_batch(
-            events
-                .into_iter()
-                .map(SchedulerTraceRecord::Profile)
-                .collect(),
-        )
-    }
-
-    fn enqueue_deferred_vnext(
-        &self,
-        event: DeferredVNextProfileEvent,
-    ) -> std::result::Result<(), JsonlJournalError> {
-        self.inner
-            .enqueue(SchedulerTraceRecord::DeferredVNext(event))
-    }
-
-    fn enqueue_deferred_vnext_batch(
-        &self,
-        events: Vec<DeferredVNextProfileEvent>,
-    ) -> std::result::Result<(), JsonlJournalError> {
-        self.inner.enqueue_batch(
-            events
-                .into_iter()
-                .map(SchedulerTraceRecord::DeferredVNext)
-                .collect(),
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn flush(&self) -> std::result::Result<(), JsonlJournalError> {
-        self.inner.flush()
-    }
-
-    pub(super) fn close(&self) -> std::result::Result<(), JsonlJournalError> {
-        self.inner.close()
-    }
-
-    pub(super) fn path(&self) -> &Path {
-        self.inner.path()
-    }
-}
+mod journal;
+pub(super) use journal::*;
 
 pub(super) struct VNextProfileExecutionEventSink {
     journals: Box<[SchedulerTraceJournal]>,
@@ -286,49 +196,26 @@ impl VNextProfileExecutionEventSink {
         &self,
         events: Vec<FerrumProfileEvent>,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
+        // Validate the complete projection before any destination can accept
+        // part of it. Queue workers only serialize already-validated data.
+        let records = SchedulerTraceJournal::validated_records(events)?;
+        let mut first_error = None;
         for journal in &self.journals {
-            journal.enqueue_batch(events.clone()).map_err(|error| {
-                ExecutionEventSinkError::new(format!(
-                    "enqueue vNext profile events to {}: {error}",
-                    journal.path().display()
-                ))
-            })?;
+            // The immutable payload is shared; fanout never deep-copies its
+            // execution identity, tensors' metadata, or profile maps.
+            if let Err(error) = journal.enqueue_validated(records.clone()) {
+                if first_error
+                    .as_ref()
+                    .is_none_or(|first: &ExecutionEventSinkError| {
+                        first.kind() == ferrum_runtime::ExecutionEventSinkErrorKind::Transport
+                            && error.kind() == ferrum_runtime::ExecutionEventSinkErrorKind::Contract
+                    })
+                {
+                    first_error = Some(error);
+                }
+            }
         }
-        Ok(())
-    }
-
-    fn enqueue_deferred_event(
-        &self,
-        event: DeferredVNextProfileEvent,
-    ) -> std::result::Result<(), ExecutionEventSinkError> {
-        for journal in &self.journals {
-            journal
-                .enqueue_deferred_vnext(event.clone())
-                .map_err(|error| {
-                    ExecutionEventSinkError::new(format!(
-                        "enqueue deferred vNext profile event to {}: {error}",
-                        journal.path().display()
-                    ))
-                })?;
-        }
-        Ok(())
-    }
-
-    fn enqueue_deferred_batch(
-        &self,
-        events: Vec<DeferredVNextProfileEvent>,
-    ) -> std::result::Result<(), ExecutionEventSinkError> {
-        for journal in &self.journals {
-            journal
-                .enqueue_deferred_vnext_batch(events.clone())
-                .map_err(|error| {
-                    ExecutionEventSinkError::new(format!(
-                        "enqueue deferred vNext profile batch to {}: {error}",
-                        journal.path().display()
-                    ))
-                })?;
-        }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1638,22 +1525,19 @@ impl VNextProfileExecutionEventSink {
             return Ok(());
         }
         let timestamp = chrono::Utc::now();
-        let mut deferred = Vec::new();
-        deferred.try_reserve(events.len()).map_err(|error| {
-            ExecutionEventSinkError::new(format!("reserve deferred vNext profile batch: {error}"))
-        })?;
-        for event in events {
-            deferred.push(DeferredVNextProfileEvent {
-                event,
-                timestamp,
-                context: Arc::clone(&self.context),
-            });
-        }
-        self.enqueue_deferred_batch(deferred)
+        let projected = events
+            .iter()
+            .map(|event| self.context.profile_event(event, timestamp))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.enqueue_profile_batch(projected)
     }
 }
 
 impl ExecutionEventSink for VNextProfileExecutionEventSink {
+    fn delivery_policy(&self) -> ferrum_runtime::ExecutionEventDeliveryPolicy {
+        observation_delivery_policy(self.context.profile_detail)
+    }
+
     fn enablement(&self) -> ferrum_runtime::ExecutionEventSinkEnablement {
         ferrum_runtime::ExecutionEventSinkEnablement::All
     }
@@ -1733,12 +1617,10 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         &self,
         permit: EventEmissionPermit,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        let event = DeferredVNextProfileEvent {
-            event: permit.into_event(),
-            timestamp: chrono::Utc::now(),
-            context: Arc::clone(&self.context),
-        };
-        self.enqueue_deferred_event(event)
+        let event = self
+            .context
+            .profile_event(&permit.into_event(), chrono::Utc::now())?;
+        self.enqueue_profile_batch(vec![event])
     }
 
     fn record_batch(
@@ -1816,60 +1698,7 @@ impl ProductExecutionEventSink for VNextProfileExecutionEventSink {
     }
 }
 
+#[cfg(test)]
 pub(super) fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<SchedulerTraceJournal> {
-    let path = path?;
-    match SchedulerTraceJournal::create(path.to_path_buf()) {
-        Ok(journal) => Some(journal),
-        Err(error) => {
-            warn!(
-                "Failed to open scheduler trace JSONL {}: {}",
-                path.display(),
-                error
-            );
-            None
-        }
-    }
-}
-
-pub(super) fn create_legacy_scheduler_trace_sink(
-    path: Option<&Path>,
-) -> Option<Arc<Mutex<std::fs::File>>> {
-    let path = path?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                warn!(
-                    "Failed to create legacy scheduler trace directory {}: {}",
-                    parent.display(),
-                    error
-                );
-                return None;
-            }
-        }
-    }
-    if let Err(error) = std::fs::remove_file(path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            warn!(
-                "Failed to clear legacy scheduler trace JSONL {}: {}",
-                path.display(),
-                error
-            );
-            return None;
-        }
-    }
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(file) => Some(Arc::new(Mutex::new(file))),
-        Err(error) => {
-            warn!(
-                "Failed to open legacy scheduler trace JSONL {}: {}",
-                path.display(),
-                error
-            );
-            None
-        }
-    }
+    SchedulerTraceJournal::create(path?.to_path_buf()).ok()
 }

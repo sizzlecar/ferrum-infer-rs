@@ -134,6 +134,12 @@ fn scheduler_trace_distribution(mut values: Vec<usize>) -> SchedulerTraceDistrib
     }
 }
 
+struct SchedulerProfileFields {
+    shape: BTreeMap<String, serde_json::Value>,
+    attributes: BTreeMap<String, serde_json::Value>,
+    error: Option<ProfileError>,
+}
+
 impl EngineInner {
     fn write_executor_scheduler_profile_event(
         &self,
@@ -142,13 +148,18 @@ impl EngineInner {
         event_kind: ProfileEventKind,
         status: ProfileStatus,
         duration_us: Option<u64>,
-        shape: BTreeMap<String, serde_json::Value>,
-        mut attributes: BTreeMap<String, serde_json::Value>,
-        error: Option<ProfileError>,
+        build_fields: impl FnOnce() -> SchedulerProfileFields,
     ) {
         let Some(sink) = &self.scheduler_trace_jsonl else {
             return;
         };
+        #[cfg(test)]
+        self.trace_payload_builds.fetch_add(1, Ordering::Relaxed);
+        let SchedulerProfileFields {
+            shape,
+            mut attributes,
+            error,
+        } = build_fields();
         let entrypoint = self.trace_entrypoint();
         attributes.insert(
             "actual_model_smoke".to_string(),
@@ -197,11 +208,13 @@ impl EngineInner {
             attributes,
         };
         if let Err(error) = event.validate() {
-            warn!("Skipping invalid executor admission trace event: {}", error);
+            self.report_observation_failure(ExecutionEventSinkError::contract(format!(
+                "invalid executor admission trace event: {error}"
+            )));
             return;
         }
         if let Err(error) = sink.enqueue(event) {
-            warn!("Failed to enqueue executor admission trace: {}", error);
+            self.report_observation_failure(error);
         }
     }
 
@@ -287,35 +300,37 @@ impl EngineInner {
                 ProfileStatus::Ok
             },
             None,
-            BTreeMap::from([
-                ("decision".to_string(), serde_json::json!(decision)),
-                (
-                    "blocker_count".to_string(),
-                    serde_json::json!(blocker_count),
-                ),
-                (
-                    "input_token_count".to_string(),
-                    serde_json::json!(trace.input_token_count),
-                ),
-                (
-                    "maximum_sequence_tokens".to_string(),
-                    serde_json::json!(trace.maximum_sequence_tokens),
-                ),
-                (
-                    "execution_authority_retained".to_string(),
-                    serde_json::json!(retained),
-                ),
-                (
-                    "maintenance_required".to_string(),
-                    serde_json::json!(maintenance),
-                ),
-                (
-                    "prefill_submit_observed".to_string(),
-                    serde_json::json!(false),
-                ),
-            ]),
-            BTreeMap::from([("admission_evidence".to_string(), evidence)]),
-            error,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([
+                    ("decision".to_string(), serde_json::json!(decision)),
+                    (
+                        "blocker_count".to_string(),
+                        serde_json::json!(blocker_count),
+                    ),
+                    (
+                        "input_token_count".to_string(),
+                        serde_json::json!(trace.input_token_count),
+                    ),
+                    (
+                        "maximum_sequence_tokens".to_string(),
+                        serde_json::json!(trace.maximum_sequence_tokens),
+                    ),
+                    (
+                        "execution_authority_retained".to_string(),
+                        serde_json::json!(retained),
+                    ),
+                    (
+                        "maintenance_required".to_string(),
+                        serde_json::json!(maintenance),
+                    ),
+                    (
+                        "prefill_submit_observed".to_string(),
+                        serde_json::json!(false),
+                    ),
+                ]),
+                attributes: BTreeMap::from([("admission_evidence".to_string(), evidence)]),
+                error: error,
+            },
         );
     }
 
@@ -323,6 +338,9 @@ impl EngineInner {
         &self,
         observation: ExecutorAdmissionQueueObservation,
     ) {
+        if self.scheduler_trace_jsonl.is_none() {
+            return;
+        }
         let epochs = |value: AdmissionWakeEpochs| {
             serde_json::json!({
                 "coordinator_id": value.coordinator_id().get(),
@@ -344,23 +362,25 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("waiting_for_owner"),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "allocator_domain": domain,
-                        "progress_owner_id": progress_owner_id,
-                        "observed_release_epoch": observed_release_epoch,
-                        "current_release_epoch": current_release_epoch,
-                    }),
-                )]),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("waiting_for_owner"),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "allocator_domain": domain,
+                            "progress_owner_id": progress_owner_id,
+                            "observed_release_epoch": observed_release_epoch,
+                            "current_release_epoch": current_release_epoch,
+                        }),
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::AllocatorCapacitySkippedUnchanged {
                 request_id,
@@ -379,26 +399,28 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!(if current_release_epoch > observed_release_epoch {
-                            "release_observed"
-                        } else {
-                            "skipped_unchanged"
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!(if current_release_epoch > observed_release_epoch {
+                                "release_observed"
+                            } else {
+                                "skipped_unchanged"
+                            }),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "allocator_domain": domain,
+                            "observed_release_epoch": observed_release_epoch,
+                            "current_release_epoch": current_release_epoch,
                         }),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "allocator_domain": domain,
-                        "observed_release_epoch": observed_release_epoch,
-                        "current_release_epoch": current_release_epoch,
-                    }),
-                )]),
-                None,
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::PressureHoldReleased {
                 episode_id,
@@ -417,46 +439,48 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    ("decision".to_string(), serde_json::json!(reason.as_str())),
-                    (
-                        "episode_id".to_string(),
-                        serde_json::json!(episode_id.get()),
-                    ),
-                    (
-                        "transition_ordinal".to_string(),
-                        serde_json::json!(transition_ordinal.get()),
-                    ),
-                    ("waiting_ticket".to_string(), serde_json::json!(ticket)),
-                    (
-                        "progress_owner_id".to_string(),
-                        serde_json::json!(progress_owner_id.0),
-                    ),
-                    (
-                        "progress_baseline".to_string(),
-                        serde_json::json!(progress_baseline.get()),
-                    ),
-                    (
-                        "progress_current".to_string(),
-                        serde_json::json!(progress_current.get()),
-                    ),
-                    (
-                        "previous_wait_condition".to_string(),
-                        serde_json::json!(previous_wait_condition),
-                    ),
-                    (
-                        "current_wait_condition".to_string(),
-                        serde_json::json!(current_wait_condition),
-                    ),
-                    ("admission_eligible".to_string(), serde_json::json!(true)),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                ]),
-                BTreeMap::new(),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        ("decision".to_string(), serde_json::json!(reason.as_str())),
+                        (
+                            "episode_id".to_string(),
+                            serde_json::json!(episode_id.get()),
+                        ),
+                        (
+                            "transition_ordinal".to_string(),
+                            serde_json::json!(transition_ordinal.get()),
+                        ),
+                        ("waiting_ticket".to_string(), serde_json::json!(ticket)),
+                        (
+                            "progress_owner_id".to_string(),
+                            serde_json::json!(progress_owner_id.0),
+                        ),
+                        (
+                            "progress_baseline".to_string(),
+                            serde_json::json!(progress_baseline.get()),
+                        ),
+                        (
+                            "progress_current".to_string(),
+                            serde_json::json!(progress_current.get()),
+                        ),
+                        (
+                            "previous_wait_condition".to_string(),
+                            serde_json::json!(previous_wait_condition),
+                        ),
+                        (
+                            "current_wait_condition".to_string(),
+                            serde_json::json!(current_wait_condition),
+                        ),
+                        ("admission_eligible".to_string(), serde_json::json!(true)),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                    ]),
+                    attributes: BTreeMap::new(),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::SkippedUnchanged {
                 request_id,
@@ -469,28 +493,30 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("skipped_unchanged"),
-                    ),
-                    ("waiting_ticket".to_string(), serde_json::json!(ticket)),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                    }),
-                )]),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("skipped_unchanged"),
+                        ),
+                        ("waiting_ticket".to_string(), serde_json::json!(ticket)),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                        }),
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
                 request_id,
@@ -503,28 +529,30 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("skipped_unchanged"),
-                    ),
-                    (
-                        "decode_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("skipped_unchanged"),
+                        ),
+                        (
+                            "decode_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
+                        }),
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::DecodeResumed {
                 request_id,
@@ -539,40 +567,42 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!(if exact_source_changed {
-                            "exact_source_changed"
-                        } else {
-                            "policy_epoch_changed"
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!(if exact_source_changed {
+                                "exact_source_changed"
+                            } else {
+                                "policy_epoch_changed"
+                            }),
+                        ),
+                        (
+                            "exact_source_changed".to_string(),
+                            serde_json::json!(exact_source_changed),
+                        ),
+                        (
+                            "policy_epoch_changed".to_string(),
+                            serde_json::json!(policy_epoch_changed),
+                        ),
+                        (
+                            "decode_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
                         }),
-                    ),
-                    (
-                        "exact_source_changed".to_string(),
-                        serde_json::json!(exact_source_changed),
-                    ),
-                    (
-                        "policy_epoch_changed".to_string(),
-                        serde_json::json!(policy_epoch_changed),
-                    ),
-                    (
-                        "decode_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::PrefillSkippedUnchanged {
                 request_id,
@@ -585,28 +615,30 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("skipped_unchanged"),
-                    ),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("skipped_unchanged"),
+                        ),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
+                        }),
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::PrefillResumed {
                 request_id,
@@ -621,40 +653,42 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!(if exact_source_changed {
-                            "exact_source_changed"
-                        } else {
-                            "policy_epoch_changed"
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!(if exact_source_changed {
+                                "exact_source_changed"
+                            } else {
+                                "policy_epoch_changed"
+                            }),
+                        ),
+                        (
+                            "exact_source_changed".to_string(),
+                            serde_json::json!(exact_source_changed),
+                        ),
+                        (
+                            "policy_epoch_changed".to_string(),
+                            serde_json::json!(policy_epoch_changed),
+                        ),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
                         }),
-                    ),
-                    (
-                        "exact_source_changed".to_string(),
-                        serde_json::json!(exact_source_changed),
-                    ),
-                    (
-                        "policy_epoch_changed".to_string(),
-                        serde_json::json!(policy_epoch_changed),
-                    ),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                    )]),
+                    error: None,
+                },
             ),
         }
     }
@@ -830,15 +864,17 @@ impl EngineInner {
                 ProfileStatus::Ok
             },
             Some(duration_to_us(elapsed)),
-            BTreeMap::from([
-                ("outcome".to_string(), serde_json::json!(outcome_name)),
-                (
-                    "duration_us".to_string(),
-                    serde_json::json!(duration_to_us(elapsed)),
-                ),
-            ]),
-            BTreeMap::from([("maintenance_evidence".to_string(), evidence)]),
-            error,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([
+                    ("outcome".to_string(), serde_json::json!(outcome_name)),
+                    (
+                        "duration_us".to_string(),
+                        serde_json::json!(duration_to_us(elapsed)),
+                    ),
+                ]),
+                attributes: BTreeMap::from([("maintenance_evidence".to_string(), evidence)]),
+                error: error,
+            },
         );
     }
 
@@ -1036,16 +1072,18 @@ impl EngineInner {
             Arc::clone(&self.work_notify),
             slot,
         )?;
-        self.write_scheduler_trace_event(serde_json::json!({
-            "event": "scheduler_execution_request_state_defer",
-            "ticket_id": ticket_id,
-            "request_ids": deferral.request_ids(),
-            "stage": deferral.stage(),
-            "observed_change_epoch": deferral.hazard().observed_change_epoch(),
-            "blockers": deferral.hazard().blockers(),
-            "pending_waiters": self.execution_readiness_waiters.pending_count(),
-            "scheduler": self.scheduler.trace_snapshot(),
-        }));
+        self.write_scheduler_trace_event(|| {
+            serde_json::json!({
+                "event": "scheduler_execution_request_state_defer",
+                "ticket_id": ticket_id,
+                "request_ids": deferral.request_ids(),
+                "stage": deferral.stage(),
+                "observed_change_epoch": deferral.hazard().observed_change_epoch(),
+                "blockers": deferral.hazard().blockers(),
+                "pending_waiters": self.execution_readiness_waiters.pending_count(),
+                "scheduler": self.scheduler.trace_snapshot(),
+            })
+        });
         Ok(())
     }
 
@@ -1081,6 +1119,8 @@ impl EngineInner {
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> SchedulerTracePlanStats {
+        #[cfg(test)]
+        self.trace_payload_builds.fetch_add(1, Ordering::Relaxed);
         let mut stats = SchedulerTracePlanStats {
             batch_size: batch.size(),
             ..SchedulerTracePlanStats::default()
@@ -1165,18 +1205,25 @@ impl EngineInner {
 
     pub(in crate::continuous_engine) fn write_scheduler_trace_event(
         &self,
-        event: serde_json::Value,
+        build_event: impl FnOnce() -> serde_json::Value,
     ) {
-        let Some(file) = &self.legacy_scheduler_trace_jsonl else {
+        let Some(journal) = &self.legacy_scheduler_trace_jsonl else {
             return;
         };
-        let mut file = file.lock();
-        if let Err(error) = serde_json::to_writer(&mut *file, &event) {
-            warn!("Failed to write scheduler trace event: {}", error);
-            return;
-        }
-        if let Err(error) = file.write_all(b"\n") {
-            warn!("Failed to terminate scheduler trace event: {}", error);
+        #[cfg(test)]
+        self.trace_payload_builds.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = journal.try_enqueue(build_event()) {
+            let message = format!("enqueue scheduler trace: {error}");
+            let error = if matches!(
+                error.kind(),
+                ferrum_bench_core::JsonlJournalErrorKind::Encoding
+                    | ferrum_bench_core::JsonlJournalErrorKind::Panic
+            ) {
+                ExecutionEventSinkError::contract(message)
+            } else {
+                ExecutionEventSinkError::transport(message)
+            };
+            self.report_observation_failure(error);
         }
     }
 
@@ -1333,21 +1380,23 @@ impl EngineInner {
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
                     if none_streak <= 4 || none_streak.is_multiple_of(128) {
-                        self.write_scheduler_trace_event(serde_json::json!({
-                            "event": "scheduler_iteration",
-                            "iteration": iteration,
-                            "result": "none",
-                            "none_streak": none_streak,
-                            "hint": {
-                                "max_batch_size": hint_max_batch_size,
-                                "max_tokens": hint_max_tokens,
-                            },
-                            "scheduler_before": trace_scheduler_before.as_ref(),
-                            "scheduler_after_schedule": self.scheduler.trace_snapshot(),
-                            "timing_us": {
-                                "schedule": duration_to_us(sched_elapsed),
-                            },
-                        }));
+                        self.write_scheduler_trace_event(|| {
+                            serde_json::json!({
+                                "event": "scheduler_iteration",
+                                "iteration": iteration,
+                                "result": "none",
+                                "none_streak": none_streak,
+                                "hint": {
+                                    "max_batch_size": hint_max_batch_size,
+                                    "max_tokens": hint_max_tokens,
+                                },
+                                "scheduler_before": trace_scheduler_before.as_ref(),
+                                "scheduler_after_schedule": self.scheduler.trace_snapshot(),
+                                "timing_us": {
+                                    "schedule": duration_to_us(sched_elapsed),
+                                },
+                            })
+                        });
                     }
                 }
                 {
@@ -1443,7 +1492,7 @@ impl EngineInner {
         if trace_enabled {
             let prefill_tokens_after = self.total_prefill_tokens.load(Ordering::Relaxed);
             let decode_tokens_after = self.total_decode_tokens.load(Ordering::Relaxed);
-            self.write_scheduler_trace_event(serde_json::json!({
+            self.write_scheduler_trace_event(|| serde_json::json!({
                 "event": "scheduler_iteration",
                 "iteration": iteration,
                 "result": if r.is_ok() { "some_ok" } else { "some_error" },

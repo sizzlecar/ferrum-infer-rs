@@ -113,7 +113,9 @@ pub fn assert_token_ack_preserves_incarnation<R: DeviceRuntime>(
     assert_eq!(output.token_sequence(), &target.token_identity);
     assert_eq!(target.prefill_tokens_processed.load(Ordering::Acquire), 0);
     assert_eq!(metrics.hits.load(Ordering::Acquire), 0);
-    let frontier = output.acknowledge_tokens().unwrap();
+    let acknowledged = output.acknowledge_tokens().unwrap();
+    assert!(acknowledged.error.is_none());
+    let frontier = acknowledged.frontier;
     assert_eq!(frontier.sequence(), &target.token_identity);
     assert_eq!(frontier.consumed_tokens(), boundary);
     assert_eq!(
