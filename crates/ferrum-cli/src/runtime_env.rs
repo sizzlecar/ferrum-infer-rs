@@ -7,6 +7,15 @@
 
 use ferrum_types::{RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource};
 
+/// Reject retired controls before source resolution or device preparation.
+pub fn capture_supported_runtime_environment() -> ferrum_types::Result<RuntimeConfigSnapshot> {
+    let snapshot = RuntimeConfigSnapshot::capture_current();
+    snapshot
+        .validate_retired_options()
+        .map_err(|(key, reason)| ferrum_types::FerrumError::config(format!("{key}: {reason}")))?;
+    Ok(snapshot)
+}
+
 pub fn push_cli_runtime_entry(
     entries: &mut Vec<RuntimeConfigEntry>,
     key: &str,

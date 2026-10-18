@@ -2,7 +2,7 @@ use super::*;
 use ferrum_interfaces::vnext::{DeviceTimingMode, ExecutionEventSinkEnablement};
 
 #[test]
-fn basic_metrics_only_attaches_to_target_and_draft_without_journals() {
+fn basic_metrics_only_attaches_to_target_without_journals() {
     for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
         for detail in [
             ObservabilityProfileDetail::Off,
@@ -12,7 +12,6 @@ fn basic_metrics_only_attaches_to_target_and_draft_without_journals() {
             config.runtime.profile_detail = detail;
             config.runtime.profile_entrypoint = Some(entrypoint);
             let target = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-            let draft = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
             let engine = ContinuousBatchEngine::new_with_resource_composition(
                 config.clone(),
                 Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
@@ -21,18 +20,14 @@ fn basic_metrics_only_attaches_to_target_and_draft_without_journals() {
                 EngineResourceComposition::PlanRuntime,
                 target.clone(),
                 Arc::new(MockTensorFactory),
-                Some(draft.clone()),
-                Some(crate::speculative::SpeculativeDecodingConfig::default()),
             )
             .unwrap();
             assert!(engine.inner.profile_trace_jsonl.is_none());
             assert!(engine.inner.scheduler_trace_jsonl.is_none());
-            for executor in [&target, &draft] {
-                let attached = executor.event_sink.lock().unwrap();
-                if detail == ObservabilityProfileDetail::Off {
-                    assert!(attached.is_none());
-                    continue;
-                }
+            let attached = target.event_sink.lock().unwrap();
+            if detail == ObservabilityProfileDetail::Off {
+                assert!(attached.is_none());
+            } else {
                 let sink = attached
                     .as_ref()
                     .expect("basic must attach timing observer");

@@ -4,17 +4,16 @@
 //!
 //! ## Overview
 //!
-//! This crate provides concrete implementations of the scheduler interfaces defined
-//! in ferrum-interfaces, including:
+//! This crate implements continuous batching using the scheduler contracts defined
+//! in ferrum-interfaces:
 //!
-//! - FIFO scheduler for simple first-come-first-served scheduling
-//! - Priority scheduler for priority-based request handling
-//! - Resource-aware scheduler for optimal resource utilization
-//! - SLA-aware scheduler for meeting service level agreements
+//! - Iteration-level prefill and decode scheduling
+//! - Capacity-aware admission, preemption, and recovery
+//! - Request priorities within the pressure-management policy
+//! - Optional feedback-driven latency targets
 //!
 //! ## Design Principles
 //!
-//! - **Strategy Pattern**: Multiple scheduling algorithms (FIFO, Priority, Fair, etc.)
 //! - **Continuous Batching**: Dynamic request batching for optimal GPU utilization
 //! - **Preemption Support**: Ability to preempt long-running requests
 //! - **SLA Awareness**: Consider latency SLAs and priorities
@@ -22,7 +21,6 @@
 
 pub mod implementations;
 pub mod metrics;
-pub mod queue;
 pub mod vnext;
 
 // Re-exports of interfaces from ferrum-interfaces

@@ -1041,6 +1041,8 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    // Capture user input once, before model selection or device preparation.
+    let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let scheduler_slo = config.resolve_scheduler_slo(cmd.scheduler_slo)?;
     if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
         crate::observability_vertical_slice::write_observability_vertical_slice(
@@ -1088,10 +1090,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         );
         return Ok(());
     }
-
-    // Capture user input once. Inferred startup values never re-enter this
-    // snapshot through the process environment.
-    let user_environment = RuntimeConfigSnapshot::capture_current();
 
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
@@ -3758,7 +3756,6 @@ mod tests {
                 .apply_runtime_config_snapshot(&resolved.runtime_config)
                 .unwrap();
             assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
-            assert!(!engine.runtime.prefix_cache_enabled);
         }
     }
 

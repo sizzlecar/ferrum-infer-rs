@@ -455,30 +455,6 @@ fn min_p_one_keeps_only_tokens_tied_for_maximum() {
 }
 
 #[test]
-fn only_unprocessed_greedy_plan_supports_raw_speculation() {
-    assert!(
-        SamplingConfig::from_params(&SamplingParams::greedy()).supports_raw_greedy_speculation()
-    );
-
-    for params in [
-        SamplingParams {
-            temperature: 1.0,
-            ..SamplingParams::greedy()
-        },
-        SamplingParams {
-            presence_penalty: 0.1,
-            ..SamplingParams::greedy()
-        },
-        SamplingParams {
-            min_p: Some(0.9),
-            ..SamplingParams::greedy()
-        },
-    ] {
-        assert!(!SamplingConfig::from_params(&params).supports_raw_greedy_speculation());
-    }
-}
-
-#[test]
 fn sampling_config_from_params_builds_chain_and_samples() {
     let params = SamplingParams {
         temperature: 0.7,

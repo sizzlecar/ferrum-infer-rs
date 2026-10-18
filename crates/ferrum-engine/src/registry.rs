@@ -194,8 +194,6 @@ impl ComponentRegistry {
         self.register_sampler_factory("greedy", Arc::new(GreedySamplerFactory));
 
         // Scheduler factories
-        self.register_scheduler_factory("fifo", Arc::new(FifoSchedulerFactory));
-        self.register_scheduler_factory("priority", Arc::new(PrioritySchedulerFactory));
         self.register_scheduler_factory("continuous", Arc::new(ContinuousBatchSchedulerFactory));
 
         // KV cache factories
@@ -638,52 +636,6 @@ impl ComponentFactory<Arc<dyn Sampler + Send + Sync>> for GreedySamplerFactory {
 // ----------------------------------------------------------------------------
 // Scheduler Factories
 // ----------------------------------------------------------------------------
-
-/// FIFO scheduler factory
-pub struct FifoSchedulerFactory;
-
-#[async_trait]
-impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for FifoSchedulerFactory {
-    async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn Scheduler + Send + Sync>> {
-        info!("Creating FIFO scheduler");
-        let scheduler_config = config.engine_config.scheduler.clone();
-        let scheduler = ferrum_scheduler::implementations::FifoScheduler::new(scheduler_config);
-        Ok(Arc::new(scheduler))
-    }
-
-    fn metadata(&self) -> ComponentMetadata {
-        ComponentMetadata {
-            name: "fifo".to_string(),
-            version: "0.1.0".to_string(),
-            description: "First-In-First-Out scheduler".to_string(),
-            supported_devices: vec![Device::CPU],
-            capabilities: vec!["simple".to_string(), "fair".to_string()],
-        }
-    }
-}
-
-/// Priority scheduler factory
-pub struct PrioritySchedulerFactory;
-
-#[async_trait]
-impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for PrioritySchedulerFactory {
-    async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn Scheduler + Send + Sync>> {
-        info!("Creating priority scheduler");
-        let scheduler_config = config.engine_config.scheduler.clone();
-        let scheduler = ferrum_scheduler::implementations::PriorityScheduler::new(scheduler_config);
-        Ok(Arc::new(scheduler))
-    }
-
-    fn metadata(&self) -> ComponentMetadata {
-        ComponentMetadata {
-            name: "priority".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Priority-based scheduler".to_string(),
-            supported_devices: vec![Device::CPU],
-            capabilities: vec!["priority".to_string(), "preemption".to_string()],
-        }
-    }
-}
 
 /// Continuous batching scheduler factory
 pub struct ContinuousBatchSchedulerFactory;
@@ -3196,7 +3148,80 @@ pub(crate) mod tests {
         assert!(registry
             .list_samplers()
             .contains(&"multinomial".to_string()));
-        assert!(registry.list_schedulers().contains(&"fifo".to_string()));
+        assert_eq!(registry.list_schedulers(), vec!["continuous".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn retired_scheduler_factories_fail_without_dispatching_continuous() {
+        let registry = ComponentRegistry::with_defaults();
+        let config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for name in ["fifo", "priority"] {
+            assert!(registry.get_scheduler_factory(name).is_none());
+            let error = match registry.create_scheduler(name, &config).await {
+                Ok(_) => panic!("unregistered scheduler name {name} silently selected a factory"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, FerrumError::Scheduler { message } if message.contains(name)));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_scheduler_registration_can_reuse_retired_names() {
+        let registry = ComponentRegistry::with_defaults();
+        let config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        for name in ["fifo", "priority"] {
+            // This is a caller-supplied factory, not an implicit product alias.
+            registry.register_scheduler_factory(name, Arc::new(ContinuousBatchSchedulerFactory));
+            let scheduler = registry.create_scheduler(name, &config).await.unwrap();
+            let request = ferrum_types::InferenceRequest::new("hello", "scheduler-test")
+                .with_metadata(
+                    ferrum_types::PROMPT_TOKENS_METADATA_KEY,
+                    serde_json::json!(1),
+                );
+            let request_id = scheduler.submit(request).await.unwrap();
+            let batch = scheduler
+                .next_batch(ferrum_interfaces::BatchHint::simple(1))
+                .await
+                .unwrap();
+            assert_eq!(batch.requests.len(), 1);
+            assert_eq!(batch.requests[0].request.id, request_id);
+            assert!(scheduler.cancel(request_id).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_scheduler_factory_preserves_request_priority_and_cancellation() {
+        let registry = ComponentRegistry::with_defaults();
+        let config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        let scheduler = registry
+            .create_scheduler("continuous", &config)
+            .await
+            .unwrap();
+        let request = ferrum_types::InferenceRequest::new("hello", "scheduler-test").with_metadata(
+            ferrum_types::PROMPT_TOKENS_METADATA_KEY,
+            serde_json::json!(1),
+        );
+        let request_id = request.id.clone();
+        assert_eq!(scheduler.submit(request).await.unwrap(), request_id);
+        scheduler
+            .update_priority(request_id.clone(), ferrum_types::Priority::High)
+            .await
+            .unwrap();
+        let batch = scheduler
+            .next_batch(ferrum_interfaces::BatchHint::simple(1))
+            .await
+            .unwrap();
+        assert_eq!(batch.requests.len(), 1);
+        assert_eq!(batch.requests[0].request.id, request_id);
+        assert_eq!(
+            batch.requests[0].request.priority,
+            ferrum_types::Priority::High
+        );
+        assert!(scheduler.cancel(request_id).await.unwrap());
+        assert!(scheduler
+            .next_batch(ferrum_interfaces::BatchHint::simple(1))
+            .await
+            .is_none());
     }
 
     #[test]

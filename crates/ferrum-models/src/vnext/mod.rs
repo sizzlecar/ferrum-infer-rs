@@ -158,12 +158,6 @@ const LEGACY_MODELS: &[LegacyModelRegistration] = &[
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.MistralForCausalLM",
     },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.PhiForCausalLM",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.GPT2LMHeadModel",
-    },
 ];
 
 /// Product executor category selected by model semantics, never by a family
@@ -1097,6 +1091,45 @@ mod tests {
                 ferrum_types::FerrumError::Unsupported { .. }
             ));
             assert!(error.to_string().contains(architecture), "{error}");
+        }
+    }
+
+    #[test]
+    fn unimplemented_text_metadata_is_rejected_before_weight_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("tokenizer.json"),
+            br#"{"version":"1.0"}"#,
+        )
+        .unwrap();
+        for architecture in ["PhiForCausalLM", "Phi3ForCausalLM", "GPT2LMHeadModel"] {
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "architectures": [architecture],
+                // A recognized dense model_type must not override the actual
+                // unsupported architecture or implicitly authorize loading.
+                "model_type": "llama",
+            }))
+            .unwrap();
+            fs::write(directory.path().join("config.json"), &raw).unwrap();
+            assert_eq!(
+                external_metadata_id_from_bytes(&raw, "config.json")
+                    .unwrap()
+                    .as_str(),
+                format!("hf.architecture.{architecture}")
+            );
+            for error in [
+                validate_registered_model_semantics(&raw).unwrap_err(),
+                resolve_registered_model_from_dir(directory.path())
+                    .err()
+                    .unwrap(),
+                open_registered_colocated_safetensors(directory.path()).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(&error, ferrum_types::FerrumError::Unsupported { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains(architecture), "{error}");
+            }
         }
     }
 

@@ -11,8 +11,7 @@
 use crate::registry::{ComponentConfig, ComponentRegistry};
 use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
 use ferrum_interfaces::{
-    KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler,
-    TensorFactory, Tokenizer,
+    KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, TensorFactory, Tokenizer,
 };
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{EngineConfig, FerrumError, Result};
@@ -21,11 +20,8 @@ use tracing::{debug, info};
 
 mod source_binding;
 
-// Engine-build composition knobs (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
-// FERRUM_SPEC_N) are no longer read from the environment here. The CLI
-// composition root captures them via `RuntimeConfigSnapshot::capture_current()`
-// and lands them in `EngineConfig.runtime` through
-// `apply_runtime_config_snapshot`; the builder reads `self.config.runtime`.
+// The product composition root captures model-loading options in the typed
+// configuration. The builder does not read process environment variables.
 
 /// Engine builder for creating inference engines with registry-based components
 pub struct EngineBuilder {
@@ -42,8 +38,6 @@ pub struct EngineBuilder {
     tokenizer_name: Option<String>,
     /// Override: custom sampler name
     sampler_name: Option<String>,
-    /// Override: custom scheduler name
-    scheduler_name: Option<String>,
     /// Override: custom KV cache name
     kv_cache_name: Option<String>,
     /// Override: custom executor name
@@ -52,8 +46,6 @@ pub struct EngineBuilder {
     custom_tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
     /// Pre-created sampler (skip factory)
     custom_sampler: Option<Arc<dyn Sampler + Send + Sync>>,
-    /// Pre-created scheduler (skip factory)
-    custom_scheduler: Option<Arc<dyn Scheduler + Send + Sync>>,
     /// Pre-created KV cache (skip factory)
     custom_kv_cache: Option<Arc<dyn KvCacheManager + Send + Sync>>,
     /// Pre-created recurrent-state manager (skip factory)
@@ -77,12 +69,10 @@ impl EngineBuilder {
             defined_model: None,
             tokenizer_name: None,
             sampler_name: None,
-            scheduler_name: None,
             kv_cache_name: None,
             executor_name: None,
             custom_tokenizer: None,
             custom_sampler: None,
-            custom_scheduler: None,
             custom_kv_cache: None,
             custom_recurrent_state_manager: None,
             custom_executor: None,
@@ -122,18 +112,6 @@ impl EngineBuilder {
     /// Set a pre-created sampler
     pub fn with_custom_sampler(mut self, sampler: Arc<dyn Sampler + Send + Sync>) -> Self {
         self.custom_sampler = Some(sampler);
-        self
-    }
-
-    /// Set the scheduler to use by name
-    pub fn with_scheduler(mut self, name: impl Into<String>) -> Self {
-        self.scheduler_name = Some(name.into());
-        self
-    }
-
-    /// Set a pre-created scheduler
-    pub fn with_custom_scheduler(mut self, scheduler: Arc<dyn Scheduler + Send + Sync>) -> Self {
-        self.custom_scheduler = Some(scheduler);
         self
     }
 
@@ -213,7 +191,7 @@ impl EngineBuilder {
             return name.clone();
         }
 
-        // If model path is set, try candle executor
+        // A model source selects the registered language-model executor.
         if self.has_typed_model_path() || self.config.runtime.model_path.is_some() {
             return "llm".to_string();
         }
@@ -239,10 +217,12 @@ impl EngineBuilder {
             self.config.model.model_id
         );
 
-        if self.scheduler_name.is_some() || self.custom_scheduler.is_some() {
-            return Err(FerrumError::config(
-                "EngineBuilder scheduler component overrides are no longer accepted; configure the typed EngineConfig.scheduler used by ContinuousBatchScheduler",
-            ));
+        for key in ["spec_draft", "spec_n"] {
+            if self.config.backend.backend_options.contains_key(key) {
+                return Err(FerrumError::config(format!(
+                    "backend option '{key}' belongs to retired experimental speculative decoding"
+                )));
+            }
         }
 
         // Pre-compute all component names before consuming self
@@ -409,57 +389,6 @@ impl EngineBuilder {
             crate::tensor_factory::candle::CandleTensorFactory::new(config.backend.device.clone()),
         );
 
-        // Opt-in speculative decoding: provide an absolute HF snapshot path
-        // for a second smaller model. The draft must use the same tokenizer
-        // + vocab as the target (same family e.g. Qwen3). Backend options are
-        // the typed startup path; the legacy speculative env names remain
-        // compatibility aliases.
-        let spec_draft = component_config
-            .get_string_option("spec_draft")
-            .or_else(|| config.runtime.spec_draft.clone());
-        if execution_resource_authority
-            == ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
-            && spec_draft.is_some()
-        {
-            return Err(FerrumError::unsupported(
-                "speculative decoding is not yet part of the plan-runtime contract",
-            ));
-        }
-        let spec_n = component_config
-            .get_option::<usize>("spec_n")
-            .unwrap_or(config.runtime.spec_n.unwrap_or(4));
-        let (draft_executor, spec_config) = match spec_draft.as_ref() {
-            Some(draft_path) => {
-                info!("Speculative decoding: loading draft model from {draft_path}");
-                let mut draft_cfg = component_config.clone();
-                draft_cfg.component_options.insert(
-                    "model_path".to_string(),
-                    serde_json::Value::String(draft_path.to_string()),
-                );
-                let draft = registry
-                    .create_executor(&executor_name, &draft_cfg)
-                    .await
-                    .map_err(|error| {
-                        FerrumError::config(format!(
-                            "requested speculative draft executor failed to load: {error}"
-                        ))
-                    })?;
-                if draft.execution_resource_authority() != execution_resource_authority {
-                    return Err(FerrumError::config(
-                        "target and speculative draft executors declare different resource authority",
-                    ));
-                }
-                (
-                    Some(draft),
-                    Some(crate::speculative::SpeculativeDecodingConfig {
-                        num_speculative_tokens: spec_n,
-                        temperature: 1.0,
-                    }),
-                )
-            }
-            _ => (None, None),
-        };
-
         // Construct the unpublished engine shell first so its typed profile
         // sink is attached before executor startup emits warmup/capture events.
         let engine = match execution_resource_authority {
@@ -477,7 +406,7 @@ impl EngineBuilder {
                 let kv_cache = kv_cache.ok_or_else(|| {
                     FerrumError::internal("legacy-engine composition lost its KV-cache manager")
                 })?;
-                crate::ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+                crate::ContinuousBatchEngine::new_with_recurrent_state_manager(
                     config,
                     cb_scheduler,
                     tokenizer,
@@ -485,8 +414,6 @@ impl EngineBuilder {
                     kv_cache,
                     Arc::clone(&executor),
                     tensor_factory,
-                    draft_executor.clone(),
-                    spec_config,
                     recurrent_state_manager,
                 )?
             }
@@ -495,14 +422,7 @@ impl EngineBuilder {
         // This is the single product readiness boundary shared by `run` and
         // `serve`. The engine is not exposed until executor-owned compilation
         // and warmup complete, but those events now share the product trace.
-        let startup_result = async {
-            executor.prepare_startup().await?;
-            if let Some(draft) = draft_executor.as_ref() {
-                draft.prepare_startup().await?;
-            }
-            Ok(())
-        }
-        .await;
+        let startup_result = executor.prepare_startup().await;
         if let Err(startup_error) = startup_result {
             if let Err(shutdown_error) = engine.shutdown().await {
                 tracing::warn!(
@@ -906,13 +826,11 @@ mod tests {
         let builder = EngineBuilder::new(config)
             .with_tokenizer("custom_tokenizer")
             .with_sampler("greedy")
-            .with_scheduler("priority")
             .with_kv_cache("paged")
             .with_executor("custom_executor");
 
         assert_eq!(builder.tokenizer_name, Some("custom_tokenizer".to_string()));
         assert_eq!(builder.sampler_name, Some("greedy".to_string()));
-        assert_eq!(builder.scheduler_name, Some("priority".to_string()));
         assert_eq!(builder.kv_cache_name, Some("paged".to_string()));
         assert_eq!(builder.executor_name, Some("custom_executor".to_string()));
     }
@@ -989,28 +907,30 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn test_builder_typed_spec_options_parse_from_component_config() {
-        let mut config = EngineConfig::default();
-        config.backend.backend_options.insert(
-            "model_path".to_string(),
-            serde_json::Value::String("/models/target".to_string()),
-        );
-        config.backend.backend_options.insert(
-            "spec_draft".to_string(),
-            serde_json::Value::String("/models/draft".to_string()),
-        );
-        config.backend.backend_options.insert(
-            "spec_n".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(6)),
-        );
-        let component_config = ComponentConfig::from_engine_config(&config);
-
-        assert_eq!(
-            component_config.get_string_option("spec_draft").as_deref(),
-            Some("/models/draft")
-        );
-        assert_eq!(component_config.get_option::<usize>("spec_n"), Some(6));
+    #[tokio::test]
+    async fn retired_speculative_options_fail_before_component_loading() {
+        for key in ["spec_draft", "spec_n"] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!(6),
+            ] {
+                let mut config = EngineConfig::default();
+                config.backend.backend_options.insert(key.to_owned(), value);
+                let error = EngineBuilder::new(config)
+                    .with_tokenizer("not-registered")
+                    .build()
+                    .await
+                    .err()
+                    .expect("retired options must not silently select ordinary decoding");
+                assert!(matches!(&error, FerrumError::Config { .. }), "{error}");
+                let message = error.to_string();
+                assert!(
+                    message.contains(key) && message.contains("retired"),
+                    "{message}"
+                );
+            }
+        }
     }
 
     #[test]

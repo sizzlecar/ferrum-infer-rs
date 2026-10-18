@@ -97,7 +97,8 @@ pub struct ModelDiscoveryEntry {
     pub format: ModelFormatType,
     /// Architecture type (if detected)
     pub architecture: Option<Architecture>,
-    /// Whether model passes validation
+    /// Whether config and recognized weight files were discovered. This does
+    /// not establish executable architecture support or numerical validity.
     pub is_valid: bool,
 }
 
@@ -136,7 +137,6 @@ impl DefaultModelRegistry {
         registry.register_alias("qwen3-4b", "Qwen/Qwen3-4B");
         registry.register_alias("mistral-7b", "mistralai/Mistral-7B-v0.1");
         registry.register_alias("mistral-7b-instruct", "mistralai/Mistral-7B-Instruct-v0.2");
-        registry.register_alias("phi3-mini", "microsoft/Phi-3-mini-4k-instruct");
 
         registry
     }
@@ -422,6 +422,7 @@ mod tests {
         // 测试一些常见别名
         assert!(registry.aliases.contains_key("tinyllama"));
         assert!(registry.aliases.contains_key("llama2-7b"));
+        assert!(!registry.aliases.contains_key("phi3-mini"));
     }
 
     #[test]

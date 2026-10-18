@@ -42,7 +42,7 @@ pub struct CliConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SchedulerCliConfig {
     /// Optional latency targets for adaptive scheduling, in milliseconds.
     pub slo: Option<ferrum_types::SchedulerSloConfig>,
@@ -994,6 +994,52 @@ impl Default for DevConfig {
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+
+    #[test]
+    fn scheduler_config_rejects_removed_and_unknown_fields_but_keeps_slo() {
+        for (key, value) in [
+            ("policy", "\"Priority\""),
+            ("scheduler_type", "\"fifo\""),
+            ("enable_load_balancing", "false"),
+            ("fair_share_weights", "{}"),
+            ("enable_sla_enforcement", "false"),
+            ("unknown_scheduler_option", "false"),
+        ] {
+            let error = toml::from_str::<CliConfig>(&format!("[scheduler]\n{key} = {value}\n"))
+                .expect_err("unsupported scheduler declarations must not be ignored");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+        let config: CliConfig = toml::from_str(
+            "[scheduler.slo]\nttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\n[runtime]\nprefix_cache = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.resolve_scheduler_slo(None).unwrap().unwrap().tpot_ms,
+            15.0
+        );
+        assert_eq!(config.runtime.prefix_cache, Some(false));
+        let restored: CliConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.scheduler.slo, config.scheduler.slo);
+        assert_eq!(restored.runtime.prefix_cache, config.runtime.prefix_cache);
+    }
+
+    #[test]
+    fn runtime_config_rejects_retired_whole_prompt_cache_and_speculation() {
+        for (key, value) in [
+            ("whole_prompt_prefix_cache", "false"),
+            ("prefix_cache_enabled", "false"),
+            ("spec_draft", "\"\""),
+            ("spec_draft", "\"/models/draft\""),
+            ("spec_n", "0"),
+            ("spec_n", "4"),
+        ] {
+            let error = toml::from_str::<CliConfig>(&format!("[runtime]\n{key} = {value}\n"))
+                .expect_err("removed execution options must not become ordinary decoding");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+    }
 
     #[test]
     fn runtime_config_rejects_retired_moe_and_unknown_fields() {

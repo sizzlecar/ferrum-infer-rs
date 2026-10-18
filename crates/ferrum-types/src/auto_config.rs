@@ -3656,6 +3656,31 @@ mod tests {
     }
 
     #[test]
+    fn retired_execution_controls_are_rejected_for_every_executor() {
+        for key in [
+            "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",
+            "FERRUM_SPEC_DRAFT",
+            "FERRUM_SPEC_N",
+        ] {
+            for value in ["", "false", "0", "1"] {
+                for authority in [
+                    ExecutionResourceAuthority::LegacyEngine,
+                    ExecutionResourceAuthority::PlanRuntime,
+                ] {
+                    let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
+                        .with_execution_resource_authority(authority)
+                        .resolve()
+                        .expect_err("retired controls must not select ordinary decoding");
+                    assert!(matches!(error,
+                        AutoConfigError::InvalidOverride { key: actual, reason }
+                        if actual == key && reason.contains("retired")
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retired_legacy_moe_controls_are_rejected_for_every_executor() {
         for key in [
             "FERRUM_MOE_GRAPH",

@@ -31,7 +31,6 @@
 //!
 //! let config = EngineConfig::default();
 //! let engine = EngineBuilder::new(config)
-//!     .with_scheduler("fifo")
 //!     .with_sampler("greedy")
 //!     .build()
 //!     .await?;
@@ -50,12 +49,10 @@ pub mod builder;
 pub mod continuous_engine;
 pub(crate) mod layer_split;
 pub mod parallel;
-pub mod pipeline;
 mod product_composition;
 pub mod recurrent_state;
 pub mod registry;
 pub(crate) mod resource_lifecycle;
-pub mod speculative;
 pub mod tensor_factory;
 #[cfg(feature = "cuda")]
 pub mod vnext_determinism;
@@ -78,11 +75,6 @@ pub use ferrum_scheduler::BatchPlan;
 // Re-exports of engine implementation
 pub use continuous_engine::{ContinuousBatchEngine, SequenceState};
 
-// Re-exports of pipeline
-pub use pipeline::{
-    ChunkedPrefillConfig, ChunkedPrefillExecutor, ExecutionPhase, PipelineConfig, PipelineExecutor,
-};
-
 pub use recurrent_state::{
     InMemoryRecurrentStateConfig, InMemoryRecurrentStateHandle, InMemoryRecurrentStateManager,
 };
@@ -95,10 +87,10 @@ pub use builder::{
 // Re-exports of registry
 pub use registry::{
     global_registry, set_global_registry, ComponentConfig, ComponentFactory, ComponentMetadata,
-    ComponentRegistry, ContinuousBatchSchedulerFactory, DefaultKvCacheFactory,
-    FifoSchedulerFactory, GreedySampler, GreedySamplerFactory, HuggingFaceTokenizerFactory,
-    LlmExecutorFactory, MultinomialSamplerFactory, PagedKvCacheFactory, PrioritySchedulerFactory,
-    StubExecutorFactory, StubTokenizer, StubTokenizerFactory,
+    ComponentRegistry, ContinuousBatchSchedulerFactory, DefaultKvCacheFactory, GreedySampler,
+    GreedySamplerFactory, HuggingFaceTokenizerFactory, LlmExecutorFactory,
+    MultinomialSamplerFactory, PagedKvCacheFactory, StubExecutorFactory, StubTokenizer,
+    StubTokenizerFactory,
 };
 
 // Back-compat alias for the renamed factory (PR A).
@@ -108,8 +100,7 @@ pub use registry::CandleExecutorFactory;
 // Re-exports of parallel module
 pub use parallel::{
     global_device_manager, DeviceCapability, DeviceInfo, DeviceManager, LayerDistribution,
-    ParallelConfig, ParallelExecutor, ParallelExecutorFactory, ParallelismType,
-    TensorParallelConfig, TensorParallelGroup,
+    ParallelConfig, ParallelismType, TensorParallelConfig, TensorParallelGroup,
 };
 
 /// Create default inference engine with MVP configuration

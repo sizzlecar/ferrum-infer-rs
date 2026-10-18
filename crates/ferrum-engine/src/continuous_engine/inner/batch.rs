@@ -19,13 +19,9 @@ impl EngineInner {
         // level, eliminating the cohort gap (decode_queue=0 ↔ 32
         // alternation that consumed half the bench wall on apples).
         //
-        // Speculative decoding still owns a separate multi-token verify path.
         // Typed chunked prefill can stay on the unified path: the unified
         // producer below emits non-final prefill chunks and can co-batch them
         // with decode work when the executor has a native unified forward.
-        if self.spec_config.is_some() {
-            return self.process_batch_legacy_split(batch).await;
-        }
         self.process_batch_unified(batch).await
     }
 
@@ -234,8 +230,8 @@ impl EngineInner {
     }
 
     /// Legacy split path: separate prefill (batched via run_batch_prefill)
-    /// then decode (batched via run_batch_decode). Used for chunked-prefill
-    /// and speculative-decoding flows that the unified path doesn't model yet.
+    /// then decode (batched via run_batch_decode), preserving chunked-prefill
+    /// and executors without unified mixed-batch support.
     async fn process_batch_legacy_split(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
         let (prefill_ids, decode_ids) = self.classify_published_batch_sequences(batch)?;
         if !prefill_ids.is_empty() {
@@ -307,20 +303,8 @@ impl EngineInner {
                     .map(|tokens| (scheduled_req.request.id.clone(), tokens))
             })
             .collect();
-        // ── 1. Per-prefill setup: prefix-cache check, KV alloc, gather tokens ──
-        // Prefix-cache hits short-circuit through the legacy single-prompt
-        // path (they don't enter the unified batch — they have no model
-        // call to make). The remainder are added to `unified_prefills`.
+        // ── 1. Per-prefill setup: KV allocation and token gathering ──
         let model_info = self.model_executor.info();
-        // Prefix cache defaults OFF on every backend. The `clone_handle`
-        // path in `crates/ferrum-kv/src/managers/paged.rs` is COW-by-flag
-        // but the engine write path doesn't fork blocks on first write,
-        // so a second request that hits the cache shares mutated KV from
-        // the first request's decode and diverges deterministically
-        // (request 1 ≠ request 2 == request 3). Reproduced 2026-05-19;
-        // see `~/.claude/projects/*/memory/project_http_server_gaps_2026_05_19.md`.
-        // Opt in via `FERRUM_PREFIX_CACHE=1` once the CoW fix lands.
-        let skip_prefix_cache = !self.runtime_config.prefix_cache_enabled;
         struct UnifiedPrefillWork {
             rid: RequestId,
             input_tokens: Vec<TokenId>,
@@ -328,7 +312,6 @@ impl EngineInner {
             recurrent_state: Option<Arc<dyn ferrum_interfaces::RecurrentStateHandle>>,
             metadata: std::collections::HashMap<String, serde_json::Value>,
             logits_policy: LogitsReturnPolicy,
-            can_use_prefix_cache: bool,
             legacy_kv_allocation: SequenceKvAllocation,
             owned_resources: UnifiedPrefillOwnedResources,
             chunk_start: usize,
@@ -349,7 +332,6 @@ impl EngineInner {
                 chunk_start,
                 mut metadata,
                 logits_policy,
-                can_use_prefix_cache,
             ) = {
                 let sequences = self.sequences.read();
                 let Some(seq) = sequences.get(rid) else {
@@ -364,12 +346,7 @@ impl EngineInner {
                     resources.recurrent_state,
                     resources.prefill_tokens_processed,
                     seq.model_decode_metadata(),
-                    if skip_prefix_cache {
-                        seq.model_decode_logits_policy()
-                    } else {
-                        LogitsReturnPolicy::FullLogits
-                    },
-                    seq.generated_tokens.is_empty(),
+                    seq.model_decode_logits_policy(),
                 )
             };
             if chunk_start >= num_tokens {
@@ -378,63 +355,6 @@ impl EngineInner {
             let recurrent_state_spec = self
                 .model_executor
                 .recurrent_state_spec(rid, &input_tokens)?;
-            let skip_request_prefix_cache =
-                skip_prefix_cache || !can_use_prefix_cache || recurrent_state_spec.is_some();
-            if chunk_start == 0 && !skip_request_prefix_cache {
-                let hit = self
-                    .prefix_cache
-                    .find_prefix(&input_tokens)
-                    .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
-                if let Some((_, cached_kv, cached_logits)) = hit {
-                    let prefix_hit_result = (|| {
-                        let cloned_kv = cached_kv.clone_handle()?;
-                        let mut sequences = self.sequences.write();
-                        let Some(seq) = sequences.get_mut(rid) else {
-                            return Ok(None);
-                        };
-                        seq.reset_guided_processors()?;
-                        let mut logits = cached_logits;
-                        let token = seq.sample_and_commit_with_processors_and_tokenizer(
-                            &mut logits,
-                            Some(self.tokenizer.as_ref()),
-                        )?;
-                        let model_cache_update =
-                            seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
-                        seq.record_generated_token_commit();
-                        Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
-                            token,
-                            model_cache_update,
-                        )))
-                    })();
-                    let prefix_hit = match prefix_hit_result {
-                        Ok(value) => value,
-                        Err(error) => {
-                            warn!(
-                                "Unified prefix-cache prefill post-process failed for {}: {}",
-                                rid, error
-                            );
-                            self.complete_request_with_error(rid, error).await?;
-                            continue;
-                        }
-                    };
-                    let Some((first_token, model_cache_update)) = prefix_hit else {
-                        continue;
-                    };
-                    self.apply_model_cache_ref_update(rid, model_cache_update);
-                    self.scheduler.mark_prefill_complete(rid, num_tokens);
-                    self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
-                    counter!("ferrum.engine.prefix_cache_hits").increment(1);
-                    let stop_reason = self.stop_reason_for_request(rid);
-                    if self.should_stream_generated_token(rid, first_token, stop_reason) {
-                        self.send_stream_update(rid, first_token).await;
-                    }
-                    if let Some(reason) = stop_reason {
-                        self.complete_request(rid, reason).await?;
-                    }
-                    continue;
-                }
-            }
-
             if existing_recurrent_state.is_none() {
                 if let (Some(spec), Some(manager)) = (
                     recurrent_state_spec.as_ref(),
@@ -563,7 +483,6 @@ impl EngineInner {
                 recurrent_state,
                 metadata,
                 logits_policy,
-                can_use_prefix_cache,
                 legacy_kv_allocation,
                 owned_resources,
                 chunk_start,
@@ -823,15 +742,6 @@ impl EngineInner {
             let num_tokens = work.input_tokens.len();
             let cache_id = unified.items[i].seq_id.clone();
             let model_kv = self.make_model_kv_handle_with_seq(cache_id.clone(), num_tokens);
-            if !skip_prefix_cache && work.can_use_prefix_cache && logits_vec.len() > 1 {
-                // Store in prefix cache (best-effort). Greedy-argmax results
-                // are single-token sentinels, not reusable full logits.
-                let _ = self.prefix_cache.store_prefix(
-                    &work.input_tokens,
-                    model_kv.clone(),
-                    logits_vec.clone(),
-                );
-            }
             let first_token_result = (|| {
                 let mut sequences = self.sequences.write();
                 let Some(seq) = sequences.get_mut(&work.rid) else {
@@ -978,14 +888,8 @@ impl EngineInner {
                 let kv_len = seq.decode_model_kv_len_after_last_generated_token();
                 let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
                 seq.commit_decode_step_physical_resources(model_kv)?;
-                // pos_offset is sourced from SequenceState bookkeeping above
-                // (`input_tokens.len() + generated_tokens.len() - 1`); the
-                // engine-side KV handle's `sequence_length` field is no
-                // longer load-bearing here. Resource handles like
-                // PagedKvCacheHandle don't update the field anyway (the
-                // model's internal paged_pool is what actually grows), so
-                // the previous `make_kv_handle_with_seq` write was a
-                // silent no-op for production handles.
+                // Position comes from committed SequenceState history; resource
+                // handles do not track the executor's model-side KV length.
                 seq.record_generated_token_commit();
                 Ok::<Option<TokenId>, FerrumError>(Some(token))
             })();

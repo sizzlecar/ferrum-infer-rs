@@ -10,7 +10,6 @@
 //! - Prefix caching for shared prompt optimization
 
 use crate::blocks::{BlockPool, BlockStorageConfig, PhysicalBlockId};
-use crate::cache::prefix::{PrefixCache, PrefixCacheStats, PrefixId};
 use async_trait::async_trait;
 use ferrum_interfaces::{
     kv_cache::{AllocationRequest, BlockTable, CacheGcStats, CacheManagerStats, MemoryPressure},
@@ -47,12 +46,6 @@ pub struct PagedKvCacheConfig {
     pub num_heads: usize,
     /// Head dimension
     pub head_dim: usize,
-    /// Enable prefix caching
-    pub enable_prefix_cache: bool,
-    /// Maximum number of prefixes to cache
-    pub max_prefixes: usize,
-    /// Minimum prefix length to cache
-    pub min_prefix_length: usize,
 }
 
 impl Default for PagedKvCacheConfig {
@@ -68,9 +61,6 @@ impl Default for PagedKvCacheConfig {
             num_layers: 32,
             num_heads: 32,
             head_dim: 128,
-            enable_prefix_cache: true,
-            max_prefixes: 100,
-            min_prefix_length: 16,
         }
     }
 }
@@ -344,8 +334,6 @@ pub struct PagedKvCacheManager {
     block_to_request: RwLock<HashMap<PhysicalBlockId, RequestId>>,
     /// Swapped out blocks (GPU block ID -> CPU block ID)
     swapped_blocks: RwLock<HashMap<PhysicalBlockId, PhysicalBlockId>>,
-    /// Prefix cache for shared prompts
-    prefix_cache: Option<PrefixCache>,
     /// Statistics
     stats: Mutex<CacheManagerStats>,
     /// Pressure callback
@@ -357,8 +345,8 @@ impl PagedKvCacheManager {
     /// Create new paged KV cache manager
     pub fn new(device: Device, config: PagedKvCacheConfig) -> Result<Self> {
         info!(
-            "Creating paged KV cache manager: device={:?}, block_size={}, max_gpu_blocks={}, max_cpu_blocks={}, prefix_cache={}",
-            device, config.block_size, config.max_gpu_blocks, config.max_cpu_blocks, config.enable_prefix_cache
+            "Creating paged KV cache manager: device={:?}, block_size={}, max_gpu_blocks={}, max_cpu_blocks={}",
+            device, config.block_size, config.max_gpu_blocks, config.max_cpu_blocks
         );
 
         let storage_config = BlockStorageConfig {
@@ -388,15 +376,6 @@ impl PagedKvCacheManager {
             None
         };
 
-        let prefix_cache = if config.enable_prefix_cache {
-            Some(PrefixCache::new(
-                config.max_prefixes,
-                config.min_prefix_length,
-            ))
-        } else {
-            None
-        };
-
         Ok(Self {
             config,
             gpu_pool,
@@ -404,7 +383,6 @@ impl PagedKvCacheManager {
             active_handles: RwLock::new(HashMap::new()),
             block_to_request: RwLock::new(HashMap::new()),
             swapped_blocks: RwLock::new(HashMap::new()),
-            prefix_cache,
             stats: Mutex::new(CacheManagerStats {
                 total_memory_bytes: 0,
                 used_memory_bytes: 0,
@@ -565,11 +543,6 @@ impl PagedKvCacheManager {
         &self.gpu_pool
     }
 
-    /// Get a reference to the prefix cache (if enabled).
-    pub fn prefix_cache(&self) -> Option<&PrefixCache> {
-        self.prefix_cache.as_ref()
-    }
-
     /// Share the first `num_prefix_blocks` physical blocks from `source` into
     /// `target`.  The shared blocks get an incremented ref count so they
     /// survive when the source handle is deallocated.
@@ -728,82 +701,6 @@ impl PagedKvCacheManager {
 
         debug!("COW copied {} blocks", new_blocks.len());
         Ok(new_blocks)
-    }
-
-    // ==========================================================================
-    // Prefix Caching Methods
-    // ==========================================================================
-
-    /// Find a cached prefix that matches the given tokens
-    /// Returns (prefix_id, kv_handle, last_logits, matched_length) if found
-    pub fn find_prefix(
-        &self,
-        tokens: &[ferrum_types::TokenId],
-    ) -> Option<(
-        PrefixId,
-        Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
-        Vec<f32>,
-        usize,
-    )> {
-        let prefix_cache = self.prefix_cache.as_ref()?;
-
-        if let Some((prefix_id, kv_handle, last_logits)) = prefix_cache.find_prefix(tokens) {
-            let matched_len = prefix_id.len();
-            debug!("Prefix cache hit: matched {} tokens", matched_len);
-
-            // Update hit rate stats
-            {
-                let mut stats = self.stats.lock();
-                let total = stats.allocation_count as f32;
-                if total > 0.0 {
-                    stats.cache_hit_rate = (stats.cache_hit_rate * (total - 1.0) + 1.0) / total;
-                }
-            }
-
-            Some((prefix_id, kv_handle, last_logits, matched_len))
-        } else {
-            None
-        }
-    }
-
-    /// Store a prefix in the cache for future reuse
-    pub fn store_prefix(
-        &self,
-        tokens: &[ferrum_types::TokenId],
-        kv_handle: Arc<dyn ferrum_interfaces::KvCacheHandle + Send + Sync>,
-        last_logits: Vec<f32>,
-    ) -> Result<()> {
-        if let Some(prefix_cache) = &self.prefix_cache {
-            prefix_cache.store_prefix(tokens, kv_handle, last_logits)?;
-            debug!("Stored prefix with {} tokens in cache", tokens.len());
-        }
-        Ok(())
-    }
-
-    /// Get prefix cache statistics
-    pub fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> {
-        self.prefix_cache.as_ref().map(|pc| pc.stats())
-    }
-
-    /// Evict oldest prefixes from cache
-    pub fn evict_prefixes(&self, count: usize) -> usize {
-        if let Some(prefix_cache) = &self.prefix_cache {
-            let evicted = prefix_cache.evict_n(count);
-            if evicted > 0 {
-                debug!("Evicted {} prefixes from cache", evicted);
-            }
-            evicted
-        } else {
-            0
-        }
-    }
-
-    /// Clear all cached prefixes
-    pub fn clear_prefix_cache(&self) {
-        if let Some(prefix_cache) = &self.prefix_cache {
-            prefix_cache.clear();
-            debug!("Cleared prefix cache");
-        }
     }
 }
 
@@ -1208,7 +1105,6 @@ mod tests {
             num_layers: 2,
             num_heads: 2,
             head_dim: 4,
-            enable_prefix_cache: false,
             ..Default::default()
         };
         let manager = PagedKvCacheManager::new(Device::CPU, config).unwrap();

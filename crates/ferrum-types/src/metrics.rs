@@ -613,14 +613,6 @@ pub struct EngineRequestProgress {
     pub estimated_remaining_ms: Option<u64>,
 }
 
-/// Speculation configuration for speculative decoding
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeculationConfig {
-    pub speculation_depth: usize,
-    pub acceptance_threshold: f32,
-    pub draft_model_config: Option<crate::ModelConfig>,
-}
-
 /// Warmup result structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WarmupResult {

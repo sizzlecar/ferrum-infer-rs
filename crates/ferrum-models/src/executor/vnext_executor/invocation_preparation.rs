@@ -240,6 +240,10 @@ mod tests {
             VNextExecutorConfig::from_engine_config(&engine, &info, composition.runtime().as_ref())
                 .unwrap();
         assert_eq!(
+            default.runtime_policy.scheduling(),
+            SchedulingDiscipline::FirstReady
+        );
+        assert_eq!(
             default.invocation_preparation_strategy,
             InvocationPreparationStrategy::Full
         );
