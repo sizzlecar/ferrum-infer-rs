@@ -376,10 +376,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
                     ))
                 }
                 Err(TryLockError::Poisoned(_)) => {
-                    return Err(error(
-                        JsonlJournalErrorKind::Panic,
-                        "JSONL publication gate is poisoned",
-                    ))
+                    return Err(self.inner.record_poison("publication gate"))
                 }
             };
             if self.inner.closed.load(Ordering::Acquire) {

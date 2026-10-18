@@ -18,8 +18,19 @@ pub use delivery::{JsonlJournalDeliveryStats, JsonlJournalErrorKind, JsonlJourna
 #[cfg(test)]
 mod delivery_tests;
 
-static JSONL_JOURNAL_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<JsonlJournalInner>>>> =
-    OnceLock::new();
+type JournalRegistry = HashMap<PathBuf, Weak<JsonlJournalInner>>;
+static JSONL_JOURNAL_REGISTRY: OnceLock<Mutex<JournalRegistry>> = OnceLock::new();
+
+fn lock_journal_registry(
+    registry: &Mutex<JournalRegistry>,
+) -> io::Result<std::sync::MutexGuard<'_, JournalRegistry>> {
+    registry.lock().map_err(|_| {
+        io::Error::other(JsonlJournalError::with_kind(
+            JsonlJournalErrorKind::Panic,
+            "JSONL journal registry is poisoned",
+        ))
+    })
+}
 
 /// Return one stable physical identity for a JSONL output path, including
 /// paths whose final component does not exist yet.
@@ -134,22 +145,36 @@ impl fmt::Display for JsonlJournalError {
 impl std::error::Error for JsonlJournalError {}
 
 struct JournalFailure {
+    // Preserve the original failure even when a later contract failure must
+    // prevent OptionalTelemetry from treating the mixed result as transport.
     error: OnceLock<JsonlJournalError>,
+    contract_error: OnceLock<JsonlJournalError>,
 }
 
 impl JournalFailure {
     fn new() -> Self {
         Self {
             error: OnceLock::new(),
+            contract_error: OnceLock::new(),
         }
     }
 
     fn record(&self, error: JsonlJournalError) {
+        if matches!(
+            error.kind(),
+            JsonlJournalErrorKind::Encoding | JsonlJournalErrorKind::Panic
+        ) {
+            let _ = self.contract_error.set(error.clone());
+        }
         let _ = self.error.set(error);
     }
 
+    fn current_ref(&self) -> Option<&JsonlJournalError> {
+        self.contract_error.get().or_else(|| self.error.get())
+    }
+
     fn current(&self) -> Option<JsonlJournalError> {
-        self.error.get().cloned()
+        self.current_ref().cloned()
     }
 }
 
@@ -175,8 +200,20 @@ struct JsonlJournalInner {
 }
 
 impl JsonlJournalInner {
+    fn record_poison(&self, lock: &str) -> JsonlJournalError {
+        let error = JsonlJournalError::with_kind(
+            JsonlJournalErrorKind::Panic,
+            format!("JSONL journal {} {lock} is poisoned", self.path.display()),
+        );
+        self.failure.record(error.clone());
+        self.failure.current().unwrap_or(error)
+    }
+
     fn send(&self, command: JournalCommand) -> Result<(), JsonlJournalError> {
-        let _send_guard = self.send_gate.lock().unwrap();
+        let _send_guard = self
+            .send_gate
+            .lock()
+            .map_err(|_| self.record_poison("publication gate"))?;
         if self.closed.load(Ordering::Acquire) {
             return Err(JsonlJournalError::with_kind(
                 JsonlJournalErrorKind::Closed,
@@ -199,7 +236,15 @@ impl JsonlJournalInner {
     fn close_and_join(&self) -> Result<(), JsonlJournalError> {
         // Serialize close with all producers so every accepted command is
         // ordered before Close and every later producer is rejected.
-        let _send_guard = self.send_gate.lock().unwrap();
+        let _send_guard = match self.send_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.record_poison("publication gate");
+                // Recovery only authorizes teardown of the original worker.
+                // The poison remains set and never permits new publication.
+                poisoned.into_inner()
+            }
+        };
         if !self.closed.swap(true, Ordering::AcqRel) {
             let (reply_tx, reply_rx) = sync_channel(1);
             if self.sender.send(JournalCommand::Close(reply_tx)).is_err() {
@@ -215,13 +260,20 @@ impl JsonlJournalInner {
             }
         }
 
-        let worker = self.worker.lock().unwrap().take();
+        let worker = match self.worker.lock() {
+            Ok(mut worker) => worker.take(),
+            Err(poisoned) => {
+                self.record_poison("worker handle");
+                // A poisoned handle lock is not permission to detach the worker.
+                poisoned.into_inner().take()
+            }
+        };
         if let Some(worker) = worker {
             if worker.join().is_err() {
-                self.failure.record(JsonlJournalError::new(format!(
-                    "JSONL journal worker for {} panicked",
-                    self.path.display()
-                )));
+                self.failure.record(JsonlJournalError::with_kind(
+                    JsonlJournalErrorKind::Panic,
+                    format!("JSONL journal worker for {} panicked", self.path.display()),
+                ));
             }
         }
         self.failure.current().map_or(Ok(()), Err)
@@ -297,12 +349,8 @@ fn open_shared_inner(
         }
     }
 
-    let mut registry = JSONL_JOURNAL_REGISTRY
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|error| {
-            io::Error::other(format!("JSONL journal registry is poisoned: {error}"))
-        })?;
+    let mut registry =
+        lock_journal_registry(JSONL_JOURNAL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new())))?;
     if let Some(existing) = registry.get(&path).and_then(Weak::upgrade) {
         if !existing.closed.load(Ordering::Acquire) {
             if let Some(error) = existing.failure.current() {
@@ -441,7 +489,10 @@ where
     pub fn delivery_stats(&self) -> JsonlJournalDeliveryStats {
         self.inner.delivery.snapshot(
             self.inner.closed.load(Ordering::Acquire),
-            self.inner.failure.error.get().map(JsonlJournalError::kind),
+            self.inner
+                .failure
+                .current_ref()
+                .map(JsonlJournalError::kind),
         )
     }
 
