@@ -9,12 +9,12 @@
 //! - `impl BackendInt8KvOps for CudaBackend` — paged INT8 append (FP16 →
 //!   INT8 + per-(token, kv_head) FP16 scale) + paged INT8 decode
 //!   attention. Both delegate to the launchers in `crate::int8_kv`.
-//! - `KvCacheQuant<CudaBackend, KvInt8>::new_paged_cuda(...)` one-call
-//!   constructor (K/V int8 pool + FP16 scales + block_table + context_lens).
+//! - Model-layer shared INT8 pools and sequence-local block tables.
 //!
 //! Tests: `crates/ferrum-kernels/tests/int8_kv_parity.rs` checks stream
 //! ownership, round-trip quantization and attention against an FP32 host reference.
 
+use crate::backend::{KvInt8, QuantizedPagedKvPool};
 use ferrum_types::{FerrumError, Result};
 
 use super::{default_stream, CudaBackend};
@@ -90,6 +90,15 @@ impl OptionalCudaScalesF16 {
 // `B::int8_paged_decode_attention(...)` without reaching into
 // cudarc primitives directly.
 impl crate::backend::BackendInt8KvOps for CudaBackend {
+    fn alloc_paged_int8_pool(
+        num_blocks: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> QuantizedPagedKvPool<Self, KvInt8> {
+        QuantizedPagedKvPool::new_cuda(num_blocks, block_size, num_kv_heads, head_dim)
+    }
+
     fn alloc_paged_int8_layer(
         max_blocks_per_seq: usize,
         block_size: usize,
@@ -108,10 +117,7 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         ctx: &mut Self::Context,
         k_in: &Self::Buffer,
         v_in: &Self::Buffer,
-        layer_k: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
-        layer_v: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
-        layer_k_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
-        layer_v_scales: &mut <Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
+        pool: &mut QuantizedPagedKvPool<Self, KvInt8>,
         paged_block_indices: &[u32],
         cache_len_before: usize,
         tokens: usize,
@@ -122,6 +128,10 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         if tokens == 0 {
             return Ok(());
         }
+        let end = cache_len_before
+            .checked_add(tokens)
+            .ok_or_else(|| FerrumError::model("INT8 append token range overflow"))?;
+        pool.validate_mapping(paged_block_indices, end, block_size, num_kv_heads, head_dim)?;
         // Compute flat slot indices: physical_block * block_size + slot.
         // Reads `paged_block_indices` directly (host mirror populated at
         // `ensure_kv`), avoiding the per-token D2H + sync barrier the
@@ -141,27 +151,14 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
             .clone_htod(&slot_mapping_host)
             .map_err(|e| FerrumError::model(format!("htod slot_mapping: {e}")))?;
 
-        // Lazily alloc INT8 buffers + scales on first call (the constructor
-        // populates them already, but defensive in case callers clear).
-        if layer_k.0.is_none() {
-            return Err(FerrumError::model(
-                "int8_kv_append_paged: layer_k not allocated",
-            ));
-        }
-        if layer_v.0.is_none() || layer_k_scales.0.is_none() || layer_v_scales.0.is_none() {
-            return Err(FerrumError::model(
-                "int8_kv_append_paged: layer_v / scales not allocated",
-            ));
-        }
-
         crate::int8_kv::launch_int8_kv_cache_append(
             &ctx.stream,
             k_in.as_f16(),
             v_in.as_f16(),
-            layer_k.buffer_mut(),
-            layer_v.buffer_mut(),
-            layer_k_scales.buffer_mut(),
-            layer_v_scales.buffer_mut(),
+            pool.k.buffer_mut(),
+            pool.v.buffer_mut(),
+            pool.k_scales.buffer_mut(),
+            pool.v_scales.buffer_mut(),
             &slot_mapping,
             tokens,
             num_kv_heads,
@@ -174,11 +171,9 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
     fn int8_paged_decode_attention(
         ctx: &mut Self::Context,
         q: &Self::Buffer,
-        layer_k: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
-        layer_v: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvBuffer,
-        layer_k_scales: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
-        layer_v_scales: &<Self as crate::backend::BackendKvDtype<crate::backend::KvInt8>>::KvScales,
+        pool: &QuantizedPagedKvPool<Self, KvInt8>,
         block_table: &Self::Buffer,
+        paged_block_indices: &[u32],
         output: &mut Self::Buffer,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -187,6 +182,13 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         block_size: usize,
         scale: f32,
     ) -> Result<()> {
+        pool.validate_mapping(
+            paged_block_indices,
+            valid_kv_len,
+            block_size,
+            num_kv_heads,
+            head_dim,
+        )?;
         // block_table is CudaBuf::U32 (typed since B-2). The launch
         // function takes `&CudaView<i32>` — same byte pattern, signed
         // view; transmute on CudaBuf dispatches to the U32 variant's
@@ -200,10 +202,10 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         crate::int8_kv::launch_int8_paged_decode_attention(
             &ctx.stream,
             q.as_f16(),
-            layer_k.buffer(),
-            layer_v.buffer(),
-            layer_k_scales.buffer(),
-            layer_v_scales.buffer(),
+            pool.k.buffer(),
+            pool.v.buffer(),
+            pool.k_scales.buffer(),
+            pool.v_scales.buffer(),
             &bt_i32_view,
             output.as_f16_mut(),
             num_q_heads,
@@ -218,13 +220,112 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
     }
 }
 
+impl QuantizedPagedKvPool<CudaBackend, KvInt8> {
+    /// Allocate physical storage once per model layer. Every sequence and
+    /// cached prefix refers to the same block namespace and these same arrays.
+    pub fn new_cuda(
+        num_blocks: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        assert!(num_blocks > 0 && block_size > 0 && num_kv_heads > 0 && head_dim > 0);
+        let pool_tokens = num_blocks
+            .checked_mul(block_size)
+            .expect("INT8 pool token overflow");
+        assert!(
+            pool_tokens <= i32::MAX as usize,
+            "INT8 pool exceeds kernel slot range"
+        );
+        let scale_count = pool_tokens
+            .checked_mul(num_kv_heads)
+            .expect("INT8 pool scale overflow");
+        let elem_count = scale_count
+            .checked_mul(head_dim)
+            .expect("INT8 pool element overflow");
+        Self {
+            k: OptionalCudaInt8::alloc(elem_count),
+            v: OptionalCudaInt8::alloc(elem_count),
+            k_scales: OptionalCudaScalesF16::alloc(scale_count),
+            v_scales: OptionalCudaScalesF16::alloc(scale_count),
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+        }
+    }
+
+    fn validate_mapping(
+        &self,
+        indices: &[u32],
+        tokens: usize,
+        block_size: usize,
+        heads: usize,
+        dim: usize,
+    ) -> Result<()> {
+        if block_size == 0
+            || block_size != self.block_size
+            || heads != self.num_kv_heads
+            || dim != self.head_dim
+        {
+            return Err(FerrumError::model(
+                "INT8 pool layout does not match the sequence",
+            ));
+        }
+        let count = tokens.div_ceil(block_size);
+        if tokens == 0
+            || indices.len() < count
+            || indices[..count]
+                .iter()
+                .any(|&index| index as usize >= self.num_blocks)
+        {
+            return Err(FerrumError::model(
+                "INT8 table references outside its shared physical pool",
+            ));
+        }
+        let scales = self
+            .num_blocks
+            .checked_mul(block_size)
+            .and_then(|n| n.checked_mul(heads))
+            .ok_or_else(|| FerrumError::model("INT8 pool dimensions overflow"))?;
+        let elements = scales
+            .checked_mul(dim)
+            .ok_or_else(|| FerrumError::model("INT8 pool dimensions overflow"))?;
+        if self
+            .k
+            .0
+            .as_ref()
+            .is_none_or(|buffer| buffer.len() != elements)
+            || self
+                .v
+                .0
+                .as_ref()
+                .is_none_or(|buffer| buffer.len() != elements)
+            || self
+                .k_scales
+                .0
+                .as_ref()
+                .is_none_or(|buffer| buffer.len() != scales)
+            || self
+                .v_scales
+                .0
+                .as_ref()
+                .is_none_or(|buffer| buffer.len() != scales)
+        {
+            return Err(FerrumError::model(
+                "INT8 shared pool allocation does not match its dimensions",
+            ));
+        }
+        Ok(())
+    }
+}
+
 // Convenience constructor for paged INT8 KV caches on CUDA.
 impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
-    /// Allocate a paged INT8 KV cache for one sequence.
+    /// Allocate one sequence's table and metadata, without private K/V storage.
     ///
     /// - `max_blocks_per_seq` × `block_size` = capacity in tokens
-    /// - K/V pool size: `max_blocks_per_seq * block_size * num_kv_heads * head_dim` int8 elems
-    /// - scales pool size: `max_blocks_per_seq * block_size * num_kv_heads` FP16 elems
+    /// - Physical K/V and scales belong to `QuantizedPagedKvPool`.
     /// - `block_table` is allocated as u32[max_blocks_per_seq] via `B::alloc_u32`
     /// - `context_lens` is allocated as u32[1] (single seq for now)
     pub fn new_paged_cuda(
@@ -234,9 +335,9 @@ impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
         head_dim: usize,
     ) -> Self {
         use crate::backend::Backend;
-        let pool_tokens = max_blocks_per_seq * block_size;
-        let elem_count = pool_tokens * num_kv_heads * head_dim;
-        let scale_count = pool_tokens * num_kv_heads;
+        let logical_capacity = max_blocks_per_seq
+            .checked_mul(block_size)
+            .expect("INT8 table capacity overflow");
         let block_table =
             <CudaBackend as Backend>::alloc_typed(crate::backend::Dtype::U32, max_blocks_per_seq);
         // The caller initializes tables on its preparation context and observes
@@ -250,12 +351,8 @@ impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
         let cl_buf = context_lens;
 
         crate::backend::KvCacheQuant {
-            k: OptionalCudaInt8::alloc(elem_count),
-            v: OptionalCudaInt8::alloc(elem_count),
-            k_scales: OptionalCudaScalesF16::alloc(scale_count),
-            v_scales: OptionalCudaScalesF16::alloc(scale_count),
             len: 0,
-            capacity: pool_tokens,
+            capacity: logical_capacity,
             num_kv_heads,
             head_dim,
             block_size,

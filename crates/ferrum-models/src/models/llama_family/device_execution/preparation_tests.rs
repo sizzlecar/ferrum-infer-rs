@@ -12,7 +12,7 @@ fn model<B: MoeLlmBackend>(paged: bool) -> LlamaFamilyModel<B, KvFp16> {
         hidden_size: 128,
         intermediate_size: 256,
         num_heads: 2,
-        num_kv_heads: 1,
+        num_kv_heads: 2,
         head_dim: 64,
         num_layers: 2,
         vocab_size: 128,
@@ -126,14 +126,27 @@ fn real_preparation_preserves_allocator_and_numerical_state<B: MoeLlmBackend>(
     let first = actual.prefill_internal("sequence", &[1, 2, 3]);
     assert_eq!(first, reference.prefill_internal("reference", &[1, 2, 3]));
     assert!(first.iter().all(|value| value.is_finite()));
-    let old_k: Vec<_> = actual.kv_caches["sequence"]
+    let heads = actual.cfg.num_kv_heads;
+    let head_dim = actual.cfg.head_dim;
+    assert_eq!(heads, 2);
+    let old_kv: Vec<_> = actual.kv_caches["sequence"]
         .iter()
-        .map(|cache| B::to_vec(&cache.k, 3 * 64))
+        .map(|cache| {
+            assert_eq!(cache.capacity, 3);
+            let count = heads * cache.capacity * head_dim;
+            (B::to_vec(&cache.k, count), B::to_vec(&cache.v, count))
+        })
         .collect();
     let failed: DeviceFrameResult<()> = actual.run_preparation_frame(|model, frame| {
         for cache in model.kv_caches.get_mut("sequence").unwrap() {
-            <KvFp16 as KvLayer<B>>::ensure_contig_capacity(&mut frame.context, cache, 7, 1, 64)
-                .unwrap();
+            <KvFp16 as KvLayer<B>>::ensure_contig_capacity(
+                &mut frame.context,
+                cache,
+                7,
+                heads,
+                head_dim,
+            )
+            .unwrap();
         }
         std::panic::panic_any(FerrumError::backend("injected contiguous growth failure"));
     });
@@ -144,10 +157,27 @@ fn real_preparation_preserves_allocator_and_numerical_state<B: MoeLlmBackend>(
         .to_string()
         .contains("injected contiguous growth failure"));
     assert!(actual.pending_device_frame.is_none());
-    for (cache, expected_k) in actual.kv_caches["sequence"].iter().zip(old_k) {
+    for (cache, (expected_k, expected_v)) in actual.kv_caches["sequence"].iter().zip(old_kv) {
         assert_eq!(cache.len, 3);
         assert_eq!(cache.capacity, 7);
-        assert_eq!(B::to_vec(&cache.k, 3 * 64), expected_k);
+        let count = heads * cache.capacity * head_dim;
+        let copied_k = B::to_vec(&cache.k, count);
+        let copied_v = B::to_vec(&cache.v, count);
+        // Each head occupies its own capacity stride. A flat prefix copy can
+        // preserve head zero while corrupting every subsequent head.
+        for head in 0..heads {
+            let old_start = head * 3 * head_dim;
+            let new_start = head * 7 * head_dim;
+            let live = cache.len * head_dim;
+            assert_eq!(
+                &copied_k[new_start..new_start + live],
+                &expected_k[old_start..old_start + live]
+            );
+            assert_eq!(
+                &copied_v[new_start..new_start + live],
+                &expected_v[old_start..old_start + live]
+            );
+        }
     }
     let actual_logits = actual.decode_internal("sequence", 4, 3);
     let reference_logits = reference.decode_internal("reference", 4, 3);

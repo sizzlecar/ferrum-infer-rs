@@ -562,7 +562,7 @@ fn int8_kv_append_then_decode_e2e() {
 #[ignore]
 fn kv_cache_quant_int8_e2e() {
     let _guard = CUDA_TEST_LOCK.lock().unwrap();
-    use ferrum_kernels::backend::{KvCacheQuant, KvInt8};
+    use ferrum_kernels::backend::{KvCacheQuant, KvInt8, QuantizedPagedKvPool};
 
     const NUM_HEADS: usize = 8;
     const NUM_KV_HEADS: usize = 2;
@@ -618,6 +618,12 @@ fn kv_cache_quant_int8_e2e() {
     // Drive the GPU side through the high-level KvCacheQuant cache.
     let mut cache: KvCacheQuant<CudaBackend, KvInt8> =
         KvCacheQuant::new_paged_cuda(MAX_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM);
+    let mut pool = QuantizedPagedKvPool::<CudaBackend, KvInt8>::new_cuda(
+        MAX_BLOCKS,
+        BLOCK_SIZE,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+    );
 
     let mut ctx = CudaBackend::new_context();
 
@@ -643,10 +649,7 @@ fn kv_cache_quant_int8_e2e() {
         &mut ctx,
         &k_in_dev,
         &v_in_dev,
-        &mut cache.k,
-        &mut cache.v,
-        &mut cache.k_scales,
-        &mut cache.v_scales,
+        &mut pool,
         &cache.paged_block_indices,
         0,
         VALID_KV_LEN,
@@ -661,11 +664,9 @@ fn kv_cache_quant_int8_e2e() {
     CudaBackend::int8_paged_decode_attention(
         &mut ctx,
         &q_dev,
-        &cache.k,
-        &cache.v,
-        &cache.k_scales,
-        &cache.v_scales,
+        &pool,
         cache.block_table.as_ref().unwrap(),
+        &cache.paged_block_indices,
         &mut out_dev,
         NUM_HEADS,
         NUM_KV_HEADS,
@@ -701,4 +702,120 @@ fn kv_cache_quant_int8_e2e() {
     assert!(cosine > 0.999, "cosine similarity too low: {cosine}");
     let rel_to_mag = max_abs / max_mag.max(1e-6);
     assert!(rel_to_mag < 0.02, "rel-to-max-mag too high: {rel_to_mag}");
+}
+
+/// Distinct sequence tables address a single physical pool, including blocks
+/// beyond either sequence's logical capacity and an aliased complete prefix.
+#[test]
+#[ignore]
+fn int8_shared_pool_nonzero_blocks_and_prefix_alias_match_host_reference() {
+    let _guard = CUDA_TEST_LOCK.lock().unwrap();
+    use ferrum_kernels::backend::{KvCacheQuant, KvInt8, QuantizedPagedKvPool};
+    const BS: usize = 16;
+    const HD: usize = 64;
+    const KV: usize = 2;
+    const Q: usize = 4;
+    let mut ctx = CudaBackend::new_context();
+    let mut pool = QuantizedPagedKvPool::<CudaBackend, KvInt8>::new_cuda(3, BS, KV, HD);
+    let mut a = KvCacheQuant::<CudaBackend, KvInt8>::new_paged_cuda(2, BS, KV, HD);
+    let mut b = KvCacheQuant::<CudaBackend, KvInt8>::new_paged_cuda(2, BS, KV, HD);
+    let mut alias = KvCacheQuant::<CudaBackend, KvInt8>::new_paged_cuda(2, BS, KV, HD);
+    a.paged_block_indices = vec![0, 1];
+    b.paged_block_indices = vec![2];
+    alias.paged_block_indices = vec![0];
+    for cache in [&mut a, &mut b, &mut alias] {
+        CudaBackend::write_typed::<u32>(
+            &mut ctx,
+            cache.block_table.as_mut().unwrap(),
+            &cache.paged_block_indices,
+        );
+    }
+    assert!(b.paged_block_indices[0] as usize * BS >= b.capacity);
+    assert_eq!(pool.k.buffer().len(), 3 * BS * KV * HD);
+    let mut rng = 0x9137_bca1;
+    let q: Vec<f32> = (0..Q * HD).map(|_| rnd(&mut rng) * 0.25).collect();
+    let a_k: Vec<f32> = (0..17 * KV * HD).map(|_| rnd(&mut rng) * 0.4).collect();
+    let a_v: Vec<f32> = (0..17 * KV * HD).map(|_| rnd(&mut rng) * 0.4).collect();
+    let b_k: Vec<f32> = (0..KV * HD).map(|_| rnd(&mut rng) * 0.7).collect();
+    let b_v: Vec<f32> = (0..KV * HD).map(|_| rnd(&mut rng) * 0.7).collect();
+    let mut expected_k = vec![0.0; 3 * BS * KV * HD];
+    let mut expected_v = expected_k.clone();
+    expected_k[..a_k.len()].copy_from_slice(&a_k);
+    expected_v[..a_v.len()].copy_from_slice(&a_v);
+    expected_k[2 * BS * KV * HD..(2 * BS + 1) * KV * HD].copy_from_slice(&b_k);
+    expected_v[2 * BS * KV * HD..(2 * BS + 1) * KV * HD].copy_from_slice(&b_v);
+    let q_device = CudaBackend::from_slice(&q);
+    let append = |ctx: &mut _, pool: &mut _, indices: &[u32], k: &[f32], v: &[f32], count| {
+        let k_device = CudaBackend::from_slice(k);
+        let v_device = CudaBackend::from_slice(v);
+        CudaBackend::int8_kv_append_paged(
+            ctx, &k_device, &v_device, pool, indices, 0, count, BS, KV, HD,
+        )
+        .unwrap();
+        assert!(matches!(
+            CudaBackend::observe_completion(ctx),
+            BackendCompletion::Succeeded
+        ));
+    };
+    let decode = |ctx: &mut _, pool: &_, cache: &KvCacheQuant<CudaBackend, KvInt8>, count| {
+        let mut output = CudaBackend::alloc(Q * HD);
+        CudaBackend::int8_paged_decode_attention(
+            ctx,
+            &q_device,
+            pool,
+            cache.block_table.as_ref().unwrap(),
+            &cache.paged_block_indices,
+            &mut output,
+            Q,
+            KV,
+            HD,
+            count,
+            BS,
+            (HD as f32).sqrt().recip(),
+        )
+        .unwrap();
+        assert!(matches!(
+            CudaBackend::observe_completion(ctx),
+            BackendCompletion::Succeeded
+        ));
+        CudaBackend::to_vec(&output, Q * HD)
+    };
+    append(&mut ctx, &mut pool, &a.paged_block_indices, &a_k, &a_v, 17);
+    let a_before = decode(&mut ctx, &pool, &a, 17);
+    append(&mut ctx, &mut pool, &b.paged_block_indices, &b_k, &b_v, 1);
+    let a_after = decode(&mut ctx, &pool, &a, 17);
+    assert_eq!(
+        a_before, a_after,
+        "B must not overwrite A's physical blocks"
+    );
+    for (cache, count) in [(&a, 17), (&b, 1), (&alias, 16)] {
+        let actual = decode(&mut ctx, &pool, cache, count);
+        let table: Vec<i32> = cache
+            .paged_block_indices
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+        let expected = host_ref_paged_decode(
+            &q,
+            &expected_k,
+            &expected_v,
+            &table,
+            Q,
+            KV,
+            HD,
+            count,
+            BS,
+            (HD as f32).sqrt().recip(),
+        );
+        let magnitude = expected.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(actual.iter().all(|x| x.is_finite()));
+        let maximum_error = actual
+            .iter()
+            .zip(&expected)
+            .fold(0.0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(
+            maximum_error < 0.02 * magnitude.max(1e-6),
+            "shared INT8 attention error={maximum_error}, magnitude={magnitude}"
+        );
+    }
 }

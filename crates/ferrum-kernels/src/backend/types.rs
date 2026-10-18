@@ -205,27 +205,24 @@ pub struct KvCache<B: Backend, K: KvDtypeKind = KvFp16> {
     pub _kv_dtype: std::marker::PhantomData<K>,
 }
 
-/// Quantized-KV cache (Dim 5 INT8 / future FP8 paths). Sibling of
-/// [`KvCache`] for backends that store K/V in a non-FP16 element type
-/// plus per-token per-kv-head scales.
-///
-/// Why a separate struct: the FP16 `KvCache<B, K>` uses `B::Buffer`
-/// uniformly, which is FP16 on every concrete backend. Stuffing INT8
-/// storage into that buffer would require unsafe transmutes; making
-/// the FP16 struct generic over the storage type would force every
-/// existing call site (4 model files, ~20 functions) to pick up an
-/// equality-bound on the associated type. Keeping a parallel struct
-/// for INT8 is the cheaper trade — the kernel launchers in
-/// [`crate::int8_kv`] take cudarc primitives directly anyway.
-///
-/// `KStorage` and `ScaleStorage` come from `BackendKvDtype<K>::KvBuffer`
-/// and `BackendKvDtype<K>::KvScales`. On CUDA they wrap `CudaSlice<i8>`
-/// and `CudaSlice<f16>`.
-pub struct KvCacheQuant<B: BackendKvDtype<K>, K: KvDtypeKind> {
+/// Physical quantized KV storage for one model layer, shared by all sequences.
+/// Its block namespace is the model allocator's namespace, including cached
+/// prefix blocks. Sequence tables do not own separate copies of these arrays.
+pub struct QuantizedPagedKvPool<B: BackendKvDtype<K>, K: KvDtypeKind> {
     pub k: <B as BackendKvDtype<K>>::KvBuffer,
     pub v: <B as BackendKvDtype<K>>::KvBuffer,
     pub k_scales: <B as BackendKvDtype<K>>::KvScales,
     pub v_scales: <B as BackendKvDtype<K>>::KvScales,
+    pub num_blocks: usize,
+    pub block_size: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+/// One sequence's logical view of a shared quantized KV pool.
+/// `capacity` bounds its logical tokens, not the physical block ids in its
+/// table. K/V and scales remain owned by [`QuantizedPagedKvPool`].
+pub struct KvCacheQuant<B: BackendKvDtype<K>, K: KvDtypeKind> {
     pub len: usize,
     pub capacity: usize,
     pub num_kv_heads: usize,

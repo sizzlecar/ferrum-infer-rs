@@ -7,7 +7,7 @@ pub use super::capabilities::{
 };
 use super::dtype::Dtype;
 pub use super::types::MoeRouting;
-use super::types::{AttnConfig, KvCacheQuant, SrcDtype};
+use super::types::{AttnConfig, KvCacheQuant, QuantizedPagedKvPool, SrcDtype};
 
 /// Maximum decode-graph layer count. Per-layer call sites that share
 /// graph-captured host staging arrays use this as the stride between
@@ -2306,7 +2306,18 @@ pub trait BackendKvDtype<K: KvDtypeKind>: BackendPagedKv {
 /// gets a chance to call into these.
 #[allow(clippy::too_many_arguments)]
 pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
-    /// Allocate the per-layer INT8 paged cache for one sequence.
+    /// Allocate the model layer's physical INT8 storage once, using the same
+    /// total block capacity as its allocator. Sequence tables reference it.
+    fn alloc_paged_int8_pool(
+        _num_blocks: usize,
+        _block_size: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) -> QuantizedPagedKvPool<Self, KvInt8> {
+        unimplemented!("alloc_paged_int8_pool not supported on this backend")
+    }
+
+    /// Allocate only the logical table and metadata for one sequence.
     /// Default panics — backends without INT8 support never reach this
     /// path (factory rejects (Cpu/Metal, Int8) before ensure_kv runs).
     fn alloc_paged_int8_layer(
@@ -2327,15 +2338,12 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
     /// on the same stream — fully overlapping with prior work.
     /// `cache_len_before` is the current number of valid tokens; the
     /// backend quantizes FP16 → INT8 with per-(token, kv-head) FP16 scale
-    /// and writes both into the layer's INT8 / scale buffers.
+    /// and writes both into the shared physical INT8 / scale buffers.
     fn int8_kv_append_paged(
         _ctx: &mut Self::Context,
         _k_in: &Self::Buffer,
         _v_in: &Self::Buffer,
-        _layer_k: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_v: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_k_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
-        _layer_v_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
+        _pool: &mut QuantizedPagedKvPool<Self, KvInt8>,
         _paged_block_indices: &[u32],
         _cache_len_before: usize,
         _tokens: usize,
@@ -2355,11 +2363,9 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
     fn int8_paged_decode_attention(
         _ctx: &mut Self::Context,
         _q: &Self::Buffer,
-        _layer_k: &<Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_v: &<Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_k_scales: &<Self as BackendKvDtype<KvInt8>>::KvScales,
-        _layer_v_scales: &<Self as BackendKvDtype<KvInt8>>::KvScales,
+        _pool: &QuantizedPagedKvPool<Self, KvInt8>,
         _block_table: &Self::Buffer,
+        _paged_block_indices: &[u32],
         _output: &mut Self::Buffer,
         _num_q_heads: usize,
         _num_kv_heads: usize,

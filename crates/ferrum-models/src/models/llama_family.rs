@@ -1848,7 +1848,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     //
     /// Shared K/V pools, one per layer. Sized at model load time for the
     /// configured `MAX_RUNNING_REQUESTS × max_blocks_per_seq` blocks.
-    pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
+    pub paged_pools: Option<Vec<K::PagedPool>>,
     /// Block allocator hands out physical block indices from the pool.
     /// `Mutex` because the engine can call `ensure_kv` / `release_kv`
     /// from multiple threads in concurrent serving.
@@ -2231,8 +2231,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         if paged && self.paged_pools.is_none() {
             let mut pools = Vec::with_capacity(self.local_layer_count());
             for _ in self.local_layer_indices() {
-                let pool_floats = total_pool_blocks * nkv * LLAMA_PAGED_BLOCK_SIZE * hd;
-                pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
+                pools.push(K::alloc_paged_pool(
+                    total_pool_blocks,
+                    LLAMA_PAGED_BLOCK_SIZE,
+                    nkv,
+                    hd,
+                ));
             }
             self.paged_pools = Some(pools);
             self.paged_block_alloc = Some(std::sync::Mutex::new(
@@ -3249,15 +3253,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         //
         // Paged mode: also need this layer's shared pool buffers
         // (self.paged_pools[li]). The pool is a separate field from
-        // kv_caches, so we take a raw pointer to its (k, v) here while
+        // kv_caches, so we take a raw pointer to its typed pool here while
         // we still hold &mut self, then deref via unsafe inside the
         // paged dispatch below. Safety: paged_pools is allocated once
         // and never resized; we don't touch self.paged_pools while the
         // pointer is in use.
-        let paged_pool_ptr: Option<(*mut B::Buffer, *mut B::Buffer)> =
+        let paged_pool_ptr: Option<*mut K::PagedPool> =
             if let Some(pools) = self.paged_pools.as_mut() {
-                let pool = &mut pools[li];
-                Some((&mut pool.0 as *mut _, &mut pool.1 as *mut _))
+                Some(&mut pools[li] as *mut _)
             } else {
                 None
             };
@@ -3296,15 +3299,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Paged path: K::paged_write fuses split_qkv_norm_rope + cache append
         // (FP16: into_paged_cache; INT8: split_qkv_norm_rope + int8_kv_append_paged).
-        // K::paged_decode_attention reads from layer-local INT8 buffers or the
-        // shared FP16 pool depending on K. Then K-agnostic post-attn tail.
+        // K::paged_decode_attention reads the same typed shared physical pool.
+        // Then K-agnostic post-attn tail.
         if cache_block_size > 0 {
-            let (pool_k_ptr, pool_v_ptr) =
+            let pool_ptr =
                 paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
             // SAFETY: paged_pools is allocated once and never resized; the
             // raw pointers don't outlive this method scope.
-            let pool_k = unsafe { &mut *pool_k_ptr };
-            let pool_v = unsafe { &mut *pool_v_ptr };
+            let pool = unsafe { &mut *pool_ptr };
 
             K::paged_write(
                 ctx,
@@ -3317,8 +3319,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &mut self.scratch.q_head_major,
                 &mut self.scratch.k_head_major,
                 &mut self.scratch.v_head_major,
-                pool_k,
-                pool_v,
+                pool,
                 tokens,
                 nh,
                 nkv,
@@ -3332,14 +3333,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let new_len = cache_len_before + tokens;
             K::set_len(&mut caches[li], new_len);
 
-            let pool_k_imm = unsafe { &*pool_k_ptr };
-            let pool_v_imm = unsafe { &*pool_v_ptr };
             K::paged_decode_attention(
                 ctx,
                 &mut caches[li],
                 &self.scratch.q_head_major,
-                pool_k_imm,
-                pool_v_imm,
+                pool,
                 &mut self.scratch.attn_head_major_out,
                 nh,
                 nkv,
@@ -5720,6 +5718,9 @@ fn scale_llama3_rope_freq(
 #[cfg(test)]
 #[path = "llama_family_lora_tests.rs"]
 mod lora_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+mod int8_shared_pool_tests;
 
 #[cfg(test)]
 mod tests {

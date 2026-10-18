@@ -17,7 +17,7 @@
 
 use ferrum_types::{FerrumError, Result};
 
-use crate::backend::{Backend, BackendInt8KvOps, KvCache, KvCacheQuant};
+use crate::backend::{Backend, BackendInt8KvOps, KvCache, KvCacheQuant, QuantizedPagedKvPool};
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 
 /// Per-K-dtype dispatch trait.
@@ -25,6 +25,17 @@ use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 pub trait KvLayer<B: Backend>: KvDtypeKind {
     /// Per-layer cache type (FP16 → `KvCache`, INT8 → `KvCacheQuant`).
     type Layer: Send + Sync;
+
+    /// Physical storage shared across sequences in one model layer. Its block
+    /// count is the model allocator's capacity, not a sequence's table length.
+    type PagedPool: Send + Sync;
+
+    fn alloc_paged_pool(
+        num_blocks: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self::PagedPool;
 
     /// Allocate storage for a paged cache layer for one sequence. The caller
     /// must initialize its block table and context length on its own retained
@@ -86,8 +97,7 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
         q_out: &mut B::Buffer,
         k_scratch: &mut B::Buffer,
         v_scratch: &mut B::Buffer,
-        pool_k: &mut B::Buffer,
-        pool_v: &mut B::Buffer,
+        pool: &mut Self::PagedPool,
         tokens: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -98,14 +108,13 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     ) -> Result<()>;
 
     /// Paged decode attention. Reads from the per-layer cache, writes the
-    /// attended output to `output`. FP16 reads from `pool_k`/`pool_v`;
-    /// INT8 reads from layer-internal INT8 buffers (pool args ignored).
+    /// attended output to `output`. Both dtypes read the physical storage
+    /// shared by the model's sequences, through the sequence's block table.
     fn paged_decode_attention(
         ctx: &mut B::Context,
         layer: &mut Self::Layer,
         q: &B::Buffer,
-        pool_k: &B::Buffer,
-        pool_v: &B::Buffer,
+        pool: &Self::PagedPool,
         output: &mut B::Buffer,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -162,6 +171,21 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
 
 impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
     type Layer = KvCache<B, KvFp16>;
+    type PagedPool = (B::Buffer, B::Buffer);
+
+    fn alloc_paged_pool(
+        num_blocks: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self::PagedPool {
+        let elements = num_blocks
+            .checked_mul(block_size)
+            .and_then(|n| n.checked_mul(num_kv_heads))
+            .and_then(|n| n.checked_mul(head_dim))
+            .expect("FP16 paged pool dimensions overflow");
+        (B::alloc(elements), B::alloc(elements))
+    }
 
     fn alloc_paged(
         max_blocks_per_seq: usize,
@@ -283,8 +307,7 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         q_out: &mut B::Buffer,
         _k_scratch: &mut B::Buffer,
         _v_scratch: &mut B::Buffer,
-        pool_k: &mut B::Buffer,
-        pool_v: &mut B::Buffer,
+        pool: &mut Self::PagedPool,
         tokens: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -310,8 +333,8 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
             sin,
             q_out,
             0,
-            pool_k,
-            pool_v,
+            &mut pool.0,
+            &mut pool.1,
             bt,
             tokens,
             num_q_heads,
@@ -330,8 +353,7 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         ctx: &mut B::Context,
         layer: &mut Self::Layer,
         q: &B::Buffer,
-        pool_k: &B::Buffer,
-        pool_v: &B::Buffer,
+        pool: &Self::PagedPool,
         output: &mut B::Buffer,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -357,8 +379,8 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         B::paged_decode_attention(
             ctx,
             q,
-            pool_k,
-            pool_v,
+            &pool.0,
+            &pool.1,
             output,
             bt,
             cl,
@@ -524,6 +546,16 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
 
 impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
     type Layer = KvCacheQuant<B, KvInt8>;
+    type PagedPool = QuantizedPagedKvPool<B, KvInt8>;
+
+    fn alloc_paged_pool(
+        num_blocks: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self::PagedPool {
+        B::alloc_paged_int8_pool(num_blocks, block_size, num_kv_heads, head_dim)
+    }
 
     fn alloc_paged(
         max_blocks_per_seq: usize,
@@ -586,8 +618,7 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         q_out: &mut B::Buffer,
         k_scratch: &mut B::Buffer,
         v_scratch: &mut B::Buffer,
-        _pool_k: &mut B::Buffer,
-        _pool_v: &mut B::Buffer,
+        pool: &mut Self::PagedPool,
         tokens: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -621,18 +652,12 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         // barrier that would otherwise dominate per-token overhead.
         let cache_len_before = layer.len;
         let block_size = layer.block_size;
-        // Clone the host indices (small Vec<u32>) so we don't hold a
-        // borrow on `layer` while passing &mut layer.k/v/scales below.
-        let paged_indices: Vec<u32> = layer.paged_block_indices.clone();
         B::int8_kv_append_paged(
             ctx,
             k_scratch,
             v_scratch,
-            &mut layer.k,
-            &mut layer.v,
-            &mut layer.k_scales,
-            &mut layer.v_scales,
-            &paged_indices,
+            pool,
+            &layer.paged_block_indices,
             cache_len_before,
             tokens,
             block_size,
@@ -645,8 +670,7 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         ctx: &mut B::Context,
         layer: &mut Self::Layer,
         q: &B::Buffer,
-        _pool_k: &B::Buffer,
-        _pool_v: &B::Buffer,
+        pool: &Self::PagedPool,
         output: &mut B::Buffer,
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -668,11 +692,9 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         B::int8_paged_decode_attention(
             ctx,
             q,
-            &layer.k,
-            &layer.v,
-            &layer.k_scales,
-            &layer.v_scales,
+            pool,
             bt,
+            &layer.paged_block_indices,
             output,
             num_q_heads,
             num_kv_heads,
