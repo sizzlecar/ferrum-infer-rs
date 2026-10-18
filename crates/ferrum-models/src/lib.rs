@@ -37,13 +37,7 @@ pub mod weight_format;
 
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
-pub use executor::{
-    LlmExecutor, StubModelExecutor, VNextCompiledModel, VNextDeterminismExecutionMode,
-    VNextDeterminismExecutionSpec, VNextDeterminismInitialState, VNextDeterminismParticipantSpec,
-    VNextDeterminismPhase, VNextDeterminismWorkspacePoison, VNextExecutorConfig,
-    VNextModelCompilationError, VNextModelExecutor, VNextRuntimeComposition,
-    MAX_VNEXT_DETERMINISM_PARTICIPANTS,
-};
+pub use executor::{LlmExecutor, StubModelExecutor};
 pub use hf_download::HfDownloader;
 pub use loader::SafeTensorsLoader;
 pub use lora::{

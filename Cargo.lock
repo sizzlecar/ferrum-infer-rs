@@ -1282,6 +1282,7 @@ dependencies = [
  "dirs 5.0.1",
  "ferrum-bench-core",
  "ferrum-engine",
+ "ferrum-execution",
  "ferrum-interfaces",
  "ferrum-kernels",
  "ferrum-models",
@@ -1413,8 +1414,17 @@ dependencies = [
  "ferrum-runtime",
  "ferrum-types",
  "futures",
+ "half",
+ "parking_lot",
+ "pin-project-lite",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1510,7 +1520,6 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pathdiff",
- "pin-project-lite",
  "rand 0.8.5",
  "reqwest",
  "safetensors 0.4.5",

@@ -215,7 +215,7 @@ Rust HTTP 生命周期测试已在 Metal、4050 和 4090 通过：两个请求�
 实现与测试入口：
 
 - [Engine 统一 token 提交与回退](../crates/ferrum-engine/src/continuous_engine/inner/token_batch.rs)、[engine 契约测试](../crates/ferrum-engine/src/continuous_engine/mixed_batch_tests.rs)、[真实 CPU 模型测试](../crates/ferrum-engine/src/registry/tests/mixed_batch_tests.rs)和[小回传测试](../crates/ferrum-engine/src/registry/tests/mixed_batch_tests/greedy_readback.rs)。
-- [Executor token 执行生命周期](../crates/ferrum-models/src/executor/vnext_executor/token_execution.rs)与[输出角色测试](../crates/ferrum-models/src/executor/vnext_executor/sampling_readback/runtime_tests/token_execution/mixed_roles.rs)。
+- [Executor token 执行生命周期](../crates/ferrum-execution/src/driver/token_execution.rs)与[输出角色测试](../crates/ferrum-execution/src/driver/sampling_readback.rs)。
 - [CUDA native Linear](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/transformer/native_linear.rs)、[SwiGLU](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/transformer/native_swiglu.rs)、[LM-head 连续布局测试](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/last_token_linear_tests.rs)、[Q4K 对照测试](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/native_blocks/tests/q4k.rs)。
 - [Metal plain 分派计划](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/plain_prefill.rs)、[尾行正确性与微基准](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/plain_prefill_tests.rs)和[八行分组正确性与微基准](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/microbench/q6_shared_groups.rs)。
 - [池内连续空间回收](../crates/ferrum-runtime/src/resource/pool_resident_reclaim.rs)、[资源与事件回归](../crates/ferrum-runtime/src/resource/pool_resident_reclaim_tests.rs)及[真实服务断流与资源恢复回归](../crates/ferrum-cli/tests/server_stream_lifecycle.rs)。后者是需要专用服务的 ignored 测试；编译通过不代表实际设备执行通过。

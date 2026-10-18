@@ -5,22 +5,22 @@
 //! while execution resources remain private to the executor.
 
 use ferrum_execution::ModelExecutor;
+use ferrum_execution::{DeterminismExecutionSpec, ProgramExecutor, ProgramExecutorConfig};
 use ferrum_kernels::backend::cuda::{
     vnext_ops::CudaVNextComposition, vnext_runtime::CudaDeviceRuntime,
 };
 use ferrum_models::vnext::DefinedProductionModel;
-use ferrum_models::{VNextDeterminismExecutionSpec, VNextExecutorConfig, VNextModelExecutor};
 use ferrum_runtime::{
     CapabilityCatalog, DeviceId, ResolvedModelPlan, SubmissionWaveDeterminismEvidence,
 };
 use ferrum_types::{EngineConfig, FerrumError, Result};
 
 pub struct CudaVNextDeterminismCollector {
-    executor: VNextModelExecutor<CudaDeviceRuntime>,
+    executor: ProgramExecutor<CudaDeviceRuntime>,
 }
 
 impl CudaVNextDeterminismCollector {
-    pub(crate) fn new(executor: VNextModelExecutor<CudaDeviceRuntime>) -> Self {
+    pub(crate) fn new(executor: ProgramExecutor<CudaDeviceRuntime>) -> Self {
         Self { executor }
     }
 
@@ -42,7 +42,7 @@ impl CudaVNextDeterminismCollector {
 
     pub async fn collect_execution(
         &self,
-        spec: &VNextDeterminismExecutionSpec,
+        spec: &DeterminismExecutionSpec,
     ) -> Result<SubmissionWaveDeterminismEvidence> {
         self.executor.collect_determinism_execution(spec).await
     }
@@ -62,7 +62,7 @@ pub fn create_cuda_vnext_determinism_collector(
     )
     .map_err(|error| FerrumError::device(format!("create vNext CUDA runtime: {error}")))?;
     let (runtime, operation_registry, weight_materializers, catalog) = composition.into_parts();
-    let executor = crate::product_composition::create_vnext_executor_with_configuration(
+    let executor = crate::product_composition::create_program_executor_with_configuration(
         engine,
         defined,
         runtime,
@@ -72,7 +72,7 @@ pub fn create_cuda_vnext_determinism_collector(
         ferrum_kernels::backend::cuda::vnext_ops::cuda_weight_materializer_selection,
         None,
         |engine, info, runtime| {
-            VNextExecutorConfig::for_determinism_collection(engine, info, runtime)
+            ProgramExecutorConfig::for_determinism_collection(engine, info, runtime)
         },
     )?;
     Ok(CudaVNextDeterminismCollector::new(executor))

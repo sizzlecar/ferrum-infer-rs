@@ -5,12 +5,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use ferrum_execution::{
+    CompiledProgram, ProgramCompilationError, ProgramExecutor, ProgramExecutorConfig,
+    RuntimeComposition,
+};
 use ferrum_models::vnext::{
     DefinedProductionModel, PreparedProductionModel, ProductionModelFamilyRegistry,
-};
-use ferrum_models::{
-    VNextCompiledModel, VNextExecutorConfig, VNextModelCompilationError, VNextModelExecutor,
-    VNextRuntimeComposition,
 };
 use ferrum_runtime::{
     CapabilityCatalog, ContractVersion, DeviceRuntime, EngineSelection, ExecutablePlanView,
@@ -51,7 +51,7 @@ pub(crate) fn cuda_attention_policy_for_kv(
     }
 }
 
-pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
+pub(crate) fn create_program_executor<R: DeviceRuntime>(
     engine: &EngineConfig,
     defined: &DefinedProductionModel,
     runtime: Arc<R>,
@@ -64,9 +64,9 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         WeightMaterializerSelection,
         ferrum_runtime::VNextError,
     >,
-    q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
-) -> Result<VNextModelExecutor<R>> {
-    create_vnext_executor_with_configuration(
+    q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<RuntimeComposition<R>>>,
+) -> Result<ProgramExecutor<R>> {
+    create_program_executor_with_configuration(
         engine,
         defined,
         runtime,
@@ -75,12 +75,12 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         catalog,
         select_materializer,
         q8_predecoded_composition,
-        |engine, info, runtime| VNextExecutorConfig::from_engine_config(engine, info, runtime),
+        |engine, info, runtime| ProgramExecutorConfig::from_engine_config(engine, info, runtime),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
+pub(crate) fn create_program_executor_with_configuration<R: DeviceRuntime>(
     engine: &EngineConfig,
     defined: &DefinedProductionModel,
     runtime: Arc<R>,
@@ -93,13 +93,13 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         WeightMaterializerSelection,
         ferrum_runtime::VNextError,
     >,
-    mut q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
-    executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<VNextExecutorConfig>,
-) -> Result<VNextModelExecutor<R>> {
+    mut q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<RuntimeComposition<R>>>,
+    executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<ProgramExecutorConfig>,
+) -> Result<ProgramExecutor<R>> {
     let requested_kv_storage = ferrum_types::KvStorageFormat::try_from(engine.kv_cache.dtype)
         .map_err(FerrumError::config)?;
     let composition =
-        VNextRuntimeComposition::new(runtime, operation_registry, weight_materializers, catalog);
+        RuntimeComposition::new(runtime, operation_registry, weight_materializers, catalog);
     let candidates = defined
         .definition()
         .numerical_profiles()
@@ -299,7 +299,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         } else {
             compiled
         };
-        let initialize = |compiled: VNextCompiledModel<'_, R>, selected_engine: &EngineConfig| {
+        let initialize = |compiled: CompiledProgram<'_, R>, selected_engine: &EngineConfig| {
             tracing::info!(requested_numerical_policy = ?engine.numerical_execution,
             requested_kv_dtype = engine.kv_cache.dtype.as_str(),
             kv_storage = ?requested_kv_storage,
@@ -405,7 +405,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                     }
                     drop(optional);
                 }
-                Err(VNextModelCompilationError::Capacity {
+                Err(ProgramCompilationError::Capacity {
                     required_bytes,
                     usable_capacity_bytes,
                 }) => {
@@ -1176,10 +1176,10 @@ mod tests {
             .into_parts()
             .unwrap();
         let composition =
-            VNextRuntimeComposition::new(Arc::clone(&runtime), operations, materializers, catalog);
+            RuntimeComposition::new(Arc::clone(&runtime), operations, materializers, catalog);
         let info = prepared_a.model_info(engine.model.model_id.clone(), ferrum_types::Device::CPU);
         let config =
-            VNextExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
+            ProgramExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
         let compiled = composition
             .compile_model(
                 prepared_a.execution_input().unwrap(),
@@ -1244,7 +1244,7 @@ mod tests {
         // The same actual composition can initialize the retained source. No
         // fixture-only validation function substitutes for real static upload.
         let config =
-            VNextExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
+            ProgramExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
         let compiled = composition
             .compile_model(
                 prepared_a.execution_input().unwrap(),
@@ -1307,11 +1307,11 @@ mod tests {
             .into_parts()
             .unwrap();
         let composition =
-            VNextRuntimeComposition::new(Arc::clone(&runtime), operations, materializers, catalog);
+            RuntimeComposition::new(Arc::clone(&runtime), operations, materializers, catalog);
         let mut info =
             prepared.model_info(engine.model.model_id.clone(), ferrum_types::Device::CPU);
         let config =
-            VNextExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
+            ProgramExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
         info.hidden_size += 1;
         let error = composition
             .compile_model(

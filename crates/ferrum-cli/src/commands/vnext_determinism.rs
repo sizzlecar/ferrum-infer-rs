@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 #[cfg(feature = "cuda")]
-use ferrum_models::{
-    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
-    VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
+use ferrum_execution::{
+    DeterminismExecutionMode, DeterminismExecutionSpec, DeterminismInitialState, DeterminismPhase,
+    DeterminismWorkspacePoison,
 };
 #[cfg(any(feature = "cuda", test))]
-use ferrum_models::{VNextDeterminismParticipantSpec, MAX_VNEXT_DETERMINISM_PARTICIPANTS};
+use ferrum_execution::{DeterminismParticipantSpec, MAX_DETERMINISM_PARTICIPANTS};
 use ferrum_types::{FerrumError, Result};
 
 const PRIMARY_MODEL_KEYS: [&str; 3] = ["m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"];
@@ -107,10 +107,10 @@ impl ShapePhase {
     }
 
     #[cfg(feature = "cuda")]
-    const fn execution_phase(self) -> VNextDeterminismPhase {
+    const fn execution_phase(self) -> DeterminismPhase {
         match self {
-            Self::Prefill => VNextDeterminismPhase::Prefill,
-            Self::Decode => VNextDeterminismPhase::Decode,
+            Self::Prefill => DeterminismPhase::Prefill,
+            Self::Decode => DeterminismPhase::Decode,
         }
     }
 }
@@ -128,8 +128,8 @@ impl ParticipantFixture {
         self.token_ids.len()
     }
 
-    fn to_spec(&self) -> Result<VNextDeterminismParticipantSpec> {
-        VNextDeterminismParticipantSpec::new(
+    fn to_spec(&self) -> Result<DeterminismParticipantSpec> {
+        DeterminismParticipantSpec::new(
             self.token_ids.clone(),
             self.immediate_start..self.immediate_end(),
             self.immediate_end().saturating_add(8),
@@ -150,11 +150,11 @@ impl ShapeFixture {
     #[cfg(feature = "cuda")]
     fn execution_spec(
         &self,
-        initial_state: VNextDeterminismInitialState,
-        workspace_poison: VNextDeterminismWorkspacePoison,
-        mode: VNextDeterminismExecutionMode,
-    ) -> Result<VNextDeterminismExecutionSpec> {
-        VNextDeterminismExecutionSpec::new(
+        initial_state: DeterminismInitialState,
+        workspace_poison: DeterminismWorkspacePoison,
+        mode: DeterminismExecutionMode,
+    ) -> Result<DeterminismExecutionSpec> {
+        DeterminismExecutionSpec::new(
             self.phase.execution_phase(),
             self.participants
                 .iter()
@@ -293,7 +293,7 @@ fn shape_fixtures(scope: VNextDeterminismScope) -> Vec<ShapeFixture> {
         decode("multi_participant", 4),
     ];
     if scope == VNextDeterminismScope::ReleaseFull {
-        fixtures.push(decode("c32", MAX_VNEXT_DETERMINISM_PARTICIPANTS));
+        fixtures.push(decode("c32", MAX_DETERMINISM_PARTICIPANTS));
     }
     fixtures
 }
@@ -787,9 +787,9 @@ mod cuda {
         engine.backend.device = Device::CUDA(0);
         engine.backend.dtype = prepared.descriptor().execution_dtype();
         engine.backend.enable_reusable_execution = true;
-        engine.scheduler.max_running_requests = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
-        engine.batching.max_batch_size = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
-        engine.batching.max_num_batched_tokens = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
+        engine.scheduler.max_running_requests = MAX_DETERMINISM_PARTICIPANTS;
+        engine.batching.max_batch_size = MAX_DETERMINISM_PARTICIPANTS;
+        engine.batching.max_num_batched_tokens = MAX_DETERMINISM_PARTICIPANTS;
         engine.runtime.model_path = Some(binding.directory.display().to_string());
         engine
     }
@@ -807,8 +807,8 @@ mod cuda {
         let mut cases = Vec::with_capacity(fixtures.len() * 4);
         for fixture in fixtures {
             for (initial_state, initial_state_kind) in [
-                (VNextDeterminismInitialState::Zero, "zero"),
-                (VNextDeterminismInitialState::Nonzero, "nonzero"),
+                (DeterminismInitialState::Zero, "zero"),
+                (DeterminismInitialState::Nonzero, "nonzero"),
             ] {
                 let zero = collect_case(
                     collector,
@@ -818,7 +818,7 @@ mod cuda {
                     quantization,
                     initial_state,
                     initial_state_kind,
-                    VNextDeterminismWorkspacePoison::Zero,
+                    DeterminismWorkspacePoison::Zero,
                     "00",
                 )
                 .await?;
@@ -836,7 +836,7 @@ mod cuda {
                     quantization,
                     initial_state,
                     initial_state_kind,
-                    VNextDeterminismWorkspacePoison::A5,
+                    DeterminismWorkspacePoison::A5,
                     "a5",
                 )
                 .await?;
@@ -905,9 +905,9 @@ mod cuda {
         fixture: &ShapeFixture,
         dtype: &str,
         quantization: &str,
-        initial_state: VNextDeterminismInitialState,
+        initial_state: DeterminismInitialState,
         initial_state_kind: &str,
-        workspace_poison: VNextDeterminismWorkspacePoison,
+        workspace_poison: DeterminismWorkspacePoison,
         workspace_poison_label: &str,
     ) -> Result<PendingCase> {
         let case_id = format!(
@@ -919,8 +919,8 @@ mod cuda {
         );
         let mut executions = Vec::with_capacity(EXECUTIONS_PER_MODE * 2);
         for (mode, mode_label) in [
-            (VNextDeterminismExecutionMode::Eager, "eager"),
-            (VNextDeterminismExecutionMode::Replayed, "replay"),
+            (DeterminismExecutionMode::Eager, "eager"),
+            (DeterminismExecutionMode::Replayed, "replay"),
         ] {
             for repeat in 0..EXECUTIONS_PER_MODE {
                 let spec = fixture.execution_spec(initial_state, workspace_poison, mode)?;

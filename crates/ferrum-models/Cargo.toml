@@ -25,7 +25,6 @@ ferrum-bench-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-pin-project-lite = "0.2"
 parking_lot = { workspace = true }
 
 # Serialization
@@ -79,6 +78,7 @@ futures-util = "0.3"
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
+ferrum-execution = { workspace = true, features = ["test-support"] }
 tokio-test = "0.4"
 tempfile = "3.8"
 ferrum-testkit = { workspace = true }

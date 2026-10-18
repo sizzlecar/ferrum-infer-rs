@@ -1255,7 +1255,7 @@ fn validate_registered_vnext_backend(
     }
 }
 
-fn create_registered_vnext_executor(
+fn create_registered_program_executor(
     config: &ComponentConfig,
     model_path: &std::path::Path,
     sources: Option<Arc<ProductionModelSourceBundle>>,
@@ -1349,7 +1349,7 @@ fn create_registered_vnext_executor(
                     let (runtime, operations, materializers, catalog) = create_composition(
                         ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32,
                     )?.into_parts();
-                    Ok(ferrum_models::VNextRuntimeComposition::new(runtime, operations, materializers, catalog))
+                    Ok(ferrum_execution::RuntimeComposition::new(runtime, operations, materializers, catalog))
                 };
                 let (
                     runtime,
@@ -1357,7 +1357,7 @@ fn create_registered_vnext_executor(
                     weight_materializers,
                     catalog,
                 ) = composition.into_parts();
-                let executor = crate::product_composition::create_vnext_executor(
+                let executor = crate::product_composition::create_program_executor(
                     &config.engine_config,
                     prepared.as_ref(),
                     runtime,
@@ -1418,7 +1418,7 @@ fn create_registered_vnext_executor(
                 ferrum_runtime::WeightMaterializerSelection::exact(
                     weight_materializer_id,
                 );
-            let executor = crate::product_composition::create_vnext_executor(
+            let executor = crate::product_composition::create_program_executor(
                 &config.engine_config,
                 prepared.as_ref(),
                 runtime,
@@ -1452,7 +1452,7 @@ fn create_registered_vnext_executor(
                 backend = "cpu",
                 "Resolving a defined model against the actual vNext runtime"
             );
-            let executor = crate::product_composition::create_vnext_executor(
+            let executor = crate::product_composition::create_program_executor(
                 &config.engine_config, prepared.as_ref(), runtime, operation_registry,
                 weight_materializers, catalog, |_| Ok(selection.clone()), None,
             )?;
@@ -1560,7 +1560,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         if let Some(production_registration) = production_registration {
             match production_registration {
                 ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => {
-                    return create_registered_vnext_executor(
+                    return create_registered_program_executor(
                         config,
                         std::path::Path::new(&model_path),
                         model_sources,
@@ -2707,10 +2707,10 @@ pub(crate) mod tests {
 
     #[test]
     fn optional_layout_compilation_drops_trial_before_one_terminal_initialization() {
-        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
-        use ferrum_models::{
-            VNextExecutorConfig, VNextModelCompilationError, VNextRuntimeComposition,
+        use ferrum_execution::{
+            ProgramCompilationError, ProgramExecutorConfig, RuntimeComposition,
         };
+        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
         use ferrum_runtime::{DeviceId, ExecutablePlanView, WeightMaterializerSelection};
 
         let dir = write_qwen35_fixture_model_dir();
@@ -2745,14 +2745,14 @@ pub(crate) mod tests {
                 .unwrap();
             let observed = Arc::downgrade(&runtime);
             (
-                VNextRuntimeComposition::new(runtime, operations, materializers, catalog),
+                RuntimeComposition::new(runtime, operations, materializers, catalog),
                 materializer,
                 observed,
             )
         };
         let (retained, materializer, retained_owner) = composition();
         let config =
-            VNextExecutorConfig::from_engine_config(&engine, &info, retained.runtime()).unwrap();
+            ProgramExecutorConfig::from_engine_config(&engine, &info, retained.runtime()).unwrap();
         let compiled = retained
             .compile_model(
                 prepared.execution_input().unwrap(),
@@ -2780,7 +2780,8 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let trial_config =
-            VNextExecutorConfig::from_engine_config(&trial_engine, &info, trial.runtime()).unwrap();
+            ProgramExecutorConfig::from_engine_config(&trial_engine, &info, trial.runtime())
+                .unwrap();
         assert!(matches!(
             trial.compile_model(
                 prepared.execution_input().unwrap(),
@@ -2789,7 +2790,7 @@ pub(crate) mod tests {
                 trial_config,
                 WeightMaterializerSelection::exact(trial_materializer)
             ),
-            Err(VNextModelCompilationError::Capacity { .. })
+            Err(ProgramCompilationError::Capacity { .. })
         ));
         assert_eq!(trial.runtime().peak_resident_bytes(), 0);
         drop(trial);
@@ -2854,7 +2855,7 @@ pub(crate) mod tests {
             let (runtime, operations, materializers, materializer, catalog) =
                 composition.into_parts().unwrap();
             let observed = Arc::clone(&runtime);
-            let executor = crate::product_composition::create_vnext_executor(
+            let executor = crate::product_composition::create_program_executor(
                 engine,
                 &defined,
                 runtime,

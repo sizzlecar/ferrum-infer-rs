@@ -21,3 +21,7 @@ tracing = { workspace = true }
 trybuild = "1.0"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = "1"
+
+[features]
+default = []
+test-support = []

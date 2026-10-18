@@ -6,16 +6,16 @@ use ferrum_execution::model_executor::{
     LogitsReturnPolicy, PrefillChunk,
 };
 use ferrum_execution::token_execution::*;
+use ferrum_execution::ProgramExecutor;
 use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
 use ferrum_kernels::backend::cpu::vnext_runtime::CpuDeviceRuntime;
-use ferrum_models::VNextModelExecutor;
 use ferrum_runtime::{DeviceId, WeightMaterializerSelection};
 use ferrum_types::{RequestId, TokenId};
 
 mod greedy_readback;
 
 struct CpuFixture {
-    executor: VNextModelExecutor<CpuDeviceRuntime>,
+    executor: ProgramExecutor<CpuDeviceRuntime>,
     directory: PathBuf,
 }
 
@@ -36,7 +36,7 @@ impl CpuFixture {
         .unwrap();
         let (runtime, operations, materializers, materializer, catalog) =
             composition.into_parts().unwrap();
-        let executor = crate::product_composition::create_vnext_executor(
+        let executor = crate::product_composition::create_program_executor(
             &config,
             &defined,
             runtime,

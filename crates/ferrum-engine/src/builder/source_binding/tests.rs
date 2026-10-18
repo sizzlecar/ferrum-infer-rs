@@ -271,7 +271,7 @@ fn typed_executor(defined: &DefinedProductionModel) -> (EngineConfig, Arc<dyn Mo
     .unwrap();
     let (runtime, operations, materializers, materializer, catalog) =
         composition.into_parts().unwrap();
-    let executor = crate::product_composition::create_vnext_executor(
+    let executor = crate::product_composition::create_program_executor(
         &config,
         defined,
         runtime,
