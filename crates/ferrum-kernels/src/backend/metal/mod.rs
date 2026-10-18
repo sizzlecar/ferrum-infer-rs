@@ -38,6 +38,9 @@ mod residency;
 pub mod vnext_ops;
 pub mod vnext_runtime;
 
+#[cfg(test)]
+mod copy_slice_tests;
+
 // GGUF k-quant kernels (Audit #9 moved here from kernels-crate top level).
 // Re-exported via `pub use backend::metal::{...}` in `crate::lib` so the
 // historical `ferrum_kernels::q4_k_gemm::*` and internal `crate::q4_k_*`
@@ -1016,21 +1019,54 @@ impl Backend for MetalBackend {
         dst_offset: usize,
         len: usize,
     ) {
+        assert_eq!(src.dtype, dst.dtype, "Metal copy_slice dtype mismatch");
+        let src_end = src_offset
+            .checked_add(len)
+            .expect("Metal copy_slice source extent overflow");
+        let dst_end = dst_offset
+            .checked_add(len)
+            .expect("Metal copy_slice destination extent overflow");
+        assert!(src_end <= src.n, "Metal copy_slice source out of bounds");
+        assert!(
+            dst_end <= dst.n,
+            "Metal copy_slice destination out of bounds"
+        );
+        let element_bytes = src.dtype.bytes_per_elem();
+        let bytes = |elements: usize| {
+            u64::try_from(
+                elements
+                    .checked_mul(element_bytes)
+                    .expect("Metal copy_slice byte extent overflow"),
+            )
+            .expect("Metal copy_slice byte extent exceeds Metal address range")
+        };
+        assert!(
+            bytes(src_end) <= src.raw.length(),
+            "Metal copy_slice source exceeds allocation"
+        );
+        assert!(
+            bytes(dst_end) <= dst.raw.length(),
+            "Metal copy_slice destination exceeds allocation"
+        );
+        let src_offset_bytes = bytes(src_offset);
+        let dst_offset_bytes = bytes(dst_offset);
+        let len_bytes = bytes(len);
+        if len == 0 {
+            return;
+        }
         // Blit encoder stays in the same command buffer as neighbouring
         // compute encoders, keeping the single-command-buffer invariant.
         // Close the sticky compute encoder first — Metal forbids two
         // active encoders on one cmd buffer.
-        let src = src.expect_f32("copy_slice src");
-        let dst = dst.expect_f32_mut("copy_slice dst");
         ctx.compute_encoder_end();
         let cmd = ctx.cmd();
         let blit = cmd.new_blit_command_encoder();
         blit.copy_from_buffer(
-            src,
-            (src_offset * 4) as u64,
-            dst,
-            (dst_offset * 4) as u64,
-            (len * 4) as u64,
+            &src.raw,
+            src_offset_bytes,
+            &dst.raw,
+            dst_offset_bytes,
+            len_bytes,
         );
         blit.end_encoding();
     }

@@ -24,17 +24,25 @@ fn legacy_checker_id(backend: Backend) -> String {
 }
 
 fn model_frame_tests(backend: Backend) -> Vec<ContractTest> {
-    let backend = backend_name(backend);
-    [
-        format!("models::llama_family::device_execution::tests::single_device_frame_restores_original_scratch_after_real_{backend}_forward_failure"),
-        format!("models::llama_family_forward_batched::tests::physical_batch_frame_preserves_real_{backend}_logits_and_scratch_on_failure"),
-        format!("models::llama_family_forward_batched::tests::selection_failure_full_readback_observes_real_{backend}_preparation"),
-    ].into_iter().map(|name| ContractTest {
-        package: "ferrum-models".into(),
-        target: "ferrum_models".into(),
-        kind: "lib".into(),
-        name,
-    }).collect()
+    let name = backend_name(backend);
+    let mut tests = vec![
+        format!("models::llama_family::device_execution::tests::single_device_frame_restores_original_scratch_after_real_{name}_forward_failure"),
+        format!("models::llama_family_forward_batched::tests::physical_batch_frame_preserves_real_{name}_logits_and_scratch_on_failure"),
+        format!("models::llama_family_forward_batched::tests::selection_failure_full_readback_observes_real_{name}_preparation"),
+        format!("models::llama_family::device_execution::preparation_tests::preparation_frame_real_{name}_allocator_and_contiguous_growth"),
+    ];
+    if backend == Backend::Metal {
+        tests.push("models::llama_family::device_execution::preparation_tests::preparation_frame_real_metal_pending_context_blocks_allocation".into());
+    }
+    tests
+        .into_iter()
+        .map(|name| ContractTest {
+            package: "ferrum-models".into(),
+            target: "ferrum_models".into(),
+            kind: "lib".into(),
+            name,
+        })
+        .collect()
 }
 
 pub fn submission_scope(backend: Backend) -> ObligationScope {
@@ -137,6 +145,22 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     }];
     if backend != Backend::Cpu {
         let mut tests = model_frame_tests(backend);
+        if backend == Backend::Metal {
+            tests.extend(
+                [
+                    "copy_slice_real_metal_f32_preserves_offsets_and_canaries",
+                    "copy_slice_real_metal_f16_preserves_offsets_and_canaries",
+                    "copy_slice_real_metal_rejects_dtype_and_extent_errors_before_encoding",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::copy_slice_tests::{name}"),
+                }),
+            );
+        }
         if backend == Backend::Cuda {
             tests.extend([
                 ContractTest {
