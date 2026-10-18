@@ -43,10 +43,14 @@ mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
+#[path = "completion_failure_tests.rs"]
+mod completion_failure_tests;
 #[path = "metrics_only_tests.rs"]
 mod metrics_only_tests;
 #[path = "mixed_batch_tests.rs"]
 mod mixed_batch_tests;
+#[path = "partial_batch_tests.rs"]
+mod partial_batch_tests;
 #[path = "prefix_prompt_tail_tests.rs"]
 mod prefix_prompt_tail_tests;
 

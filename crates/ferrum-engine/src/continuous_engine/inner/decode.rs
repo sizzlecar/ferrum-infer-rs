@@ -11,6 +11,12 @@ pub(in crate::continuous_engine) enum PlanRuntimeDecodeBatchOutcome {
     },
 }
 
+/// The model has returned outputs for this cohort. A later product/cleanup
+/// error must not turn consumed inputs into permission to run the model again.
+pub(super) struct LegacyDecodeBatchConsumption {
+    completion_error: Option<FerrumError>,
+}
+
 impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
@@ -509,7 +515,7 @@ impl EngineInner {
     }
 
     pub(super) async fn run_batch_decode_adaptive(&self, request_ids: &[RequestId]) -> Result<()> {
-        self.run_batch_decode_adaptive_inner(request_ids, true)
+        self.run_batch_decode_adaptive_inner(request_ids, true, true)
             .await
     }
 
@@ -517,7 +523,7 @@ impl EngineInner {
         &self,
         request_ids: &[RequestId],
     ) -> Result<()> {
-        self.run_batch_decode_adaptive_inner(request_ids, false)
+        self.run_batch_decode_adaptive_inner(request_ids, false, false)
             .await
     }
 
@@ -525,16 +531,22 @@ impl EngineInner {
         &self,
         request_ids: &[RequestId],
         allow_preempt: bool,
+        allow_legacy_fallback: bool,
     ) -> Result<()> {
         let pressure_width = request_ids.len().max(1);
         let mut stack = vec![(self.decode_ready_request_ids(request_ids), pressure_width)];
+        let mut completion_error = None;
         while let Some((chunk, pressure_width)) = stack.pop() {
             let chunk = self.decode_ready_request_ids(&chunk);
             if chunk.is_empty() {
                 continue;
             }
             match self.run_batch_decode(&chunk).await {
-                Ok(()) => {}
+                Ok(consumed) => {
+                    if let Some(error) = consumed.completion_error {
+                        completion_error.get_or_insert(error);
+                    }
+                }
                 Err(e) if is_resource_exhausted_error(&e) && chunk.len() > 1 => {
                     let pressure = paged_kv_admission_pressure(&e);
                     self.scheduler.record_decode_capacity_pressure(
@@ -588,10 +600,32 @@ impl EngineInner {
                         continue;
                     }
                 }
-                Err(e) => return Err(e),
+                Err(error) if allow_legacy_fallback => {
+                    // Keep the legacy error fallback scoped to this chunk.
+                    // Earlier chunks may already have committed output. This
+                    // branch still lacks executor submission evidence; the
+                    // unified execution protocol must replace that legacy gap.
+                    warn!(
+                        "Batch decode failed, falling back within its current chunk: {}",
+                        error
+                    );
+                    for rid in self.decode_ready_request_ids(&chunk) {
+                        if let Err(error) = self.run_decode_step(&rid).await {
+                            warn!("Decode failed for {}: {}", rid, error);
+                            if is_resource_exhausted_error(&error) {
+                                continue;
+                            }
+                            if let Err(error) = self.complete_request_with_error(&rid, error).await
+                            {
+                                completion_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
-        Ok(())
+        completion_error.map_or(Ok(()), Err)
     }
 
     /// Run batch decode for multiple requests in a single forward pass.
@@ -603,7 +637,10 @@ impl EngineInner {
     /// to the existing batched decode path; once `LlmFamilyModel` ships
     /// a real unified forward (Step 5), the same call benefits from the
     /// chunked-prefill kernel work without further engine changes.
-    pub(super) async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
+    pub(super) async fn run_batch_decode(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<LegacyDecodeBatchConsumption> {
         use ferrum_execution::model_executor::{UnifiedBatch, UnifiedBatchItem};
 
         let mut rids: Vec<RequestId> = Vec::new();
@@ -633,7 +670,9 @@ impl EngineInner {
             }
         }
         if batch.items.is_empty() {
-            return Ok(());
+            return Ok(LegacyDecodeBatchConsumption {
+                completion_error: None,
+            });
         }
 
         let kv_requests = kv_slot_requests_for_unified_batch(&batch);
@@ -657,11 +696,21 @@ impl EngineInner {
             }
         };
         if results.len() != rids.len() {
-            return Err(FerrumError::internal(format!(
+            let error = FerrumError::internal(format!(
                 "unified_decode returned {} results for {} requests",
                 results.len(),
                 rids.len(),
-            )));
+            ));
+            // A malformed batch does not provide a reliable row mapping. The
+            // forward already ran, so terminate every participant without
+            // sampling guessed rows or replaying the original inputs.
+            let mut completion_error = None;
+            for rid in &rids {
+                if let Err(error) = self.complete_request_with_error(rid, error.clone()).await {
+                    completion_error.get_or_insert(error);
+                }
+            }
+            return Ok(LegacyDecodeBatchConsumption { completion_error });
         }
         let t_decode_done = if prof { Some(Instant::now()) } else { None };
         let mut t_sample_us: u64 = 0;
@@ -669,19 +718,19 @@ impl EngineInner {
         let mut t_stream_us: u64 = 0;
         let mut t_stop_us: u64 = 0;
         let mut t_complete_us: u64 = 0;
+        let mut completion_error = None;
 
         // Per-item post-processing: sample, update sequence state, stream
         // the new token, check stop conditions. Decode-only items always
         // produce Some(logits); a None here would indicate a backend bug.
         for (rid, logits_opt) in rids.iter().zip(results.into_iter()) {
-            let mut logits = logits_opt.ok_or_else(|| {
-                FerrumError::internal(format!(
-                    "unified_decode returned None for decode item (rid={rid})"
-                ))
-            })?;
-
             let t0_sample = if prof { Some(Instant::now()) } else { None };
-            let next_token_result = {
+            let next_token_result = (|| {
+                let mut logits = logits_opt.ok_or_else(|| {
+                    FerrumError::internal(format!(
+                        "unified_decode returned None for decode item (rid={rid})"
+                    ))
+                })?;
                 let mut sequences = self.sequences.write();
                 let seq = sequences
                     .get_mut(rid)
@@ -714,12 +763,14 @@ impl EngineInner {
                 // anymore — production handles (Paged/Default) don't
                 // update it across iterations.
                 Ok::<TokenId, FerrumError>(token)
-            };
+            })();
             let next_token = match next_token_result {
                 Ok(token) => token,
                 Err(e) => {
                     warn!("Batch decode post-process failed for {}: {}", rid, e);
-                    self.complete_request_with_error(rid, e).await?;
+                    if let Err(error) = self.complete_request_with_error(rid, e).await {
+                        completion_error.get_or_insert(error);
+                    }
                     continue;
                 }
             };
@@ -758,7 +809,9 @@ impl EngineInner {
             }
             if let Some(reason) = stop_reason {
                 let t0_comp = if prof { Some(Instant::now()) } else { None };
-                self.complete_request(rid, reason).await?;
+                if let Err(error) = self.complete_request(rid, reason).await {
+                    completion_error.get_or_insert(error);
+                }
                 if let Some(t0) = t0_comp {
                     t_complete_us += t0.elapsed().as_micros() as u64;
                 }
@@ -787,7 +840,7 @@ impl EngineInner {
                 );
             }
         }
-        Ok(())
+        Ok(LegacyDecodeBatchConsumption { completion_error })
     }
     // ── decode step ────────────────────────────────────────────────────
 
