@@ -138,6 +138,24 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     }
     groups.extend(numerical::groups(backend));
     groups.extend(compatibility::groups(backend));
+    if backend != Backend::Cpu {
+        // Shared legacy weight loading has its own numerical contract. These
+        // checks do not establish qualification for a typed model plan.
+        groups.push(ContractGroup {
+            id: format!("backend-contract.{}.gguf-fused-bias", backend_name(backend)),
+            behavior: Behavior::KernelNumerics,
+            entrypoints: Vec::new(),
+            tests: vec![ContractTest {
+                package: "ferrum-quantization".into(),
+                target: "gguf_loader_test".into(),
+                kind: "test".into(),
+                name: format!(
+                    "fused_bias::{}_fused_bias_matches_complete_oracles",
+                    backend_name(backend),
+                ),
+            }],
+        });
+    }
     if backend == Backend::Cuda {
         // Dense Marlin coverage requires these matrices and the numerical
         // group's F16 providers, workspace lifecycle and projection stitching.

@@ -3,7 +3,8 @@
 //! over it, and exercise the `WeightLoader<B>` API the model actually
 //! uses (load_tensor / load_linear / qkv fusion / gate_up fusion / bias).
 //!
-//! All tests run on `CpuBackend` — no GGUF model file required.
+//! Default tests run on `CpuBackend`; feature-gated tests run the same fused
+//! bias fixtures on real Metal/CUDA devices. No downloaded model is required.
 
 use std::io::{Cursor, Write};
 use std::sync::Arc;
@@ -245,4 +246,274 @@ fn quant_config_returns_none_in_phase_1c() {
     let tmp = build_full_layer_gguf();
     let loader = build_loader(&tmp);
     assert!(loader.quant_config().is_none());
+}
+
+mod fused_bias {
+    use super::*;
+    use ferrum_kernels::backend::{Backend, BackendQuantGguf, BackendQuantMarlin};
+
+    fn fixture(
+        parts: &[(&str, usize)],
+        cols: usize,
+        dtype: GgmlDType,
+        bias_shapes: &[Option<Vec<usize>>],
+    ) -> tempfile::NamedTempFile {
+        let mut tensors = Vec::new();
+        for (index, ((stem, rows), bias_shape)) in parts.iter().zip(bias_shapes).enumerate() {
+            let values: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.125 + index as f32 * 0.03125)
+                .collect();
+            let weight = Tensor::from_vec(values, (*rows, cols), &Device::Cpu).unwrap();
+            tensors.push((
+                format!("{stem}.weight"),
+                QTensor::quantize(&weight, dtype).unwrap(),
+            ));
+            if let Some(shape) = bias_shape {
+                let values: Vec<f32> = (0..shape.iter().product::<usize>())
+                    .map(|row| {
+                        let magnitude = (index + row + 1) as f32 * 0.25;
+                        if row % 2 == 0 {
+                            magnitude
+                        } else {
+                            -magnitude
+                        }
+                    })
+                    .collect();
+                let bias = Tensor::from_vec(values, shape.as_slice(), &Device::Cpu).unwrap();
+                tensors.push((
+                    format!("{stem}.bias"),
+                    QTensor::quantize(&bias, GgmlDType::F32).unwrap(),
+                ));
+            }
+        }
+        let architecture = Value::String("qwen2".to_owned());
+        let metadata = [("general.architecture", &architecture)];
+        let views = tensors
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        gguf_file::write(&mut Cursor::new(&mut bytes), &metadata, &views).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn assert_complete_outputs<B: Backend + BackendQuantGguf + BackendQuantMarlin>(
+        file: &tempfile::NamedTempFile,
+        fused_name: &str,
+        parts: &[&str],
+        cols: usize,
+        synchronize: impl Fn(&mut B::Context),
+    ) {
+        let loader = GgufLoader::<B>::from_file(Arc::new(GgufFile::open(file.path()).unwrap()));
+        let reference = build_loader(file);
+        let fused = loader.load_linear(fused_name).unwrap();
+        let batch = 3;
+        // The zero row isolates bias; the two signed rows exercise the full
+        // matrix product and batch-major concatenation with unequal Q/K/V widths.
+        let input: Vec<f32> = (0..batch)
+            .flat_map(|m| {
+                (0..cols).map(move |col| {
+                    if m == 0 {
+                        0.0
+                    } else {
+                        m as f32 * ((col % 7) as f32 - 3.0) * 0.125
+                    }
+                })
+            })
+            .collect();
+        let total_rows = fused.out_features();
+        let device_input = B::from_slice(&input);
+        let mut device_output = B::from_slice(&vec![f32::NAN; batch * total_rows]);
+        let mut context = B::new_context();
+        fused.forward(&mut context, &device_input, &mut device_output, batch);
+        synchronize(&mut context);
+        let actual = B::to_vec(&device_output, batch * total_rows);
+        let mut reference_context = CpuBackend::new_context();
+        let mut offset = 0;
+        for part in parts {
+            // CUDA's legacy backend has no standalone unbiased Q4K route.
+            // The independently loaded CPU projections are the reference for
+            // every backend, including mixed-bias Q4K eager fusion on CUDA.
+            let single = reference.load_linear(part).unwrap();
+            let rows = single.out_features();
+            let mut separate = vec![f32::NAN; batch * rows];
+            single.forward(&mut reference_context, &input, &mut separate, batch);
+            let weight_name = format!("{part}.weight");
+            let reference_weights = reference.load_tensor(&weight_name).unwrap();
+            // Observe the existing backend storage conversion (CUDA uses
+            // FP16 here) separately from fused arithmetic. No precision mode
+            // is changed to make the device test pass.
+            let weights = B::to_vec(&loader.load_tensor(&weight_name).unwrap(), rows * cols);
+            let bias_name = format!("{part}.bias");
+            let bias = if loader.has_tensor(&bias_name) {
+                B::to_vec(&loader.load_tensor(&bias_name).unwrap(), rows)
+            } else {
+                vec![0.0; rows]
+            };
+            let reference_bias = if reference.has_tensor(&bias_name) {
+                reference.load_tensor(&bias_name).unwrap()
+            } else {
+                vec![0.0; rows]
+            };
+            for m in 0..batch {
+                for row in 0..rows {
+                    let expected = (0..cols)
+                        .map(|col| {
+                            f64::from(weights[row * cols + col]) * f64::from(input[m * cols + col])
+                        })
+                        .sum::<f64>()
+                        + f64::from(bias[row]);
+                    let reference_expected = (0..cols)
+                        .map(|col| {
+                            f64::from(reference_weights[row * cols + col])
+                                * f64::from(input[m * cols + col])
+                        })
+                        .sum::<f64>()
+                        + f64::from(reference_bias[row]);
+                    let got = f64::from(actual[m * total_rows + offset + row]);
+                    let standalone = f64::from(separate[m * rows + row]);
+                    let roundoff = if B::activation_elem_size_bytes() == 2 {
+                        1e-3
+                    } else {
+                        1e-4
+                    };
+                    let tolerance = roundoff * (1.0 + expected.abs());
+                    let reference_tolerance = 1e-4 * (1.0 + reference_expected.abs());
+                    assert!(
+                        (standalone - reference_expected).abs() <= reference_tolerance,
+                        "{part}, batch {m}, row {row}: CPU {standalone} != scalar {reference_expected}"
+                    );
+                    assert!(
+                        (got - expected).abs() <= tolerance,
+                        "{fused_name} / {part}, batch {m}, row {row}: {got} != scalar {expected}"
+                    );
+                    assert!(
+                        (got - standalone).abs()
+                            <= tolerance
+                                + reference_tolerance
+                                + (expected - reference_expected).abs(),
+                        "{fused_name} / {part}, batch {m}, row {row}: {got} != standalone {standalone}"
+                    );
+                }
+            }
+            assert_eq!(&actual[offset..offset + rows], bias.as_slice());
+            offset += rows;
+        }
+        assert_eq!(offset, total_rows);
+    }
+
+    fn qkv_cases<B: Backend + BackendQuantGguf + BackendQuantMarlin>(
+        synchronize: impl Fn(&mut B::Context) + Copy,
+    ) {
+        let gguf_parts = [
+            ("blk.0.attn_q", 4),
+            ("blk.0.attn_k", 2),
+            ("blk.0.attn_v", 2),
+        ];
+        let ferrum_parts = [
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+        ];
+        for dtype in [GgmlDType::F32, GgmlDType::Q4K] {
+            let cols = if dtype == GgmlDType::Q4K { 256 } else { 4 };
+            for present in [
+                [true, true, true],
+                [false, true, false],
+                [true, false, true],
+            ] {
+                let shapes = gguf_parts
+                    .iter()
+                    .zip(present)
+                    .map(|((_, rows), present)| present.then(|| vec![*rows]))
+                    .collect::<Vec<_>>();
+                let file = fixture(&gguf_parts, cols, dtype, &shapes);
+                assert_complete_outputs::<B>(
+                    &file,
+                    "model.layers.0.self_attn.qkv_proj",
+                    &ferrum_parts,
+                    cols,
+                    synchronize,
+                );
+            }
+        }
+    }
+
+    fn gate_up_cases<B: Backend + BackendQuantGguf + BackendQuantMarlin>(
+        synchronize: impl Fn(&mut B::Context) + Copy,
+    ) {
+        let gguf_parts = [("blk.0.ffn_gate", 3), ("blk.0.ffn_up", 5)];
+        for shapes in [vec![Some(vec![3]), None], vec![None, Some(vec![5])]] {
+            let file = fixture(&gguf_parts, 4, GgmlDType::F32, &shapes);
+            assert_complete_outputs::<B>(
+                &file,
+                "model.layers.0.mlp.gate_up_proj",
+                &["model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj"],
+                4,
+                synchronize,
+            );
+        }
+    }
+
+    #[test]
+    fn qkv_preserves_all_and_mixed_bias_for_dense_and_quantized_weights() {
+        qkv_cases::<CpuBackend>(CpuBackend::sync);
+    }
+
+    #[test]
+    fn gate_up_preserves_bias_and_zero_fills_either_missing_segment() {
+        gate_up_cases::<CpuBackend>(CpuBackend::sync);
+    }
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn metal_fused_bias_matches_complete_oracles() {
+        use ferrum_kernels::backend::metal::MetalBackend;
+
+        let synchronize = |context: &mut <MetalBackend as Backend>::Context| {
+            MetalBackend::sync_checked(context)
+                .expect("fused linear must complete real Metal work");
+        };
+        qkv_cases::<MetalBackend>(synchronize);
+        gate_up_cases::<MetalBackend>(synchronize);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_bias_matches_complete_oracles() {
+        use ferrum_kernels::backend::cuda::CudaBackend;
+
+        qkv_cases::<CudaBackend>(CudaBackend::sync);
+        gate_up_cases::<CudaBackend>(CudaBackend::sync);
+    }
+
+    #[test]
+    fn qkv_rejects_bias_with_wrong_length_or_rank() {
+        let parts = [
+            ("blk.0.attn_q", 4),
+            ("blk.0.attn_k", 2),
+            ("blk.0.attn_v", 2),
+        ];
+        for invalid_shape in [vec![3], vec![1, 2]] {
+            let file = fixture(
+                &parts,
+                4,
+                GgmlDType::F32,
+                &[None, Some(invalid_shape), None],
+            );
+            let loader = build_loader(&file);
+            let error = loader
+                .load_linear("model.layers.0.self_attn.qkv_proj")
+                .err()
+                .expect("malformed fused bias must fail during loading");
+            assert!(error.to_string().contains("bias shape"), "{error}");
+            assert!(error.to_string().contains("blk.0.attn_k.bias"), "{error}");
+            assert!(loader
+                .load_linear("model.layers.0.self_attn.k_proj")
+                .is_err());
+        }
+    }
 }
