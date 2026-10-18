@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 首批删除已实现：退役模型拒绝、HTTP 路由隔离、CLI 入口及真实 CPU tiny-Llama `run` / `serve` 定向测试通过；工作区和后端检查待完成，尚未合并。没有新增性能或 SLO 达标声明。
+R0 首批已合并（PR #429），本机完整测试 5,110 通过、76 忽略，必需 CI 全过。Claude R181 补充的孤立 TTS kernel 与公开 GGUF 构造校验已修正，28 项定向测试通过，包含真实 CPU `run` / `serve` 与 Metal attention；后续改动仍需合并。没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -30,7 +30,10 @@ R0 首批删除已实现：退役模型拒绝、HTTP 路由隔离、CLI 入口�
 | 独立 `FifoScheduler` / `PriorityScheduler` 及 factories | 退役未接入当前 Engine 构建链的旧实现、注册和导出，说明公共 API 变化 | 保留统一 scheduler 的明确优先级语义；旧名称不能静默映射为调度顺序不同的 Continuous |
 | 独立 `pipeline` 执行器、模拟并行 executor 及专用 factory/导出 | 清理未接入当前产品的旧执行链和模拟能力 | 保留生产 chunked prefill、实际接线的 layer-split 与其共用配置/设备组件，不按目录整删 |
 | 近期已验证的文本生成路线、默认性能、OpenAI 文本协议 | 保留并迁移，继续验证 `run` / `serve` | 包括已有真实验收的 legacy Llama 路线，不能因是 legacy 就一起删掉 |
-| 其余旧文本家族、LoRA、投机解码及其他实验能力 | R0 按真实证据、主线用途和迁移成本逐项定为保留或退役；不默认要求全量移植 | 不以历史枚举或一个 mock 判定已支持；待决项须在对应迁移前定案 |
+| 其余文本家族 | 保留实际 LlamaFamily 与 typed 家族实现；清理 Phi/GPT2 仅注册声明、factory 无实现的支持声明 | 共享实现存在不代表所有架构/格式/后端组合已实测；资格按证据域保留 |
+| LoRA | 保留旧路径实际 adapter 执行；按实现能力声明支持，未实现的执行路径在注册/入队/执行前明确拒绝 | 保留 CPU 数值对照；alias 成功或 metadata 透传不能证明 adapter 生效 |
+| 旧投机解码入口与专用状态机 | 退役仅 legacy 接入、缺少真实模型验收的实验链路 | 不为 mock 测试保留平行驱动；将来通过统一的实际执行/提交契约扩展 |
+| 旧 whole-prompt prefix 复用 | 退役只克隆 handle 身份、缺少实际 KV fork 的复用；保留 typed checkpoint/restore | 默认关闭不等于正确；未支持 provider 明确拒绝，不泛称所有路径具备 prefix 能力 |
 
 退役要贯穿实现、loader/registry、CLI/HTTP 入口、独占配置/依赖、示例、CI smoke 与支持文档；删除只服务于退役实现的测试，保留或改写仍有价值的协议/共用组件测试。失效模型类型或任务必须明确拒绝，不隐式转到文本生成、空输出或 stub。不得只隐藏帮助或关闭 feature 后留下整套旧状态机。
 

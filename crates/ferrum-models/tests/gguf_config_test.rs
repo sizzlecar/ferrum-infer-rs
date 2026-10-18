@@ -1,14 +1,15 @@
-//! `LlamaFamilyConfig::from_gguf` — verify metadata parsing for the four
-//! Llama-family architectures (qwen3 / qwen2 / llama / mistral) plus
-//! fallback paths (missing optional fields, vocab inferred from embed).
+//! Dense GGUF config eligibility and metadata parsing, including optional
+//! fields and vocab inferred from the embedding table.
 
 use std::io::{Cursor, Write};
 
 use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
+use ferrum_models::gguf_engine_loader::load_gguf_decoder;
 use ferrum_models::models::llama_family::LlamaFamilyConfig;
 use ferrum_quantization::gguf::GgufFile;
+use ferrum_types::FerrumError;
 
 /// Build a GGUF that contains only metadata + a fake embed table — enough
 /// to drive `from_gguf` end-to-end without needing real weights.
@@ -189,8 +190,8 @@ fn missing_required_field_returns_err() {
 }
 
 #[test]
-fn unknown_architecture_works_with_safe_defaults() {
-    // Unknown arch — has_qk_norm should default to false, rope_theta to 10k.
+fn unknown_architecture_is_rejected_even_with_dense_metadata() {
+    // Supplying plausible dense dimensions must not authorize an unknown model.
     let extra = [
         ("custom.block_count", Value::U32(4)),
         ("custom.embedding_length", Value::U32(32)),
@@ -204,10 +205,58 @@ fn unknown_architecture_works_with_safe_defaults() {
     ];
     let tmp = build_metadata_gguf("custom", &extra, 32, 32);
     let gguf = GgufFile::open(tmp.path()).unwrap();
-    let cfg = LlamaFamilyConfig::from_gguf(&gguf).unwrap();
-    assert!(!cfg.has_qk_norm, "unknown arch defaults to no QK-norm");
-    assert!(
-        (cfg.rope_theta - 10_000.0).abs() < 1.0,
-        "unknown arch defaults to 10k rope"
-    );
+    assert!(matches!(
+        LlamaFamilyConfig::from_gguf(&gguf),
+        Err(FerrumError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn unsupported_architectures_are_rejected_before_dimensions_or_weights() {
+    for arch in ["bert", "clip", "whisper", "qwen3_tts", "mistral3", "custom"] {
+        // Valid GGUF container, but no model dimensions or runnable weights:
+        // both public entrypoints must reject the architecture first.
+        let tmp = build_metadata_gguf(arch, &[], 1, 1);
+        let gguf = GgufFile::open(tmp.path()).unwrap();
+        for error in [
+            LlamaFamilyConfig::from_gguf(&gguf).err().unwrap(),
+            load_gguf_decoder(tmp.path(), &ferrum_types::Device::CPU)
+                .err()
+                .unwrap(),
+        ] {
+            match error {
+                FerrumError::Unsupported { message } => assert!(message.contains(arch)),
+                other => panic!("{arch} must fail architecture eligibility first: {other}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn supported_dense_architectures_keep_metadata_parsing() {
+    for arch in ["qwen", "qwen2", "qwen3", "llama", "mistral", "gemma3"] {
+        let metadata = [
+            (format!("{arch}.block_count"), Value::U32(1)),
+            (format!("{arch}.embedding_length"), Value::U32(4)),
+            (format!("{arch}.feed_forward_length"), Value::U32(8)),
+            (format!("{arch}.attention.head_count"), Value::U32(2)),
+            (
+                format!("{arch}.attention.layer_norm_rms_epsilon"),
+                Value::F32(1.0e-6),
+            ),
+        ];
+        let extra = metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        let tmp = build_metadata_gguf(arch, &extra, 4, 4);
+        let gguf = GgufFile::open(tmp.path()).unwrap();
+        let config = LlamaFamilyConfig::from_gguf(&gguf).unwrap();
+        assert_eq!(config.num_layers, 1, "{arch}");
+        assert_eq!(config.hidden_size, 4, "{arch}");
+        assert_eq!(config.intermediate_size, 8, "{arch}");
+        assert_eq!(config.num_heads, 2, "{arch}");
+        assert_eq!(config.head_dim, 2, "{arch}");
+        assert_eq!(config.vocab_size, 4, "{arch}");
+    }
 }

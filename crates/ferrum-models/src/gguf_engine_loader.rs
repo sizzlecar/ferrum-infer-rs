@@ -14,6 +14,7 @@ use ferrum_quantization::gguf::{GgufFile, GgufLoader};
 use ferrum_types::{DataType, Device, FerrumError, ModelId, ModelInfo, ModelType, Result};
 
 use crate::common::DecoderOnlyLLM;
+use crate::gguf_config::validate_dense_gguf_architecture;
 use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 use crate::models::Qwen3MoeModel;
 use crate::moe_config::Qwen3MoeConfig;
@@ -135,14 +136,10 @@ pub fn load_gguf_decoder_with_info(
     // `mistral3` (YaRN-from-GGUF + attention temperature scaling) loads
     // "successfully" that way and then generates pure garbage — a loud
     // error beats degraded output.
-    if !gguf_arch_supported(&arch) {
-        return Err(FerrumError::model(format!(
-            "unsupported GGUF architecture '{arch}' in {}; supported: \
-             qwen3, qwen3moe, qwen2, qwen, llama, mistral",
-            gguf_path.display()
-        )));
-    }
     let is_moe = arch == "qwen3moe";
+    if !is_moe {
+        validate_dense_gguf_architecture(&arch)?;
+    }
 
     let dense_cfg = if is_moe {
         None
@@ -254,30 +251,9 @@ pub fn load_gguf_decoder_with_info(
     Ok((llm, model_info))
 }
 
-/// GGUF architectures the loader actually implements. Everything here maps
-/// onto `LlamaFamilyModel` config toggles (or `Qwen3MoeModel` for qwen3moe);
-/// anything else must hard-error rather than load-and-garble.
-fn gguf_arch_supported(arch: &str) -> bool {
-    matches!(
-        arch,
-        "qwen3" | "qwen3moe" | "qwen2" | "qwen" | "llama" | "mistral" | "gemma3"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unsupported_gguf_arch_is_rejected() {
-        // mistral3 (Devstral 2) needs YaRN-from-GGUF + attention
-        // temperature scaling — loading it through the llama-family path
-        // produces degenerate output, so it must not pass the gate.
-        assert!(!gguf_arch_supported("mistral3"));
-        assert!(gguf_arch_supported("gemma3"));
-        assert!(gguf_arch_supported("mistral"));
-        assert!(gguf_arch_supported("qwen3moe"));
-    }
 
     #[test]
     fn gguf_path_detected() {

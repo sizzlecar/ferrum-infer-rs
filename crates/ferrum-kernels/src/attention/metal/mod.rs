@@ -4,7 +4,6 @@
 //! Accepts raw Metal Buffer references to avoid CPU↔GPU copies.
 
 pub mod pipelines;
-pub mod transformer;
 
 use crate::attention::AttentionParams;
 use metal::{Buffer, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};

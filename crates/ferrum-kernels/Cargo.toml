@@ -55,7 +55,7 @@ cuda-production = [
     "cuda-q6-f16-linear",
 ]
 candle-cuda-compat = ["cuda", "candle-core/cuda"]
-metal = ["dep:metal"]  # Metal backend (macOS) — also gates the fused-transformer Metal pipelines
+metal = ["dep:metal"]  # Metal backend (macOS).
 marlin = []  # Marlin INT4xFP16 native artifact (auto-enabled by cuda).
 vllm-marlin = ["cuda"]  # vLLM GPTQ-Marlin native artifact (Phase 12).
 vllm-moe-marlin = ["cuda", "vllm-marlin"]  # vLLM Marlin MoE artifact (Stage

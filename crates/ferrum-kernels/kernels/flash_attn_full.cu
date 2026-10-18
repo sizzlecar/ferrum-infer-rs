@@ -1,5 +1,5 @@
 // Flash attention for full sequence (prefill + autoregressive with KV cache).
-// Used by TTS FusedTransformer. Supports GQA (num_heads != num_kv_heads).
+// Used by the CUDA backend for prefill. Supports GQA (num_heads != num_kv_heads).
 //
 // Q: [batch, num_heads, q_len, head_dim]
 // K: [batch, num_kv_heads, kv_len, head_dim]
